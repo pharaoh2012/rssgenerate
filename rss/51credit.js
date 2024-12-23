@@ -150,7 +150,7 @@ async function getPage(url) {
 }
 
 function getCookie(html) {
-    console.info('getCoolie')
+    console.info('getCookie')
     globalThis.document = {}
     globalThis.window = {}
     globalThis.window.document = {}
