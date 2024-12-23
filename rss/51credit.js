@@ -10,7 +10,7 @@ const iconv = require('iconv-lite');
 
 const rootUrl = `https://bbs.51credit.com`;
 const HOME_URL = 'https://bbs.51credit.com/forum-235-1.html'
-const COOKIE_FILE = "/tmp/51credit.cookie"
+const COOKIE_FILE = "./out/51credit.cookie"
 const title = "羊毛优惠 - 我爱卡论坛";
 const RSS_NAME = "51credit";
 
@@ -150,7 +150,7 @@ async function getPage(url) {
 }
 
 function getCookie(html) {
-    console.info('getCookie')
+    console.info('getCookie:'+html);
     globalThis.document = {}
     globalThis.window = {}
     globalThis.window.document = {}
