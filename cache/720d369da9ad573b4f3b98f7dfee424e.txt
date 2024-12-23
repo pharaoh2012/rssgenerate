@@ -1,0 +1,171 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huangxincheng/p/18619048" title="发布于 2024-12-20 12:29">
+    <span role="heading" aria-level="2">聊一聊坑人的 C# MySql.Data SDK</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一背景">一：背景</h2>
+<h3 id="1-讲故事">1. 讲故事</h3>
+<p>为什么说这东西比较坑人呢？是因为最近一个月接到了两个dump，都反应程序卡死无响应，最后分析下来是因为<code>线程饥饿</code>导致，那什么原因导致的线程饥饿呢？进一步分析发现罪魁祸首是 <code>MySql.Data</code>，这就让人无语了，并且反馈都是升级了<code>MySql.Data</code>驱动引发，接下来我们简单聊一下。</p>
+<h2 id="二-mysqldata-到底怎么了">二： MySql.Data 到底怎么了</h2>
+<h3 id="1-祸根溯源">1. 祸根溯源</h3>
+<p>早期版本的 <code>MySql.Data</code> 访问数据库都是以同步的方式进行，比如：<code>ExecuteReader</code> 而不是 <code>ExecuteReaderAsync</code>，随着项目的升级改造需要提升MySql.Data的版本， MySql为了向前兼容保留了同步方法，下面引用最新的 MySql.Data 9.1.0 截图和参考代码如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241220122814059-88699629.png" alt="" loading="lazy"></p>
+<pre><code class="language-C#">
+// MySql.Data, Version=9.1.0.0, Culture=neutral, PublicKeyToken=c5687fc88969c44d
+// MySql.Data.MySqlClient.MySqlConnection
+using System.Threading;
+
+public override void Open()
+{
+	OpenAsync(execAsync: false, CancellationToken.None).GetAwaiter().GetResult();
+}
+
+
+// MySql.Data, Version=9.1.0.0, Culture=neutral, PublicKeyToken=c5687fc88969c44d
+// MySql.Data.MySqlClient.MySqlCommand
+using System.Data;
+using System.Threading;
+
+public new MySqlDataReader ExecuteReader()
+{
+	return ExecuteReaderAsync(CommandBehavior.Default, execAsync: false, CancellationToken.None).GetAwaiter().GetResult();
+}
+
+public override object ExecuteScalar()
+{
+	return ExecuteScalarAsync(execAsync: false, CancellationToken.None).GetAwaiter().GetResult();
+}
+
+</code></pre>
+<p>仔细看上面这段代码，不觉让人吸了一口凉气，所谓的同步方式竟然是用<code>异步方法简单包装</code> 而来的，这种异步混用同步的方式很容易导致线程饥饿，即线程池中已无可用线程来唤醒 GetResult() 下的 Event 事件，这个我准备后面用一篇文章详细来聊一下线程饥饿，这里用<code>C#内功修炼训练营</code>中的一张图来演示下.NET8 中异步在线程池中的走法。</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241220122814063-1263517898.png" alt="" loading="lazy"></p>
+<h3 id="2-线程饥饿的现场">2. 线程饥饿的现场</h3>
+<p>问题方法给大家列出来的，接下来用 windbg 看下dump中的故障现场吧。</p>
+<ol>
+<li>某考试系统的故障</li>
+</ol>
+<p>看故障现象比较简单，使用 <code>!tp</code> 和 <code>!tpq</code> 即可，输出如下：</p>
+<pre><code class="language-C#">
+0:000&gt; !tp
+Using the Portable thread pool.
+
+CPU utilization:  1%
+Workers Total:    268
+Workers Running:  268
+Workers Idle:     0
+Worker Min Limit: 4
+Worker Max Limit: 32767
+
+0:000&gt; !sos tpq
+global work item queue________________________________
+0x000002410E750218 Microsoft.AspNetCore.Server.IIS.Core.IISHttpContextOfT&lt;Microsoft.AspNetCore.Hosting.HostingApplication+Context&gt;
+0x000002410E7505A0 Microsoft.AspNetCore.Server.IIS.Core.IISHttpContextOfT&lt;Microsoft.AspNetCore.Hosting.HostingApplication+Context&gt;
+0x000002410E750928 Microsoft.AspNetCore.Server.IIS.Core.IISHttpContextOfT&lt;Microsoft.AspNetCore.Hosting.HostingApplication+Context&gt;
+...
+local per thread work items_____________________________________
+0x0000024114903310 System.Runtime.CompilerServices.AsyncTaskMethodBuilder&lt;MySql.Data.MySqlClient.MySqlPool&gt;+AsyncStateMachineBox&lt;MySql.Data.MySqlClient.MySqlPoolManager+&lt;GetPoolAsync&gt;d__23&gt;
+
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241220122814051-131311025.png" alt="" loading="lazy"></p>
+<p>从卦中可以看到线程池中目前有268个线程，此时都处于运行状态，并且线程池的全局队列积压了<code>1000+</code>的任务没有处理，接下来使用 <code>~*e !clrstack</code> 观察每个线程都在做什么。</p>
+<pre><code class="language-C#">
+0:287&gt; !clrstack
+OS Thread Id: 0x39ec (287)
+        Child SP               IP Call Site
+000000858C5FD1B8 00007ffc95ca04e4 [HelperMethodFrame_1OBJ: 000000858c5fd1b8] System.Threading.Monitor.ObjWait(Int32, System.Object)
+000000858C5FD2E0 00007ffc087cccc9 System.Threading.Monitor.Wait(System.Object, Int32) [/_/src/coreclr/System.Private.CoreLib/src/System/Threading/Monitor.CoreCLR.cs @ 156]
+000000858C5FD310 00007ffc087cd027 System.Threading.ManualResetEventSlim.Wait(Int32, System.Threading.CancellationToken) [/_/src/libraries/System.Private.CoreLib/src/System/Threading/ManualResetEventSlim.cs @ 561]
+000000858C5FD3D0 00007ffc087cc4f2 System.Threading.Tasks.Task.SpinThenBlockingWait(Int32, System.Threading.CancellationToken) [/_/src/libraries/System.Private.CoreLib/src/System/Threading/Tasks/Task.cs @ 3072]
+000000858C5FD440 00007ffc087cc099 System.Threading.Tasks.Task.InternalWaitCore(Int32, System.Threading.CancellationToken) [/_/src/libraries/System.Private.CoreLib/src/System/Threading/Tasks/Task.cs @ 3007]
+000000858C5FD4C0 00007ffc08796cc6 System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(System.Threading.Tasks.Task, System.Threading.Tasks.ConfigureAwaitOptions) [/_/src/libraries/System.Private.CoreLib/src/System/Runtime/CompilerServices/TaskAwaiter.cs @ 111]
+000000858C5FD500 00007ffc086ffbc4 xxxx.UpdateAnswerUrl(System.String, Int32, System.Collections.Generic.Dictionary`2&lt;System.String,System.String&gt;)
+
+</code></pre>
+<p>发现这些线程都卡在 <code>xxxx.UpdateAnswerUrl</code> 方法上，那到底卡在方法的何处呢？可以用 <code>!U /d 00007ffc086ffbc4</code> 观察方法的反汇编代码，看看这个00007ffc086ffbc4停留在何处？输出如下：</p>
+<pre><code class="language-C#">0:000&gt; !U /d 00007ffc086ffbc4
+Normal JIT generated code
+xxx.UpdateAnswerUrl(System.String, Int32, System.Collections.Generic.Dictionary`2&lt;System.String,System.String&gt;)
+...
+00007ffc`086ffb79 ff15114bb9fe    call    qword ptr [00007ffc`07294690] (System.Runtime.CompilerServices.AsyncMethodBuilderCore.Start[[MySql.Data.MySqlClient.MySqlCommand+&lt;ExecuteScalarAsync&gt;d__117, MySql.Data]](&lt;ExecuteScalarAsync&gt;d__117 ByRef), mdToken: 000000000600646B)
+00007ffc`086ffb7f 488b8c2468010000 mov     rcx,qword ptr [rsp+168h]
+00007ffc`086ffb87 4885c9          test    rcx,rcx
+00007ffc`086ffb8a 0f84890c0000    je      00007ffc`08700819
+00007ffc`086ffb90 3809            cmp     byte ptr [rcx],cl
+00007ffc`086ffb92 48898c2498010000 mov     qword ptr [rsp+198h],rcx
+00007ffc`086ffb9a 488d8c2498010000 lea     rcx,[rsp+198h]
+00007ffc`086ffba2 48baf02b5006fc7f0000 mov rdx,7FFC06502BF0h (MT: System.Runtime.CompilerServices.TaskAwaiter`1[[System.Object, System.Private.CoreLib]])
+00007ffc`086ffbac ff158e7cdefd    call    qword ptr [00007ffc`064e7840] (System.Runtime.CompilerServices.TaskAwaiter`1[[System.__Canon, System.Private.CoreLib]].GetResult(), mdToken: 00000000060065F0)
+00007ffc`086ffbb2 48898424e8000000 mov     qword ptr [rsp+0E8h],rax
+00007ffc`086ffbba eb0d            jmp     00007ffc`086ffbc9
+00007ffc`086ffbbc 33d2            xor     edx,edx
+00007ffc`086ffbbe ff1544d4bffd    call    qword ptr [00007ffc`062fd008] (System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(System.Threading.Tasks.Task, System.Threading.Tasks.ConfigureAwaitOptions), mdToken: 00000000060065E4)
+&gt;&gt;&gt; 00007ffc`086ffbc4 e960ffffff      jmp     00007ffc`086ffb29
+
+</code></pre>
+<p>从汇编代码中可以观测它是在获取 <code>ExecuteScalarAsync</code> 方法的 Result 结果，有了这个信息就可以翻源代码了，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241220122814038-228777954.png" alt="" loading="lazy"></p>
+<p>最终就发现了ExecuteScalar下面的荒唐一幕。。。</p>
+<ol start="2">
+<li>某跟踪埋点系统的故障</li>
+</ol>
+<p>埋点系统也是一样的问题，使用 <code>!tp</code> 观察到线程池有 602 个线程都处于运行状态，输出如下：</p>
+<pre><code class="language-C#">
+0:000&gt; !tp
+Using the Portable thread pool.
+
+CPU utilization:  11%
+Workers Total:    602
+Workers Running:  602
+Workers Idle:     0
+Worker Min Limit: 32
+Worker Max Limit: 32767
+
+</code></pre>
+<p>然后通过 <code>~*e !clrstack</code> 观察发现线程都处于 <code>Open()</code> 方法中，输出如下：</p>
+<pre><code class="language-C#">
+OS Thread Id: 0x1a9d4 (23)
+        Child SP               IP Call Site
+0000007AD4DBE228 00007ff9feb70b24 [HelperMethodFrame_1OBJ: 0000007ad4dbe228] System.Threading.Monitor.ObjWait(Int32, System.Object)
+0000007AD4DBE350 00007ff9b655d55e System.Threading.Monitor.Wait(System.Object, Int32) [/_/src/coreclr/System.Private.CoreLib/src/System/Threading/Monitor.CoreCLR.cs @ 156]
+0000007AD4DBE380 00007ff9b656860e System.Threading.ManualResetEventSlim.Wait(Int32, System.Threading.CancellationToken) [/_/src/libraries/System.Private.CoreLib/src/System/Threading/ManualResetEventSlim.cs @ 561]
+0000007AD4DBE420 00007ff9b6581729 System.Threading.Tasks.Task.SpinThenBlockingWait(Int32, System.Threading.CancellationToken) [/_/src/libraries/System.Private.CoreLib/src/System/Threading/Tasks/Task.cs @ 3072]
+0000007AD4DBE4A0 00007ff9b6581516 System.Threading.Tasks.Task.InternalWaitCore(Int32, System.Threading.CancellationToken) [/_/src/libraries/System.Private.CoreLib/src/System/Threading/Tasks/Task.cs @ 3007]
+0000007AD4DBE520 00007ff959e9e9f4 System.Runtime.CompilerServices.TaskAwaiter.HandleNonSuccessAndDebuggerNotification(System.Threading.Tasks.Task, System.Threading.Tasks.ConfigureAwaitOptions) [/_/src/libraries/System.Private.CoreLib/src/System/Runtime/CompilerServices/TaskAwaiter.cs @ 111]
+0000007AD4DBE560 00007ff95752e95b MySql.Data.MySqlClient.MySqlConnection.Open()
+...
+
+</code></pre>
+<p>可恶的是 Open() 方法内部也是用 <code>异步转同步</code> 实现的，真的无语了。</p>
+<h3 id="3-解决方法">3. 解决方法</h3>
+<p>要想解决这个问题，大概两种方法吧。</p>
+<ol>
+<li>使用纯异步写法，这也是高版本 MySql.Data 极力推荐的，不然就给你埋坑。。。</li>
+<li>退回到低版本的 MySql.Data，继续使用真正的同步版写法。</li>
+</ol>
+<h2 id="三总结">三：总结</h2>
+<p>挺意外的是 MySql.Data 项目在 github：<a href="https://github.com/mysql/mysql-connector-net" target="_blank" rel="noopener nofollow">https://github.com/mysql/mysql-connector-net</a> 上没开 issue 栏。</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241220122814046-969721033.png" alt="" loading="lazy"></p>
+<p>这就无法让社区开发者介入，真的很奇葩，只能在这里给大家做个预警吧。<br>
+<img src="https://images.cnblogs.com/cnblogs_com/huangxincheng/345039/o_210929020104最新消息优惠促销公众号关注二维码.jpg" width="700" height="300" alt="图片名称" align="center"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="3.1042043672349537" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2024-12-20 12:29">2024-12-20 12:29</span>&nbsp;
+<a href="https://www.cnblogs.com/huangxincheng">一线码农</a>&nbsp;
+阅读(<span id="post_view_count">1609</span>)&nbsp;
+评论(<span id="post_comment_count">28</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18619048" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18619048);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18619048', targetLink: 'https://www.cnblogs.com/huangxincheng/p/18619048', title: '聊一聊坑人的 C# MySql.Data SDK' })">举报</a>
+</div>
+        

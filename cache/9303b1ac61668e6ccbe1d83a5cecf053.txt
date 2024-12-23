@@ -1,0 +1,182 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huangxincheng/p/18623762" title="发布于 2024-12-23 13:30">
+    <span role="heading" aria-level="2">聊一聊 C#线程池 的线程动态注入 (上)</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一背景">一：背景</h2>
+<h3 id="1-讲故事">1. 讲故事</h3>
+<p>在线程饥饿的场景中，我们首先要了解的就是线程是如何动态注入的？其实现如今的ThreadPool内部的实现逻辑非常复杂，而且随着版本的迭代内部逻辑也在不断的变化，有时候也没必要详细的去了解，只需在稍微宏观的角度去理解一下即可，我准备用三篇来详细的聊一聊<code>线程注入</code>的流程走向来作为<code>线程饥饿</code>的铺垫系列，这篇我们先从 <code>Thread.Sleep</code> 的角度观察线程的动态注入。</p>
+<h2 id="二sleep-角度下的动态注入">二：Sleep 角度下的动态注入</h2>
+<h3 id="1-测试代码">1. 测试代码</h3>
+<p>为了方便研究，我们用 <code>Thread.Sleep</code> 的方式阻塞线程池线程，然后观察线程的注入速度，参考代码如下：</p>
+<pre><code class="language-C#">
+        static void Main(string[] args)
+        {
+            for (int i = 0; i &lt; 10000; i++)
+            {
+                ThreadPool.QueueUserWorkItem((idx) =&gt;
+                {
+                    Console.WriteLine($"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss:fff")} -&gt; {idx}: 这是耗时任务");
+
+                    Thread.Sleep(int.MaxValue);
+                }, i);
+            }
+
+            Console.ReadLine();
+        }
+
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241223132927655-2111789500.png" alt="" loading="lazy"></p>
+<p>仔细观察卦中的输出，除了初始的12个线程喷涌而出，后面你会发现它的线程动态注入有时候大概是 <code>500ms</code> 一次，有时候会是 <code>1000ms</code> 一次，所以我们可以得到一个简单的结论：Thread.Sleep 场景下1s 大概会动态注入<code>1~2</code>个线程。</p>
+<p>有了这个结论之后，接下来我们探究下它的底层逻辑在哪？</p>
+<h3 id="2-底层代码逻辑在哪">2. 底层代码逻辑在哪</h3>
+<p>千言万语不及一张图，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241223132927635-1600544138.png" alt="" loading="lazy"></p>
+<p>接下来我们来聊一下卦中的各个元素吧。</p>
+<ol>
+<li>GateThread</li>
+</ol>
+<p>在 PortableThreadPool 中有一个 GateThread 类，专门掌管着线程的动态注入，默认情况下它大概是 500ms 被唤醒一次。这个是有很多逻辑源码支撑的。</p>
+<pre><code class="language-C#">
+    private static class GateThread
+    {
+        public const uint GateActivitiesPeriodMs = 500;
+
+        private static void GateThreadStart()
+        {
+            while (true)
+            {
+                bool wasSignaledToWake = DelayEvent.WaitOne((int)delayHelper.GetNextDelay(currentTimeMs));
+                ...
+            }
+        }
+
+        public uint GetNextDelay(int currentTimeMs)
+        {
+            uint elapsedMsSincePreviousGateActivities = (uint)(currentTimeMs - _previousGateActivitiesTimeMs);
+            uint nextDelayForGateActivities =
+                elapsedMsSincePreviousGateActivities &lt; GateActivitiesPeriodMs
+                    ? GateActivitiesPeriodMs - elapsedMsSincePreviousGateActivities
+                    : 1;
+            ...
+        }
+    }
+
+</code></pre>
+<ol start="2">
+<li>SufficientDelaySinceLastDequeue</li>
+</ol>
+<p>这个方法是用来判断任务最后一次出队的时间，即内部的<code>lastDequeueTime</code> 字段，这也是为什么有时候是1个周期(500ms)，有时候是2个周期的底层原因，如果在一个周期内判断<code>lastDequeueTime(490ms)&lt;=500ms</code>，那么在下一个周期内判断最后一次出队的时间自然就是 <code>490ms+500ms</code>，所以这就是为什么 Console 上显示大约 1s 的间隔的原因了，下面的代码演示了 lastDequeueTime 是如何存取的。</p>
+<pre><code class="language-C#">
+        private static void GateThreadStart()
+        {
+            if (!disableStarvationDetection &amp;&amp;
+                threadPoolInstance._pendingBlockingAdjustment == PendingBlockingAdjustment.None &amp;&amp;
+                threadPoolInstance._separated.numRequestedWorkers &gt; 0 &amp;&amp;
+                SufficientDelaySinceLastDequeue(threadPoolInstance))
+            {
+                bool addWorker = false;
+              
+                if (addWorker)
+                {
+                    WorkerThread.MaybeAddWorkingWorker(threadPoolInstance);
+                }
+            }
+        }
+        private static bool SufficientDelaySinceLastDequeue(PortableThreadPool threadPoolInstance)
+        {
+            uint delay = (uint)(Environment.TickCount - threadPoolInstance._separated.lastDequeueTime);
+            uint minimumDelay;
+            if (threadPoolInstance._cpuUtilization &lt; CpuUtilizationLow)
+            {
+                minimumDelay = GateActivitiesPeriodMs;
+            }
+            else
+            {
+                minimumDelay = (uint)threadPoolInstance._separated.counts.NumThreadsGoal * DequeueDelayThresholdMs;
+            }
+
+            return delay &gt; minimumDelay;
+        }
+        private static void WorkerDoWork(PortableThreadPool threadPoolInstance, ref bool spinWait)
+        {
+            bool alreadyRemovedWorkingWorker = false;
+            while (TakeActiveRequest(threadPoolInstance))
+            {
+                threadPoolInstance._separated.lastDequeueTime = Environment.TickCount;
+                if (!ThreadPoolWorkQueue.Dispatch())
+                {
+                }
+            }
+        }
+
+</code></pre>
+<ol start="3">
+<li>CreateWorkerThread</li>
+</ol>
+<p>这个方法是用来创建线程的主体逻辑，在线程池中由上层的 MaybeAddWorkingWorker 调用，参考如下：</p>
+<pre><code class="language-C#">
+        internal static void MaybeAddWorkingWorker(PortableThreadPool threadPoolInstance)
+        {
+            while (toCreate &gt; 0)
+            {
+                CreateWorkerThread();
+                toCreate--;
+            }
+        }
+
+        private static void CreateWorkerThread()
+        {
+            Thread workerThread = new Thread(s_workerThreadStart);
+            workerThread.IsThreadPoolThread = true;
+            workerThread.IsBackground = true;
+            workerThread.UnsafeStart();
+        }
+
+</code></pre>
+<p>这里有一个注意点：上面的 <code> while (toCreate &gt; 0)</code> 代码预示着一个周期内（500ms）可能会连续创建多个工作线程，但在饥饿的大多数情况下都是<code>toCreate=1</code>的情况。</p>
+<h3 id="3如何眼见为实">3.如何眼见为实</h3>
+<p>说了这么多，能不能用一些手段让我眼见为实呢？要想眼见为实也不难，可以用 dnspy 断点日志功能观察即可，分别在如下三个方法上下断点。</p>
+<ol>
+<li>delayHelper.GetNextDelay</li>
+</ol>
+<p>在此处下断点的目的用于观察 GateThread 的唤醒周期时间，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241223132927652-2072102697.png" alt="" loading="lazy"></p>
+<ol start="2">
+<li>SufficientDelaySinceLastDequeue</li>
+</ol>
+<p>这里下断点主要是观察当前的延迟如果超过 500ms 时是否真的会通过 CreateWorkerThread 创建线程。截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241223132927632-1005362261.png" alt="" loading="lazy"></p>
+<ol start="3">
+<li>WorkerThread.CreateWorkerThread</li>
+</ol>
+<p>最后我们在 MaybeAddWorkingWorker 方法的底层的线程创建方法 CreateWorkerThread 中下一个断点。</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241223132927628-696834274.png" alt="" loading="lazy"></p>
+<p>所有的埋点下好之后，我们让程序跑起来，观察 output 窗口的输出。</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241223132927643-1284478038.png" alt="" loading="lazy"></p>
+<p>从输出窗口中可以清晰的看到以500ms为界限判断啥时该创建，啥时不该创建。</p>
+<h2 id="三总结">三：总结</h2>
+<p>可能有些朋友很感慨，线程的动态注入咋怎么慢？1s才1-2个，难怪会出现线程饥饿。。。哈哈，下一篇我们聊一聊Task.Result下的注入优化。<br>
+<img src="https://images.cnblogs.com/cnblogs_com/huangxincheng/345039/o_210929020104最新消息优惠促销公众号关注二维码.jpg" width="700" height="300" alt="图片名称" align="center"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.061230122090277776" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2024-12-23 13:30">2024-12-23 13:30</span>&nbsp;
+<a href="https://www.cnblogs.com/huangxincheng">一线码农</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18623762" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18623762);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18623762', targetLink: 'https://www.cnblogs.com/huangxincheng/p/18623762', title: '聊一聊 C#线程池 的线程动态注入 (上)' })">举报</a>
+</div>
+        
