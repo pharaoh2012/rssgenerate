@@ -104,7 +104,7 @@ async function getPage(url) {
 }
 
 async function getDetail(item,i) {
-    let fn = `/tmp/${item.guid}.txt`;
+    let fn = tools.RSSOUT + `${item.guid}.txt`;
     if (fs.existsSync(fn)) {
         item.description = fs.readFileSync(fn, "utf8");
         item.cache = 1;
