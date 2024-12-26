@@ -1,0 +1,173 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huangxincheng/p/18622015" title="发布于 2024-12-22 13:08">
+    <span role="heading" aria-level="2">聊一聊 C#前台线程 如何阻塞程序退出</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一背景">一：背景</h2>
+<h3 id="1-讲故事">1. 讲故事</h3>
+<p>这篇文章起源于我的 <code>C#内功修炼训练营</code>里的一位朋友提的问题：<code>后台线程的内部是如何运转的 ?</code> ，犹记得<code>C# Via CLR</code>这本书中 Jeffery 就聊到了他曾经给别人解决一个程序无法退出的bug，最后发现是有一个 Backgrond=false 的线程导致的。恰巧在我分析的350+dump中，也还真遇到了。有了这些铺垫，我觉得有必要简单的聊一聊。</p>
+<h2 id="二后台线程的底层逻辑">二：后台线程的底层逻辑</h2>
+<h3 id="1-测试代码">1. 测试代码</h3>
+<p>为了方便讲解，先上一段代码，参考如下：</p>
+<pre><code class="language-C#">
+    static void Main(string[] args)
+    {
+        var thread = new Thread(() =&gt;
+        {
+            while (true)
+            {
+                Console.WriteLine(DateTime.Now);
+            }
+        });
+
+        thread.IsBackground = false;
+        thread.Start();
+    }
+
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241222130700601-228578574.png" alt="" loading="lazy"></p>
+<p>按照我们朴素的想法，主线程退出，程序自然就terminal，但这个程序并没有退出？原因就在于设置了 <code>thread.IsBackground = false;</code> 导致的，当然要想程序正常退出改为 ``thread.IsBackground = true;` 即可，接下来我们洞察下 IsBackground 有何魔力导致程序无法退出。</p>
+<h3 id="2-程序为什么无法退出">2. 程序为什么无法退出</h3>
+<p>要想知道这个答案，可以用 windbg 附加一下看看主线程此时正在做什么? 参考如下：</p>
+<pre><code class="language-C#">
+0:000&gt; k
+ # Child-SP          RetAddr               Call Site
+00 0000003f`7d59e498 00007ffd`cd8d0590     ntdll!NtWaitForMultipleObjects+0x14
+01 0000003f`7d59e4a0 00007ffd`8f842dd4     KERNELBASE!WaitForMultipleObjectsEx+0xf0
+02 (Inline Function) --------`--------     coreclr!Thread::DoAppropriateAptStateWait+0x4a [D:\a\_work\1\s\src\coreclr\vm\threads.cpp @ 3333] 
+03 0000003f`7d59e790 00007ffd`8f842c25     coreclr!Thread::DoAppropriateWaitWorker+0x170 [D:\a\_work\1\s\src\coreclr\vm\threads.cpp @ 3467] 
+04 0000003f`7d59e850 00007ffd`8f99498e     coreclr!Thread::DoAppropriateWait+0x85 [D:\a\_work\1\s\src\coreclr\vm\threads.cpp @ 3182] 
+05 (Inline Function) --------`--------     coreclr!CLREventBase::WaitEx+0x26 [D:\a\_work\1\s\src\coreclr\vm\synch.cpp @ 459] 
+06 (Inline Function) --------`--------     coreclr!CLREventBase::Wait+0x26 [D:\a\_work\1\s\src\coreclr\vm\synch.cpp @ 412] 
+07 0000003f`7d59e8d0 00007ffd`8f94c185     coreclr!CLREventWaitWithTry+0x9a [D:\a\_work\1\s\src\coreclr\vm\threads.cpp @ 5676] 
+08 0000003f`7d59e980 00007ffd`8f8a062b     coreclr!ThreadStore::WaitForOtherThreads+0xabafd [D:\a\_work\1\s\src\coreclr\vm\threads.cpp @ 5715] 
+09 0000003f`7d59e9b0 00007ffd`8f83eaad     coreclr!RunMainPost+0x5f [D:\a\_work\1\s\src\coreclr\vm\assembly.cpp @ 1407] 
+0a 0000003f`7d59e9f0 00007ffd`8f83e0e7     coreclr!Assembly::ExecuteMainMethod+0x1f5 [D:\a\_work\1\s\src\coreclr\vm\assembly.cpp @ 1524] 
+0b 0000003f`7d59ecc0 00007ffd`8f889778     coreclr!CorHost2::ExecuteAssembly+0x267 [D:\a\_work\1\s\src\coreclr\vm\corhost.cpp @ 349] 
+...
+
+</code></pre>
+<p>从卦中数据可以看到，主线程正在调用 <code>ThreadStore::WaitForOtherThreads</code> 方法，貌似是在等待其他线程完成，那具体做了什么呢？这个需要在 coreclr 上寻找答案，删减后的代码如下：</p>
+<pre><code class="language-C++">
+    void ThreadStore::WaitForOtherThreads()
+    {
+        if (!OtherThreadsComplete())
+        {
+            TSLockHolder.Release();
+
+            pCurThread-&gt;SetThreadState(Thread::TS_ReportDead);
+
+            DWORD ret = WAIT_OBJECT_0;
+            while (CLREventWaitWithTry(&amp;m_TerminationEvent, INFINITE, TRUE, &amp;ret))
+            {
+            }
+        }
+    }
+
+    BOOL OtherThreadsComplete()
+    {
+        return (m_ThreadCount - m_UnstartedThreadCount - m_DeadThreadCount
+                - Thread::m_ActiveDetachCount + m_PendingThreadCount
+                == m_BackgroundThreadCount);
+    }
+
+</code></pre>
+<p>从卦中看逻辑还是非常简单的，就是因为 <code>m_ThreadCount - m_UnstartedThreadCount - m_DeadThreadCount- Thread::m_ActiveDetachCount + m_PendingThreadCount</code> 减完之后和 <code>m_BackgroundThreadCount</code> 对不上，最后在 <code>m_TerminationEvent</code> 事件上等待唤醒。</p>
+<p>这里稍微提一下，这几个值可以通过 <code>!t</code> 显示出来，参考如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241222130700613-1932955601.png" alt="" loading="lazy"></p>
+<p>还有一个 <code>Thread::m_ActiveDetachCount</code> 计数值，这个值统计的是那种被coreclr从 ThreadStore 中移除尚未被 delete 的线程对象。结合 !t 的输出，很显然 <code>OtherThreadsComplete()</code> 为 <code>3=2</code> 显然返回 false。因为有 1 个 background 的存在。</p>
+<h3 id="3-isbackgroundtrue-能破局吗">3. IsBackground=true 能破局吗</h3>
+<p>症结我们也找到了，只要<code>m_TerminationEvent</code>事件能够被唤醒，链路就会被再次打通，让程序安全退出。接下来我们研究下 <code>IsBackground=true</code> 在底层会做什么？简化后的C++代码如下：</p>
+<pre><code class="language-C++">
+    void Thread::SetBackground(BOOL isBack)
+    {
+        if (isBack)
+        {
+            if (!IsBackground())
+            {
+                SetThreadState(TS_Background);
+
+                if (!IsUnstarted())
+                    ThreadStore::s_pThreadStore-&gt;m_BackgroundThreadCount++;
+
+                ThreadStore::CheckForEEShutdown();
+            }
+        }
+    }
+
+    void ThreadStore::CheckForEEShutdown()
+    {
+        if (g_fWeControlLifetime &amp;&amp;
+            s_pThreadStore-&gt;OtherThreadsComplete())
+        {
+            BOOL bRet;
+            bRet = s_pThreadStore-&gt;m_TerminationEvent.Set();
+            _ASSERTE(bRet);
+        }
+    }
+
+</code></pre>
+<p>哈哈，卦中的化煞方法真的妙不可言，做了如下两个步骤：</p>
+<ol>
+<li>做了 m_BackgroundThreadCount++，这样 OtherThreadsComplete() 的值就对上了。</li>
+<li>使用 m_TerminationEvent.Set 做了事件唤醒，这样主线程就可以从 WaitForOtherThreads() 方法中逃出生天。</li>
+</ol>
+<p>如果有些朋友没搞明白，我再画一张简图吧：<br>
+<img src="https://img2024.cnblogs.com/blog/214741/202412/214741-20241222130700615-777243573.png" alt="" loading="lazy"></p>
+<h3 id="4-判断线程的前后状态">4. 判断线程的前后状态</h3>
+<p>这是最后一个要聊的话题，要想知道线程的前后状态，这个需要在 coreclr 源码中寻找答案，参考代码如下：</p>
+<pre><code class="language-C++">
+    void SetThreadState(ThreadState ts)
+    {
+        InterlockedOr((LONG*)&amp;m_State, ts);
+    }
+
+    enum ThreadState
+    {
+        TS_Background = 0x00000200,    // Thread is a background thread
+    }
+
+</code></pre>
+<p>从代码中可以看到，只要判断 ThreadState 中有没有 0x200 的标记即可，接下来用 <code>!t</code> 观察线程状态。</p>
+<pre><code class="language-C#">
+0:000&gt; !t
+ThreadCount:      4
+UnstartedThread:  0
+BackgroundThread: 3
+PendingThread:    0
+DeadThread:       0
+Hosted Runtime:   no
+                                                                                                            Lock  
+ DBG   ID     OSID ThreadOBJ           State GC Mode     GC Alloc Context                  Domain           Count Apt Exception
+   0    1      918 000001FA530317B0  203a220 Preemptive  000001FA574096F8:000001FA5740A5C8 000001fa530273e0 -00001 MTA 
+   6    2     37c8 000001FA53009B70    21220 Preemptive  0000000000000000:0000000000000000 000001fa530273e0 -00001 Ukn (Finalizer) 
+   7    3     2c7c 000001FA5307F700    2b220 Preemptive  0000000000000000:0000000000000000 000001fa530273e0 -00001 MTA 
+   8    4     3bd4 0000023AE951DFD0    2b020 Preemptive  000001FA57563A08:000001FA57565010 000001fa530273e0 -00001 MTA 
+
+</code></pre>
+<p>从卦中可以轻松的看到 <code>DBG=8</code> 的线程状态是 <code>2b020</code>，自然就是前台线程咯。</p>
+<h2 id="三总结">三：总结</h2>
+<p>现在我们知道了前后台线程本质上是 coreclr 弄出来的概念，并非系统线程素有之物。还是那句话，知识不重要，重要的是会使用合适的工具和保有的探索心，这也是在训练营里重度强调的。<br>
+<img src="https://images.cnblogs.com/cnblogs_com/huangxincheng/345039/o_210929020104最新消息优惠促销公众号关注二维码.jpg" width="700" height="300" alt="图片名称" align="center"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="4.628532451567129" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2024-12-22 13:10">2024-12-22 13:08</span>&nbsp;
+<a href="https://www.cnblogs.com/huangxincheng">一线码农</a>&nbsp;
+阅读(<span id="post_view_count">1124</span>)&nbsp;
+评论(<span id="post_comment_count">7</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18622015" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18622015);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18622015', targetLink: 'https://www.cnblogs.com/huangxincheng/p/18622015', title: '聊一聊 C#前台线程 如何阻塞程序退出' })">举报</a>
+</div>
+        
