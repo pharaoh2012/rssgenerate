@@ -1,0 +1,487 @@
+
+	<div class="postTitle">
+		<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zyl910/p/18636962/VectorTraits_Sample_Complexes_ComplexMultiplySumBenchmark" title="发布于 2024-12-28 00:56">
+    <span role="heading" aria-level="2">[C#] 复数乘法的跨平台SIMD硬件加速向量算法（不仅支持X86的Sse、Avx、Avx512，还支持Arm的AdvSimd）</span>
+    
+
+</a>
+
+	</div>
+	
+	<div class="postText">
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>将复数乘法改造为SIMD向量算法，是稍微有一些的难度的。首个难点是需要重新调整元素的位置，才能满足复数乘法公式。而“调整元素的位置”与内存中数据布局有关，不同办法的性能不同。还需考虑优化内存访问等细节。</p>
+<p>最近知乎有个 <a href="https://www.zhihu.com/question/762906402/answer/63205597712" target="_blank" rel="noopener nofollow">帖子</a> 讨论了该话题，且 hez2010 给出了修正后的基于Avx指令集 HorizontalAdd（水平加法）的向量算法。</p>
+<p>于是我来说说基于 Shuffle（换位）的向量算法吧。且这些算法是跨平台的，同一份源代码，能在 X86（Sse、Avx等指令集）及Arm（AdvSimd指令集）等架构上运行，且均享有SIMD硬件加速。本文还介绍了512位向量算法，用于对比测试Avx512指令集的硬件加速。</p>
+<h1 id="一简单算法">一、简单算法</h1>
+<p>先回顾一下 .NET 里怎么做复数乘法。</p>
+<p>从 <code>.NET 4.0</code> 开始，提供了 Complex类型。于是不必手工地根据数学知识来编写复数乘法函数，而是可以使用Complex类型来做复数运算，简化了不少。</p>
+<p>为了便于进行基准测试，可以将一个数组作为输入参数，随后对各个元素自乘并进行累加。最后返回累加的结果。</p>
+<pre><code class="language-cs">public static Complex mul(Complex[] a) {
+    Complex c = 0;
+    for (int i = 0; i &lt; a.Length; i++) {
+        c += a[i] * a[i];
+    }
+
+    return c;
+}
+</code></pre>
+<h1 id="二向量算法">二、向量算法</h1>
+<h2 id="21-算法思路">2.1 算法思路</h2>
+<h3 id="211-复数乘法的数学定义">2.1.1 复数乘法的数学定义</h3>
+<p>向量类型并未提供复数乘法的方法，于是需要手工地根据数学知识来编写复数乘法函数了。</p>
+<p>先来回顾一下复数乘法的数学定义。</p>
+<pre><code>(a + bi)*(c + di) = (ac – bd) + (ad + bc)i
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/169212/202412/169212-20241228005637218-1865452110.png" alt="ComplexMultiply" loading="lazy"></p>
+<p><code>a + bi</code> 是乘法的左侧参数， <code>c + di</code> 是乘法的右侧参数。</p>
+<p>数学表达式一般喜欢省略“乘法运算符”。例如上式里，“ac”其实表示“a*c”。为了能使乘法运算更清晰，上式可以写成下面的形式。</p>
+<pre><code>(a + bi)*(c + di) = (a*c – b*d) + (a*d + b*c)i
+</code></pre>
+<p>可以看出，复数乘法是由4次实数乘法，以及若干个加减运算所组成。</p>
+<h3 id="212-复数的数据布局">2.1.2 复数的数据布局</h3>
+<p>Complex 是一个结构体，其中顺序存放了2个Double类型的成员，分别为“实部”与“虚部”。Double类型是64位的，2个Double就是128位，于是 Complex类型是128位的，即16字节。</p>
+<p>由于大多数架构都支持128位向量的SIMD硬件加速。所以 C# 程序在使用Complex类型时，其实已经享受到SIMD硬件加速了。这就是为什么手写的向量算法，有时还比不过 Complex的原因。于是需要更仔细的进行优化。</p>
+<p>对于 Complex数组，数据是连续存放的。于是使用向量类型从Complex数组加载数据时，能加载到整数个Complex。</p>
+<ul>
+<li>对于128位向量，能存放1个Complex。以Double元素的视角来看，向量中的元素依次是 <code>[a, b]</code>。注：“a”代表复数的“实部”，“b”代表复数的“虚部”。</li>
+<li>对于256位向量，能存放2个Complex。以Double元素的视角来看，向量中的元素依次是 <code>[a0, b0, a1, b1]</code>。</li>
+<li>对于512位向量，能存放4个Complex。以Double元素的视角来看，向量中的元素依次是 <code>[a0, b0, a1, b1, a2, b2, a3, b3]</code>。</li>
+</ul>
+<p>由于数据都是这样连续存放的，对于上面这种数据布局，本文将它简称为 <code>a + bi</code> 形式。后面将会经常使用这种简称。</p>
+<p>例如将实部与虚部交换，变为 <code>b + ai</code> 形式。那么代表的是下面这样的数据布局。</p>
+<ul>
+<li>128位向量：<code>[b, a]</code>。</li>
+<li>256位向量：<code>[b0, a0, b1, a1]</code>。</li>
+<li>512位向量：<code>[b0, a0, b1, a1, b2, a2, b3, a3]</code>。</li>
+</ul>
+<h3 id="213-第1步计算-ac---bdi">2.1.3 第1步：计算 <code>(a*c) + (-b*d)i</code></h3>
+<p>先来观察一下 向量乘法（<code>Vector.Multiply</code>）对复数数据的运算效果。</p>
+<p>假设已经将复数数据分别加载到向量a（<code>a + bi</code>）、向量c（<code>c + di</code>）之中，随后对这2个向量进行向量乘法运算。由于向量乘法依然是对逐个地对相同位置的元素做乘法处理，所以计算结果为 <code>(a*c) + (b*d)i</code>。可以观察到，它正好包含了“复数乘法内部的4个实数乘法”中的2项——<code>a*c</code>、<code>b*d</code>。</p>
+<p>表示这个思路是正确的。但是可以注意到，复数乘法需要使用 <code>-b*d</code>，而上面的 <code>b*d</code>是不带“负号”的。于是我们需要对数据进行进一步的处理，将奇数位置（虚部）的元素做一次“求负”处理。Vector类型里没有单独提供这种处理的方法，于是需要自行编写算法。</p>
+<p>对于“求负”处理，性能最高的办法是直接翻转浮点类型的符号位。在IEEE754浮点数标准里，规定了最高位是符号位，该位为0时表示正数，为1时表示负数。于是IEEE754浮点数标准里还能表达 <code>-0.0</code>（负零），它的最高位符号位为1，剩余数据位（阶码s、尾数m）均为0。</p>
+<p>二进制的Xor（异或运算）可以使相关二进制进行翻转。于是，将某个浮点数，与 <code>-0.0</code>（负零）执行Xor运算，就能将符号位翻转，这正好是“求负”运算。</p>
+<p>由于仅需对奇数位置求负，于是我们可以预先准备一个向量mask，它的偶数位置为 <code>0</code>（正零），奇数位置为 <code>-0.0</code>（负零）。向量c（<code>c + di</code>）与mask进行Xor运算后，结果是 <code>c + (-d)i</code>。随后再与向量a（<code>a + bi</code>）执行乘法，结果是 <code>(a*c) + (-b*d)i</code>。满足所需。</p>
+<pre><code class="language-cs">Vector&lt;double&gt; mask = Vectors.CreateRotate(0.0, -0.0);
+
+Vector&lt;double&gt; a = *p; // a + bi
+var c = a; // c + di
+var e = Vector.Multiply(a, Vector.Xor(c, mask)); // (a*c) + (-b*d)i
+</code></pre>
+<p>由于 Vector 的长度不是固定的，手工给mask赋值不太方便。于是这里使用 VectorTraits 库的 <code>Vectors.CreateRotate</code> 方法来简化赋值，它会循环将各个参数依次放置在向量的各个元素里。从而满足了“偶数为正零，奇数为负零”的要求。</p>
+<p><code>Vector&lt;double&gt; a = *p</code> 表示根据指针p，将数据加载到向量a。由于是复数数据，于是a的数学意义为 <code>a + bi</code>，即复数乘法的左侧参数。</p>
+<p>为了与前面的“简单算法”保持一致，于是将a复制给了c。此时c的数学意义为 <code>c + di</code>，即复数乘法的右侧参数。</p>
+<p>随后根据上面的经验，算出 <code>(a*c) + (-b*d)i</code>，赋值给向量e。</p>
+<h3 id="214-第2步计算-ad--bci">2.1.4 第2步：计算 <code>(a*d) + (b*c)i</code></h3>
+<p>根据上一节的经验，使用2个步骤就能计算出 <code>(a*d) + (b*c)i</code>——</p>
+<ol>
+<li>将c的实部与虚部交换，得到 <code>(d) + (c)i</code>，赋值给向量f。</li>
+<li>对 a、f 执行向量乘法（<code>Vector.Multiply</code>），便能得到  <code>(a*d) + (b*c)i</code>。</li>
+</ol>
+<p>第2步容易实现，但第1步遇到了困难——.NET 的向量方法里，没有合适的方法来做这一工作。</p>
+<p>从<code>.NET 7.0</code>开始，Vector128等向量类型增加了 Shuffle 方法。用该方法，可以给向量内的元素进行换位。但是直至 <code>.NET 8.0</code>，Shuffle都没有硬件加速，而是使用了标量回退代码。</p>
+<p>为了解决 Shuffle 方法没有硬件加速的问题，我开发了<a href="https://www.nuget.org/packages/VectorTraits" target="_blank" rel="noopener nofollow">VectorTraits</a> 库。它使用了各个架构的shuffle类别的指令，从而使 Shuffle 方法具有硬件加速。具体来说，它分别使用了以下指令。</p>
+<ul>
+<li>X86: 使用 <code>_mm_shuffle_epi8</code>  等指令.</li>
+<li>Arm: 使用 <code>vqvtbl1q_u8</code> 指令.</li>
+<li>Wasm: 使用 <code>i8x16.swizzle</code> 指令.</li>
+</ul>
+<p>VectorTraits 不仅为固定大小的向量类型（如 Vector128）提供了Shuffle方法，它还为自动大小的向量类型（Vector）也提供了Shuffle方法。</p>
+<p>虽然VectorTraits的Shuffle方法是有硬件加速的，但它不是最佳办法。VectorTraits还提供了YShuffleG2方法，专门用来处理2元素组的换位。它用起来更简单，且大多数时候的性能更高。</p>
+<p>YShuffleG2方法通过ShuffleControlG2参数来控制换位模式，例如 <code>ShuffleControlG2.YX</code> 表示将“XY”顺序给换成“YX”顺序，即我们所需的“实部与虚部交换”。</p>
+<p>根据这些信息，便能完成第2步的代码了。</p>
+<pre><code class="language-cs">var f = Vectors.YShuffleG2(c, ShuffleControlG2.YX); // (d) + (c)i
+f = Vector.Multiply(a, f); // (a*d) + (b*c)i
+</code></pre>
+<h3 id="215-第3步计算结果合并">2.1.5 第3步：计算结果合并</h3>
+<p>经过上面的步骤，已经算出了 <code>(a*c) + (-b*d)i</code>、<code>(a*d) + (b*c)i</code>。复数乘法规则是 <code>(a*c – b*d) + (a*d + b*c)i</code>，实数乘法的步骤均处理完了，还剩下加法与数据变换的处理。</p>
+<p>向量加法与向量乘法一样，是对逐个地对相同位置的元素做相加处理。于是我们需要将上面的那2组数据，变换为 <code>(a*c) + (a*d)i</code>、<code>(-b*d) + (b*c)i</code>，这样才好交给向量加法去处理。</p>
+<p>可以观察到，这种变换，就是 2x2矩阵的转置操作。将数据写成矩阵形式，便能清晰看出它是转置操作。</p>
+<pre><code>[(a*c) (-b*d)] --&gt; [(a*c) (a*d)]
+[(a*d) (b*c)] --&gt; [(-b*d) (b*c)]
+</code></pre>
+<p>VectorTraits库提供了YGroup2Transpose方法，用它便能实现2x2矩阵的转置操作。</p>
+<pre><code class="language-cs">var g = Vectors.YGroup2Transpose(e, f, out var h); // g is {(a*c) + (a*d)i}; h is {(-b*d) + (b*c)i}
+g += h; // (a*c - b*d) + (a*d + b*c)i
+</code></pre>
+<p>自此，完成了复数乘法的计算。</p>
+<h2 id="22-算法实现usevectors">2.2 算法实现（UseVectors）</h2>
+<p>有了上面的思路，便能编写出对数组计算向量乘法累加的算法了。源代码如下。</p>
+<pre><code class="language-cs">public static unsafe Complex UseVectorsDo(Complex[] numbers) {
+    int blockWidth = Vector&lt;double&gt;.Count / 2; // Complex is double*2
+    int cntBlock = numbers.Length / blockWidth;
+    int cntRem = numbers.Length - (cntBlock * blockWidth);
+    // -- Processs body.
+    Complex result;
+    Vector&lt;double&gt; acc = Vector&lt;double&gt;.Zero;
+    Vector&lt;double&gt; mask = Vectors.CreateRotate(0.0, -0.0);
+    fixed (Complex* pnumbers = numbers) {
+        Vector&lt;double&gt;* p = (Vector&lt;double&gt;*)pnumbers; // Set pointer to numbers[0].
+        Vector&lt;double&gt;* pEnd = p + cntBlock;
+        while (p &lt; pEnd) {
+            // -- Complex multiply: (a + bi)*(c + di) = (ac – bd) + (ad + bc)i
+            Vector&lt;double&gt; a = *p; // a + bi
+            var c = a; // c + di
+            var e = Vector.Multiply(a, Vector.Xor(c, mask)); // (a*c) + (-b*d)i
+            var f = Vectors.YShuffleG2(c, ShuffleControlG2.YX); // (d) + (c)i
+            f = Vector.Multiply(a, f); // (a*d) + (b*c)i
+            var g = Vectors.YGroup2Transpose(e, f, out var h); // g is {(a*c) + (a*d)i}; h is {(-b*d) + (b*c)i}
+            g += h; // (a*c - b*d) + (a*d + b*c)i
+            // Sum
+            acc += g;
+            // Next
+            ++p;
+        }
+        // Vector to a Complex.
+        double re = 0.0, im = 0.0;
+        for (int i = 0; i &lt; Vector&lt;double&gt;.Count; i += 2) {
+            re += acc[i];
+            im += acc[i + 1];
+        }
+        result = new Complex(re, im);
+        // -- Processs remainder.
+        Complex* q = (Complex*)pEnd;
+        for (int i = 0; i &lt; cntRem; i++) {
+            result += (*q) * (*q);
+            // Next
+            ++q;
+        }
+    }
+    return result;
+}
+</code></pre>
+<p>该方法是用指针来处理数据的。代码分为4个部分。</p>
+<ol>
+<li>最前面的部分，是变量初始化。例如计算 cntBlock（有多少个块）、cntRem（剩余部分有多少个复数）等。</li>
+<li>“Processs body”是向量处理的主体代码，它构造好mask，并计算好指针地址，随后循环处理主要数据（向量类型的整数倍的数据）。用的就是上面提到的算法。</li>
+<li>“Vector to a Complex”是将向量里存放的复数数据，转换为单个复数。</li>
+<li>“Processs remainder”是剩余部分的处理。</li>
+</ol>
+<h2 id="23-深入探讨">2.3 深入探讨</h2>
+<h3 id="231-ygroup2transpose的深入探讨">2.3.1 YGroup2Transpose的深入探讨</h3>
+<p>此时，有些读者可能会产生疑问——Vector类型有可能是256位（CPU支持Avx2指令集时），这时向量里不只是2个Double，而是4个Double，YGroup2Transpose还能正常工作吗？</p>
+<p>答案是——YGroup2Transpose当然能正常工作。</p>
+<p>当 Vector 为256位时，4个Double被分为了2组。既可以看作有2组2x2矩阵，随后分别进行了矩阵转置处理。正好Complex类型是128位的，由2个Double所组成，与2x2矩阵相匹配。</p>
+<p>从中可以看出规律——假设向量里可以存放 <code>N*2</code> 个元素（如Double元素），那么 YGroup2Transpose可以对 <code>N</code>组2x2矩阵进行转置。且“N个Complex”做复数乘法时，能使用YGroup2Transpose方法。</p>
+<p>对于X86架构，YGroup2Transpose是用Shuffle类别的指令来实现的。对于Arm架构，它是使用 AdvSimd中转置类指令 <code>TRN1</code>、<code>TRN2</code> 来实现的，效率很高。</p>
+<p>另注：为了使方法名的可读性更高，未来计划将 <code>YGroup2Transpose</code> 改名为 <code>YMatrix2Transpose</code>。初步计划将在VectorTraits库下一个大版本，做这个改名。</p>
+<h3 id="232-horizontaladd水平加法算法与本算法的区别">2.3.2 HorizontalAdd（水平加法）算法与本算法的区别</h3>
+<p>HorizontalAdd（水平加法）算法与本算法是非常相似的，仅“第3步：计算结果合并”不同。</p>
+<p>先来看看128位向量时的运算情况。HorizontalAdd 会将 相邻2个元素相加，并把结果放在1个元素里，于是2个向量在处理后被合并成了1个向量。</p>
+<p>经过前面2步，已经算出了 <code>(a*c) + (-b*d)i</code>、<code>(a*d) + (b*c)i</code>。此时进行 HorizontalAdd，便会算出 <code>(a*c – b*d) + (a*d + b*c)i</code>，正好是复数乘法的运算结果！</p>
+<p>随后改为用Avx指令集的256位向量来实现，虽然也能正确算出结果，但其实此时 HorizontalAdd 是Avx指令集的特殊版本——它不是对整个向量进行水平加法的，而是按每128位小道（lane）来做水平加法的。</p>
+<p>例如Double类型的源数据是 <code>[x0, x1, x2, x3]</code>、<code>[y0, y1, y2, y3]</code>，那么这2种水平加法的结果是不同的——</p>
+<ul>
+<li>整256位向量：<code>[x0+x1, x2+x3, y0+y1, y2+y3]</code></li>
+<li>每128位小道：<code>[x0+x1, y0+y1, x2+x3, y2+y3]</code></li>
+</ul>
+<p>第1种方式（整256位向量）比较符合常规思路，但第2种方式（ 每128位小道）在很多时候更有用。例如复数类型Complex是128位，要使Complex的运算结果正确，于是需要第2种方式（ 每128位小道）的水平加法。幸好Avx指令集，提供的就是第2种方式的水平加法，从而方便了计算。</p>
+<p>虽然仅需要1条水平加法指令就能实现“第3步：计算结果合并”，但由于该指令牵涉2个向量的水平操作，所以处理器会稍微多花一些时间。下面摘录了Intel手册对水平加法指令（vhaddpd）的说明，“Latency and Throughput”就是介绍延迟与吞吐率的，可以发现它的值比较高。</p>
+<pre><code>__m256d _mm256_hadd_pd (__m256d a, __m256d b)
+#include &lt;immintrin.h&gt;
+Instruction: vhaddpd ymm, ymm, ymm
+CPUID Flags: AVX
+Description
+Horizontally add adjacent pairs of double-precision (64-bit) floating-point elements in a and b, and pack the results in dst.
+Operation
+dst[63:0] := a[127:64] + a[63:0]
+dst[127:64] := b[127:64] + b[63:0]
+dst[191:128] := a[255:192] + a[191:128]
+dst[255:192] := b[255:192] + b[191:128]
+dst[MAX:256] := 0
+
+Latency and Throughput
+Architecture	Latency	Throughput (CPI)
+Alderlake	5	2
+Icelake Intel Core	6	2
+Icelake Xeon	6	2
+Sapphire Rapids	5	2
+Skylake	7	2
+</code></pre>
+<p>对于现代处理器，水平加法算法与本算法的性能，一般是是差不多的。详见“三、基准测试结果”。</p>
+<p>而且Avx512系列指令集里，尚未提供512位的水平加法指令，故更推荐使用本算法来处理复数加法。</p>
+<h2 id="24-用引用代替指针-摆脱unsafe关键字usevectorssafedo">2.4 用引用代替指针, 摆脱unsafe关键字（UseVectorsSafeDo）</h2>
+<p>从 C# 7.3开始，可以用引用代替指针, 摆脱unsafe关键字与fixed语句。其实编程思路与指针差不多的，只是一些地方需要换一种写法。具体办法可参考《<a href="https://www.cnblogs.com/zyl910/p/dotnet_simd_BenchmarkVector4.html" target="_blank">C# 使用SIMD向量类型加速浮点数组求和运算（4）：用引用代替指针, 摆脱unsafe关键字，兼谈Unsafe类的使用</a>》。</p>
+<p>改造后的代码如下。</p>
+<pre><code class="language-cs">public static Complex UseVectorsSafeDo(Complex[] numbers) {
+    int blockWidth = Vector&lt;double&gt;.Count / 2; // Complex is double*2
+    int cntBlock = numbers.Length / blockWidth;
+    int cntRem = numbers.Length - (cntBlock * blockWidth);
+    // -- Processs body.
+    Vector&lt;double&gt; acc = Vector&lt;double&gt;.Zero;
+    Vector&lt;double&gt; mask = Vectors.CreateRotate(0.0, -0.0);
+    ref Vector&lt;double&gt; p = ref Unsafe.As&lt;Complex, Vector&lt;double&gt;&gt;(ref numbers[0]); // Set pointer to numbers[0].
+    ref Vector&lt;double&gt; pEnd = ref Unsafe.Add(ref p, cntBlock);
+    while (Unsafe.IsAddressLessThan(ref p, ref pEnd)) {
+        // -- Complex multiply: (a + bi)*(c + di) = (ac – bd) + (ad + bc)i
+        Vector&lt;double&gt; a = p; // a + bi
+        var c = a; // c + di
+        var e = Vector.Multiply(a, Vector.Xor(c, mask)); // (a*c) + (-b*d)i
+        var f = Vectors.YShuffleG2(c, ShuffleControlG2.YX); // (d) + (c)i
+        f = Vector.Multiply(a, f); // (a*d) + (b*c)i
+        var g = Vectors.YGroup2Transpose(e, f, out var h); // g is {(a*c) + (a*d)i}; h is {(-b*d) + (b*c)i}
+        g += h; // (a*c - b*d) + (a*d + b*c)i
+        // Sum
+        acc += g;
+        // Next
+        p = ref Unsafe.Add(ref p, 1);
+    }
+    // Vector to a Complex.
+    double re = 0.0, im = 0.0;
+    for (int i = 0; i &lt; Vector&lt;double&gt;.Count; i += 2) {
+        re += acc[i];
+        im += acc[i + 1];
+    }
+    Complex result = new Complex(re, im);
+    // -- Processs remainder.
+    ref Complex q = ref Unsafe.As&lt;Vector&lt;double&gt;, Complex&gt;(ref pEnd);
+    for (int i = 0; i &lt; cntRem; i++) {
+        result += q * q;
+        // Next
+        q = ref Unsafe.Add(ref q, 1);
+    }
+    return result;
+}
+</code></pre>
+<p>上面的代码，与指针版代码（UseVectorsDo）是等价的。程序的性能，也是差不多的。</p>
+<h2 id="25-循环展开usevectorsx2do">2.5 循环展开（UseVectorsX2Do）</h2>
+<p>对于小循环，循环时的跳转处理也是一笔不小的开销。此时可以使用循环展开的办法，在循环内处理多条数据，从而使循环开销的占比减低。优化了性能。</p>
+<p>这里选用了2倍循环展开。它还能带来一个好处，就是能将2元素组换位（YShuffleG2），改为4元素组换位（YShuffleG4X2）。因为一些架构上有“4元素组换位”的专业指令（例如 <code>Avx2.Permute4x64</code>），性能很高。</p>
+<p>当初因为自动大小向量有时只有128位，只能存放2个Double，无法满足“4元素组换位”的要求，故谨慎的使用了YShuffleG2方法。而现在有了2倍数据，即使自动大小向量只有128位，也能保证至少共有4个元素，故可以使用 YShuffleG4X2方法。</p>
+<p>YShuffleG4X2方法通过ShuffleControlG4参数来控制换位模式，例如 <code>ShuffleControlG4.YXWZ</code> 表示将“XYZW”顺序给换成“YXWZ”顺序，即我们所需的“实部与虚部交换”。（其实， <code>ShuffleControlG4.YXWZ</code> 就是  <code>Avx2.Permute4x64</code> 指令的参数 <code>0b10110001</code>，现在用枚举来描述，代码的可读性更好）</p>
+<p>由于现在所用的ShuffleControlG4参数是固定的常数，于是还可以使用 <code>YShuffleG4X2_Const</code>，它的性能一般更好。</p>
+<p>根据上面的经验，便能编写出2倍循环展开时的算法了。源代码如下。</p>
+<pre><code class="language-cs">public static Complex UseVectorsX2Do(Complex[] numbers) {
+    const int batchWidth = 2; // X2
+    int blockWidth = Vector&lt;double&gt;.Count * batchWidth / 2; // Complex is double*2
+    int cntBlock = numbers.Length / blockWidth;
+    int cntRem = numbers.Length - (cntBlock * blockWidth);
+    // -- Processs body.
+    Vector&lt;double&gt; acc = Vector&lt;double&gt;.Zero;
+    Vector&lt;double&gt; acc1 = Vector&lt;double&gt;.Zero;
+    Vector&lt;double&gt; mask = Vectors.CreateRotate(0.0, -0.0);
+    ref Vector&lt;double&gt; p = ref Unsafe.As&lt;Complex, Vector&lt;double&gt;&gt;(ref numbers[0]); // Set pointer to numbers[0].
+    ref Vector&lt;double&gt; pEnd = ref Unsafe.Add(ref p, cntBlock * batchWidth);
+    while (Unsafe.IsAddressLessThan(ref p, ref pEnd)) {
+        // -- Complex multiply: (a + bi)*(c + di) = (ac – bd) + (ad + bc)i
+        Vector&lt;double&gt; a0 = p; // a + bi
+        var a1 = Unsafe.Add(ref p, 1);
+        var c0 = a0; // c + di
+        var c1 = a1;
+        var e0 = Vector.Multiply(a0, Vector.Xor(c0, mask)); // (a*c) + (-b*d)i
+        var e1 = Vector.Multiply(a1, Vector.Xor(c1, mask));
+        var f0 = Vectors.YShuffleG4X2_Const(c0, c1, ShuffleControlG4.YXWZ, out var f1); // (d) + (c)i
+        f0 = Vector.Multiply(a0, f0); // (a*d) + (b*c)i
+        f1 = Vector.Multiply(a1, f1);
+        var g0 = Vectors.YGroup2Transpose(e0, f0, out var h0); // g is {(a*c) + (a*d)i}; h is {(-b*d) + (b*c)i}
+        var g1 = Vectors.YGroup2Transpose(e1, f1, out var h1);
+        g0 += h0; // (a*c - b*d) + (a*d + b*c)i
+        g1 += h1;
+        // Sum
+        acc += g0;
+        acc1 += g1;
+        // Next
+        p = ref Unsafe.Add(ref p, batchWidth);
+    }
+    acc += acc1;
+    // Vector to a Complex.
+    double re = 0.0, im = 0.0;
+    for (int i = 0; i &lt; Vector&lt;double&gt;.Count; i += 2) {
+        re += acc[i];
+        im += acc[i + 1];
+    }
+    Complex result = new Complex(re, im);
+    // -- Processs remainder.
+    ref Complex q = ref Unsafe.As&lt;Vector&lt;double&gt;, Complex&gt;(ref pEnd);
+    for (int i = 0; i &lt; cntRem; i++) {
+        result += q * q;
+        // Next
+        q = ref Unsafe.Add(ref q, 1);
+    }
+    return result;
+}
+</code></pre>
+<h2 id="26-512位算法usevector512sx2do">2.6 512位算法（UseVector512sX2Do）</h2>
+<p><code>.NET 8.0</code> 新增了对 X86架构的Avx512系列指令集的支持，且新增了 Vector512类型。</p>
+<p>VectorTraits 3.0版已经支持了Avx512系列指令集，于是能够很容易将自动大小向量的算法，改造为512位向量的算法。只需要做文本替换，将“Vector”替换为“Vector512”，便基本完成了改造，顶多有少量报错需修正。而不用学习复杂的Avx512指令集，大大降低了门槛。源代码如下。</p>
+<pre><code class="language-cs">#if NET8_0_OR_GREATER
+
+[Benchmark]
+public void UseVector512sX2() {
+    if (!Vector512s.IsHardwareAccelerated) throw new NotSupportedException("Vector512 does not have hardware acceleration!");
+    _destination = UseVector512sX2Do(_array);
+}
+
+public static Complex UseVector512sX2Do(Complex[] numbers) {
+    const int batchWidth = 2; // X2
+    int blockWidth = Vector512&lt;double&gt;.Count * batchWidth / 2; // Complex is double*2
+    int cntBlock = numbers.Length / blockWidth;
+    int cntRem = numbers.Length - (cntBlock * blockWidth);
+    // -- Processs body.
+    Vector512&lt;double&gt; acc = Vector512&lt;double&gt;.Zero;
+    Vector512&lt;double&gt; acc1 = Vector512&lt;double&gt;.Zero;
+    Vector512&lt;double&gt; mask = Vector512s.CreateRotate(0.0, -0.0);
+    ref Vector512&lt;double&gt; p = ref Unsafe.As&lt;Complex, Vector512&lt;double&gt;&gt;(ref numbers[0]); // Set pointer to numbers[0].
+    ref Vector512&lt;double&gt; pEnd = ref Unsafe.Add(ref p, cntBlock * batchWidth);
+    while (Unsafe.IsAddressLessThan(ref p, ref pEnd)) {
+        // -- Complex multiply: (a + bi)*(c + di) = (ac – bd) + (ad + bc)i
+        Vector512&lt;double&gt; a0 = p; // a + bi
+        var a1 = Unsafe.Add(ref p, 1);
+        var c0 = a0; // c + di
+        var c1 = a1;
+        var e0 = Vector512s.Multiply(a0, Vector512s.Xor(c0, mask)); // (a*c) + (-b*d)i
+        var e1 = Vector512s.Multiply(a1, Vector512s.Xor(c1, mask));
+        var f0 = Vector512s.YShuffleG4X2_Const(c0, c1, ShuffleControlG4.YXWZ, out var f1); // (d) + (c)i
+        f0 = Vector512s.Multiply(a0, f0); // (a*d) + (b*c)i
+        f1 = Vector512s.Multiply(a1, f1);
+        var g0 = Vector512s.YGroup2Transpose(e0, f0, out var h0); // g is {(a*c) + (a*d)i}; h is {(-b*d) + (b*c)i}
+        var g1 = Vector512s.YGroup2Transpose(e1, f1, out var h1);
+        g0 += h0; // (a*c - b*d) + (a*d + b*c)i
+        g1 += h1;
+        // Sum
+        acc += g0;
+        acc1 += g1;
+        // Next
+        p = ref Unsafe.Add(ref p, batchWidth);
+    }
+    acc += acc1;
+    // Vector to a Complex.
+    double re = 0.0, im = 0.0;
+    for (int i = 0; i &lt; Vector512&lt;double&gt;.Count; i += 2) {
+        re += acc[i];
+        im += acc[i + 1];
+    }
+    Complex result = new Complex(re, im);
+    // -- Processs remainder.
+    ref Complex q = ref Unsafe.As&lt;Vector512&lt;double&gt;, Complex&gt;(ref pEnd);
+    for (int i = 0; i &lt; cntRem; i++) {
+        result += q * q;
+        // Next
+        q = ref Unsafe.Add(ref q, 1);
+    }
+    return result;
+}
+
+#endif // NET8_0_OR_GREATER
+</code></pre>
+<p>注意，从<code>.NET 8.0</code>才开始支持 Vector512，故需要使用条件编译符号<code>NET8_0_OR_GREATER</code>进行判断。</p>
+<p>由于现在有不少处理器尚未支持 Avx512系列指令集，于是需要用if语句判断一下“Vector512s.IsHardwareAccelerated”是否为真。否则就不要执行了。</p>
+<h1 id="三基准测试结果">三、基准测试结果</h1>
+<h2 id="31-x86-架构">3.1 X86 架构</h2>
+<p>X86架构下的基准测试结果如下。</p>
+<pre><code>BenchmarkDotNet v0.14.0, Windows 11 (10.0.26100.2605)
+AMD Ryzen 7 7840H w/ Radeon 780M Graphics, 1 CPU, 16 logical and 8 physical cores
+.NET SDK 9.0.101
+  [Host]     : .NET 8.0.11 (8.0.1124.51707), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
+  DefaultJob : .NET 8.0.11 (8.0.1124.51707), X64 RyuJIT AVX-512F+CD+BW+DQ+VL+VBMI
+
+
+| Method           | Count | Mean     | Error    | StdDev   | Ratio | Code Size |
+|----------------- |------ |---------:|---------:|---------:|------:|----------:|
+| CallMul          | 65536 | 44.45 us | 0.329 us | 0.308 us |  1.00 |     128 B |
+| CallMul2         | 65536 | 92.50 us | 0.104 us | 0.087 us |  2.08 |        NA |
+| UseVectors       | 65536 | 22.48 us | 0.068 us | 0.061 us |  0.51 |        NA |
+| UseVectorsSafe   | 65536 | 22.47 us | 0.084 us | 0.070 us |  0.51 |        NA |
+| UseVectorsX2     | 65536 | 17.95 us | 0.080 us | 0.075 us |  0.40 |        NA |
+| UseVector512sX2  | 65536 | 17.26 us | 0.179 us | 0.167 us |  0.39 |        NA |
+| Hez2010Simd_Mul2 | 65536 | 23.69 us | 0.206 us | 0.193 us |  0.53 |        NA |
+| Hez2010Simd      | 65536 | 23.01 us | 0.151 us | 0.134 us |  0.52 |     298 B |
+</code></pre>
+<p>方法说明——</p>
+<ul>
+<li>CallMul: 简单算法。</li>
+<li>CallMul2: 知乎帖子提出给出的有问题的Avx向量算法。</li>
+<li>UseVectors: 指针写法的向量算法（2.2 算法实现）。</li>
+<li>UseVectorsSafe: 引用写法的安全向量算法（2.4 用引用代替指针, 摆脱unsafe关键字）。</li>
+<li>UseVectorsX2: 2倍循环展开的向量算法（2.5 循环展开）。</li>
+<li>UseVector512sX2: 2倍循环展开的512位向量算法（2.6 512位算法）。</li>
+<li>Hez2010Simd_Mul2: hez2010将CallMul2修正后的向量算法。</li>
+<li>Hez2010Simd: hez2010的安全向量算法。</li>
+</ul>
+<p>现在来对比一下各个方法的性能。</p>
+<ul>
+<li>CallMul2: 44.45/92.50 ≈ 0.4805（倍）。</li>
+<li>UseVectors: 44.45/22.48 ≈ 1.9773（倍）。</li>
+<li>UseVectorsSafe: 44.45/22.47 ≈ 1.9782（倍）。</li>
+<li>UseVectorsX2: 44.45/17.95 ≈ 2.4763（倍）。性能是UseVectorsSafe的 22.47/17.95 ≈ 1.2518（倍）</li>
+<li>UseVector512sX2: 44.45/17.26 ≈ 2.5753（倍）。性能是UseVectorsSafe的 22.47/17.26 ≈ 1.3019（倍）</li>
+<li>Hez2010Simd_Mul2: 44.45/23.69 ≈ 1.8763（倍）。</li>
+<li>Hez2010Simd: 44.45/23.01 ≈ 1.9318（倍）。</li>
+</ul>
+<p>首先可以注意到，UseVectors、UseVectorsSafe的性能几乎是一样的。这是因为不论是指针写法，还是引用写法，它们的算法是相同的，所以性能是一样的。而且若观察JIT生成汇编代码，你会发现它们基本是一样的。</p>
+<p>其次，可以发现 Hez2010Simd_Mul2、Hez2010Simd、UseVectors、UseVectorsSafe 这4种方法的耗时很接近，都是23us左右。差距很小，可看作测试误差范围内。故可以得出结论，水平加法算法与本算法的性能是几乎是一样的。Avx是256位向量宽度，比Sse的128位向量宽度翻了一倍，理论性能是2倍。现在的测试结果，很接近这个理论值。</p>
+<p>再来看 UseVectorsX2，会发现它的性能又有提升，比起普通向量算法（UseVectorsSafe）快了20%左右。看来此时做循环展开，确实有效。</p>
+<p>最后来看 UseVector512sX2。Avx512是512位向量宽度，是Sse的128位向量宽度的4倍，理论性能应该是4倍。但是实际测试时，它仅比 UseVectorsX2 稍微快了一点点。</p>
+<p>这是因为当前处理器是 <code>Zen4</code>微架构的，它并没有专门的512位运算单元，而是通过2个256位运算单元组合而成的，还不能完全发挥Avx512指令集的潜力。若换成 <code>Zen5</code>、<code>Sapphire Rapids</code>等具有专门512位运算单元的微架构的处理器，能获得进一步性能提升。</p>
+<h3 id="311-更深入的说明">3.1.1 更深入的说明</h3>
+<p>仔细观察一下上面的测试结果，会发现本算法（UseVectorsSafe）比起水平加法算法（Hez2010Simd），稍微快一点点。</p>
+<p>其实这跟CPU微架构有关。在AMD的处理器上，很多时候是本算法稍微快一点；而在Intel的处理器上，很多时候是水平加法算法稍微快一点。</p>
+<p>而且在 Intel 处理器上测试 UseVectorsX2 算法时，有时它的性能与 UseVectorsSafe 相差不大。这也是CPU微架构的差别。</p>
+<h2 id="32-arm-架构">3.2 Arm 架构</h2>
+<p>同样的源代码可以在 Arm 架构上运行。基准测试结果如下。</p>
+<pre><code>BenchmarkDotNet v0.14.0, macOS Sequoia 15.1.1 (24B91) [Darwin 24.1.0]
+Apple M2, 1 CPU, 8 logical and 8 physical cores
+.NET SDK 8.0.204
+  [Host]     : .NET 8.0.4 (8.0.424.16909), Arm64 RyuJIT AdvSIMD
+  DefaultJob : .NET 8.0.4 (8.0.424.16909), Arm64 RyuJIT AdvSIMD
+
+
+| Method           | Count | Mean     | Error    | StdDev   | Ratio | RatioSD |
+|----------------- |------ |---------:|---------:|---------:|------:|--------:|
+| CallMul          | 65536 | 56.30 us | 0.051 us | 0.045 us |  1.00 |    0.00 |
+| CallMul2         | 65536 |       NA |       NA |       NA |     ? |       ? |
+| UseVectors       | 65536 | 56.90 us | 0.468 us | 0.415 us |  1.01 |    0.01 |
+| UseVectorsSafe   | 65536 | 56.32 us | 0.019 us | 0.017 us |  1.00 |    0.00 |
+| UseVectorsX2     | 65536 | 47.18 us | 0.025 us | 0.024 us |  0.84 |    0.00 |
+| UseVector512sX2  | 65536 |       NA |       NA |       NA |     ? |       ? |
+| Hez2010Simd_Mul2 | 65536 |       NA |       NA |       NA |     ? |       ? |
+| Hez2010Simd      | 65536 |       NA |       NA |       NA |     ? |       ? |
+</code></pre>
+<p>首先可以注意到，CallMul2、Hez2010Simd_Mul2、Hez2010Simd 都无法执行基准测试。这是因为它们都依赖Avx指令集，但现在是Arm架构的处理器，没有Avx指令集，于是报错了。</p>
+<p>此时便能体现出本文介绍的算法的优势了——支持跨平台。同一份源代码，能在 X86（Sse、Avx等指令集）及Arm（AdvSimd指令集）等架构上运行，且均享有SIMD硬件加速。</p>
+<p>UseVector512sX2是我们主动抛出了异常。虽然同一份源代码可以运行，但由于此时没有硬件加速，测试起来没有意义。故不必测试。</p>
+<p>随后来对比一下各个方法的性能。</p>
+<ul>
+<li>UseVectors: 56.30/56.90 ≈ 0.9895（倍）。</li>
+<li>UseVectorsSafe: 56.30/56.32 ≈ 0.9996（倍）。</li>
+<li>UseVectorsX2: 56.30/47.18 ≈ 1.1933（倍）。</li>
+</ul>
+<p>UseVectors、UseVectorsSafe的耗时，与CallMul的结果几乎相同。前面提到过，Complex类型内部是已经使用了128位向量加速的。由于Arm架构的AdvSimd指令集是 128位的，于是此时 Vector类型的宽度也是128位的。所以此时用Vector类型实现的算法，理论上跟Complex类型的性能是一样的。</p>
+<p>而UseVectorsX2比CallMul快20%左右。这表示此时做循环展开，确实有效。</p>
+<h1 id="附录">附录</h1>
+<ul>
+<li>完整源代码: <a href="https://github.com/zyl910/VectorTraits.Sample.Benchmarks/blob/main/VectorTraits.Sample.Benchmarks.Inc/Complexes/ComplexMultiplySumBenchmark.cs" target="_blank" rel="noopener nofollow">https://github.com/zyl910/VectorTraits.Sample.Benchmarks/blob/main/VectorTraits.Sample.Benchmarks.Inc/Complexes/ComplexMultiplySumBenchmark.cs</a></li>
+<li>YGroup2Transpose 的文档: <a href="https://zyl910.github.io/VectorTraits_doc/api/Zyl.VectorTraits.Vectors.YGroup2Transpose.html" target="_blank" rel="noopener nofollow">https://zyl910.github.io/VectorTraits_doc/api/Zyl.VectorTraits.Vectors.YGroup2Transpose.html</a></li>
+<li>YShuffleG2 的文档: <a href="https://zyl910.github.io/VectorTraits_doc/api/Zyl.VectorTraits.Vectors.YShuffleG2.html" target="_blank" rel="noopener nofollow">https://zyl910.github.io/VectorTraits_doc/api/Zyl.VectorTraits.Vectors.YShuffleG2.html</a></li>
+<li><code>YShuffleG4X2_Const</code> 的文档: <a href="https://zyl910.github.io/VectorTraits_doc/api/Zyl.VectorTraits.Vectors.YShuffleG4X2_Const.html" target="_blank" rel="noopener nofollow">https://zyl910.github.io/VectorTraits_doc/api/Zyl.VectorTraits.Vectors.YShuffleG4X2_Const.html</a></li>
+<li>VectorTraits 的NuGet包: <a href="https://www.nuget.org/packages/VectorTraits" target="_blank" rel="noopener nofollow">https://www.nuget.org/packages/VectorTraits</a></li>
+<li>VectorTraits 的在线文档: <a href="https://zyl910.github.io/VectorTraits_doc/" target="_blank" rel="noopener nofollow">https://zyl910.github.io/VectorTraits_doc/</a></li>
+<li>VectorTraits 源代码: <a href="https://github.com/zyl910/VectorTraits" target="_blank" rel="noopener nofollow">https://github.com/zyl910/VectorTraits</a></li>
+<li><a href="https://www.zhihu.com/question/762906402/answer/63205597712" target="_blank" rel="noopener nofollow">C#simd使用Avx类的代码比普通的for循环代码慢，什么原因呢？ - hez2010的回答 - 知乎</a></li>
+<li><a href="https://www.cnblogs.com/zyl910/p/dotnet_simd_BenchmarkVector4.html" target="_blank">C# 使用SIMD向量类型加速浮点数组求和运算（4）：用引用代替指针, 摆脱unsafe关键字，兼谈Unsafe类的使用</a></li>
+<li>《<a href="https://zhuanlan.zhihu.com/p/12124516287" target="_blank" rel="noopener nofollow">[C#] 24位图像水平翻转的跨平台SIMD硬件加速向量算法的关键——YShuffleX3Kernel源码解读（如Avx2解决shuffle的跨lane问题、Avx512优化等）</a>》</li>
+</ul>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div id="MySignature"><div>作者：<a href="http://www.cnblogs.com/zyl910/" target="_blank">zyl910</a></div>
+    <div>出处：<a href="http://www.cnblogs.com/zyl910/" target="_blank">http://www.cnblogs.com/zyl910/</a></div>
+    <div>版权声明：自由转载-非商用-非衍生-保持署名 | <a href="http://creativecommons.org/licenses/by-nc-nd/3.0/deed.zh">Creative Commons BY-NC-ND 3.0</a>.</div>  
+</div>
+
+</div>
+<div class="clear"></div>
+
+	</div>
+	
+	<div class="postfoot">
+		posted on 
+<span id="post-date" data-last-update-days="2.7555343677199073" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2024-12-28 10:07">2024-12-28 00:56</span>&nbsp;
+<a href="https://www.cnblogs.com/zyl910">zyl910</a>&nbsp;
+阅读(<span id="post_view_count">28</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18636962" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18636962);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18636962', targetLink: 'https://www.cnblogs.com/zyl910/p/18636962/VectorTraits_Sample_Complexes_ComplexMultiplySumBenchmark', title: '[C#] 复数乘法的跨平台SIMD硬件加速向量算法（不仅支持X86的Sse、Avx、Avx512，还支持Arm的AdvSimd）' })">举报</a>
+
+	</div>
