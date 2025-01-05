@@ -1,0 +1,175 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xy1997/p/18654151" title="发布于 2025-01-05 23:42">
+    <span role="heading" aria-level="2">SQL优化——深分页&amp;排序</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="问题背景">问题背景</h2>
+<p>在开发 Web 应用或处理数据库查询时，分页是一项常见需求。然而，当面对深度分页（即页码较大，偏移量较高的分页情况）时，性能问题往往接踵而至。比如对一些需要拉特定的页面查询、范围导出、范围计算等业务需求，都会涉及大量的深分页查询的SQL，不当的SQL会导致执行超时，页面响应显著上升等问题。本文重点讨论Mysql下以Innodb为存储引擎时，深分页造成性能恶化的根因以及一般解决方案。</p>
+<h2 id="为什么limit在offset很大时性能会变差">为什么Limit在offset很大时性能会变差？</h2>
+<blockquote>
+<p>假设当前存在一张item表，单表有千万级数据，其核心字段有id, item_code, item_name, type, sub_type, biz_type, status等，并且在<code>type, sub_type, biz_type</code>三个字段上存在索引, id上存在默认的主键索引</p>
+<p>当执行SQL</p>
+</blockquote>
+<pre><code class="language-SQL">-- SQL1  -&gt; 3ms; 如果把候选列设置为* -&gt; 4ms
+Select id, item_code, type, sub_type 
+From item
+where type = 'normal'
+order by id ASC
+limit 0, 20;
+
+-- SQL2 2300ms； 如果把候选列设置为* -&gt; 3700ms
+Select id, item_code, type, sub_type 
+From item
+where type = 'normal'
+order by id ASC
+limit 1000000, 20;
+
+-- SQL3 500ms； 只查找主键和覆盖索引上的东西
+Select id, type 
+From item
+where type = 'normal'
+order by id ASC
+limit 1000000, 20;
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/2913076/202501/2913076-20250105234218650-211842291.png" alt="" loading="lazy"></p>
+<hr>
+<h3 id="不必要的回表">不必要的回表</h3>
+<p>我们都知道innodb采用B+树作为索引（如上图），在普通索引的条件下，非叶子阶段上存储了索引列值的比较锚点，叶子节点上存储索引列值到主键id的pair。在普通索引上查询到叶子节点并获取对应的主键后，若SQL中需要获取索引列以外的值，则需要到主键索引上，利用先前定位到的主键进行回表操作，获取完整的数据。</p>
+<p>SQL2和SQL3的对比正好是是否需要触发回表的对比，可以发现执行时间差了4倍以上。通过执行两者的执行计划，也可以发现，在SQL3的extra信息中，会有<code>Using Index</code>的信息，这代表命中了覆盖索引，不需要额外进行回表。</p>
+<p>同时对比SQL1和SQL2，两者只有在offset的部分存在区别，所以当offset变大时，会导致回表后需要扫描记录数显著增加（这也说明<code>limit</code>的执行逻辑是在回表之后，但是where条件执行是会在索引或者回表时就应用的，那么有办法把limit的操作前置到where中呢？）</p>
+<h4 id="延迟关联">延迟关联</h4>
+<pre><code class="language-SQL">-- 500ms
+Select id, item_code, type, sub_type 
+From item
+INNER JOIN (
+    Select id 
+    From item
+    where type = 'normal'
+    order by id ASC
+    limit 1000000, 20
+) t1 using (id);
+</code></pre>
+<h4 id="子查询">子查询</h4>
+<pre><code class="language-SQL">-- 500ms 
+Select id, item_code, type, sub_type 
+From item
+where id &gt;= (
+    Select id 
+    From item
+    where type = 'normal'
+    order by id ASC
+    limit 1000000, 1
+) limit 20;
+</code></pre>
+<p>两种方式都非常类似，都是通过避免回表，拿到数据的主键id，再通过join 或者id直接比较的方式，跳过了无意义的回表扫描。（相当于通过人为的方式将<code>limit</code>操作前置到回表之前了）</p>
+<h4 id="禁止跳页">禁止跳页</h4>
+<p>还有一种简单的方式就是，需要客户端传入上一次调用的last_id，然后在where条件里加上last_id的条件即可。但是这种做法使得客户端无法进行跳页访问了，只能连续的进行上一页或者下一页操作。（批处理或者导出的场景还是非常适用的）</p>
+<h2 id="关于orderby的影响">关于OrderBy的影响</h2>
+<p>上述的SQL当order by 条件发生变化时，SQL的执行效率也会发生巨大的变化，甚至比limit本身影响更大。因为order By会决定mysql优化器的索引选择，以及会触发FileSort（即在内存中开辟专属空间进行排序）。</p>
+<pre><code class="language-SQL">-- SQL5 9000 ms
+Select id, item_code, type, sub_type 
+From item
+where type = 'normal'
+order by item_code ASC 
+-- 此处基于item_code排序
+limit 0, 20;
+</code></pre>
+<h4 id="全字段排序">全字段排序</h4>
+<p>可以看到SQL5仅仅是换了一个排序条件，并且查询计划显示命中的索引仍与先前一致，但是执行时间却来到了夸张的9000ms，相比SQL1，多了近20倍，为什么会产生这样的结果呢？可以先了解一下OrderBy的基本执行逻辑：</p>
+<ol>
+<li>
+<p>初始化sort_buffer, 放入字段id, item_code, type, sub_type</p>
+</li>
+<li>
+<p>从type索引中找到符合type = 'normal'的记录，获取id</p>
+</li>
+<li>
+<p>根据id，从主键索引中获取id, item_code, type, sub_type，放入sort_buffer</p>
+</li>
+<li>
+<p>重复2~3，直到没有符合type = 'normal'的记录</p>
+</li>
+<li>
+<p>sort_buffer根据item_code进行排序</p>
+</li>
+<li>
+<p>排序结果取前20行返回</p>
+</li>
+</ol>
+<blockquote>
+<p>当排序的数据过大时，会启用外部排序（临时文件归并排序）</p>
+</blockquote>
+<ul>
+<li>这里可能会有些疑问，为什么要把不排序的字段也放到sort_buffer中？是因为排完序后，可以直接从排序的结果集中取出完整的Select所需要的字段。</li>
+</ul>
+<h4 id="部分字段排序">部分字段排序</h4>
+<ul>
+<li>那如果是Select *呢？并且表的字段非常多，是否会过度浪费sort_buffer的资源，导致触发外部排序呢？是的，但是Mysql中存在一个配置，max_length_for_sort_data，当所放字段大于这个值时，就不会把所有select的字段放入sort_buffer，而是选择排完序之后，再次进行回表，得到完整的数据：</li>
+</ul>
+<ol>
+<li>
+<p>初始化sort_buffer, 放入字段id, item_code</p>
+</li>
+<li>
+<p>从type索引中找到符合type = 'normal'的记录，获取id</p>
+</li>
+<li>
+<p>根据id，从主键索引中获取id, item_code，放入sort_buffer</p>
+</li>
+<li>
+<p>重复2~3，直到没有符合type = 'normal'的记录</p>
+</li>
+<li>
+<p>sort_buffer根据item_code进行排序</p>
+</li>
+<li>
+<p>排序结果取前20行, 得到对应的id，从聚簇索引中回表，得到完整的数据</p>
+</li>
+</ol>
+<p>通常来说，Mysql规格够大时，不建议使用这种排序方式，因为会额外回表。</p>
+<h4 id="覆盖索引跳过排序">覆盖索引跳过排序</h4>
+<p>如果此时存在<code>type, item_code</code>的覆盖索引，则无需额外排序，即可返回结果集，执行效率是最高的。</p>
+<p>但是如果type的条件变为<code>in</code>呢？</p>
+<pre><code class="language-SQL">-- SQL5 9000 ms
+Select id, item_code, type, sub_type 
+From item
+where type in ('normal', 'abnormal')
+order by item_code ASC 
+-- 此处基于item_code排序
+limit 0, 20;
+</code></pre>
+<p>答案是，需要排序。因此这种情况下推荐在业务代码中，将其拆为两句 type = 'normal' 和 type = 'abnormal'的SQL，然后业务代码中自行实现归并排序即可。</p>
+<h2 id="参考文献">参考文献</h2>
+<ol>
+<li>
+<p>MySQL实战45讲</p>
+</li>
+<li>
+<p>从根儿上理解Mysql</p>
+</li>
+<li>
+<p><a href="https://dev.mysql.com/doc/refman/8.0/en/order-by-optimization.html" target="_blank" rel="noopener nofollow">Mysql官方文档/排序优化</a></p>
+</li>
+</ol>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.18800592715625" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-01-05 23:43">2025-01-05 23:42</span>&nbsp;
+<a href="https://www.cnblogs.com/xy1997">XinStar</a>&nbsp;
+阅读(<span id="post_view_count">4</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18654151" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18654151);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18654151', targetLink: 'https://www.cnblogs.com/xy1997/p/18654151', title: 'SQL优化——深分页&amp;amp;排序' })">举报</a>
+</div>
+        
