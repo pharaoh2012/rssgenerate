@@ -1,0 +1,367 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/JulianHuang/p/18655087" title="发布于 2025-01-06 12:56">
+    <span role="heading" aria-level="2">字节二面：你怎么理解信道是golang中的顶级公民</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="1-信道是golang中的顶级公民">1. 信道是golang中的顶级公民</h2>
+<p>goroutine结合信道channel是golang中实现并发编程的标配。</p>
+<p>信道给出了一种不同于<strong>传统共享内存并发通信</strong>的新思路，以一种<strong>通道复制</strong>的思想解耦了并发编程的各个参与方。</p>
+<p>信道分为两种： 无缓冲和有缓冲信道（先入先出）。</p>
+<p>分别用于goroutine同步和异步生产消费：</p>
+<blockquote>
+<p>无缓冲信道： 若没有反向的goroutine在做动作， 当前goroutine会阻塞；<br>
+有缓冲信道： goroutine 直接面对的是缓冲队列， 队列满则写阻塞， 队列空则读阻塞。</p>
+</blockquote>
+<p>一个陷阱： 信道被关闭后， 原来的goroutine阻塞状态不会维系， 能从信道读取到零值。</p>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202501/587720-20250106131111776-531191839.png" alt="" loading="lazy"></p>
+<p>for range可以用于信道 :<br>
+一直从指定信道中<strong>读</strong>值， 没有数据会阻塞， 直到信道关闭会自动退出循环。</p>
+<pre><code>var ch chan int = make(chan int, 10)
+go func() {
+	for i := 0; i &lt; 20; i++ { 
+		ch &lt;- i
+	}
+	close(ch)
+}()
+
+time.Sleep(time.Second * 2)
+for ele := range ch {
+	fmt.Println(ele)
+}
+
+output: 0,1,2,3,4...19
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202501/587720-20250106130757755-911108211.png" alt="" loading="lazy"></p>
+<p>上面的示例描述了信道4个阶段：<br>
+写完10个数据(阻塞写)、暂停2s、<br>
+读取10个数据（解除阻塞写）、读完20个数据、关闭信道。</p>
+<h2 id="2-信道channel实现思路大盘点">2. 信道channel实现思路大盘点</h2>
+<p>channel是指向<code>hchan</code>结构体的指针.</p>
+<pre><code>        type hchan struct {
+        	qcount   uint           // 队列中已有的缓存元素的数量
+        	dataqsiz uint           // 环形队列的容量
+        	buf      unsafe.Pointer // 环形队列的地址
+        	elemsize uint16
+        	closed   uint32        // 标记是否关闭，初始化为0，一旦close(ch)为1
+        	elemtype *_type // 元素类型
+        	sendx    uint   // 待发送的元素索引
+        	recvx    uint   // 待接受元素索引
+        	recvq    waitq  // 阻塞等待的读goroutine队列
+        	sendq    waitq  // 阻塞等待的写gotoutine队列
+         
+        	// lock protects all fields in hchan, as well as several
+        	// fields in sudogs blocked on this channel.
+        	//
+        	// Do not change another G's status while holding this lock
+        	// (in particular, do not ready a G), as this can deadlock
+        	// with stack shrinking.
+        	lock mutex
+        }
+        
+    type waitq struct {  
+        first *sudog  
+        last *sudog  
+    }
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202501/587720-20250106130811903-1891556390.png" alt="" loading="lazy"></p>
+<h3 id="21--静态全局解读">2.1  静态全局解读</h3>
+<p>两个核心的结构</p>
+<p>①   环形队列<code>buf</code> （buf、dataqsize、sendx、recvx 圈定了一个有固定长度，由读/写指针控制队列数据的环形队列），从这看出队列是以链表实现。</p>
+<p>②  存放阻塞写G和阻塞读G的队列<code>sendq</code>，<code>recvq</code>,   <a href="https://github.com/golang/go/blob/772f024c615ec13c6cd28bf024e9d6be852201b6/src/runtime/chan.go#L229" target="_blank" rel="noopener nofollow">recvq、sendq存放的不是当前通信的goroutine</a>， 而是<strong>因读写信道而阻塞的goroutine</strong>:</p>
+<ul>
+<li>如果 qcount &lt;dataqsiz（队列未满），sendq就为空（写就不会阻塞）；</li>
+<li>如果 qcount &gt; 0 (队列不为空)，recvq就为空（读就不会阻塞）。</li>
+</ul>
+<p>一旦解除阻塞，读/写动作会给到先进入阻塞队列的goroutine，也就是 recvq、sendq也是先进先出。</p>
+<h3 id="22-动态解读demo">2.2 动态解读demo</h3>
+<p>以第一部分的demo为例：</p>
+<p>第一阶段： 写入0到9这个10个元素</p>
+<ol>
+<li>goroutine在写数据之后会获取锁，以确保安全地修改信道底层的<code>hchan</code>结构体；</li>
+<li>向环形队列<code>buf</code>入队enqueue元素，实际是将原始数据拷贝进环形队列<code>buf</code>的待插入位置<code>sendx</code>；</li>
+<li>入队操作完成，释放锁。</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202501/587720-20250106130829668-1519187622.png" alt="" loading="lazy"></p>
+<p>第二阶段：信道满，写阻塞（写goroutine会停止，并等待读操作唤醒）</p>
+<p>①  基于<code>写goroutine</code>创建<a href="https://go.dev/src/runtime/runtime2.go" target="_blank" rel="noopener nofollow">sudog</a>, 并将其放进<code>sendq队列</code>中；</p>
+<p>②  调用<code>gopark</code>函数，让调度器P终止该goroutine执行。</p>
+<blockquote>
+<p>调度器P将该goroutine状态改为<code>waiting</code>， 并从调度器P挂载的<code>runQueue</code>中移除，调度器P重新出队一个G交给OS线程来执行，这就是上下文切换，G被阻塞了而不是OS线程。</p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202501/587720-20250106130839879-1276501410.png" alt="" loading="lazy"></p>
+<hr>
+<p><code>读goroutine</code>开始被调度执行：</p>
+<p>第三阶段： 读前10个元素（解除写阻塞)</p>
+<ol>
+<li>for range chan： 读goroutine从<code>buf</code>中出队元素: 将信道元素拷贝到目标接收区；</li>
+<li>写goroutine从<code>sendq</code>中出队，因为现在信道不满，写不会阻塞；</li>
+<li>调度器P调用<code>goready</code>， 将写goroutine状态变为<code>runnable</code>，并移入runQueue。</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202501/587720-20250106130858257-1045680778.png" alt="" loading="lazy"></p>
+<p>下面的源码截取自<a href="https://github.com/golang/go/blob/772f024c615ec13c6cd28bf024e9d6be852201b6/src/runtime/chan.go#L236C2-L309C13" target="_blank" rel="noopener nofollow">chansend()</a> ，<br>
+体现了写信道--&gt; 写阻塞---&gt; 被唤醒的过程</p>
+<pre><code>     // 这一部分是写数据， 从这里也可以看出是点对点的覆写，原buf内队列元素不用移动， 只用关注sendx  
+     
+        if c.qcount &lt; c.dataqsiz {  // 信道未满，则写不会阻塞=&gt;senq为空	
+                qp := chanbuf(c, c.sendx)   // chanbuf(c, i) 返回的是信道buf中待插入的位置指针
+                typedmemmove(c.elemtype, qp, ep)  
+                c.sendx++
+                if c.sendx == c.dataqsiz {
+                     c.sendx = 0
+                }
+                c.qcount++
+                return true
+        }
+        if !block {       // 用于select case结构中，不阻塞select case的选择逻辑
+                unlock(&amp;c.lock)
+                return false
+        }
+
+  // 这二部分是： 构建sudog，放进写阻塞队列，阻塞当前写gooroutine的执行
+        // Block on the channel. Some receiver will complete our operation for us.
+        gp := getg()     // 获取当前的goroutine  https://go.dev/src/runtime/HACKING
+        mysg := acquireSudog()   // sudog是等待队列sendq中的元素，封装了goroutine
+        mysg.releasetime = 0
+        if t0 != 0 {
+                mysg.releasetime = -1
+        }
+        // No stack splits between assigning elem and enqueuing mysg
+        // on gp.waiting where copystack can find it.
+        mysg.elem = ep
+        mysg.waitlink = nil
+        mysg.g = gp
+        mysg.isSelect = false
+        mysg.c = c
+        gp.waiting = mysg
+        gp.param = nil
+        c.sendq.enqueue(mysg)  // 当前goroutine压栈sendq
+        // Signal to anyone trying to shrink our stack that we're about
+        // to park on a channel. The window between when this G's status
+        // changes and when we set gp.activeStackChans is not safe for
+        // stack shrinking.
+        gp.parkingOnChan.Store(true)
+        reason := waitReasonChanSend
+
+        gopark(chanparkcommit, unsafe.Pointer(&amp;c.lock), reason, traceBlockChanSend, 2)   // 这里是阻塞函数
+    	
+        KeepAlive(ep)
+ // 这三部分： 调度器唤醒了当前goroutine
+        // someone woke us up.  
+        if mysg != gp.waiting {
+                throw("G waiting list is corrupted")
+        }
+        gp.waiting = nil
+        gp.activeStackChans = false
+        closed := !mysg.success
+        gp.param = nil
+        if mysg.releasetime &gt; 0 {
+                blockevent(mysg.releasetime-t0, 2)
+        }
+        mysg.c = nil
+        releaseSudog(mysg)
+        if closed {     // 已经关闭了，再写数据会panic
+             if c.closed == 0 {
+                 throw("chansend: spurious wakeup")
+             }
+            panic(plainError("send on closed channel"))
+        }
+        return true
+</code></pre>
+<p>其中：</p>
+<p>①  <a href="https://go.dev/src/runtime/HACKINGn" target="_blank" rel="noopener nofollow">getg</a> 获取当前的goroutine，sudog是goroutine的封装，表征一个因读写信道而阻塞的G，</p>
+<p>②  <a href="https://github.com/golang/go/blob/4b652e9f5f5c0793f2e41cd2876bce5a241b2c95/src/runtime/mbarrier.go#L150C1-L171C2%EF%BC%89" target="_blank" rel="noopener nofollow"><code>typedmemmove(c.elemtype, qp, ep)</code></a>:  写数据到信道buf，由两个指针来完成拷贝覆写。</p>
+<pre><code>  //  typedmemmove copies a value of type typ to dst from src.
+    func typedmemmove(typ *abi.Type, dst, src unsafe.Pointer) {
+    	if dst == src {
+    		return
+    	}
+    	if writeBarrier.enabled &amp;&amp; typ.Pointers() {
+    		// This always copies a full value of type typ so it's safe
+    		// to pass typ along as an optimization. See the comment on
+    		// bulkBarrierPreWrite.
+    		bulkBarrierPreWrite(uintptr(dst), uintptr(src), typ.PtrBytes, typ)
+    	}
+    	// There's a race here: if some other goroutine can write to
+    	// src, it may change some pointer in src after we've
+    	// performed the write barrier but before we perform the
+    	// memory copy. This safe because the write performed by that
+    	// other goroutine must also be accompanied by a write
+    	// barrier, so at worst we've unnecessarily greyed the old
+    	// pointer that was in src.
+    	memmove(dst, src, typ.Size_)
+    	if goexperiment.CgoCheck2 {
+    		cgoCheckMemmove2(typ, dst, src, 0, typ.Size_)
+    	}
+    }
+</code></pre>
+<p>③ 我们看上面源码的第三部分， 唤醒了阻塞的<code>写goroutine</code>， 但是这里貌似没有将写goroutine携带的值传递给信道或对端。<br>
+实际上这个行为是在<code>recv</code>函数内。</p>
+<p>跟一下接收方：读第一个元素，刚解除写阻塞的源码：</p>
+<pre><code>// 发现sendq有阻塞的写G，则读取，并使用该写G携带的数据填充数据
+// Just found waiting sender with not closed.
+    if sg := c.sendq.dequeue(); sg != nil {
+    // Found a waiting sender. If buffer is size 0, receive value
+    // directly from sender. Otherwise, receive from head of queue
+    // and add sender's value to the tail of the queue (both map to
+    // the same buffer slot because the queue is full).
+    recv(c, sg, ep, func() { unlock(&amp;c.lock) }, 3)
+    return true, true
+}
+if c.qcount &gt; 0 {  // 如果sendq队里没有阻塞G， 则直接从队列中读值
+    // Receive directly from queue
+}
+
+---
+
+{
+    // Queue is full. Take the item at the
+    // head of the queue. Make the sender enqueue
+    // its item at the tail of the queue. Since the
+    // queue is full, those are both the same slot.
+    qp := chanbuf(c, c.recvx)  // 拿到buf中待接受元素指针
+    if raceenabled {
+            racenotify(c, c.recvx, nil)
+            racenotify(c, c.recvx, sg)
+    }
+    // copy data from queue to receiver
+    if ep != nil {
+            typedmemmove(c.elemtype, ep, qp)  // 将buf中待接收元素qp拷贝到目标指针ep
+    }
+    // copy data from sender to queue
+    typedmemmove(c.elemtype, qp, sg.elem)  //  将阻塞sendq队列中出站的sudog携带的值写入到待插入指针。
+    c.recvx++
+    if c.recvx == c.dataqsiz {
+            c.recvx = 0
+    }
+    c.sendx = c.recvx // c.sendx = (c.sendx+1) % c.dataqsiz
+}
+        
+</code></pre>
+<p>从上线源码可以验证：</p>
+<p>① <code>读goroutine</code>读取第一个元素之前，信道满，此时sendx=recvx，也即信道内读写指针指向同一个槽位；</p>
+<p>② 读取第一个元素，解除写阻塞： <code>sendq</code>写G队列会出队第一个sudog， 将其携带的元素填充进<code>buf</code>待插入指针<code>sendx</code>，因为此时sendx=recvx，故第二次<code>typedmemmove(c.elemtype, qp, sg.elem)</code>是合理的。</p>
+<blockquote>
+<p>如果sendq队列没有阻塞G， 则直接从buf中读取值。</p>
+</blockquote>
+<h2 id="3-不要使用共享内存来通信而是使用通信来共享内存">3. 不要使用共享内存来通信，而是使用通信来共享内存</h2>
+<p>常见的后端java C#标配使用共享内存来通信， 比如 mutex、lock 关键词:<br>
+通过对一块共有的区域做属性变更来反映系统当前的状态，详细的请搜索<code>同步索引块</code>。</p>
+<p>golang 推荐使用通信来共享内存， 这个是怎么理解的呢？</p>
+<p>你要想使用某块内存数据， 并不是直接共享给你， 而是给你一个信道作为访问的接口， 并且你得到的是目标数据的拷贝，由此形成的信道访问为通信方式；</p>
+<p>而原始的目标数据的生命周期由产生这个数据的G来决定， 它甚至不用care自己是不是要被其他G获知，因此体现了解耦并发编程参与方的作用。</p>
+<p><a href="https://medium.com/womenintechnology/exploring-the-internals-of-channels-in-go-f01ac6e884dc" target="_blank" rel="noopener nofollow">https://medium.com/womenintechnology/exploring-the-internals-of-channels-in-go-f01ac6e884dc</a></p>
+<h2 id="4-信道的实践指南">4. 信道的实践指南</h2>
+<h3 id="41--无缓冲信道">4.1  无缓冲信道</h3>
+<p>结合了通信（值交换）和同步。</p>
+<pre><code>    c := make(chan int)  // Allocate a channel.
+    // Start the sort in a goroutine; when it completes, signal on the channel.
+    go func() {
+        list.Sort()
+        c &lt;- 1  // Send a signal; value does not matter.
+    }()
+    doSomethingForAWhile()
+    &lt;-c   // Wait for sort to finish; discard sent value.
+</code></pre>
+<h3 id="42-有缓冲信道">4.2 有缓冲信道</h3>
+<h4 id="基础实践-信号量限流能力">基础实践： 信号量、限流能力</h4>
+<p>下面演示了：服务端使用有缓冲信道限制并发请求</p>
+<pre><code class="language-Server">var sem = make(chan int, MaxOutstanding) 
+
+func Serve(queue chan *Request) {
+    for req := range queue {
+        req:= req
+        sem &lt;- 1   
+        go func() {   // 只会开启MaxOutstanding个并发协程
+            process(req)
+            &lt;-sem
+        }()
+    }
+}
+</code></pre>
+<p>上面出现了两个信道：<br>
+① <code>sem</code> 提供了限制服务端并发处理请求的信号量<br>
+② <code>queue</code> 提供了一个客户端请求队列，起媒介/解耦的作用</p>
+<h4 id="解多路复用">解多路复用</h4>
+<p>多路复用是网络编程中一个耳熟能详的概念，nginx redis等高性能web、内存kv都用到了这个技术 。</p>
+<p>这个<strong>解多路复用</strong>是怎么理解呢？</p>
+<p>我们针对上面的服务端，编写客户端请求， 独立的客户端请求被服务端Serve收敛之后， Serve就起到了多路复用的概念，在<code>Request</code>定义<code>resultChan信道</code>，就给每个客户端请求提供了独立获取请求结果的能力， 这便是一种解多路复用。</p>
+<pre><code>    type Request struct {
+        args        []int
+        f           func([]int) int
+        resultChan  chan int
+    }
+    request := &amp;Request{[]int{3, 4, 5}, nil, make(chan int)}
+
+    func SendReq(req *Request）{
+        // Send request
+        clientRequests &lt;- request
+        // Wait for response.
+        fmt.Printf("answer: %d\n", &lt;-request.resultChan)
+    }
+</code></pre>
+<p>在服务端，定义handler,返回响应结果</p>
+<pre><code>    // 定义在服务端的处理handler
+    func sum(a []int) (s int) {
+        for _, v := range a {
+            s += v
+        }
+        return
+    }
+
+    func process(req *Request) {
+       req.f = sum
+       req.resultChan &lt;- req.f(req.args)
+    }
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202501/587720-20250106131047736-1277999661.png" alt="" loading="lazy"></p>
+<h4 id="基于cpu的并行编程">基于cpu的并行编程</h4>
+<p>如果计算可被划分为独立的（不相互依赖的）计算分片，则可以利用信道开启CPU的并行编程能力。</p>
+<pre><code>    var numCPU = runtime.NumCPU() // number of CPU cores
+
+    func (v Vector) DoAll(u Vector) {
+        c := make(chan int, numCPU)  // Buffering optional but sensible.
+        for i := 0; i &lt; numCPU; i++ {
+            go v.DoSome(i*len(v)/numCPU, (i+1)*len(v)/numCPU, u, c)
+        }
+        
+        for i := 0; i &lt; numCPU; i++ {
+            &lt;-c    // wait for one task to complete
+        }
+        // All done.
+    }
+</code></pre>
+<h2 id="全文复盘">全文复盘</h2>
+<p>本文整体视角讲述了Golang信道的用法、信道的静态结构(通过这个静态结构读者可以盲猜一二)；<br>
+通过一个动态示例（G和信道的交互行为）解剖了信道在阻塞前后的状态变化；</p>
+<p>最后给出了信道的常规实践， 解读了一些常规姿势的上层思路来源。</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <hr style="FILTER: alpha(opacity=100,finishopacity=0,style=3)" width="80%" color="#987cb9" size="3">
+<div style="text-align:center;">
+<p>本文来自博客园，作者：{有态度的马甲}，转载请注明原文链接：<a href="https://www.cnblogs.com/JulianHuang/p/18655087" target="_blank">https://www.cnblogs.com/JulianHuang/p/18655087</a></p>
+<strong style="color: red; ">欢迎关注我的原创技术、职场公众号， 加好友谈天说地，一起进化</strong>
+<div><img style="width: 250px;height:250px;" src="https://blog-static.cnblogs.com/files/JulianHuang/QR.gif"> </div>
+
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.21887064824421296" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-01-06 17:00">2025-01-06 12:56</span>&nbsp;
+<a href="https://www.cnblogs.com/JulianHuang">码甲哥不卷</a>&nbsp;
+阅读(<span id="post_view_count">213</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18655087" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18655087);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18655087', targetLink: 'https://www.cnblogs.com/JulianHuang/p/18655087', title: '字节二面：你怎么理解信道是golang中的顶级公民' })">举报</a>
+</div>
+        
