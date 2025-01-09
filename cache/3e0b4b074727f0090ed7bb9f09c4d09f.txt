@@ -1,0 +1,473 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/KubeExplorer/p/18661923" title="发布于 2025-01-09 12:38">
+    <span role="heading" aria-level="2">基于 Admission Webhook 实现 Pod DNSConfig 自动注入</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img.lixueduan.com/kubernetes/cover/node-local-dns-webhook.png" alt="node-local-dns-webhook.png" loading="lazy"></p>
+<p>本文主要分享如何使用 基于 Admission Webhook 实现自动修改 Pod DNSConfig，使其优先使用 NodeLocalDNS 。</p>
+
+<h2 id="1背景">1.背景</h2>
+<p>上一篇部署好 <strong>NodeLocal DNSCache，</strong>但是还差了很重要的一步，<strong>配置</strong> <strong>pod</strong> <strong>使用 NodeLocal DNSCache 作为优先的</strong> <strong>DNS</strong> <strong>服务器。</strong></p>
+<p>有以下几种方式：</p>
+<ul>
+<li>方式一：修改 kubelet 中的 dns nameserver 参数，并重启节点 kubelet。<strong>存在业务中断风险，不推荐使用此方式</strong>。
+<ul>
+<li>测试时可以用这个方式，比较简单</li>
+</ul>
+</li>
+<li>方式二：创建 Pod 时手动指定 DNSConfig，<strong>比较麻烦，不推荐。</strong></li>
+<li>方式三：借助 DNSConfig 动态注入控制器在 Pod 创建时配置 DNSConfig 自动注入，<strong>推荐使用此方式。</strong>
+<ul>
+<li>需要自己实现一个 webhook，相当于把方式二自动化了</li>
+</ul>
+</li>
+</ul>
+<p>第一种方式存在业务中断风险，而且后续新增节点时也需要修改 kubelet 配置，比较麻烦。</p>
+<p>而第二种方式则每个创建的 Pod 都需要手动指定 DNSConfig 就更繁琐了。</p>
+<p>因此一般是推荐使用第三种方式，实现一个 Webhook，由该 Webhook 来自动修改 Pod 的 DNSConfig。</p>
+<h2 id="2-自动注入规则">2. 自动注入规则</h2>
+<p>Admission Webhook 用于自动注入 DNSConfig 到新建的 Pod 中，避免您手工配置 Pod YAML进行注入。</p>
+<h3 id="注入范围">注入范围</h3>
+<p>为了使应用更灵活，我们指定，只对携带<code>node-local-dns-injection=enabled</code>  label 的命名空间中新建 Pod 的进行注入。</p>
+<p>可以通过以下命令给命名空间打上Label标签：</p>
+<pre><code class="language-bash">kubectl label namespace &lt;namespace-name&gt; node-local-dns-injection=enabled
+</code></pre>
+<h3 id="注入规则">注入规则</h3>
+<p>Webhook 则是在所有 Pod 创建、更新前都会进行检测，如果 Pod 所在 Namespace 满足条件，或者 Pod 也满足条件则自动注入 DNSConfig，将 NodeLocalDNS 作为 Pod 的优先 DNS 服务。</p>
+<p>具体规则如下：</p>
+<p>Pod 在同时满足以下条件时，才会自动注入 DNS 缓存。如果您的 Pod 容器未注入 DNS 缓存服务器的 IP 地址，请检查 Pod 是否未满足以下条件。</p>
+<ul>
+<li>1）新建 Pod 不位于 kube-system 和 kube-public 命名空间。</li>
+<li>2）新建 Pod 所在命名空间的 Labels 标签包含 node-local-dns-injection=enabled。</li>
+<li>3）新建 Pod 没有被打上禁用 DNS 注入 node-local-dns-injection=disabled 标签。</li>
+<li>4）新建 Pod 的网络为 hostNetwork 且 DNSPolicy 为 ClusterFirstWithHostNet，或 Pod 为非 hostNetwork 且 DNSPolicy 为 ClusterFirst。</li>
+</ul>
+<h2 id="3-admission-webhook-实现">3. Admission Webhook 实现</h2>
+<blockquote>
+<p>源码：<a href="https://github.com/lixd/nodelocaldns-admission-webhook" target="_blank" rel="noopener nofollow">lixd/nodelocaldns-admission-webhook</a></p>
+</blockquote>
+<h3 id="配置文件">配置文件</h3>
+<p>我们可以通过配置文件来执行 KubeDNS 地址和 NodeLocalDNS 地址，也提供了默认值。</p>
+<pre><code class="language-go">const (
+	DefaultKubeDNS  = "10.96.0.10"
+	DefaultLocalDNS = "169.254.20.10"
+)
+
+func NewDNSConfig(kubedns, localdns string) Config {
+	if kubedns == "" {
+		kubedns = DefaultKubeDNS
+	}
+	if localdns == "" {
+		localdns = DefaultLocalDNS
+	}
+	return Config{
+		KubeDNS:  kubedns,
+		LocalDNS: localdns,
+	}
+}
+</code></pre>
+<p>启动服务时可以指定</p>
+<pre><code class="language-bash">	flag.StringVar(&amp;kubedns, "kube-dns", "10.96.0.10", "The service ip of kube dns.")
+	flag.StringVar(&amp;localdns, "local-dns", "169.254.20.10", "The virtual ip of node local dns.")
+</code></pre>
+<h3 id="注入-dnsconfig">注入 DNSConfig</h3>
+<p>Webhook Handle 方法中就是核心逻辑。</p>
+<pre><code class="language-go">func (a *PodAnnotator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	pod := &amp;corev1.Pod{}
+	err := a.Decoder.Decode(req, pod)
+	if err != nil {
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+	klog.Infof("AdmissionReview for Kind=%v, Namespace=%v Name=%v (%v) UID=%v patchOperation=%v UserInfo=%v",
+		req.Kind, req.Namespace, req.Name, pod.Name, req.UID, req.Operation, req.UserInfo)
+
+	// determine whether to perform mutation
+	if !a.NeedMutation(pod) {
+		klog.Infof("Skipping mutation for %s/%s due to policy check", pod.Namespace, pod.Name)
+		return admission.Allowed("not need mutation,skip")
+	}
+
+	// mutate the fields in pod
+	mutation(pod, a.Config)
+
+	marshaledPod, err := json.Marshal(pod)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
+}
+</code></pre>
+<p>首先通过 NeedMutation 判断是否满足条件，如果不需要注入则跳过</p>
+<p>如果需要则执行 mutation 方法修改 Pod 的 DNSConfig 字段。</p>
+<h4 id="needmutation">NeedMutation</h4>
+<p>这里就是按照之前提到的注入规则进行判定</p>
+<pre><code class="language-go">// NeedMutation Check whether the target resoured need to be mutated
+func (a *PodAnnotator) NeedMutation(pod *corev1.Pod) bool {
+	if pod.Namespace == "" {
+		pod.Namespace = "default"
+	}
+	/*
+	   Pod will automatically inject DNS cache when all of the following conditions are met:
+	   1. The newly created Pod is not in the kube-system and kube-public namespaces.
+	   2. The Labels of the namespace where the new Pod is located contain node-local-dns-injection=enabled.
+	   3. The newly created Pod is not labeled with the disabled DNS injection node-local-dns-injection=disabled label.
+	   4. The network of the newly created Pod is hostNetwork and DNSPolicy is ClusterFirstWithHostNet, or the Pod is non-hostNetwork and DNSPolicy is ClusterFirst.
+	*/
+	//1. The newly created Pod is not in the kube-system and kube-public namespaces.
+	for _, namespace := range ignoredNamespaces {
+		if pod.Namespace == namespace {
+			klog.V(1).Infof("Skip mutation for %v for it's in special namespace: %v", pod.Name, pod.Namespace)
+			return false
+		}
+	}
+
+	// Fetch the namespace where the Pod is located.
+	var ns corev1.Namespace
+	err := a.Client.Get(context.Background(), client.ObjectKey{Name: pod.GetNamespace()}, &amp;ns)
+	if err != nil {
+		klog.V(1).ErrorS(err, "Failed to fetch namespace: %v", pod.Namespace)
+		return false
+	}
+
+	//2. The Labels of the namespace where the new Pod is located contain node-local-dns-injection=enabled.
+	if v, ok := ns.Labels[NodeLocalDNSInjection]; !ok || v != "enabled" {
+		return false
+	}
+
+	//3. The newly created Pod is not labeled with the disabled DNS injection node-local-dns-injection=disabled label.
+	if v, ok := pod.Labels[NodeLocalDNSInjection]; ok &amp;&amp; v == "disabled" {
+		return false
+	}
+
+	//4. The network of the newly created Pod is hostNetwork and DNSPolicy is ClusterFirstWithHostNet, or the Pod is non-hostNetwork and DNSPolicy is ClusterFirst.
+	// The network of the Pod is hostNetwork, so DNSPolicy should be ClusterFirstWithHostNet.
+	if pod.Spec.HostNetwork &amp;&amp; pod.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+		return false
+	}
+
+	// The network of the Pod is not hostNetwork, so DNSPolicy should be ClusterFirst.
+	if !pod.Spec.HostNetwork &amp;&amp; pod.Spec.DNSPolicy != corev1.DNSClusterFirst {
+		return false
+	}
+
+	// If all conditions are met, return true.
+	return true
+}
+</code></pre>
+<h4 id="mutation">mutation</h4>
+<p>mutation 则是根据配置文件组装好 DNSConfig 并注入到 Pod。</p>
+<pre><code class="language-go">func mutation(pod *corev1.Pod, conf Config) {
+	ns := pod.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	pod.Spec.DNSPolicy, pod.Spec.DNSConfig = loadCustomDnsConfig(ns, conf)
+}
+
+func loadCustomDnsConfig(namespace string, config Config) (corev1.DNSPolicy, *corev1.PodDNSConfig) {
+	nsSvc := fmt.Sprintf("%s.svc.cluster.local", namespace)
+	return "None", &amp;corev1.PodDNSConfig{
+		Nameservers: []string{config.LocalDNS, config.KubeDNS},
+		Searches:    []string{nsSvc, "svc.cluster.local", "cluster.local"},
+		Options: []corev1.PodDNSConfigOption{
+			{
+				Name:  "ndots",
+				Value: StringPtr("3"),
+			},
+			{
+				Name:  "attempts",
+				Value: StringPtr("2"),
+			},
+			{
+				Name:  "timeout",
+				Value: StringPtr("1"),
+			},
+		},
+	}
+}
+</code></pre>
+<p>至此，核心逻辑就结束了，还是比较简单的，对于每个 Pod 创建、更新请求，Webhook 中都判断该 Pod 是否需要注入，不满足条件则直接跳过，满足条件则根据配置生成 DNSConfig 并注入到 Pod 中。</p>
+<h2 id="4-部署">4. 部署</h2>
+<p>包含两部分：</p>
+<ul>
+<li>1）Webhook 本身部署</li>
+<li>2）K8s 中增加 Webhook 配置</li>
+</ul>
+<h3 id="webhook-部署">Webhook 部署</h3>
+<p>需要部署以下几部分内容：</p>
+<ul>
+<li>Cert-manager : 由于 Webhook 需要配置证书，建议使用 cert-manager 来自动注入，减少手动操作。</li>
+<li>RBAC：Webhook 需要查询 Pod、Namespace 等信息，因此需要授权</li>
+<li>Deploy：Webhook 本身以 Deploy 方式部署。</li>
+</ul>
+<p>具体文件都在 /deploy 目录下，直接使用即可。</p>
+<p>在 deploy 目录提供了部署相关 yaml，apply 即可。</p>
+<ul>
+<li>1）部署 cert-manager 用于管理证书</li>
+<li>2）创建 Issuer、Certificate 对象，让 cert-manager 签发证书并存放到 Secret</li>
+<li>3）创建 rbac 并部署 Webhook, 挂载 2 中的 Secret 到容器中以开启 TLS
+<ul>
+<li>可以修改启动命令中的 -kube-dns 和 -local-dns 参数来调整 KubeDNS 和 NodeLocalDNS 地址，默认为 10.96.0.10 和 169.254.20.10。</li>
+</ul>
+</li>
+</ul>
+<p>webhook-deploy.yaml 如下，就是一个普通的 Deployment：</p>
+<blockquote>
+<p>镜像已经推送到了 Dockerhub，大家可以直接使用</p>
+</blockquote>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nodelocaldns-webhook
+  namespace: kube-system
+  labels:
+    app: nodelocaldns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nodelocaldns
+  template:
+    metadata:
+      labels:
+        app: nodelocaldns
+    spec:
+      serviceAccountName: nodelocaldns-webhook # 提供查询 namespace 信息的权限
+      containers:
+        - name: nodelocaldns-webhook
+          image: lixd96/nodelocaldns-admission-webhook:v0.0.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - /manager
+          args:
+            - "-kube-dns=10.96.0.10"
+            - "-local-dns=169.254.20.10"
+          volumeMounts:
+            - name: webhook-certs
+              mountPath: /tmp/k8s-webhook-server/serving-certs # Webhook 证书默认路径
+              readOnly: true
+      volumes:
+        - name: webhook-certs
+          secret:
+            secretName: nodelocaldns-webhook
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodelocaldns-webhook
+  namespace: kube-system
+  labels:
+    app: nodelocaldns
+spec:
+  ports:
+    - port: 443
+      targetPort: 9443
+  selector:
+    app: nodelocaldns
+</code></pre>
+<p>部署命令如下：</p>
+<pre><code class="language-bash">cd deploy
+# 部署 CertManager 以及签发证书
+kubectl apply -f cert-manager
+
+# 部署 Webhook
+kubectl apply -f webhook-deploy.yaml
+kubectl apply -f webhook-rbac.yaml
+</code></pre>
+<h3 id="mutatingwebhookconfiguration">MutatingWebhookConfiguration</h3>
+<p>yaml 大概是这样的：</p>
+<pre><code class="language-yaml">---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: mutating-webhook-configuration
+  annotations:
+    cert-manager.io/inject-ca-from: kube-system/nodelocaldns-webhook
+webhooks:
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      #caBundle: ""
+      service:
+        name: nodelocaldns-webhook
+        namespace: kube-system
+        path: /mutate-v1-pod
+    failurePolicy: Fail
+    name: nodelocaldns-webhook.kube-system.svc
+    namespaceSelector: # 限制生效范围
+      matchLabels:
+        node-local-dns-injection: enabled
+    rules:
+      - apiGroups:
+          - ""
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - pods
+    sideEffects: None
+</code></pre>
+<p>增加 <code>cert-manager.io/inject-ca-from</code> annotation 让 CertManager 自动注入 CA 证书。</p>
+<pre><code class="language-yaml">  annotations:
+    cert-manager.io/inject-ca-from: kube-system/nodelocaldns-webhook
+</code></pre>
+<p>限制生效范围</p>
+<pre><code class="language-yaml">    namespaceSelector: # 限制生效范围
+      matchLabels:
+        node-local-dns-injection: enabled
+</code></pre>
+<p>只关心 Pod 的 Create、Update 事件：</p>
+<pre><code class="language-yaml">    rules:
+      - apiGroups:
+          - ""
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - pods
+</code></pre>
+<p>也是直接 apply 即可</p>
+<pre><code class="language-bash">cd deploy 
+kubectl apply -f webhook-config.yaml
+</code></pre>
+<h2 id="5-测试">5. 测试</h2>
+<p>首先给 default namespace 打上 <code>node-local-dns-injection=enabled</code>  label。</p>
+<pre><code class="language-Bash">kubectl label namespace default node-local-dns-injection=enabled
+</code></pre>
+<p>创建一个 Pod，然后查看 yaml 看看 dnsConfig 是否被修改了。</p>
+<pre><code class="language-Bash">kubectl run busybox --image=busybox --restart=Never --namespace=default --command -- sleep infinity
+</code></pre>
+<p>查看一下完整 Yaml</p>
+<pre><code class="language-Bash">[root@webhook ~]# k get po busybox -oyaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    cni.projectcalico.org/containerID: 2a4caca308b031f872c47ef334cf7e940d74646a2f0a8893c7786508d30ed488
+    cni.projectcalico.org/podIP: 172.25.233.215/32
+    cni.projectcalico.org/podIPs: 172.25.233.215/32
+  creationTimestamp: "2024-02-05T10:43:16Z"
+  labels:
+    run: nginx-pod
+  name: nginx-pod
+  namespace: default
+  resourceVersion: "19341"
+  uid: 2b107b50-e85c-462f-8919-a0c01114bae6
+spec:
+  containers:
+  - image: nginx
+    imagePullPolicy: Always
+    name: nginx-pod
+    resources: {}
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-4wf2n
+      readOnly: true
+  dnsConfig:
+    nameservers:
+    - 169.254.20.10
+    options:
+    - name: ndots
+      value: "2"
+    searches:
+    - default.svc.cluster.local
+    - svc.cluster.local
+    - cluster.local
+  dnsPolicy: None
+</code></pre>
+<p>Dns 部分如下：</p>
+<pre><code class="language-YAML">  dnsConfig:
+    nameservers:
+    - 169.254.20.10
+    options:
+    - name: ndots
+      value: "2"
+    searches:
+    - default.svc.cluster.local
+    - svc.cluster.local
+    - cluster.local
+  dnsPolicy: None
+</code></pre>
+<p>可以看到，已经注入了我们的 NodeLocalDNS 了。</p>
+<p>然后往没有打 Label 的命名空间创建 Pod</p>
+<pre><code class="language-Bash">kubectl create namespace myns
+kubectl run busybox --image=busybox --restart=Never --namespace=myns --command -- sleep infinity
+</code></pre>
+<p>查看 DNSConfig 是否被修改</p>
+<pre><code class="language-Bash">[root@webhook ~]# kubectl -n myns get pod nginx-pod -oyaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    cni.projectcalico.org/containerID: 93a545988d7c7bbb88f0bc0e745226cd9e684bd63b78754dadd738861ed34512
+    cni.projectcalico.org/podIP: 172.25.233.218/32
+    cni.projectcalico.org/podIPs: 172.25.233.218/32
+  creationTimestamp: "2024-02-06T01:22:36Z"
+  labels:
+    run: nginx-pod
+  name: nginx-pod
+  namespace: myns
+  resourceVersion: "116195"
+  uid: 1f64a831-7470-49d5-b28e-1cd231ef5d8f
+spec:
+  containers:
+  - image: nginx
+    imagePullPolicy: Always
+    name: nginx-pod
+    resources: {}
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-shk68
+      readOnly: true
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+</code></pre>
+<p>可以看到，并没有，说明我们的逻辑是没问题的，只会对打了 Label 的命名空间中的 Pod 进行注入。</p>
+<p>最后测试能否正常解析</p>
+<p>测试一下注入 DNSConfig 之后能否正常解析 DNS</p>
+<pre><code class="language-Bash">kubectl run busybox-pod --image=busybox --restart=Never --namespace=default
+</code></pre>
+<p>进入 Pod 并测试解析 Service 记录</p>
+<pre><code class="language-Bash">[root@webhook ~]# k exec -it busybox-pod -- nslookup nodelocaldns-webhook.kube-system.svc.cluster.local
+Server:                169.254.20.10
+Address:        169.254.20.10:53
+
+Name:        nodelocaldns-webhook.kube-system.svc.cluster.local
+Address: 10.105.137.213
+[root@webhook ~]# kk get svc nodelocaldns-webhook
+NAME                   TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)   AGE
+nodelocaldns-webhook   ClusterIP   10.105.137.213   &lt;none&gt;        443/TCP   14h
+</code></pre>
+<p>可以看到，Nameserver 是 169.254.20.10，也就是我们的 NodeLocalDNS，然后能拿到正确的 IP，说明我们的 NodeLocalDNS 是没问题的。</p>
+<h2 id="6-小结">6. 小结</h2>
+<p>本文主要分析了如何通过自定义一个 Admission Webhook 来自动化的修改 Pod 的 DNSConfig，使其优先使用 NodeLocalDNS。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.25738516402314815" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-01-09 12:38">2025-01-09 12:38</span>&nbsp;
+<a href="https://www.cnblogs.com/KubeExplorer">探索云原生</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18661923" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18661923);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18661923', targetLink: 'https://www.cnblogs.com/KubeExplorer/p/18661923', title: '基于 Admission Webhook 实现 Pod DNSConfig 自动注入' })">举报</a>
+</div>
+        
