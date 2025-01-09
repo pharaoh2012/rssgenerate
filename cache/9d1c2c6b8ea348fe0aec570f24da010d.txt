@@ -1,0 +1,179 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huangxincheng/p/18657596" title="发布于 2025-01-07 14:41">
+    <span role="heading" aria-level="2">为什么 .NET8线程池 容易引发线程饥饿</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一背景">一：背景</h2>
+<h3 id="1-讲故事">1. 讲故事</h3>
+<p>最近时间相对比较宽裕，多写点文章来充实社区吧，这篇文章主要还是来自于最近遇到的几例线程饥饿<code>(Task.Result)</code>引发的一系列的反思和总结，我觉得.NET8容易引发饥饿的原因，更多的在于异步回调之后底层会反复的将结果丢到线程池所致，因为数据进线程池容易，再用线程到池中去捞就没有那么简单了，可能今天的话题比较有争议，当然我个人的思考也不见得一定对，算是给大家提供一个角度吧，话不多说，开干！</p>
+<h2 id="二为什么会容易饥饿">二：为什么会容易饥饿</h2>
+<h3 id="1-测试代码">1. 测试代码</h3>
+<p>为了方便讲述异步回调的路径，这里我用简单的 <code>FileStream</code> 的异步读取来演示，当然实际的场景更多的是网络IO，最后我再上一个 .NET6 和 .NET8 的对比，先看一下参考代码。</p>
+<pre><code class="language-C#">
+    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            UseAwaitAsync();
+
+            Console.ReadLine();
+        }
+
+        static async Task&lt;string&gt; UseAwaitAsync()
+        {
+            string filePath = "D:\\dumps\\trace-1\\GenHome.DMP";
+            Console.WriteLine($"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss:fff")} 请求发起...");
+            using (FileStream fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 16, useAsync: true))
+            {
+                byte[] buffer = new byte[fileStream.Length];
+
+                int bytesRead = await fileStream.ReadAsync(buffer, 0, buffer.Length);
+
+                string content = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+                var query = $"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss:fff")} 获取到结果:{content.Length}";
+
+                Console.WriteLine(query);
+
+                return query;
+            }
+        }
+    }
+
+</code></pre>
+<p>卦中 await 之后的回调，很多人可能会想当然的以为是<code>IO线程</code>一撸到底，其实在.NET8中并不是这样的，它会经历两次 Enqueue 到线程池，步骤如下：</p>
+<ol>
+<li>IO线程 封送 event 到 线程池队列。</li>
+<li>Worker线程 读取 event 拆解出 ValueTaskSourceAsTask(ReadAsync) 再次入 线程池队列。</li>
+<li>Worker线程 读取 ValueTaskSourceAsTask(ReadAsync) 拆解出编译器生成的状态机<code>&lt;UseAwaitAsync&gt;d__1</code>，回到用户代码。</li>
+</ol>
+<p>这里我姑且定义成三阶段吧，可能有些朋友有点模糊，我画一张简图给大家辅助一下。</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250107144032748-177103632.png" alt="" loading="lazy"></p>
+<p>代码和图都有了，接下来就是眼见为实的阶段了。</p>
+<h3 id="2-如何眼见为实">2. 如何眼见为实</h3>
+<p>这个相对来说比较简单，在合适的位置埋上断点，然后观察线程栈即可。</p>
+<ol>
+<li>观察第一阶段</li>
+</ol>
+<p>自 C# 重写了ThreadPool之后，底层会用一个单独的线程轮询IO完成端口队列（GetQueuedCompletionStatusEx），参考代码如下：</p>
+<pre><code class="language-C#">
+    internal sealed class PortableThreadPool
+    {
+        private unsafe void Poll()
+        {
+            int num;
+            while (Interop.Kernel32.GetQueuedCompletionStatusEx(this._port, this._nativeEvents, 1024, out num, -1, false))
+            {
+                for (int i = 0; i &lt; num; i++)
+                {
+                    Interop.Kernel32.OVERLAPPED_ENTRY* ptr = this._nativeEvents + i;
+                    if (ptr-&gt;lpOverlapped != null)
+                    {
+                        this._events.BatchEnqueue(new PortableThreadPool.IOCompletionPoller.Event(ptr-&gt;lpOverlapped, ptr-&gt;dwNumberOfBytesTransferred));
+                    }
+                }
+                this._events.CompleteBatchEnqueue();
+            }
+            ThrowHelper.ThrowApplicationException(Marshal.GetHRForLastWin32Error());
+        }
+    }
+
+</code></pre>
+<p>从卦中看，一旦 GetQueuedCompletionStatusEx 获取到了数据就开始封送 event，并投送到线程池的<code>高优先级队列</code>中,我们可以在 UnsafeQueueHighPriorityWorkItemInternal 上下断点即可，然后观察线程栈，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250107144032769-1646360453.png" alt="" loading="lazy"></p>
+<ol start="2">
+<li>观察第二阶段</li>
+</ol>
+<p>当IO线程将数据丢到队列之后，接下来就需要用 Worker线程 去取了，这里就有了一个重大隐患，这个隐患在于如果当前存在线程饥饿，而线程的动态注入又比较慢，所以这个event存在不能及时取出来的情况。</p>
+<p>按照模型图描述，这个阶段是从 event 中拆解出 ValueTaskSourceAsTask，这中间还涉及到了 ThreadPoolBoundHandleOverlapped 的解包逻辑，我在上篇<a href="https://www.cnblogs.com/huangxincheng/p/18654968" target="_blank">聊一聊 C#异步中的Overlapped是如何寻址的<br>
+</a>和大家聊过，这里就不赘述了，接下来在<code>ManualResetValueTaskSourceCore&lt;TResult&gt;.SignalCompletion()</code> 上下一个断点观察。</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250107144032752-364226040.png" alt="" loading="lazy"></p>
+<p>上面卦中的 <code>_continuationState</code> 就是最终拆解的 ValueTaskSourceAsTask（ReadAsync），截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250107144032729-1492230148.png" alt="" loading="lazy"></p>
+<p>有些朋友可能会有疑惑，<code>ReadAsync</code> 返回的是 <code>Task&lt;int&gt;</code> ，怎么就变成了 <code>ValueTaskSourceAsTask</code> 呢？这是因为 ReadAsync 的底层做了一个 <code>ValueTask&lt;int&gt; -&gt; Task&lt;int&gt;</code> 的转换，参考代码如下：</p>
+<pre><code class="language-C#">
+        public override Task&lt;int&gt; ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            ValueTask&lt;int&gt; valueTask = this.ReadAsync(new Memory&lt;byte&gt;(buffer, offset, count), cancellationToken);
+            if (!valueTask.IsCompletedSuccessfully)
+            {
+                return valueTask.AsTask();
+            }
+            return this._lastSyncCompletedReadTask.GetTask(valueTask.Result);
+        }
+
+</code></pre>
+<p>反正不管怎么说，确实是真真切切的再次将数据(ValueTaskSourceAsTask) 丢入了线程池的线程本地队列，可二次丢入又放大了饥饿的风险。</p>
+<ol start="3">
+<li>观察第三阶段</li>
+</ol>
+<p>数据进了队列之后，需要线程池线程再次提取，这个逻辑就比较简单了，提取 <code>ValueTaskSourceAsTask</code> 中的延续字段 <code>continuationObject</code> 来解构状态机最终回到用户代码，要想观察直接在用户方法 UseAwaitAsync() 的 await 之后下一个断点即可。</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250107144032746-278512009.png" alt="" loading="lazy"></p>
+<h3 id="3-net6-会这样吗">3. .NET6 会这样吗</h3>
+<p>很多朋友可能会说 .NET8 是这样，那之前的版本也是这样吗？ 也有一些朋友可能会说，我的饥饿发生在 <code>网络IO</code>，并没有看到类似 <code>文件IO</code> 的情况。</p>
+<p>在我的dump分析之旅中，确实几乎所有的饥饿都发生在 <code>网络IO</code>上，并且 .NET6 和 .NET8 在 <code>网络IO</code> 上的行为已经完全不一样了。</p>
+<ol>
+<li>.NET6 是IO线程 一撸到底。</li>
+<li>.NET8 则需要 Worker线程 做二次处理。</li>
+</ol>
+<p>说了这么多，我们上一个<code>网络IO</code>的例子，然后观察 .NET6 和 .NET8 在处理回调上的不同，参考代码如下：</p>
+<pre><code class="language-C#">
+    internal class Program
+    {
+        static async Task Main(string[] args)
+        {
+            var task = await GetContentLengthAsync("http://baidu.com");
+
+            Console.ReadLine();
+        }
+        static async Task&lt;int&gt; GetContentLengthAsync(string url)
+        {
+            using (HttpClient client = new HttpClient())
+            {
+                var content = await client.GetStringAsync(url);
+
+                Debug.WriteLine($"线程编号:{Environment.CurrentManagedThreadId}, content.length={content.Length}");
+
+                Debugger.Break();
+
+                return content.Length;
+            }
+        }
+    }
+
+</code></pre>
+<ol>
+<li>.NET6 下的WinDbg观察</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250107144032732-877209947.png" alt="" loading="lazy"></p>
+<p>从卦中可以看到 <code>tid=10</code> 后面有一个 <code>Threadpool Completion Port</code>标记，这就表明确实是 IO线程 一撸到底。</p>
+<ol start="2">
+<li>.NET8 下的WinDbg观察</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250107144032746-1061913083.png" alt="" loading="lazy"></p>
+<p>从卦中可以看到 <code>tid=9</code> 后面是 <code>Threadpool Worker</code>标记，这就说明复杂了哈。。。</p>
+<h2 id="三总结">三：总结</h2>
+<p>可以肯定的是减少callback重入队列次数可以尽可能的避免线程饥饿，但怎么说呢？<code>.NET8</code>的线程池综合性能绝对比 <code>.NET6</code> 要强悍的多，但.NET8中的设计理念可能也不能达到100%的全域领跑，可能在某些1%的场景下还不如 .NET6 的简单粗暴。<br>
+<img src="https://images.cnblogs.com/cnblogs_com/huangxincheng/345039/o_210929020104最新消息优惠促销公众号关注二维码.jpg" width="700" height="300" alt="图片名称" align="center"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="2.243826656511574" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-01-07 14:41">2025-01-07 14:41</span>&nbsp;
+<a href="https://www.cnblogs.com/huangxincheng">一线码农</a>&nbsp;
+阅读(<span id="post_view_count">1562</span>)&nbsp;
+评论(<span id="post_comment_count">15</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18657596" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18657596);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18657596', targetLink: 'https://www.cnblogs.com/huangxincheng/p/18657596', title: '为什么 .NET8线程池 容易引发线程饥饿' })">举报</a>
+</div>
+        
