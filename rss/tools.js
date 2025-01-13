@@ -30,13 +30,13 @@ function filterSkipWords(items, skipWords) {
     return items.filter(it => it.description);
 }
 
-function getRssXml(title, link, items,max = 20) {
-let itemsXml = items.slice(0,max).map(it => `<item>
+function getRssXml(title, link, items, max = 20) {
+    let itemsXml = items.filter(it => it.description && it.title && it.guid).slice(0, max).map(it => `<item>
     <title><![CDATA[ ${it.title} ]]></title>
     <link>${it.link}</link>
     <guid>${it.guid}</guid>
     <description>
-    <![CDATA[ ${it.description.replace(/<!\[CDATA\[/g,"<! [C DATA [").replace(/\]\]>/g,"] ] >") } ]]>
+    <![CDATA[ ${it.description.replace(/<!\[CDATA\[/g, "<! [C DATA [").replace(/\]\]>/g, "] ] >")} ]]>
     </description>
     </item>`)
 
@@ -71,19 +71,19 @@ async function uploadXml(xml, RSS_NAME) {
         "body": xml,
         "method": "POST",
     })
-    console.info(await res.text())    
+    console.info(await res.text())
 }
 
 async function uploadJson(title, link, items, RSS_NAME) {
     let json = {
-        rss:{
-            channel:{
+        rss: {
+            channel: {
                 title,
                 link,
-                lastBuildDate:new Date().toISOString(),
-                description:title + " RSS",
-                language:"zh-cn",
-                item:items
+                lastBuildDate: new Date().toISOString(),
+                description: title + " RSS",
+                language: "zh-cn",
+                item: items
             }
         }
     }
