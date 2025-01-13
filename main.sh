@@ -5,3 +5,4 @@ node ./rss/52pojie.js
 node ./rss/cnblogs.js
 node ./rss/juejin.js
 node ./rss/smzdm.js
+node ./rss/52pojie_aiqiyi.js
