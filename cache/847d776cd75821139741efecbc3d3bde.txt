@@ -1,0 +1,343 @@
+
+		<h2>
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/lmy5215006/p/18657952" title="发布于 2025-01-13 12:23">
+    <span role="heading" aria-level="2">.NET Core GC标记阶段(mark_phase)底层原理浅谈</span>
+    
+
+</a>
+
+		</h2>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="简介">简介</h1>
+<p>C# 采用基于代的回收机制，并使用了更复杂的 <code>链式跟踪算法</code> 来识别对象是否为垃圾。</p>
+<h2 id="gc触发的原因">GC触发的原因</h2>
+<p>截至到.NET 8，GC触发的原因有18种</p>
+<pre><code>enum gc_reason
+{
+    reason_alloc_soh = 0,//小对象堆，快速分配预算不足
+    reason_induced = 1,//主动触发GC，没有关于压缩和阻塞的选项
+    reason_lowmemory = 2,//操作系统发出内存不足通知信号
+    reason_empty = 3,//操作系统内存耗尽
+    reason_alloc_loh = 4,//大对象堆，快速分配预算不足
+    reason_oos_soh = 5,//小对象堆段，慢速分配预算不足
+    reason_oos_loh = 6,//大对象堆段，慢速分配预算不足
+    reason_induced_noforce = 7, // it's an induced GC and doesn't have to be blocking.
+    reason_gcstress = 8,        // this turns into reason_induced &amp; gc_mechanisms.stress_induced = true
+    reason_lowmemory_blocking = 9,
+    reason_induced_compacting = 10,
+    reason_lowmemory_host = 11,//主机发出内存不足通知信号
+    reason_pm_full_gc = 12, // provisional mode requested to trigger full GC
+    reason_lowmemory_host_blocking = 13,
+    reason_bgc_tuning_soh = 14,
+    reason_bgc_tuning_loh = 15,
+    reason_bgc_stepping = 16,
+    reason_induced_aggressive = 17,
+    reason_max
+};
+</code></pre>
+<p>根据命名总体分为5类</p>
+<ol>
+<li>ptr_limit预算用完<br>
+reason_alloc_soh,reason_alloc_loh 代空间不够</li>
+<li>段空间预算用完<br>
+reason_oos_soh,reason_oos_loh oos是OutOfSegment的缩写，</li>
+<li>代码主动触发<br>
+reason_induced_xxxx,比如GC.Collect</li>
+<li>系统内存不足<br>
+reason_lowmemory,reason_lowmemory_blocking,reason_empty,reason_lowmemory_host</li>
+<li>其它<br>
+reason_bgc_tuning_soh,reason_bgc_tuning_loh</li>
+</ol>
+<blockquote>
+<p><a href="https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.h" target="_blank" rel="noopener nofollow">https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.h</a></p>
+</blockquote>
+<h3 id="眼见为实触发gc的详情">眼见为实：触发GC的详情</h3>
+<p>使用x coreclr!*gc_heap::settings*<br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250113141900195-1269865105.png" alt="image" loading="lazy"></p>
+<h3 id="眼见为实触发gc的次数">眼见为实：触发GC的次数</h3>
+<p>x coreclr!*full_gc_counts*<br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250113142032746-780731906.png" alt="image" loading="lazy"></p>
+<pre><code>enum gc_type
+{
+    gc_type_compacting = 0,
+    gc_type_blocking = 1,
+#ifdef BACKGROUND_GC
+    gc_type_background = 2,
+#endif //BACKGROUND_GC
+    gc_type_max = 3
+};
+</code></pre>
+<p>coreCLR内部会记录各种类型GC触发的次数，以供参考。</p>
+<h2 id="gc回收流程图节选">GC回收流程图(节选)</h2>
+<p>以<span style="color: rgba(255, 0, 0, 1)">非并发工作站GC</span>为蓝本,投石问路，先介绍最简单的一种，后面文章再展开。说人话就是挖坑待埋。<br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250107174811964-1990933098.png" alt="image" loading="lazy"></p>
+<blockquote>
+<p><a href="https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md" target="_blank" rel="noopener nofollow">https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md</a></p>
+</blockquote>
+<h1 id="对象的遍历与标记">对象的遍历与标记</h1>
+<p>在mark_phase阶段，CLR会从根对象出发，寻找所有可到达对象，也就是依旧存在引用关系的对象。主要历经以下几个步骤</p>
+<ol>
+<li>将根对象转换为托管对象的地址<br>
+如果根对象是非托管对象，需要在托管堆中给它占一个坑</li>
+<li>设置固定标记<br>
+如果对象被固定，在ObjectHeader中，设置一个flg。</li>
+<li>开始遍历对象的引用<br>
+通过MethodTable的类型信息，得出内部引用的偏移量。从而以<span style="color: rgba(255, 0, 0, 1)">深度优先</span>的方式扫描。并将已经扫描的对象维护到一个集合中，这被称为<span style="color: rgba(255, 0, 0, 1)">"标记堆栈"</span></li>
+</ol>
+<p>当标记堆栈中，不存在未访问的对象时。即代表遍历操作完成</p>
+<blockquote>
+<p>注意：pinned与marked标记都是在mrak_phase阶段被设置，plan_phase阶段被清除。在正常情况下，是不会存在objectheader与methodtable中的。</p>
+</blockquote>
+<h1 id="根对象">根对象</h1>
+<p>标记阶段最重要的任务，就是标记引用根(root)，对于引用跟踪算法而言，这是万物的起点。<br>
+C#中，root分为<span style="color: rgba(255, 0, 0, 1)">四种</span>，组成了标记阶段要扫描的所有root</p>
+<h2 id="线程栈thread-stack">线程栈(thread stack)</h2>
+<p>查找stack上的根对象，如果实时扫描stack与寄存器，在面对高频次的小对象GC中会显得力不从心，因此，CLR团队采用了更高性能的查询策略。</p>
+<ol>
+<li>空间换时间，对引用类型缓存一个额外的gcinfo来提高查询性能</li>
+<li>激进式根回收，对作用域进行判断，过滤掉出不会被线程栈引用的对象</li>
+</ol>
+<h3 id="眼见为实gcinfo">眼见为实：gcinfo</h3>
+<details>
+<summary>点击查看代码</summary>
+<pre><code>        static void Main(string[] args)
+        {
+            var name = "lewis.liu";
+
+            var age = 155;
+
+            var person=new Person();
+
+            Debugger.Break();
+        }
+</code></pre>
+</details>
+<p><img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250109170316824-1376060378.png" alt="image" loading="lazy"></p>
+<p><img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250109173247333-831918415.png" alt="image" loading="lazy"></p>
+<h3 id="眼见为实激进式根回收">眼见为实：激进式根回收</h3>
+<details>
+<summary>点击查看代码</summary>
+<pre><code>        static void Main(string[] args)
+        {
+
+            Timer timer = new Timer((obj) =&gt;
+            {
+                Console.WriteLine($"我是 Timer 线程，当前时间：{DateTime.Now}");
+            }, null, 0, 100); 
+
+
+            var person = new Person();
+
+            GC.Collect();
+            Console.WriteLine("GC已触发。。。");
+
+            Console.ReadLine();
+        }
+</code></pre>
+</details>
+<p>使用.NET Core 2.1 分别以Debug与Release来运行。会发现惊喜！</p>
+<p><strong>1. Debug</strong><br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250109172357237-1574156824.png" alt="image" loading="lazy"><br>
+<strong>2. Release</strong><br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250109172418694-1898804999.png" alt="image" loading="lazy"></p>
+<p>简单来说，不同版本的JIT对作用域有不同的判断策略，.NET Core 2.1中，会认为在触发GC.Collect()之前，timer与person都不再被stack所引用，因此会被GC所释放掉。这个过程叫做<span style="color: rgba(255, 0, 0, 1)">激进式根回收</span></p>
+<blockquote>
+<p>.NET Core 3 之后已经修复此问题。</p>
+</blockquote>
+<h2 id="终结器队列finalize-queue">终结器队列(Finalize queue)</h2>
+<p>带有析构函数的对象，会单独在<span style="color: rgba(255, 0, 0, 1)">终结器队列</span>中持有一份对这个对象的引用</p>
+<h3 id="眼见为实">眼见为实</h3>
+<details>
+<summary>点击查看代码</summary>
+<pre><code>    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            Run();
+            Debugger.Break();
+            GC.Collect();
+            Console.WriteLine("11");
+            Debugger.Break();
+        }
+
+        static void Run()
+        {
+            var person = new Person();
+        }
+    }
+
+    class Person
+    {
+        public int Id { get; set; }
+        ~Person()
+        {
+            Console.WriteLine("析构已执行");
+        }
+    }
+</code></pre>
+</details>
+<p><img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250110093915687-1398896604.png" alt="image" loading="lazy"></p>
+<h2 id="gc句柄表gchandles">GC句柄表(GCHandles)</h2>
+<p>通过GCHandle.Alloc或者fix产生的固定，以及CLR内部固定的对象<br>
+它们全部存储在CLR内部的<span style="color: rgba(255, 0, 0, 1)">全局句柄映射表</span>中 ，可以使用!gchandles命令查看</p>
+<p>GCHandleType总共有五种，GC只会对Normal，Pinned视为root，</p>
+<ol>
+<li>Weak<br>
+弱引用，弱引用允许应用程序访问对象，同时不会阻止垃圾回收器回收该对象</li>
+<li>WeakTrackResurrection<br>
+类似弱引用，与普通弱引用不同的是，当对象被垃圾回收时，它仍然可以跟踪对象的复活（Resurrection）情况</li>
+<li>Normal<br>
+强引用，只要这个GCHandle存在，垃圾回收器就不会回收它所引用的托管对象</li>
+<li>Pinned<br>
+强引用的更强版，当一个对象被这种方式引用时，它会在内存中被 “固定”，防止垃圾回收器移动它的位置。这在与非托管代码交互时非常重要</li>
+<li>AsyncPinned(未开放)<br>
+固定句柄还有一个重要的变种，叫异步固定句柄，作用与类似pinned，有一个额外功能：一旦异步操作完成，它即在内部取消pinned状态。使得pinned的时间尽可能的短。目前尽在CLR内部开放。</li>
+</ol>
+<blockquote>
+<p>还有一个fixed关键字，也可以固定对象。两者结果相同，但是root不同，使用GCHandle时是句柄表，使用fixed关键词是标记堆栈</p>
+</blockquote>
+<h3 id="眼见为实-1">眼见为实</h3>
+<details>
+<summary>点击查看代码</summary>
+<pre><code>    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            Run();
+            Debugger.Break();
+        }
+
+        static void Run()
+        {
+            var person = new Person();
+            GCHandle.Alloc(person, GCHandleType.Normal);
+        }
+    }
+
+    class Person
+    {
+    }
+</code></pre>
+</details>
+<p><img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250110095321960-236152406.png" alt="image" loading="lazy"><br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250110095352509-1165155537.png" alt="image" loading="lazy"></p>
+<h2 id="跨代引用">跨代引用</h2>
+<p>为了解决跨代引用问题产生的卡表，卡包</p>
+<p><img src="https://img2024.cnblogs.com/blog/1084317/202410/1084317-20241031141145079-1843708103.png" alt="image" loading="lazy"></p>
+<p>图中举例了一个常见的情况</p>
+<ol>
+<li>年前对象引用老对象<br>
+A对象创建的时候，字段引用了对象E 。这很合理吧？</li>
+<li>老对象引用年前对象<br>
+在代码运行过程中，对象D的某个字段引用了对象A 。这也很合理吧？</li>
+</ol>
+<p>那么问题来了，CLR将SOH分为0代，1代，2代。目的就是想根据<span style="color: rgba(255, 0, 0, 1)">生命周期</span>的不同。对不同的代设置不同的GC频率。<br>
+现在好了，我回收0代内存，还因为被1代和2代引用。导致GC标记的时候，要<span style="color: rgba(255, 0, 0, 1)">遍历整个对象图</span></p>
+<p>那内存分代图个什么？<br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202410/1084317-20241031142527009-6543568.png" alt="image" loading="lazy"></p>
+<h3 id="remembered-sets">remembered sets</h3>
+<p>为了处理跨代引用的问题，CLR团队引入了remembered sets（记忆集）。简单来说，就是记录对象被哪些对象所引用。拿空间换时间</p>
+<blockquote>
+<p>太阳底下没有新鲜事，JVM也是使用记忆集解决跨代引用的问题</p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/1084317/202410/1084317-20241031150953671-728875539.png" alt="image" loading="lazy"><br>
+举个例子，回收1代内存。在某个时机(对象创建，指针移动)，冗余了引用关系。那么只需要扫描对象的GC Root与remembered sets 便可轻松得知对象是否能被回收</p>
+<blockquote>
+<p>思考一个问题，这里还有优化空间吗？</p>
+</blockquote>
+<h4 id="remembered-sets存储的优化">remembered sets存储的优化</h4>
+<p>上面可以看到，当回收1代内存时，要同时维护与0代和2代的关系。实现记忆集并不是一件容易的事</p>
+<blockquote>
+<p>思考一下单链表与双链表的维护成本</p>
+</blockquote>
+<p>那么如何减少维护成本呢？CLR团队做了一个决定：”回收N代意味着回收该代以及N-1代的对象“<br>
+简单来说就是：</p>
+<ol>
+<li>仅回收0代</li>
+<li>仅回收0代，1代</li>
+<li>完全回收，回收0，1，2以及LOH</li>
+</ol>
+<p>这样的话，记忆集只需要维护<span style="color: rgba(255, 0, 0, 1)">比对象代更老</span>的关系，大大减轻了维护成本</p>
+<h4 id="remembered-sets查询的优化">remembered sets查询的优化</h4>
+<p>将每个对象的引用存储在记忆集中，记忆集虽然很小(只包含了更老对象的引用)，但在大型系统中，几万甚至十几万个对象都是正常的现象，那么意味着也会有同等数量的记忆集。维护数量如此庞大的记忆集，将会为GC管理带来极大的开销<br>
+因此，CLR团队必须做出一些妥协，在性能与准确性之间进行权衡</p>
+<ol>
+<li>卡表(Card Tables)<br>
+卡表的原理很简单，将老一代的内存地址。在逻辑上<span style="color: rgba(255, 0, 0, 1)">拆分为固定大小的区域</span>。某个区域只要有任意对象存在跨代引用。就将对象所在的区域标记为dirty.<br>
+<img src="https://img2024.cnblogs.com/blog/1084317/202410/1084317-20241031163634845-423992093.png" alt="image" loading="lazy"></li>
+</ol>
+<p>这样虽然会导致即使只有一个记忆集，也必须访问card中的所有对象。但也极大提高了GC的性能</p>
+<blockquote>
+<p>有点类似涂抹算法<br>
+源码地址：<a href="https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/amd64/JitHelpers_FastWriteBarriers.asm" target="_blank" rel="noopener nofollow">https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/amd64/JitHelpers_FastWriteBarriers.asm</a></p>
+</blockquote>
+<p>在.NET Runtime中，一个bit位(clean/dirty代表0/1)对应256byte(64位)与128byte(32位) .<br>
+以64位系统为例，1byte可以表示8<em>256=2048byte的存储区域。<br>
+一个卡表字的大小为4字节(DWORD).它所覆盖的大小为4</em>2048=8192byte</p>
+<ol start="2">
+<li>卡包(Card Bundles)<br>
+任意一个对象包含跨代引用，都会涂抹2048byte的空间。这就足够了吗？<br>
+假如一个Web应用程序内存使用量为1gb,那么对应多少卡表呢？1024<em>1024</em>1024/2024=524288. 512kb。<br>
+乍一看还算好，1mb都没有。但不要忘了，每一个对象都需要扫描一遍Card Table，以确定是否存在跨代引用。</li>
+</ol>
+<blockquote>
+<p>想象一下，一个占用内存32gb的，超过5万个对象的服务器。它们的扫描量有多大。这会严重拖慢GC时间</p>
+</blockquote>
+<p>因此，基于Card Tables的思路，CLR团队又引入了Card Bundles的概念。<br>
+以64位系统为例,每个bit位代表32个卡表字。因此一个bit覆盖范围为32<em>8192=262144,256kb<br>
+一个卡包位占用4字节空间，因此一个卡包可以覆盖256kb</em>8*4=8192kb ,8mb空间。</p>
+<blockquote>
+<p>这时候再算一下1gb内存使用量的web服务器，1024/8=128 .扫描量是不是就大大减少了。<br>
+其核心思路类似涂抹算法+二级缓存</p>
+</blockquote>
+<h3 id="眼见为实-2">眼见为实</h3>
+<details>
+<summary>点击查看代码</summary>
+<pre><code>        static void Main(string[] args)
+        {
+            var address = CreatedAddress();
+            GC.Collect();//gc后 address 升为1代
+            Debugger.Break();
+
+            var person = CreatedPerson();
+            person.Address = address;//0代的person引用1代的address
+
+
+            Debugger.Break();
+        }
+        static Address CreatedAddress()
+        {
+            var address = new Address()
+            {
+                City = "xxx",
+                County = "yyy"
+            };
+            return address;
+        }
+        static Person CreatedPerson()
+        {
+            var person = new Person()
+            {
+                Address = null,
+            };
+            return person;
+        }
+</code></pre>
+</details>
+<p><img src="https://img2024.cnblogs.com/blog/1084317/202501/1084317-20250110104154568-1340197998.png" alt="image" loading="lazy"></p>
+
+</div>
+<div class="clear"></div>
+
+		<p class="postfoot">
+			posted on 
+<span id="post-date" data-last-update-days="0.1594368825925926" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-01-13 14:28">2025-01-13 12:23</span>&nbsp;
+<a href="https://www.cnblogs.com/lmy5215006">叫我安不理</a>&nbsp;
+阅读(<span id="post_view_count">118</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18657952" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18657952);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18657952', targetLink: 'https://www.cnblogs.com/lmy5215006/p/18657952', title: '.NET Core GC标记阶段(mark_phase)底层原理浅谈' })">举报</a>
+
+		</p>
+	
