@@ -1,0 +1,490 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/swx123/p/18689447/golang-syncpool-source-code-analysis-1xpgw6" title="发布于 2025-01-24 14:05">
+    <span role="heading" aria-level="2">Golang sync.pool源码解析</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        sync.Pool 是 Go 中用于对象复用的工具，可减少频繁创建和销毁对象的开销，从而优化内存使用和降低 GC 压力。本文通过分析其用法、真实案例及源码结构，详细解读了 sync.Pool 的读写流程及其背后的高效设计思想，为性能优化提供了实用参考。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>👋 大家好，我是思无邪，某go中厂开发工程师，也是OSPP2024的学生参与者！<br>
+🚀 如果你觉得我的文章有帮助，记得三连支持一下哦！<br>
+🍂 目前正在深入研究源码，与你们一起进步，共同攻克编程难关！<br>
+📝 欢迎关注我的公众号【小菜先生的编程随想】，一起学习、一起成长，勇敢面对互联网寒冬！💡</p>
+<h1 id="golang-syncpool源码解析">Golang sync.pool源码解析</h1>
+<pre><code class="language-mindmap">- sync.pool
+	- 是什么
+	- 怎么用
+		- demo
+		- 真实世界的使用
+	- 源码解读-数据结构
+	- 源码解读-读写流程
+		- 写流程
+		- 读流程
+	- 源码解读-细节补充
+	- 总结
+</code></pre>
+<h2 id="引言">引言</h2>
+<p>​<code>sync.pool</code> ​是 golang 语言提供的一种用于缓存对象的“池子”。</p>
+<p>可以通过 <code>sync.pool</code> ​将对象放入“池”中缓存，在后续创建对象时避免真正申请内存创造对象的步骤，是一种典型的空间换时间的优化思路~</p>
+<p>‍</p>
+<h2 id="是什么--怎么用">是什么 | 怎么用</h2>
+<p>sync.pool 是 golang 语言提供的一种对象缓存机制，通过将对象缓存在 pool 中，可以避免每次创建对象的时候都重新申请内存构造对象，而是直接从 pool 中取出对象使用即可，在频繁创建对象和销毁对象的时候极大的缓解了 gc 压力。</p>
+<p><img src="https://img2024.cnblogs.com/blog/2630005/202501/2630005-20250124143123237-73117003.png" alt="" loading="lazy"></p>
+<h3 id="使用-demo-和注意事项">使用 demo 和注意事项</h3>
+<p>sync.pool的使用非常简单，创建池子之后put、get对象即可，全部代码可见：「<a href="https://github.com/578223592/go-small-practices/blob/31a13fa1b86e8a439384e5c0b3816e3bd2e2d03b/test4/main.go#L34" target="_blank" rel="noopener nofollow">我的github仓库</a>」。</p>
+<pre><code class="language-go">func NewStudent() *Student {
+	return &amp;Student{}
+}
+
+type Student struct {
+	Name  string
+	Age   int
+	Right bool
+}
+
+func (s *Student) Clear() {
+	s.Name = ""
+	s.Age = 0
+	s.Right = false
+}
+
+var studentPool = sync.Pool{
+	New: func() interface{} {
+		return NewStudent()
+	},
+}
+
+func main() {
+	student := studentPool.Get().(*Student)
+	// 使用student
+
+	student.Clear() //返回给studentPool之前必须清空
+	studentPool.Put(student)
+}
+</code></pre>
+<p>虽然使用非常简单，但是在使用的过程中，我们必须注意下面几个事项，以防使用出错。</p>
+<ul>
+<li>
+<p>「非常重要」pool 在使用的时候需要在创建对象的时候或者是销毁的时候<strong>清空自己</strong>，如果不清空，产生的错误及其难排查错误。具体来说：对于基础数据类型，赋予零值，对于数组之类的，可以使用<code>[:0]</code>​来清空，避免重新申请内存（当然同时要注意数组长度过长还是直接<code>make(T,0)</code>​清空合适）。</p>
+</li>
+<li>
+<p>池子对外暴露的方法<code>Put</code>​和<code>Get</code>​，其执行顺序没有任何依赖。<code>Put</code>​后马上<code>Get</code>​，存取的对象没有任何保证是同一个。</p>
+</li>
+<li>
+<p>对<strong>大对象使用池优化效果明显</strong>：池子本身是对对象的复用，减少了重复创建对象和反复GC的开销，但是由于将对象放入池子中本身也存在一定的开销，因此一般来说对大对象才使用池进行优化，对于小对象可能还有反向优化。</p>
+</li>
+</ul>
+<h3 id="真实世界的使用">真实世界的使用</h3>
+<ol>
+<li>
+<p>在基于 gin 启动的 http server 中，针对到来的 http 请求，会为之分配一个 gin.Context 实例，由于承载关于这次请求链路的上下文信息.</p>
+<p>在这个场景中，gin.Context 就是一个可能被量产使用的工具类，其本身创建销毁成本不高，但随着 qps（Query Per-Second） 的增长，可能在短时间内被重复创建、销毁，因此很适合使用对象池技术进行缓存复用.</p>
+</li>
+<li>
+<p>​<code>fmt.Printf</code>​ ，来源于golang源码：</p>
+</li>
+</ol>
+<pre><code class="language-go">// go 1.13.6
+
+// pp is used to store a printer's state and is reused with sync.Pool to avoid allocations.
+type pp struct {
+    buf buffer
+    ...
+}
+
+var ppFree = sync.Pool{
+	New: func() interface{} { return new(pp) },
+}
+
+// newPrinter allocates a new pp struct or grabs a cached one.
+func newPrinter() *pp {
+	p := ppFree.Get().(*pp)
+	p.panicking = false
+	p.erroring = false
+	p.wrapErrs = false
+	p.fmt.init(&amp;p.buf)
+	return p
+}
+</code></pre>
+<h2 id="源码解读-数据结构">源码解读-数据结构</h2>
+<h3 id="结构总览">结构总览</h3>
+<p>sync.pool设计的结构体的总览图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/2630005/202501/2630005-20250124143148152-142331412.png" alt="" loading="lazy"></p>
+<ul>
+<li>
+<p>​<code>Pool</code>​是对外提供的结构体，作为go的使用方可以直接看到。</p>
+</li>
+<li>
+<p>​<code>local</code>​是一个数组，每个元素为<code>poolLocal</code>​。其类型是<code>unsafe.pointer</code>​也可以用来表示数组，后面单独总结，这先就看成数组即可。</p>
+</li>
+<li>
+<p>poolLocal里面就两个元素：<code>poolLocalInternal</code>​和<code>pad</code>​。<code>poolLocalInternal</code>​是核心，<code>pad</code>​只是为了字节对齐128而产生填充。</p>
+</li>
+<li>
+<p>​<code>poolLocalInternal</code>​中两个元素：</p>
+<ul>
+<li>​<code>private</code>​：每个p私有的元素，不会被其他p操作。</li>
+<li>​<code>poolChain</code>​：对外提供双向链表的能力。不同于普通双向链表，其每个节点是一个环形数组而非一个数据。并且提供“有限制的”并发能力。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p>为什么<code>poolChain</code>​中的每个节点是 环形数组 而非节点，大概原因是因为环形数组这样的结构是内存连续的，可以更好的利用cpu缓存的特性，这点更优于链表。</p>
+<p>而既然环形数组这么优秀，那么为什么<code>poolChain</code>​为什么还是一个链表呢？为什么不把它直接做成一个环形数组？</p>
+<p>因为环形数组虽然可以利用缓存，但是其必须要提前申请空间，在元素数量不多的情况下会对空间有比较多的浪费。</p>
+</blockquote>
+<h3 id="poolchain的设计">poolchain的设计</h3>
+<p>poolChain有如下几个特点：</p>
+<ul>
+<li>lock-free</li>
+<li>固定大小，ring形结构(底层存储使用数组,使用两个指针标记ehead、tail)</li>
+<li>单生产者</li>
+<li>多消费者</li>
+<li>生产者可以从head进行<code>pushHead</code>​、<code>popHead</code>​</li>
+<li>消费者可以从tail进行<code>popTail</code>​</li>
+</ul>
+<p>上面提到【<code>poolChain</code>​：对外提供双向链表的能力。不同于普通双向链表，其每个节点是一个环形数组而非一个数据。并且提供有限制的并发能力。】，对于有限制的并发能力，指的是：单生产者，可以从head进行<code>pushHead</code>​生产、<code>popHead</code>​消费；多消费者，消费者可以从tail进行<code>popTail</code>​消费。</p>
+<p>其具体设计细节虽然对pool的使用性能有很重要的影响，但是并不是本篇文章的重点，因此将其拆分在sync.pool中的“并发”“双向链表”poolChain的设计学习[^1]中。</p>
+<h2 id="源码解读-主要流程走读">源码解读-主要流程走读</h2>
+<p>sync.pool在创建之后，对外提供的操作入口之后两个：读（<code>Get</code>​）和写（<code>Put</code>​），两种操作在某种程度上是”逆反操作“。</p>
+<h3 id="归还对象流程">归还对象流程</h3>
+<p>写流程的入口函数是<code>Put</code>​函数，其函数如下代码块。主要逻辑也是很简单：</p>
+<p><img src="https://img2024.cnblogs.com/blog/2630005/202501/2630005-20250124143156155-936570985.png" alt="" loading="lazy"></p>
+<p>核心源码如下：</p>
+<pre><code class="language-go">// Put adds x to the pool.
+func (p *Pool) Put(x any) {
+	if x == nil {
+		return
+	}
+	l, _ := p.pin() //pin返回的两个元素：当前p对应的poolLocal，当前p的id
+	if l.private == nil { //private对象对p来说是私有的，存取效率更高，因此优先存取，这里发现没有，就存到这
+		l.private = x
+		x = nil
+	}
+	if x != nil { //private已经有了，就往shared里面放了，放入shared使用的是头插！
+		l.shared.pushHead(x)
+	}
+	runtime_procUnpin() //接触当前g独占p的状态
+}
+</code></pre>
+<p>其中<code>pin</code>​元素是比较有意思的，<u>其主要功能是：让当前的g独占当前的p，并获取当前p对应的</u>​<u>​<code>poolLocal</code>​</u>​，其源码如下：</p>
+<pre><code class="language-go">// pin pins the current goroutine to P, disables preemption and
+// returns poolLocal pool for the P and the P's id.
+// Caller must call runtime_procUnpin() when done with the pool.
+// pin函数让当前的g独占p，并且返回当前p的poolLocal和P的id
+// 调用方必须在使用pool完毕后调用runtime_procUnpin()函数
+func (p *Pool) pin() (*poolLocal, int) {
+	pid := runtime_procPin()
+	// In pinSlow we store to local and then to localSize, here we load in opposite order.
+	// Since we've disabled preemption, GC cannot happen in between.
+	// Thus here we must observe local at least as large localSize.
+	// We can observe a newer/larger local, it is fine (we must observe its zero-initialized-ness).
+	s := runtime_LoadAcquintptr(&amp;p.localSize) // load-acquire
+	l := p.local                              // load-consume
+	if uintptr(pid) &lt; s {
+		return indexLocal(l, pid), pid
+	}
+	return p.pinSlow()
+}
+</code></pre>
+<p>按理来说没有太多特别的地方，因为按照预想的节奏，每个p与<code>poolLocal</code>​是一一对应的关系，因此按照当前p的pid去数组对应下标取<code>poolLocal</code>​就可以了！</p>
+<p>但是<strong>有一点很重要也很有意思，这种p和</strong>​<strong>​<code>poolLocal</code>​</strong>​<strong>一一对应的关系是什么时候建立的？初始化的时候并没有这个操作！ 其奥秘就在</strong>​<strong>​<code>pinSlow</code>​</strong>​函数中！</p>
+<p>​<code>pinSlow</code>​的源码如下，简单易懂，主要逻辑是解锁后重新拿锁，并尝试重新分配local和localSize。</p>
+<pre><code class="language-go">func (p *Pool) pinSlow() (*poolLocal, int) {
+	// Retry under the mutex.
+	// Can not lock the mutex while pinned.
+	runtime_procUnpin() //先解绑p与g
+	allPoolsMu.Lock() //所有pool共享这个锁
+	defer allPoolsMu.Unlock()
+	pid := runtime_procPin() //绑定
+	// poolCleanup won't be called while we are pinned.
+	s := p.localSize
+	l := p.local
+	if uintptr(pid) &lt; s { // 在解绑p与g之后，加锁之前，可能已经有其他的goroutine执行了pinSlow函数，因此再校验一次
+		return indexLocal(l, pid), pid
+	}
+	if p.local == nil { 
+		allPools = append(allPools, p)
+	}
+	// If GOMAXPROCS changes between GCs, we re-allocate the array and lose the old one.
+	// 如果全局（所有goroutine）第一次进入pinSlow函数，或者改变了runtime.GOMAXPROCS导致进入pinSlow函数
+	// 就会触发local和localSize的重新分配。（原来的直接全部舍弃掉）
+	size := runtime.GOMAXPROCS(0)
+	local := make([]poolLocal, size)
+	atomic.StorePointer(&amp;p.local, unsafe.Pointer(&amp;local[0])) // store-release
+	runtime_StoreReluintptr(&amp;p.localSize, uintptr(size))     // store-release
+	return &amp;local[pid], pid
+}
+</code></pre>
+<p>下面我们再来看下Put函数的最后一步：<code>l.shared.pushHead(x)</code>​，函数的定义如下，其主要功能是向共享的双向链表poolChain头插入一个节点。</p>
+<pre><code class="language-go">func (c *poolChain) pushHead(val any) {
+	d := c.head   //对于头的操作是当前p特有的，因此不用考虑并发安全
+	if d == nil { //  头为nil，即链表中没有元素（没有环形数组），建立环形数组
+		// Initialize the chain.
+		const initSize = 8 // 环形数组大小必须是2的次方
+		d = new(poolChainElt)
+		d.vals = make([]eface, initSize)
+		c.head = d
+		storePoolChainElt(&amp;c.tail, d) //对于尾的操作不是当前p特有的，因此需要用atom相关函数保证并发安全
+	}
+
+	if d.pushHead(val) { //对于环形数组的操作并不是p特有的，因此里面需要考虑并发安全
+		return
+	}
+
+	// 满了就新建一个元素（环形数组），大小为2倍，最大大小为dequeueLimit（32）
+	newSize := len(d.vals) * 2
+	if newSize &gt;= dequeueLimit {
+		// Can't make it any bigger.
+		newSize = dequeueLimit
+	}
+
+	d2 := &amp;poolChainElt{prev: d}
+	d2.vals = make([]eface, newSize)
+	c.head = d2
+	storePoolChainElt(&amp;d.next, d2)
+	d2.pushHead(val)
+}
+</code></pre>
+<p>这里面涉及了一些很有意思的设计：</p>
+<ul>
+<li>​<code>poolChain.head</code>​不用考虑并发，<code>poolChain.tail</code>​需要考虑并发：因为当前p是头插头取，而p操作的时候会使用pin使得当前g独占当前p，因此操作head不会涉及并发；对于其他p的操作是尾取，因此需要考虑并发安全。</li>
+</ul>
+<h3 id="拿取对象流程">拿取对象流程</h3>
+<p>拿取对象入口是<code>Get</code>​函数，<code>Get</code>​流程相较于Put稍微复杂，因为<code>Put</code>​流程无论什么状态下只会涉及操作当前p绑定的local，但是<code>Get</code>​可能会跑到其他p对应的local中的shared的双向链表中“偷取”对象；如果偷不到的话还可能取Vctim中去偷。</p>
+<p>​<code>Get</code>​核心流程图如下，<a href="https://excalidraw.com/#json=JA5NaKZKdRz_GoBUNv0qC,ZTsDHqhOiz1tDIGlukcumQ" target="_blank" rel="noopener nofollow">link</a></p>
+<p>​<img src="https://img2023.cnblogs.com/blog/2630005/202501/2630005-20250124140459658-1388188277.png" alt="image" loading="lazy">​</p>
+<p>从Victim拿取的流程与从Local拿取相比，区别主要是不会优先从shared列表中拿取，原因在于Victim不会再有生产，因此也不用优先从当前的拿取了！</p>
+<p>核心源码如下：</p>
+<pre><code class="language-go">func (p *Pool) Get() any {
+	l, pid := p.pin()
+	x := l.private   //尝试从private拿取
+	l.private = nil
+	if x == nil {  
+		// Try to pop the head of the local shard. We prefer
+		// the head over the tail for temporal locality of
+		// reuse.
+		x, _ = l.shared.popHead() //private拿不到就自己的shared拿取，从头部拿取
+		if x == nil {
+			x = p.getSlow(pid)  //再拿不到就从其他p的local拿取，从尾部开始遍历； 再不行就走Victim拿取的流程
+		}
+	}
+	runtime_procUnpin()
+	if x == nil &amp;&amp; p.New != nil { //最后的兜底，如果还没有拿到，那么就new一个新的出来
+		x = p.New()
+	}
+	return x
+}
+</code></pre>
+<p>‍</p>
+<h3 id="清理pool流程poolcleanup函数">清理pool流程|<code>poolCleanup</code>​函数</h3>
+<p>主要涉及的是：<code>poolCleanup</code>​函数（GC的时候对池化对象的释放)</p>
+<p>与 清理pool的流程 强相关的有victim和victimSize两个变量。</p>
+<pre><code class="language-go">	victim     unsafe.Pointer // local from previous cycle，上一轮的​local
+	victimSize uintptr        // size of victims array ，上一轮的​localSize
+</code></pre>
+<p>在pool文件的init函数中，其将清理pool的函数<code>poolCleanup</code>​注册到gc的钩子中，在每次gc的时候都会执行poolCleanup函数清理sync.pool。</p>
+<pre><code class="language-go">// pool.go文件 start
+func init() {
+	runtime_registerPoolCleanup(poolCleanup)
+}
+//pool.go文件 end
+
+//mgc.go文件  start
+var poolcleanup func()
+
+//go:linkname sync_runtime_registerPoolCleanup sync.runtime_registerPoolCleanup
+func sync_runtime_registerPoolCleanup(f func()) {
+	poolcleanup = f
+}
+
+func clearpools() {
+	// clear sync.Pools
+	if poolcleanup != nil {
+		poolcleanup()
+	}
+	...
+}
+
+// gc入口
+func gcStart(trigger gcTrigger) {
+	//...
+	clearpools()
+	//...
+}
+
+</code></pre>
+<p>在<code>sync.pool</code>​的中总览图中，对于<code>victim</code>​ 和<code>victimSize</code>​介绍其是上一轮的<code>local</code>​和<code>localSize</code>​变量，这里的“上一轮”指的是每一次清理sync.pool，因此在每一次gc的时候都会：会将<code>local pool</code>​中缓存对象移动到<code>victim cache</code>​中，然后在下一次GC时候，清空<code>victim cache</code>​对象。</p>
+<blockquote>
+<p>这也是为什么有种说法是<code>sync.pool</code>​中的对象会保留两个gc的时间：第一个gc从local--&gt;victim，第二个gc从victim--&gt;内存释放。</p>
+</blockquote>
+<p>再来看下<code>poolCleanup</code>​函数，因为其发生的实际一定是gc期间，因此不用考虑锁、<code>pin</code>​绑定之类的函数，一顿操作就行了。</p>
+<pre><code class="language-go">
+func poolCleanup() {
+	// This function is called with the world stopped, at the beginning of a garbage collection.
+	// It must not allocate and probably should not call any runtime functions.
+
+	// Because the world is stopped, no pool user can be in a
+	// pinned section (in effect, this has all Ps pinned).
+
+	// Drop victim caches from all pools.
+	for _, p := range oldPools {
+		p.victim = nil
+		p.victimSize = 0
+	}
+
+	// Move primary cache to victim cache.
+	for _, p := range allPools {
+		p.victim = p.local
+		p.victimSize = p.localSize
+		p.local = nil
+		p.localSize = 0
+	}
+
+	// The pools with non-empty primary caches now have non-empty
+	// victim caches and no pools have primary caches.
+	oldPools, allPools = allPools, nil
+}
+</code></pre>
+<h3 id="源码解读-其它问题补充">源码解读-其它问题补充</h3>
+<h4 id="victim数组">victim数组</h4>
+<p>Q：在正文的「清理pool流程」部分，我们提到 sync.pool中的某个对象在第一轮gc的时候会从local--&gt;victim，第二轮gc的时候才会从victim中被清理掉，那么为什么要有个victim这一步，而不直接被清理掉呢？</p>
+<p>A：victim是“受害者”缓存，相当于是一个gc的缓冲。如果没有victim，那么一次gc之后，下次对象又需要完全重新申请，这时候会增加gc和内存申请的压力。显然victim也是一个空间换时间的做法，保留Victim优化性能的同时，也会带来额外的内存占用的开销！<br>
+因此这样的设计思想实际上是与gc类型的语言强绑定的，如果是非gc类的语言，也许需要一些其他类似思想机制代替victim数组。</p>
+<blockquote>
+<p>软件开发领域很少有“银弹“。</p>
+</blockquote>
+<h4 id="unsafepointer代表数组">unsafe.Pointer代表数组</h4>
+<p>Q1：<code>local  unsafe.Pointer</code>​ 既然本质上是一个数组，那么为什么不直接按照数组来使用，要搞成<code> unsafe.Pointer</code>​的形式来使用呢？</p>
+<p>A1：这里使用<code>unsafe.Pointer</code>​的目的是为了性能，如果使用slice，那么为了保证原子性，不可避免的就需要引入Mutex来保证并发安全，而使用unsafe.Pointer之后，就可以使用atomic相关函数。</p>
+<p>Q2：在<code>sync.pool</code>​中，分别用<code>local</code>​和<code>localSize</code>​维护数组和数组长度，怎么保证“数据的一致性”的？</p>
+<p>A2：既然有两个变量，那么不适用Mutex的情况下肯定是没办法维护两个变量的一致性的。为了防止使用问题，因此只需要保证localSize小于等于数组实际大小即可。<br>
+可以从源码中看出，在重新分配的时候是先分配local然后才分配localSize。</p>
+<pre><code class="language-go">// pinSlow函数 重新分配local和localSize，重新分配只会扩容，不会缩容
+atomic.StorePointer(&amp;p.local, unsafe.Pointer(&amp;local[0])) // store-release
+runtime_StoreReluintptr(&amp;p.localSize, uintptr(size))     // store-release
+
+</code></pre>
+<p>在读取的时候与分配的时候是相反，先读取localSize再读取local，这样保证不会出现使用问题。</p>
+<pre><code class="language-go">// pin函数
+// In pinSlow we store to local and then to localSize, here we load in opposite order.
+// 在pinSlow函数中，先储存local，然后储存localSize，因此以反着顺序来转载。
+	s := runtime_LoadAcquintptr(&amp;p.localSize) // load-acquire
+	l := p.local                              // load-consume
+</code></pre>
+<p>Q3：使用了<code>unsafe.Pointer</code>​来模拟一个array，那么增删改查操作应该如何完成？</p>
+<p>A3：这是一个典型的通用问题，范例代码放在下方，如果刨去疯狂的类型转换，还是非常好理解的!</p>
+<p>读取：</p>
+<pre><code class="language-golang">// indexLocal
+// @Description:  读取对应的内存
+// @param l 为数组刚开始的位置转换成的unsafe.Pointer
+// @param i 偏移量，相当于[i]中的i
+// @return *poolLocal 返回[i]命中的元素
+func indexLocal(l unsafe.Pointer, i int) *poolLocal {
+	lp := unsafe.Pointer(uintptr(l) + uintptr(i)*unsafe.Sizeof(poolLocal{})) //为了能够进行＋操作，因此转成uintptr进行操作
+	return (*poolLocal)(lp)
+}
+
+</code></pre>
+<p>写入：创建一个slice，然后取第0个元素的地址即可。<u>需要注意的是取的是第0个元素的地址，而非slice的地址！</u></p>
+<pre><code class="language-go">// pinSlow 函数
+// @Description:  初始化赋值就直接使用slice的方式来初始化，并且unsafe.Pointer(&amp;local[0])来赋值。
+	size := xxx
+	local := make([]poolLocal, size)
+	atomic.StorePointer(&amp;p.local, unsafe.Pointer(&amp;local[0])) // store-release 
+	runtime_StoreReluintptr(&amp;p.localSize, uintptr(size))     // store-release
+</code></pre>
+<h4 id="golang既然自带gc为什么官方不从需要被内存回收但是还没有被内存回收的对象里面拿对象呢">golang既然自带gc，为什么官方不从需要被内存回收，但是还没有被内存回收的对象里面拿对象呢？</h4>
+<p>因为golang中gc的时候是会STW（stop the world）的，这个问题的前提是gc和pool.Get时间上是并行的，因此不存在这样的前提。</p>
+<h4 id="nocopy相关">noCopy相关</h4>
+<p>Q：pool结构体相关部分中见到了noCopy相关的成员和注释，like：<code>noCopy noCopy // nocopy机制，用于go vet命令检查是否复制后使用</code>​，这个用处是什么？<br>
+A：作用就是禁止这个结构产生复制行为，可以禁止的复制行为包括但是不限于显式的复制、隐式的函数传参复制，like：</p>
+<pre><code class="language-go">type User struct {
+	noCopy noCopy
+}
+func main() {
+	u1 := User{}
+	_ = u1
+	testFunc(u1)
+}
+func testFunc(u User)  {
+
+}
+
+</code></pre>
+<p>这时候如果使用<code>go vet {文件名}</code>​的命令，就可以检测到是否存在不合理的复制：</p>
+<pre><code class="language-bash">(base) ➜  test26 git:(main) ✗ go vet main.go
+# command-line-arguments
+# [command-line-arguments]
+./main.go:10:6: assignment copies lock value to _: command-line-arguments.User contains command-line-arguments.noCopy
+./main.go:11:11: call of testFunc copies lock value: command-line-arguments.User contains command-line-arguments.noCopy
+./main.go:13:17: testFunc passes lock by value: command-line-arguments.User contains command-line-arguments.noCopy
+
+</code></pre>
+<p><u>需要注意的是：go vet检测不合理的复制 !=  编译失败。</u></p>
+<p>实际上，现代的IDE也会直接在编译之前提示，like：​<img src="https://img2023.cnblogs.com/blog/2630005/202501/2630005-20250124140500574-1967134272.png" alt="image" loading="lazy">​</p>
+<p>Q2：noCopy在源码中是没有暴露出来的，我该怎么使用呢？</p>
+<p>A2：没有太好的办法直接使用，最简单的办法就是把源码的视线部分搬到自己的代码中即可：其实就是实现<code>Locker</code>​即可，源码如下：</p>
+<pre><code class="language-bash">// noCopy may be embedded into structs which must not be copied
+// after the first use.
+//
+// See https://golang.org/issues/8005#issuecomment-190753527
+// for details.
+type noCopy struct{}
+
+// Lock is a no-op used by -copylocks checker from `go vet`.
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+</code></pre>
+<blockquote>
+<p>全部代码可见：<a href="https://github.com/578223592/go-small-practices/blob/main/test26/main.go#L13" title="go-small-practices/test26/main.go at main · 578223592/go-small-practices · GitHub" target="_blank" rel="noopener nofollow">我的代码仓库</a></p>
+</blockquote>
+<p>‍</p>
+<h2 id="总结">总结</h2>
+<p>sync.pool为我们提供了一个并发安全的对象池，让我们放心的存取对象，在使用的时候，需要注意”清空“对象。<br>
+sync.pool中有很多精妙的设计思想值得我们学习，包括但不限于：poolChain、内存对齐、sync.pool与golang的gpm体系的结合等等。</p>
+<ul>
+<li>
+<p>poolChain：无锁实现一定并发安全能力的poolChain、并且综合链表和环形数组的优劣势。</p>
+</li>
+<li>
+<p>底层原理中充分考虑到了cpu的缓存，128bit的padding对齐；localPool的private变量</p>
+</li>
+<li>
+<p>代码是逐步优化来的，就算是golang源码编写者这样级别的大佬们，也没法一步就编写出如此精妙的代码，包括但不限于poolChain环形链表和victim数组的设计都是不断演进来的，而不是一开始就全部设计好的，具体见：<a href="https://colobu.com/2019/10/08/how-is-sync-Pool-improved-in-Go-1-13/" title="Go 1.13中 sync.Pool 是如何优化的?" target="_blank" rel="noopener nofollow">Go 1.13中 sync.Pool 是如何优化的?</a></p>
+</li>
+</ul>
+<p>‍</p>
+<p>参考：</p>
+<p><a href="https://geektutu.com/post/hpg-sync-pool.html#4-1-fmt-Printf" target="_blank" rel="noopener nofollow">https://geektutu.com/post/hpg-sync-pool.html#4-1-fmt-Printf</a></p>
+<p><a href="https://www.cnblogs.com/qcrao-2018/p/12736031.html" title="深度解密 Go 语言之 sync.Pool - Stefno - 博客园" target="_blank">深度解密 Go 语言之 sync.Pool - Stefno - 博客园</a></p>
+<p><a href="https://xie.infoq.cn/article/55f28d278cccf0d8195459263" title="Go 并发编程 — 深度剖析 sync.Pool 源码级原理_并发编程_奇伢云存储_InfoQ写作社区" target="_blank" rel="noopener nofollow">Go 并发编程 — 深度剖析 sync.Pool 源码级原理_并发编程_奇伢云存储_InfoQ写作社区</a></p>
+<p><a href="https://colobu.com/2019/10/08/how-is-sync-Pool-improved-in-Go-1-13/" title="Go 1.13中 sync.Pool 是如何优化的?" target="_blank" rel="noopener nofollow">Go 1.13中 sync.Pool 是如何优化的?</a></p>
+<p>感谢大家阅读到这里！🎉<br>
+如果你有任何问题或想法，欢迎在评论区留言，我们一起讨论、一起进步！<br>
+如果你觉得这篇文章对你有所帮助，也请不吝点赞、分享，支持博主继续创作更多优质内容！💪<br>
+关注【小菜先生的编程随想】公众号，我们一起在编程的道路上越走越远，战胜一切挑战！💥<br>
+希望可以下次再见！👋</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.4063925128877315" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-01-24 14:33">2025-01-24 14:05</span>&nbsp;
+<a href="https://www.cnblogs.com/swx123">思wu邪</a>&nbsp;
+阅读(<span id="post_view_count">78</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18689447" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18689447);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18689447', targetLink: 'https://www.cnblogs.com/swx123/p/18689447/golang-syncpool-source-code-analysis-1xpgw6', title: 'Golang sync.pool源码解析' })">举报</a>
+</div>
+        
