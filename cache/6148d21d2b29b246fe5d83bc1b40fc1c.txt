@@ -1,0 +1,207 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huangxincheng/p/18681199" title="发布于 2025-01-20 13:51">
+    <span role="heading" aria-level="2">记一次 .NET某数字化协同管理系统 内存暴涨分析</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一背景">一：背景</h2>
+<h3 id="1-讲故事">1. 讲故事</h3>
+<p>高级调试训练营里的一位朋友找到我，说他们跑在linux上的.NET程序出现了内存泄露的情况，上windbg观察发现内存都是IMAGE给吃掉了，那些image都标记了 <code>doublemapper__deleted_</code> 字样，问我为啥会这样？说实话作为我们这些调试者非常喜欢和这样的人打交道，毕竟沟通起来顺畅，也特别能激发对方的探索欲，这也是训练营给予的一种魅力吧。</p>
+<h2 id="二内存暴涨分析">二：内存暴涨分析</h2>
+<h3 id="1-为什么会暴涨">1. 为什么会暴涨</h3>
+<p>看过我这个系列的朋友都知道观察内存用 <code>!address -summary</code> 命令，但这个命令是为 windows 打造的，所以在 linux 上行不通，为此sos提供了一个专门的命令 <code>!maddress</code> 来替代，接下来使用 <code>!maddress -orderBySize</code> 观察下内存分布情况。</p>
+<pre><code class="language-C#">
+0:000&gt; !maddress -orderBySize
+ +----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+ 
+ | Memory Kind         |        StartAddr |        EndAddr-1 |         Size | Type        | State       | Protect           | Image                                                             | 
+ +----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+ 
+ | Image               |     7f4000000000 |     7f4007ff6000 |     127.96mb | MEM_IMAGE   | MEM_COMMIT  | PAGE_READWRITE    | doublemapper__deleted_                                            | 
+ | Image               |     7f3fc4000000 |     7f3fcbff5000 |     127.96mb | MEM_IMAGE   | MEM_COMMIT  | PAGE_READWRITE    | doublemapper__deleted_                                            | 
+ | Image               |     7f404c021000 |     7f4051b4c000 |      91.17mb | MEM_IMAGE   | MEM_UNKNOWN | PAGE_UNKNOWN      | doublemapper__deleted_                                            | 
+ | Image               |     7f3fae82e000 |     7f3fb4000000 |      87.82mb | MEM_IMAGE   | MEM_COMMIT  | PAGE_EXECUTE_READ | doublemapper__deleted_                                            | 
+ | Image               |     7f406c021000 |     7f40701ff000 |      65.87mb | MEM_IMAGE   | MEM_UNKNOWN | PAGE_UNKNOWN      | doublemapper__deleted_    
+ ...
+  +----------------------------------------------------------------------+ 
+ | Memory Type         |          Count |         Size |   Size (bytes) | 
+ +----------------------------------------------------------------------+ 
+ | Image               |            980 |       3.54gb |  3,801,517,056 | 
+ | PAGE_READWRITE      |          1,178 |       1.17gb |  1,255,059,968 | 
+ | Stack               |             66 |     499.35mb |    523,604,992 | 
+...
+ | NewStubPrecodeHeap  |              4 |      64.00kb |         65,536 | 
+ +----------------------------------------------------------------------+ 
+ | [TOTAL]             |          8,254 |       6.01gb |  6,451,347,968 | 
+ +----------------------------------------------------------------------+ 
+
+</code></pre>
+<p>从卦象看，总计 6.4G 的内存使用，Image 就吃了 3.8G，从 details 看确实都标记了 <code>doublemapper__deleted_</code>，说实话我分析了300多例的dump，Image 吃了大头是第二次遇到，这种故障案例一般是可遇不可求的，接下来我们探究下 <code>doublemapper__deleted_</code> 为何方神圣。</p>
+<h3 id="2-doublemapper__deleted_-是什么">2. doublemapper__deleted_ 是什么</h3>
+<p>要想找到这个答案，先从 coreclr 源代码中寻找蛛丝马迹，全局检索之后很快发现了关键词 <code>doublemapper</code>相关的代码：</p>
+<pre><code class="language-C++">
+bool VMToOSInterface::CreateDoubleMemoryMapper(void** pHandle, size_t *pMaxExecutableCodeSize)
+{
+#ifndef TARGET_OSX
+
+#ifdef TARGET_FREEBSD
+    int fd = shm_open(SHM_ANON, O_RDWR | O_CREAT, S_IRWXU);
+#elif defined(TARGET_SUNOS) // has POSIX implementation
+    char name[24];
+    sprintf(name, "/shm-dotnet-%d", getpid());
+    name[sizeof(name) - 1] = '\0';
+    shm_unlink(name);
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+#else // TARGET_FREEBSD
+    int fd = memfd_create("doublemapper", MFD_CLOEXEC);
+#endif // TARGET_FREEBSD
+
+    *pMaxExecutableCodeSize = MaxDoubleMappedSize;
+    *pHandle = (void*)(size_t)fd;
+#else // !TARGET_OSX
+
+    *pMaxExecutableCodeSize = SIZE_MAX;
+    *pHandle = NULL;
+#endif // !TARGET_OSX
+
+    return true;
+}
+
+</code></pre>
+<p>从卦象看，真尼玛乱，coreclr 为了兼容各种操作系统核，加了无数的 if，else 判断，无语了，最后在非OSX,非FREEBSD,非SUNOS的情况下走了 <code>memfd_create</code> 函数，到这里事情有了一些进展了。</p>
+<p>熟悉 Linux 的朋友应该知道 <code>memfd_create</code> 是一个 Linux 系统调用，用于创建一个匿名文件描述符，如果在 Windows 上找等价函数的话，那就是 win32api 中的 <code>CreateFileMapping</code> 函数，即内存映射文件，这个在源码目录中也能观之一二：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202501/214741-20250120135119809-1297613752.png" alt="" loading="lazy"></p>
+<p>可能有些朋友对 <code>memfd_create</code> 的使用还是有些模糊，我让 chatgpt 帮我生成一段简单的 demo 辅助大家理解下，简化后如下：</p>
+<pre><code class="language-C++">
+int main() {
+    const char *name = "example_memfd";
+    int fd;
+    size_t size = 1024; // 1 KB
+    void *map;
+    const char *text = "Hello, memfd_create!";
+
+    // Create the memory file descriptor
+    fd = memfd_create(name, MFD_CLOEXEC);
+
+    // Resize the memory file to the desired size
+    ftruncate(fd, size)
+
+    // Map the memory file into the address space
+    map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    // Write some data to the memory file
+    strncpy(map, text, strlen(text));
+
+    // Print the data from the memory file
+    printf("Data in memory file: %s\n", (char *)map);
+
+    // Unmap the memory
+    munmap(map, size)
+
+    // Close the file descriptor
+    close(fd);
+
+    return 0;
+}
+
+</code></pre>
+<p>卦中的逻辑非常简单，需要注意的是这里有一个重要步骤就是通过 mmap 将 fd 挂上物理内存，即 <code>fd -&gt; mmap &lt;- memory</code>，挂上之后就可以轻松的往里面写数据了。</p>
+<p>有了这些基础之后，大家再看 <code>doublemapper__deleted_</code> 字样是不是有种豁然开朗的感觉？大概就是资源释放中只执行了 <code>close(fd)</code>，但没有执行 <code>mummap</code>，参考如下：</p>
+<pre><code class="language-C++">
+    // Unmap the memory (某种原因未执行)
+    //munmap(map, size)  
+
+    // Close the file descriptor
+    close(fd);
+
+</code></pre>
+<p>哈哈，当然我的推测不一样对，熟悉 linux 的朋友可以指点指点。 接下来研究方向在哪里呢？既然我已经推测出貌似存在某种逻辑bug，但 coreclr 代码不是我们写的，所以我能不能绕过去呢？</p>
+<h3 id="3-可以绕过-memfd_create-吗">3. 可以绕过 memfd_create 吗？</h3>
+<p>要想知道能不能绕过去，还得从源代码中寻找答案，天不负有心人，还真给找到了，简化后的代码如下：</p>
+<pre><code class="language-C++">
+bool ExecutableAllocator::Initialize()
+{
+    if (IsDoubleMappingEnabled())
+    {
+        if (!VMToOSInterface::CreateDoubleMemoryMapper(&amp;m_doubleMemoryMapperHandle, &amp;m_maxExecutableCodeSize))
+        {
+            g_isWXorXEnabled = false;
+            return true;
+        }
+
+        m_CriticalSection = ClrCreateCriticalSection(CrstExecutableAllocatorLock,CrstFlags(CRST_UNSAFE_ANYMODE | CRST_DEBUGGER_THREAD));
+    }
+
+    return true;
+}
+
+bool ExecutableAllocator::IsDoubleMappingEnabled()
+{
+
+#if defined(HOST_OSX) &amp;&amp; defined(HOST_ARM64)
+    return false;
+#else
+    return g_isWXorXEnabled;
+#endif
+}
+
+bool ExecutableAllocator::g_isWXorXEnabled = CLRConfig::GetConfigValue(CLRConfig::EXTERNAL_EnableWriteXorExecute) != 0;
+
+RETAIL_CONFIG_DWORD_INFO(EXTERNAL_EnableWriteXorExecute, W("EnableWriteXorExecute"), 1, "Enable W^X for executable memory.");
+
+</code></pre>
+<p>从卦中代码看，最终是由 <code>EnableWriteXorExecute</code> 外部变量控制的，那这个变量是什么意思呢？其实它是操作系统和CPU联合提供的功能，在 <code>https://en.wikipedia.org/wiki/W%5EX</code> 上对 <code>W^X</code> 特性做了介绍，大概意思就是:</p>
+<blockquote>
+<p>它是一种内存保护策略，根据该策略，进程或内核地址空间中的每个页面要么是可写的，要么是可执行的，但不能同时具备这两种属性,如果没有这种保护，程序就可以在原本用于存储数据的内存区域中写入（作为数据 “W”）CPU 指令，然后运行（作为可执行代码 “X”；或读 - 执行 “RX”）这些指令。如果写入内存的一方怀有恶意，这就会带来危险。</p>
+</blockquote>
+<p>而且 <code>EnableWriteXorExecute</code> 这东西导致的问题在 github 上有很多的讨论：</p>
+<ol>
+<li><a href="https://github.com/dotnet/runtime/issues/97765" target="_blank" rel="noopener nofollow">https://github.com/dotnet/runtime/issues/97765</a></li>
+<li><a href="https://stackoverflow.com/questions/77164379/how-do-i-debug-a-net-core-console-app-with-windbg-by-launch-executable" target="_blank" rel="noopener nofollow">https://stackoverflow.com/questions/77164379/how-do-i-debug-a-net-core-console-app-with-windbg-by-launch-executable</a></li>
+<li><a href="https://github.com/dotnet/runtime/issues/79469" target="_blank" rel="noopener nofollow">https://github.com/dotnet/runtime/issues/79469</a></li>
+</ol>
+<p>大家给出的建议都是将其关闭，操作方式如下：</p>
+<pre><code class="language-C++">
+export DOTNET_EnableWriteXorExecute=0
+
+</code></pre>
+<p>让朋友关闭了这个选项之后，朋友反馈程序运行正常。</p>
+<h3 id="4-到底是什么代码导致的">4. 到底是什么代码导致的</h3>
+<p>虽然可以通过 <code>export DOTNET_EnableWriteXorExecute=0</code> 搞定这个问题，那到底是什么业务导致产生了很多的 <code>doublemapper</code> 呢？这就需要从这些内存段上寻找答案了，仔细想想，既然是内存文件嘛，大概率承载了 .NET 的 dll 文件，而 dll 文件都是魔术 <code>MZ</code> 开头的。所以使用 s-a 抽查其中一个内存段。</p>
+<pre><code class="language-C#">
+0:000&gt; s-a 7f3fc4000000 7f3fcbff5000-0x1 "MZ"
+00007f3f`c4059ce4  4d 5a 00 00 00 00 00 00-00 00 00 00 7c 00 00 00  MZ..........|...
+00007f3f`c44f2989  4d 5a 3c 40 7f 00 00 b1-05 00 00 94 99 00 00 80  MZ&lt;@............
+00007f3f`c44f2b69  4d 5a 3c 40 7f 00 00 b1-05 00 00 98 99 00 00 40  MZ&lt;@...........@
+00007f3f`c44f3d99  4d 5a 3c 40 7f 00 00 b2-05 00 00 ac 99 00 00 80  MZ&lt;@............
+00007f3f`c44f4d49  4d 5a 3c 40 7f 00 00 b2-05 00 00 b6 99 00 00 80  MZ&lt;@............
+00007f3f`c45a3c61  4d 5a c4 3f 7f 00 00 00-00 00 00 00 00 00 00 cd  MZ.?............
+00007f3f`c45a3ca1  4d 5a c4 3f 7f 00 00 00-00 00 00 00 00 00 00 cd  MZ.?............
+00007f3f`c45a3ce1  4d 5a c4 3f 7f 00 00 00-00 00 00 00 00 00 00 cd  MZ.?............
+00007f3f`c45a3d21  4d 5a c4 3f 7f 00 00 00-00 00 00 00 00 00 00 cd  MZ.?............
+...
+
+</code></pre>
+<p>然后用了一段私藏的脚本导出来后，发现是大量的项目dll，这个就不截图了，朋友也有说他们程序有动态生成代码的逻辑。</p>
+<h2 id="四总结">四：总结</h2>
+<p>EnableWriteXorExecute 特性是在 .NET7 之后默认将0设为1的，在某些开源linux上会因为各种兼容性问题导致各种奇葩的问题发生，这东西我感觉目前还是能禁掉就禁掉吧。<br>
+<img src="https://images.cnblogs.com/cnblogs_com/huangxincheng/345039/o_210929020104最新消息优惠促销公众号关注二维码.jpg" width="700" height="300" alt="图片名称" align="center"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="8.101919947916667" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-01-20 13:52">2025-01-20 13:51</span>&nbsp;
+<a href="https://www.cnblogs.com/huangxincheng">一线码农</a>&nbsp;
+阅读(<span id="post_view_count">703</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18681199" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18681199);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18681199', targetLink: 'https://www.cnblogs.com/huangxincheng/p/18681199', title: '记一次 .NET某数字化协同管理系统 内存暴涨分析' })">举报</a>
+</div>
+        
