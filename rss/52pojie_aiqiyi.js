@@ -11,7 +11,7 @@ const iconv = require('iconv-lite');
 const RSSOUT = "/tmp";
 
 const rootUrl = `https://www.52pojie.cn/forum-66-1.html`;
-const HOME_URL = "https://www.52pojie.cn/thread-1996177-1-1.html"  // 2025-1
+const HOME_URL = "https://www.52pojie.cn/thread-2003371-1-1.html"  // 2025-2
 const title = "吾爱破解-爱奇艺";
 const RSS_NAME = "52pojie_aiqiyi";
 
@@ -26,8 +26,8 @@ async function main() {
     let html = await getPage(HOME_URL);
 
     let items = html.replace(/[ <]/g,"\n").split('\n')
-    .filter(c => (c.indexOf('https://vip.iqiyi.com/') >= 0) && (c.indexOf('redNo=') >= 0))
-    .map(d => d.replace(/.*?(https:.+)/, "$1")).map(u=>{
+    。filter(c => (c.indexOf('https://vip.iqiyi.com/') >= 0) && (c.indexOf('redNo=') >= 0))
+    。map(d => d.replace(/.*?(https:.+)/, "$1")).map(u=>{
         const url = new URL(u);
         const redNo = url.searchParams.get('redNo').replace(/"'/g,'');
         return {
