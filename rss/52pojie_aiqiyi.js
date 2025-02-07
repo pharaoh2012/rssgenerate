@@ -25,31 +25,31 @@ async function main() {
     cookie = await getCookie();
     let html = await getPage(HOME_URL);
 
-    let items = html.replace(/[ <]/g,"\n").split('\n')
-    。filter(c => (c.indexOf('https://vip.iqiyi.com/') >= 0) && (c.indexOf('redNo=') >= 0))
-    。map(d => d.replace(/.*?(https:.+)/, "$1")).map(u=>{
-        const url = new URL(u);
-        const redNo = url.searchParams.get('redNo').replace(/"'/g,'');
-        return {
-            guid: redNo,
-            title: "爱奇艺红包:"+redNo,
-            link: "https://vip.iqiyi.com/html5VIP/activity/hongbao_h5/index.html?redNo="+redNo,
-            description: `<br /><a href='https://vip.iqiyi.com/html5VIP/activity/hongbao_h5/index.html?redNo=${redNo}'>爱奇艺红包:${redNo}</a><br /><br />`
-        }
-    })
-    
+    let items = html.replace(/[ <]/g, "\n").split('\n')
+        .filter(c => (c.indexOf('https://vip.iqiyi.com/') >= 0) && (c.indexOf('redNo=') >= 0))
+        .map(d => d.replace(/.*?(https:.+)/, "$1")).map(u => {
+            const url = new URL(u);
+            const redNo = url.searchParams.get('redNo').replace(/"'/g, '');
+            return {
+                guid: redNo,
+                title: "爱奇艺红包:" + redNo,
+                link: "https://vip.iqiyi.com/html5VIP/activity/hongbao_h5/index.html?redNo=" + redNo,
+                description: `<br /><a href='https://vip.iqiyi.com/html5VIP/activity/hongbao_h5/index.html?redNo=${redNo}'>爱奇艺红包:${redNo}</a><br /><br />`
+            }
+        })
+
     console.info(items);
 
 
-    let xml = tools.getRssXml(title,HOME_URL,items);
+    let xml = tools.getRssXml(title, HOME_URL, items);
 
     // fs.writeFileSync(`${RSSOUT}/${RSS_NAME}.json`, JSON.stringify(items));
     // fs.writeFileSync(`${RSSOUT}/${RSS_NAME}.xml`, xml);
 
     //upload
     await tools.uploadJson(title, HOME_URL, items, RSS_NAME)
-    await tools.uploadXml(xml,RSS_NAME)
-    
+    await tools.uploadXml(xml, RSS_NAME)
+
 }
 
 
@@ -93,14 +93,14 @@ async function getPage(url) {
     // });
 }
 
-async function getDetail(item,i) {
+async function getDetail(item, i) {
     let fn = `/tmp/${item.guid}.txt`;
     if (fs.existsSync(fn)) {
         item.description = fs.readFileSync(fn, "utf8");
         item.cache = 1;
         return;
     }
-    console.info(`${i+1}. get:`, item.title, item.link);
+    console.info(`${i + 1}. get:`, item.title, item.link);
     item.cache = 0;
     let html = await getPage(item.link);
     await tools.sleep(1000);
@@ -136,7 +136,7 @@ module.exports = {
     main: main
 }
 
-if(require.main === module) {
+if (require.main === module) {
     main();
 }
 
