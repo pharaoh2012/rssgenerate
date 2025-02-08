@@ -29,7 +29,7 @@ async function main() {
         .filter(c => (c.indexOf('https://vip.iqiyi.com/') >= 0) && (c.indexOf('redNo=') >= 0))
         .map(d => d.replace(/.*?(https:.+)/, "$1")).map(u => {
             const url = new URL(u);
-            const redNo = url.searchParams.get('redNo').replace(/"'/g, '');
+            const redNo = url.searchParams.get('redNo').replace(/["']/g, '');
             return {
                 guid: redNo,
                 title: "爱奇艺红包:" + redNo,
