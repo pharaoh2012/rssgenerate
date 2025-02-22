@@ -1,0 +1,225 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/12lisu/p/18730055" title="发布于 2025-02-21 19:58">
+    <span role="heading" aria-level="2">10亿数据，如何做迁移？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="section">前言</h2>
+<p>某次金融系统迁移项目中，原计划8小时完成的用户数据同步迟迟未能完成。</p>
+<p>24小时后监控警报显示：由于全表扫描<code>SELECT * FROM users</code>导致源库CPU几乎熔毁，业务系统被迫停机8小时。</p>
+<p>这让我深刻领悟到——<strong>10亿条数据不能用蛮力搬运，得用巧劲儿递接</strong>！</p>
+<p>今天这篇文章，跟大家一起聊聊10亿条数据，如何做迁移，希望对你会有所帮助。</p>
+<h2 id="section-1">一、分而治之</h2>
+<p>若把数据迁移比作吃蛋糕，没人能一口吞下整个十层蛋糕；</p>
+<p>必须切成小块细嚼慢咽。</p>
+<h3 id="section-2">避坑案例：线程池滥用引发的血案</h3>
+<p>某团队用100个线程并发插入新库，结果目标库死锁频发。</p>
+<p>最后发现是主键冲突导致——<strong>批处理必须兼顾顺序和扰动</strong>。</p>
+<p><strong>分页迁移模板代码</strong>：</p>
+<pre><code class="language-java">long maxId = 0;  
+int batchSize = 1000;  
+while (true) {  
+    List&lt;User&gt; users = jdbcTemplate.query(  
+        "SELECT * FROM users WHERE id &gt; ? ORDER BY id LIMIT ?",  
+        new BeanPropertyRowMapper&lt;&gt;(User.class),  
+        maxId, batchSize  
+    );  
+    if (users.isEmpty()) {
+        break;  
+    }
+    // 批量插入新库（注意关闭自动提交）  
+    jdbcTemplate.batchUpdate(  
+        "INSERT INTO new_users VALUES (?,?,?)",  
+        users.stream().map(u -&gt; new Object[]{u.id, u.name, u.email}).collect(Collectors.toList())  
+    );  
+    
+    maxId = users.get(users.size()-1).getId();  
+}
+</code></pre>
+<p><strong>避坑指南</strong>：</p>
+<ul>
+<li>每批取递增ID而不是<code>OFFSET</code>，避免越往后扫描越慢</li>
+<li>批处理大小根据目标库写入能力动态调整（500-5000条/批）</li>
+</ul>
+<blockquote>
+<p><a href="http://www.susan.net.cn" rel="noopener nofollow">最近准备面试的小伙伴，可以看一下这个宝藏网站：www.susan.net.cn，里面：面试八股文、面试真题、工作内推什么都有。</a></p>
+</blockquote>
+<h2 id="section-3">二、双写</h2>
+<p>经典方案是停机迁移，但对10亿数据来说停机成本难以承受，双写方案才是王道。</p>
+<h3 id="section-4">双写的三种段位：</h3>
+<ol>
+<li><strong>青铜级</strong>：先停写旧库→导数据→开新库 →风险：停机时间不可控</li>
+<li><strong>黄金级</strong>：同步双写+全量迁移→差异对比→切流 →优点：数据零丢失</li>
+<li><strong>王者级</strong>：逆向同步兜底（新库→旧库回写），应对切流后异常场景</li>
+</ol>
+<p>当然双写分为：</p>
+<ul>
+<li>同步双写</li>
+<li>异步双写</li>
+</ul>
+<p>同步双写实时性更好，但性能较差。</p>
+<p>异步双写实时性差，但性能更好。</p>
+<p>我们这里考虑使用异步双写。</p>
+<p>异步双写架构如图所示：<br>
+<img src="https://files.mdnice.com/user/5303/db05460a-ddc8-4b75-b1b7-cf7ab5651f0f.png" alt=""></p>
+<p><strong>代码实现核心逻辑</strong>：</p>
+<ol>
+<li>开启双写开关</li>
+</ol>
+<pre><code class="language-java">@Transactional  
+public void createUser(User user) {  
+    // 旧库主写  
+    oldUserRepo.save(user);  
+    // 异步写新库（允许延迟）  
+    executor.submit(() -&gt; {  
+        try {  
+            newUserRepo.save(user);  
+        } catch (Exception e) {  
+            log.error("新库写入失败：{}", user.getId());  
+            retryQueue.add(user);  
+        }  
+    });  
+}
+</code></pre>
+<ol>
+<li>差异定时校验</li>
+</ol>
+<pre><code class="language-java">// 每天凌晨校验差异数据  
+@Scheduled(cron = "0 0 3 * * ?")  
+public void checkDiff() {  
+    long maxOldId = oldUserRepo.findMaxId();  
+    long maxNewId = newUserRepo.findMaxId();  
+    if (maxOldId != maxNewId) {  
+        log.warn("数据主键最大不一致,旧库{} vs 新库{}", maxOldId, maxNewId);  
+        repairService.fixData();  
+    }  
+}
+</code></pre>
+<h2 id="section-5">三、用好工具</h2>
+<p>不同场景需匹配不同的工具链，好比搬家时家具用货车，细软用包裹。</p>
+<h3 id="section-6">工具选型对照表</h3>
+<table>
+<thead>
+<tr>
+<th>工具名称</th>
+<th>适用场景</th>
+<th>10亿数据速度参考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mysqldump</td>
+<td>小型表全量导出</td>
+<td>不建议（可能天级）</td>
+</tr>
+<tr>
+<td>MySQL Shell</td>
+<td>InnoDB并行导出</td>
+<td>约2-4小时</td>
+</tr>
+<tr>
+<td>DataX</td>
+<td>多源异构迁移</td>
+<td>依赖资源配置</td>
+</tr>
+<tr>
+<td>Spark</td>
+<td>跨集群大数据量ETL</td>
+<td>30分钟-2小时</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Spark迁移核心代码片段</strong>：</p>
+<pre><code class="language-spark">val jdbcDF = spark.read  
+    .format("jdbc")  
+    .option("url", "jdbc:mysql://source:3306/db")  
+    .option("dbtable", "users")  
+    .option("partitionColumn", "id")  
+    .option("numPartitions", 100) // 按主键切分100个区  
+    .load()  
+
+jdbcDF.write  
+    .format("jdbc")  
+    .option("url", "jdbc:mysql://target:3306/db")  
+    .option("dbtable", "new_users")  
+    .mode(SaveMode.Append)  
+    .save()
+</code></pre>
+<p><strong>避坑经验</strong>：</p>
+<ul>
+<li>分区数量应接近Spark执行器核数，太多反而降低效率</li>
+<li>分区字段必须是索引列，防止全表扫</li>
+</ul>
+<h2 id="section-7">四、影子测试</h2>
+<p>迁移后的数据一致性验证，好比宇航员出舱前的模拟训练。</p>
+<p><strong>影子库验证流程</strong>：</p>
+<ol>
+<li>生产流量同时写入新&amp;旧双库（影子库）</li>
+<li>对比新旧库数据一致性（抽样与全量结合）</li>
+<li>验证新库查询性能指标（TP99/TP95延迟）</li>
+</ol>
+<p><strong>自动化对比脚本示例</strong>：</p>
+<pre><code class="language-php">def check_row_count(old_conn, new_conn):  
+    old_cnt = old_conn.execute("SELECT COUNT(*) FROM users").scalar()  
+    new_cnt = new_conn.execute("SELECT COUNT(*) FROM new_users").scalar()  
+    assert old_cnt == new_cnt, f"行数不一致: old={old_cnt}, new={new_cnt}"  
+
+def check_data_sample(old_conn, new_conn):  
+    sample_ids = old_conn.execute("SELECT id FROM users TABLESAMPLE BERNOULLI(0.1)").fetchall()  
+    for id in sample_ids:  
+        old_row = old_conn.execute(f"SELECT * FROM users WHERE id = {id}").fetchone()  
+        new_row = new_conn.execute(f"SELECT * FROM new_users WHERE id = {id}").fetchone()  
+        assert old_row == new_row, f"数据不一致, id={id}"
+</code></pre>
+<h2 id="section-8">五、回滚</h2>
+<p>即便做好万全准备，也要设想失败场景的回滚方案——迁移如跳伞，备份伞必须备好。</p>
+<p><strong>回滚预案关键点</strong>：</p>
+<ol>
+<li><strong>备份快照</strong>：迁移前全量快照（物理备份+ Binlog点位）</li>
+<li><strong>流量回切</strong>：准备路由配置秒级切换旧库</li>
+<li><strong>数据标记</strong>：新库数据打标，便于清理脏数据</li>
+</ol>
+<p><strong>快速回滚脚本</strong>：</p>
+<pre><code class="language-sql"># 恢复旧库数据  
+mysql -h旧库 &lt; backup.sql  
+
+# 应用Binlog增量  
+mysqlbinlog --start-position=154 ./binlog.000001 | mysql -h旧库  
+
+# 切换DNS解析  
+aws route53 change-resource-record-sets --cli-input-json file://switch_to_old.json
+</code></pre>
+<h2 id="section-9">总结</h2>
+<p>处理10亿数据的核心心法：</p>
+<ol>
+<li><strong>分而治之</strong>：拆解问题比解决问题更重要</li>
+<li><strong>逐步递进</strong>：通过灰度验证逐步放大流量</li>
+<li><strong>守牢底线</strong>：回滚方案必须真实演练过</li>
+</ol>
+<p>记住——没有百分百成功的迁移，只有百分百准备的Plan B！</p>
+<p>搬运数据如同高空走钢丝，你的安全保障（备份、监控、熔断）就是那根救命绳。🪂</p>
+<h2 id="section-10">最后说一句(求关注，别白嫖我)</h2>
+<p>如果这篇文章对您有所帮助，或者有所启发的话，帮忙关注一下我的同名公众号：苏三说技术，您的支持是我坚持写作最大的动力。</p>
+<p>求一键三连：点赞、转发、在看。</p>
+<p>关注公众号：【苏三说技术】，在公众号中回复：进大厂，可以免费获取我最近整理的10万字的面试宝典，好多小伙伴靠这个宝典拿到了多家大厂的offer。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.6773892667465278" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-02-21 20:02">2025-02-21 19:58</span>&nbsp;
+<a href="https://www.cnblogs.com/12lisu">苏三说技术</a>&nbsp;
+阅读(<span id="post_view_count">179</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18730055" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18730055);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18730055', targetLink: 'https://www.cnblogs.com/12lisu/p/18730055', title: '10亿数据，如何做迁移？' })">举报</a>
+</div>
+        
