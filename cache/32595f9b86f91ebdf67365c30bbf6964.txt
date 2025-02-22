@@ -1,0 +1,256 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/JulianHuang/p/18731012" title="发布于 2025-02-22 16:41">
+    <span role="heading" aria-level="2">记一次golang项目context引发的进程OOM故障</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>之前写过一篇<a href="https://juejin.cn/post/7088136319376818206" target="_blank" rel="noopener nofollow">一种基于etcd实践节点自动故障转移的思路</a>， 程序经历过一次<strong>线上进程内存持续上涨终OOOM</strong>的小事故， 本次技术复盘导致本次内存泄露的完整起因。</p>
+<p>提炼代码：</p>
+<p>业务函数etcdWatchLoop： 基于etcd的<code>Watch机制</code>持续监听<code>/foo</code>前缀键值对的变更; 收到Watch信道的变更消息，就去查询当前键值对。</p>
+<pre><code class="language-golang">func etcdWatchLoop() error {
+	ctx, cancle := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancle()
+	wchan := eClient.Watch(ctx, "/foo", clientv3.WithPrefix())
+
+   var tick = time.NewTicker(time.Minute * 1)
+	defer tick.Stop()
+	for {
+		select {
+                case &lt;-tick.C: // 1min 探测一次，防止假死
+			fmt.Println("watch tick")
+		case resp := &lt;-wchan:
+			fmt.Printf("watch result: %v \n", resp)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+			defer cancel()
+			if r, err := eClient.Get(ctx, "/foo"); err != nil {
+				fmt.Println(err)
+			} else {
+				// todo logic 
+			}
+		}
+	}
+}
+</code></pre>
+<p>程序日志显示： 程序进入死循环。</p>
+<pre><code> watch result: {{0 0 0 0 {} [] 0} [] 0 false false &lt;nil&gt; } 
+ watch result: {{0 0 0 0 {} [] 0} [] 0 false false &lt;nil&gt; } 
+ watch result: {{0 0 0 0 {} [] 0} [] 0 false false &lt;nil&gt; } 
+ .....
+</code></pre>
+<p>当时etcd底层正在压缩或者发生网络问题，watch方法产生的信道<code>resp := &lt;-wchan</code>被cancle了，信道被关闭，程序进入了死循环。</p>
+<p><strong>故障产生的第一点： 没有关注到从closed的信道中能持续读取到零值</strong>，导致进入无限循环。</p>
+<hr>
+<p>无限循环（持续发送到etcd的get请求） 导致了OOM， 那具体是哪块内存泄露呢，高频grpc请求还是其他？</p>
+<p>事后重现的示例进程。</p>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202502/587720-20250222180614371-855812499.png" alt="" loading="lazy"></p>
+<p><code>ps -p &lt;PID&gt; -o etime=</code>显示程序执行了20:33:12， 内存从7M上涨到184M，持续进行中。</p>
+<p>执行go tool pprof -http=:8090 <a href="http://localhost:6060/debug/pprof/heap" target="_blank" rel="noopener nofollow">http://localhost:6060/debug/pprof/heap</a>) 显示调用grpc请求时与context相关的2处堆内存占用较大且持续增长。</p>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202502/587720-20250222180630116-1090840655.png" alt="" loading="lazy"></p>
+<p><strong>故障点二： 代码中的defer cancel()函数并不会执行</strong>，因为是无限循环，函数不会返回，defer压栈的<code>cancel</code>函数无法出栈执行。</p>
+<blockquote>
+<p>godoc：<br>
+<strong>Calling the CancelFunc cancels the child and its children, removes the parent's reference to the child, and stops any associated timers. Failing to call the CancelFunc leaks the child and its children until the parent is "canceled" or the "timer fires"</strong></p>
+</blockquote>
+<p>修复代码如下：</p>
+<pre><code>func etcdWatchLoop1() error {
+	ctx, cancle := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancle()
+	wchan := eClient.Watch(ctx, "/foo", clientv3.WithPrefix()) //  使用超时机制模拟 信道关闭
+
+	var tick = time.NewTicker(time.Minute * 1)
+	defer tick.Stop()
+
+	for {
+		select {
+		case &lt;-tick.C: 
+			fmt.Println("watch tick")
+		case resp, ok := &lt;-wchan: // 从cancled信道或者超时信道中，信道会关闭，从closed信道会读取到零值，导致死循环
+			if ok {
+				fmt.Printf("watch result: %v \n", resp)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+				fmt.Printf("watch ptr: %p, %p \n", &amp;ctx, cancel)
+				if _, err := eClient.Get(ctx, "/foo"); err != nil {
+					fmt.Println(err)
+				} else {
+                                    // todo logic
+				}
+				cancel()
+			} else {
+				wchan = eClient.Watch(ctx, "/foo", clientv3.WithPrefix())
+			}
+		}
+	}
+}
+</code></pre>
+<ul>
+<li>利用读信道的参数2， 来判断信道是否关闭，如果关闭了，重新初始化监听信道。</li>
+<li>context.WithTimeout 产生的cancel，在业务逻辑结束后迅速主动执行。</li>
+</ul>
+<hr>
+<p>在本例中， 与<a href="https://go.dev/blog/context" target="_blank" rel="noopener nofollow">context</a>相关的内存泄露有两处，且有关联。</p>
+<p>&lt;1&gt; 业务函数<code>context.WithTimeout</code>无限循环，未能执行cancel()， 导致高频产生的<code>timerCtx</code>堆内存迟迟无法释放。</p>
+<p>&lt;2&gt; grpc请求底层源码以第一处产生的timerCtx为父级, 产生的子级<code>cancelCtx</code>接收父级取消传播，此处为父级timerCtx填充了取消信道。</p>
+<p>第&lt;1&gt;处：未能调用cancel 导致的内存泄露。</p>
+<p><code>ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)</code><br>
+<code>defer cancel()</code></p>
+<p>产生了<code>timerCtx</code>对象, 因函数返回逃逸到堆上（由栈区返回值ctx引用）。</p>
+<pre><code>func WithDeadlineCause(parent Context, d time.Time, cause error) (Context, CancelFunc) {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
+	if cur, ok := parent.Deadline(); ok &amp;&amp; cur.Before(d) {
+		// The current deadline is already sooner than the new one.
+		return WithCancel(parent)
+	}
+	c := &amp;timerCtx{    //  withTmeout实际产生了timerCtx对象
+		deadline: d,
+	}
+	c.cancelCtx.propagateCancel(parent, c)  
+	dur := time.Until(d)
+	if dur &lt;= 0 {
+		c.cancel(true, DeadlineExceeded, cause) // deadline has already passed
+		return c, func() { c.cancel(false, Canceled, nil) }
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err == nil {
+		c.timer = time.AfterFunc(dur, func() { // 异步启动goroutine执行定时器触发逻辑
+			c.cancel(true, DeadlineExceeded, cause)
+		})
+	}
+	return c, func() { c.cancel(true, Canceled, nil) } 
+}
+</code></pre>
+<p><code>context.WithTimeout</code>返回的cancel函数和timer触发函数做了相同的动作：</p>
+<ul>
+<li>形成了闭包，捕获了timerCtx对象</li>
+<li>与父级context解绑， 停止timer资源</li>
+</ul>
+<p>区别在于释放的时机： 定时器触发函数捕获的timerCtx，要在定时器触发之后才能释放，也就是说timerCtx堆内存被硬生生持有了timeout=10s（连带上timerCtx附加的timer资源）。</p>
+<p>于是在本例中， 理想情况下， 高频产生的timerCtx虽然在10s之后被GC清理，但是架不住无限循环导致的随地分配啊。</p>
+<p>有如下简化实验：</p>
+<pre><code>for {
+	 context.WithTimeout(context.Background(), time.Second*10)
+}
+</code></pre>
+<p>GODEBUG = gotrace=1 ./sample  执行程序并打印gc日志：</p>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202502/587720-20250222180704552-1331889125.png" alt="" loading="lazy"></p>
+<p>有关gotrace=1 的输出解释，godoc <a href="https://pkg.go.dev/runtime" target="_blank" rel="noopener nofollow">https://pkg.go.dev/runtime</a> 有详细介绍。</p>
+<pre><code>#-&gt;#-&gt;# MB   heap size at GC mark start, at GC Mark end, and live heap
+</code></pre>
+<p>当第三列值持续上升，说明发生了内存泄露 （每次GC之后 live heap在持续上升）。</p>
+<p>第&lt;2&gt;处的内存泄露：</p>
+<p>在grpc一元请求堆栈函数newClientStreamWithParams内会产生子context： <code>cancelCtx</code>， 也会逃逸到堆上（由另一个栈区变量ctx引用)。</p>
+<blockquote>
+<p>WithCancel returns a copy of parent with a new Done channel. The returned<br>
+context's Done channel is closed when the returned cancel function is called<br>
+or when the parent context's Done channel is closed, whichever happens first.</p>
+</blockquote>
+<pre><code>newClientStreamWithParams
+--- ctx, cancel = context.WithCancel(ctx)
+--- defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+
+
+func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
+	c := withCancel(parent)
+	return c, func() { c.cancel(true, Canceled, nil) }
+}
+
+func withCancel(parent Context) *cancelCtx {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
+	c := &amp;cancelCtx{}
+	c.propagateCancel(parent, c)
+	return c
+}
+</code></pre>
+<p>根据火焰图，此处产生内存泄露的地方是 <code>propagateCancel</code>函数：</p>
+<p>设置接受父级的取消传播, 此处是通过<strong>懒加载</strong>的方式为父级timerCtx填充取消信道，</p>
+<pre><code>func (c *cancelCtx) propagateCancel(parent Context, child canceler) {
+	c.Context = parent
+
+	done := parent.Done()    // 此函数为timerCtx填充信道， 懒加载
+	if done == nil {
+		return // parent is never canceled
+	}
+}
+......
+
+
+func (c *cancelCtx) Done() &lt;-chan struct{} {
+	d := c.done.Load()
+	if d != nil {
+		return d.(chan struct{})
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d = c.done.Load()
+	if d == nil {
+		d = make(chan struct{})
+		c.done.Store(d)
+	}
+	return d.(chan struct{})
+}        
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202502/587720-20250222164514089-1223851647.png" alt="" loading="lazy"></p>
+<h3 id="总结">总结</h3>
+<p>本文复盘了golang项目生产环境某次OOM的现场，记录了本人未能强化的golang的知识点。</p>
+<ul>
+<li>
+<p>从closed信道能持续读取零值</p>
+</li>
+<li>
+<p>defer 函数压栈，在函数返回之前出栈。</p>
+</li>
+<li>
+<p>在业务逻辑结束后尽早 执行cancel() 解绑子级关系和释放timer资源，避免内存泄露。</p>
+</li>
+<li>
+<p>强化了pprof的使用方式、理解了火焰图的指标意义</p>
+</li>
+<li>
+<p>GODEBUG=gotrace=1 输出了gc日志，观察每次gc的堆内存变动。</p>
+</li>
+</ul>
+<p>有些坑位看起来，是菜鸟级别， 老鸟轻喷， 有则改之无则加勉。</p>
+<p>btw, 这个问题让deepseek来回答，会有三个层面</p>
+<ul>
+<li>大量占用的timeCtx和timer资源</li>
+<li>GC延迟性： 并不是实时运行， 在GC之前， 堆内存可能就持续上涨。</li>
+<li>Goroutine 调度器的压力：每个timer都会启动gorutine， 大量goroutine会给调度带来压力。</li>
+</ul>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <hr style="FILTER: alpha(opacity=100,finishopacity=0,style=3)" width="80%" color="#987cb9" size="3">
+<div style="text-align:center;">
+<p>本文来自博客园，作者：{有态度的马甲}，转载请注明原文链接：<a href="https://www.cnblogs.com/JulianHuang/p/18731012" target="_blank">https://www.cnblogs.com/JulianHuang/p/18731012</a></p>
+<strong style="color: red; ">欢迎关注我的原创技术、职场公众号， 加好友谈天说地，一起进化</strong>
+<div><img style="width: 250px;height:250px;" src="https://blog-static.cnblogs.com/files/JulianHuang/QR.gif"> </div>
+
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.17087158348958334" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-02-22 18:07">2025-02-22 16:41</span>&nbsp;
+<a href="https://www.cnblogs.com/JulianHuang">码甲哥不卷</a>&nbsp;
+阅读(<span id="post_view_count">18</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18731012" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18731012);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18731012', targetLink: 'https://www.cnblogs.com/JulianHuang/p/18731012', title: '记一次golang项目context引发的进程OOM故障' })">举报</a>
+</div>
+        
