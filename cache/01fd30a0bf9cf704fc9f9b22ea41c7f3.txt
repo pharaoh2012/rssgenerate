@@ -1,0 +1,304 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/deali/p/18731660" title="发布于 2025-02-22 23:48">
+    <span role="heading" aria-level="2">基于.NetCore开发 StarBlog 番外篇 (1) 全新的访问统计功能，异步队列，分库存储</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>虽然现在工作重心以AI为主了，不过相比起各种大模型的宏大叙事，我还是更喜欢自己构思功能、写代码，享受解决问题和发布上线的过程。</p>
+<p>之前 StarBlog 系列更新的时候我也有提到，随着功能更新，会在教程系列完结之后继续写番外，这不第一篇番外就来了。</p>
+<p>这次是全新设计的访问统计功能。</p>
+<h2 id="访问统计">访问统计</h2>
+<p>访问统计功能很早就已经实现了，在之前这篇 <a href="https://www.cnblogs.com/deali/p/16349155.html" target="_blank">基于.NetCore开发博客项目 StarBlog - (11) 实现访问统计</a></p>
+<h3 id="旧实现存在的问题">旧实现存在的问题</h3>
+<p>之前是添加了一个中间件 <code>VisitRecordMiddleware</code> ，每个请求都写入到数据库里</p>
+<p>这样会导致两个问题：</p>
+<ol>
+<li>影响性能</li>
+<li>导致数据库太大，不好备份</li>
+</ol>
+<h3 id="新的实现">新的实现</h3>
+<p>我一直对之前这个实现不满意</p>
+<p>这次索性重新设计了，一次性把以上提到的问题都解决了</p>
+<p>我用 mermaid 画了个简单的图（第一次尝试在文章里插入 mermaid 画的图，不知道效果咋样）</p>
+<p><a href="https://mermaid.js.org/syntax/flowchart.html" target="_blank" rel="noopener nofollow">https://mermaid.js.org/syntax/flowchart.html</a></p>
+<div class="mermaid">---
+title: 新的访问统计功能设计图
+---
+flowchart LR
+    Request(用户请求) --&gt; Middleware(访问日志中间件)
+    Middleware(访问日志中间件) --&gt; Queue[/日志队列/]
+    Worker[后台定时任务] --取出日志--- Queue[/日志队列/]
+    Worker[后台定时任务] --写入数据库--&gt; DB[(访问日志独立数据库)]
+</div><p>新的实现用一个队列来暂存访问日志</p>
+<p>并且添加了后台任务，定时从队列里取出访问日志来写入数据库</p>
+<p>这样就不会影响访问速度</p>
+<p>到这里这个新的功能基本就介绍完了</p>
+<p>当然具体实现会有一些细节需要注意，接下来的代码部分会介绍</p>
+<h3 id="新的技术栈">新的技术栈</h3>
+<p>这次我用了 EFCore 作为 ORM</p>
+<p>原因和如何引入我在之前这篇文章有介绍了：<a href="https://www.cnblogs.com/deali/p/17749676.html" target="_blank">Asp-Net-Core开发笔记：快速在已有项目中引入efcore</a></p>
+<p>主要目的是使用 EFCore 能更方便实现分库</p>
+<h2 id="具体实现">具体实现</h2>
+<p>接下来是具体的代码实现</p>
+<h3 id="队列">队列</h3>
+<p>在 <code>StarBlog.Web/Services</code> 里添加 <code>VisitRecordQueueService.cs</code> 文件</p>
+<pre><code class="language-c#">public class VisitRecordQueueService {
+  private readonly ConcurrentQueue&lt;VisitRecord&gt; _logQueue = new ConcurrentQueue&lt;VisitRecord&gt;();
+  private readonly ILogger&lt;VisitRecordQueueService&gt; _logger;
+  private readonly IServiceScopeFactory _scopeFactory;
+
+  /// &lt;summary&gt;
+  /// 批量大小
+  /// &lt;/summary&gt;
+  private const int BatchSize = 10;
+
+  public VisitRecordQueueService(ILogger&lt;VisitRecordQueueService&gt; logger, IServiceScopeFactory scopeFactory) {
+    _logger = logger;
+    _scopeFactory = scopeFactory;
+  }
+
+  // 将日志加入队列
+  public void EnqueueLog(VisitRecord log) {
+    _logQueue.Enqueue(log);
+  }
+
+  // 定期批量写入数据库的
+  public async Task WriteLogsToDatabaseAsync(CancellationToken cancellationToken) {
+    if (_logQueue.IsEmpty) {
+      // 暂时等待，避免高频次无意义的检查
+      await Task.Delay(1000, cancellationToken);
+      return;
+    }
+
+    var batch = new List&lt;VisitRecord&gt;();
+    // 从队列中取出一批日志
+    while (_logQueue.TryDequeue(out var log) &amp;&amp; batch.Count &lt; BatchSize) {
+      batch.Add(log);
+    }
+
+    try {
+      using var scope = _scopeFactory.CreateScope();
+      var dbCtx = scope.ServiceProvider.GetRequiredService&lt;AppDbContext&gt;();
+      await using var transaction = await dbCtx.Database.BeginTransactionAsync(cancellationToken);
+      try {
+        dbCtx.VisitRecords.AddRange(batch);
+        await dbCtx.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        _logger.LogInformation("访问日志 Successfully wrote {BatchCount} logs to the database", batch.Count);
+      }
+      catch (Exception) {
+        await transaction.RollbackAsync(cancellationToken);
+        throw;
+      }
+    }
+    catch (Exception ex) {
+      _logger.LogError(ex, "访问日志 Error writing logs to the database: {ExMessage}", ex.Message);
+    }
+  }
+}
+</code></pre>
+<p>这里使用了：</p>
+<ul>
+<li><code>ConcurrentQueue</code> 这个线程安全的FIFO队列</li>
+<li>在批量写入数据库的时候用了事务，遇到报错自动回滚</li>
+</ul>
+<h3 id="中间件">中间件</h3>
+<p>修改 StarBlog.Web/Middlewares/VisitRecordMiddleware.cs</p>
+<pre><code class="language-c#">public class VisitRecordMiddleware {
+  private readonly RequestDelegate _next;
+
+  public VisitRecordMiddleware(RequestDelegate requestDelegate) {
+    _next = requestDelegate;
+  }
+
+  public Task Invoke(HttpContext context, VisitRecordQueueService logQueue) {
+    var request = context.Request;
+    var ip = context.GetRemoteIpAddress()?.ToString();
+    var item = new VisitRecord {
+      Ip = ip?.ToString(),
+      RequestPath = request.Path,
+      RequestQueryString = request.QueryString.Value,
+      RequestMethod = request.Method,
+      UserAgent = request.Headers.UserAgent,
+      Time = DateTime.Now
+    };
+    logQueue.EnqueueLog(item);
+
+    return _next(context);
+  }
+}
+</code></pre>
+<p>没什么特别的，就是把之前数据库操作替换为添加到队列</p>
+<p>注意依赖注入不能在中间件的构造方法里，<code>IApplicationBuilder</code> 注册中间件的时候依赖注入容器还没完全准备好</p>
+<h3 id="后台任务">后台任务</h3>
+<p>在 StarBlog.Web/Services 里添加 <code>VisitRecordWorker.cs</code> 文件</p>
+<pre><code class="language-c#">public class VisitRecordWorker : BackgroundService {
+  private readonly ILogger&lt;VisitRecordWorker&gt; _logger;
+  private readonly IServiceScopeFactory _scopeFactory;
+  private readonly VisitRecordQueueService _logQueue;
+  private readonly TimeSpan _executeInterval = TimeSpan.FromSeconds(30);
+
+  public VisitRecordWorker(ILogger&lt;VisitRecordWorker&gt; logger, IServiceScopeFactory scopeFactory, VisitRecordQueueService logQueue) {
+    _logger = logger;
+    _scopeFactory = scopeFactory;
+    _logQueue = logQueue;
+  }
+
+  protected override async Task ExecuteAsync(CancellationToken stoppingToken) {
+    while (!stoppingToken.IsCancellationRequested) {
+      await _logQueue.WriteLogsToDatabaseAsync(stoppingToken);
+      await Task.Delay(_executeInterval, stoppingToken);
+      _logger.LogDebug("后台任务 VisitRecordWorker ExecuteAsync");
+    }
+  }
+}
+</code></pre>
+<p>要注意的是，BackgroundService 是 singleton 生命周期的，而数据库相关的是 scoped 生命周期，所以在使用前要先获取 scope ，而不是直接注入。</p>
+<p>这里使用了 <code>IServiceScopeFactory</code> 而不是 <code>IServiceProvider</code></p>
+<p>在多线程环境里可以保证可以获取根容器的实例，这也是微软文档里推荐的做法。</p>
+<h2 id="分库与重构">分库与重构</h2>
+<h3 id="引入efcore">引入EFCore</h3>
+<p>如上文所说，访问日志是比较大的，上线这个功能之后几个月的时间，就积累了几十万的数据，在数据库里占用也有100多M了，虽然这还远远达不到数据库的瓶颈</p>
+<p>但是对于我们这个轻量级的项目来说，当我想要备份的时候，相比起几个MB的博客数据，这上百MB的访问日志就成了冗余数据，这部分几乎没有备份的意义</p>
+<p>所以分库就是势在必得的</p>
+<p>这次我使用了EFCore来单独操作这个新的数据库</p>
+<p>具体如何引入和实现，之前那篇文章介绍得很详细了，本文不再重复。</p>
+<p><a href="https://www.cnblogs.com/deali/p/17749676.html" target="_blank">Asp-Net-Core开发笔记：快速在已有项目中引入efcore</a></p>
+<h3 id="重构服务">重构服务</h3>
+<p>因为使用了EFCore，涉及到的服务也需要调整一下，从FreeSQL换到EFCore</p>
+<p>修改 StarBlog.Web/Services/VisitRecordService.cs</p>
+<pre><code class="language-c#">public class VisitRecordService {
+  private readonly ILogger&lt;VisitRecordService&gt; _logger;
+  private readonly AppDbContext _dbContext;
+
+  public VisitRecordService(ILogger&lt;VisitRecordService&gt; logger, AppDbContext dbContext) {
+    _logger = logger;
+    _dbContext = dbContext;
+  }
+
+  public async Task&lt;VisitRecord?&gt; GetById(int id) {
+    var item = await _dbContext.VisitRecords.FirstOrDefaultAsync(e =&gt; e.Id == id);
+    return item;
+  }
+
+  public async Task&lt;List&lt;VisitRecord&gt;&gt; GetAll() {
+    return await _dbContext.VisitRecords.OrderByDescending(e =&gt; e.Time).ToListAsync();
+  }
+
+  public async Task&lt;IPagedList&lt;VisitRecord&gt;&gt; GetPagedList(VisitRecordQueryParameters param) {
+    var querySet = _dbContext.VisitRecords.AsQueryable();
+
+    // 搜索
+    if (!string.IsNullOrEmpty(param.Search)) {
+      querySet = querySet.Where(a =&gt; a.RequestPath.Contains(param.Search));
+    }
+
+    // 排序
+    if (!string.IsNullOrEmpty(param.SortBy)) {
+      var isDesc = param.SortBy.StartsWith("-");
+      var orderByProperty = param.SortBy.Trim('-');
+      if (isDesc) {
+        orderByProperty = $"{orderByProperty} desc";
+      }
+
+      querySet = querySet.OrderBy(orderByProperty);
+    }
+    
+    IPagedList&lt;VisitRecord&gt; pagedList = new StaticPagedList&lt;VisitRecord&gt;(
+      await querySet.Page(param.Page, param.PageSize).ToListAsync(),
+      param.Page, param.PageSize,
+      Convert.ToInt32(await querySet.CountAsync())
+    );
+    return pagedList;
+  }
+
+  /// &lt;summary&gt;
+  /// 总览数据
+  /// &lt;/summary&gt;
+  public async Task&lt;object&gt; Overview() {
+    var querySet = _dbContext.VisitRecords
+      .Where(e =&gt; !e.RequestPath.StartsWith("/Api"));
+
+    return new {
+      TotalVisit = await querySet.CountAsync(),
+      TodayVisit = await querySet.Where(e =&gt; e.Time.Date == DateTime.Today).CountAsync(),
+      YesterdayVisit = await querySet
+        .Where(e =&gt; e.Time.Date == DateTime.Today.AddDays(-1).Date)
+        .CountAsync()
+    };
+  }
+
+  /// &lt;summary&gt;
+  /// 趋势数据
+  /// &lt;/summary&gt;
+  /// &lt;param name="days"&gt;查看最近几天的数据，默认7天&lt;/param&gt;
+  public async Task&lt;object&gt; Trend(int days = 7) {
+    var startDate = DateTime.Today.AddDays(-days).Date;
+    return await _dbContext.VisitRecords
+      .Where(e =&gt; !e.RequestPath.StartsWith("/Api"))
+      .Where(e =&gt; e.Time.Date &gt;= startDate)
+      .GroupBy(e =&gt; e.Time.Date)
+      .Select(g =&gt; new {
+        time = g.Key,
+        date = $"{g.Key.Month}-{g.Key.Day}",
+        count = g.Count()
+      })
+      .OrderBy(e =&gt; e.time)
+      .ToListAsync();
+  }
+
+  /// &lt;summary&gt;
+  /// 统计数据
+  /// &lt;/summary&gt;
+  public async Task&lt;object&gt; Stats(DateTime date) {
+    return new {
+      Count = await _dbContext.VisitRecords
+        .Where(e =&gt; e.Time.Date == date)
+        .Where(e =&gt; !e.RequestPath.StartsWith("/Api"))
+        .CountAsync()
+    };
+  }
+}
+</code></pre>
+<p>主要变动的就是 GetPagedList 和 Overview 接口</p>
+<ul>
+<li>EFCore默认不支持按字段名称排序，为此我引入了 Microsoft.EntityFrameworkCore.DynamicLinq 库来实现</li>
+<li>EFCore 似乎没有FreeSQL的Aggregate API，可以用原生SQL来替换，但我没有这么做，还是做了多次查询，其实影响不大</li>
+</ul>
+<p>其他的属于语法的区别，简单修改即可。</p>
+<h2 id="小结">小结</h2>
+<p>时隔好久再次为 StarBlog 开发新功能，C# 的开发体验还是那么丝滑</p>
+<p>然而 "Packages with vulnerabilities have been detected" 的警告也在提醒我这个项目的SDK版本已经outdated了</p>
+<p>所以接下来会找时间尽快升级</p>
+<p>预告一波：下一个功能与备份有关</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a href="https://learn.microsoft.com/zh-cn/dotnet/core/extensions/scoped-service" target="_blank" rel="noopener nofollow">https://learn.microsoft.com/zh-cn/dotnet/core/extensions/scoped-service</a></li>
+<li><a href="https://www.cnblogs.com/wucy/p/16566495.html" target="_blank">https://www.cnblogs.com/wucy/p/16566495.html</a></li>
+</ul>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    微信公众号：「程序设计实验室」
+专注于互联网热门新技术探索与团队敏捷开发实践，包括架构设计、机器学习与数据分析算法、移动端开发、Linux、Web前后端开发等，欢迎一起探讨技术，分享学习实践经验。
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.8543172326655093" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-02-22 23:54">2025-02-22 23:48</span>&nbsp;
+<a href="https://www.cnblogs.com/deali">程序设计实验室</a>&nbsp;
+阅读(<span id="post_view_count">36</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18731660" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18731660);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18731660', targetLink: 'https://www.cnblogs.com/deali/p/18731660', title: '基于.NetCore开发 StarBlog 番外篇 (1) 全新的访问统计功能，异步队列，分库存储' })">举报</a>
+</div>
+        
