@@ -1,0 +1,584 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/diststorage/p/18735580" title="发布于 2025-02-25 09:56">
+    <span role="heading" aria-level="2">gdfs: 基于Fuse的GoogleDrive客户端开源代码分析</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="背景">背景</h1>
+<p>在学习fuse的过程中，首先从libfuse中的demo开始学习，以了解用户态与内核态通信的框架。而此处的demo只聚焦于最基本的通信，用户态文件系统的实现只是一个最简单的read only文件系统，其他操作都是假接口。<br>
+要继续深入学习，直接看cephfs等高集成、高完善的代码容易被细节淹没，最好能够循序渐进，同时也可以横向对比，看各个实现解决了什么问题，如何在用户态组织文件索引，缓存如何实现，客户端与服务端的缓存一致性如何解决，分布式锁如何实现，实现方式是否优雅，哪里有需要完善的地方等。<br>
+找到一个基于fuse开发的google drive文件系统，翻了一下代码结构比较简单，适合入门学习。因此本文以该项目来做说明。<br>
+项目地址：<br>
+<a href="https://github.com/robin-thomas/GDFS" target="_blank" rel="noopener nofollow">GitHub - robin-thomas/GDFS: Google Drive File System</a><br>
+注：该代码涉及到通过api与google drive进行交互，因此也需要了解google api：<br>
+gdrive api:<br>
+<a href="https://developers.google.com/drive/api/guides/about-sdk?hl=zh-cn" title="https://developers.google.com/drive/api/guides/about-sdk?hl=zh-cn" target="_blank" rel="noopener nofollow">https://developers.google.com/drive/api/guides/about-sdk?hl=zh-cn</a><br>
+google drive go sdk quickstart（此处以go sdk为例。官方不提供c++ sdk，因此作者是通过libcurl手搓的api调用）:<br>
+<a href="https://developers.google.com/drive/api/quickstart/go?hl=zh-cn" title="https://developers.google.com/drive/api/quickstart/go?hl=zh-cn" target="_blank" rel="noopener nofollow">https://developers.google.com/drive/api/quickstart/go?hl=zh-cn</a><br>
+google cloud console:<br>
+<a href="https://console.cloud.google.com/apis/credentials?hl=zh-cn&amp;inv=1&amp;invt=AbpcxA&amp;project=wangxz-proj00049" title="https://console.cloud.google.com/apis/credentials?hl=zh-cn&amp;inv=1&amp;invt=AbpcxA&amp;project=wangxz-proj00049" target="_blank" rel="noopener nofollow">https://console.cloud.google.com/apis/credentials?hl=zh-cn&amp;inv=1&amp;invt=AbpcxA&amp;project=wangxz-proj00049</a></p>
+<h1 id="环境搭建">环境搭建</h1>
+<pre><code class="language-bash"># 拉起centos8容器：
+IMAGE_ID='5d0da3dc9764'
+NAME=centos8_demo
+docker run --privileged -idt \
+        --name $NAME \
+        -v /data:/data \
+        --net host \
+        ${IMAGE_ID} \
+        /usr/sbin/init
+docker exec -it $NAME /bin/bash
+
+# 配置源：
+mkdir /etc/yum.repos.d/orig &amp;&amp; mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/orig &amp;&amp; curl -o /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-8.repo
+
+# 安装编译工具：
+yum install automake gcc-c++ cmake libfuse-devel libfuse3-devel curl libcurl -y -q
+
+# 编译：
+# 按照具体按照的automake版本重新配置，否则会报错找不到automake-1.15:
+autoreconf -f -i
+./configure
+make 
+make install
+
+# 配置：
+vim /opt/gdfs/gdfs.conf
+# 日志位置：
+tail -f /opt/gdfs/gdfs.log
+
+# 启动：
+/opt/gdfs/gdfs.sh start
+
+# 或
+/usr/local/bin/mount.gdfs -m /tmp/robin -f -s --log_path /opt/gdfs --log_level DEBUG -o allow_other -o allow_root -o direct_io
+
+b mount_fs
+b get_node
+b gdfs_read
+b fuse_ll_process_buf
+b LRUCache::get
+b File::get
+b File::read_file
+
+#--
+cat /tmp/robin/_opt_gdfs_/haha
+</code></pre>
+<h1 id="架构分析">架构分析</h1>
+<h2 id="google-auth">google auth</h2>
+<p>该项目使用google OAuth2.0进行鉴权。API示例如下：</p>
+<pre><code class="language-javascript"># google api示例：
+curl 'https://www.googleapis.com/drive/v3/about?fields=storageQuota(limit%2CusageInDrive)&amp;key=[YOUR_API_KEY]' \
+  --header 'Authorization: Bearer [YOUR_ACCESS_TOKEN]' \
+  --header 'Accept: application/json' \
+  --compressed
+</code></pre>
+<p>api模拟：<a href="https://developers.google.com/drive/api/reference/rest/v3/about/get?hl=zh-cn&amp;apix_params=%7B%22fields%22%3A%22storageQuota" title="https://developers.google.com/drive/api/reference/rest/v3/about/get?hl=zh-cn&amp;apix_params=%7B%22fields%22%3A%22storageQuota" target="_blank" rel="noopener nofollow">https://developers.google.com/drive/api/reference/rest/v3/about/get?hl=zh-cn&amp;apix_params=%7B%22fields%22%3A%22storageQuota</a>(limit%2CusageInDrive)%22%7D</p>
+<h2 id="google-drivev3files-api">google drive/v3/files api</h2>
+<p>需要了解如何使用google api来访问google drive的文件。<br>
+● 每个文件或文件夹都有一个file_id作为唯一标识。例如可以通过以下接口来获取某个file_id的修改时间：</p>
+<pre><code class="language-javascript">https://www.googleapis.com/drive/v3/files/&lt;file_id&gt;?fields=modifiedTime
+</code></pre>
+<p>gdfs使用该接口来查看某个文件的修改时间是否与本地相同。若不同，则意味着远端有修改，需要获取这个目录所有的子目录（否则无法知道子目录是否被修改），然后查看其子项是否被修改。若有修改，需要GET下来。<br>
+需要完整的新子项列表才能准确识别出被删除的文件（存在于旧列表但不在新列表中的项）<br>
+需要完整列表来检测和处理文件名冲突（当多个客户端并发创建同名文件时）<br>
+若父目录没有被修改，则也意味着其子目录下的文件也没有被修改。<br>
+一个包含5000个文件的目录需要分5次请求获取当云端删除10个文件时，仅通过修改时间无法知道具体删除了哪些文件当其他客户端新增文件时，需要通过完整列表同步新增项</p>
+<pre><code class="language-javascript">// Construct the URL to send the request.
+url  = GDFS_FILE_URL_ + std::string("?pageSize=1000&amp;q='") + parent_file_id;
+url += "'+in+parents+and+trashed+%3D+false&amp;orderBy=name&amp;spaces=drive";
+url += "&amp;fields=files(id%2CmimeType%2CmodifiedTime%2Cname%2Csize%2CviewedByMeTime)%2CnextPageToken";
+</code></pre>
+<h2 id="数据结构">数据结构</h2>
+<h3 id="公共功能">公共功能</h3>
+<pre><code class="language-javascript">//一个全局静态变量file_id_node，用于维护file_name与GDFSNode指针的映射关系：
+std::unordered_multimap &lt;std::string, GDFSNode *&gt; file_id_node;
+// 这样设计在多客户端挂载的情况下应该会有问题，TODO：测试。
+
+// 一个客户端的挂载点对应一个GDrive，包含了uid/gid，容量信息，挂载目录名称rootDir，用于和google api调用的Auth实例，缓存管理LRUCache实例，线程池实例，以及一个GDFSNode *root指针，在GDrive::get_root()的时候初始化，指向当前文件系统的根目录。并将其加入file_node_id的map中。
+class GDrive {
+  public:
+    uid_t uid;
+    gid_t gid;
+    time_t mounting_time;
+    uint64_t bytes_used;
+    uint64_t bytes_free;
+    uint64_t bytes_total;
+    std::string rootDir; //根目录地址
+    std::string change_id; //根目录change_id，可以从远端通过API获取扼杀，用于描述根目录是否被修改
+    Auth auth; //认证实例
+    LRUCache cache; //缓存管理实例
+    Threadpool threadpool; //线程池管理实例
+    struct GDFSNode * root; //根目录GDFSNode指针
+}
+
+// 类比于inode用于描述一个文件的基础数据结构，可以用其找到父节点(parent),子节点（通过map children）。
+// （linux是将file_name放到entry中，但本项目是直接将其放到Node中。）
+struct GDFSNode {
+  char link;
+  std::string file_name;
+  std::string sym_link;
+  GDFSEntry * entry;  // 该文件到entry信息指针
+  GDFSNode  * parent; // 父节点指针
+  std::unordered_map &lt;std::string, struct GDFSNode *&gt; children;// 该目录下的子node map
+}
+
+//用于描述一个文件在内存中的组织形式，类比于dentry
+struct GDFSEntry {
+  std::string file_id; //google drive中的文件标识，每个文件有唯一的file_id，所有通过api交互，都需要用其来进行标识。
+  //file_id的生成规则在下面描述。
+  uint64_t file_size;
+  time_t ctime;
+  time_t mtime;
+  time_t atime;
+  time_t cached_time;
+  uid_t uid;
+  gid_t gid;
+  mode_t file_mode;
+  dev_t dev;
+  bool is_dir; //是否为dir，用于区分处理文件夹与文件
+  int ref_count;
+  std::string mime_type;
+  bool g_doc;
+  bool dirty;
+  bool pending_create;//在创建文件的时候，标记是否为
+  bool file_open;
+  bool write;
+  bool pending_get;
+}
+
+sem_t req_item_sem;
+pthread_mutex_t worker_lock;
+std::list &lt;struct req_item&gt; req_queue;
+std::queue &lt;std::string&gt; file_id_q; //全局的file_id队列，批量生成
+</code></pre>
+<h4 id="file_id的生成">file_id的生成</h4>
+<p>在GDrive::make_file()中，若file_name以'.'开头，则表示隐藏文件，file_id定义为file_id = gdfs_name_prefix + rand_str()；否则表示正常文件或文件夹，此时从file_id_q中找到一个作为file_id。<br>
+此处的队列file_id_q是在每次GDrive::make_file()或GDrive::make_dir()时主动调用generate_file_id()生成的。这个队列预期是存放大于100个file_id队列。<br>
+当在创建文件或文件夹的的时候，会调用generate_file_id()，检查该队列是否为空，或该队列小于100个，若是，则调用API 'generateIds'来获取，file_id被放到该队列'file_id_q'中，</p>
+<pre><code class="language-javascript">void
+GDrive::make_file (const std::string &amp; file_name,
+                   mode_t file_mode,
+                   struct GDFSNode * parent_node,
+                   uid_t uid_,
+                   gid_t gid_)
+void
+GDrive::make_dir (const std::string &amp; file_name,
+                  mode_t file_mode,
+                  struct GDFSNode * parent_node,
+                  uid_t uid_,
+                  gid_t gid_)
+</code></pre>
+<h4 id="pending_create延时远端创建">pending_create：延时远端创建</h4>
+<p>当客户端创建文件时，在GDrive::make_file()中，获取上文所述的file_id，new一个GDFSEntry()，将其加入到parent_node中，并将其加入file_id_node中：</p>
+<pre><code class="language-javascript">// Add to the directory tree.
+entry = new GDFSEntry(file_id, 0, false, mtime, mtime, uid_, gid_, file_mode);
+assert(entry != NULL);
+node = parent_node-&gt;insert(new GDFSNode(file_name, entry, parent_node));
+assert(node != NULL);
+file_id_node.emplace(file_id, node);
+</code></pre>
+<p>判断，若不是系统文件（即文件名不以gdfs_name_prefix开头），而是用户自己的文件，则将该entry-&gt;pending_create设置为true，表示正在创建过程中，然后向google api发起一个INSERT请求：</p>
+<pre><code class="language-javascript">if (file_id.compare(0, gdfs_name_prefix.size(), gdfs_name_prefix) != 0) {
+  entry-&gt;pending_create = true;//设置pending_create=true，表示正在创建。
+  threadpool.build_request(file_id, INSERT, node, url, query);  
+}
+</code></pre>
+<p>在调用google api的INSERT请求完成后，将其设置为false，表示针对该文件的创建请求已经完成：</p>
+<pre><code class="language-javascript">bool
+Threadpool::send_insert_req (std::string &amp; url,
+                             std::string &amp; query,
+                             struct GDFSEntry * entry) {
+  //...
+  //发送请求：
+  resp = this-&gt;auth.sendRequest(url, INSERT, query);
+  //更新mtime:
+  mtime = rfc3339_to_sec(val["modifiedTime"].get());
+  entry-&gt;mtime = entry-&gt;ctime = mtime;
+  //将pending_create置回false:
+  entry-&gt;pending_create = false; 
+  //...
+}
+</code></pre>
+<p>这样设计是因为内存中建立GDFSNode数据结构与发请求给Google Drive上传二者是不原子的。<br>
+那么在什么时候会用到这个entry-&gt;pending_create呢？<br>
+在get_children()中，最后一步会检查GoogleDrive现有的文件list与</p>
+<h4 id="get_children建立数据结构按需更新修改到本地">get_children：建立数据结构、按需更新修改到本地</h4>
+<pre><code class="language-javascript">/*
+ * Retrieve the children list,
+ * given a pointer to the node of the directory,
+ * in the directory tree.
+ */
+void
+GDrive::get_children (struct GDFSNode * parent)
+</code></pre>
+<p>在GDrive::get_children(struct GDFSNode *parent)中，会根据传入的parent来查询其子项，若内存中没有node,会根据远端获取的列表及信息进行重建。同时还会检查是否远端与本地不一致，若远端比本地新，则拉取最新的文件，并更新node。<br>
+具体会进行如下工作：<br>
+● 检查该目录是否被修改，未同步到本地。即是否为pending_get状态。若<code>parent-&gt;entry-&gt;pending_get==true</code>，则重置其为false，然后设置dir_modified=true。<br>
+○ 设置dir_modified=true后，后续会判断，若非如此，则意味着这个目录下没有被修改，无需更新。<br>
+○ 设置pending_get状态的时机为get_children()中，判断当前entry为dir(<code>is_dir==true</code>),且entry-&gt;mtime &lt; mtime(entry中记录的mtime小于从接口中获取的该文件的mtime，即该目录在远端被修改过，还没有更新到客户端）。<br>
+○ pending_get只会在dir类型的entry中设置，不会在file级别设置。<br>
+● 若当前传入的parent为根目录（<code>parent-&gt;file_name=="/"</code>）<br>
+○ 调用"<a href="https://www.googleapis.com/drive/v3/changes/startPageToken?fields=startPageToken" title="https://www.googleapis.com/drive/v3/changes/startPageToken?fields=startPageToken" target="_blank" rel="noopener nofollow">https://www.googleapis.com/drive/v3/changes/startPageToken?fields=startPageToken</a>"获取change_id，与当前GDrive中记录的change_id做对比。<br>
+○ 若不同，则意味着根目录被修改过，则设置dir_modified=true,并更新新的change_id到GDrive-&gt;change_id。<br>
+● 以上两种条件都不进入，则进入当前条件，即当前文件夹不是根目录，可以是某个子目录或者文件，<br>
+○ 调用“<a href="https://www.googleapis.com/drive/v3/files/%3Cparent_fild_id%3E/?fileds=modifiedTime%E2%80%9D%EF%BC%8C%E6%9D%A5%E8%8E%B7%E5%8F%96%E5%BD%93%E5%89%8Dfile_id%E7%9A%84mtime%E3%80%82" title="https://www.googleapis.com/drive/v3/files/<parent_fild_id>/?fileds=modifiedTime”，来获取当前file_id的mtime。" target="_blank" rel="noopener nofollow">https://www.googleapis.com/drive/v3/files/&lt;parent_fild_id&gt;/?fileds=modifiedTime”，来获取当前file_id的mtime。</a><br>
+○ 若获取到的mtime大于entry中记录的mtime（mtime&gt; entry-&gt;mtime），或当前parent没有字目录时，设置dir_modified=true。<br>
+■ 此处判断<code>parent-&gt;is_empty()==true</code>时，也认为dir可能被修改，是因为可能这个目录下远端有新建文件，而还没有同步到本地。需要强制校验。<br>
+● 若<code>dir_modified==false</code>, 则意味着本parent_node没有被修改，直接goto out。否则意味着perent_node已被修改，继续现有流程。<br>
+以上都是处理parent本身的判断，以下将处理parent作为目录时，其字目录和文件的事项。<br>
+● 调用API，获取最新的parent的子项列表，传值给child_items。<br>
+这里的获取列表是以1000个为分页处理的，类似rgw中的分页list对象，以避免单个目录文件数目过大，占用大量内存，以及查询返回超时。</p>
+<pre><code class="language-javascript">url  = GDFS_FILE_URL_ + std::string("?pageSize=1000&amp;q='") + parent_file_id;
+url += "'+in+parents+and+trashed+%3D+false&amp;orderBy=name&amp;spaces=drive";
+url += "&amp;fields=files(id%2CmimeType%2CmodifiedTime%2Cname%2Csize%2CviewedByMeTime)%2CnextPageToken";
+</code></pre>
+<p>● 遍历child_items<br>
+○ 获取其file_id和mtime。记录atime=mtime。<br>
+○ 检查child是否是dir。根据child中的mimeType判断是否为dir（if (mime_type == "application/vnd.google-apps.folder")），若是，则设置is_dir=true。<br>
+○ 若不是dir，则检查是否为Google Docs，若是，则在后缀加pdf。</p>
+<pre><code class="language-javascript"> if (mime_type == "application/vnd.google-apps.document" ||
+      mime_type == "application/vnd.google-apps.spreadsheet" ||
+      mime_type == "application/vnd.google-apps.drawing" ||
+      mime_type == "application/vnd.google-apps.presentation") {
+    g_doc = true;
+    file_name += ".pdf";
+</code></pre>
+<p>○ 若既不是dir，又不是Google Docs，只是普通文件，则根据返回的size字段，赋值给file_size。<br>
+○ 根据file_id，查看map file_id_node中是否存在。<br>
+■ 若存在，则获取其entry。<br>
+● 若该文件为脏数据，即<code>entry-&gt;dirty==true</code>，则跳过。<br>
+○ 设置entry-&gt;dirty=true的时机为：删除某个文件时，在GDrive::delete_file(GDFSNode&nbsp;_node, bool delete_req)（此处还涉及到硬连接的处理）<br>
+■ 若node-&gt;parent存在，则断开其父节点到本节点的指针链接。<br>
+■ 若当前节点是dir，则遍历所有children，将其加入q_nodes待处理队列中。<br>
+■ 否则不是目录，但<code>entry-&gt;ref_count==1</code>，则将其调用cache.remove(file_id)删除。<br>
+■ 若被删除的不是特殊文件（gdfs_name_prefix），且有请求删除标记（delete_req)，且（<code>entry-&gt;ref_count==1</code>或entry是dir且<code>ref_count==2</code>，此时标记为脏:entry-&gt;dirty=true,并将其加入队列处理：threadpool.build_request(file_id, DELETE, node, url);<br>
+■ 否则意味着有硬连接，即多个inode有相同file_id。此时需要注意删除正确的node。<br>
+● 在file_id_node中根据file_id找到对应GDFSNode，进行遍历，找到当前node对应的项目，并从file_id_node删除。<br>
+■ 释放node内存，并将其设为NULL。<br>
+○ ref_count初始化时，dir为2，文件为1.<br>
+○ ref_count减少时机：～GDFSNode()析构函数中。<br>
+○ ref_count增加时机：在gdfs_link(path,new_path)中<br>
+■ 找到new_path对应的new_parent和new_file_name<br>
+■ 根据path,uid,pid调用state-&gt;get_node()赋值给node,并获取到entry=node-&gt;entry;<br>
+■ 校验，若entry-&gt;is_dir=true，则返回EPERM，不允许创建硬连接给目录。<br>
+■ 根据new_parent,uid,gid通过state-&gt;get_node()获取node,确认new_parent存在。<br>
+■ 检查权限<br>
+■ 检查新路径是否存在：tmp_node=node-&gt;find(new_file_name)<br>
+■ 增加entry的引用计数：++entry-&gt;ref_count<br>
+■ 针对new_file_name，新建一个new GDFSNode，并将其加到file_id_node中，注意此处file_id还是老的file_id。即实现了硬连接。<br>
+● 若该文件正在被写入，即entry-&gt;write=true，则将其file_id加入集合s1中。<br>
+○ entry-&gt;write被设置为true的时机1：gdfs_write(_path, *buf, size, offset, fuse_file_info)中：<br>
+■ 根据path获取node: node=state-&gt;get_node(path,uid,gid);<br>
+■ 根据node获取entry: entry=node-&gt;entry;<br>
+■ 检查权限<br>
+■ 设置当前时间为entry-&gt;mtime, 设置entry-&gt;file-&gt;size<br>
+■ 将当前文件进行缓存，详见《写入缓存逻辑》：</p>
+<pre><code class="language-javascript">ret = state-&gt;cache.put(entry-&gt;file_id, const_cast&lt;char*&gt;(buf), offset, size, node, false);
+entry-&gt;write = true;
+</code></pre>
+<p>■ 返回size给write系统调用。<br>
+○ entry-&gt;write被设置为true的时机2: gdfs_truncate(path,newsize):<br>
+■ 获取node = state-&gt;get_node(path,uid,gid);<br>
+■ 获取entry = node-&gt;entry;<br>
+■ 判断newsize大小<br>
+● 若<code>newsize==0</code>,则清空缓存中该file_id的缓存：<br>
+state-&gt;cache.put(entry-&gt;file_id, NULL, 0, 0, NULL);<br>
+● 否则是truncate指定大小，则如同write操作一样，设置写标记：entry-&gt;write=true。然后计算truncate的起始位置与大小，调用memset初始化给定大小的buf，更新到缓存中。<br>
+○ 若newsize &gt; entry-&gt;file_size，则补零：<br>
+state-&gt;cache.put(entry-&gt;file_id, buf, start, size, node, false)&nbsp;<br>
+○ 否则，若newsize &lt; entry-&gt;file_size，则对缓存进行缩减：state-&gt;cache.resize(entry-&gt;file_id, newsize);<br>
+■ 更新缓存中该file_id的mtime： state-&gt;cache.set_time(entry-&gt;file_id, mtime);<br>
+■ 跟新entry-&gt;mtime与entry-&gt;file_size。</p>
+<p>● 若该文件是Google Docs,即<code>g_doc==true</code>，且远端的文件被修改未同步到本地，即mtime&gt;entry-&gt;mtime，则调用download_file()将其下载到本地。<br>
+● 若该文件是dir，即i<code>s_dir==true</code>，且被远端修改未同步到本地，则设置entry-&gt;pending_get=true。<br>
+● 判断file_name是否与本地记录的file_name相同<br>
+○ 若名字相同，则更新entry中的atime与mtime<br>
+○ 否则处理名字冲突。并更新entry中的atime与mtime。<br>
+■ 若不存在file_id_node中，则需要重新建立GDFSEntry和GDFSNode数据结构，将其插入parent的GDFSNode链表中，并下载到本地。<br>
+这也是对于首次访问某个文件时，客户端本地没有对应文件，通过本函数调用该parent文件夹的list接口，找到这个文件，建立客户端的元数据接口，并将数据拉到本地的位置。<br>
+■ 将该file_id加入到s1中。<br>
+○ 从parent-&gt;get_children()中，获取所有的child,加入s2中。<br>
+○ 对s1,s2做集合差，写入s3中<br>
+○ 遍历s3，判断是否是deleted_child，加入其中<br>
+○ 遍历deleted_child，调用child-&gt;parent-&gt;remove_child(child_node)，从GDFSNode角度删除该node。</p>
+<h4 id="file_node_id">file_node_id：</h4>
+<p>file_id_node是一个允许重复键的哈希表（unordered_multimap&lt;string, GDFSNode*&gt;），用于存储Google Drive文件ID到节点指针的映射。<br>
+添加时机：<br>
+在make_dir(),make_file(),get_children()等需要建立内存数据结构时添加。<br>
+读取时机：<br>
+唯一的作为检查是在get_children()中，用于检查该file_id是否在本地。若在，则进行一些操作；若不在，则new GDFSNode与GDFSEntry，重新建立内存数据结构。<br>
+其他场景则是单纯用于遍历，delete或renam操作时的修改操作。<br>
+修改时机：<br>
+rename。<br>
+删除时机：<br>
+delete。</p>
+<h4 id="get_node实现">get_node实现</h4>
+<p>实现功能为根据path进行路径查询，从缓存中找到对应的GDFSNode。若不在缓存中，则调用get_children构建并加入缓存。</p>
+<pre><code class="language-javascript">struct GDFSNode *
+GDrive::get_node (const std::string &amp; path,
+                  uid_t uid,
+                  gid_t gid,
+                  bool search)
+</code></pre>
+<p>● 在GDrive实例中，找到root node指针，这是整个查找树的起点：struct GDFSNode * node = this-&gt;root;<br>
+● 将传入的path赋值给tmp,判断其是否以'/'结尾<br>
+○ 若tmp本身就是'/'，则意味着是根目录。调用get_children(node)获取其子目录，并goto out;<br>
+○ 否则意味着不是根目录，将结尾的'/'去掉。tmp.pop_back();<br>
+● 对tmp进行循环根据'/'分割，逐步解析路径上的文件名称到next_dir，<br>
+○ 在父node中，根据分割出来的下一层目录尝试查找GDFSNode: child = node-&gt;find(next_dir)，即根据file_name在node-&gt;children中查询，看是否存在。<br>
+■ 若不存在，则调用GDrive::get_children(node)进行重建。然后再进行查询：child = node-&gt;find(next_dir)。若还查不到，则报错目录不存在。<br>
+■ 否则意味着找到了下级目录，node = child;<br>
+■ 检查权限： GDrive-&gt;file_access(uid,gid,X_OK,node-&gt;entry);<br>
+■ 若不是目录，则报错返回。node-&gt;entry-&gt;is_dir == false;<br>
+● 处理队列中pending DELETE请求。若<code>node-&gt;entry-&gt;dirty==true</code>，则意味着正在队列中等待删除，此时直接返回不存在，并goto out；<br>
+● 若未在缓存中找到，则调用get_children(node)，从GoogleDrive中查找，并new GDFSNode与GDFSEntry，加入缓存：</p>
+<pre><code class="language-javascript">// Check if the path component exists.
+child = node-&gt;find(next_dir);
+if (child == NULL) {
+  search = ((search &amp;&amp; tmp.empty() == true) ? true : false);
+  try {
+    this-&gt;get_children(node);
+  } catch (GDFSException &amp; err) {
+    err_num = errno;
+    error = err.get();
+    goto out;
+  }
+  child = node-&gt;find(next_dir);
+  if (child == NULL) {
+    err_num = ENOENT;
+    error = "path component " + next_dir + " does not exist";
+    goto out;
+  }
+}
+node = child;
+</code></pre>
+<p>● 一些update_node(node)或get_children(node)的逻辑。</p>
+<pre><code class="language-javascript">if (search &amp;&amp;
+  node != NULL &amp;&amp;
+  node-&gt;entry-&gt;mtime &gt; 0 &amp;&amp;
+  node-&gt;entry-&gt;file_id.compare(0, gdfs_name_prefix.size(), gdfs_name_prefix) != 0 &amp;&amp;
+  (node-&gt;entry-&gt;is_dir || node-&gt;link == 0) &amp;&amp;
+  node-&gt;entry-&gt;write == false) {
+this-&gt;update_node(node);
+} else if (node != NULL &amp;&amp;
+         node-&gt;entry-&gt;is_dir &amp;&amp;
+         node-&gt;entry-&gt;pending_get) {
+get_children(node);
+}
+</code></pre>
+<h4 id="缓存管理数据结构">缓存管理数据结构</h4>
+<p>由以下三个数据结构管理：<br>
+Page: 数据存储单元<br>
+File：文件级缓存管理。一个文件由一个File管理，一个File可能由多个不同(start,stop)的Page组成。这样设计可以实现大文件的部分加载，以降低内存等资源占用。<br>
+LRUCache：系统级缓存管理</p>
+<pre><code class="language-javascript">// 一个文件的某个部分
+struct Page {       // 数据存储单元
+    char* mem;      // 内存块指针
+    off_t start;    // 起始偏移
+    off_t stop;     // 结束偏移
+    size_t size;    // 数据块长度
+};
+
+struct File {       // 文件级管理，针对某个文件，由多个pages的set组成
+    std::set&lt;Page*&gt; pages;  // 有序分页集合
+    pthread_mutex_t lock;   // 文件级锁
+    size_t size;            // 文件总大小
+    time_t mtime;           // 修改时间
+};
+
+class LRUCache {    // 全局缓存管理，每个GDFSDrive拥有一个实例
+    std::list&lt;std::pair&lt;std::string, File*&gt;&gt; cache; // 访问顺序链表
+    std::unordered_map&lt;std::string, decltype(cache.begin())&gt; map; // 文件索引
+};
+</code></pre>
+<h4 id="缓存读取逻辑lrucacheget">缓存读取逻辑：LRUCache::get</h4>
+<pre><code class="language-javascript">size_t
+LRUCache::get (const std::string &amp; file_id,
+               char * buffer,
+               off_t offset,
+               size_t len,
+               struct GDFSNode * node)
+</code></pre>
+<p>基本逻辑如下：<br>
+● 根据传入的file_id，在LRUCache-&gt;map中查找：<br>
+○ 若没有，则新建一个File空实例，将其加到LRUCache-&gt;cache前端。并加到LRUCache-&gt;map中。通过当前给定的file_id做关联。<br>
+○ 若能找到，则将对应的 File对象移动到cache的前端（通过cache.splice())。若传入的to_delete为true，则说明所有file page都被从google drive中下载下来了，整个文件可能都被修改了，将其全部移除（f-&gt;delete_pages())。<br>
+● 释放缓存里传入的len大小的空间，以确保缓存有容量。 this-&gt;free_cache(len)；<br>
+● 将buffer复制到新建的new_buf，通过调用File-&gt;put(new_buf, start,stop, node-&gt;entry)，将其加入到缓存中。<br>
+● 更新LRUCache-&gt;size长度：this-&gt;size += len;</p>
+<p>而此处File-&gt;put接口的实现则有点意思，涉及到一个File如何通过多个Page来优化管理空间。</p>
+<h4 id="将page写入filefileput">将Page写入File：File::put</h4>
+<pre><code class="language-javascript">struct Page *
+File::put (char * buf,
+           off_t start,
+           off_t stop,
+           struct GDFSEntry * entry)
+</code></pre>
+<p>如上文所述，File用于表示一个文件。而针对大文件部分读取的场景，为了优化空间和网络带宽占用，采用了类似于range的方式进行管理：每个File都由多个Page组成，其数据结构为<br>
+std::set &lt;struct Page *, page_cmp&gt; pages; 其中page_cmp定义为a-&gt;start &lt; b-&gt;start，即以start升序排序的、key唯一的map。put相同的key的value，也无法修改其内容。<br>
+此处主要有以下几种可能性：</p>
+<pre><code class="language-javascript"># 如下有两个page，[start,stop]分别为[99,199], [299,399]。中间为空，表示客户端缓存了该文件的这两个range。
+# 此时有以下7种可能性:
+           |99--------199|                |299--------399|
+1) |20-80|
+2) |20-------------150|
+3) |20-----------------------230|
+4)           |100--150|
+5)           |100------------230|
+6)           |100----------------------------350|
+7)                           |200---280| 
+</code></pre>
+<p>其中，第1、2、3种可能性可以被第5、6、7包含，因此最终剩下如下4种可能性：</p>
+<pre><code class="language-javascript">           |99--------199|                |299--------399|
+1)           |100--150|
+2)           |100------------230|
+3)           |100----------------------------350|
+4)                           |200---280| 
+</code></pre>
+<p>以下分别对其进行解释：</p>
+<ol>
+<li>新修改内容全部在原来的某个Page的某个Range之内：直接覆盖这个Page的指定Range的内容为新修改内容。</li>
+<li>新修改的内容部分在某个Page的某个Range之内，但超出一部分。超出的部分是空隙：在这个Page之内的，修改。在这个Page之外的，new Page，加入File。</li>
+<li>在2）的基础上，超出的部分覆盖了下个Page的一部分：在这个Page之内的修改，在这个Page之外的，new Page并加入File，覆盖下个Page的，修改。</li>
+<li>新修改的内容在两个已有的Page的空隙内：直接new Page，加入File。<br>
+5）这个File原来没有page：这种最简单，直接new Page加入File即可。<br>
+如此便可以使用一个File-&gt;pages来管理某个文件的部分数据的缓存，可以做到“需要哪一部分才取哪一部分”的效果，避免数据的全量拷贝。</li>
+</ol>
+<h4 id="将file写入缓存lrucacheput">将File写入缓存：LRUCache::put</h4>
+<p>该函数实现了LRU缓存写入机制。主要包括：<br>
+● 维护LRU淘汰顺序<br>
+● 缓存空间管理<br>
+● 文件数据页更新</p>
+<pre><code class="language-javascript">bool
+LRUCache::put (const std::string &amp; file_id,
+               char * buffer,
+               off_t offset,
+               size_t len,
+               struct GDFSNode * node,
+               bool to_delete) 
+</code></pre>
+<p>具体思路如下：<br>
+● 在cache-&gt;map中查找，若找不到，意味着不在缓存中，则需要new File，将其与file_id关联，加入map中。<br>
+● 否则意味着能在缓存中找到，则调整cache队列，使用splice函数，将该File放到缓存队列前端，即LRU效果。判断是否to_delete为true，若是，则意味着缓存在已经是脏数据，需清空缓存，调用f-&gt;delete_pages()。<br>
+to_delete只在cache.put()的时候根据实际场景被设置。设置的时机有如下：<br>
+○ to_delete=true的场景：<br>
+■ GDrive::download_file()。该方法只针对GoogleDoc。可能该格式有特殊要求，不做过多探讨。<br>
+■ gdfs_truncate()中，<code>newSize==0</code>时，即需要全清的场景。<br>
+○ to_delete=false的场景：<br>
+■ gdfs_truncate()，newSize !=0时，即部分truncate的场景。<br>
+■ gdfs_write()。<br>
+● 根据传入的len，释放缓存空间，以避免内存不足。<br>
+● 调用File-&gt;put()，将Page加入cache。<br>
+● 更新cache-&gt;size。</p>
+<pre><code class="language-javascript">//eg:
+(gdb) p file_id_node
+$49 = std::unordered_multimap with 2 elements = {["1wKdLp3fiUv3fKVj6ibTnFhUv1MSMOwmY"] = 0x13046f0, ["root"] = 0x1221520}
+</code></pre>
+<h3 id="fuse接口实现">FUSE接口实现</h3>
+<p>理解了《公共功能》部分，实现FUSE接口就十分简单了。举例说明：</p>
+<pre><code class="language-javascript"># 以 echo "123" &gt;  robin/_opt_gdfs_/1234 为例
+# 先调用get_attr
+
+# gdfs_create
+state-&gt;make_file() # 在Google Drive中创建文件。涉及获取parent_file_id与当前文件的file_id，调用API在Google Drive中创建文件，建立GDFSEntry与GDFSNode，将其加入parent结构中，将&lt;file_id,node&gt;加入到file_id_node map中。
+
+# gdfs_open
+
+
+# gdfs_write
+## 将数据加入缓存
+ret = state-&gt;cache.put(entry-&gt;file_id, const_cast&lt;char*&gt;(buf), offset, size, node, false);
+entry-&gt;write = true;  
+# gdfs_release
+## 获取node,entry:
+ node = state-&gt;get_node(path, uid, gid);
+ entry = node-&gt;entry;
+ 
+## 检查access:
+ 
+## 上传到Google Drive:
+state-&gt;write_file(node); # 调用UPLOAD API上传。做了些优化，使用GDFS_UPLOAD_CHUNK_SIZE进行分片上传，但是用法上只有简单的重试
+entry-&gt;write = false;
+entry-&gt;file_open = false;
+</code></pre>
+<h4 id="libfuse框架">libfuse框架</h4>
+<pre><code class="language-javascript">#4  0x00007fdabc02b818 in fuse_ll_process_buf () from /lib64/libfuse.so.2
+#5  0x00007fdabc028013 in fuse_session_loop () from /lib64/libfuse.so.2
+#6  0x00007fdabc0200b6 in fuse_loop () from /lib64/libfuse.so.2
+#7  0x00007fdabc030a87 in fuse_main_common () from /lib64/libfuse.so.2
+#8  0x0000000000410cf4 in initGDFS (rootDir="/tmp/robin", path="/opt/gdfs/", argc=6, argv=0x7ffcc2bca2e0) at gdfs.cc:1612
+#9  0x0000000000406df8 in mount_::mount_fs () at mount.cc:142
+#10 0x00000000004064fc in main (argc=15, argv=0x7ffcc2bca578) at main.cc:172
+</code></pre>
+<h3 id="api认证">api认证</h3>
+<pre><code class="language-javascript">class Auth {
+  private:
+    Request reqObj;
+}
+class Request {
+  private:
+    std::string confFile;
+    std::string redirectUri;
+    std::string clientId;
+    std::string clientSecret;
+    std::string accessToken;
+    std::string refreshToken;
+    time_t expiresIn;
+}
+enum requestType {
+  GET,
+  POST,
+  DELETE,
+  UPDATE,
+  INSERT,
+  DOWNLOAD,
+  UPLOAD_SESSION,
+  UPLOAD,
+  GENERATE_ID,
+};
+</code></pre>
+<pre><code class="language-shell">#0  GDrive::get_node (this=0x9c1ce0, path="/_opt_gdfs_/haha", uid=0, gid=0, search=false) at gdapi.cc:126
+#0  gdfs_read (path=0xaf08c0 "/_opt_gdfs_/haha", buf=0x7fdabc84f010 "", size=131072, offset=0, fi=0x7ffcc2bc9e80) at gdfs.cc:1310
+#1  0x00007fdabc0224e8 in fuse_fs_read_buf () from /lib64/libfuse.so.2
+#2  0x00007fdabc0226b6 in fuse_lib_read () from /lib64/libfuse.so.2
+#3  0x00007fdabc02b0df in do_read () from /lib64/libfuse.so.2
+#4  0x00007fdabc02b818 in fuse_ll_process_buf () from /lib64/libfuse.so.2
+#5  0x00007fdabc028013 in fuse_session_loop () from /lib64/libfuse.so.2
+#6  0x00007fdabc0200b6 in fuse_loop () from /lib64/libfuse.so.2
+#7  0x00007fdabc030a87 in fuse_main_common () from /lib64/libfuse.so.2
+#8  0x0000000000410cf4 in initGDFS (rootDir="/tmp/robin", path="/opt/gdfs/", argc=6, argv=0x7ffcc2bca2e0) at gdfs.cc:1612
+#9  0x0000000000406df8 in mount_::mount_fs () at mount.cc:142
+#10 0x00000000004064fc in main (argc=15, argv=0x7ffcc2bca578) at main.cc:172
+</code></pre>
+<h1 id="存在问题">存在问题</h1>
+<p>● 没有考虑多客户端并发修改删除，即没有实现分布式锁。<br>
+● 没有本地客户端与google drive的强一致性处理。应该是最终一致性，不是强一致性。</p>
+<h1 id="附录">附录</h1>
+<p>原有out-of-band的auth方式已经在2023年被完全屏蔽：<br>
+2022 年 2 月 28 日 - OOB 流程禁止使用新的 OAuth<br>
+2022 年 9 月 5 日 - 系统可能会向不合规的 OAuth 请求显示一条面向用户的警告消息<br>
+2022 年 10 月 3 日 - 对于 2022 年 2 月 28 日之前创建的 OAuth 客户端，OOB 流程已废弃<br>
+2023 年 1 月 31 日 - 所有现有客户端都被屏蔽（包括豁免的客户端）<br>
+<a href="https://developers.google.com/identity/protocols/oauth2/resources/oob-migration?hl=zh-cn" title="https://developers.google.com/identity/protocols/oauth2/resources/oob-migration?hl=zh-cn" target="_blank" rel="noopener nofollow">https://developers.google.com/identity/protocols/oauth2/resources/oob-migration?hl=zh-cn</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.5120527298946759" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-02-25 09:59">2025-02-25 09:56</span>&nbsp;
+<a href="https://www.cnblogs.com/diststorage">强壮的派大星</a>&nbsp;
+阅读(<span id="post_view_count">51</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18735580" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18735580);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18735580', targetLink: 'https://www.cnblogs.com/diststorage/p/18735580', title: 'gdfs: 基于Fuse的GoogleDrive客户端开源代码分析' })">举报</a>
+</div>
+        
