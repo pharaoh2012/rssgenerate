@@ -1,0 +1,319 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xiezhr/p/18737457" title="发布于 2025-02-25 22:39">
+    <span role="heading" aria-level="2">凌晨三点救火实录：Java内存泄漏的七个神坑，你至少踩过三个！</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h3 id="引子那个让运维集体加班的夜晚"><strong>引子：那个让运维集体加班的夜晚</strong></h3>
+<p>"凡哥！线上服务响应时间飙到10秒了！"凌晨1点，实习生小李的语音带着哭腔。<br>
+监控大屏上，JVM堆内存曲线像坐了火箭——刚扩容的16G内存，30分钟就被吃干抹净。<br>
+我咬着牙拍桌子："把最近一周上线的代码给我翻个底朝天！"</p>
+<hr>
+<h3 id="第一坑static集合成永动机"><strong>第一坑：Static集合成永动机</strong></h3>
+<p><strong>▌ 翻车代码（真实项目片段）</strong></p>
+<pre><code class="language-java">// 缓存用户AI对话历史 → 翻车写法！
+public class ChatHistoryCache {
+    private static Map&lt;Long, List&lt;String&gt;&gt; cache = new HashMap&lt;&gt;();
+
+    public static void addMessage(Long userId, String msg) {
+        cache.computeIfAbsent(userId, k -&gt; new ArrayList&lt;&gt;()).add(msg);
+    }
+}
+</code></pre>
+<p><strong>▌ 翻车现场</strong></p>
+<ul>
+<li>用户量暴增时，缓存数据只进不出，48小时撑爆内存</li>
+<li>用Arthas抓现行：<code>vmtool --action getInstances -c 4614556e</code> 看到Map尺寸破千万</li>
+<li>MAT分析：<code>HashMap$Node</code>对象占堆内存82%</li>
+</ul>
+<p><strong>▌ 正确姿势</strong></p>
+<pre><code class="language-java">// 改用Guava带过期时间的缓存
+private static Cache&lt;Long, List&lt;String&gt;&gt; cache = CacheBuilder.newBuilder()
+        .expireAfterAccess(1, TimeUnit.HOURS) 
+        .maximumSize(10000)
+        .build();
+</code></pre>
+<hr>
+<h3 id="第二坑lambda忘记关文件流"><strong>第二坑：Lambda忘记关文件流</strong></h3>
+<p><strong>▌ 致命代码（处理AI模型文件）</strong></p>
+<pre><code class="language-java">// 加载本地模型文件 → 翻车写法！
+public void loadModels(List&lt;File&gt; files) {
+    files.forEach(file -&gt; {
+        try {
+            InputStream is = new FileInputStream(file); // 漏了关闭！
+            parseModel(is);
+        } catch (IOException e) { /*...*/ }
+    });
+}
+</code></pre>
+<p><strong>▌ 诡异现象</strong></p>
+<ul>
+<li>服务运行三天后突然报 "Too many open files"</li>
+<li>Linux排查：<code>lsof -p 进程ID | grep 'deleted'</code> 发现大量未释放文件句柄</li>
+<li>JVM监控：<code>jcmd PID VM.native_memory</code>显示文件描述符数量突破1万</li>
+</ul>
+<p><strong>▌ 抢救方案</strong></p>
+<pre><code class="language-java">// 正确写法：try-with-resources自动关闭
+files.forEach(file -&gt; {
+    try (InputStream is = new FileInputStream(file)) { // 自动关流
+        parseModel(is);
+    } catch (IOException e) { /*...*/ }
+});
+</code></pre>
+<hr>
+<h3 id="第三坑spring事件监听成钉子户"><strong>第三坑：Spring事件监听成钉子户</strong></h3>
+<p><strong>▌ 坑爹代码（消息通知模块）</strong></p>
+<pre><code class="language-java">// 监听AI处理完成事件 → 翻车写法！
+@Component
+public class NotifyService {
+
+    @EventListener
+    public void handleAiEvent(AICompleteEvent event) {
+        // 错误持有外部服务引用
+        externalService.registerCallback(this::sendNotification); 
+    }
+}
+</code></pre>
+<p><strong>▌ 内存曲线</strong></p>
+<ul>
+<li>每次事件触发，监听器对象就被外部服务强引用，永远不释放</li>
+<li>MAT分析：<code>NotifyService</code>实例数随时间线性增长</li>
+<li>GC日志：老年代占用率每周增长5%</li>
+</ul>
+<p><strong>▌ 避坑绝招</strong></p>
+<pre><code class="language-java">// 使用弱引用解除绑定
+public void handleAiEvent(AICompleteEvent event) {
+    WeakReference&lt;NotifyService&gt; weakRef = new WeakReference&lt;&gt;(this);
+    externalService.registerCallback(() -&gt; {
+        NotifyService service = weakRef.get();
+        if (service != null) service.sendNotification();
+    });
+}
+</code></pre>
+<hr>
+<h3 id="第四坑线程池里的僵尸任务"><strong>第四坑：线程池里的僵尸任务</strong></h3>
+<p><strong>▌ 问题代码（异步处理AI请求）</strong></p>
+<pre><code class="language-java">// 异步线程池配置 → 翻车写法！
+@Bean
+public Executor asyncExecutor() {
+    return new ThreadPoolExecutor(10, 10,
+        0L, TimeUnit.MILLISECONDS,
+        new LinkedBlockingQueue&lt;&gt;()); // 无界队列！
+}
+</code></pre>
+<p><strong>▌ 灾难现场</strong></p>
+<ul>
+<li>请求突增时队列堆积50万任务，每个任务持有一个AI响应对象</li>
+<li>堆dump显示：<code>byte[]</code>占内存90%，全是待处理的响应数据</li>
+<li>监控指标：<code>queue_size</code>指标持续高位不降</li>
+</ul>
+<p><strong>▌ 正确配置</strong></p>
+<pre><code class="language-java">// 设置队列上限+拒绝策略
+new ThreadPoolExecutor(10, 50, 
+    60L, TimeUnit.SECONDS,
+    new ArrayBlockingQueue&lt;&gt;(1000), 
+    new ThreadPoolExecutor.CallerRunsPolicy());
+</code></pre>
+<hr>
+<h3 id="第五坑mybatis连接池里的幽灵"><strong>第五坑：MyBatis连接池里的幽灵</strong></h3>
+<p><strong>▌ 致命代码（查询用户对话记录）</strong></p>
+<pre><code class="language-java">public List&lt;ChatRecord&gt; getHistory(Long userId) {
+    SqlSession session = sqlSessionFactory.openSession();
+    try {
+        return session.selectList("queryHistory", userId);
+    } finally {
+        // 忘记session.close() → 连接池逐渐枯竭
+    }
+}
+</code></pre>
+<p><strong>▌ 泄露证据</strong></p>
+<ul>
+<li>Druid监控面板显示活跃连接数达到最大值</li>
+<li>日志报错：<code>Cannot get connection from pool, timeout 30000ms</code></li>
+<li>堆分析：<code>SqlSession</code>实例数异常增长</li>
+</ul>
+<p><strong>▌ 正确姿势</strong></p>
+<pre><code class="language-java">// 使用try-with-resources自动关闭
+try (SqlSession session = sqlSessionFactory.openSession()) {
+    return session.selectList("queryHistory", userId);
+}
+</code></pre>
+<hr>
+<h3 id="第六坑第三方库的温柔陷阱"><strong>第六坑：第三方库的温柔陷阱</strong></h3>
+<p><strong>▌ 问题代码（缓存用户偏好设置）</strong></p>
+<pre><code class="language-java">// 使用Ehcache时的错误配置
+CacheConfiguration&lt;Long, UserPreference&gt; config = new CacheConfiguration&lt;&gt;()
+    .setName("user_prefs")
+    .setMaxEntriesLocalHeap(10000); // 只设置了数量，没设过期时间！
+</code></pre>
+<p><strong>▌ 内存症状</strong></p>
+<ul>
+<li>GC日志显示老年代每周增长3%</li>
+<li>Arthas监控：<code>watch com.example.CacheService getCachedUser</code>返回对象存活时间超7天</li>
+<li>压测时触发OOM，堆中发现大量<code>UserPreference</code>对象</li>
+</ul>
+<p><strong>▌ 正确配置</strong></p>
+<pre><code class="language-java">config.setTimeToLiveSeconds(3600) // 1小时过期
+      .setDiskExpiryThreadIntervalSeconds(60); // 过期检查间隔
+</code></pre>
+<hr>
+<h3 id="第七坑threadlocal用完不打扫"><strong>第七坑：ThreadLocal用完不打扫</strong></h3>
+<p><strong>▌ 致命代码（用户上下文传递）</strong></p>
+<pre><code class="language-java">public class UserContextHolder {
+    private static final ThreadLocal&lt;User&gt; currentUser = new ThreadLocal&lt;&gt;();
+
+    public static void set(User user) {
+        currentUser.set(user);
+    }
+
+    // 缺少remove方法！
+}
+</code></pre>
+<p><strong>▌ 内存异常</strong></p>
+<ul>
+<li>线程池复用后，ThreadLocal中旧用户数据堆积</li>
+<li>MAT分析：<code>User</code>对象被<code>ThreadLocalMap</code>强引用无法释放</li>
+<li>监控发现：每个线程持有平均50个过期用户对象</li>
+</ul>
+<p><strong>▌ 修复方案</strong></p>
+<pre><code class="language-java">// 使用后必须清理！
+public static void remove() {
+    currentUser.remove();
+}
+
+// 在拦截器中强制清理
+@Around("execution(* com.example..*.*(..))")
+public Object clearContext(ProceedingJoinPoint pjp) throws Throwable {
+    try {
+        return pjp.proceed();
+    } finally {
+        UserContextHolder.remove(); // 关键！
+    }
+}
+</code></pre>
+<hr>
+<h3 id="终极排查工具箱"><strong>终极排查工具箱</strong></h3>
+<p><strong>1. Arthas实战三连击</strong></p>
+<pre><code class="language-bash"># 实时监控GC情况
+dashboard -n 5 -i 2000
+
+# 追踪可疑方法调用频次
+trace com.example.CacheService addCacheEntry -n 10
+
+# 动态修改日志级别（无需重启）
+logger --name ROOT --level debug
+</code></pre>
+<p><strong>2. MAT分析三板斧</strong></p>
+<ul>
+<li><strong>Dominator Tree</strong>：揪出内存吞噬者</li>
+<li><strong>Path to GC Roots</strong>：顺藤摸瓜找凶手</li>
+<li><strong>OQL黑科技</strong>：<pre><code class="language-sql">SELECT * FROM java.util.HashMap WHERE size &gt; 10000
+SELECT toString(msg) FROM java.lang.String WHERE msg.value LIKE "%OOM%"
+</code></pre>
+</li>
+</ul>
+<p><strong>3. 线上救火命令包</strong></p>
+<pre><code class="language-bash"># 快速查看堆内存分布
+jhsdb jmap --heap --pid &lt;PID&gt;
+
+# 统计对象数量排行榜
+jmap -histo:live &lt;PID&gt; | head -n 20
+
+# 强制触发Full GC（慎用！）
+jcmd &lt;PID&gt; GC.run
+</code></pre>
+<hr>
+<h3 id="防泄漏军规十二条"><strong>防泄漏军规十二条</strong></h3>
+<ol>
+<li><strong>所有缓存必须设置双保险</strong>：过期时间 + 容量上限</li>
+<li><strong>IO操作三重防护</strong>：<pre><code class="language-java">try (InputStream is = ...) { // 第一重
+    useStream(is); 
+} catch (IOException e) {    // 第二重
+    log.error("IO异常", e);
+} finally {                  // 第三重
+    cleanupTempFiles();
+}
+</code></pre>
+</li>
+<li><strong>线程池四不原则</strong>：
+<ul>
+<li>不用无界队列</li>
+<li>不设不合理核心数</li>
+<li>不忽略拒绝策略</li>
+<li>不存放大对象</li>
+</ul>
+</li>
+<li><strong>Spring组件三查</strong>：
+<ul>
+<li>查事件监听器引用链</li>
+<li>查单例对象中的集合类</li>
+<li>查@Async注解的线程池配置</li>
+</ul>
+</li>
+<li><strong>第三方库两验</strong>：
+<ul>
+<li>验连接池归还机制</li>
+<li>验缓存默认配置</li>
+</ul>
+</li>
+<li><strong>代码审查重点关注</strong>：
+<ul>
+<li>所有static修饰的集合</li>
+<li>所有close()/release()调用点</li>
+<li>所有内部类持有外部引用的地方</li>
+</ul>
+</li>
+</ol>
+<hr>
+<p><strong>运维老凡的避坑日记</strong></p>
+<blockquote>
+<p><strong>2024-03-20 凌晨2点</strong><br>
+"小王啊，知道为什么我头发这么少吗？<br>
+当年有人把用户会话存到ThreadLocal里不清理，<br>
+结果线上十万用户同时在线时——<br>
+那内存泄漏的速度比理发店推子还快！"</p>
+</blockquote>
+<hr>
+<p><strong>自测题：你能看出这段代码哪里会泄漏吗？</strong></p>
+<pre><code class="language-java">// 危险代码！请找出三个泄漏点
+public class ModelLoader {
+    private static List&lt;Model&gt; loadedModels = new ArrayList&lt;&gt;();
+    
+    public void load(String path) {
+        Model model = new Model(Files.readAllBytes(Paths.get(path)));
+        loadedModels.add(model);
+        Executors.newSingleThreadScheduledExecutor()
+                 .scheduleAtFixedRate(() -&gt; model.refresh(), 1, 1, HOURS);
+    }
+}
+</code></pre>
+<p><strong>答案揭晓</strong>：</p>
+<ol>
+<li>static集合无清理机制</li>
+<li>定时任务线程池未关闭</li>
+<li>匿名内部类持有Model强引用</li>
+</ol>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/xiezhr/" target="_blank">程序员晓凡</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/xiezhr/p/18737457" target="_blank">https://www.cnblogs.com/xiezhr/p/18737457</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.06955156531018518" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-02-25 22:40">2025-02-25 22:39</span>&nbsp;
+<a href="https://www.cnblogs.com/xiezhr">程序员晓凡</a>&nbsp;
+阅读(<span id="post_view_count">10</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18737457" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18737457);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18737457', targetLink: 'https://www.cnblogs.com/xiezhr/p/18737457', title: '凌晨三点救火实录：Java内存泄漏的七个神坑，你至少踩过三个！' })">举报</a>
+</div>
+        
