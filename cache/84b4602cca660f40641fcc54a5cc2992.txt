@@ -1,0 +1,558 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huggingface/p/18764887" title="发布于 2025-03-11 13:47">
+    <span role="heading" aria-level="2">LayerSkip: 使用自推测解码加速大模型推理</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>自推测解码是一种新颖的文本生成方法，它结合了推测解码 (Speculative Decoding) 的优势和大语言模型 (LLM) 的提前退出 (Early Exit) 机制。该方法出自论文 <a href="https://arxiv.org/abs/2404.16710" target="_blank" rel="noopener nofollow">LayerSkip: Enabling Early-Exit Inference and Self-Speculative Decoding</a>。它通过使用 <em>同一个模型</em> 的早期层来生成候选词元 (token)，并使用后期层进行验证，从而实现高效生成。</p>
+<p>这项技术不仅加快了文本生成速度，还显著节省了内存并降低了计算延迟。为了实现端到端的加速，早期层的输出需要与最终层的输出足够接近。正如论文中所述，这可以通过一种训练方法来实现，该方法可以在预训练期间应用，也可以在特定领域进行微调时应用。自推测解码对于实际应用特别高效，它可以在较小的 GPU 上部署，并降低 <strong>大规模推理</strong> 所需的整体硬件资源。</p>
+<p>在本博客中，我们将探讨自推测解码的概念、其实现方式以及在 🤗 transformers 库中的实际应用。您将了解到其技术原理，包括 <strong>提前退出层 (Early-Exit Layers)</strong> 、 <strong>反嵌入 (Unembedding)</strong> 和 <strong>训练修改 (Training Modifications)</strong>。为了将这些概念付诸实践，我们提供了代码示例、与传统推测解码的基准比较，以及对性能权衡的见解。</p>
+<p>您还可以直接查看以下 Hugging Face 资源，了解更多关于该方法的信息并亲自尝试:</p>
+<ol>
+<li><a href="https://huggingface.co/papers/2404.16710" target="_blank" rel="noopener nofollow">Hugging Face 论文讨论论坛</a></li>
+<li><a href="https://huggingface.co/collections/facebook/layerskip-666b25c50c8ae90e1965727a" target="_blank" rel="noopener nofollow">LayerSkip 模型集合</a></li>
+<li><a href="https://huggingface.co/datasets/ariG23498/layer-skip-assets/blob/main/early_exit_self_speculative_decoding.ipynb" target="_blank" rel="noopener nofollow">展示自推测解码深入工作原理的 Colab 笔记本</a></li>
+</ol>
+<h2 id="推测解码与自推测解码">推测解码与自推测解码</h2>
+<p><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/f9219dd8e44eb.gif" alt="LayerSkip 演示 GIF" loading="lazy"></p>
+<p><em>在 <a href="https://huggingface.co/facebook/layerskip-llama2-7B" target="_blank" rel="noopener nofollow"><code>facebook/layerskip-llama2-7B</code></a> 上的 LayerSkip 推理演示 (使用 LayerSkip 方法持续预训练的 Llama2 7B)。</em></p>
+<p><a href="https://huggingface.co/blog/assisted-generation" target="_blank" rel="noopener nofollow">传统的推测解码</a> 使用 <strong>两个</strong> 模型: 一个较小的模型 (草稿模型) 用于生成一系列候选词元，一个较大的模型 (验证模型) 用于验证草稿的准确性。较小的模型执行大部分生成工作，而较大的模型则负责改进结果。这提高了文本生成速度，因为较大的模型一次性验证完整序列，而不是逐个生成词元。</p>
+<p>在自推测解码中，作者在此概念的基础上，使用大模型的早期层来生成草稿词元，然后由模型的更深层进行验证。这种推测解码的“自洽”特性需要特定的训练，使模型能够同时执行草稿生成和验证。这反过来又比传统的推测解码提高了速度并降低了计算成本。</p>
+<h2 id="在-transformers-中的使用">在 <code>transformers</code> 中的使用</h2>
+<p>为了在 🤗 transformers 库中启用提前退出自推测解码，我们只需在 <code>generate()</code> 函数中添加 <code>assistant_early_exit</code> 参数。</p>
+<p>以下是一个简单的代码片段，展示了该功能:</p>
+<pre><code class="language-python">pip install transformers
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+early_exit_layer = 4
+prompt = "Alice and Bob"
+checkpoint = "facebook/layerskip-llama2-7B"
+
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+model = AutoModelForCausalLM.from_pretrained(checkpoint).to("cuda")
+outputs = model.generate(**inputs, assistant_early_exit=early_exit_layer)
+</code></pre>
+<p>注意: 虽然 <code>assistant_early_exit</code> 参数可以为任何仅解码器的 transformer 启用提前退出自推测解码，但除非模型经过专门训练，否则无法反嵌入 (通过 LM 头进行解码的过程，在博客文章后面有描述) 中间层的 logits。只有对检查点进行这样的训练，以提高早期层的准确性，您才能获得加速。LayerSkip 论文提出了一种训练方法来实现这一点 (即应用提前退出损失，并逐步增加层丢弃率)。<a href="https://huggingface.co/collections/facebook/layerskip-666b25c50c8ae90e1965727a" target="_blank" rel="noopener nofollow">这里</a> 提供了使用 LayerSkip 训练方法持续预训练的 Llama2、Llama3 和 Code Llama 检查点的集合。</p>
+<h2 id="基准测试">基准测试</h2>
+<p>我们进行了一系列广泛的基准测试，以衡量 LayerSkip 的自推测解码相对于自回归解码在各种模型上的加速情况。我们还将自推测解码 (基于提前退出) 与标准推测解码技术进行了比较。要复现这些结果，您可以在 <a href="https://github.com/aritra24rg/LayerSkip-Benchmarking" target="_blank" rel="noopener nofollow">这里</a> 找到代码，并在 <a href="https://docs.google.com/spreadsheets/d/15poLaR_7tG_5xZo-LzLMFd4dzz-dHl_h/edit#gid=1155443081" target="_blank" rel="noopener nofollow">此电子表格</a> 中找到运行每个实验的命令。所有实验均在单个 80GB A100 GPU 上运行，除了 Llama2 70B 实验在 8 个 A100 GPU 的节点上运行。</p>
+<h4 id="llama32-1b">Llama3.2 1B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">Model Variant (模型变体)</th>
+<th style="text-align: left">Layers (层数)</th>
+<th style="text-align: left">Assistant Model (辅助模型)</th>
+<th style="text-align: left">Assistant Layers (辅助层数)</th>
+<th style="text-align: left">Task (任务)</th>
+<th style="text-align: left">Total Layers (总层数)</th>
+<th style="text-align: left">FLOPs/Input (G) (输入 FLOPs)</th>
+<th style="text-align: left">Time/Input (s) (输入时间)</th>
+<th style="text-align: left">FLOPs/Output (G) (输出 FLOPs)</th>
+<th style="text-align: left">Time/Output (s) (输出时间)</th>
+<th style="text-align: left">Efficiency (效率)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">facebook/layerskip-llama3.2-1B</td>
+<td style="text-align: left">1</td>
+<td style="text-align: left">Early Exit @ Layer 4</td>
+<td style="text-align: left"></td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">1</td>
+<td style="text-align: left">1195.28</td>
+<td style="text-align: left">9.96</td>
+<td style="text-align: left">2147.7</td>
+<td style="text-align: left">17.9</td>
+<td style="text-align: left">1.80</td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama3-8b">Llama3 8B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">Model Variant (模型变体)</th>
+<th style="text-align: left">Layers (层数)</th>
+<th style="text-align: left">Assistant Model (辅助模型)</th>
+<th style="text-align: left">Assistant Layers (辅助层数)</th>
+<th style="text-align: left">Task (任务)</th>
+<th style="text-align: left">Total Layers (总层数)</th>
+<th style="text-align: left">FLOPs/Input (G) (输入 FLOPs)</th>
+<th style="text-align: left">Time/Input (s) (输入时间)</th>
+<th style="text-align: left">FLOPs/Output (G) (输出 FLOPs)</th>
+<th style="text-align: left">Time/Output (s) (输出时间)</th>
+<th style="text-align: left">Efficiency (效率)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">meta-llama/Meta-Llama-3-8B</td>
+<td style="text-align: left">8</td>
+<td style="text-align: left">meta-llama/Llama-3.2-1B</td>
+<td style="text-align: left">1</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">9</td>
+<td style="text-align: left">1872.46</td>
+<td style="text-align: left">19.04</td>
+<td style="text-align: left">2859.35</td>
+<td style="text-align: left">29.08</td>
+<td style="text-align: left">1.53</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Meta-Llama-3-8B</td>
+<td style="text-align: left">8</td>
+<td style="text-align: left">meta-llama/Llama-3.2-3B</td>
+<td style="text-align: left">3</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">11</td>
+<td style="text-align: left">2814.82</td>
+<td style="text-align: left">28.63</td>
+<td style="text-align: left">2825.36</td>
+<td style="text-align: left">28.73</td>
+<td style="text-align: left">1.00</td>
+</tr>
+<tr>
+<td style="text-align: left">facebook/layerskip-llama3-8B</td>
+<td style="text-align: left">8</td>
+<td style="text-align: left">Early Exit @ Layer 4</td>
+<td style="text-align: left"></td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">8</td>
+<td style="text-align: left">1949.02</td>
+<td style="text-align: left">15.75</td>
+<td style="text-align: left">3571.81</td>
+<td style="text-align: left">28.87</td>
+<td style="text-align: left">1.83</td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama2-70b">Llama2 70B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">Model Variant (模型变体)</th>
+<th style="text-align: left">Layers (层数)</th>
+<th style="text-align: left">Assistant Model (辅助模型)</th>
+<th style="text-align: left">Assistant Layers (辅助层数)</th>
+<th style="text-align: left">Task (任务)</th>
+<th style="text-align: left">Total Layers (总层数)</th>
+<th style="text-align: left">FLOPs/Input (G) (输入 FLOPs)</th>
+<th style="text-align: left">Time/Input (s) (输入时间)</th>
+<th style="text-align: left">FLOPs/Output (G) (输出 FLOPs)</th>
+<th style="text-align: left">Time/Output (s) (输出时间)</th>
+<th style="text-align: left">Efficiency (效率)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-70b-hf</td>
+<td style="text-align: left">70</td>
+<td style="text-align: left">meta-llama/Llama-2-13b-hf</td>
+<td style="text-align: left">13</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">83</td>
+<td style="text-align: left">5036.54</td>
+<td style="text-align: left">46.3</td>
+<td style="text-align: left">12289.01</td>
+<td style="text-align: left">112.97</td>
+<td style="text-align: left">2.44</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-70b-hf</td>
+<td style="text-align: left">70</td>
+<td style="text-align: left">meta-llama/Llama-2-7b-hf</td>
+<td style="text-align: left">7</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">77</td>
+<td style="text-align: left">4357.55</td>
+<td style="text-align: left">40.06</td>
+<td style="text-align: left">12324.19</td>
+<td style="text-align: left">113.3</td>
+<td style="text-align: left">2.83</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-70b-hf</td>
+<td style="text-align: left">70</td>
+<td style="text-align: left">TinyLlama/TinyLlama_v1.1</td>
+<td style="text-align: left">1</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">71</td>
+<td style="text-align: left">4356.21</td>
+<td style="text-align: left">40.05</td>
+<td style="text-align: left">12363.22</td>
+<td style="text-align: left">113.66</td>
+<td style="text-align: left">2.84</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>facebook/layerskip-llama2-70B</strong></td>
+<td style="text-align: left">70</td>
+<td style="text-align: left">Early Exit @ Layer 10</td>
+<td style="text-align: left"></td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">70</td>
+<td style="text-align: left">6012.04</td>
+<td style="text-align: left">54.96</td>
+<td style="text-align: left">1283.34</td>
+<td style="text-align: left">113.2</td>
+<td style="text-align: left">2.06</td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama2-13b">Llama2 13B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">Model Variant (模型变体)</th>
+<th style="text-align: left">Layers (层数)</th>
+<th style="text-align: left">Assistant Model (辅助模型)</th>
+<th style="text-align: left">Assistant Layers (辅助层数)</th>
+<th style="text-align: left">Task (任务)</th>
+<th style="text-align: left">Total Layers (总层数)</th>
+<th style="text-align: left">FLOPs/Input (G) (输入 FLOPs)</th>
+<th style="text-align: left">Time/Input (s) (输入时间)</th>
+<th style="text-align: left">FLOPs/Output (G) (输出 FLOPs)</th>
+<th style="text-align: left">Time/Output (s) (输出时间)</th>
+<th style="text-align: left">Efficiency (效率)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-13b-hf</td>
+<td style="text-align: left">13</td>
+<td style="text-align: left">meta-llama/Llama-2-7b-hf</td>
+<td style="text-align: left">7</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">20</td>
+<td style="text-align: left">3557.07</td>
+<td style="text-align: left">27.79</td>
+<td style="text-align: left">4088.48</td>
+<td style="text-align: left">31.94</td>
+<td style="text-align: left">1.15</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-13b-hf</td>
+<td style="text-align: left">13</td>
+<td style="text-align: left">TinyLlama/TinyLlama_v1.1</td>
+<td style="text-align: left">1</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">14</td>
+<td style="text-align: left">2901.92</td>
+<td style="text-align: left">22.67</td>
+<td style="text-align: left">4190.42</td>
+<td style="text-align: left">32.74</td>
+<td style="text-align: left">1.44</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-13b-hf</td>
+<td style="text-align: left">13</td>
+<td style="text-align: left">apple/OpenELM-270M</td>
+<td style="text-align: left">0.27</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">13.27</td>
+<td style="text-align: left">2883.33</td>
+<td style="text-align: left">22.53</td>
+<td style="text-align: left">4521.12</td>
+<td style="text-align: left">35.32</td>
+<td style="text-align: left">1.57</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-13b-hf</td>
+<td style="text-align: left">13</td>
+<td style="text-align: left">apple/OpenELM-450M</td>
+<td style="text-align: left">0.45</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">13.45</td>
+<td style="text-align: left">3267.69</td>
+<td style="text-align: left">25.53</td>
+<td style="text-align: left">4321.75</td>
+<td style="text-align: left">33.76</td>
+<td style="text-align: left">1.32</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>facebook/layerskip-llama2-13B</strong></td>
+<td style="text-align: left"><strong>13</strong></td>
+<td style="text-align: left"><strong>Early Exit @ Layer 4</strong></td>
+<td style="text-align: left"></td>
+<td style="text-align: left"><strong>summarization</strong></td>
+<td style="text-align: left"><strong>13</strong></td>
+<td style="text-align: left"><strong>4238.45</strong></td>
+<td style="text-align: left"><strong>33.11</strong></td>
+<td style="text-align: left"><strong>4217.78</strong></td>
+<td style="text-align: left"><strong>32.95</strong></td>
+<td style="text-align: left"><strong>0.995</strong></td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>facebook/layerskip-llama2-13B</strong></td>
+<td style="text-align: left">13</td>
+<td style="text-align: left">Early Exit @ Layer 8</td>
+<td style="text-align: left"></td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">13</td>
+<td style="text-align: left">2459.61</td>
+<td style="text-align: left">19.22</td>
+<td style="text-align: left">4294.98</td>
+<td style="text-align: left">33.55</td>
+<td style="text-align: left">1.746</td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama2-7b">Llama2 7B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">Model Variant (模型变体)</th>
+<th style="text-align: left">Layers (层数)</th>
+<th style="text-align: left">Assistant Model (辅助模型)</th>
+<th style="text-align: left">Assistant Layers (辅助层数)</th>
+<th style="text-align: left">Task (任务)</th>
+<th style="text-align: left">Total Layers (总层数)</th>
+<th style="text-align: left">FLOPs/Input (G) (输入 FLOPs)</th>
+<th style="text-align: left">Time/Input (s) (输入时间)</th>
+<th style="text-align: left">FLOPs/Output (G) (输出 FLOPs)</th>
+<th style="text-align: left">Time/Output (s) (输出时间)</th>
+<th style="text-align: left">Efficiency (效率)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-7b-hf</td>
+<td style="text-align: left">7</td>
+<td style="text-align: left">TinyLlama/TinyLlama_v1.1</td>
+<td style="text-align: left">1</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">8</td>
+<td style="text-align: left">2771.54</td>
+<td style="text-align: left">21.65</td>
+<td style="text-align: left">3368.48</td>
+<td style="text-align: left">26.32</td>
+<td style="text-align: left">1.22</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-7b-hf</td>
+<td style="text-align: left">7</td>
+<td style="text-align: left">apple/OpenELM-270M</td>
+<td style="text-align: left">0.27</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">7.27</td>
+<td style="text-align: left">2607.82</td>
+<td style="text-align: left">20.37</td>
+<td style="text-align: left">4221.14</td>
+<td style="text-align: left">32.98</td>
+<td style="text-align: left">1.62</td>
+</tr>
+<tr>
+<td style="text-align: left">meta-llama/Llama-2-7b-hf</td>
+<td style="text-align: left">7</td>
+<td style="text-align: left">apple/OpenELM-450M</td>
+<td style="text-align: left">0.45</td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">7.45</td>
+<td style="text-align: left">3324.68</td>
+<td style="text-align: left">25.97</td>
+<td style="text-align: left">4178.66</td>
+<td style="text-align: left">32.65</td>
+<td style="text-align: left">1.26</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>facebook/layerskip-llama2-7B</strong></td>
+<td style="text-align: left">7</td>
+<td style="text-align: left">Early Exit @ Layer 4</td>
+<td style="text-align: left"></td>
+<td style="text-align: left">summarization</td>
+<td style="text-align: left">7</td>
+<td style="text-align: left">2548.4</td>
+<td style="text-align: left">19.91</td>
+<td style="text-align: left">3306.73</td>
+<td style="text-align: left">25.83</td>
+<td style="text-align: left">1.297</td>
+</tr>
+</tbody>
+</table>
+<p>我们可以观察到以下几点:</p>
+<ul>
+<li>从“ <strong>总参数数量</strong>”列可以看出，自推测解码消耗的内存更少，因为它不需要单独的草稿模型，并且草稿阶段层的权重被重用。</li>
+<li>对于除 Llama2 70B 之外的所有模型大小和生成，提前退出自推测解码比常规的两模型推测解码更快。</li>
+<li>与其它模型相比，Llama2 70B 的自推测解码速度提升相对有限，可能有不同的原因，例如，Llama2 70B 的 LayerSkip 检查点持续预训练的 token 较少 (Llama2 70B 为 328M token，而 Llama2 7B 为 52B token)。但这是未来研究需要改进的一个方面。尽管如此，70B 的自推测解码明显快于自回归解码。</li>
+</ul>
+<h2 id="自生成和自验证"><strong>自生成和自验证</strong></h2>
+<p>自推测解码过程从自生成开始，其中词元是通过从某个中间层提前退出来生成的。推测词元的数量定义了在此阶段生成多少草稿词元，而我们退出的层定义了草稿阶段的规模和准确性。这两个参数都可以在推理时根据草稿阶段的速度和准确性之间的权衡来指定。</p>
+<p>下一步是自验证，其中使用完整模型来验证草稿词元。验证模型重用草稿模型中的缓存部分。如果草稿词元与验证的词元一致，则将它们添加到最终输出中，从而更好地利用我们系统中的内存带宽，因为使用完整模型生成一系列词元比验证草稿要昂贵得多，只要有几个词元匹配即可。</p>
+<p>在自验证阶段，只有剩余的层才会被计算以进行验证，因为早期层的结果在草稿阶段已被缓存。</p>
+<h2 id="提前退出和反嵌入"><strong>提前退出和反嵌入</strong></h2>
+<p>自推测解码中的一项关键技术是提前退出，即生成过程可以在预先指定的层停止。为了实现这一点，我们通过将这些层的 logits 投影到语言模型 (LM) 头上来反嵌入它们，以预测下一个词元。这允许模型跳过后续层并提高推理时间。</p>
+<p>可以在任何 transformer 层执行反嵌入，将提前退出转变为一种高效的词元预测机制。一个自然而然的问题出现了: 当 LM 头最初被训练为仅与最终层一起工作时，如何使其适应反嵌入较早层的 logits？这就是训练修改发挥作用的地方。</p>
+<h2 id="训练修改"><strong>训练修改</strong></h2>
+<p>在训练阶段，我们引入了层丢弃，它允许模型在训练期间跳过某些层。丢弃率在较深的层中逐渐增加，使模型不太依赖其后面的层，并增强模型的泛化能力并加快训练速度。</p>
+<p>除了层丢弃之外，还应用了提前退出损失，以确保 LM 头学习反嵌入不同的层。使用每个出口 (中间层) 的归一化损失的总和来给出使用提前出口训练模型的总损失函数。这种技术通过在所有层之间分配学习任务来实现高效训练。</p>
+<h2 id="优化-共享权重共享-kv-缓存和共享计算">优化: 共享权重、共享 KV 缓存和共享计算</h2>
+<p>自推测解码显著受益于缓存重用，特别是 KV 缓存，它存储在草稿阶段计算的键值对。此缓存允许模型跳过冗余计算，因为草稿和验证阶段都使用相同的早期层。此外，退出查询缓存存储来自退出层的查询向量，允许验证从草稿阶段无缝继续。</p>
+<p>与传统的双模型推测解码相比，提前退出自推测解码可以从以下节省中受益:</p>
+<ul>
+<li><strong>共享权重</strong>: 为草稿和验证重用前 E 层 的权重。</li>
+<li><strong>共享 KV 缓存</strong>:  为草稿和验证重用前 E 层的键值对</li>
+<li><strong>共享计算</strong>:  通过使用仅保存退出层 E-1 的查询向量的退出查询缓存来重用前 E 层的计算，以便验证过程无需计算层 0 到 E-1。</li>
+</ul>
+<p>KV 和退出查询缓存的组合称为 KVQ 缓存，可减少内存开销并提高推理延迟。</p>
+<p>到目前为止，🤗 transformers 库已在此 <a href="https://github.com/huggingface/transformers/pull/30890" target="_blank" rel="noopener nofollow">pull request</a> 中实现了第一个优化 (共享权重)。随着使用此方法的模型数量增加，我们将考虑其他优化。如果您有兴趣，请随时提出 PR！</p>
+<h2 id="提前退出层的选择策略">提前退出层的选择策略</h2>
+<p>草稿阶段的提前退出层是一个超参数，我们可以在推理期间调整或修改:</p>
+<ul>
+<li>我们越早退出，生成草稿词元的速度就越快，但它们的准确性就越低。</li>
+<li>我们越晚退出，生成的草稿词元就越准确，但它们的速度就越慢。</li>
+</ul>
+<p>我们编写了一个脚本来遍历不同的提前退出层并测量 A100 GPU 上的每秒词元数。在下面的表格中，我们绘制了针对不同 Llama 模型的 LayerSkip 和基线检查点的每秒词元数与提前退出层的关系图 (您可以在 <a href="https://docs.google.com/spreadsheets/d/15poLaR_7tG_5xZo-LzLMFd4dzz-dHl_h/edit#gid=1155443081" target="_blank" rel="noopener nofollow">此处</a> 查看完整日志)。</p>
+<h4 id="llama32-1b-1">Llama3.2 1B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">Normal (常规模型)</th>
+<th style="text-align: center">LayerSkip (LayerSkip 模型)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/d240200a5a4ae.png" alt="llama 3.2 1b" loading="lazy"></td>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/7986ed1d443bf.png" alt="layer skip llama 3.2 1b" loading="lazy"></td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama3-8b-1">Llama3 8B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">Normal (常规模型)</th>
+<th style="text-align: center">LayerSkip (LayerSkip 模型)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/57f23cc6903cd.png" alt="llama 3 8b" loading="lazy"></td>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/4ce0a860909aa.png" alt="layer skip llama 3 8b" loading="lazy"></td>
+</tr>
+</tbody>
+</table>
+<h4 id="code-llama3-34b">Code Llama3 34B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">Normal (常规模型)</th>
+<th style="text-align: center">LayerSkip (LayerSkip 模型)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/37e3deef9439f.png" alt="code llama 3 34b" loading="lazy"></td>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/cbd40b5a62436.png" alt="code layer skip llama 3 34b" loading="lazy"></td>
+</tr>
+</tbody>
+</table>
+<h4 id="code-llama3-7b">Code Llama3 7B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">Normal (常规模型)</th>
+<th style="text-align: center">LayerSkip (LayerSkip 模型)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/686542c0ca421.png" alt="code llama 3 7b" loading="lazy"></td>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/1633ddb1a1603.png" alt="code layer skip llama 3 7b" loading="lazy"></td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama2-70b-1">Llama2 70B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">Normal (常规模型)</th>
+<th style="text-align: center">LayerSkip (LayerSkip 模型)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/66e5c6631175d.png" alt="llama 2 70b" loading="lazy"></td>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/bde6acabc54ba.png" alt="layer skip llama 2 70b" loading="lazy"></td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama2-13b-1">Llama2 13B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">Normal (常规模型)</th>
+<th style="text-align: center">LayerSkip (LayerSkip 模型)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/57400c5b2afc6.png" alt="llama 2 13b" loading="lazy"></td>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/892351300bada.png" alt="layer skip llama 2 13b" loading="lazy"></td>
+</tr>
+</tbody>
+</table>
+<h4 id="llama2-7b-1">Llama2 7B</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">Normal (常规模型)</th>
+<th style="text-align: center">LayerSkip (LayerSkip 模型)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/ee27edcc592a5.png" alt="llama 2 7b" loading="lazy"></td>
+<td style="text-align: center"><img src="https://img-s2.andfun.cn/devrel/posts/2025/03/9de975ee945c4.png" alt="layer skip llama 2 7b" loading="lazy"></td>
+</tr>
+</tbody>
+</table>
+<p>我们可以观察到以下几点:</p>
+<ul>
+<li>对于没有使用 LayerSkip 训练方法进行预训练或持续预训练的基线检查点，提前退出自推测解码比自回归解码更慢。这是因为在大多数 LLM 的训练过程中，早期层并没有被激励去学习预测输出，因此使用早期层生成词元的接受率会非常低。</li>
+<li>另一方面，对于使用 LayerSkip 训练方法持续预训练的 Llama 检查点，提前退出自推测解码在至少一部分层中比自回归解码具有更高的加速比。
+<ul>
+<li>对于大多数模型 (除了 Llama3.2 1B)，当我们遍历各层时，我们注意到一个规律模式: 加速比在前几层较低，逐渐增加到一个最佳点，然后再次下降。</li>
+<li>提前退出层的最佳点是在预测的高准确性和生成词元的低开销之间达到最佳权衡时。这个最佳点取决于每个模型，也可能取决于提示或提示的领域。</li>
+</ul>
+</li>
+</ul>
+<p>这些观察为进一步的实验和探索提供了有趣的机会。我们鼓励读者在这些想法的基础上进行构建，测试变体，并进行自己的研究。这些努力可以带来有价值的见解，并为该领域做出有意义的贡献。</p>
+<h2 id="结论">结论</h2>
+<p>LayerSkip 利用提前退出、层丢弃和缓存重用之间的协同作用，创建了一个快速高效的文本生成流程。通过训练模型从不同层反嵌入输出，并使用缓存优化验证过程，这种方法在速度和准确性之间取得了平衡。因此，它显著改善了大语言模型的推理时间，同时保持了高质量的输出。由于使用单个模型作为草稿和验证模型，它还比传统的推测解码技术减少了内存使用。</p>
+<p>自推测是一个令人兴奋的领域，同一个 LLM 可以创建草稿词元并自我修正。其他自推测方法包括:</p>
+<ul>
+<li><a href="https://aclanthology.org/2024.acl-long.607/" target="_blank" rel="noopener nofollow">Draft &amp; Verify</a>: 其中草稿阶段涉及跳过预定的注意力和前馈层。</li>
+<li><a href="https://arxiv.org/abs/2408.11049" target="_blank" rel="noopener nofollow">MagicDec</a>: 其中草稿阶段使用 KV 缓存的子集，这对长上下文输入很有用。</li>
+<li><a href="https://arxiv.org/abs/2305.10427" target="_blank" rel="noopener nofollow">Jacobi Decoding</a> 和 <a href="https://arxiv.org/abs/2402.02057" target="_blank" rel="noopener nofollow">Lookahead Decoding</a>: 其中草稿阶段是一系列“猜测词元”，可以是随机的或从 n-gram 查找表中获得的。</li>
+</ul>
+<hr>
+<blockquote>
+<p>英文原文: <a href="https://huggingface.co/blog/layerskip" target="_blank" rel="noopener nofollow">https://huggingface.co/blog/layerskip</a></p>
+<p>原文作者: Aritra Roy Gosthipaty, Mostafa Elhoushi, Pedro Cuenca, Vaibhav Srivastav</p>
+<p>译者: smartisan</p>
+</blockquote>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.8800018894305556" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-03-11 13:47">2025-03-11 13:47</span>&nbsp;
+<a href="https://www.cnblogs.com/huggingface">HuggingFace</a>&nbsp;
+阅读(<span id="post_view_count">133</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18764887" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18764887);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18764887', targetLink: 'https://www.cnblogs.com/huggingface/p/18764887', title: 'LayerSkip: 使用自推测解码加速大模型推理' })">举报</a>
+</div>
+        
