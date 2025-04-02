@@ -1,0 +1,259 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/12lisu/p/18805646" title="发布于 2025-04-02 11:29">
+    <span role="heading" aria-level="2">Excel百万数据如何快速导入？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>今天要讨论一个让无数人抓狂的话题：<strong>如何高效导入百万级Excel数据</strong>。</p>
+<p>去年有家公司找到我，他们的电商系统遇到一个致命问题：每天需要导入20万条商品数据，但一执行就卡死，最长耗时超过3小时。</p>
+<p>更魔幻的是，重启服务器后前功尽弃。</p>
+<p>经过半天的源码分析，我们发现了下面这些触目惊心的代码...</p>
+<h2 id="1-为什么传统导入方案会崩盘">1 为什么传统导入方案会崩盘？</h2>
+<p>很多小伙伴在实现Excel导入时，往往直接写出这样的代码：</p>
+<pre><code class="language-java">// 错误示例：逐行读取+逐条插入
+public void importExcel(File file) {
+    List&lt;Product&gt; list = ExcelUtils.readAll(file); // 一次加载到内存
+    for (Product product : list) {
+        productMapper.insert(product); // 逐行插入
+    }
+}
+</code></pre>
+<p>这种写法会引发三大致命问题：</p>
+<h3 id="11-内存熔断堆区oom惨案">1.1 内存熔断：堆区OOM惨案</h3>
+<ul>
+<li><strong>问题</strong>：POI的<code>UserModel</code>（如XSSFWorkbook）一次性加载整个Excel到内存</li>
+<li><strong>实验</strong>：一个50MB的Excel（约20万行）直接耗尽默认的1GB堆内存</li>
+<li><strong>症状</strong>：频繁Full GC ➔ CPU飙升 ➔ 服务无响应</li>
+</ul>
+<h3 id="12-同步阻塞用户等到崩溃">1.2 同步阻塞：用户等到崩溃</h3>
+<ul>
+<li><strong>过程</strong>：用户上传文件 → 同步等待所有数据处理完毕 → 返回结果</li>
+<li><strong>风险</strong>：连接超时（HTTP默认30秒断开）→ 任务丢失</li>
+</ul>
+<h3 id="13-效率黑洞逐条操作事务">1.3 效率黑洞：逐条操作事务</h3>
+<ul>
+<li><strong>实测数据</strong>：MySQL单线程逐条插入≈200条/秒 → 处理20万行≈16分钟</li>
+<li><strong>幕后黑手</strong>：每次insert都涉及事务提交、索引维护、日志写入</li>
+</ul>
+<h2 id="2-性能优化四板斧">2 性能优化四板斧</h2>
+<h3 id="第一招流式解析">第一招：流式解析</h3>
+<p>使用POI的SAX模式替代DOM模式：</p>
+<pre><code class="language-java">// 正确写法：分段读取（以HSSF为例）
+OPCPackage pkg = OPCPackage.open(file);
+XSSFReader reader = new XSSFReader(pkg);
+SheetIterator sheets = (SheetIterator) reader.getSheetsData();
+
+while (sheets.hasNext()) {
+    try (InputStream stream = sheets.next()) {
+        Sheet sheet = new XSSFSheet(); // 流式解析
+        RowHandler rowHandler = new RowHandler();
+        sheet.onRow(row -&gt; rowHandler.process(row));
+        sheet.process(stream); // 不加载全量数据
+    }
+}
+</code></pre>
+<p>⚠️ <strong>避坑指南</strong>：</p>
+<ul>
+<li>不同Excel版本需适配（HSSF/XSSF/SXSSF）</li>
+<li>避免在解析过程中创建大量对象，需复用数据容器</li>
+</ul>
+<h3 id="第二招分页批量插入">第二招：分页批量插入</h3>
+<p>基于MyBatis的批量插入+连接池优化：</p>
+<pre><code class="language-java">// 分页批量插入（每1000条提交一次）
+public void batchInsert(List&lt;Product&gt; list) {
+    SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH);
+    ProductMapper mapper = sqlSession.getMapper(ProductMapper.class);
+    
+    int pageSize = 1000;
+    for (int i = 0; i &lt; list.size(); i += pageSize) {
+        List&lt;Product&gt; subList = list.subList(i, Math.min(i + pageSize, list.size()));
+        mapper.batchInsert(subList);
+        sqlSession.commit();
+        sqlSession.clearCache(); // 清理缓存
+    }
+}
+</code></pre>
+<p><strong>关键参数调优</strong>：</p>
+<pre><code class="language-yml"># MyBatis配置
+mybatis.executor.batch.size=1000
+
+# 连接池（Druid）
+spring.datasource.druid.maxActive=50
+spring.datasource.druid.initialSize=10
+</code></pre>
+<h3 id="第三招异步化处理">第三招：异步化处理</h3>
+<p>架构设计：<br>
+<img src="https://files.mdnice.com/user/5303/cd6bd89e-ad71-49b1-99b4-b6498e211d70.png" alt="" loading="lazy"></p>
+<ol>
+<li><strong>前端上传</strong>：客户端使用WebUploader等分片上传工具</li>
+<li><strong>服务端</strong>：
+<ul>
+<li>生成唯一任务ID</li>
+<li>写入任务队列（Redis Stream/RabbitMQ）</li>
+</ul>
+</li>
+<li><strong>异步线程池</strong>：
+<ul>
+<li>多线程消费队列</li>
+<li>处理进度存储在Redis中</li>
+</ul>
+</li>
+<li><strong>结果通知</strong>：通过WebSocket或邮件推送完成状态</li>
+</ol>
+<h3 id="第四招并行导入">第四招：并行导入</h3>
+<p>对于千万级数据，可采用分治策略：</p>
+<table>
+<thead>
+<tr>
+<th><strong>阶段</strong></th>
+<th><strong>操作</strong></th>
+<th><strong>耗时对比</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单线程</td>
+<td>逐条读取+逐条插入</td>
+<td>基准值100%</td>
+</tr>
+<tr>
+<td>批处理</td>
+<td>分页读取+批量插入</td>
+<td>时间降至5%</td>
+</tr>
+<tr>
+<td>多线程分片</td>
+<td>按Sheet分片，并行处理</td>
+<td>时间降至1%</td>
+</tr>
+<tr>
+<td>分布式分片</td>
+<td>多节点协同处理（如Spring Batch集群）</td>
+<td>时间降至0.5%</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3-代码之外的关键经验">3 代码之外的关键经验</h2>
+<h3 id="31-数据校验必须前置">3.1 数据校验必须前置</h3>
+<p>典型代码缺陷：</p>
+<pre><code class="language-java">// 错误：边插入边校验，可能污染数据库
+public void validateAndInsert(Product product) {
+    if (product.getPrice() &lt; 0) {
+        throw new Exception("价格不能为负");
+    }
+    productMapper.insert(product);
+}
+</code></pre>
+<p>✅ <strong>正确实践</strong>：</p>
+<ol>
+<li>在流式解析阶段完成基础校验（格式、必填项）</li>
+<li>入库前做业务校验（数据关联性、唯一性）</li>
+</ol>
+<h3 id="32-断点续传设计">3.2 断点续传设计</h3>
+<p>解决方案：</p>
+<ul>
+<li>记录每个分片的处理状态</li>
+<li>失败时根据偏移量（offset）恢复</li>
+</ul>
+<h3 id="33-日志与监控">3.3 日志与监控</h3>
+<p>配置要点：</p>
+<pre><code class="language-java">// Spring Boot配置Prometheus指标
+@Bean
+public MeterRegistryCustomizer&lt;PrometheusMeterRegistry&gt; metrics() {
+    return registry -&gt; registry.config().meterFilter(
+        new MeterFilter() {
+            @Override
+            public DistributionStatisticConfig configure(Meter.Id id, DistributionStatisticConfig config) {
+                return DistributionStatisticConfig.builder()
+                    .percentiles(0.5, 0.95) // 统计中位数和95分位
+                    .build().merge(config);
+            }
+        }
+    );
+}
+</code></pre>
+<h2 id="四百万级导入性能实测对比">四、百万级导入性能实测对比</h2>
+<p>测试环境：</p>
+<ul>
+<li>服务器：4核8G，MySQL 8.0</li>
+<li>数据量：100万行x15列（约200MB Excel）</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th><strong>方案</strong></th>
+<th><strong>内存峰值</strong></th>
+<th><strong>耗时</strong></th>
+<th><strong>吞吐量</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>传统逐条插入</td>
+<td>2.5GB</td>
+<td>96分钟</td>
+<td>173条/秒</td>
+</tr>
+<tr>
+<td>分页读取+批量插入</td>
+<td>500MB</td>
+<td>7分钟</td>
+<td>2381条/秒</td>
+</tr>
+<tr>
+<td>多线程分片+异步批量</td>
+<td>800MB</td>
+<td>86秒</td>
+<td>11627条/秒</td>
+</tr>
+<tr>
+<td>分布式分片（3节点）</td>
+<td>300MB/节点</td>
+<td>29秒</td>
+<td>34482条/秒</td>
+</tr>
+</tbody>
+</table>
+<h2 id="总结">总结</h2>
+<p>Excel高性能导入的11条军规：</p>
+<ol>
+<li><strong>决不允许全量加载数据到内存</strong> → 使用SAX流式解析</li>
+<li><strong>避免逐行操作数据库</strong> → 批量插入加持</li>
+<li><strong>永远不要让用户等待</strong> → 异步处理+进度查询</li>
+<li><strong>横向扩展比纵向优化更有效</strong> → 分片+分布式计算</li>
+<li><strong>内存管理是生死线</strong> → 对象池+避免临时大对象</li>
+<li><strong>合理配置连接池参数</strong> → 杜绝瓶颈在数据源</li>
+<li><strong>前置校验绝不动摇</strong> → 脏数据必须拦截在入口</li>
+<li><strong>监控务必完善</strong> → 掌握全链路指标</li>
+<li><strong>设计必须支持容灾</strong> → 断点续传+幂等处理</li>
+<li><strong>抛弃单机思维</strong> → 拥抱分布式系统设计</li>
+<li><strong>测试要覆盖极端场景</strong> → 百万数据压测不可少</li>
+</ol>
+<p>如果你正在为Excel导入性能苦恼，希望这篇文章能为你的系统打开一扇新的大门。</p>
+<p>如果你有其他想了解的技术难题，欢迎在评论区留言！</p>
+<h2 id="最后说一句求关注别白嫖我">最后说一句(求关注，别白嫖我)</h2>
+<p>如果这篇文章对您有所帮助，或者有所启发的话，帮忙关注一下我的同名公众号：苏三说技术，您的支持是我坚持写作最大的动力。</p>
+<p>求一键三连：点赞、转发、在看。</p>
+<p>关注公众号：【苏三说技术】，在公众号中回复：进大厂，可以免费获取我最近整理的10万字的面试宝典，好多小伙伴靠这个宝典拿到了多家大厂的offer。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.20241575661226852" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-04-02 11:30">2025-04-02 11:29</span>&nbsp;
+<a href="https://www.cnblogs.com/12lisu">苏三说技术</a>&nbsp;
+阅读(<span id="post_view_count">170</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+<a href="https://i.cnblogs.com/EditPosts.aspx?postid=18805646" rel="nofollow">编辑</a>&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18805646);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18805646', targetLink: 'https://www.cnblogs.com/12lisu/p/18805646', title: 'Excel百万数据如何快速导入？' })">举报</a>
+</div>
+        
