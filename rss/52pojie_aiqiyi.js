@@ -11,7 +11,7 @@ const iconv = require('iconv-lite');
 const RSSOUT = "/tmp";
 
 const rootUrl = `https://www.52pojie.cn/forum-66-1.html`;
-const HOME_URL = "https://www.52pojie.cn/thread-2003371-1-1.html"  // 2025-2
+const HOME_URL = "https://www.52pojie.cn/thread-2020721-1-1.html"  // 2025-4
 const title = "吾爱破解-爱奇艺";
 const RSS_NAME = "52pojie_aiqiyi";
 
