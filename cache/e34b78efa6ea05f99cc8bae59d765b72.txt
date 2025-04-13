@@ -1,0 +1,97 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/longfurcat/p/18822604" title="发布于 2025-04-13 19:32">
+    <span role="heading" aria-level="2">【杂谈】死锁？NO，时间跳跃！</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p>在日常开发或线上运维中，我们经常会遇到各种数据库异常，例如超时、死锁等。但有些问题，表面看似平常，背后却藏着意想不到的原因。</p>
+<p>今天就分享一次<strong data-start="149" data-end="178">由服务器时间跳跃引发的 MySQL 获取锁超时问题</strong>的排查过程。</p>
+<h3 data-start="191" data-end="210">问题现象：大量锁超时日志出现</h3>
+<p data-start="212" data-end="239">某天系统日志中突然频繁出现如下报错信息：</p>
+<div class="contain-inline-size rounded-md border-[0.5px] border-token-border-medium relative bg-token-sidebar-surface-primary">
+<div class="flex items-center text-token-text-secondary px-4 py-2 text-xs font-sans justify-between h-9 bg-token-sidebar-surface-primary dark:bg-token-main-surface-secondary select-none rounded-t-[5px]">
+<div class="cnblogs_code">
+<pre>Caused by: com.mysql.cj.jdbc.exceptions.MySQLTransactionRollbackException: Lock wait timeout exceeded; <span style="color: rgba(0, 0, 255, 1)">try</span> restarting transaction</pre>
+</div>
+</div>
+</div>
+<p data-start="372" data-end="420">获取锁超时导致事务失败。</p>
+<h3 data-start="372" data-end="420">初步分析：死锁？</h3>
+<p>可能是出现死锁了，于是根据异常栈定位到问题代码，但发现该方法逻辑简单，仅修改一个entity，类似下面这样。（非真实业务代码）</p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 仅更新用户的最后访问时间</span>
+<span style="color: rgba(0, 0, 0, 1)">user.setLastVisitTime(LocalDateTime.now());
+userRepository.save(user);</span></pre>
+</div>
+<p>强行分析（猜想），这个修改是每个请求都会改到的，由于在请求事务内，事务没提交就会一直锁着，直到请求完成。</p>
+<p>但一个长期稳定运行的项目，请求不太可能突然变慢</p>
+<h3>深入排查：慢日志未出现异常</h3>
+<p>如果出现死锁，那么慢日志里面一定有记录。但实际排查袭来，慢日志并无User相关的慢查询。</p>
+<h3>蛛丝马迹：不太常见的日志</h3>
+<div class="cnblogs_code">
+<pre>om.zaxxer.hikari.pool.HikariPool - HikariPool-<span style="color: rgba(128, 0, 128, 1)">1</span> - Thread starvation or clock leap detected (housekeeper delta=1m26s857ms76µs413ns).</pre>
+</div>
+<p>翻阅日志，发现一条clock leap detected的异常记录。于是验证服务器时间，发现比本地环境快了40多秒。</p>
+<h3>真相大白：服务器时间跳跃引发误判</h3>
+<p>MySQL进行锁等待和事务超时时，依赖系统时间戳进行判断。当系统时间突然跳跃到未来时间，导致MYSQL误判。</p>
+<p>至于跳跃原因，推测是 NTP 客户端在检测到时间漂移后进行了强制同步（stepping）操作，瞬间将时间快进了几十秒。</p>
+<h3>更近一步：有哪些操作会导致获取锁超时？</h3>
+<p data-start="78" data-end="153">在 MySQL 使用 InnoDB 引擎的前提下，<strong data-start="103" data-end="110">锁超时</strong>（<code data-start="111" data-end="139">Lock wait timeout exceeded</code>）的出现通常有两个主要诱因：</p>
+<p data-start="155" data-end="175"><strong>1. 死锁（Deadlock）</strong></p>
+<p data-start="177" data-end="240">最常见的原因就是<strong data-start="185" data-end="191">死锁</strong>。死锁往往由于多个事务以不同顺序下修改相同资源，彼此持有对方需要的锁，造成互相等待、永远无法释放。</p>
+<p data-start="242" data-end="245">比如：</p>
+<ul data-start="247" data-end="322">
+<li data-start="247" data-end="270">
+<p data-start="249" data-end="270">事务 A 修改顺序是：先改用户，再改订单；</p>
+</li>
+<li data-start="271" data-end="294">
+<p data-start="273" data-end="294">事务 B 修改顺序是：先改订单，再改用户；</p>
+</li>
+<li data-start="295" data-end="322">
+<p data-start="297" data-end="322">双方各自持有一个锁，又想获取对方的，结果就死锁了。</p>
+</li>
+</ul>
+<p data-start="324" data-end="348">MySQL 会检测到死锁并主动中断其中一个事务。（这时候日志里就会出现Dealock报错了）</p>
+<p data-start="324" data-end="348">其实，只要在项目中统一规定 Entity 的修改顺序，大部分死锁是可以避免的。</p>
+<p data-start="350" data-end="370"><strong>2. 长事务导致的锁未及时释放</strong></p>
+<p data-start="372" data-end="437">InnoDB 中，事务未提交期间会<strong data-start="389" data-end="398">一直持有锁</strong>。如果事务执行时间过长，会导致其他并发请求长时间阻塞，最终抛出锁等待超时异常。</p>
+<p data-start="439" data-end="453">事务执行过长，常见原因包括：</p>
+<ul data-start="455" data-end="638">
+<li data-start="455" data-end="514">
+<p data-start="457" data-end="514"><strong data-start="457" data-end="475">Entity 修改过多</strong><br data-start="475" data-end="478">
+比如循环中逐个修改并保存，每次都 <code data-start="497" data-end="505">save()</code>，反复刷 SQL。</p>
+
+</li>
+<li data-start="516" data-end="578">
+<p data-start="518" data-end="578"><strong data-start="518" data-end="531">事务中包含耗时操作</strong><br data-start="531" data-end="534">
+例如调用外部服务、HTTP 接口、微服务 RPC 等，尤其是对慢接口没有超时控制时。</p>
+
+</li>
+<li data-start="580" data-end="638">
+<p data-start="582" data-end="638"><strong data-start="582" data-end="595">事务中存在显式等待</strong><br data-start="595" data-end="598">
+如 <code data-start="602" data-end="618">Thread.sleep()</code> 用于调试、限速等场景，期间锁不会释放。</p>
+
+</li>
+
+</ul>
+<p>&nbsp;</p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.28302719196527776" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-04-13 19:32">2025-04-13 19:32</span>&nbsp;
+<a href="https://www.cnblogs.com/longfurcat">猫毛·波拿巴</a>&nbsp;
+阅读(<span id="post_view_count">10</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18822604);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18822604', targetLink: 'https://www.cnblogs.com/longfurcat/p/18822604', title: '【杂谈】死锁？NO，时间跳跃！' })">举报</a>
+</div>
+        
