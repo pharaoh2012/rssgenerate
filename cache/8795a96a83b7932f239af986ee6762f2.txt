@@ -1,0 +1,319 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/pretttyboy/p/18826383" title="发布于 2025-04-15 11:25">
+    <span role="heading" aria-level="2">基于Redission实现分布式调度任务选主</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        基于Redission实现分布式任务选主
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>在Spring Cloud微服务架构中，基于Redisson实现分布式调度任务的选主和心跳监听，可以通过以下完整方案实现。该方案结合了Redisson的分布式锁和发布/订阅功能，确保高可靠性和实时性：</p>
+<hr>
+<h3 id="一整体架构设计">一、整体架构设计</h3>
+<div class="mermaid">graph TD
+    A[微服务实例1] --&gt;|竞争锁| B(Redisson)
+    C[微服务实例2] --&gt;|竞争锁| B
+    D[微服务实例3] --&gt;|竞争锁| B
+    B --&gt;|心跳事件| E[Redis Pub/Sub]
+    E --&gt; A
+    E --&gt; C
+    E --&gt; D
+</div><hr>
+<h3 id="二核心实现步骤">二、核心实现步骤</h3>
+<h4 id="1-添加依赖">1. 添加依赖</h4>
+<pre><code class="language-xml">&lt;!-- Redisson Starter --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.redisson&lt;/groupId&gt;
+    &lt;artifactId&gt;redisson-spring-boot-starter&lt;/artifactId&gt;
+    &lt;version&gt;3.23.2&lt;/version&gt;
+&lt;/dependency&gt;
+</code></pre>
+<h4 id="2-选主服务实现">2. 选主服务实现</h4>
+<pre><code class="language-java">import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class LeaderElectionService {
+
+    private static final String LEADER_LOCK_KEY = "scheduler:leader:lock";
+    private static final String HEARTBEAT_CHANNEL = "scheduler:heartbeat";
+
+    @Autowired
+    private RedissonClient redisson;
+    
+    private volatile boolean isLeader = false;
+    private RLock leaderLock;
+    private Thread heartbeatThread;
+
+    @PostConstruct
+    public void init() {
+        leaderLock = redisson.getLock(LEADER_LOCK_KEY);
+        startElection();
+        startHeartbeatListener();
+    }
+
+    private void startElection() {
+        // 尝试获取领导权（非阻塞式）
+        new Thread(() -&gt; {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    // 尝试获取锁，锁过期时间30秒
+                    boolean acquired = leaderLock.tryLock(0, 30, TimeUnit.SECONDS);
+                    if (acquired) {
+                        isLeader = true;
+                        System.out.println("当前节点当选为Leader");
+                        startHeartbeatTask(); // 启动心跳任务
+                        break;
+                    }
+                    Thread.sleep(5000); // 每5秒重试一次
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }).start();
+    }
+
+    private void startHeartbeatTask() {
+        heartbeatThread = new Thread(() -&gt; {
+            while (isLeader &amp;&amp; !Thread.currentThread().isInterrupted()) {
+                try {
+                    // 1. 续期锁（看门狗机制会自动处理）
+                    // 2. 发布心跳
+                    redisson.getTopic(HEARTBEAT_CHANNEL)
+                           .publish(System.currentTimeMillis());
+                    
+                    Thread.sleep(10000); // 每10秒发送一次心跳
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        heartbeatThread.start();
+    }
+
+    private void startHeartbeatListener() {
+        // 监听Leader心跳
+        redisson.getTopic(HEARTBEAT_CHANNEL)
+               .addListener(Long.class, (channel, heartbeatTime) -&gt; {
+                   System.out.println("收到Leader心跳: " + heartbeatTime);
+                   // 可在此更新最后一次心跳时间
+               });
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        if (isLeader &amp;&amp; leaderLock.isHeldByCurrentThread()) {
+            leaderLock.unlock();
+            isLeader = false;
+            if (heartbeatThread != null) {
+                heartbeatThread.interrupt();
+            }
+        }
+    }
+
+    public boolean isLeader() {
+        return isLeader;
+    }
+}
+</code></pre>
+<h4 id="3-健康检查增强">3. 健康检查增强</h4>
+<pre><code class="language-java">@Service
+public class HealthCheckService {
+    
+    @Autowired
+    private RedissonClient redisson;
+    
+    private volatile long lastHeartbeatTime = 0;
+    
+    @PostConstruct
+    public void init() {
+        // 定时检查Leader状态
+        Executors.newSingleThreadScheduledExecutor()
+                .scheduleAtFixedRate(this::checkLeaderStatus, 0, 5, TimeUnit.SECONDS);
+    }
+    
+    private void checkLeaderStatus() {
+        Long currentTime = redisson.getBucket("scheduler:leader:heartbeat").get();
+        if (currentTime != null) {
+            lastHeartbeatTime = currentTime;
+        }
+        
+        // 超过30秒未收到心跳认为Leader失效
+        if (System.currentTimeMillis() - lastHeartbeatTime &gt; 30000) {
+            System.out.println("Leader可能已宕机，触发重新选举");
+            // 可在此触发主动抢锁逻辑
+        }
+    }
+}
+</code></pre>
+<hr>
+<h3 id="三关键优化点">三、关键优化点</h3>
+<h4 id="1-多级故障检测">1. 多级故障检测</h4>
+<table>
+<thead>
+<tr>
+<th>检测方式</th>
+<th>触发条件</th>
+<th>恢复动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Redisson看门狗超时</td>
+<td>锁续期失败（默认30秒）</td>
+<td>自动释放锁，其他节点可竞争</td>
+</tr>
+<tr>
+<td>主动心跳超时</td>
+<td>自定义阈值（如30秒）</td>
+<td>强制释放锁并重新选举</td>
+</tr>
+<tr>
+<td>Redis连接断开</td>
+<td>ConnectionState.LOST</td>
+<td>暂停选举直到连接恢复</td>
+</tr>
+</tbody>
+</table>
+<h4 id="2-选举性能优化配置">2. 选举性能优化配置</h4>
+<pre><code class="language-yaml"># application.yml
+redisson:
+  lock:
+    watchdog-timeout: 30000 # 看门狗超时时间(ms)
+  threads: 16 # 事件处理线程数
+  netty-threads: 32 # Netty工作线程数
+</code></pre>
+<h4 id="3-脑裂防护方案">3. 脑裂防护方案</h4>
+<pre><code class="language-java">// 使用Redisson的MultiLock实现多Redis节点锁
+RLock lock1 = redissonClient1.getLock(LEADER_LOCK_KEY);
+RLock lock2 = redissonClient2.getLock(LEADER_LOCK_KEY);
+RLock multiLock = redisson.getMultiLock(lock1, lock2);
+
+boolean acquired = multiLock.tryLock(0, 30, TimeUnit.SECONDS);
+</code></pre>
+<hr>
+<h3 id="四生产环境部署建议">四、生产环境部署建议</h3>
+<h4 id="1-redis架构选择">1. Redis架构选择</h4>
+<table>
+<thead>
+<tr>
+<th>部署模式</th>
+<th>适用场景</th>
+<th>建议配置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>哨兵模式</td>
+<td>高可用要求高</td>
+<td>3哨兵+3Redis实例</td>
+</tr>
+<tr>
+<td>Cluster模式</td>
+<td>大数据量+高性能</td>
+<td>至少6节点（3主3从）</td>
+</tr>
+<tr>
+<td>单节点</td>
+<td>仅开发测试</td>
+<td>不推荐生产使用</td>
+</tr>
+</tbody>
+</table>
+<h4 id="2-监控指标">2. 监控指标</h4>
+<pre><code class="language-java">// 暴露Redisson指标（配合Spring Boot Actuator）
+@Bean
+public RedissonMetricsBinder redissonMetrics(RedissonClient redisson) {
+    return new RedissonMetricsBinder(redisson);
+}
+</code></pre>
+<p>监控关键指标：</p>
+<ul>
+<li><code>redisson.executor.active_threads</code>：活跃线程数</li>
+<li><code>redisson.pubsub.subscriptions</code>：订阅数量</li>
+<li><code>redisson.connections.active</code>：活跃连接数</li>
+</ul>
+<h4 id="3-灾备方案">3. 灾备方案</h4>
+<ul>
+<li><strong>双活数据中心</strong>：通过<code>RedissonClient</code>配置多区域端点<pre><code class="language-java">Config config = new Config();
+config.useClusterServers()
+    .addNodeAddress("redis://dc1-node1:6379")
+    .addNodeAddress("redis://dc2-node1:6379");
+</code></pre>
+</li>
+<li><strong>降级策略</strong>：本地缓存最后已知状态<pre><code class="language-java">@Bean
+@Primary
+public LeaderService fallbackLeaderService() {
+    return new FallbackLeaderService(redisLeaderService, localCache);
+}
+</code></pre>
+</li>
+</ul>
+<hr>
+<h3 id="五与spring-cloud集成">五、与Spring Cloud集成</h3>
+<h4 id="1-调度任务控制">1. 调度任务控制</h4>
+<pre><code class="language-java">@Scheduled(fixedRate = 5000)
+public void scheduledTask() {
+    if (leaderElectionService.isLeader()) {
+        // 只有Leader执行的逻辑
+        processBatchData();
+    }
+}
+</code></pre>
+<h4 id="2-动态配置更新">2. 动态配置更新</h4>
+<pre><code class="language-java">@RefreshScope
+@RestController
+@RequestMapping("/leader")
+public class LeaderController {
+    
+    @Value("${election.timeout:30000}")
+    private long electionTimeout;
+    
+    @Autowired
+    private LeaderElectionService electionService;
+    
+    @PostMapping("/timeout")
+    public void updateTimeout(@RequestParam long timeout) {
+        // 动态调整选举超时
+        electionService.setElectionTimeout(timeout);
+    }
+}
+</code></pre>
+<hr>
+<h3 id="六方案优势总结">六、方案优势总结</h3>
+<ol>
+<li><strong>亚秒级故障检测</strong>：通过Redis Pub/Sub实现实时通知</li>
+<li><strong>自动故障转移</strong>：Redisson看门狗机制保障锁释放</li>
+<li><strong>弹性扩展</strong>：支持动态增减微服务实例</li>
+<li><strong>最小依赖</strong>：仅需Redis集群，无需额外组件</li>
+<li><strong>与Spring生态无缝集成</strong>：完美配合<code>@Scheduled</code>等组件</li>
+</ol>
+<hr>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.37822298746527777" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-04-15 11:26">2025-04-15 11:25</span>&nbsp;
+<a href="https://www.cnblogs.com/pretttyboy">想念泡凤爪的味道</a>&nbsp;
+阅读(<span id="post_view_count">20</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18826383);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18826383', targetLink: 'https://www.cnblogs.com/pretttyboy/p/18826383', title: '基于Redission实现分布式调度任务选主' })">举报</a>
+</div>
+        
