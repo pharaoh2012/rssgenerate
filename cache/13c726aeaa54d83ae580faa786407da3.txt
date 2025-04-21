@@ -1,0 +1,536 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ITnoteforlsy/p/18828955" title="发布于 2025-04-21 15:19">
+    <span role="heading" aria-level="2">从源码看 QT 的事件系统及自定义事件</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>事件是程序内部或外部触发的动作或状态变化的信号。在 Qt 中，所有事件都是 QEvent 派生类的对象，事件由 QObject 派生类的对象接收和处理。每一个事件都有对应的 QEvent 派生类，当事件发生时，QT 会创建相应事件的对象。然后调用接收者（QObject 派生类对象）的 event() 方法，将事件交给其进行处理。QT 中事件与窗口（widget）密切相关，常见的事件有 QResizeEvent、QPaintEvent、QMouseEvent、QKeyEvent、QTimerEvent等。每个事件都与一个指定类型（ QEvent::Type）关联。注：以下引用的源码版本为 QT 7.6.3</p>
+<h2 id="事件类型">事件类型</h2>
+<p>QT 中的事件都是预定义事件，都与指定的类型关联。枚举类 QEvent::Type 定义系统所支持的事件类型，所有的 QEvent 子类需要重载 <code>QEvent::Type QEvent::type() const</code> 方法指明事件类型。事件类型的定义及含义详见： <a href="https://doc.qt.io/qt-6/qevent.html#type" target="_blank" rel="noopener nofollow">https://doc.qt.io/qt-6/qevent.html#type</a></p>
+<p>QT 中的事件根据其发送者和用途，可以分为三类：</p>
+<ul>
+<li><strong>系统事件</strong><br>
+与操作系统相关，由 QT 封装后再交给应用程序处理。如：QMouseEvent、QKeyEvent、QInputEvent。方法 <code>bool QEvent::spontaneous() const</code> 用于判断是否为系统事件。</li>
+<li><strong>QT 框架事件</strong><br>
+用于 QT 对象间的通信。如：QActionEvent、QDynamicPropertyChangeEvent。</li>
+<li><strong>自定义事件</strong><br>
+用户处理应用程序时定义的事件。事件类型必须位于 QEvent::User 与 QEvent::MaxUser 之间。</li>
+</ul>
+<h2 id="事件循环">事件循环</h2>
+<p>应用程序在 main 函数中执行 <code>QCoreApplication::exec()</code> 后，QT 的事件循环系统开始运行。从源码中可以看出，<code>QCoreApplication::exec()</code> 主要是启动了事件循环系统。</p>
+<pre><code>// qcoreapplication.cpp
+int QCoreApplication::exec()
+{
+    if (!QCoreApplicationPrivate::checkInstance("exec"))
+        return -1;
+
+    QThreadData *threadData = self-&gt;d_func()-&gt;threadData.loadAcquire();
+    if (threadData != QThreadData::current()) {
+        qWarning("%s::exec: Must be called from the main thread", self-&gt;metaObject()-&gt;className());
+        return -1;
+    }
+    if (!threadData-&gt;eventLoops.isEmpty()) {
+        qWarning("QCoreApplication::exec: The event loop is already running");
+        return -1;
+    }
+
+    threadData-&gt;quitNow = false;
+    QEventLoop eventLoop;
+    self-&gt;d_func()-&gt;in_exec = true;
+    self-&gt;d_func()-&gt;aboutToQuitEmitted = false;
+	// 事件循环系统开始执行
+    int returnCode = eventLoop.exec(QEventLoop::ApplicationExec);
+    threadData-&gt;quitNow = false;
+
+    if (self)
+        self-&gt;d_func()-&gt;execCleanup();
+
+    return returnCode;
+}
+
+// qguiapplication.cpp
+int QGuiApplication::exec()
+{
+#if QT_CONFIG(accessibility)
+    QAccessible::setRootObject(qApp);
+#endif
+    return QCoreApplication::exec();
+}
+
+// qapplication.cpp
+int QApplication::exec()
+{
+    return QGuiApplication::exec();
+}
+</code></pre>
+<p>实际上，事件循环也不是由 QEventLoop 执行的，它只是对 QAbstractEventDispatcher 进行了包装。QAbstractEventDispatcher 是一个抽象类，定义了处理事件的虚函数。事件的具体执行跟平台相关。如 QEventDispatcherWin32 处理 windows 平台上的事件，QEventDispatcherUNIX 处理 unix 平台上的事件。QAbstractEventDispatcher 的子类在 processEvents() 方法中处理事件，对于 QEventDispatcherWin32 类 processEvents() 方法执行内容如下：首先，执行 sendPostedEvents() 处理事件队列中的事件，即发送 postEvent 事件队列中的事件（注意，QEventDispatcherWin32 子类中的 sendPostedEvents() 还有其它操作）；然后从系统消息队列中获取消息，处理 WM_TIMER、WM_QUIT 消息，并继续分发消息。</p>
+<pre><code>// qeventloop.cpp
+int QEventLoop::exec(ProcessEventsFlags flags)
+{
+    Q_D(QEventLoop);
+    auto threadData = d-&gt;threadData.loadRelaxed();
+
+    //we need to protect from race condition with QThread::exit
+    QMutexLocker locker(&amp;static_cast&lt;QThreadPrivate *&gt;(QObjectPrivate::get(threadData-&gt;thread.loadAcquire()))-&gt;mutex);
+    if (threadData-&gt;quitNow)
+        return -1;
+
+    if (d-&gt;inExec) {
+        qWarning("QEventLoop::exec: instance %p has already called exec()", this);
+        return -1;
+    }
+
+    struct LoopReference {
+	...
+    };
+    LoopReference ref(d, locker);
+
+    // remove posted quit events when entering a new event loop
+    QCoreApplication *app = QCoreApplication::instance();
+    if (app &amp;&amp; app-&gt;thread() == thread())
+        QCoreApplication::removePostedEvents(app, QEvent::Quit);
+
+    while (!d-&gt;exit.loadAcquire())
+        processEvents(flags | WaitForMoreEvents | EventLoopExec);
+
+    ref.exceptionCaught = false;
+    return d-&gt;returnCode.loadRelaxed();
+}
+
+bool QEventLoop::processEvents(ProcessEventsFlags flags)
+{
+    Q_D(QEventLoop);
+    auto threadData = d-&gt;threadData.loadRelaxed();
+    if (!threadData-&gt;hasEventDispatcher())
+        return false;
+    return threadData-&gt;eventDispatcher.loadRelaxed()-&gt;processEvents(flags);
+}
+</code></pre>
+<h2 id="处理系统事件">处理系统事件</h2>
+<p>系统事件（windows 下的 WM_KEYUP、WM_MOUSEFIRST 等消息）一般与用户界面密切相关，QT 中就是与 QWidget 相关。应用程序中要使用 QWidget 就要配置 QT += gui。此时，在 main 函数中执行的是 <code>QApplication::exec()</code>。QApplication 继承自 QGuiApplication，QGuiApplication 继承自 QCoreApplication。QGuiApplication 类实现了系统消息的处理。</p>
+<p>QGuiApplication 的构造函数中调用了 QGuiApplicationPrivate::init() 方法。该方法调用了 QCoreApplicationPrivate::init()， 执行了 SESSIONMANAGER、PLUGINS、 animation、TESTABILITY 等初始化，并调用 QGuiApplicationPrivate::createPlatformIntegration() 识别应用程序所在的操作系统平台，通过 static void init_platform() 方法初始化平台环境。init_platform() 方法通过集成平台工厂（QPlatformIntegrationFactory::create()）创建了对应平台的集成对象（QPlatformIntegration 的子类）。</p>
+<p>QWindowsIntegration 类是对应 windows 平台的集成类（目录 qtbase\src\plugins\platforms\windows 存放 windows 平台相关类）。再看 QCoreApplicationPrivate::init() 方法，它通过 createEventDispatcher() 方法创建了 QAbstractEventDispatcher 对象。QGuiApplicationPrivate 类（继承自 QCoreApplicationPrivate 类）对 createEventDispatcher() 进行了重载。重载后的方法通过QWindowsIntegration::createEventDispatcher() 方法创建 QWindowsGuiEventDispatcher（继承自 QAbstractEventDispatcher 类） 对象。QWindowsGuiEventDispatcher 类对 processEvents()、sendPostedEvents() 方法进行了重载。重载后的代码如下：</p>
+<pre><code>bool QWindowsGuiEventDispatcher::processEvents(QEventLoop::ProcessEventsFlags flags)
+{
+    const QEventLoop::ProcessEventsFlags oldFlags = m_flags;
+    m_flags = flags;
+    const bool rc = QEventDispatcherWin32::processEvents(flags);
+    m_flags = oldFlags;
+    return rc;
+}
+
+void QWindowsGuiEventDispatcher::sendPostedEvents()
+{
+    QEventDispatcherWin32::sendPostedEvents();
+    QWindowSystemInterface::sendWindowSystemEvents(m_flags);
+}
+</code></pre>
+<p>再看 QApplication::exec() 的实现，最终使用的是 QCoreApplication::exec()。所以事件循环由 QAbstractEventDispatcher 的子类（即 QWindowsGuiEventDispatcher 类）通过 processEvents() 方法进行处理。</p>
+<pre><code>// qapplication.cpp
+int QApplication::exec()
+{
+    return QGuiApplication::exec();
+}
+
+// qguiapplication.cpp
+int QGuiApplication::exec()
+{
+#if QT_CONFIG(accessibility)
+    QAccessible::setRootObject(qApp);
+#endif
+    return QCoreApplication::exec();
+}
+</code></pre>
+<p>QEventDispatcherWin32::processEvents() 方法中执行了 sendPostedEvents() 方法。QWindowsGuiEventDispatcher 类中的 sendPostedEvents() 方法在调用 QEventDispatcherWin32::sendPostedEvents() 后调用了    QWindowSystemInterface::sendWindowSystemEvents(m_flags)。QWindowSystemInterface 的私有类 QWindowSystemInterfacePrivate 类中定义了 MouseEvent、KeyEvent、PaintEvent 等事件类，并定义了一个用于存放 windows 消息的队列（windowSystemEventQueue）。QT 转换后的事件存放在 windowSystemEventQueue 队列中。sendWindowSystemEvents() 方法遍历 windowSystemEventQueue 队列，并将事件交给 QGuiApplicationPrivate::processWindowSystemEvent(event) 进行处理。processWindowSystemEvent 会根据事件类型进行分类处理。具体的事件处理方法（如processPaintEvent）会将系统消息包装为 QT 事件（如QPaintEvent），并通过 QCoreApplication::sendSpontaneousEvent 方法执行具体的事件处理（事件过滤和receiver-&gt;event()操作）。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1596700/202504/1596700-20250419000845196-1068270352.png" alt="image" loading="lazy"></p>
+<pre><code>void QGuiApplicationPrivate::processPaintEvent(QWindowSystemInterfacePrivate::PaintEvent *e)
+{
+    Q_ASSERT_X(platformIntegration()-&gt;hasCapability(QPlatformIntegration::PaintEvents), "QGuiApplication",
+        "The platform sent paint events without claiming support for it in QPlatformIntegration::capabilities()");
+
+    if (!e-&gt;window)
+        return;
+
+    QPaintEvent paintEvent(e-&gt;region);
+    QCoreApplication::sendSpontaneousEvent(e-&gt;window, &amp;paintEvent);
+
+    // We report back the accepted state to the platform, so that it can
+    // decide when the best time to send the fallback expose event is.
+    e-&gt;eventAccepted = paintEvent.isAccepted();
+}
+</code></pre>
+<p>还有一个问题就是操作系统发送的 WM_KEYUP 消息是如何与 QT 应用程序交互的呢？回到 QWindowsIntegration 类，它的私有类 QWindowsIntegrationPrivate 中有一个成员变量 QWindowsContext m_context。QWindowsContext 提供了一个 registerWindowClass() 方法，该方法中使用了 windows 的系统函数 RegisterClassEx() 进行了类注册。在注册过程中，绑定了windows 消息的处理函数（qWindowsWndProc()）。qWindowsWndProc() 对系统消息进行了分类，并调用 QWindowsContext::windowsProc() 处理系统消息。windowsProc() 调用对应的消息处理方法（QWindowsMouseHandler、QWindowsKeyMapper 等）对消息内容进行解析，然后交给 QWindowSystemInterface 对应的 handle 方法（如 handleMouseEvent、handlePaintEvent 等）进行处理。这些 handle 会将解析后的消息存放到 windowSystemEventQueue 队列，并唤醒 QAbstractEventDispatcher 对象进行消息处理。<br>
+<img src="https://img2024.cnblogs.com/blog/1596700/202504/1596700-20250419011721096-2061960380.png" alt="image" loading="lazy"></p>
+<p>QWidget 对象创建后并没有立即创建窗口，而是在 show(true) 或 setVisible(true) 时创建窗口。创建的窗口为一个 QWidgetWindow 对象，QWidgetWindow 是 QWindow 的子类。QWindow 的 create() 方法使用 QPlatformIntegration 对象（windows 下为 QWindowsIntegration对象）的 createPlatformWindow（）方法（或createForeignWindow()方法）创建对应平台上的窗口。该方法调用了 QWindowsWindowData::create() 方法（和 QWindowsWindow 一起在qwindowswindow.cpp 中实现），构建并返回 QWindowsWindow 对象。QWindowsWindowData::create() 方法中调用了 QWindowsContext 的 registerWindowClass()  方法进行了类的注册，并调用 windows 的系统函数 CreateWindowEx() 创建了窗口。</p>
+<p>至此，windows 系统的消息接收、包装、传递过程完整结束。涉及到了类及其调用关系（仅用作示意）如下图所示：<br>
+<img src="https://img2024.cnblogs.com/blog/1596700/202504/1596700-20250421151757832-36163570.png" alt="image" loading="lazy"></p>
+<h2 id="发送事件">发送事件</h2>
+<ol>
+<li><strong>QT 应用内部发送事件</strong></li>
+</ol>
+<p>QT 中事件的发送涉及以下3个方法，但是事件的发送最终由 notify() 完成，notify() 会直接调用接收者的 event() 方法。</p>
+<pre><code>bool QCoreApplication::notify(QObject *receiver, QEvent *event)
+void QCoreApplication::postEvent(QObject *receiver, QEvent *event, int priority = Qt::NormalEventPriority)
+bool QCoreApplication::sendEvent(QObject *receiver, QEvent *event)
+</code></pre>
+<ul>
+<li>
+<p><code>void QCoreApplication::postEvent(QObject *receiver, QEvent *event, int priority = Qt::NormalEventPriority)</code><br>
+将事件和接收者信息保存到事件队列并立即返回。事件循环处理方法 QAbstractEventDispatcher::processEvents() 会调用 QCoreApplication::sendPostedEvents(QObject *receiver, int event_type) 将队列中的事件全部发送出去（使用 QCoreApplication::sendEvent() 发送事件）。sendPostedEvents() 处理事件时会从事件队列中删除事件，所以该事件必须分配在堆上。因此使用 postEvent 发布事件后，再访问该事件并不安全。注意：<mark>该方法不是线程安全的。</mark></p>
+</li>
+<li>
+<p><code>bool QCoreApplication::sendEvent(QObject *receiver, QEvent *event)</code><br>
+调用 QCoreApplication::notify() 方法将事件发送出去，并返回事件处理程序的返回值。发送事件后，该事件不会被删除。一般是在栈上创建该事件。</p>
+</li>
+<li>
+<p><code>bool QCoreApplication::notify(QObject *receiver, QEvent *event)</code><br>
+调用接收方（需继承 QObject）的 event() 方法，并返回 event() 的返回值。不管接收方是否在当前线程中，都会调用其 event() 方法。注意：如果重写了该函数，必须确保所有处理事件的线程（包括由其他库启动的线程）都已经停止工作，然后才能开始销毁应用程序对象。QGuiApplication、QApplication 都重写了该方法，也就是说在事件的发送操作上有不同的实现s。</p>
+</li>
+</ul>
+<ol start="2">
+<li><strong>QT 向操作系统发送事件</strong></li>
+</ol>
+<p>若需要向操作系统发送消息/事件，就需要调用系统 API，如：SendMessage/PostMessage、XSendEvent。或者借助系统命令行工具，使用 QProcess 调用系统命令。</p>
+<ol start="3">
+<li><strong>进程间发送事件</strong><br>
+QT 并不支持进程间的事件，可通过进程间通信方法（共享内存、Socket通信等）来解决。</li>
+</ol>
+<h2 id="事件优先级">事件优先级</h2>
+<p>QCoreApplication::postEvent() 发送的事件可以设置优先级。事件按优先级降序排序，即优先级高的事件在优先级较低的事件之前。优先级可以是任何整数值，即介于 INT_MAX 和 INT_MIN 之间，包含INT_MAX 和 INT_MIN。具有相同优先级的事件将按发布的顺序进行处理。为了便于使用 Qt::EventPriority 定义了 3 个优先级。</p>
+<table>
+<thead>
+<tr>
+<th>枚举值</th>
+<th>值</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Qt::HighEventPriority</td>
+<td>1</td>
+<td>高优先级</td>
+</tr>
+<tr>
+<td>Qt::NormalEventPriority</td>
+<td>0</td>
+<td>优先级介于 HighEventPriority 和 LowEventPriority之间</td>
+</tr>
+<tr>
+<td>Qt::LowEventPriority</td>
+<td>-1</td>
+<td>低优先级</td>
+</tr>
+<tr>
+<td>也可以自定义优先级：</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<pre><code>enum CustomEventPriority
+{
+    // An important event
+    ImportantEventPriority = Qt::HighEventPriority,
+
+    // A more important event
+    MoreImportantEventPriority = ImportantEventPriority + 1,
+
+    // A critical event
+    CriticalEventPriority = 100 * MoreImportantEventPriority,
+
+    // Not that important
+    StatusEventPriority = Qt::LowEventPriority,
+
+    // These are less important than Status events
+    IdleProcessingDoneEventPriority = StatusEventPriority - 1
+};
+</code></pre>
+<h2 id="事件的传递">事件的传递</h2>
+<p>为了确定接收者是否被处理发送的事件，事件系统提供了 accept() 和 ignore() 方法。当接收者处理该事件并期望事件系统知道该事件已被处理时，使用 accept() 方法设置 "accept" 标记；如果接收者不处理该事件，使用 ignore() 方法设置 "accept" 标记。</p>
+<p>对于一些特殊的系统事件，需要事件系统进行逐层传递。例如，操作系统发送的 WM_KEYUP、WM_MOUSEFIRST 等消息，一般先由顶层子窗口进行处理，然后冒泡到父窗口（SendMessage()、PostMessage()发送的消息除外）。在 windows 环境下，创建窗口时会调用操作系统函数 RegisterClass 注册窗口类，并指定消息处理函数。顶层的消息处理函数如果接收该消息则返回true，如果不接收该消息则会调用 DefWindowProc() 方法继续传递处理消息。按照设计原则（单一职责），这些事件的传递应该由 QWidget 来负责实现。但是在 QWidget 的事件处理方法里运行的是 <code>event-&gt;ignore();</code> 并没做其它事，这种设计看起来很奇怪。</p>
+<p>QT 处理这些事件传递的方式是通过 QApplication 重写 notify() 方法来实现。也就是说使用 QCoreApplication、QGUIApplication 时，QMouseEvent 这类需要传递的事件不会自动传递给父窗口。QApplication 重写的 notify() 方法部分代码摘录如下：</p>
+<pre><code>bool QApplication::notify(QObject *receiver, QEvent *e)
+{
+    Q_D(QApplication);
+	...
+	const bool isWindowType = receiver-&gt;isWindowType();
+    const bool isWidgetType = receiver-&gt;isWidgetType();
+	...
+	if (isWidgetType) {
+        QWidget * w = static_cast&lt;QWidget *&gt;(receiver);
+        switch (e-&gt;type()) {
+        case QEvent::ShortcutOverride:
+        case QEvent::KeyPress:
+        case QEvent::KeyRelease: {
+            QKeyEvent* key = static_cast&lt;QKeyEvent*&gt;(e);
+            bool def = key-&gt;isAccepted();
+            /*
+                QLineEdit will emit a signal on Key_Return, but
+                ignore the event, and sometimes the connected
+                slot deletes the QLineEdit (common in itemview
+                delegates), so we have to check if the widget
+                was destroyed even if the event was ignored (to
+                prevent a crash)
+
+                Note that we don't have to reset pr while
+                propagating (because the original receiver will
+                be destroyed if one of its ancestors is)
+            */
+            QPointer&lt;QObject&gt; pr = receiver;
+            while (w) {
+                if (def)
+                    key-&gt;accept();
+                else
+                    key-&gt;ignore();
+                res = d-&gt;notify_helper(w, e);
+
+                if (res &amp;&amp; key-&gt;isAccepted())
+                    break;
+                if (!pr || w-&gt;isWindow())
+                    break;
+
+                w = w-&gt;parentWidget();
+            }
+            qt_in_tab_key_event = false;
+            break;
+        }
+		case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonRelease:
+        case QEvent::MouseButtonDblClick:
+        case QEvent::MouseMove: {
+		...
+		}
+	} else {
+        res = d-&gt;notify_helper(receiver, e);
+    }
+
+    return res;
+}
+</code></pre>
+<p>从源码中可以看出，以下事件类型在 QT 中实现了自动传递： QEvent::ShortcutOverride、QEvent::KeyPress、QEvent::KeyRelease、QEvent::MouseButtonPress、QEvent::MouseButtonRelease、QEvent::MouseButtonDblClick、QEvent::MouseMove、QEvent::Wheel、QEvent::ContextMenu、QEvent::TabletMove、QEvent::TabletPress、QEvent::TabletRelease、QEvent::ToolTip、QEvent::WhatsThis、QEvent::QueryWhatsThis、QEvent::StatusTip、QEvent::WhatsThisClicked、QEvent::DragEnter、QEvent::DragMove、QEvent::Drop、QEvent::DragLeave、QEvent::TouchBegin、QEvent::NativeGesture、QEvent::Gesture、QEvent::GestureOverride。</p>
+<p>对于其它事件，如果要实现事件的传递可以通过重写接收者的 event() 方法来实现。通过事件的 accept 标记来确定是否继续传递事件。</p>
+<h2 id="拦截事件">拦截事件</h2>
+<p>从 QT 对事件的处理流程来看，事件都由 notify() 方法进行分发，事件先经过 ApplicationEventFilters、ObjectEventFilters 处理，最后由接收者的 event() 方法进行处理。QGuiApplication 和 QApplication 虽然对 notify() 方法进行了重写，但是对事件的处理流程没有改变。</p>
+<pre><code>bool QCoreApplication::notify(QObject *receiver, QEvent *event)
+{
+    Q_ASSERT(receiver);
+    Q_ASSERT(event);
+
+#if QT_VERSION &gt;= QT_VERSION_CHECK(7, 0, 0)
+    Q_ASSERT(receiver-&gt;d_func()-&gt;threadData.loadAcquire()-&gt;thread.loadRelaxed()
+             == QCoreApplicationPrivate::mainThread());
+#endif
+
+    // no events are delivered after ~QCoreApplication() has started
+    if (QCoreApplicationPrivate::is_app_closing)
+        return true;
+    return doNotify(receiver, event);
+}
+
+static bool doNotify(QObject *receiver, QEvent *event)
+{
+    Q_ASSERT(event);
+
+    // ### Qt 7: turn into an assert
+    if (receiver == nullptr) {                        // serious error
+        qWarning("QCoreApplication::notify: Unexpected null receiver");
+        return true;
+    }
+
+#ifndef QT_NO_DEBUG
+    QCoreApplicationPrivate::checkReceiverThread(receiver);
+#endif
+
+    return receiver-&gt;isWidgetType() ? false : QCoreApplicationPrivate::notify_helper(receiver, event);
+}
+/*!
+  \internal
+
+  Helper function called by QCoreApplicationPrivate::notify() and qapplication.cpp
+ */
+bool QCoreApplicationPrivate::notify_helper(QObject *receiver, QEvent * event)
+{
+    // Note: when adjusting the tracepoints in here
+    // consider adjusting QApplicationPrivate::notify_helper too.
+    Q_TRACE(QCoreApplication_notify_entry, receiver, event, event-&gt;type());
+    bool consumed = false;
+    bool filtered = false;
+    Q_TRACE_EXIT(QCoreApplication_notify_exit, consumed, filtered);
+
+    // send to all application event filters (only does anything in the main thread)
+    if (receiver-&gt;d_func()-&gt;threadData.loadRelaxed()-&gt;thread.loadAcquire() == mainThread()
+            &amp;&amp; QCoreApplication::self
+            &amp;&amp; QCoreApplication::self-&gt;d_func()-&gt;sendThroughApplicationEventFilters(receiver, event)) {
+        filtered = true;
+        return filtered;
+    }
+    // send to all receiver event filters
+    if (sendThroughObjectEventFilters(receiver, event)) {
+        filtered = true;
+        return filtered;
+    }
+
+    // deliver the event
+    consumed = receiver-&gt;event(event);
+    return consumed;
+}
+
+
+/*! \reimp
+*/
+bool QGuiApplication::notify(QObject *object, QEvent *event)
+{
+    if (object-&gt;isWindowType()) {
+        if (QGuiApplicationPrivate::sendQWindowEventToQPlatformWindow(static_cast&lt;QWindow *&gt;(object), event))
+            return true; // Platform plugin ate the event
+    }
+
+    QGuiApplicationPrivate::captureGlobalModifierState(event);
+
+    return QCoreApplication::notify(object, event);
+}
+
+
+
+bool QApplicationPrivate::notify_helper(QObject *receiver, QEvent * e)
+{
+    // These tracepoints (and the whole function, actually) are very similar
+    // to the ones in QCoreApplicationPrivate::notify_helper; the reason for their
+    // duplication is because tracepoint symbols are not exported by QtCore.
+    // If you adjust the tracepoints here, consider adjusting QCoreApplicationPrivate too.
+    Q_TRACE(QApplication_notify_entry, receiver, e, e-&gt;type());
+    bool consumed = false;
+    bool filtered = false;
+    Q_TRACE_EXIT(QApplication_notify_exit, consumed, filtered);
+
+    // send to all application event filters
+    if (threadRequiresCoreApplication()
+        &amp;&amp; receiver-&gt;d_func()-&gt;threadData.loadRelaxed()-&gt;thread.loadAcquire() == mainThread()
+        &amp;&amp; sendThroughApplicationEventFilters(receiver, e)) {
+        filtered = true;
+        return filtered;
+    }
+
+    if (receiver-&gt;isWidgetType()) {
+        QWidget *widget = static_cast&lt;QWidget *&gt;(receiver);
+
+#if !defined(QT_NO_CURSOR)
+        // toggle HasMouse widget state on enter and leave
+        if ((e-&gt;type() == QEvent::Enter || e-&gt;type() == QEvent::DragEnter) &amp;&amp;
+            (!QApplication::activePopupWidget() || QApplication::activePopupWidget() == widget-&gt;window()))
+            widget-&gt;setAttribute(Qt::WA_UnderMouse, true);
+        else if (e-&gt;type() == QEvent::Leave || e-&gt;type() == QEvent::DragLeave)
+            widget-&gt;setAttribute(Qt::WA_UnderMouse, false);
+#endif
+
+        if (QLayout *layout=widget-&gt;d_func()-&gt;layout) {
+            layout-&gt;widgetEvent(e);
+        }
+    }
+
+    // send to all receiver event filters
+    if (sendThroughObjectEventFilters(receiver, e)) {
+        filtered = true;
+        return filtered;
+    }
+
+    // deliver the event
+    consumed = receiver-&gt;event(e);
+
+    QCoreApplicationPrivate::setEventSpontaneous(e, false);
+    return consumed;
+}
+</code></pre>
+<p>QT  对事件的拦截有以下 5 种方法：</p>
+<ol>
+<li>
+<p><strong>重载 notify() 方法</strong><br>
+此方法的权限最高，可以完全控制事件。但是该方法需要继承QCoreApplication，一个应用中只能有一个 Application 对象，也只能有一个 notify() 方法。</p>
+</li>
+<li>
+<p><strong>全局事件过滤器</strong><br>
+在 QCoreApplication::instance() 的实例上可以通过 QObject::installEventFilter() 安装事件过滤器（可以安装多个）。这些过滤器是 notify() 方法中第一个调用的方法，是一个全局事件过滤器，可以拦截所有事件。在全局事件过滤器中可以处理设置为 disable 的窗口的鼠标事件。注意：<mark>过滤器所在对象必须在主线程内，否则全局事件处理器不会调用</mark>。</p>
+</li>
+<li>
+<p><strong>局部事件过滤器</strong><br>
+对于需要拦截事件的对象（必须继承自 QObject ），可以在该对象上调用 QObject::installEventFilter() 安装事件过滤器（可以安装多个），来拦截该对象接收到的所有事件。该过滤器是 notify() 方法中第二个调用的方法，事件可以在被 event() 方法接收前进行处理。</p>
+</li>
+<li>
+<p><strong>重载 event() 方法</strong><br>
+notify() 方法是通过调用对象的 event() 方法来处理事件的，所以重载该方法可以处理所有发送到对象的事件。</p>
+</li>
+<li>
+<p><strong>重载特定事件的方法</strong><br>
+重载 paintEvent()、 mousePressEvent() 等事件的处理方法也可以拦截事件。</p>
+</li>
+</ol>
+<h2 id="自定义事件">自定义事件</h2>
+<p>枚举类型 QEvent::Type 定义了 Qt 中的有效事件类型，用户事件的值应介于 User 和 MaxUser 之间：</p>
+<table>
+<thead>
+<tr>
+<th>枚举值</th>
+<th>值</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>QEvent::User</td>
+<td>1000</td>
+<td>用户自定义事件</td>
+</tr>
+<tr>
+<td>QEvent::MaxUser</td>
+<td>65535</td>
+<td>用户自定义事件的最大值</td>
+</tr>
+</tbody>
+</table>
+<p>自定义事件需要使用 <code>int QEvent::registerEventType(int hint = -1)</code> 方法注册和保留自定义事件类型，以确保自定义事件的唯一性。</p>
+<pre><code>// 定义自定义事件
+class MyEvent : public QEvent {
+public:
+    static const QEvent::Type Type = static_cast&lt;QEvent::Type&gt;(1000);
+    MyEvent() : QEvent(Type) {}
+};
+
+// 投递事件
+QCoreApplication::postEvent(target, new MyEvent());
+
+// 处理事件
+bool MyObject::event(QEvent *event) {
+    if (event-&gt;type() == MyEvent::Type) {
+        qDebug() &lt;&lt; "Custom event received";
+        return true;
+    }
+    return QObject::event(event);
+}
+</code></pre>
+<p>参考：<br>
+<a href="https://doc.qt.io/qt-6/qevent.html" target="_blank" rel="noopener nofollow">QEvent Class</a><br>
+<a href="https://doc.qt.io/qt-6/qcoreapplication.html#notify" target="_blank" rel="noopener nofollow">QCoreApplication class</a><br>
+<a href="https://doc.qt.io/archives/qq/qq11-events.html" target="_blank" rel="noopener nofollow">Another Look at Events</a><br>
+<a href="https://cloud.tencent.com/developer/article/1852629" target="_blank" rel="noopener nofollow">【Qt源码笔记】Qt事件与Windows消息循环的联系</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.21504286184375" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-04-21 15:20">2025-04-21 15:19</span>&nbsp;
+<a href="https://www.cnblogs.com/ITnoteforlsy">永不停转</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18828955);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18828955', targetLink: 'https://www.cnblogs.com/ITnoteforlsy/p/18828955', title: '从源码看 QT 的事件系统及自定义事件' })">举报</a>
+</div>
+        
