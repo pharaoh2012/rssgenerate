@@ -1,0 +1,664 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sctb/p/18842012" title="发布于 2025-04-23 21:53">
+    <span role="heading" aria-level="2">Golang 版本导致的容器运行时问题</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="问题现场">问题现场</h1>
+<p>用户反馈安装了某个 containerd 版本的节点无法正常拉起容器，业务场景是在 K8S Pod 里面运行一个 Docker，在容器里面通过 docker 命令再启动新的容器。</p>
+<p>报错信息如下：</p>
+<pre><code class="language-shell">$&nbsp;docker run -it ubuntu /bin/bash
+
+docker: Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: error mounting "proc" to rootfs at "/proc": mount proc:/proc (via /proc/self/fd/10), flags: 0xe: operation not permitted: unknown.
+
+ERRO[0000] error waiting for container: context canceled
+
+</code></pre>
+<h1 id="排查过程">排查过程</h1>
+<p>从报错信息<code>flags: 0xe: operation not permitted</code>可以知道这个问题的直接原因是挂载 <code>proc</code>文件系统的时候没有权限，导致这一现象的根本原因还需要进一步定位。</p>
+<h2 id="containerd">Containerd</h2>
+<p>在用户反馈的信息中，比较关键的一点是某个 containerd 版本开始存在问题，很容易联想到可能和 Containerd 引入的改动有关系。</p>
+<p>经过分析，出现问题的 containerd 版本与上一个版本相比，仅新增了两个 Commit，改动内容非常少。通过仔细分析这些引入的改动，发现它们与上述报错信息并无关联，并且新增的特性不会默认打开。因此，基本确定和 containerd 引入的改动无关。</p>
+<h2 id="pod-配置">Pod 配置</h2>
+<p>既然 Containerd 的改动不会有影响，是不是用户 Pod 配置的不同导致呢？</p>
+<p>经过对比 Pod yaml，我们发现用户在两个不同 containerd 版本的节点上的 Pod 没有影响权限的配置项。</p>
+<ul>
+<li>
+<p>都是用了特权容器，配置相同</p>
+<pre><code class="language-yaml">securityContext:
+&nbsp;&nbsp;privileged:&nbsp;true
+&nbsp;&nbsp;runAsNonRoot:&nbsp;false
+</code></pre>
+</li>
+<li>
+<p>都挂载了节点上的以下目录（排除 ConfigMap，PVC 等内容）：</p>
+<pre><code class="language-yaml">volumes:
+&nbsp;&nbsp;-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/usr
+&nbsp; &nbsp; &nbsp;&nbsp;type:Directory
+&nbsp; &nbsp;&nbsp;name:host-usr
+&nbsp; -hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;type:Directory
+&nbsp; &nbsp;&nbsp;name:containerd-image
+&nbsp; -hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/run/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;type:Directory
+&nbsp; &nbsp;&nbsp;name:containerd-dir
+&nbsp; -hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/lxc/lxcfs/proc/cpuinfo
+&nbsp; &nbsp; &nbsp;&nbsp;type:File
+&nbsp; &nbsp;&nbsp;name:lxcfs-proc-cpuinfo
+&nbsp; -hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/lxc/lxcfs/proc/meminfo
+&nbsp; &nbsp; &nbsp;&nbsp;type:File
+&nbsp; &nbsp;&nbsp;name:lxcfs-proc-meminfo
+&nbsp; -hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/lxc/lxcfs/sys/devices/system/cpu/online
+&nbsp; &nbsp; &nbsp;&nbsp;type:File
+&nbsp; &nbsp;&nbsp;name:system-cpu-online
+</code></pre>
+</li>
+</ul>
+<p>由于暂时无法确定根因，提供了回退 Containerd 版本的脚本：</p>
+<pre><code class="language-shell">TOS_URL=https://xxx/containerd-$VERSION.tar.gz
+
+function downgrade() {
+&nbsp; &nbsp; &nbsp; &nbsp; wget $TOS_URL -o containerd.tar.gz
+&nbsp; &nbsp; &nbsp; &nbsp; tar -zxvf containerd.tar.gz -C /usr/
+&nbsp; &nbsp; &nbsp; &nbsp; systemctl restart containerd
+}
+
+downgrade
+
+
+</code></pre>
+<h2 id="runc">Runc</h2>
+<p>既然 Containerd 的改动不会影响权限，这个报错信息是什么地方导致的呢？</p>
+<p>这个报错信息来自 runc，分析 runc 报错的具体位置：</p>
+<pre><code class="language-golang">// prepareRootfs sets up the devices, mount points, and filesystems for use
+// inside a new mount namespace. It doesn't set anything as ro. You must call
+// finalizeRootfs after this function to finish setting up the rootfs.
+func&nbsp;prepareRootfs(pipe io.ReadWriter, iConfig *initConfig, mountFds []int)&nbsp;(err error)&nbsp;{
+&nbsp; &nbsp; config := iConfig.Config
+&nbsp; &nbsp;&nbsp;if&nbsp;err := prepareRoot(config); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;fmt.Errorf("error preparing rootfs:%w", err)
+&nbsp; &nbsp; }
+
+&nbsp; &nbsp;&nbsp;if&nbsp;mountFds !=&nbsp;nil&nbsp;&amp;&amp;&nbsp;len(mountFds) !=&nbsp;len(config.Mounts) {
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;fmt.Errorf("malformed mountFds slice. Expected size: %v, got: %v. Slice: %v",&nbsp;len(config.Mounts),&nbsp;len(mountFds), mountFds)
+&nbsp; &nbsp; }
+
+&nbsp; &nbsp; mountConfig := &amp;mountConfig{
+&nbsp; &nbsp; &nbsp; &nbsp; root: &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;config.Rootfs,
+&nbsp; &nbsp; &nbsp; &nbsp; label: &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; config.MountLabel,
+&nbsp; &nbsp; &nbsp; &nbsp; cgroup2Path: &nbsp; &nbsp; iConfig.Cgroup2Path,
+&nbsp; &nbsp; &nbsp; &nbsp; rootlessCgroups: iConfig.RootlessCgroups,
+&nbsp; &nbsp; &nbsp; &nbsp; cgroupns: &nbsp; &nbsp; &nbsp; &nbsp;config.Namespaces.Contains(configs.NEWCGROUP),
+&nbsp; &nbsp; }
+&nbsp; &nbsp; setupDev := needsSetupDev(config)
+&nbsp; &nbsp;&nbsp;for&nbsp;i, m :=&nbsp;range&nbsp;config.Mounts {
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;for&nbsp;_, precmd :=&nbsp;range&nbsp;m.PremountCmds {
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;err := mountCmd(precmd); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;fmt.Errorf("error running premount command:%w", err)
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; &nbsp; &nbsp; }
+
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// Just before the loop we checked that if not empty, len(mountFds) == len(config.Mounts).
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// Therefore, we can access mountFds[i] without any concerns.
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;mountFds !=&nbsp;nil&nbsp;&amp;&amp; mountFds[i] !=&nbsp;-1&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; mountConfig.fd = &amp;mountFds[i]
+&nbsp; &nbsp; &nbsp; &nbsp; }&nbsp;else&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; mountConfig.fd =&nbsp;nil
+&nbsp; &nbsp; &nbsp; &nbsp; }
+
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;err := mountToRootfs(m, mountConfig); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;fmt.Errorf("error mounting %q to rootfs at %q:%w", m.Source, m.Destination, err)
+&nbsp; &nbsp; &nbsp; &nbsp; }
+
+&nbsp; &nbsp;&nbsp;// 省略部分内容
+
+&nbsp; &nbsp;&nbsp;returnnil
+}
+
+
+</code></pre>
+<p><code>prepareRootfs</code>中调用了<code>mountToRootfs</code>：</p>
+<pre><code class="language-golang">func&nbsp;mountToRootfs(m *configs.Mount, c *mountConfig)&nbsp;error&nbsp;{
+&nbsp; &nbsp; rootfs := c.root
+
+&nbsp; &nbsp;&nbsp;// procfs and sysfs are special because we need to ensure they are actually
+&nbsp; &nbsp;&nbsp;// mounted on a specific path in a container without any funny business.
+&nbsp; &nbsp;&nbsp;switch&nbsp;m.Device {
+&nbsp; &nbsp;&nbsp;case"proc",&nbsp;"sysfs":
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// If the destination already exists and is not a directory, we bail
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// out. This is to avoid mounting through a symlink or similar -- which
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// has been a "fun" attack scenario in the past.
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;//&nbsp;TODO:&nbsp;This won't be necessary once we switch to libpathrs and we can
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// &nbsp; &nbsp; &nbsp; stop all of these symlink-exchange attacks.
+&nbsp; &nbsp; &nbsp; &nbsp; dest := filepath.Clean(m.Destination)
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;!strings.HasPrefix(dest, rootfs) {
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// Do not use securejoin as it resolves symlinks.
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; dest = filepath.Join(rootfs, dest)
+&nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;fi, err := os.Lstat(dest); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;!os.IsNotExist(err) {
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;err
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; &nbsp; &nbsp; }&nbsp;elseif&nbsp;!fi.IsDir() {
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;fmt.Errorf("filesystem %q must be mounted on ordinary directory", m.Device)
+&nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;err := os.MkdirAll(dest,&nbsp;0o755); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;err
+&nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;// Selinux kernels do not support labeling of /proc or /sys.
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;mountPropagate(m, rootfs,&nbsp;"",&nbsp;nil)
+&nbsp; &nbsp; }
+
+&nbsp; &nbsp;&nbsp;// 省略部分内容
+}
+
+
+</code></pre>
+<p>对于<code>proc</code> 和 <code>sysfs</code> 文件系统，最终会调用<code>mountPropagate</code>：</p>
+<pre><code class="language-golang">// Do the mount operation followed by additional mounts required to take care
+// of propagation flags. This will always be scoped inside the container rootfs.
+func&nbsp;mountPropagate(m *configs.Mount, rootfs&nbsp;string, mountLabel&nbsp;string, mountFd *int)&nbsp;error&nbsp;{
+&nbsp; &nbsp;&nbsp;var&nbsp;(
+&nbsp; &nbsp; &nbsp; &nbsp; data &nbsp;= label.FormatMountLabel(m.Data, mountLabel)
+&nbsp; &nbsp; &nbsp; &nbsp; flags = m.Flags
+&nbsp; &nbsp; )
+&nbsp; &nbsp;&nbsp;// Delay mounting the filesystem read-only if we need to do further
+&nbsp; &nbsp;&nbsp;// operations on it. We need to set up files in "/dev", and other tmpfs
+&nbsp; &nbsp;&nbsp;// mounts may need to be chmod-ed after mounting. These mounts will be
+&nbsp; &nbsp;&nbsp;// remounted ro later in finalizeRootfs(), if necessary.
+&nbsp; &nbsp;&nbsp;if&nbsp;m.Device ==&nbsp;"tmpfs"&nbsp;|| utils.CleanPath(m.Destination) ==&nbsp;"/dev"&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; flags &amp;= ^unix.MS_RDONLY
+&nbsp; &nbsp; }
+
+&nbsp; &nbsp;&nbsp;// Because the destination is inside a container path which might be
+&nbsp; &nbsp;&nbsp;// mutating underneath us, we verify that we are actually going to mount
+&nbsp; &nbsp;&nbsp;// inside the container with WithProcfd() -- mounting through a procfd
+&nbsp; &nbsp;&nbsp;// mounts on the target.
+&nbsp; &nbsp; source := m.Source
+&nbsp; &nbsp;&nbsp;if&nbsp;mountFd !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; source =&nbsp;"/proc/self/fd/"&nbsp;+ strconv.Itoa(*mountFd)
+&nbsp; &nbsp; }
+
+&nbsp; &nbsp;&nbsp;if&nbsp;err := utils.WithProcfd(rootfs, m.Destination,&nbsp;func(procfd&nbsp;string)&nbsp;error&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;mount(source, m.Destination, procfd, m.Device,&nbsp;uintptr(flags), data)
+&nbsp; &nbsp; }); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;err
+&nbsp; &nbsp; }
+&nbsp; &nbsp;&nbsp;// We have to apply mount propagation flags in a separate WithProcfd() call
+&nbsp; &nbsp;&nbsp;// because the previous call invalidates the passed procfd -- the mount
+&nbsp; &nbsp;&nbsp;// target needs to be re-opened.
+&nbsp; &nbsp;&nbsp;if&nbsp;err := utils.WithProcfd(rootfs, m.Destination,&nbsp;func(procfd&nbsp;string)&nbsp;error&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;for&nbsp;_, pflag :=&nbsp;range&nbsp;m.PropagationFlags {
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;err := mount("", m.Destination, procfd,&nbsp;"",&nbsp;uintptr(pflag),&nbsp;""); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;err
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;returnnil
+&nbsp; &nbsp; }); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;fmt.Errorf("change mount propagation through procfd:%w", err)
+&nbsp; &nbsp; }
+&nbsp; &nbsp;&nbsp;returnnil
+}
+
+
+</code></pre>
+<p>最终调用的标准库中的<code>unix.Mount</code>：</p>
+<pre><code class="language-golang">// mount is a simple unix.Mount wrapper. If procfd is not empty, it is used
+// instead of target (and the target is only used to add context to an error).
+func&nbsp;mount(source, target, procfd, fstype&nbsp;string, flags&nbsp;uintptr, data&nbsp;string)&nbsp;error&nbsp;{
+&nbsp; &nbsp; dst := target
+&nbsp; &nbsp;&nbsp;if&nbsp;procfd !=&nbsp;""&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; dst = procfd
+&nbsp; &nbsp; }
+&nbsp; &nbsp;&nbsp;if&nbsp;err := unix.Mount(source, dst, fstype, flags, data); err !=&nbsp;nil&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;&amp;mountError{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; op: &nbsp; &nbsp;&nbsp;"mount",
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; source: source,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; target: target,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; procfd: procfd,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; flags: &nbsp;flags,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; data: &nbsp; data,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; err: &nbsp; &nbsp;err,
+&nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; }
+&nbsp; &nbsp;&nbsp;returnnil
+}
+
+
+</code></pre>
+<p>从 runc 源码看，在挂载 proc 的时候，Mount 系统调用返回的错误信息。因此，挂载失败和 runc 调用 mount 时的现场有关系。</p>
+<p>我们通过修改 runc 源码，打印 runc 挂载 proc 时相关的现场信息。</p>
+<p>正常启动 case：</p>
+<pre><code>[31017-09+00 17:24:24] Destination: /proc,
+uid: 0,
+uid_map: &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;0 &nbsp; &nbsp; &nbsp; 1000 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1 &nbsp; &nbsp; 100000 &nbsp; &nbsp; &nbsp;65536
+&nbsp; &nbsp; &nbsp;65537 &nbsp; &nbsp; 165536 &nbsp; &nbsp; &nbsp;65536
+,
+gid_map: &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;0 &nbsp; &nbsp; &nbsp; 1000 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1 &nbsp; &nbsp; 100000 &nbsp; &nbsp; &nbsp;65536
+&nbsp; &nbsp; &nbsp;65537 &nbsp; &nbsp; 165536 &nbsp; &nbsp; &nbsp;65536
+,
+userns: user:[4026534201],
+mntns: mnt:[4026534601],
+cgroupns: cgroup:[4026531835],
+mode: dr-xr-xr-x, owner: 65534,
+fileGid: 65534
+cap: "Name:\trunc:[2:INIT]\nUmask:\t0022\nState:\tR (running)\nTgid:\t749\nNgid:\t0\nPid:\t749\nPPid:\t739\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t0 \nNStgid:\t749\t1\nNSpid:\t749\t1\nNSpgid:\t749\t1\nNSsid:\t749\t1\nVmPeak:\t 1090280 kB\nVmSize:\t 1090280 kB\nVmLck:\t &nbsp; &nbsp; &nbsp; 0 kB\nVmPin:\t &nbsp; &nbsp; &nbsp; 0 kB\nVmHWM:\t &nbsp; &nbsp;9664 kB\nVmRSS:\t &nbsp; &nbsp;9664 kB\nRssAnon:\t &nbsp; &nbsp;2540 kB\nRssFile:\t &nbsp; &nbsp;7124 kB\nRssShmem:\t &nbsp; &nbsp; &nbsp; 0 kB\nVmData:\t &nbsp; 86400 kB\nVmStk:\t &nbsp; &nbsp; 132 kB\nVmExe:\t &nbsp; &nbsp;5208 kB\nVmLib:\t &nbsp; &nbsp; 772 kB\nVmPTE:\t &nbsp; &nbsp; 148 kB\nVmSwap:\t &nbsp; &nbsp; &nbsp; 0 kB\nHugetlbPages:\t &nbsp; &nbsp; &nbsp; 0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nThreads:\t6\nSigQ:\t0/900794\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\tfffffffdffc1feff\nCapInh:\t0000000000000000\nCapPrm:\t0000003fffffffff\nCapEff:\t0000003fffffffff\nCapBnd:\t0000003fffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSpeculation_Store_Bypass:\tthread vulnerable\nCpus_allowed:\t3ffffff,ffffffff\nCpus_allowed_list:\t0-57\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t3\nnonvoluntary_ctxt_switches:\t0\n"
+
+
+</code></pre>
+<p>异常 case：</p>
+<pre><code>[31017-09+00 17:24:24] uid: 0,
+uid_map: &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;0 &nbsp; &nbsp; &nbsp; 1000 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1 &nbsp; &nbsp; 100000 &nbsp; &nbsp; &nbsp;65536
+&nbsp; &nbsp; &nbsp;65537 &nbsp; &nbsp; 165536 &nbsp; &nbsp; &nbsp;65536
+,
+gid_map: &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;0 &nbsp; &nbsp; &nbsp; 1000 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;1 &nbsp; &nbsp; 100000 &nbsp; &nbsp; &nbsp;65536
+&nbsp; &nbsp; &nbsp;65537 &nbsp; &nbsp; 165536 &nbsp; &nbsp; &nbsp;65536
+,
+userns: user:[4026534201],
+mntns: mnt:[4026534601],
+cgroupns: cgroup:[4026531835],
+mode: dr-xr-xr-x, owner: 65534,
+fileGid: 65534
+cap: "Name:\trunc:[2:INIT]\nUmask:\t0022\nState:\tR (running)\nTgid:\t812\nNgid:\t0\nPid:\t812\nPPid:\t802\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t0 \nNStgid:\t812\t1\nNSpid:\t812\t1\nNSpgid:\t812\t1\nNSsid:\t812\t1\nVmPeak:\t 1090536 kB\nVmSize:\t 1090536 kB\nVmLck:\t &nbsp; &nbsp; &nbsp; 0 kB\nVmPin:\t &nbsp; &nbsp; &nbsp; 0 kB\nVmHWM:\t &nbsp; 10032 kB\nVmRSS:\t &nbsp; 10032 kB\nRssAnon:\t &nbsp; &nbsp;2988 kB\nRssFile:\t &nbsp; &nbsp;7044 kB\nRssShmem:\t &nbsp; &nbsp; &nbsp; 0 kB\nVmData:\t &nbsp; 86656 kB\nVmStk:\t &nbsp; &nbsp; 132 kB\nVmExe:\t &nbsp; &nbsp;5208 kB\nVmLib:\t &nbsp; &nbsp; 772 kB\nVmPTE:\t &nbsp; &nbsp; 160 kB\nVmSwap:\t &nbsp; &nbsp; &nbsp; 0 kB\nHugetlbPages:\t &nbsp; &nbsp; &nbsp; 0 kB\nCoreDumping:\t0\nTHP_enabled:\t1\nThreads:\t6\nSigQ:\t0/900794\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\tfffffffdffc1feff\nCapInh:\t0000000000000000\nCapPrm:\t0000003fffffffff\nCapEff:\t0000003fffffffff\nCapBnd:\t0000003fffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSpeculation_Store_Bypass:\tthread vulnerable\nCpus_allowed:\t3ffffff,ffffffff\nCpus_allowed_list:\t0-57\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t3\nnonvoluntary_ctxt_switches:\t0\n"
+
+
+</code></pre>
+<p>正常拉起 docker 容器和拉起失败情况下，runc 的 userns 相同，target 的 owner 都是 65534（没有 map id）。此外，查看 runc 进程的 Capability，都包括 SYS_ADMIN：</p>
+<pre><code class="language-shell">#&nbsp;capsh --decode=0000003fffffffff
+0x0000003fffffffff=cap_chown,cap_dac_override,cap_dac_read_search,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_linux_immutable,cap_net_bind_service,cap_net_broadcast,cap_net_admin,cap_net_raw,cap_ipc_lock,cap_ipc_owner,cap_sys_module,cap_sys_rawio,cap_sys_chroot,cap_sys_ptrace,cap_sys_pacct,cap_sys_admin,cap_sys_boot,cap_sys_nice,cap_sys_resource,cap_sys_time,cap_sys_tty_config,cap_mknod,cap_lease,cap_audit_write,cap_audit_control,cap_setfcap,cap_mac_override,cap_mac_admin,cap_syslog,cap_wake_alarm,cap_block_suspend,cap_audit_read
+
+</code></pre>
+<p>异常 case 和正常 case 的 runc 进程环境也没区别，为什么挂载 proc 会失败呢？</p>
+<p>进一步修改 runc 源码，当 mount 失败之后，让进程不退出，保留现场，然后进入 runc 所在 user namespace 和 mount namespace，尝试 mount proc 文件系统，结果【失败】。</p>
+<p>Bind mount 没问题，但是 mount proc 失败：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fBDFzvxxibqttmP9OnBAO10lqWfB9iarNUeM78fH04FFW5eBjkaPAaFxg/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<h2 id="场景分析">场景分析</h2>
+<p>通过分析，用户的使用场景大致如下：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fpwqKt90wM1H6OsdUsJXPT5AHETf5dVIk69wu8XKgKtkBcQFYaGQomg/640?wx_fmt=png&amp;from=appmsg" alt="docker in container architecture" loading="lazy"></p>
+<p>docker in container architecture</p>
+<ul>
+<li>
+<p>用户挂载了节点上的一些目录到外部容器。</p>
+</li>
+<li>
+<p>Docker 用的 runc 是社区提供的。</p>
+</li>
+</ul>
+<p><strong>核心问题：节点上 Containerd 版本的变化为什么会影响容器中的 Runc ？</strong></p>
+<p>对比容器中的挂载点信息，发现有些区别。</p>
+<p>正常 case：</p>
+<pre><code>2409 2408 0:308 / /proc rw,nosuid,nodev,noexec,relatime master:461 - proc proc rw
+2410 2409 0:235 /proc/cpuinfo /proc/cpuinfo ro,relatime master:462 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+2411 2409 0:235 /proc/meminfo /proc/meminfo ro,relatime master:463 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+2633 2632 0:308 / /run/containerd/io.containerd.runtime.v2.task/k8s.io/17c97f222c6a02eb46f170cdf5ed6621bee116836a57c6121de9f3818494182f/rootfs/proc&nbsp;rw,nosuid,nodev,noexec,relatime master:609 - proc proc rw
+3010 3009 0:330 / /ebs/docker/165536.165536/fuse-overlayfs/70c276e0d397f4bebfea4239e967132baa2db0746181b0b7dc0ea7b24912f1e3/merged/proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+
+</code></pre>
+<p>异常 case：</p>
+<pre><code>2779 2778 0:308 / /proc rw,nosuid,nodev,noexec,relatime master:461 - proc proc rw
+2827 2779 0:235 /proc/meminfo /proc/meminfo ro,relatime master:462 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+2828 2779 0:235 /proc/cpuinfo /proc/cpuinfo ro,relatime master:463 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+3074&nbsp;3073 0:308 / /run/containerd/io.containerd.runtime.v2.task/k8s.io/a33db564c39c8573ea92e3e5327be27ca205684cb965b8f03d9eaa0ae2b8aff7/rootfs/proc&nbsp;rw,nosuid,nodev,noexec,relatime master:608 - proc proc rw
+3075&nbsp;3074&nbsp;0:235 /proc/meminfo /run/containerd/io.containerd.runtime.v2.task/k8s.io/a33db564c39c8573ea92e3e5327be27ca205684cb965b8f03d9eaa0ae2b8aff7/rootfs/proc/meminfo&nbsp;ro,relatime master:609 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+3076&nbsp;3074&nbsp;0:235 /proc/cpuinfo /run/containerd/io.containerd.runtime.v2.task/k8s.io/a33db564c39c8573ea92e3e5327be27ca205684cb965b8f03d9eaa0ae2b8aff7/rootfs/proc/cpuinfo&nbsp;ro,relatime master:610 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+
+</code></pre>
+<p>注意，异常 case 中多出了两条挂载点。正常 case 只有：</p>
+<ul>
+<li><code>/run/containerd/xxx/rootfs/proc</code></li>
+</ul>
+<p>异常 case 除了这条挂载点，还多出了：</p>
+<ul>
+<li>
+<p><code>/run/containerd/xxx/rootfs/proc/meminfo</code></p>
+</li>
+<li>
+<p><code>/run/containerd/xxx/rootfs/proc/cpuinfo</code></p>
+</li>
+</ul>
+<h2 id="golang-版本柳暗花明">Golang 版本（柳暗花明）</h2>
+<p>除了 Containerd 版本不一样，我们注意到，编译 Containerd 的环境也有一些区别，旧版本是用 Golang 1.18 编译，新版本使用了 Golang 1.20。基于这个思路，我们使用不同 Golang 版本编译了相同的 Containerd 源码。</p>
+<p>Golang 1.18 编译的 containerd 没问题：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fo0wicDz1LicNKPl6mfxnjhWCrgWFIG8Dt7R7dqzdB8EQQyze5BHq1tKA/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>Golang 1.20 编译的 containerd 有问题：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fGOXd6OiavEk96zpJBN8pUSDHlRS0q8Sicx9HIaeBqqTOBXiah9bkeymAA/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>从这个现象基本可以确定这个问题和 Golang 版本有关系。</p>
+<p>通过编译 Golang 源码找到引入问题的 commit。golang 1.19 的第一个 commit：936c7fbc1c154964b6e3e8a7523bdf0c29b4e1b3[1]</p>
+<p>通过二分查找的方法，找到引入问题的 commit：</p>
+<p>Step 1:</p>
+<pre><code>4a4127bccc go1.19.1
+43456202a1 go1.19
+ad672e7ce1 go1.19rc2
+bac4eb53d6 go1.19rc1
+2cfbef4380 go1.19beta1 --&gt; failed
+
+d81dd12906 --&gt; fail
+797e8890 --&gt; ok
+
+2ea7d3461b go1.9.2 --&gt; build error
+7f40c1214d go1.9.1 --&gt; build error
+c8aec4095e go1.9 --&gt; build error
+048c9cfaac go1.9rc2 --&gt; build error
+65c6c88a94 go1.9rc1 --&gt; build error
+936c7fbc1c go1.19 start --&gt; ok
+
+
+</code></pre>
+<p>Step 2:</p>
+<pre><code>1:* d81dd12906 --&gt; fail
+2:* 420a1fb223
+88:* e0ae8540ab
+735:* 0670afa1b3 --&gt; fail
+760:* 2c73f5f32f --&gt; fail
+772:* d2552037 --&gt; fail
+
+773:* 72e77a7f41 --&gt; fail
+774:* 9298f604f4 --&gt; ok
+
+775:* d65a41329e --&gt; ok
+778:* 517781b391 --&gt; ok
+785:* d85694ab4f --&gt; ok
+839:* 6f6942ef7a --&gt; ok
+992:* 1724077b78 --&gt; ok
+1136:* 79861be205
+1269:* 797e889046 --&gt; ok
+
+
+</code></pre>
+<p>最终，找到导致问题的 Commit：72e77a7f41bbf45d466119444307fd3ae996e257[2]</p>
+<p>72e77a7f41：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6faXxXGYY6XJIBmQpCibk57iaSqictB6EPiaek7G2B4RG64NuBjDtR848zyg/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>上一个 commit 9298f604f4：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fh1CQwwaxL9jVMBXQNy1SdYraGQnXnZTuQUJjk4L78v5rDRCQpXMknA/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>这个 commit 修改了<code>sort.Sort()</code>的实现，从<code>稳定排序</code>变成<code>不稳定排序</code>。</p>
+<p>为了进一步验证这个改动对 containerd 的影响，修改 containerd 中所有<code>sort.Sort()</code>为<code>sort.Stable()</code>，即修改为稳定排序，问题修复。</p>
+<p>Containerd 调用 sort.Sort() 排序 mounts：pkg/cri/opts/spec_linux.go#L120[3]</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fmy1QdzevB0b8eyVkCQee6ZreFmNkp2mkcLg10nYnnwK39mLeibsWaGA/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>修改 containerd，输出稳定排序和非稳定排序场景下的 mounts 结果。</p>
+<p>stable sort mounts：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fPxxm2Ijic8MtHqTRicZKJVT7KCX9lm8dDBjYfC3ftfetibMqqQAVzK3xA/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>unstable sort mounts：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fMAslzgd7CdzFH4mgcbfZI5iaiakO39XAKNfFicJdicRcibmXkAXvZGqW8ibQ/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p><strong>为什么挂载顺序的区别会导致 mount proc 失败？</strong></p>
+<h2 id="mount-限制根因">Mount 限制（根因）</h2>
+<p>runc 调用 mount 系统调用返回的错误信息，根因是<code>mount_too_revealing</code> 返回 1 导致挂载失败：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6f3GwurPMyCoQ8vybibO4am2zgGLVWeDJOvWGCXdLSosHRXicIJWsoYYgA/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fFibACtrfsz3WQr1k2OqhJcegGhicOqibicVWPHJiafdTicYPc1naafVF5Xjg/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>在 <code>mount_too_revealing</code> 函数中，如果是 <code>proc</code> 和 <code>sys</code> 会走到 <code>mnt_already_visible</code> 来检查权限。</p>
+<blockquote>
+<p>“</p>
+<p>参考 cve-2022-0492[4]</p>
+</blockquote>
+<p>源码如下：</p>
+<pre><code class="language-c">static&nbsp;bool&nbsp;mnt_already_visible(struct mnt_namespace *ns,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;const&nbsp;struct super_block *sb,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;int&nbsp;*new_mnt_flags)
+&nbsp; &nbsp;&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;int&nbsp;new_flags = *new_mnt_flags;
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;struct&nbsp;mount&nbsp;*mnt;
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;bool&nbsp;visible =&nbsp;false;
+
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; down_read(&amp;namespace_sem);
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; lock_ns_list(ns);
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; list_for_each_entry(mnt, &amp;ns-&gt;list, mnt_list) {
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;struct&nbsp;mount&nbsp;*child;
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;int&nbsp;mnt_flags;
+
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; ...
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; list_for_each_entry(child, &amp;mnt-&gt;mnt_mounts, mnt_child) {
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;struct&nbsp;inode&nbsp;*inode&nbsp;=&nbsp;child-&gt;mnt_mountpoint-&gt;d_inode;
+/* Only worry about locked mounts */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;(!(child-&gt;mnt.mnt_flags &amp; MNT_LOCKED))
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;continue;
+/* Is the directorypermanetly empty? */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;if&nbsp;(!is_empty_dir_inode(inode))
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;goto&nbsp;next;
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; }
+/* Preserve the locked attributes */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; *new_mnt_flags |= mnt_flags &amp; (MNT_LOCK_READONLY | \
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; MNT_LOCK_ATIME);
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; visible =&nbsp;true;
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;goto&nbsp;found;
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; next: &nbsp; &nbsp; &nbsp; &nbsp;;
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; }
+&nbsp; &nbsp; found:
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; unlock_ns_list(ns);
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; up_read(&amp;namespace_sem);
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&nbsp;return&nbsp;visible;
+&nbsp; &nbsp; }
+
+
+</code></pre>
+<p><code>mnt_already_visible</code>会遍历新的 mount namespace 并且检查是否有子挂载点，如果已经有子挂载点并且不是全部对当前 mount namespace 可见，则不能挂载 <code>proc</code> 和 <code>sys</code>。原因如下：<strong>procfs 和 sysfs 包括许多全局数据，不能直接挂载到容器中。</strong></p>
+<blockquote>
+<p>“</p>
+<p><code>mnt_already_visible</code> will iterate the new mount namespace and check whether it has child mountpoint. If it has child mountpoint, it is not fully visible to this mount namespace so the procfs will not be mounted.</p>
+</blockquote>
+<blockquote>
+<p>“</p>
+<p>This reason is as following. The procfs and sysfs contains some global data, so the container should not touch. So mouting procfs and sysfs in new user namespace should be restricted.</p>
+</blockquote>
+<p>这是内核的限制：</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6faSepXq5eDq1iaLLv64a6IxWria6nMic9LvTNjwUrYOcsx2m15QOjs72cQ/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_jpg/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fpbf6JW8hyPELVAU4SF52uplictJWEk2w4uYATEicgDVt3e1dE765iacTg/640?wx_fmt=jpeg" alt="图片" loading="lazy"></p>
+<p>回头看下我们拿到的容器中的挂载点信息。</p>
+<p>正常 case：<img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fPxxm2Ijic8MtHqTRicZKJVT7KCX9lm8dDBjYfC3ftfetibMqqQAVzK3xA/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<pre><code>2409 2408 0:308 / /proc rw,nosuid,nodev,noexec,relatime master:461 - proc proc rw
+2410 2409 0:235 /proc/cpuinfo /proc/cpuinfo ro,relatime master:462 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+2411 2409 0:235 /proc/meminfo /proc/meminfo ro,relatime master:463 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+2633 2632 0:308 / /run/containerd/io.containerd.runtime.v2.task/k8s.io/17c97f222c6a02eb46f170cdf5ed6621bee116836a57c6121de9f3818494182f/rootfs/proc&nbsp;rw,nosuid,nodev,noexec,relatime master:609 - proc proc rw
+3010 3009 0:330 / /ebs/docker/165536.165536/fuse-overlayfs/70c276e0d397f4bebfea4239e967132baa2db0746181b0b7dc0ea7b24912f1e3/merged/proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+
+
+</code></pre>
+<p>异常 case：<img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fMAslzgd7CdzFH4mgcbfZI5iaiakO39XAKNfFicJdicRcibmXkAXvZGqW8ibQ/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<pre><code>2779 2778 0:308 / /proc rw,nosuid,nodev,noexec,relatime master:461 - proc proc rw
+2827 2779 0:235 /proc/meminfo /proc/meminfo ro,relatime master:462 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+2828 2779 0:235 /proc/cpuinfo /proc/cpuinfo ro,relatime master:463 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+3074&nbsp;3073 0:308 / /run/containerd/io.containerd.runtime.v2.task/k8s.io/a33db564c39c8573ea92e3e5327be27ca205684cb965b8f03d9eaa0ae2b8aff7/rootfs/proc&nbsp;rw,nosuid,nodev,noexec,relatime master:608 - proc proc rw
+3075&nbsp;3074&nbsp;0:235 /proc/meminfo /run/containerd/io.containerd.runtime.v2.task/k8s.io/a33db564c39c8573ea92e3e5327be27ca205684cb965b8f03d9eaa0ae2b8aff7/rootfs/proc/meminfo&nbsp;ro,relatime master:609 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+3076&nbsp;3074&nbsp;0:235 /proc/cpuinfo /run/containerd/io.containerd.runtime.v2.task/k8s.io/a33db564c39c8573ea92e3e5327be27ca205684cb965b8f03d9eaa0ae2b8aff7/rootfs/proc/cpuinfo&nbsp;ro,relatime master:610 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other,force_umount
+
+
+</code></pre>
+<p>在异常 case 中，多出来的两个挂载点的父挂载点是 3074，也就是 <code>proc</code> 的挂载点。</p>
+<p>至此，问题的根因已经确定。</p>
+<p>runc 会先挂载 <code>/proc/cpuinfo</code> 和 <code>/proc/meminfo</code>，这两个目录实际对应节点上 <code>/run/containerd</code> 下的子目录，比较巧的是，用户刚好挂载了 <code>/run/containerd</code> 目录到容器。</p>
+<p>因此，先挂载的 <code>/proc/cpuinfo</code> 和 <code>/proc/meminfo</code> 由于是<code>/run/containerd/xxx/rootfs/proc</code> 的子挂载点，在挂载 <code>/run/containerd</code> 目录的时候会被传播到容器内。而先挂载 <code>/run/containerd</code> 则不存在这个问题。</p>
+<h1 id="问题复现">问题复现</h1>
+<ul>
+<li>在节点安装 lxcfs</li>
+</ul>
+<pre><code class="language-shell">$&nbsp;apt-get update &amp;&amp; apt-get install lxcfs -y
+
+
+</code></pre>
+<ul>
+<li>异常 case：创建 Pod，其中 <code>/run/containerd</code> 晚于 <code>/proc/cpuinfo</code> 和 <code>/proc/meminfo</code> 挂载，docker 无法启动容器</li>
+</ul>
+<pre><code class="language-yaml">apiVersion:&nbsp;v1
+kind:Pod
+metadata:
+name:docker-mount-sort-stable-test-pod
+namespace:default
+spec:
+hostNetwork:true
+containers:
+-image:ghcr.io/sctb512/docker-test:latest
+&nbsp; &nbsp;&nbsp;imagePullPolicy:Always
+&nbsp; &nbsp;&nbsp;name:docker
+&nbsp; &nbsp;&nbsp;securityContext:
+&nbsp; &nbsp; &nbsp;&nbsp;privileged:true
+&nbsp; &nbsp; &nbsp;&nbsp;runAsNonRoot:false
+&nbsp; &nbsp;&nbsp;terminationMessagePath:/dev/termination-log
+&nbsp; &nbsp;&nbsp;terminationMessagePolicy:File
+&nbsp; &nbsp;&nbsp;volumeMounts:
+&nbsp; &nbsp;&nbsp;-mountPath:/var/lib/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;mountPropagation:HostToContainer
+&nbsp; &nbsp; &nbsp;&nbsp;name:containerd-image
+&nbsp; &nbsp;&nbsp;-mountPath:/proc/meminfo
+&nbsp; &nbsp; &nbsp;&nbsp;name:lxcfs-proc-meminfo
+&nbsp; &nbsp; &nbsp;&nbsp;readOnly:true
+&nbsp; &nbsp;&nbsp;-mountPath:/proc/cpuinfo
+&nbsp; &nbsp; &nbsp;&nbsp;name:lxcfs-proc-cpuinfo
+&nbsp; &nbsp; &nbsp;&nbsp;readOnly:true
+&nbsp; &nbsp;&nbsp;-mountPath:/run/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;name:containerd-dir
+volumes:
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/lxc/lxcfs/proc/meminfo
+&nbsp; &nbsp; &nbsp;&nbsp;type:File
+&nbsp; &nbsp;&nbsp;name:lxcfs-proc-meminfo
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/lxc/lxcfs/proc/cpuinfo
+&nbsp; &nbsp; &nbsp;&nbsp;type:File
+&nbsp; &nbsp;&nbsp;name:lxcfs-proc-cpuinfo
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/run/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;type:Directory
+&nbsp; &nbsp;&nbsp;name:containerd-dir
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;type:Directory
+&nbsp; &nbsp;&nbsp;name:containerd-image
+
+
+</code></pre>
+<p>通过 docker 拉起容器：</p>
+<pre><code class="language-shell">$&nbsp;docker run --rm -it nginx:latest
+
+
+</code></pre>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6f4T0BQBuTIyJYbBf8icxCBQy0E6daJAQnVXD4PPiaO029cvTN8IDHYedQ/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<ul>
+<li>正常 case：创建 Pod <code>/run/containerd</code> 早于 <code>/proc/cpuinfo</code> 和 <code>/proc/meminfo</code> 挂载，docker 可以启动容器</li>
+</ul>
+<pre><code class="language-yaml">apiVersion:&nbsp;v1
+kind:Pod
+metadata:
+name:docker-mount-sort-stable-test-pod
+namespace:default
+spec:
+hostNetwork:true
+containers:
+-image:ghcr.io/sctb512/docker-test:latest
+&nbsp; &nbsp;&nbsp;imagePullPolicy:Always
+&nbsp; &nbsp;&nbsp;name:docker
+&nbsp; &nbsp;&nbsp;securityContext:
+&nbsp; &nbsp; &nbsp;&nbsp;privileged:true
+&nbsp; &nbsp; &nbsp;&nbsp;runAsNonRoot:false
+&nbsp; &nbsp;&nbsp;terminationMessagePath:/dev/termination-log
+&nbsp; &nbsp;&nbsp;terminationMessagePolicy:File
+&nbsp; &nbsp;&nbsp;volumeMounts:
+&nbsp; &nbsp;&nbsp;-mountPath:/var/lib/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;mountPropagation:HostToContainer
+&nbsp; &nbsp; &nbsp;&nbsp;name:containerd-image
+&nbsp; &nbsp;&nbsp;-mountPath:/run/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;name:containerd-dir
+&nbsp; &nbsp;&nbsp;-mountPath:/proc/meminfo
+&nbsp; &nbsp; &nbsp;&nbsp;name:lxcfs-proc-meminfo
+&nbsp; &nbsp; &nbsp;&nbsp;readOnly:true
+&nbsp; &nbsp;&nbsp;-mountPath:/proc/cpuinfo
+&nbsp; &nbsp; &nbsp;&nbsp;name:lxcfs-proc-cpuinfo
+&nbsp; &nbsp; &nbsp;&nbsp;readOnly:true
+volumes:
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/lxc/lxcfs/proc/meminfo
+&nbsp; &nbsp; &nbsp;&nbsp;type:File
+&nbsp; &nbsp;&nbsp;name:lxcfs-proc-meminfo
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/lxc/lxcfs/proc/cpuinfo
+&nbsp; &nbsp; &nbsp;&nbsp;type:File
+&nbsp; &nbsp;&nbsp;name:lxcfs-proc-cpuinfo
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/run/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;type:Directory
+&nbsp; &nbsp;&nbsp;name:containerd-dir
+-hostPath:
+&nbsp; &nbsp; &nbsp;&nbsp;path:/var/lib/containerd
+&nbsp; &nbsp; &nbsp;&nbsp;type:Directory
+&nbsp; &nbsp;&nbsp;name:containerd-image
+
+
+</code></pre>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_jpg/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6f9FaXiazMtV52sP8PlECic2e5trl3vzpfUyzibldX3RVf3803pTqTw7w9A/640?wx_fmt=jpeg&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<h1 id="总结">总结</h1>
+<p>Containerd 老版本使用 Golang 1.18 编译，新版本使用 golang 1.20 编译，Golang 1.19 在 commit 72e77a7f41bbf45d466119444307fd3ae996e257[5] 将 <code>sort.Sort</code> 由稳定排序修改为不稳定排序。containerd 使用 <code>sort.Sort</code> 对挂载点进行排序，<code>sort.Sort</code>变为不稳定之后，containerd 传给 runc 的挂载点顺序发生了变化。</p>
+<p>用户场景会将 <code>/run/containerd</code> 目录挂载到容器中，不同挂载顺序会导致 runc 挂载 procfs 时看到的子挂载点信息不同：</p>
+<ul>
+<li>
+<p><code>/proc/meminfo</code> 和 <code>/proc/cpuinfo</code> 先于 <code>/run/containerd</code> 挂载，containerd 传的挂载参数是 rbind（类似于 bind，会递归 bind 当前挂载点上已有的子挂载点），meminfo 和 cpuinfo 作为 <code>/run/containerd/xxx/proc</code> 的子挂载点在挂载 <code>/run/containerd</code> 时会被挂载，也就是说，runc 挂载 <code>procfs</code> 时， <code>/run/containerd/xxx/proc</code> 存在子挂载点，因此，不能挂载。</p>
+</li>
+<li>
+<p><code>/proc/meminfo</code> 和 <code>/proc/cpuinfo</code> 晚于 <code>/run/containerd</code> 挂载，runc 挂载 <code>/run/containerd</code> 时 meminfo 和 cpuinfo 还没被挂载，因此，runc 挂载 <code>/run/containerd</code> 时不存在子挂载点，可以挂载 procfs。</p>
+</li>
+</ul>
+<p>问题触发条件：</p>
+<ul>
+<li>
+<p>容器挂载了 <code>/proc/xxx</code> 目录 &amp; 挂载了节点上的 <code>/run/containerd</code> 目录</p>
+</li>
+<li>
+<p>sysfs 也有类似问题</p>
+</li>
+</ul>
+<p>解决方案：</p>
+<ul>
+<li>Containerd 侧：修改<code>sort.Sort</code>为<code>sort.Stable</code></li>
+</ul>
+<p>pkg/cri/opts/spec_linux.go#L120[6]</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6fvmLNc5ial4KHiaLhAgzK5OgJdDpn709v50OkGNWrnzKWiabicGUJrbXloQ/640?wx_fmt=png&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<p>有个有意思的点，containerd 社区给<code>OrderedMounts</code> 加了单元测试，用例中用的 <code>sort.Stable</code>，但代码逻辑中实际用的是 <code>sort.Sort</code>。可能默许了 <code>sort.Sort</code> 包含稳定排序的特征，只不过在 Golang 1.19 被打破了，才导致的问题。</p>
+<p>pkg/cri/opts/spec_test.go#L44[7]</p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_jpg/NyssVd6aPwu4oJK6yoQsfhTo1DXuHK6flmccrsXQnqj6RBCdXkhV8Y5NbMKpE6alopC8AItUAXbZd5ibW6u0VAQ/640?wx_fmt=jpeg&amp;from=appmsg" alt="图片" loading="lazy"></p>
+<ul>
+<li>用户侧：确保 Pod yaml 中容器挂载点的顺序 <code>/run/containerd</code> 在 <code>/proc/xxx</code> 挂载点之前。</li>
+</ul>
+<p>向社区提交的 PR：</p>
+<p>containerd/containerd/pull/10021[8]</p>
+<p>回合到 1.6 分支：</p>
+<p>containerd/containerd/pull/10045[9]</p>
+<p>正式 release 版本：v1.6.32[10]</p>
+<p>参考资料</p>
+<p>[1] 936c7fbc1c154964b6e3e8a7523bdf0c29b4e1b3: <em><a href="https://github.com/golang/go/commit/936c7fbc1c154964b6e3e8a7523bdf0c29b4e1b3" target="_blank" rel="noopener nofollow">https://github.com/golang/go/commit/936c7fbc1c154964b6e3e8a7523bdf0c29b4e1b3</a></em></p>
+<p>[2] 72e77a7f41bbf45d466119444307fd3ae996e257: <em><a href="https://github.com/golang/go/commit/72e77a7f41bbf45d466119444307fd3ae996e257" target="_blank" rel="noopener nofollow">https://github.com/golang/go/commit/72e77a7f41bbf45d466119444307fd3ae996e257</a></em></p>
+<p>[3] pkg/cri/opts/spec_linux.go#L120: <em><a href="https://github.com/containerd/containerd/blob/91a68edd775bba554a9eac7e04898b22069db5aa/pkg/cri/opts/spec_linux.go#L120" target="_blank" rel="noopener nofollow">https://github.com/containerd/containerd/blob/91a68edd775bba554a9eac7e04898b22069db5aa/pkg/cri/opts/spec_linux.go#L120</a></em></p>
+<p>[4] cve-2022-0492: <em><a href="https://terenceli.github.io/%E6%8A%80%E6%9C%AF/2022/03/06/cve-2022-0492" target="_blank" rel="noopener nofollow">https://terenceli.github.io/技术/2022/03/06/cve-2022-0492</a></em></p>
+<p>[5] 72e77a7f41bbf45d466119444307fd3ae996e257: <em><a href="https://github.com/golang/go/commit/72e77a7f41bbf45d466119444307fd3ae996e257" target="_blank" rel="noopener nofollow">https://github.com/golang/go/commit/72e77a7f41bbf45d466119444307fd3ae996e257</a></em></p>
+<p>[6] pkg/cri/opts/spec_linux.go#L120: <em><a href="https://github.com/containerd/containerd/blob/v1.6.31/pkg/cri/opts/spec_linux.go#L120" target="_blank" rel="noopener nofollow">https://github.com/containerd/containerd/blob/v1.6.31/pkg/cri/opts/spec_linux.go#L120</a></em></p>
+<p>[7] pkg/cri/opts/spec_test.go#L44: <em><a href="https://github.com/containerd/containerd/blob/v1.6.31/pkg/cri/opts/spec_test.go#L44" target="_blank" rel="noopener nofollow">https://github.com/containerd/containerd/blob/v1.6.31/pkg/cri/opts/spec_test.go#L44</a></em></p>
+<p>[8] containerd/containerd/pull/10021: <em><a href="https://github.com/containerd/containerd/pull/10021" target="_blank" rel="noopener nofollow">https://github.com/containerd/containerd/pull/10021</a></em></p>
+<p>[9] containerd/containerd/pull/10045: <em><a href="https://github.com/containerd/containerd/pull/10045" target="_blank" rel="noopener nofollow">https://github.com/containerd/containerd/pull/10045</a></em></p>
+<p>[10] v1.6.32: <em><a href="https://github.com/containerd/containerd/releases/tag/v1.6.32" target="_blank" rel="noopener nofollow">https://github.com/containerd/containerd/releases/tag/v1.6.32</a></em></p>
+<p><img src="https://mmbiz.qpic.cn/sz_mmbiz_png/NyssVd6aPwtCCDMBNRSxxBiboUtfEfKSOaibpWqManwicmeyfSeDrMAStcGg7JlHNibU3dTYAmcCsvdNJPVicL7icggg/640?wx_fmt=png" alt="图片" loading="lazy"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.011462460950231481" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-04-23 22:01">2025-04-23 21:53</span>&nbsp;
+<a href="https://www.cnblogs.com/sctb">abin在路上</a>&nbsp;
+阅读(<span id="post_view_count">1</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18842012);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18842012', targetLink: 'https://www.cnblogs.com/sctb/p/18842012', title: 'Golang 版本导致的容器运行时问题' })">举报</a>
+</div>
+        
