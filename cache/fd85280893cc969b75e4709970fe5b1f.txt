@@ -1,0 +1,683 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/mazhimazhi/p/18845888" title="发布于 2025-04-25 09:21">
+    <span role="heading" aria-level="2">Java虚拟机代码是如何一步一步变复杂且难以理解的？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>有相关统计数据显示，Java开发者有1000万+，这么多的人每天都在使用Java虚拟机进行开发，不过真正看过虚拟机代码的人应该非常非常少吧，可能有些人研究过，不过由于Java虚拟机是一个高度复杂的系统性工程，过于复杂的实现让他们最终放弃。</p>
+<p>目前服务器上使用最多的虚拟机还是HotSpot，HotSpot是用C/C++编写的，JDK8版本中虚拟机的代码就有60万行左右的代码，我们需要聚焦C1、C2编译器、垃圾回收、最基础的类加载等模块，以及只针对某一特定平台和架构下的代码实现（推荐研究linux平台下的x86-64位架构实现），那也有50万行左右的代码，所以对于想研究HotSpot虚拟机的Java程序员来说，挑战很大。</p>
+<p>这一篇就以HotSpot中实现相对复杂的一个点展开研究，看看它是如何一步一步变成今天这么复杂的。简单来说，有为了性能的，也有为了满足Java更多特性的，以GC任务提交执行为例能很好的说明代码从简单变为复杂的一个过程。</p>
+<p>文章分为4部分：</p>
+<ol>
+<li>基本需求</li>
+<li>执行非安全点任务</li>
+<li>优化安全点任务的执行效率</li>
+<li>支持临界区<br>
+4.1 VMThread对临界区的支持<br>
+4.2 业务线程对临界区的支持<br>
+4.3 业务线程提交GC任务</li>
+</ol>
+<p>通过学习这篇文章，你就能够从最简单的实现开始，一步一步彻底理解ParallelScavengeHeap::mem_allocate()、VMThread::execute()以及VMThread::loop()这些复杂函数的实现逻辑了。</p>
+<p>业务线程在执行应用程序时，通过调用ParallelScavengeHeap::mem_allocate()函数为Java对象分配内存。如果内存不足，此时就要调用VMThread::execute()函数向队列提交一个GC任务了。<br>
+VMThread::loop()中有一个VMThead守护线程会从队列中取出这些任务（包括刚才提交的GC任务）并执行垃圾收集。</p>
+<h1 id="1-基本需求">1. 基本需求</h1>
+<p>ParallelScavengeHeap::mem_allocate()函数的实现如下：</p>
+<pre><code>// size指定分配的内存大小
+HeapWord* ParallelScavengeHeap::mem_allocate(size_t size){
+
+  // 尝试在年轻代分配内存，allocate()不需要加锁，这个函数自己有处理
+  // 多线程的能力
+  PSYoungGen* psyg = young_gen();
+  HeapWord*   result = psyg-&gt;allocate(size);
+
+   if(result == NULL){
+      MutexLocker ml(Heap_lock);
+      // 再次进行判断，如果分配成功则避免重复提交GC请求
+      result = young_gen()-&gt;allocate(size);
+      if (result != NULL) {
+        return result;
+      }
+
+      // 尝试从老年代中分配内存，老年代中分配时必须要加锁
+      result = mem_allocate_old_gen(size);
+      if (result != NULL) {
+        return result;
+      }
+      // 提交一个GC任务　　　　
+      VM_ParallelGCFailedAllocation op(size);
+      Thread::execute(&amp;op);
+      return op.result;
+   }
+
+   return result;
+}
+
+void VMThread::execute(VM_Operation* op) {
+　　{
+        // 操作_vm_queue队列时必须要获取VMOperationQueue_lock锁，GC线程等待在
+        // 这个锁上，如果GC线程获取到这个锁，会尝试获取其中的任务
+        VMOperationQueue_lock-&gt;lock_without_safepoint_check();
+
+        // 向队列中加入新的任务，其中_vm_queue是VMOperationQueue*类型的全局变量，
+        // 不是一个线程安全队列
+        _vm_queue-&gt;add(op);  
+
+         // 唤醒VMThread线程，执行队列中的任务
+         VMOperationQueue_lock-&gt;notify();
+         VMOperationQueue_lock-&gt;unlock();
+    }
+
+    // 提交GC任务后，等待这个GC任务执行完成后，在堆中释放出空间才可能满足
+　　 // 这次的内存分配请求
+    VMOperationRequest_lock-&gt;wait();
+}
+</code></pre>
+<p>业务线程会提交GC请求，如果堆内存紧张的话，极有可能多个业务线程同时提交GC任务，GC任务会造成STW（Stop The World），影响系统时延和吞吐量，所以通过Heap_lock互斥锁加上重试分配逻辑来避免这样的问题。<br>
+下面看一下VMThread单线程取GC任务执行的实现逻辑：</p>
+<pre><code>void VMThread::loop() {
+  while(true) {
+     {
+          由于队列不是一个线程安全的容器，所以要通过锁来保证线程安全性
+          MutexLockerEx mu_queue(VMOperationQueue_lock,Mutex::_no_safepoint_check_flag);
+          // 从队列中获取一个新的任务
+          _cur_vm_operation = _vm_queue-&gt;remove_next();
+
+          // 如果当前线程不应该终止并且没有从队列中获取到任务时，需要等待
+          while (_cur_vm_operation == NULL) {
+            VMOperationQueue_lock-&gt;wait();
+            ...
+            // 线程被唤醒后从队列中获取任务
+            _cur_vm_operation = _vm_queue-&gt;remove_next();
+          }
+      }
+        
+　　　 // 进入安全点执行需要在安全点执行的GC任务，如Parallel GC的YGC和FGC是一定要在安全点下执行的　　
+      SafepointSynchronize::begin();
+      evaluate_operation(_cur_vm_operation);
+      SafepointSynchronize::end();
+
+      {
+　　　　　　// 通知相关任务执行完成，唤醒业务线程继续执行
+          MutexLockerEx mu(VMOperationRequest_lock);
+          VMOperationRequest_lock-&gt;notify_all();
+      }
+  } // while循环结束
+}
+</code></pre>
+<p>业务线程和VMThread线程之间的交互涉及到了VMOperationQueue_lock和VMOperationRequest_lock锁，VMOperationQueue_lock锁在保护队列的同时，也让有任务到来时，能及时获取队列中的任务并执行。<br>
+执行完成后通过VMOperationRequest_lock通知业务线程，结束本次GC垃圾回收操作。<br>
+交互操作如下图所示。<br>
+<img src="https://img2024.cnblogs.com/blog/1236123/202504/1236123-20250424090411358-1499970890.png" alt="" loading="lazy"></p>
+<h1 id="2-执行非安全点任务">2. 执行非安全点任务</h1>
+<p>有一些非安全点的任务可在VMThread空闲时执行，重构VMThread::loop()后的实现如下：</p>
+<pre><code>void VMThread::loop() {
+  while(true) {
+        {
+          MutexLockerEx mu_queue(VMOperationQueue_lock,Mutex::_no_safepoint_check_flag);
+          _cur_vm_operation = _vm_queue-&gt;remove_next();
+
+          while (_cur_vm_operation == NULL) {
+            // 等待一段时间（由GuaranteedSafepointInterval选项指定）后，就从队列中获取任务
+            bool timedout = VMOperationQueue_lock-&gt;wait(Mutex::_no_safepoint_check_flag,GuaranteedSafepointInterval);
+            _cur_vm_operation = _vm_queue-&gt;remove_next();
+          }
+        }
+        
+        if (_cur_vm_operation-&gt;evaluate_at_safepoint()) { // 在安全点下执行任务
+            SafepointSynchronize::begin();
+            evaluate_operation(_cur_vm_operation);
+            SafepointSynchronize::end();
+        } else { 
+            // 在非安全点下执行任务时，每次只会执行一个任务，然后再次获取任务，不能一次执行多个
+            // 非安全占下任务时，导致安全点下的优先级高的任务得不到及时执行
+            evaluate_operation(_cur_vm_operation);
+            _cur_vm_operation = NULL;
+        }
+
+        {
+          MutexLockerEx mu(VMOperationRequest_lock);
+          VMOperationRequest_lock-&gt;notify_all();
+        }
+  } // while循环结束
+}
+</code></pre>
+<p>在一些业务线程提交非安全点上执行的任务时并不会等待，可能有时候连notify()都不会调用，所以这里需要在VMOperationQueue_lock-&gt;wait()上定时去唤醒来执行非安全点上的任务。</p>
+<h1 id="3-优化执行安全点任务">3. 优化执行安全点任务</h1>
+<p>调用SafepointSynchronize::begin()会让所有的业务线程进入安全点，这会对整个系统的时延和吞吐量造成影响。所以是重点优化的地方。既然安全点进入来之不易，那在进入安全点后，就尽量多执行一些需要在安全点上执行的任务，最好是把当前能获取到的安全点任务都执行完，优化后的代码实现如下：</p>
+<pre><code>void VMThread::loop() {
+  while(true) {
+      // 将_vm_queue队列中一些优化级比较高的、需要在安全点下执行的任务都提取出来单独保存
+      VM_Operation* safepoint_ops = NULL;
+      {
+          MutexLockerEx mu_queue(VMOperationQueue_lock,Mutex::_no_safepoint_check_flag);
+          _cur_vm_operation = _vm_queue-&gt;remove_next();
+
+          while (_cur_vm_operation == NULL) {
+            bool timedout = VMOperationQueue_lock-&gt;wait(Mutex::_no_safepoint_check_flag,GuaranteedSafepointInterval);
+            _cur_vm_operation = _vm_queue-&gt;remove_next();
+          }
+
+          // 如果当前获取到的任务需要在安全点下执行，则获取队
+          // 列中的所有需要在安全点中执行的任务，这样要尽量在一次STW期间
+          // 内执行完所有需要在安全点中执行的任务
+          if (
+              _cur_vm_operation != NULL &amp;&amp;
+              _cur_vm_operation-&gt;evaluate_at_safepoint()
+          ){
+             // 获取队列中的所有需要在安全点中执行的任务
+             safepoint_ops = _vm_queue-&gt;drain_at_safepoint_priority();
+          }
+      }
+
+      {
+            // 将需要在安全点下执行的任务列表保存到_drain_list属性中
+            _vm_queue-&gt;set_drain_list(safepoint_ops);
+            // 进入安全点
+            SafepointSynchronize::begin();
+            // 执行任务
+            evaluate_operation(_cur_vm_operation);
+            // 循环执行任务列表中的所有任务
+            do {
+              _cur_vm_operation = safepoint_ops;
+              if (_cur_vm_operation != NULL) {
+                do {
+                  VM_Operation* next = _cur_vm_operation-&gt;next();
+                  _vm_queue-&gt;set_drain_list(next);
+                  evaluate_operation(_cur_vm_operation);
+                  // 针对线程设定任务完成数量，好让等待的线程迟早退出等待状态
+                  op-&gt;calling_thread()-&gt;increment_vm_operation_completed_count();
+
+                  _cur_vm_operation = next;
+                } while (_cur_vm_operation != NULL);
+              }
+
+              // 在执行任务的过程中，可能队列中又被其它业务线程压入了优化级高且需要在安全点下执行的任务，
+              // 取出来继续执行
+              if (_vm_queue-&gt;peek_at_safepoint_priority()) {
+                MutexLockerEx mu_queue(VMOperationQueue_lock,Mutex::_no_safepoint_check_flag);
+                safepoint_ops = _vm_queue-&gt;drain_at_safepoint_priority();
+              } else {
+                safepoint_ops = NULL;
+              }
+            } while(safepoint_ops != NULL);
+
+            _vm_queue-&gt;set_drain_list(NULL);
+
+            // 离开安全点
+            SafepointSynchronize::end();
+        }
+
+
+        {
+          MutexLockerEx mu(VMOperationRequest_lock);
+          VMOperationRequest_lock-&gt;notify_all();
+        }
+  } // while循环结束
+}
+
+</code></pre>
+<p>经过这一次的性能优化后，VMThread::loop()函数变的复杂了起来。<br>
+首先是从_vm_queue队列中分离出了需要在安全点下操作的高优先级任务，这些任务需要串行操作，也就是一个操作完成后才能再操作一个。在操作第一个任务，那后面的安全点任务也要做为根进行扫描的，这就是调用set_drain_list()的原因。<br>
+另外，为了高效，我们从队列中取出任务后就释放了VMOperationQueue_lock，这会让其它的业务线程也会提交更多的任务到队列，所以我们在进入安全点后，执行的安全点任务要比之前更多了，效率更高了。</p>
+<p>现在VMThread::loop()函数的实现已经非常接近JDK8的版本了，不过还需要完善一些细节，比如VMThead做为后台线程，应该在Java业务线程退出时停止等。完整函数的判断流程如下图所示。<br>
+<img src="https://img2024.cnblogs.com/blog/1236123/202504/1236123-20250424093822316-1706569384.png" width="700" height="1000"></p>
+<pre><code>void VMThread::execute(VM_Operation* op) {
+    Heap_lock-&gt;lock();
+    // 任务中保存当前的线程，让VMThread在执行完任务时，针对这个线程设定任务完成数量，让当前
+    // 线程尽快退出等待状态
+    op-&gt;set_calling_thread(t, Thread::get_priority(t));
+    int ticket = t-&gt;vm_operation_ticket();
+
+    {
+        VMOperationQueue_lock-&gt;lock_without_safepoint_check();
+        bool ok = _vm_queue-&gt;add(op); 
+        VMOperationQueue_lock-&gt;notify();
+        VMOperationQueue_lock-&gt;unlock();
+    }
+
+    {
+        // 当前的JavaThread必须等待任务执行完成后的结果
+        MutexLocker mu(VMOperationRequest_lock);
+        // 当Thread::_vm_operation_started_count的值大于等于ticket时，表示
+        // 提交的任务已经执行完成，JavaThread不必等待，可以开始运行了
+        while(t-&gt;vm_operation_completed_count() &lt; ticket) {
+           VMOperationRequest_lock-&gt;wait();
+        }
+    }
+
+    Heap_lock-&gt;unlock();
+}
+</code></pre>
+<p>提交一个任务时，返回_vm_operation_started_count加1后的结果做为ticket，当任务执行完成后，VMThread会调用increment_vm_operation_completed_count()函数对_vm_operation_completed_count加1，由于_vm_operation_started_count与_vm_operation_completed_count初始时都为0，所以当_vm_operation_completed_count不小于_vm_operation_started_count时就表示任务执行完成，可以不用等待了。</p>
+<p>有人可能好奇，这里为什么要用计数来判断呢？这是因为有些业务线程提交了安全点操作后并不需要等待执行结果，而GC垃圾回收任务，例如Parallel Scaveng提交一个VM_ParallelGCFailedAllocation是需要等待任务执行结果的，当然也可以通过判断具体的VM_ParallelGCFailedAllocation任务是否完成来结束等待，不过鉴于之前在VMThread::loop()中会批处理安全点任务，这里计数就可以达到目的了。</p>
+<h1 id="4-对临界区的支持">4. 对临界区的支持</h1>
+<p>使用JNI临界区的方式操作数组或者字符串时，为了防止GC过程中jarray或者jstring发生位移而导致数组指针失效，需要保持它们在Java堆中的地址在JNI临界区执行过程中保持不变。HotSpot通过GC_locker来阻止其他GC的发生。</p>
+<p>HotSpot通过阻止GC来防止堆中对象的移动，这样就不用将堆中的数据先行拷贝到C/C++堆中，这样可避免因为数据拷贝导致的开销，从而提高JNI的性能。</p>
+<p>临界区的支持要涉及到当前正在临界区执行代码的线程、提交GC任务的业务线程和执行GC任务的VMThread线程，这几个线程通过JNICritical_lock全局互斥锁以及GC_locker中定义的_needs_gc、_jni_lock_count等静态变量来交互。</p>
+<p>GC_locker类的定义如下：</p>
+<pre><code>class GC_locker: public AllStatic {
+ private:
+  // 这个属性记录了当前在临界区中的线程数量
+  // 当进入安全点时才会更新这个值，因为此时的业务线程已经STW，可能会改变_jni_lock_count的只有本地线程，
+  // 本地线程此时的状态可能是：
+  // 1. 没有进入安全点，如果操作对象，则会被阻塞
+  // 2. 要进入临界区
+  // 3. 进入临界区了，要离开
+  static volatile jint _jni_lock_count; 
+
+  static volatile jint _lock_count;      // number of other active instances
+  static volatile bool _needs_gc;        // heap is filling, we need a GC
+  static volatile bool _doing_gc;        // unlock_critical() is doing a GC
+  // ...
+</code></pre>
+<p>上面的变量全部都是静态全局的，所以操作时要注意多线程问题。</p>
+<h2 id="41-vmthread对临界区的支持">4.1 VMThread对临界区的支持</h2>
+<p>当VMthread进入安全点开始执行任务时发现有线程进入，此时无论如何也不能继续GC，只能退出并将_needs_gc变量设置为true。</p>
+<pre><code>VMThread::loop()
+  VMThread::evaluate_operation()
+    VM_Operation::evaluate()
+      VM_ParallelGCFailedAllocation::doit()
+        ParallelScavengeHeap::failed_mem_allocate()
+          PSScavenge::invoke()
+             PSScavenge::invoke_no_policy()
+             PSParallelCompact::invoke_no_policy()
+</code></pre>
+<p>VMThread是单线程在安全点下执行GC，在PSScavenge::invoke_no_policy()和PSParallelCompact::invoke_no_policy()函数中首先会调用GC_locker::check_active_before_gc()函数判断是否有线程进入了临界区，函数的实现如下：</p>
+<pre><code>// 当前函数在安全点内调用
+bool GC_locker::check_active_before_gc() {
+  assert(SafepointSynchronize::is_at_safepoint(), "only read at safepoint");
+  if (is_active() &amp;&amp; !_needs_gc) {
+    _needs_gc = true;
+  }
+  return is_active();
+}
+
+static bool is_active() {
+    return is_active_internal();
+}
+
+static bool is_active_internal() {
+    return _lock_count &gt; 0 || _jni_lock_count &gt; 0;
+}
+</code></pre>
+<p>调用check_active_before_gc()函数时，可能会将_needs_gc设置为true，注意这里是唯一一个将_needs_gc设置为true的地方。如果设置为true，则：</p>
+<ol>
+<li>会阻塞其他业务线程进入JNI临界区；</li>
+<li>在最后一个位于JNI临界区的线程退出临界区时，发起一次CGCause为_gc_locker的GC；</li>
+<li>让尝试提交GC任务的线程阻塞等待，逻辑在GC_locker::stall_until_clear()函数中实现。</li>
+</ol>
+<p>另外在VM_ParallelGCFailedAllocation::doit()函数中也有对临界区的支持逻辑，如下：</p>
+<pre><code>void VM_ParallelGCFailedAllocation::doit() {
+  SvcGCMarker sgcm(SvcGCMarker::MINOR);
+
+  ParallelScavengeHeap* heap = (ParallelScavengeHeap*)Universe::heap();
+
+  GCCauseSetter gccs(heap, _gc_cause);
+  _result = heap-&gt;failed_mem_allocate(_size);
+
+  // 需要发生GC并且还有线程在临界区内执行任务??
+  if (_result == NULL &amp;&amp; GC_locker::is_active_and_needs_gc()) {
+    set_gc_locked();
+  }
+}
+
+void set_gc_locked() { 
+  _gc_locked = true; // 定义在VM_GC_Operation类中的实例变量
+}
+</code></pre>
+<p>当_gc_locked为true时，本次的GC任务并没有真正执行，但是GC_locker::is_active_and_needs_gc()为true时表示有临界区线程，当最后一个临界区线程退出时会触发GC执行，那么提交此次GC任务的那个线程就需要重试了，后面在介绍ParallelScavengeHeap::mem_allocate()函数时会介绍。</p>
+<h2 id="42-业务线程对临界区的支持">4.2 业务线程对临界区的支持</h2>
+<p>进入临界区的代码如下：</p>
+<pre><code>inline void GC_locker::lock_critical(JavaThread* thread) {
+  // 当前线程还没有进入临界区时，可能在进入临界区时要阻塞等待GC执行完成
+  if (!thread-&gt;in_critical()) { 
+    // needs_gc()表示现在堆中需要发生GC来进行垃圾回收
+    if (needs_gc()) { 
+      jni_lock(thread);
+      return;
+    }
+  }
+   
+  thread-&gt;enter_critical();
+}
+</code></pre>
+<p>在进入临界区时，如果当前线程不在临界区并且_needs_gc的值为true时，要调用jni_lock()。_needs_gc为true表示有VMThead线程在安全点中试着执行GC任务，但是由于临界区有线程在，所以没有执行。那当退出临界区的最后一个线程是需要调用GC_locker::unlock_critical()函数触发GC的，所以如果是GC已经触发，那么_doing_gc为true，这个线程要阻塞等待；假设上一个线程还在临界区，那当前线程也要阻塞，因为要防止饿死GC线程。</p>
+<pre><code>void GC_locker::jni_lock(JavaThread* thread) {
+  // 加互斥锁
+  // 1. 保护_doing_gc变量
+  // 2. 保护_jni_lock_count变量
+  MutexLocker mu(JNICritical_lock);
+
+  // 当需要发生GC并且已经有至少一个线程在临界区时，要阻止当前的线程进入临界区，防止饿死GC线程
+  // 当正在发生GC时，同样需要阻止当前线程进入临界区
+  while ((needs_gc() &amp;&amp; is_jni_active()) || _doing_gc) {
+    JNICritical_lock-&gt;wait();
+  }
+  // 当前线程被允许进入临界区
+  thread-&gt;enter_critical();
+  _jni_lock_count++;  // 进入临界区的线程数量要增加1
+}
+
+static bool is_jni_active() {
+  assert(_needs_gc, "only valid when _needs_gc is set");
+  return _jni_lock_count &gt; 0;
+}
+ 
+// _jni_active_critical是一个实例变量，表示一个线程进入临界区的数量
+bool in_critical()    { 
+  return _jni_active_critical &gt; 0; 
+}
+ 
+void enter_critical() {
+   _jni_active_critical++; 
+}
+
+</code></pre>
+<p>下面看一下退出临界区的代码，如下：</p>
+<p>退出临界区的代码如下：</p>
+<pre><code>inline void GC_locker::unlock_critical(JavaThread* thread) {
+  if (thread-&gt;in_last_critical()) { // 当前线程实例变量_jni_active_critical的值为1
+    if (needs_gc()) {
+      // 如果当前线程是临界区中最后一个线程，并且堆需要发生GC回收垃圾时，
+      // 要在退出临界区时触发垃圾回收操作
+      jni_unlock(thread);
+      return;
+    }
+  }
+  thread-&gt;exit_critical();
+}
+ 
+// 只有当前线程是临界区中最后一个线程时才会调用这个函数
+void GC_locker::jni_unlock(JavaThread* thread) {
+  MutexLocker mu(JNICritical_lock);
+
+  _jni_lock_count--; // 临界区的线程数量减一
+  thread-&gt;exit_critical(); // 当前线程进入的临界区的数量减一
+
+  // 当前线程是临界区最后一个线程了，需要触发GC操作
+  if (needs_gc() &amp;&amp; !is_jni_active()) {
+    if (!is_active_internal()) {
+      _doing_gc = true;
+      {
+        // Must give up the lock while at a safepoint
+        MutexUnlocker munlock(JNICritical_lock);
+        // 触发一次原因为GCCause::_gc_locker的GC
+        Universe::heap()-&gt;collect(GCCause::_gc_locker);
+      }
+      _doing_gc = false;
+    }
+ 
+    _needs_gc = false;
+    // 唤醒被阻塞在临界区外面的线程 
+    JNICritical_lock-&gt;notify_all();
+  }
+}
+ 
+static bool is_active_internal() {
+  return _lock_count &gt; 0 || _jni_lock_count &gt; 0;
+}
+bool in_last_critical() { 
+  return _jni_active_critical == 1; 
+}
+void exit_critical() { 
+  _jni_active_critical--; 
+}
+</code></pre>
+<p>最后一个位于JNI临界区的线程退出临界区时，发起一次CGCause为_gc_locker的GC。<br>
+如上函数要注意，在调用Universe::heap()-&gt;collect()函数之前释放了JNICritical_lock锁，这是为了让一切没有进入临界区的线程全部都能走到GC_locker::jni_lock()函数的wait()上，为本次的GC任务让路。<br>
+调用的collect()函数的实现如下：</p>
+<pre><code>void ParallelScavengeHeap::collect(GCCause::Cause cause) {
+  assert(!Heap_lock-&gt;owned_by_self(),
+    "this thread should not own the Heap_lock");
+
+  unsigned int gc_count      = 0;
+  unsigned int full_gc_count = 0;
+  {
+    MutexLocker ml(Heap_lock);
+    // This value is guarded by the Heap_lock
+    gc_count      = Universe::heap()-&gt;total_collections();
+    full_gc_count = Universe::heap()-&gt;total_full_collections();
+  }
+
+  VM_ParallelGCSystemGC op(gc_count, full_gc_count, cause);
+  VMThread::execute(&amp;op);
+}
+</code></pre>
+<h2 id="43-业务线程提交gc任务">4.3 业务线程提交GC任务</h2>
+<pre><code>HeapWord* ParallelScavengeHeap::mem_allocate(
+	 size_t size,
+	 bool* gc_overhead_limit_was_exceeded
+){
+
+  // 发生在GC占用大量时间为释放很小空间的时候发生的，是一种保护机制
+  // 这里初始化为false，后面根据实际情况进行值的更新
+  *gc_overhead_limit_was_exceeded = false;
+
+  PSYoungGen* psyg = young_gen();
+  HeapWord*   result = psyg-&gt;allocate(size);
+
+  uint gc_count = 0;
+  int  gclocker_stalled_count = 0;
+
+  while (result == NULL) {
+    {
+      MutexLocker ml(Heap_lock);
+      gc_count = Universe::heap()-&gt;total_collections();
+      result = young_gen()-&gt;allocate(size);
+      if (result != NULL) {
+        return result;
+      }
+
+      // 尝试从老年代中分配内存
+      result = mem_allocate_old_gen(size);
+      if (result != NULL) {
+        return result;
+      }
+
+      // 当线程尝试分配内存时，若此时GCLocker机制暂时冻结GC操作。
+      // 此时分配请求会进入重试流程，GCLockerRetryAllocationCount 即记录重试次数‌
+      if (gclocker_stalled_count &gt; GCLockerRetryAllocationCount) {
+        return NULL;
+      }
+
+      // 有线程在进入临界区并且当前堆需要发生GC收集时，is_active_and_needs_gc()返回true
+      if (GC_locker::is_active_and_needs_gc()) {
+        // 当临界区最终被清空时，最后一个退出临界区的线程会触发GC。
+        // 因此我们会从循环开始处重试分配流程，而非触发更多（此时可能已无必要的）GC尝试。
+        JavaThread* jthr = JavaThread::current();
+        if (!jthr-&gt;in_critical()) {
+           // 在这里释放了Heap_lock锁
+           MutexUnlocker mul(Heap_lock);
+           // 由于临界区的扰乱，本来堆中内存吃紧，需要发生GC回收（_needs_gc的值为true）的时候，有线程却
+　　　　　　 // 在临界区内阻塞了GC回收，此时当前要提交GC任务的业务线程就只能等待在JNICritical_lock锁上
+           GC_locker::stall_until_clear();
+           // 等待退出临界区时，然后从头再试
+           gclocker_stalled_count += 1;
+           continue;
+        } else {
+　　　　　　 // 一定要让在临界区的代码返回，否则临界区线程可能永远出不来，导致系统实际上僵死
+           // 当前线程在执行临界区代码时，由于内存没有成功分配导致流程执行到这里
+           if (CheckJNICalls) {
+              fatal("Possible deadlock due to allocating while in jni critical section");
+           }
+           return NULL;
+        }
+      }
+    } // 持有Heap_lock锁的块结束，锁将被释放
+
+    // 注意下面的代码执行时，Heap_lock锁已经释放，那么可能有多个业务线程在分配内存失败时，会提交GC任务
+    // 对于Parallel GC来说，仍然是再次获取Heap_lock锁来互斥操作，不过由于锁可以轮流持有，所以仍然可能会
+    // 重复提交GC任务，此时就在第一个线程提交GC任务后，会增加gc计数，这样第二个线程在获取互斥锁时，判断
+    // gc_count和实时取到的gc计数不同，就会跳过gc操作，回到本次的while大循环内重新试着分配内存
+
+    if (result == NULL) {
+      // 流程走到这里说明了：
+      // 1、内存分配没有成功
+      // 2、大概率已经没有线程在临界区了，因为没有锁的保护，所以可能还有线程进入临界区
+      VM_ParallelGCFailedAllocation op(size, gc_count);
+      VMThread::execute(&amp;op);
+
+      // 提交的GC任务是否已打算执行？若打算执行，prologue_succeeded()函数返回true
+      // 该机制可避免系统对无法满足的请求持续重试，从而防止陷入循环直至超时。
+      if (op.prologue_succeeded()) {
+        // 若在GC任务操作期间GC被锁定，则需重试内存分配和/或进入等待状态，这就是因为
+        // 进入安全点后才发现，又有线程进入临界区了，导致没办法执行GC任务 
+        if (op.gc_locked()) {
+          continue;  
+        }
+
+        // 如果已超过GC时间限制，则退出循环。
+        // 此时内存分配必定已在上方失败（守卫此路径的"result"为NULL），且最近一次垃圾
+        // 收集已超过GC开销限制（尽管可能已回收足够内存来满足此次分配）。退出循环以便
+        // 抛出内存溢出错误（返回NULL并忽略op.result()的内容），但需要清除 
+        // gc_overhead_limit_exceeded标志，让下一次垃圾收集可以从全新状态开始（即忘记之前开销超标的情况）。
+        const bool limit_exceeded = size_policy()-&gt;gc_overhead_limit_exceeded();
+        const bool softrefs_clear = collector_policy()-&gt;all_soft_refs_clear();
+
+        if (limit_exceeded &amp;&amp; softrefs_clear) {
+          *gc_overhead_limit_was_exceeded = true;
+          size_policy()-&gt;set_gc_overhead_limit_exceeded(false);
+         
+          if (op.result() != NULL) {
+            // 用填充对象填充op.result()，以保持堆的可解析性
+            CollectedHeap::fill_with_object(op.result(), size);
+          }
+          return NULL;
+        }
+
+        return op.result();
+      }
+    } // if (result == NULL) 判断结束
+ } // while (result == NULL) 循环结束
+  return result;
+}
+</code></pre>
+<p>上面图的流程如下图所示。<br>
+<img src="https://img2024.cnblogs.com/blog/1236123/202504/1236123-20250424194641991-1211135843.png" width="900" height="1250"></p>
+<p>图中灰色背景表示内部循环，橙色背景表示外部循环。</p>
+<p>这里我们要着重看一下对临界区的支持。由于临界区的扰乱，本来堆中内存吃紧，需要发生GC回收（_needs_gc的值为true）的时候，有线程却在临界区内阻塞了GC回收，此时当前要提交GC任务的业务线程就只能等待在JNICritical_lock锁上。<br>
+之前在没有支持临界区时，分配内存失败的线程都阻塞在Heap_lock互斥锁上。</p>
+<p>GC_locker::stall_until_clear()函数的实现如下：</p>
+<pre><code>void GC_locker::stall_until_clear() {
+  assert(!JavaThread::current()-&gt;in_critical(), "Would deadlock");
+  MutexLocker   ml(JNICritical_lock);
+
+  while (needs_gc()) {
+    JNICritical_lock-&gt;wait();
+  }
+}
+</code></pre>
+<p>上图中灰色背景表示内部循环，这个循环就是因为临界区扰乱，所以需要等待，当临界区最后一个线程触发GC任务完成后，会调用JNICritical_lock-&gt;notify_all()通过这些业务线程重新进行内存分配等尝试。</p>
+<p>完整的VMThread::execute()函数的实现如下：</p>
+<pre><code>源代码位置：openjdk/hotspot/src/share/vm/runtime/vmThread.cpp
+void VMThread::execute(VM_Operation* op) {
+  Thread* t = Thread::current();
+   
+  if (!t-&gt;is_VM_thread()) {
+    // 对于Parallel GC来说，concurrent的值为false
+    bool concurrent = op-&gt;evaluate_concurrently();
+    // 在doit_prologue()中获取Heap_lock锁
+    if (!op-&gt;doit_prologue()) {
+       return;  
+    }
+   
+    // 设置提交当前任务的线程
+    op-&gt;set_calling_thread(t, Thread::get_priority(t));
+    // 对于Parallel GC来说，返回true
+    bool execute_epilog = !op-&gt;is_cheap_allocated();
+   
+    // 生成ticket，辅助判断提交的任务是否执行完成
+    int ticket = 0;
+    if (!concurrent) {
+       ticket = t-&gt;vm_operation_ticket();
+    }
+   
+    {
+      // 操作_vm_queue队列时必须要获取VMOperationQueue_lock锁，GC线程等待在
+     // 这个锁上，如果GC线程获取到这个锁，会尝试获取其中的任务
+      VMOperationQueue_lock-&gt;lock_without_safepoint_check();
+      bool ok = _vm_queue-&gt;add(op);  // 向队列中加入新的任务
+  
+      // 唤醒VMThread线程，执行队列中的任务
+      VMOperationQueue_lock-&gt;notify();
+      VMOperationQueue_lock-&gt;unlock();
+    }
+   
+    if (!concurrent) {
+      // 当前的JavaThread必须等待任务执行完成后的结果
+      MutexLocker mu(VMOperationRequest_lock);
+      // 当Thread::_vm_operation_started_count的值大于等于ticket时，表示
+      // 提交的任务已经执行完成，JavaThread不必等待，可以开始运行了
+      while(t-&gt;vm_operation_completed_count() &lt; ticket) {
+        VMOperationRequest_lock-&gt;wait(!t-&gt;is_Java_thread());
+      }
+    }
+    // 在doit_epilogue()中释放Heap_lock锁
+    if (execute_epilog) {
+      op-&gt;doit_epilogue();
+    }
+  }
+  ...
+}
+</code></pre>
+<p>大概的流程如下图所示。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1236123/202504/1236123-20250424093701522-1729997281.png" alt="" loading="lazy"></p>
+<p>在向队列提交任务后，当前线程需要在VMOperationRequest_lock上等待，直到GC线程执行完成后会调用VMoperationRequest_lock的notifyAll()进行通知。</p>
+<p>对于Parallel GC来说，其VM_ParallelGCFailedAllocation并非concurrent，执行的doit_prologue()函数的实现如下：</p>
+<pre><code>bool VM_GC_Operation::doit_prologue() {
+  // 获取Heap_lock锁
+  Heap_lock-&gt;lock();
+ 
+  if (skip_operation()) {
+　　 // 当某些原因导致当前的GC任务仍然不能提交到队列时，及时释放Heap_lock锁
+    Heap_lock-&gt;unlock(); 
+    _prologue_succeeded = false;
+  } else {
+    _prologue_succeeded = true; 
+    SharedHeap* sh = SharedHeap::heap();
+    if (sh != NULL)
+        sh-&gt;_thread_holds_heap_lock_for_gc = true;
+  }
+  return _prologue_succeeded;
+}
+</code></pre>
+<p>_prologue_succeeded値返回true时会提交GC操作，否则可能由于临界区等原因没办法提交GC操作。</p>
+<pre><code>bool VM_GC_Operation::skip_operation() const {
+  // 在ParallelScavengeHeap::mem_allocate()函数中获取的_gc_count_before，当这个值不相等时，
+  // 说明已经有线程提交了GC操作并执行了GC
+  bool skip = (_gc_count_before != Universe::heap()-&gt;total_collections());
+  if (_full &amp;&amp; skip) {
+    skip = (_full_gc_count_before != Universe::heap()-&gt;total_full_collections());
+  }
+  // 有必要触发执行GC，但是有线程在临界区
+  if (!skip &amp;&amp; GC_locker::is_active_and_needs_gc()) {
+    // 如果Java对象分配堆区已到达无需垃圾回收即可达到的最大提交内存上限，则返回true
+    skip = Universe::heap()-&gt;is_maximal_no_gc();
+    assert(!(skip &amp;&amp; (_gc_cause == GCCause::_gc_locker)), "GC_locker cannot be active when initiating GC");
+  }
+  return skip;
+}
+</code></pre>
+<p>不得不说，从最初最简单的功能需求开始，由于需要高性能、也需要一些特性的支持，最终导致代码变的复杂且难以理解，尤其是临界区特性的支持（这其实也是为了性能），为了性能，不能加过多的互斥锁，只能是用一些变量加Critical_lock互斥锁来协调临界区线程、提交GC任务的线程和VMThread后台线程。这样复杂的代码对后来的开发者极不友好，并且也非常容易引入Bug。</p>
+<img src="https://img2024.cnblogs.com/blog/1236123/202504/1236123-20250424100503675-351126910.png" width="550" height="200">
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0714078892349537" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-04-25 09:22">2025-04-25 09:21</span>&nbsp;
+<a href="https://www.cnblogs.com/mazhimazhi">鸠摩（马智）</a>&nbsp;
+阅读(<span id="post_view_count">36</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18845888);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18845888', targetLink: 'https://www.cnblogs.com/mazhimazhi/p/18845888', title: 'Java虚拟机代码是如何一步一步变复杂且难以理解的？' })">举报</a>
+</div>
+        
