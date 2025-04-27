@@ -1,0 +1,219 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/qwqwQAQ/p/18849019" title="发布于 2025-04-27 10:57">
+    <span role="heading" aria-level="2">C# 使用StackExchange.Redis实现分布式锁的两种方式</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>分布式锁在集群的架构中发挥着重要的作用。以下有主要的使用场景<br>
+1.在秒杀、抢购等高并发场景下，多个用户同时下单同一商品，可能导致库存超卖。<br>
+2.支付、转账等金融操作需保证同一账户的资金变动是串行执行的。<br>
+3.分布式环境下，多个节点可能同时触发同一任务（如定时报表生成）。<br>
+4.用户因网络延迟重复提交表单，可能导致数据重复插入。</p>
+</blockquote>
+<p></p><div class="toc"><div class="toc-container-header">目录</div><ul><li><a href="#自定义分布式锁" rel="noopener nofollow">自定义分布式锁</a><ul><li><a href="#获取锁" rel="noopener nofollow">获取锁</a></li><li><a href="#释放锁" rel="noopener nofollow">释放锁</a></li><li><a href="#自动续期" rel="noopener nofollow">自动续期</a></li></ul></li><li><a href="#stackexchangeredis分布式锁" rel="noopener nofollow">StackExchange.Redis分布式锁</a><ul><li><a href="#获取锁-1" rel="noopener nofollow">获取锁</a></li><li><a href="#释放锁-1" rel="noopener nofollow">释放锁</a></li><li><a href="#自动续期-1" rel="noopener nofollow">自动续期</a></li></ul></li></ul></div><p></p>
+<h4 id="自定义分布式锁">自定义分布式锁</h4>
+<h5 id="获取锁">获取锁</h5>
+<p>比如一下一个场景，需要对订单号为 <strong>order-88888944010</strong>的订单进行扣款处理，因为后端是多节点的，防止出现用户重复点击导致扣款请求到不用的集群节点，所以需要同时只有一个节点处理该订单。</p>
+<pre><code>        public static async Task&lt;(bool Success, string LockValue)&gt; LockAsync(string cacheKey, int timeoutSeconds = 5)
+        {
+            var lockKey = GetLockKey(cacheKey);
+            var lockValue = Guid.NewGuid().ToString();
+            var timeoutMilliseconds = timeoutSeconds * 1000;
+            var expiration = TimeSpan.FromMilliseconds(timeoutMilliseconds);
+            bool flag = await _redisDb.StringSetAsync(lockKey, lockValue, expiration, When.NotExists);
+
+            return (flag, flag ? lockValue : string.Empty);
+        }
+</code></pre>
+<pre><code>        public static string GetLockKey(string cacheKey)
+        {
+            return $"MyApplication:locker:{cacheKey}";
+        }
+</code></pre>
+<blockquote>
+<p>上述代码是在请求时将订单号作为redis key的一部分存储到redis中，并且生成了一个随机的lockValue作为值。只有当redis中不存在该key的时候才能够成功设置，即为获取到该订单的分布式锁了。</p>
+</blockquote>
+<pre><code>
+            await LockAsync("order-88888944010",30); //获取锁，并且设置超时时间为30秒
+</code></pre>
+<h5 id="释放锁">释放锁</h5>
+<pre><code>        public static async Task&lt;bool&gt; UnLockAsync(string cacheKey, string lockValue)
+        {
+            var lockKey = GetLockKey(cacheKey);
+            var script = @"local invalue = @value
+                                    local currvalue = redis.call('get',@key)
+                                    if(invalue==currvalue) then redis.call('del',@key)
+                                        return 1
+                                    else
+                                        return 0
+                                    end";
+            var parameters = new { key = lockKey, value = lockValue };
+            var prepared = LuaScript.Prepare(script);
+            var result = (int)await _redisDb.ScriptEvaluateAsync(prepared, parameters);
+
+            return result == 1;
+        }
+</code></pre>
+<p>释放锁采用了lua脚本先判断lockValue是否是同一个处理节点发过来的删除请求，即判断加锁和释放锁是同一个来源。<br>
+用lua脚本而不是直接使用API执行删除的原因:</p>
+<blockquote>
+<p>1.A获取锁后因GC停顿或网络延迟导致锁过期，此时客户端B获取了锁。若A恢复后直接调用DEL，会错误删除B持有的锁。<br>
+2.脚本在Redis中单线程执行，确保GET和DEL之间不会被其他命令打断。</p>
+</blockquote>
+<h5 id="自动续期">自动续期</h5>
+<p>一些比较耗时的任务，可能在指定的超时时间内无法完成业务处理，需要存在自动续期的机制。</p>
+<pre><code>        /// &lt;summary&gt;
+        /// 自动续期
+        /// &lt;/summary&gt;
+        /// &lt;param name="redisDb"&gt;&lt;/param&gt;
+        /// &lt;param name="key"&gt;&lt;/param&gt;
+        /// &lt;param name="value"&gt;&lt;/param&gt;
+        /// &lt;param name="milliseconds"&gt;续期的时间&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public async static Task Delay(IDatabase redisDb, string key, string value, int milliseconds)
+        {
+            if (!AutoDelayHandler.Instance.ContainsKey(key))
+                return;
+
+            var script = @"local val = redis.call('GET', @key)
+                                    if val==@value then
+                                        redis.call('PEXPIRE', @key, @milliseconds)
+                                        return 1
+                                    end
+                                    return 0";
+            object parameters = new { key, value, milliseconds };
+            var prepared = LuaScript.Prepare(script);
+            var result = await redisDb.ScriptEvaluateAsync(prepared, parameters, CommandFlags.None);
+            if ((int)result == 0)
+            {
+                AutoDelayHandler.Instance.CloseTask(key);
+            }
+            return;
+        }
+</code></pre>
+<p>保存自动续期任务的处理器</p>
+<pre><code> public class AutoDelayHandler
+ {
+     private static readonly Lazy&lt;AutoDelayHandler&gt; lazy = new Lazy&lt;AutoDelayHandler&gt;(() =&gt; new AutoDelayHandler());
+     private static ConcurrentDictionary&lt;string, (Task, CancellationTokenSource)&gt; _tasks = new ConcurrentDictionary&lt;string, (Task, CancellationTokenSource)&gt;();
+
+     public static AutoDelayHandler Instance =&gt; lazy.Value;
+
+     /// &lt;summary&gt;
+     /// 任务令牌添加到集合中
+     /// &lt;/summary&gt;
+     /// &lt;param name="key"&gt;&lt;/param&gt;
+     /// &lt;param name="task"&gt;&lt;/param&gt;
+     /// &lt;returns&gt;&lt;/returns&gt;
+     public bool TryAdd(string key, Task task, CancellationTokenSource token)
+     {
+         if (_tasks.TryAdd(key, (task, token)))
+         {
+             task.Start();
+
+             return true;
+         }
+         else
+         {
+             return false;
+         }
+     }
+
+
+     public void CloseTask(string key)
+     {
+         if (_tasks.ContainsKey(key))
+         {
+             if (_tasks.TryRemove(key, out (Task, CancellationTokenSource) item))
+             {
+                 item.Item2?.Cancel();
+                 item.Item1?.Dispose();
+             }
+         }
+     }
+
+     public bool ContainsKey(string key)
+     {
+         return _tasks.ContainsKey(key);
+     }
+ }
+</code></pre>
+<p>在申请带有自动续期的分布式锁的完整代码</p>
+<pre><code>/// &lt;summary&gt;
+/// 获取锁
+/// &lt;/summary&gt;
+/// &lt;param name="cacheKey"&gt;&lt;/param&gt;
+/// &lt;param name="timeoutSeconds"&gt;超时时间&lt;/param&gt;
+/// &lt;param name="autoDelay"&gt;是否自动续期&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+public static async Task&lt;(bool Success, string LockValue)&gt; LockAsync(string cacheKey, int timeoutSeconds = 5, bool autoDelay = false)
+{
+    var lockKey = GetLockKey(cacheKey);
+    var lockValue = Guid.NewGuid().ToString();
+    var timeoutMilliseconds = timeoutSeconds * 1000;
+    var expiration = TimeSpan.FromMilliseconds(timeoutMilliseconds);
+    bool flag = await _redisDb.StringSetAsync(lockKey, lockValue, expiration, When.NotExists);
+    if (flag &amp;&amp; autoDelay)
+    {
+        //需要自动续期，创建后台任务
+        CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+        var autoDelaytask = new Task(async () =&gt;
+        {
+            while (!cancellationTokenSource.IsCancellationRequested)
+            {
+                await Task.Delay(timeoutMilliseconds / 2);
+                await Delay(lockKey, lockValue, timeoutMilliseconds);
+            }
+        }, cancellationTokenSource.Token);
+        var result = AutoDelayHandler.Instance.TryAdd(lockKey, autoDelaytask, cancellationTokenSource);
+
+        if (!result) 
+        {
+            autoDelaytask.Dispose();
+            await UnLockAsync(cacheKey, lockValue);
+            return (false, string.Empty);
+        }
+    }
+    return (flag, flag ? lockValue : string.Empty);
+}
+</code></pre>
+<blockquote>
+<p>Redis的过期时间精度约为1秒，且过期检查是周期性执行的（默认每秒10次）。选择TTL/2的间隔能：<br>
+确保在Redis下一次过期检查前完成续期。<br>
+兼容Redis的主从同步延迟（通常&lt;1秒）</p>
+</blockquote>
+<h4 id="stackexchangeredis分布式锁">StackExchange.Redis分布式锁</h4>
+<h5 id="获取锁-1">获取锁</h5>
+<pre><code>string lockKey = "order:88888944010:lock";
+string lockValue = Guid.NewGuid().ToString(); // 唯一标识锁持有者
+TimeSpan expiry = TimeSpan.FromSeconds(10);   // 锁自动过期时间
+// 尝试获取锁（原子操作）
+bool lockAcquired = db.LockTake(lockKey, lockValue, expiry);
+</code></pre>
+<h5 id="释放锁-1">释放锁</h5>
+<pre><code> bool released = await ReleaseLockAsync(db, lockKey, lockValue);
+</code></pre>
+<h5 id="自动续期-1">自动续期</h5>
+<p>同样需要自己实现</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.1406789913449074" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-04-27 10:58">2025-04-27 10:57</span>&nbsp;
+<a href="https://www.cnblogs.com/qwqwQAQ">BruceNeter</a>&nbsp;
+阅读(<span id="post_view_count">137</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18849019);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18849019', targetLink: 'https://www.cnblogs.com/qwqwQAQ/p/18849019', title: 'C# 使用StackExchange.Redis实现分布式锁的两种方式' })">举报</a>
+</div>
+        
