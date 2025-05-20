@@ -1,0 +1,154 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sunstrikes/p/18887861" title="发布于 2025-05-20 21:30">
+    <span role="heading" aria-level="2">SgLang代码细读-2.forward过程</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        主要记录了sglang 从scheduleBatch开始如何进行forward推理, 通过采样得到最后输出的token过程.
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="sglang代码细读-2forward过程">SgLang代码细读-2.forward过程</h1>
+<h2 id="总览">总览</h2>
+<p>Forward的主要过程围绕着 <code>run_batch-&gt;TPModelWorker-&gt;ModelRunner-&gt;Model-&gt;layer-&gt;AttentionBackend-&gt;process_batch_result</code> 这个链条展开</p>
+<img src="https://img2023.cnblogs.com/blog/1439743/202505/1439743-20250520212338415-2043846641.png" alt="image-20250519160525797" style="zoom: 50%">
+<p>Prefill由于输入不定长, 无法开启cudagraph, 而decode由于输入输出是one-by-one的模式, 且能通过merge_batch的方式组装batch, 因此可以通过cudaGraph来加速. 而且P和D对与kvCache的处理逻辑也不同, 在看的时候重点关注这两部分, 看的时候model以deepseek,MLA,fa3为主.</p>
+<p><code>ScheduleBatch -&gt; ModelWorkerBatch -&gt; ForwardBatch</code> 这三个的关系:</p>
+<ol>
+<li><code>ScheduleBatch</code>: 最上层的batch结构, 和scheduler交互, 大多数在CPU上的数据, 比如: 当前batch的类型，模型参数，sampling参数, 请求级信息, kvcache的索引数据等</li>
+<li><code>ModelWorkerBatch</code>: <code>ScheduleBatch</code>的子集, 只包含和forward相关的data</li>
+<li><code>ForwardBatch</code>: 最底层结构, 主要包含forward所需的GPU tensor相关data</li>
+</ol>
+<h2 id="共同forward逻辑">共同forward逻辑</h2>
+<h3 id="1batchget_model_worker_batch">1.batch.get_model_worker_batch()</h3>
+<p>seq_lens从GPU-&gt;CPU / 维护bid(batch id) / 从ScheduleBatch构建ModelWorkerBatch</p>
+<h3 id="2tp_workerforward_batch_generationmodel_worker_batch">2.tp_worker.forward_batch_generation(model_worker_batch)</h3>
+<ul>
+<li>更新sampling_info: decode采样所需的参数和相关惩罚系数, 如temperatures, top_p, top_k等.</li>
+<li>overlap状态下: 把ModelWorkerBatch塞到input_queue里, input_queue是一个独立的线程不断loop<code>forward_thread_func</code>, 从input_queue里循环pop后进行前向计算, 计算完后同步传入的event.</li>
+</ul>
+<p>关闭overlap状态的逻辑:</p>
+<ol>
+<li>ForwardBatch.init_new</li>
+<li>如果开启了PP, 不是PP第一层的节点需要先经过通信拿到上一层PP的输出, 具体步骤: <code>pp_group.recv_tensor_dict</code>, 如果TP&gt;1, 那么先要把同TPRank的上一层节点进行P2P通信, 拿到分片结果, 然后再把同一个TPgroup的激活allGather到TP_Rank=0的节点上, 最后以这个作为forward输入</li>
+<li><code>self.model_runner.forward</code>: 根据forwardBatch类型(extend/decode/idle), 判断接下来要走的forward逻辑, 而forward所使用的attn_backend是通过server_args在启动时的入参来指定的</li>
+</ol>
+<h2 id="prefill-forward_extend">Prefill (forward_extend)</h2>
+<ol>
+<li><code>attn_backend.init_forward_metadata</code>: 因为每个layer存在相同的数据, 比如<code>max_seq_len</code>, 如果在forward之前就算好就减少了layer-1次的重复计算. 所以把layer间的共有数据定义为metadata.</li>
+<li><code>self.model.forward</code>: 根据modelConfig实例化的model. 通过<code>model-path</code>这个参数进行的模型加载, 组网逻辑在<code>sglang/python/sglang/srt/models</code>下面. 模型部分的优化与cache部分的读写和通信, 在下一篇blog中细说</li>
+</ol>
+<h2 id="decode-selfcuda_graph_runnerreplay">Decode (self.cuda_graph_runner.replay)</h2>
+<h3 id="cudagraphrunner">CUDAGraphRunner</h3>
+<h4 id="initialize">initialize</h4>
+<p>在ModelRunner初始化的时候, 一起初始化的init_cuda_graphs, 主要是几个步骤:</p>
+<ol>
+<li><code>get_batch_sizes_to_capture</code>: 根据<code>req_to_token_pool.size</code>, <code>server_args.cuda_graph_max_bs</code>, <code>server_args.torch_compile_max_bs</code> 这几个参数或变量, 确定要捕获的最大batch_size, 确保显存不会超限.</li>
+<li><code>attn_backend.init_cuda_graph_state</code>: 根据确定的bs列表拿到最大的bs, 根据maxbs确定attn中使用的中间激活分配的固定长度</li>
+<li>根据max_bs/max_num_token, 分配输入显存空间, 同时打开torch.compile转静态图.</li>
+<li>进行图capture, 对每个可用的bs跑一次forward(<code>capture_one_batch_size</code>), 使能够捕获到图.</li>
+</ol>
+<h4 id="执行">执行</h4>
+<p><code>cuda_graph_runner.replay</code>, 根据当前forward_batch的batch_size来确定跑哪张图, 然后进入cudaGraph的replay</p>
+<h3 id="采样与惩罚">采样与惩罚</h3>
+<p><code>model_runner.sample</code></p>
+<h4 id="preprocess_logits">preprocess_logits</h4>
+<ol>
+<li>enable_overlap时, 需要先等待sampling_info_done这个event跑完.</li>
+<li><code>apply_logits_bias</code>:
+<ul>
+<li>如果存在惩罚规则时, <code>penalizer_orchestrator.apply(logits)</code>, 对对应的logits进行惩罚.</li>
+<li>当请求对输出有格式要求时, 比如json. 需要通过grammar-&gt;vocab_mask来规范化输出</li>
+</ul>
+</li>
+</ol>
+<h4 id="惩罚规则">惩罚规则</h4>
+<p>目前有3种规则:</p>
+<ul>
+<li>BatchedMinNewTokensPenalizer: 在每个请求生成的 token 数未达到min_new_tokens之前，强制禁止生成<eos>，从而保证每个请求至少生成指定数量的新 token</eos></li>
+<li>BatchedPresencePenalizer: 在每个请求的输出序列中，统计每个 token 已经出现的次数，并根据frequency_penalty，对这些 token 的 logits 进行惩罚（减去一定分数），从而降低它们再次被采样的概率。这样可以有效减少重复 token 的生成，提高输出的多样性</li>
+<li>BatchedPresencePenalizer: 在每个请求的输出序列中，如果某个 token 已经出现过一次，就对该 token 的 logits 施加一次惩罚（减去 presence_penalty 分数），从而降低它再次被采样的概率</li>
+</ul>
+<h3 id="mtpmulti-token-prediction">MTP（Multi-Token Prediction）</h3>
+<p>单次预测多个词用于加速decode阶段的预测, 主要原理如图, 主要分成3步:</p>
+<img src="https://img2023.cnblogs.com/blog/1439743/202505/1439743-20250520212326375-962196168.png" alt="image-20250519211713144" style="zoom: 50%">
+<ol>
+<li>使用小模型(draft)用于推理出多个token, in the bus即为结果.</li>
+<li>把小模型预估出的3个token分别组成batchsize=3的一个batch进行并行推理</li>
+<li>在batch内与之前的多个token一致的最长前缀记录下来, 在这里in the 一致, 那么就可以直接accept后输出. 这样就能减少对main模型的one-by-one串行调用, 加速推理.</li>
+<li>如果想进一步加速, 那么在verify的时候, 可以也同步跑小模型进行推理, 把最长前缀的那个batch_index推理出的draft token作为下一次verify的输入. 流程就变成了predict-&gt;verify-&gt;accept-&gt;verify-&gt;accept-&gt;...</li>
+</ol>
+<p>在deepseek中的MTP:</p>
+<img src="https://img2023.cnblogs.com/blog/1439743/202505/1439743-20250520212321986-2123592137.png" alt="image-20250519213421987" style="zoom: 50%">
+<p>通过样本错位的方式进行训练, 通过N次样本错位就能训出用于nextN预估的N个draft模型.</p>
+<p><code>forward_batch_speculative_generation</code>  (python/sglang/srt/speculative/eagle_worker.py)</p>
+<h4 id="draft">draft</h4>
+<ol>
+<li>
+<p><code>cumulate_output_tokens</code>: 计算token惩罚项</p>
+</li>
+<li>
+<p><code>alloc_paged_token_slots_extend</code>: 为next_k token在kv缓存池中申请空间, 如果不够则从tree_cache中驱逐(evict), backup_state的作用是备份当前的allocator状态, 如果后续出现显存不足之类的问题, 可以方便的回滚</p>
+</li>
+<li>
+<p><code>assign_draft_cache_locs</code>: 把<code>out_cache_locs</code>里的数据copy到kv缓存池里用于后续的forward</p>
+</li>
+<li>
+<p><code>draft_forward</code>: 也可以采用cudaGraph的运行模式, 这里以非cudaGraph模式看逻辑, for循环K次</p>
+<ul>
+<li><code>select_top_k_tokens</code>: 把上一步算出的topk候选token中,和当前top路径相乘, 拿到联合概率最高的k条路径.然后更新input_ids, hidden_states, scores(选中路径的分数)等</li>
+<li>构造这次循环draft_model.forward需要用到的forwardBatch, 进入forward拿到<code>logics_output</code></li>
+<li><code>logics_output</code>经过softmax, 获取到各个输出的token和其对应的概率, 选出topk用于下一次循环.</li>
+</ul>
+<p>draft-tree:</p>
+</li>
+</ol>
+<img src="https://img2023.cnblogs.com/blog/1439743/202505/1439743-20250520212316254-1861615781.png" alt="image-20250520202929537" style="zoom: 50%">
+<h4 id="verify">verify</h4>
+<ol>
+<li>
+<p><code>spec_info.prepare_for_verify</code>: 提前分配kv缓存空间</p>
+</li>
+<li>
+<p><code>target_worker.forward_batch_generation</code>: 在正常模型推理之前, 把spec_info中的position替换到forward_batch里, 另外再draft的时候就通过seq_lens_sum重新组织了batch的排布. 便于并行验证.</p>
+</li>
+<li>
+<p><code>spec_info.verify</code>-&gt;<code>verify_tree_greedy</code>: 当采样策略设置为贪心时, 通过贪心策略在生成的draft树上找到最长能够接受的目标token路径.</p>
+<p>否则通过正常采样逻辑从树中获取路径</p>
+</li>
+<li>
+<p>判断batch内有木有直接推理到<eos>的输出, 如果有完成的请求进行batch 动态收缩，只保留未完成请求，已完成请求从 batch 中剔除，后续只推理未完成部分, 返回加上接受token长度的verify结果</eos></p>
+</li>
+<li>
+<p>如果verify之后的verifyied_id不为空, 还需要继续进行验证<code>forward_draft_extend_after_decode</code></p>
+</li>
+</ol>
+<h2 id="参考">参考:</h2>
+<p>sglang blog: <a href="https://lmsys.org/blog/2025-05-05-large-scale-ep/" target="_blank" rel="noopener nofollow">https://lmsys.org/blog/2025-05-05-large-scale-ep/</a></p>
+<p>sglang源码学习笔记: <a href="https://zhuanlan.zhihu.com/p/18285771025" target="_blank" rel="noopener nofollow">https://zhuanlan.zhihu.com/p/18285771025</a></p>
+<p>decode采样策略: <a href="https://zhuanlan.zhihu.com/p/29031912458" target="_blank" rel="noopener nofollow">https://zhuanlan.zhihu.com/p/29031912458</a></p>
+<p>sharedExpert与普通Expert融合: <a href="https://zhuanlan.zhihu.com/p/1890914228480767683" target="_blank" rel="noopener nofollow">https://zhuanlan.zhihu.com/p/1890914228480767683</a></p>
+<p>sglang投机推理: <a href="https://www.zhihu.com/search?type=content&amp;q=sglang%20nextn" target="_blank" rel="noopener nofollow">https://www.zhihu.com/search?type=content&amp;q=sglang nextn</a></p>
+<p>DeepSeek MTP解析: <a href="https://zhuanlan.zhihu.com/p/18056041194" target="_blank" rel="noopener nofollow">https://zhuanlan.zhihu.com/p/18056041194</a></p>
+<p>投机算法EAGLE3: <a href="https://zhuanlan.zhihu.com/p/29007609465" target="_blank" rel="noopener nofollow">https://zhuanlan.zhihu.com/p/29007609465</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.3574452181805556" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-05-20 21:40">2025-05-20 21:30</span>&nbsp;
+<a href="https://www.cnblogs.com/sunstrikes">SunStriKE</a>&nbsp;
+阅读(<span id="post_view_count">7</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18887861);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18887861', targetLink: 'https://www.cnblogs.com/sunstrikes/p/18887861', title: 'SgLang代码细读-2.forward过程' })">举报</a>
+</div>
+        
