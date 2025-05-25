@@ -1,0 +1,264 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/GuZhenYin/p/18879790" title="发布于 2025-05-16 12:00">
+    <span role="heading" aria-level="2">记一次ASP.NET CORE线上内存溢出问题与dotnet-dump的排查方法</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<div style="text-align: center; background-color: rgba(136, 136, 136, 1)"><span style="font-size: 24px; line-height: 40px; color: rgba(255, 255, 255, 1)">前言</span></div>
+<p>这周系统更新了一个版本,部署到线上.</p>
+<p>客户反馈整个系统全部都卡顿,随即我们上服务器检查</p>
+<p>发现整个服务器内存竟然达到了20-30G的占用..如图:</p>
+<p><img src="https://img2024.cnblogs.com/blog/653851/202505/653851-20250516081003138-1889588337.png" alt="" loading="lazy"></p>
+<p>其中有一个订单服务,独自占用13-18G内存,</p>
+<p>当它重启以后,内存会降低下来一段时间,但过不了多久 就又会增长上去</p>
+<p>高度怀疑出现了内存溢出的情况,由于是线上服务器而且是离线内网.</p>
+<p>项目又都运行在docker容器中,容器为了最小化,<strong>采用了极简的系统,几乎任何常见命令都没有.</strong></p>
+<p>所以考虑采用<strong>挂载额外辅助容器</strong>的形式进行调试.</p>
+<div style="text-align: center; background-color: rgba(136, 136, 136, 1)"><span style="font-size: 24px; line-height: 40px; color: rgba(255, 255, 255, 1)">正文</span></div>
+<p>&nbsp;</p>
+<h2>1.创建调试用的辅助容器</h2>
+<p>这个简单,我们直接创建DockerFile如下:</p>
+<div class="cnblogs_code">
+<pre># 使用 .NET <span style="color: rgba(128, 0, 128, 1)">5</span><span style="color: rgba(0, 0, 0, 1)"> SDK 作为基础镜像
+FROM mcr.microsoft.com</span>/dotnet/sdk:<span style="color: rgba(128, 0, 128, 1)">5.0</span><span style="color: rgba(0, 0, 0, 1)">
+
+# 安装 dotnet</span>-dump 、 dotnet-stack 、dotnet-counters、dotnet-trace的旧版本（兼容 .NET <span style="color: rgba(128, 0, 128, 1)">5</span><span style="color: rgba(0, 0, 0, 1)">）
+RUN dotnet tool install </span>-g dotnet-dump --version <span style="color: rgba(128, 0, 128, 1)">5.0</span>.<span style="color: rgba(128, 0, 128, 1)">220101</span><span style="color: rgba(0, 0, 0, 1)"> \
+ </span>&amp;&amp; dotnet tool install -g dotnet-stack --version <span style="color: rgba(128, 0, 128, 1)">1.0</span>.<span style="color: rgba(128, 0, 128, 1)">130701</span><span style="color: rgba(0, 0, 0, 1)"> \
+</span>&amp;&amp; dotnet tool install -g dotnet-counters --version <span style="color: rgba(128, 0, 128, 1)">5.0</span>.<span style="color: rgba(128, 0, 128, 1)">251802</span><span style="color: rgba(0, 0, 0, 1)"> \
+</span>&amp;&amp; dotnet tool install -g dotnet-trace --version <span style="color: rgba(128, 0, 128, 1)">5.0</span>.<span style="color: rgba(128, 0, 128, 1)">251802</span><span style="color: rgba(0, 0, 0, 1)"> \
+ </span>&amp;&amp; apt-<span style="color: rgba(0, 0, 255, 1)">get</span><span style="color: rgba(0, 0, 0, 1)"> update \
+ </span>&amp;&amp; apt-<span style="color: rgba(0, 0, 255, 1)">get</span> install -<span style="color: rgba(0, 0, 0, 1)">y unzip procps \
+ </span>&amp;&amp; echo <span style="color: rgba(128, 0, 0, 1)">'</span><span style="color: rgba(128, 0, 0, 1)">export PATH="$PATH:/root/.dotnet/tools"</span><span style="color: rgba(128, 0, 0, 1)">'</span> &gt;&gt; /root/<span style="color: rgba(0, 0, 0, 1)">.bashrc
+
+#设定全局工具环境变量
+ENV PATH</span>=<span style="color: rgba(128, 0, 0, 1)">"</span><span style="color: rgba(128, 0, 0, 1)">${PATH}:/root/.dotnet/tools</span><span style="color: rgba(128, 0, 0, 1)">"</span><span style="color: rgba(0, 0, 0, 1)">
+
+# 默认启动 bash 以方便交互
+CMD [</span><span style="color: rgba(128, 0, 0, 1)">"</span><span style="color: rgba(128, 0, 0, 1)">/bin/bash</span><span style="color: rgba(128, 0, 0, 1)">"</span>]</pre>
+</div>
+<p>这里我们使用当前系统RunTime对应版本的SDK作为基础镜像.</p>
+<p>然后安装我们调试程序信息需要的工具:dotnet-dump 、 dotnet-stack 、dotnet-counters、dotnet-trace</p>
+<p>先介绍一下这些工具.</p>
+<p><strong>dotnet-dump</strong>:可以收集和分析 Windows、Linux 和 macOS dump的信息,可以运行 SOS 命令来分析崩溃和垃圾回收器 (GC)。</p>
+<p><strong>dotnet-stack</strong>:可以收集&nbsp;.NET 进程中的所有线程捕获和打印托管堆栈。</p>
+<p><strong>dotnet-counters</strong>:是一个性能监视工具，可以临时监视.NET程序的运行状况和做一些初级的性能调查</p>
+<p><strong>dotnet-trace</strong>:在不使用本机探查器的情况下对正在运行的.NET Core 进程进行跟踪</p>
+<h2>2.将辅助调试容器附加到应用容器运行</h2>
+<p>首先我们需要重新run一个应用容器,并给它特权模式和系统级的调试权限,大概命令如下:</p>
+<div class="cnblogs_code">
+<pre>docker run -d --name myapp --privileged=true --cap-add=SYS_PTRACE -e ASPNETCORE_ENVIRONMENT=dev -e COMPlus_EnableDiagnostics=<span style="color: rgba(128, 0, 128, 1)">1</span> --volume /home/tmp:/tmp order-test:<span style="color: rgba(128, 0, 128, 1)">5.0</span></pre>
+</div>
+<p>重点是<strong>privileged</strong>参数和<strong>cap-add</strong>参数,还有应用<strong>系统的tmp文件夹需要映射到宿主机</strong></p>
+<p>然后我们运行我们的调试容器并附加到应用容器</p>
+<div class="cnblogs_code">
+<pre>docker run -it --rm  --cap-add=SYS_PTRACE --pid=container:myapp --privileged=true --volume /home/tmp:/tmp dotnet-debug-tools:<span style="color: rgba(128, 0, 128, 1)">5.0</span></pre>
+</div>
+<p>同样,它也需要<strong>privileged</strong>参数和<strong>cap-add</strong>参数,tmp临时文件也需要映射在宿主机和应用容器同样的目录下</p>
+<p>注意--pid=container:myapp 中的myapp 是上面<strong>应用容器的名称.</strong></p>
+<p>然后,我们在调试容器直接运行命令:</p>
+<div class="cnblogs_code">
+<pre>ps aux</pre>
+</div>
+<p>应该就能看到应用服务中的dotnet的进程了.因为在容器中运行,所以一般dotnet的PID是1,如图:</p>
+<p><img src="https://img2024.cnblogs.com/blog/653851/202505/653851-20250516101049122-858461876.png" alt="" loading="lazy"></p>
+<p>&nbsp;</p>
+<h2>3.分析应用容器内dotnet进程的情况.</h2>
+<p>我们可以先使用dotnet-counters进行监控.</p>
+<p>命令如下,其中-p是dotnet的进程编号:</p>
+<div class="cnblogs_code">
+<pre>dotnet-counters monitor -p <span style="color: rgba(128, 0, 128, 1)">1</span></pre>
+</div>
+<p>能得到如下结果:</p>
+<div class="cnblogs_code">
+<pre>% Time <span style="color: rgba(0, 0, 255, 1)">in</span> GC since last GC (%)                                 <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    Allocation Rate (B </span>/ <span style="color: rgba(128, 0, 128, 1)">2</span> sec)                               <span style="color: rgba(128, 0, 128, 1)">98</span>,<span style="color: rgba(128, 0, 128, 1)">016</span><span style="color: rgba(0, 0, 0, 1)">
+    CPU Usage (</span>%)                                                  <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    Exception Count (Count </span>/ <span style="color: rgba(128, 0, 128, 1)">2</span> sec)                                <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    GC Fragmentation (</span>%)                                           <span style="color: rgba(128, 0, 128, 1)">8.189</span><span style="color: rgba(0, 0, 0, 1)">
+    GC Heap Size (MB)                                         </span><span style="color: rgba(128, 0, 128, 1)">11</span>,<span style="color: rgba(128, 0, 128, 1)">419</span><span style="color: rgba(0, 0, 0, 1)">
+    Gen </span><span style="color: rgba(128, 0, 128, 1)">0</span> GC Count (Count / <span style="color: rgba(128, 0, 128, 1)">2</span> sec)                                 <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    Gen </span><span style="color: rgba(128, 0, 128, 1)">0</span> Size (B)                                               <span style="color: rgba(128, 0, 128, 1)">192</span><span style="color: rgba(0, 0, 0, 1)">
+    Gen </span><span style="color: rgba(128, 0, 128, 1)">1</span> GC Count (Count / <span style="color: rgba(128, 0, 128, 1)">2</span> sec)                                 <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    Gen </span><span style="color: rgba(128, 0, 128, 1)">1</span> Size (B)                                        <span style="color: rgba(128, 0, 128, 1)">36</span>,<span style="color: rgba(128, 0, 128, 1)">742</span>,<span style="color: rgba(128, 0, 128, 1)">336</span><span style="color: rgba(0, 0, 0, 1)">
+    Gen </span><span style="color: rgba(128, 0, 128, 1)">2</span> GC Count (Count / <span style="color: rgba(128, 0, 128, 1)">2</span> sec)                                 <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    Gen </span><span style="color: rgba(128, 0, 128, 1)">2</span> Size (B)                                            <span style="color: rgba(128, 0, 128, 1)">8.8066e+09</span><span style="color: rgba(0, 0, 0, 1)">
+    IL Bytes Jitted (B)                                    </span><span style="color: rgba(128, 0, 128, 1)">7</span>,<span style="color: rgba(128, 0, 128, 1)">248</span>,<span style="color: rgba(128, 0, 128, 1)">623</span><span style="color: rgba(0, 0, 0, 1)">
+    LOH Size (B)                                              </span><span style="color: rgba(128, 0, 128, 1)">3.3414e+09</span><span style="color: rgba(0, 0, 0, 1)">
+    Monitor Lock Contention Count (Count </span>/ <span style="color: rgba(128, 0, 128, 1)">2</span> sec)                  <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    Number of Active Timers                                      </span><span style="color: rgba(128, 0, 128, 1)">209</span><span style="color: rgba(0, 0, 0, 1)">
+    Number of Assemblies Loaded                                  </span><span style="color: rgba(128, 0, 128, 1)">426</span><span style="color: rgba(0, 0, 0, 1)">
+    Number of Methods Jitted                                 </span><span style="color: rgba(128, 0, 128, 1)">135</span>,<span style="color: rgba(128, 0, 128, 1)">063</span><span style="color: rgba(0, 0, 0, 1)">
+    POH (Pinned Object Heap) Size (B)                      </span><span style="color: rgba(128, 0, 128, 1)">1</span>,<span style="color: rgba(128, 0, 128, 1)">299</span>,<span style="color: rgba(128, 0, 128, 1)">832</span><span style="color: rgba(0, 0, 0, 1)">
+    ThreadPool Completed Work Item Count (Count </span>/ <span style="color: rgba(128, 0, 128, 1)">2</span> sec)           <span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    ThreadPool Queue Length                                        </span><span style="color: rgba(128, 0, 128, 1)">0</span><span style="color: rgba(0, 0, 0, 1)">
+    ThreadPool Thread Count                                       </span><span style="color: rgba(128, 0, 128, 1)">12</span><span style="color: rgba(0, 0, 0, 1)">
+    Working Set (MB)                                          </span><span style="color: rgba(128, 0, 128, 1)">14</span>,<span style="color: rgba(128, 0, 128, 1)">910</span></pre>
+</div>
+<p>我们可以直接借助AI分析这个性能指标如下:</p>
+<table style="height: 505px; width: 1188px">
+<thead>
+<tr><th>指标</th><th>当前值</th><th>分析建议</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CPU Usage (%)</strong></td>
+<td><code>0</code></td>
+<td>CPU 几乎未被使用，说明当前应用 <strong>处于空闲或阻塞状态</strong>。如果此时预期它应该在处理请求，说明可能卡在 I/O、锁、数据库等等待资源上。</td>
+</tr>
+<tr>
+<td><strong>GC Heap Size (MB)</strong></td>
+<td><code>11,419 MB</code></td>
+<td>堆内存非常大（约 <strong>11GB</strong>），说明分配对象多或存在内存泄漏风险。建议配合 dump 分析对象分布。</td>
+</tr>
+<tr>
+<td><strong>GC Fragmentation (%)</strong></td>
+<td><code>8.189%</code></td>
+<td>碎片率较低，尚可接受。通常低于 20% 问题不大。</td>
+</tr>
+<tr>
+<td><strong>LOH Size (B)</strong></td>
+<td><code>~3.34 GB</code></td>
+<td>Large Object Heap（LOH）占用了非常大的空间。意味着有很多大对象（如数组、字符串、缓存等）未被及时回收，或持续增长。需要进一步 dump 分析。</td>
+</tr>
+<tr>
+<td><strong>Gen 2 Size (B)</strong></td>
+<td><code>~8.8 GB</code></td>
+<td>Gen2 表示长时间存活对象。此值非常高，说明内存中存在大量老对象未被释放，<strong>极可能存在内存泄漏</strong>。</td>
+</tr>
+<tr>
+<td><strong>Gen 0/1 GC Count</strong></td>
+<td><code>0</code></td>
+<td>说明当前没有发生 GC，或者是刚启动。这种情况下内存持续增长会导致最终触发 GC 或 OOM。</td>
+</tr>
+<tr>
+<td><strong>% Time in GC since last GC</strong></td>
+<td><code>0%</code></td>
+<td>目前没有 GC 时间消耗，结合上面 GC Count 是 0，一致。</td>
+</tr>
+<tr>
+<td><strong>Working Set (MB)</strong></td>
+<td><code>14,910 MB</code></td>
+<td>进程实际占用物理内存约 14GB，结合堆大小与 LOH/Gen2 数值合理，但这也是很大的内存占用，<strong>需要关注增长趋势</strong>。</td>
+</tr>
+<tr>
+<td><strong>Allocation Rate</strong></td>
+<td><code>98 KB / 2 sec</code></td>
+<td>内存分配速率很低（接近空闲），说明当前没有明显的内存增长。</td>
+</tr>
+<tr>
+<td><strong>ThreadPool Thread Count</strong></td>
+<td><code>12</code></td>
+<td>线程池线程数正常范围，无需担心。</td>
+</tr>
+<tr>
+<td><strong>ThreadPool Queue Length</strong></td>
+<td><code>0</code></td>
+<td>没有待处理任务，说明任务执行速度没有瓶颈。</td>
+</tr>
+<tr>
+<td><strong>Exception Count</strong></td>
+<td><code>0</code></td>
+<td>无异常抛出，良好。</td>
+</tr>
+<tr>
+<td><strong>Monitor Lock Contention Count</strong></td>
+<td><code>0</code></td>
+<td>没有锁争用，说明线程间竞争不激烈。</td>
+</tr>
+</tbody>
+</table>
+<p>&nbsp;</p>
+<p>根据AI的分析报告,我们可以得知:</p>
+<p><strong>GC Heap Size (MB)</strong> 堆内存极大达到了11G</p>
+<p><strong>LOH Size (B)</strong>大对象指标也很大,有3G的大对象</p>
+<p><strong>Gen2 </strong>长期活动的对象很多,占用了8G</p>
+<p>这样我们基本就可以断定是在应用中出现了内存泄漏的情况.</p>
+<p>&nbsp;</p>
+<p>也不用额外在看别的信息了. 我们直接使用<strong>dotnet-dump 抓取内存快照</strong>进行分析,抓取命令如下:</p>
+<div class="cnblogs_code">
+<pre>dotnet-dump collect -p <span style="color: rgba(128, 0, 128, 1)">1</span></pre>
+</div>
+<p>我们会得到如下结果:</p>
+<div class="cnblogs_code">
+<pre>Writing minidump with heap to ./<span style="color: rgba(0, 0, 0, 1)">core_20250514_030614
+Complete</span></pre>
+</div>
+<p>由于内存快照比较大,复制回来分析..难度比较高.我们可以直接继续利用dotnet-dump analyze 在线上分析</p>
+<p>执行命令如下:</p>
+<div class="cnblogs_code">
+<pre>dotnet-dump analyze core_20250514_030614</pre>
+</div>
+<p>然后我们就可以使用sos命令进行分析了.</p>
+<p>既然是内存泄漏,我们直接查看托管堆里面的到底是啥情况,命令如下:</p>
+<div class="cnblogs_code">
+<pre>dumpheap -<span class="hljs-built_in">stat</span></pre>
+</div>
+<p>正常是按从小到大排序的..所以很尬,我们划到最下面,看到如下结果:</p>
+<p><img src="https://img2024.cnblogs.com/blog/653851/202505/653851-20250516111349823-486551890.png" alt="" loading="lazy"></p>
+<p>&nbsp;由于我比较清楚这个代码的情况,直接发现了一个很明显的问题,</p>
+<p>Order.OperApply.ApplyVoucherDetail&nbsp; 只是一个业务实体而已,但是在堆里面有<span style="font-size: 18px"><strong>29W</strong></span>个对象,</p>
+<p>明显是很不合理的.</p>
+<p>我们直接分析它.可以使用dumpheap -mt 获取它的所有实列地址.</p>
+<div class="cnblogs_code">
+<pre>dumpheap -mt 00007f117f67e590</pre>
+</div>
+<p>可以得到如下结果:</p>
+<p><img src="https://img2024.cnblogs.com/blog/653851/202505/653851-20250516111903405-1288286457.png" alt="" loading="lazy"></p>
+<p>&nbsp;我们选择最后一个Adderss寻找对象的根方法.命令如下:</p>
+<div class="cnblogs_code">
+<pre>gcroot 00007f0ca9b55818</pre>
+</div>
+<p>可以看到如下代码内容(由于太多,我只贴出来有用的):</p>
+<div class="cnblogs_code">
+<pre>-&gt;<span style="color: rgba(0, 0, 0, 1)">  00007F0E643FB770 RabbitMQ.Client.Impl.AsyncConsumerWorkService
+</span>-&gt;  00007F0DA4D0BBB8 System.Runtime.CompilerServices.AsyncTaskMethodBuilder`<span style="color: rgba(128, 0, 128, 1)">1</span>+AsyncStateMachineBox`<span style="color: rgba(128, 0, 128, 1)">1</span>[[System.Threading.Tasks.VoidTaskResult, System.Private.CoreLib],[StockManage.Handler.ProductInOutStockStatDistributedHandler+&lt;HandleEventAsync&gt;<span style="color: rgba(0, 0, 0, 1)">d__6, StockManage.Application]]
+</span>-&gt;  00007F0AFCCE9020 System.Collections.Generic.Dictionary`<span style="color: rgba(128, 0, 128, 1)">2</span>+<span style="color: rgba(0, 0, 0, 1)">Entry[[System.Object, System.Private.CoreLib],[Microsoft.EntityFrameworkCore.ChangeTracking.Internal.InternalEntityEntry, Microsoft.EntityFrameworkCore]][]
+</span>-&gt;<span style="color: rgba(0, 0, 0, 1)">  00007F1035A778A0 Order.OperApply.ApplyVoucher            </span></pre>
+</div>
+<p>这四条,我们就可以看出来,是RabbitMQ的消息队列,在ProductInOutStockStatDistributedHandler方法,进行消费的时候</p>
+<p>会通过EF CORE 创建这个ApplyVoucher的实例,接下来,我们就需要查看这个ProductInOutStockStatDistributedHandler,到底做了什么.</p>
+<h2>4.排查代码</h2>
+<p>直接去查看这个方法的代码,发现竟然没有任何一处使用了ApplyVoucher实体.</p>
+<p>所以,我们直接运行本地调试,发现在这个方法<strong>结束后</strong>会去查询ApplyVoucher表.</p>
+<p>分析代码后,我们发现,由于我们使用的是ABP的框架,在方法结束后,<strong>会自动写入审计日志</strong>,最后才会结束整个调用.</p>
+<p>遂调查审计日志模块,发现有小伙伴在审计日志中对ABP的<strong>AuditLogInfo</strong>对象进行了序列化操作.</p>
+<p>查询ABP源码发现,<strong>AuditLogInfo</strong>的<strong>EntityChanges</strong>中竟然储存了<strong>Microsoft.EntityFrameworkCore.ChangeTracking.EntityEntry</strong>对象</p>
+<p>而<strong>EntityEntry</strong>对象又包含了整个<strong>DBContext</strong>上下文..然而我们的<strong>DBContext</strong> 又开启了<strong>懒加载</strong>的功能</p>
+<p>所以当它被序列化的时候...等于在<strong>序列化整个数据库</strong>..(这里省略一百个C...)</p>
+<p>赶紧屏蔽这段代码,并更新到线上. 问题瞬间解决了..</p>
+<h2>5.深入求证.</h2>
+<p>解决问题后,还是比较好奇,有没有同样使用ABP的兄弟遇见相关问题,遂去查询abp源码仓库..</p>
+<p>竟然发现在Extracting a Module as a Microservice的相关说明里.</p>
+<p>看到了这一段...</p>
+<p><img src="https://img2024.cnblogs.com/blog/653851/202505/653851-20250516115649667-1719917290.png" alt="" loading="lazy"></p>
+<p>而且ABP框架还特意创建了一个IAuditLogInfoToAuditLogConverter来转换AuditLogInfo对象..方便后面进行序列化和存储..</p>
+<p>&nbsp;</p>
+<div style="text-align: center; background-color: rgba(136, 136, 136, 1)"><span style="font-size: 24px; line-height: 40px; color: rgba(255, 255, 255, 1)">后记</span></div>
+<p>&nbsp;</p>
+<p>这一次分析线上问题的过程,还是比较有参考性的,所以记录一下.也希望对各位兄弟们有帮助.觉得OK的可以点个推荐~~.3Q~</p>
+</div>
+<div id="MySignature" role="contentinfo">
+    作者：顾振印
+出处：http://www.cnblogs.com/GuZhenYin/
+如果您觉得阅读本文对您有帮助，请点一下“推荐”按钮，您的“推荐”将是我最大的写作动力！本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须保留此段声明，且在文章页面
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="9.158762403086806" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-05-16 14:26">2025-05-16 12:00</span>&nbsp;
+<a href="https://www.cnblogs.com/GuZhenYin">GuZhenYin</a>&nbsp;
+阅读(<span id="post_view_count">1602</span>)&nbsp;
+评论(<span id="post_comment_count">7</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18879790);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18879790', targetLink: 'https://www.cnblogs.com/GuZhenYin/p/18879790', title: '记一次ASP.NET CORE线上内存溢出问题与dotnet-dump的排查方法' })">举报</a>
+</div>
+        
