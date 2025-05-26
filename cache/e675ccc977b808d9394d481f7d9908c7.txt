@@ -1,0 +1,423 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/mjunz/p/18896319" title="发布于 2025-05-26 08:58">
+    <span role="heading" aria-level="2">Disruptor—4.与Netty的简单应用</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p data-track="4" data-pm-slice="0 0 []"><strong>大纲</strong></p>
+<p data-track="5"><strong>1.服务端代码最佳实践</strong></p>
+<p data-track="6"><strong>2.客户端代码最佳实践</strong></p>
+<p data-track="7"><strong>3.Netty的高性能核心问题分析</strong></p>
+<p data-track="8"><strong>4.基于Disruptor异步化处理Netty的长链接业务</strong></p>
+<p data-track="9"><strong>5.Disruptor核心池化封装实现</strong></p>
+<p data-track="10"><strong>6.实现接入百万长链接</strong></p>
+<p data-track="11">&nbsp;</p>
+<p data-track="12"><strong>1.服务端代码最佳实践</strong></p>
+<p data-track="13"><strong>(1)TCP握手原理</strong></p>
+<p data-track="14"><strong>(2)Netty服务端代码</strong></p>
+<p data-track="15">&nbsp;</p>
+<p data-track="16"><strong>(1)TCP握手原理</strong></p>
+<p data-track="17">服务端处理客户端的TCP连接请求时，系统底层会采用两个队列，这两个队列分别是SYNC队列和ACCEPT队列。这两个队列的处理分别对应创建Netty服务端时的两个EventLoopGroup，其中bossNioEventLoopGroup用来处理SYNC队列，workNioEventLoopGroup用来处理ACCEPT队列。</p>
+<p data-track="18">&nbsp;</p>
+<p data-track="19">决定服务端可以接收百万级长链接的基础是：服务端的ulimit链接句柄数和backlog链接队列大小，其中backlog链接队列大小 = SYNC队列大小 + ACCEPT队列大小。</p>
+<div class="pgc-img"><img src="https://p26-sign.toutiaoimg.com/tos-cn-i-6w9my0ksvp/58a470502ab74cb99a2daf825daa3c23~tplv-obj.image?lk3s=ef143cfe&amp;traceid=202505260853143A521557FCC67638DB26&amp;x-expires=2147483647&amp;x-signature=rQcDAKpCCPHurwpvBVgejAzz1jU%3D" data-ic="false" data-width="1080" data-height="300" data-ic-uri=""></div>
+<p data-track="20"><strong>(2)Netty服务端代码</strong></p>
+<pre class="highlighter-hljs"><code>public class NettyServer {
+    public NettyServer() {
+        //1.创建两个工作线程组: 一个用于接受网络请求的线程组. 另一个用于实际处理业务的线程组
+        EventLoopGroup bossGroup = new NioEventLoopGroup();
+        EventLoopGroup workGroup = new NioEventLoopGroup();
+  
+        //2.辅助类
+        ServerBootstrap serverBootstrap = new ServerBootstrap();
+        try {
+            serverBootstrap.group(bossGroup, workGroup)
+                .channel(NioServerSocketChannel.class)
+                .option(ChannelOption.SO_BACKLOG, 1024)
+                //表示缓存区动态调配(自适应)
+                .option(ChannelOption.RCVBUF_ALLOCATOR, AdaptiveRecvByteBufAllocator.DEFAULT)
+                //缓存区池化操作
+                .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                //设置使用日志
+                .handler(new LoggingHandler(LogLevel.INFO))
+                //设置workGroup的异步回调
+                .childHandler(new ChannelInitializer&lt;SocketChannel&gt;() {
+                    @Override
+                    protected void initChannel(SocketChannel sc) throws Exception {
+                        sc.pipeline().addLast(MarshallingCodeCFactory.buildMarshallingDecoder());
+                        sc.pipeline().addLast(MarshallingCodeCFactory.buildMarshallingEncoder());
+                        sc.pipeline().addLast(new ServerHandler());
+                    }
+                });
+            //同步绑定端口
+            ChannelFuture cf = serverBootstrap.bind(8765).sync();
+            System.err.println("Server Startup...");
+            //同步等待请求连接
+            cf.channel().closeFuture().sync();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } finally {
+            //优雅停机
+            bossGroup.shutdownGracefully();
+            workGroup.shutdownGracefully();
+            System.err.println("Sever ShutDown...");
+        }
+    }
+}
+
+public class ServerHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        TranslatorData request = (TranslatorData)msg;
+        System.err.println("Sever端: id= " + request.getId() + ", name= " + request.getName() + ", message= " + request.getMessage());
+  
+        //数据库持久化操作 IO读写 ---&gt; 交给一个线程池，去异步的调用执行
+        TranslatorData response = new TranslatorData();
+        response.setId("resp: " + request.getId());
+        response.setName("resp: " + request.getName());
+        response.setMessage("resp: " + request.getMessage());
+  
+        //发送response响应信息
+        ctx.writeAndFlush(response);
+    }
+}</code></pre>
+<p data-track="22">&nbsp;</p>
+<p data-track="23"><strong>2.客户端代码最佳实践</strong></p>
+<pre class="highlighter-hljs"><code>public class NettyClient {
+    public static final String HOST = "127.0.0.1";
+    public static final int PORT = 8765;
+    //扩展完善池化: ConcurrentHashMap&lt;KEY -&gt; String, Value -&gt; Channel&gt;
+    private Channel channel;
+    //1.创建工作线程组: 用于实际处理业务的线程组
+    private EventLoopGroup workGroup = new NioEventLoopGroup();
+    private ChannelFuture cf;
+
+    public NettyClient() {
+        this.connect(HOST, PORT);
+    }
+
+    private void connect(String host, int port) {
+        //2.辅助类(注意Client和Server不一样)
+        Bootstrap bootstrap = new Bootstrap();
+        try {
+            bootstrap.group(workGroup)
+                .channel(NioSocketChannel.class)
+                //表示缓存区动态调配(自适应)
+                .option(ChannelOption.RCVBUF_ALLOCATOR, AdaptiveRecvByteBufAllocator.DEFAULT)
+                //缓存区池化操作
+                .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                //设置日志处理器
+                .handler(new LoggingHandler(LogLevel.INFO))
+                .handler(new ChannelInitializer&lt;SocketChannel&gt;() {
+                    @Override
+                    protected void initChannel(SocketChannel sc) throws Exception {
+                        sc.pipeline().addLast(MarshallingCodeCFactory.buildMarshallingDecoder());
+                        sc.pipeline().addLast(MarshallingCodeCFactory.buildMarshallingEncoder());
+                        sc.pipeline().addLast(new ClientHandler());
+                    }
+                });
+            //同步绑定端口
+            this.cf = bootstrap.connect(host, port).sync();
+            System.err.println("Client connected...");
+  
+            //接下来就进行数据的发送, 但是首需要获取channel:
+            this.channel = cf.channel();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void sendData() {
+        for (int i = 0; i &lt; 10; i++) {
+            TranslatorData request = new TranslatorData();
+            request.setId("" + i);
+            request.setName("请求消息名称 " + i);
+            request.setMessage("请求消息内容 " + i);
+            this.channel.writeAndFlush(request);
+        }
+    }
+
+    public void close() throws Exception {
+        cf.channel().closeFuture().sync();
+        //优雅停机
+        workGroup.shutdownGracefully();
+        System.err.println("Sever ShutDown...");
+    }
+}
+
+public class ClientHandler extends ChannelInboundHandlerAdapter {
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+       try {
+           TranslatorData response = (TranslatorData)msg;
+           System.err.println("Client端: id= " + response.getId() + ", name= " + response.getName() + ", message= " + response.getMessage());
+       } finally {
+           //一定要注意用完了缓存后要进行释放
+           ReferenceCountUtil.release(msg);
+       }
+    }
+}</code></pre>
+<p data-track="25">&nbsp;</p>
+<p data-track="26"><strong>3.Netty的高性能核心问题分析</strong></p>
+<p data-track="27">如果ServerHandler的业务很复杂，耗时很长，那么就会影响Netty性能。所以在使用Netty进行接收处理数据时，不要在workGroup中处理业务。此时可利用异步机制，使用线程池异步处理来提升ServerHandler性能。如果使用线程池，那么又意味着需要使用阻塞队列。因此为消除线程池的阻塞队列影响性能，可使用Disruptor替换线程池。</p>
+<p data-track="28">&nbsp;</p>
+<p data-track="29"><strong>4.基于Disruptor异步化处理Netty的长链接业务</strong></p>
+<p data-track="30">基于Netty + Disruptor构建高性能Netty的核心架构图如下所示：</p>
+<div class="pgc-img"><img src="https://p26-sign.toutiaoimg.com/tos-cn-i-6w9my0ksvp/ded7e56aece94cbb8a2d3bc2a2ad1157~tplv-obj.image?lk3s=ef143cfe&amp;traceid=202505260853143A521557FCC67638DB26&amp;x-expires=2147483647&amp;x-signature=2I4%2B5EqAo%2B2el9wLsCI5C5kcPrY%3D" data-ic="false" data-width="1080" data-height="916" data-ic-uri=""></div>
+<p data-track="31">&nbsp;</p>
+<p data-track="32"><strong>5.Disruptor核心池化封装实现</strong></p>
+<p data-track="33">基于多生产者和多消费者模型，为了避免在ClientHandler和ServerHandler中不断创建生产者和消费者，可以将生产者对象和消费者对象通过池化的方式进行管理。</p>
+<pre class="highlighter-hljs"><code>public class RingBufferWorkerPoolFactory {
+    private static Map&lt;String, MessageProducer&gt; producers = new ConcurrentHashMap&lt;String, MessageProducer&gt;();
+    private static Map&lt;String, MessageConsumer&gt; consumers = new ConcurrentHashMap&lt;String, MessageConsumer&gt;();
+    private RingBuffer&lt;TranslatorDataWapper&gt; ringBuffer;
+    private SequenceBarrier sequenceBarrier;
+    private WorkerPool&lt;TranslatorDataWapper&gt; workerPool;
+
+    private RingBufferWorkerPoolFactory() {
+    
+    }
+
+    public static RingBufferWorkerPoolFactory getInstance() {
+        return SingletonHolder.instance;
+    }
+
+    public void initAndStart(ProducerType type, int bufferSize, WaitStrategy waitStrategy, MessageConsumer[] messageConsumers) {
+        //1.构建ringBuffer对象
+        this.ringBuffer = RingBuffer.create(
+            type,
+            new EventFactory&lt;TranslatorDataWapper&gt;() {
+                public TranslatorDataWapper newInstance() {
+                    return new TranslatorDataWapper();
+                }
+            },
+            bufferSize,
+            waitStrategy
+        );
+        //2.设置序号栅栏
+        this.sequenceBarrier = this.ringBuffer.newBarrier();
+        //3.设置工作池
+        this.workerPool = new WorkerPool&lt;TranslatorDataWapper&gt;(
+            this.ringBuffer,
+            this.sequenceBarrier,
+            new EventExceptionHandler(),
+            messageConsumers
+        );
+        //4.把所构建的消费者置入池中
+        for (MessageConsumer mc : messageConsumers) {
+            this.consumers.put(mc.getConsumerId(), mc);
+        }
+        //5.添加我们的sequences
+        this.ringBuffer.addGatingSequences(this.workerPool.getWorkerSequences());
+        //6.启动我们的工作池
+        this.workerPool.start(Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() / 2));
+    }
+
+    public MessageProducer getMessageProducer(String producerId) {
+        MessageProducer messageProducer = this.producers.get(producerId);
+        if (null == messageProducer) {
+            messageProducer = new MessageProducer(producerId, this.ringBuffer);
+            this.producers.put(producerId, messageProducer);
+        }
+        return messageProducer;
+    }
+
+    private static class SingletonHolder {
+        static final RingBufferWorkerPoolFactory instance = new RingBufferWorkerPoolFactory();
+    }
+
+    //异常静态类
+    static class EventExceptionHandler implements ExceptionHandler&lt;TranslatorDataWapper&gt; {
+        public void handleEventException(Throwable ex, long sequence, TranslatorDataWapper event) {
+        
+        }
+        
+        public void handleOnStartException(Throwable ex) {
+        
+        }
+        
+        public void handleOnShutdownException(Throwable ex) {
+        
+        }
+    }
+}
+
+public class MessageProducer {
+    private String producerId;
+    private RingBuffer&lt;TranslatorDataWapper&gt; ringBuffer;
+    
+    public MessageProducer(String producerId, RingBuffer&lt;TranslatorDataWapper&gt; ringBuffer) {
+        this.producerId = producerId;
+        this.ringBuffer = ringBuffer;
+    }
+    
+    public void onData(TranslatorData data, ChannelHandlerContext ctx) {
+        long sequence = ringBuffer.next();
+        try {
+            TranslatorDataWapper wapper = ringBuffer.get(sequence);
+            wapper.setData(data);
+            wapper.setCtx(ctx);
+        } finally {
+            ringBuffer.publish(sequence);
+        }
+    }
+}
+
+//Netty的Client端和Server端分别具体实现
+public abstract class MessageConsumer implements WorkHandler&lt;TranslatorDataWapper&gt; {
+    protected String consumerId;
+    
+    public MessageConsumer(String consumerId) {
+        this.consumerId = consumerId;
+    }
+    
+    public String getConsumerId() {
+        return consumerId;
+    }
+    
+    public void setConsumerId(String consumerId) {
+        this.consumerId = consumerId;
+    }
+}</code></pre>
+<p data-track="35">&nbsp;</p>
+<p data-track="36"><strong>6.实现接入百万长链接</strong></p>
+<p data-track="37"><strong>(1)服务端处理客户端请求实现支持百万长链接</strong></p>
+<p data-track="38"><strong>(2)客户端处理服务端响应实现支持百万长链接</strong></p>
+<p data-track="39"><strong>(3)启动Netty服务端</strong></p>
+<p data-track="40"><strong>(4)启动Netty客户端</strong></p>
+<p data-track="41">&nbsp;</p>
+<p data-track="42"><strong>(1)服务端处理客户端请求实现支持百万长链接</strong></p>
+<pre class="highlighter-hljs"><code>public class ServerHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        TranslatorData request = (TranslatorData) msg;
+        //自已的应用服务应该有一个ID生成规则
+        String producerId = "code:sessionId:001";
+        MessageProducer messageProducer = RingBufferWorkerPoolFactory.getInstance().getMessageProducer(producerId);
+        //通过Disruptor的生产者来处理request，同时传入ctx
+        messageProducer.onData(request, ctx);
+    }
+}
+
+//通过Disruptor的消费者来处理request
+public class MessageConsumerImpl4Server extends MessageConsumer {
+    public MessageConsumerImpl4Server(String consumerId) {
+        super(consumerId);
+    }
+    
+    public void onEvent(TranslatorDataWapper event) throws Exception {
+        TranslatorData request = event.getData();
+        ChannelHandlerContext ctx = event.getCtx();
+        //1.对客户端请求的处理逻辑:
+        System.err.println("Sever端: id= " + request.getId() + ", name= " + request.getName() + ", message= " + request.getMessage());
+  
+        //2.发送响应信息
+        TranslatorData response = new TranslatorData();
+        response.setId("resp: " + request.getId());
+        response.setName("resp: " + request.getName());
+        response.setMessage("resp: " + request.getMessage());
+        //写出response响应信息
+        ctx.writeAndFlush(response);
+    }
+}</code></pre>
+<p data-track="44"><strong>(2)客户端处理服务端响应实现支持百万长链接</strong></p>
+<pre class="highlighter-hljs"><code>public class ClientHandler extends ChannelInboundHandlerAdapter {
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        //接收服务端的响应
+        TranslatorData response = (TranslatorData) msg;
+        String producerId = "code:seesionId:002";
+        MessageProducer messageProducer = RingBufferWorkerPoolFactory.getInstance().getMessageProducer(producerId);
+        messageProducer.onData(response, ctx);
+    }
+}
+
+public class MessageConsumerImpl4Client extends MessageConsumer {
+    public MessageConsumerImpl4Client(String consumerId) {
+        super(consumerId);
+    }
+    
+    public void onEvent(TranslatorDataWapper event) throws Exception {
+        TranslatorData response = event.getData();
+        ChannelHandlerContext ctx = event.getCtx();
+        //对服务端返回响应的处理逻辑:
+        try {
+            System.err.println("Client端: id= " + response.getId() + ", name= " + response.getName() + ", message= " + response.getMessage());
+        } finally {
+            ReferenceCountUtil.release(response);
+        }
+    }
+}</code></pre>
+<p data-track="46"><strong>(3)启动Netty服务端</strong></p>
+<pre class="highlighter-hljs"><code>@SpringBootApplication
+public class NettyServerApplication {
+    public static void main(String[] args) {
+      //1.启动SpringBoot
+      SpringApplication.run(NettyServerApplication.class, args);
+        
+      //2.准备Disruptor的消费者
+      MessageConsumer[] consumers = new MessageConsumer[4];
+      for (int i = 0; i &lt; consumers.length; i++) {
+          MessageConsumer messageConsumer = new MessageConsumerImpl4Server("code:serverId:" + i);
+          consumers[i] = messageConsumer;
+      }
+        
+      //3.启动Disruptor，使用多生产者多消费者模型
+      RingBufferWorkerPoolFactory.getInstance().initAndStart(
+          ProducerType.MULTI,
+          1024 * 1024,
+          //new YieldingWaitStrategy(),
+          new BlockingWaitStrategy(),
+          consumers
+      );
+        
+      //4.启动Netty
+      new NettyServer();
+    }
+}</code></pre>
+<p data-track="48"><strong>(4)启动Netty客户端</strong></p>
+<pre class="highlighter-hljs"><code>@SpringBootApplication
+public class NettyClientApplication {
+    public static void main(String[] args) {
+        //1.启动SpringBoot
+        SpringApplication.run(NettyClientApplication.class, args);
+        
+        //2.准备Disruptor的消费者
+        MessageConsumer[] conusmers = new MessageConsumer[4];
+        for (int i = 0; i &lt; conusmers.length; i++) {
+            MessageConsumer messageConsumer = new MessageConsumerImpl4Client("code:clientId:" + i);
+            conusmers[i] = messageConsumer;
+        }
+       
+        //3.启动Disruptor，使用多生产者多消费者模型
+        RingBufferWorkerPoolFactory.getInstance().initAndStart(
+            ProducerType.MULTI,
+            1024 * 1024,
+            //new YieldingWaitStrategy(),
+            new BlockingWaitStrategy(),
+            conusmers
+        );
+  
+        //4.建立连接 并发送消息
+        new NettyClient().sendData();
+    }
+}</code></pre>
+<p>&nbsp;</p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.009718543167824074" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-05-26 08:59">2025-05-26 08:58</span>&nbsp;
+<a href="https://www.cnblogs.com/mjunz">东阳马生架构</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18896319);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18896319', targetLink: 'https://www.cnblogs.com/mjunz/p/18896319', title: 'Disruptor—4.与Netty的简单应用' })">举报</a>
+</div>
+        
