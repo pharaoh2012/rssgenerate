@@ -1,0 +1,242 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huangxincheng/p/18886478" title="发布于 2025-05-20 11:41">
+    <span role="heading" aria-level="2">.NET外挂系列：3. 了解 harmony 中灵活的纯手工注入方式</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一背景">一：背景</h2>
+<h3 id="1-讲故事">1. 讲故事</h3>
+<p>上一篇我们讲到了 <code>注解特性</code>，harmony 在内部提供了 20个 <code>HarmonyPatch</code> 重载方法尽可能的让大家满足业务开发，那时候我也说了，特性虽然简单粗暴，但只能解决 95% 的问题，言外之意还有一些事情做不到，所以剩下的 <code>5%</code> 只能靠 <code>完全手工</code> 的方式了。</p>
+<h2 id="二注解特性的局限性">二：注解特性的局限性</h2>
+<p>虽然有20个重载方法，但还不能达到100%覆盖，不要以为我说的这种情况比较罕见，是很正常的场景，比如说：</p>
+<ol>
+<li>嵌套类。</li>
+<li>程序集中的某些特殊不对外公开类。</li>
+</ol>
+<p>这里我就拿第二种来说把，参考代码如下：</p>
+<pre><code class="language-C#">
+internal sealed class ServiceProviderEngineScope : IServiceScope, IDisposable, IServiceProvider, IKeyedServiceProvider, IAsyncDisposable, IServiceScopeFactory
+{
+    public ServiceProviderEngineScope(ServiceProvider provider, bool isRootScope)
+    {
+        ResolvedServices = new Dictionary&lt;ServiceCacheKey, object&gt;();
+        RootProvider = provider;
+        IsRootScope = isRootScope;
+    }
+}
+
+</code></pre>
+<p>这段代码有几个要素：</p>
+<h3 id="1-internal">1. internal</h3>
+<p>代码是程序集可访问，所以你不能使用任何 <code>typeof(xxx)</code> 形式的构造函数，否则就会报错，参考如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202505/214741-20250520114113239-1090546064.png" alt="" loading="lazy"></p>
+<h3 id="2-有参构造函数">2. 有参构造函数</h3>
+<p>由于不能使用 <code>typeof(xxx)</code>，所以只能通过 <code>字符串模式</code> 反射type，当你有心查找你会发现第20个重载方法虽然支持 <code>string</code> 格式，但不提供 <code>Type[] argumentTypes</code> 参数信息，代码如下：</p>
+<pre><code class="language-C#">
+[AttributeUsage(AttributeTargets.Class | AttributeTargets.Method | AttributeTargets.Delegate, AllowMultiple = true)]
+public class HarmonyPatch : HarmonyAttribute
+{
+    ...
+    public HarmonyPatch(string typeName, string methodName, MethodType methodType = MethodType.Normal);
+    ...
+}
+
+</code></pre>
+<p>所以这个就是很无语的事情了，哈哈，上面所说的其实就是我最近遇到了一例 <code>.NET托管内存暴涨</code> 问题，观察托管堆之后，发现有 975w 的 ServiceProviderEngineScope 类，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202505/214741-20250520114113227-306441836.png" alt="" loading="lazy"></p>
+<p>熟悉这个类的朋友应该明白，这是上层调用 <code>serviceProvider.CreateScope()</code> 方法没有释放导致的，那接下来的问题是到底谁在不断的调用 <code>CreateScope()</code> 呢？ 直接监控 <code>ServiceProviderEngineScope</code> 的构造函数就可以了。</p>
+<h2 id="三解决方案">三：解决方案</h2>
+<h3 id="1-使用-targetmethod-口子函数">1. 使用 TargetMethod 口子函数</h3>
+<p>上一篇跟大家聊过 harmony 的口子函数 <code>TargetMethods</code>，它可以批量返回需要被 patch 的方法，如果你明确知道只需返回一个，可以用 <code>TargetMethod</code> 口子来实现，有了这些思路之后，完整的实现代码如下：</p>
+<pre><code class="language-C#">
+    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            var harmony = new Harmony("com.dotnetdebug.www");
+
+            harmony.PatchAll();
+
+            // 1. 创建服务集合
+            var services = new ServiceCollection();
+
+            // 2. 注册一个作用域服务
+            services.AddScoped&lt;MyService&gt;();
+
+            // 3. 构建服务提供者
+            var serviceProvider = services.BuildServiceProvider();
+
+            // 4. 创建作用域
+            var scope = serviceProvider.CreateScope();
+            var myService = scope.ServiceProvider.GetRequiredService&lt;MyService&gt;();
+            myService.DoSomething();
+
+            Console.ReadLine();
+        }
+    }
+
+    class MyService : IDisposable
+    {
+        public MyService()
+        {
+            Console.WriteLine("i'm MyService...");
+        }
+        public void DoSomething()
+        {
+            Console.WriteLine($"{DateTime.Now} Doing work...");
+        }
+
+        public void Dispose()
+        {
+            Console.WriteLine($"{DateTime.Now} Disposing MyService");
+        }
+    }
+
+    [HarmonyPatch]
+    public class HookServiceProviderEngineScope
+    {
+        [HarmonyTargetMethod]
+        static MethodBase TargetMethod()
+        {
+            var engineScopeType = Type.GetType("Microsoft.Extensions.DependencyInjection.ServiceLookup.ServiceProviderEngineScope, Microsoft.Extensions.DependencyInjection");
+            var constructor = engineScopeType.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)[0];
+
+            return constructor;
+        }
+
+        public static void Prefix(bool isRootScope)
+        {
+            Console.WriteLine("----------------------------");
+            Console.WriteLine($"isRootScope:{isRootScope}");
+            Console.WriteLine(Environment.StackTrace);
+            Console.WriteLine("----------------------------");
+        }
+    }
+
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202505/214741-20250520114113249-1383346805.png" alt="" loading="lazy"></p>
+<p>有些朋友可能要说了，这地方为什么会有两个调用栈，熟悉底层的朋友应该知道分别由 <code>services.BuildServiceProvider</code> 和 <code>serviceProvider.CreateScope</code> 贡献的。</p>
+<p>写到这里的时候，出门抽了个烟，突然灵光一现，既然20个单重载方法不够用，我完全可以使用 HarmonyPatch 注解特性组合呀。。。相当于平级补充，说干就干，参考代码如下：</p>
+<pre><code class="language-C#">
+    [HarmonyPatch("Microsoft.Extensions.DependencyInjection.ServiceLookup.ServiceProviderEngineScope, Microsoft.Extensions.DependencyInjection", null, MethodType.Constructor)]
+    [HarmonyPatch(new Type[2] { typeof(ServiceProvider), typeof(bool) })]
+    public class HookServiceProviderEngineScope
+    {
+        public static void Prefix(bool isRootScope)
+        {
+            Console.WriteLine("----------------------------");
+            Console.WriteLine($"isRootScope:{isRootScope}");
+            Console.WriteLine(Environment.StackTrace);
+            Console.WriteLine("----------------------------");
+        }
+    }
+
+</code></pre>
+<p>有了胜利喜悦之后，我想可有神鬼不测之术来解决 <code>嵌套类</code> 的问题，纠结了之后用 <code>HarmonyPatch</code> 特性理论上搞不定。</p>
+<h3 id="2-完全动态hook">2. 完全动态hook</h3>
+<p>整体上来说前面的 <code>TargetMethod</code> 模式属于<code>混合编程(特性+手工)</code>，如果让代码更纯粹一点话，就要把所有的 Attribute 摘掉，这就需要包装器类 <code>HarmonyMethod</code> ，修改后的代码如下：</p>
+<pre><code class="language-C#">
+    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            var harmony = new Harmony("com.dotnetdebug.www");
+
+            var engineScopeType = Type.GetType("Microsoft.Extensions.DependencyInjection.ServiceLookup.ServiceProviderEngineScope, Microsoft.Extensions.DependencyInjection");
+            var originalMethod = engineScopeType.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)[0];
+
+            var prefixMethod = typeof(HookServiceProviderEngineScope).GetMethod("Prefix");
+
+            harmony.Patch(originalMethod, new HarmonyMethod(prefixMethod));
+
+            // 1. 创建服务集合
+            var services = new ServiceCollection();
+
+            // 2. 注册一个作用域服务
+            services.AddScoped&lt;MyService&gt;();
+
+            // 3. 构建服务提供者
+            var serviceProvider = services.BuildServiceProvider();
+
+            // 4. 创建作用域
+            var scope = serviceProvider.CreateScope();
+            var myService = scope.ServiceProvider.GetRequiredService&lt;MyService&gt;();
+            myService.DoSomething();
+
+            Console.ReadLine();
+        }
+    }
+
+    class MyService : IDisposable
+    {
+        public MyService()
+        {
+            Console.WriteLine("i'm MyService...");
+        }
+        public void DoSomething()
+        {
+            Console.WriteLine($"{DateTime.Now} Doing work...");
+        }
+
+        public void Dispose()
+        {
+            Console.WriteLine($"{DateTime.Now} Disposing MyService");
+        }
+    }
+
+    public class HookServiceProviderEngineScope
+    {
+        public static void Prefix(bool isRootScope)
+        {
+            Console.WriteLine("----------------------------");
+            Console.WriteLine($"isRootScope:{isRootScope}");
+            Console.WriteLine(Environment.StackTrace);
+            Console.WriteLine("----------------------------");
+        }
+    }
+
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202505/214741-20250520114113224-1333959442.png" alt="" loading="lazy"></p>
+<p>这里稍微提一下 <code>HarmonyMethod</code> 类，它的内部有很多的参数可以配置，比如 <code>优先级</code>，<code>日志</code> 功能，这些都是 <code>Attribute</code> 所做不了的，参考如下：</p>
+<pre><code class="language-C#">
+public class HarmonyMethod
+{
+    public MethodInfo method;
+    public string category;
+    public Type declaringType;
+    public string methodName;
+    public MethodType? methodType;
+    public Type[] argumentTypes;
+    public int priority = -1;
+    public string[] before;
+    public string[] after;
+    public HarmonyReversePatchType? reversePatchType;
+    public bool? debug;
+    public bool nonVirtualDelegate;
+}
+
+</code></pre>
+<h2 id="四总结">四：总结</h2>
+<p>在 <code>特性</code> 搞不定的时候，手工HarmonyMethod编程是一个很好的补充，这几篇我们只关注了 <code>Prefix</code>，毕竟从高级调试的角度看，我们更关注问题代码的 <code>调用栈</code> ，从而寻找引发故障的元凶。<br>
+<img src="https://images.cnblogs.com/cnblogs_com/huangxincheng/345039/o_210929020104最新消息优惠促销公众号关注二维码.jpg" width="700" height="300" alt="图片名称" align="center"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="14.441540405199074" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-05-20 11:42">2025-05-20 11:41</span>&nbsp;
+<a href="https://www.cnblogs.com/huangxincheng">一线码农</a>&nbsp;
+阅读(<span id="post_view_count">346</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18886478);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18886478', targetLink: 'https://www.cnblogs.com/huangxincheng/p/18886478', title: '.NET外挂系列：3. 了解 harmony 中灵活的纯手工注入方式' })">举报</a>
+</div>
+        
