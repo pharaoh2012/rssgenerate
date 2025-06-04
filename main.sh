@@ -8,7 +8,7 @@ runscript() {
         START_TIME=$(date +%s)
         echo "🟢🟢🟢🟢正在执行: $JS_FILE"
 
-        node "$JS_FILE" || true
+        timeout 10m node "$JS_FILE" || true
 
         END_TIME=$(date +%s)
         EXECUTION_TIME=$((END_TIME - START_TIME))
