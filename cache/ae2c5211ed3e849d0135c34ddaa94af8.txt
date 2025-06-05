@@ -1,0 +1,2408 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/coredx/p/18900966" title="发布于 2025-05-30 11:31">
+    <span role="heading" aria-level="2">如何在 .NET 中构建一个好用的动态查询生成器</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="前言">前言</h1>
+<p>自从.NET Framework 3.5提供了LINQ之后，集合数据查询基本被LINQ统一了。这大幅提高了编写数据查询代码的效率和质量，但是在需要编写动态查询的时候反而很困难，特别是最常用的where和order by子句，他们的参数是<code>Expression</code>。编写静态查询的时候编译器会自动把代码转换成等价的表达式，而动态查询无法借助编译器完成表达式构建，只能手动拼接。想要正确拼接一个描述低级代码结构的表达式对开发者的功力提出了较高的要求，哪怕是这方面的高手也容易翻车。</p>
+<p>为了简化查询表达式的动态构建，社区出现了很多表达式生成辅助库。其中最知名当属<code>System.Linq.Dynamic.Core</code>和<code>LinqKit</code>。<code>System.Linq.Dynamic.Core</code>使用字符串定义表达式，并在内部转换成<code>Expression</code>，<code>LinqKit</code>则是使用<code>PredicateBuilder&lt;T&gt;</code>把复杂表达式拆分成多个片段的组合。但是他们也存在一些不便之处，<code>System.Linq.Dynamic.Core</code>牺牲了代码的静态检查能力，只有在运行时才知道表达式是否正确。如果把表达式作为允许前端填写的参数，不仅需要让前端开发人员多学习一套表达式定义语法，还会产生安全漏洞。如果想提前检查表达式的安全性，就需要对字符串进行分析。分析字符串生成表达式会成为一个流行库的原因之一就是分析这个字符串很难，这样一来相当于把外包出去的困难任务又拿回来了。<code>LinqKit</code>则是对前端不友好，这种类型无法序列化传输，如果想通过前端配合使用，还是需要再想办法写一套转换代码和配套的可序列化数据结构。</p>
+<p>这两个库在传输序列化和动态拼接简化方面各有显著优势，也各有明显不足。因此笔者开始思考是否有办法开发一个便于序列化传输，安全性能得到静态检查保证，对于复杂表达式的拼接也能良好支持的表达式生成器。经过多次摸索，终有一些心得，在此分享给大家。</p>
+<h2 id="新书宣传">新书宣传</h2>
+<p>有关新书的更多介绍欢迎查看<a href="https://www.cnblogs.com/coredx/p/17184289.html" title="《C#与.NET6 开发从入门到实践》上市" target="_blank">《C#与.NET6 开发从入门到实践》上市，作者亲自来打广告了！</a><br>
+<img src="https://img2023.cnblogs.com/blog/1512608/202303/1512608-20230306175259039-82706909.jpg" alt="image" loading="lazy"></p>
+<p>虽然本书是基于.NET 6编写的，但是其中大多数内容依然可用，仍然具有一定的参考价值。</p>
+<h1 id="正文">正文</h1>
+<h2 id="提炼基本概念">提炼基本概念</h2>
+<h3 id="在安全的前提下提高灵活性">在安全的前提下提高灵活性</h3>
+<p>想要保证构建的查询安全性，势必要限制能够查询的属性，最好能让生成器中只出现可以查询的属性。为了避免底层属性改名导致查询出错，或是隐藏代码中的属性名，暴露给生成器的名称应该和真实属性名解耦，两者能独立调整。对于查询器中可能出现的特殊自定义条件提供自定义扩展点。最好支持静态编译检查和基于自动重构的自动代码调整。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 查询条件构造器接口
+/// &lt;/summary&gt;
+public interface IFilterPredicateBuilder&lt;T&gt;
+{
+    /// &lt;summary&gt;
+    /// 获取查询条件
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;生成的查询条件&lt;/returns&gt;
+    Expression&lt;Func&lt;T, bool&gt;&gt;? GetWherePredicate();
+}
+</code></pre>
+<p>基于以上假设，笔者提炼出了这个基本接口，用于生成器表示支持生成谓词表达式。接口没有任何额外内容以允许最大程度的自定义扩展。</p>
+<h3 id="为复杂的嵌套查询提供支持">为复杂的嵌套查询提供支持</h3>
+<p>一个完备的表达式生成一定会面临嵌套对象属性的情况，这其中的问题在于，对象类型无穷无尽，相同类型的对象也可能出现在各种地方。如何访问到需要的对象属性并应用筛选条件就是一个需要仔细考虑的问题。在笔者看来，这个问题可以分解为两个子问题，访问属性和应用条件。将这两个部分分离开，条件就可以只针对最终类型开发，属性的访问则交由外部决定。这样一来，针对某种类型开发的条件就可以在任何地方的属性上使用。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 可组合的查询条件构造器接口
+/// &lt;/summary&gt;
+public interface IComposableFilterPredicateBuilder&lt;T&gt;
+{
+    /// &lt;summary&gt;
+    /// 获取查询条件，并把条件应用到&lt;typeparamref name="TOwner"/&gt;类型的对象所拥有的&lt;typeparamref name="T"/&gt;类型的成员上。
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="TOwner"&gt;拥有&lt;typeparamref name="T"/&gt;类型的成员的类型&lt;/typeparam&gt;
+    /// &lt;param name="memberAccesser"&gt;成员访问器&lt;/param&gt;
+    /// &lt;returns&gt;已应用到成员的查询条件&lt;/returns&gt;
+    Expression&lt;Func&lt;TOwner, bool&gt;&gt;? GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, T&gt;&gt; memberAccesser);
+}
+
+/// &lt;summary&gt;
+/// 值类型可组合的查询条件构造器接口
+/// &lt;/summary&gt;
+public interface IStructComposableFilterPredicateBuilder&lt;T&gt; : IComposableFilterPredicateBuilder&lt;T&gt;
+    where T : struct
+{
+    /// &lt;summary&gt;
+    /// 获取查询条件，并把条件应用到&lt;typeparamref name="TOwner"/&gt;类型的对象所拥有的&lt;typeparamref name="T"/&gt;类型的成员上。
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="TOwner"&gt;拥有&lt;typeparamref name="T"/&gt;类型的成员的类型&lt;/typeparam&gt;
+    /// &lt;param name="memberAccesser"&gt;成员访问器&lt;/param&gt;
+    /// &lt;returns&gt;已应用到成员的查询条件&lt;/returns&gt;
+    Expression&lt;Func&lt;TOwner, bool&gt;&gt;? GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, T?&gt;&gt; memberAccesser);
+}
+</code></pre>
+<p>基于以上假设，可以再次提炼出一个接口。通过参数由外部决定属性如何访问，并返回最终拼合条件。值类型需要特殊处理。</p>
+<h3 id="为集合类型的查询提供支持">为集合类型的查询提供支持</h3>
+<p>有时要查询的属性可能是集合类型，这种查询和普通的单值查询有区别，需要单独处理。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 集合可组合的查询条件构造器接口
+/// &lt;/summary&gt;
+public interface ICollectionComposableFilterPredicateBuilder&lt;T&gt;
+{
+    /// &lt;summary&gt;
+    /// 获取查询条件，并把条件应用到&lt;typeparamref name="TOwner"/&gt;类型的对象所拥有的&lt;typeparamref name="T"/&gt;类型的集合的成员上。
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="TOwner"&gt;拥有&lt;typeparamref name="T"/&gt;类型的集合的成员的类型&lt;/typeparam&gt;
+    /// &lt;param name="memberAccesser"&gt;成员访问器&lt;/param&gt;
+    /// &lt;returns&gt;已应用到成员的查询条件&lt;/returns&gt;
+    Expression&lt;Func&lt;TOwner, bool&gt;&gt;? GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, IEnumerable&lt;T&gt;&gt;&gt; memberAccesser);
+}
+</code></pre>
+<p>这表示专门用于集合类型的查询，<code>IQueryable&lt;T&gt;</code>实现了<code>IEnumerable&lt;T&gt;</code>，不需要单独定义。</p>
+<h3 id="条件反转">条件反转</h3>
+<p>一键支持条件反转是个非常有用的功能，如果一个条件有多个子条件，且条件之间混合了各种加了括号的且或非连接，想要正确反转这样的条件非常困难。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 可反转条件接口
+/// &lt;/summary&gt;
+public interface IPredicateReversible
+{
+    /// &lt;summary&gt;
+    /// 是否反转条件
+    /// &lt;/summary&gt;
+    bool Reverse { get; }
+}
+</code></pre>
+<p>使用一个bool标记反转条件，由查询生成器自动处理反转是合理的选择。</p>
+<h2 id="序列化传输支持">序列化传输支持</h2>
+<p>到此为止，一个完备的表达式生成器所需的基本接口就提炼完成了。但是这些接口所表达的概念并不支持序列化传输，接下来就要解决这问题。</p>
+<p>序列化传输查询条件意味着要分离出条件中可以序列化的部分。例如：<code>Foo.Bar &gt; 1</code>，此处需要传输的部分是属性，比较方式，比较参数。属性的话由于需要支持静态检查，需要单独处理。至于比较方式，办法比较多，笔者选择使用枚举来表达。关键字一般是各种基础类型，应该天然支持序列化。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 引用类型搜索关键字接口
+/// &lt;/summary&gt;
+/// &lt;typeparam name="T"&gt;关键字类型&lt;/typeparam&gt;
+public interface ISearchFilterClassKey&lt;T&gt; where T : class
+{
+    /// &lt;summary&gt;
+    /// 搜索关键字
+    /// &lt;/summary&gt;
+    ImmutableList&lt;T?&gt; Keys { get; }
+}
+
+/// &lt;summary&gt;
+/// 值类型搜索关键字接口
+/// &lt;/summary&gt;
+/// &lt;typeparam name="T"&gt;关键字类型&lt;/typeparam&gt;
+public interface ISearchFilterStructKey&lt;T&gt; where T : struct
+{
+    /// &lt;summary&gt;
+    /// 搜索关键字
+    /// &lt;/summary&gt;
+    ImmutableList&lt;T?&gt; Keys { get; }
+}
+
+/// &lt;summary&gt;
+/// 搜索操作符接口
+/// &lt;/summary&gt;
+/// &lt;typeparam name="TOperator"&gt;&lt;/typeparam&gt;
+public interface ISearchFilterOperator&lt;TOperator&gt; where TOperator : struct, Enum
+{
+    /// &lt;summary&gt;
+    /// 搜索操作符
+    /// &lt;/summary&gt;
+    TOperator Operator { get; }
+}
+</code></pre>
+<p>基于以上假设，可以提炼出以上接口。</p>
+<h2 id="为概念接口提供实现">为概念接口提供实现</h2>
+<p>这些接口表达了查询生成器所需的各种概念，但是让开发者自行实现并不是好主意，这些接口对于开发者来说应该是用做泛型约束的。笔者势必要为此提供一套最常见情形的实现。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 查询构造器基类
+/// &lt;/summary&gt;
+/// &lt;typeparam name="T"&gt;查询的数据类型&lt;/typeparam&gt;
+/// &lt;param name="CombineType"&gt;条件谓词组合方式。Json属性名用 combine 减少字数。&lt;/param&gt;
+/// &lt;inheritdoc cref="IFilterPredicateBuilder{T}"/&gt;
+public abstract record QueryBuilderBase&lt;T&gt;(
+    [EnumDataType(typeof(PredicateCombineKind))]
+    PredicateCombineKind? CombineType = PredicateCombineKind.And)
+    : IFilterPredicateBuilder&lt;T&gt;, IComposableFilterPredicateBuilder&lt;T&gt;
+{
+    /// &lt;inheritdoc/&gt;
+    public Expression&lt;Func&lt;T, bool&gt;&gt;? GetWherePredicate()
+    {
+        var where = BuildWherePredicate();
+        if (this is IPredicateReversible reversible) where = reversible.ApplyReversiblePredicate(where);
+        return where;
+    }
+
+    /// &lt;summary&gt;
+    /// 构造查询条件
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;获得的查询条件&lt;/returns&gt;
+    /// &lt;remarks&gt;
+    /// 派生类重写时请只负责构造自身的条件，
+    /// 最后使用&lt;see cref="CombinePredicates"/&gt;合并来自基类的条件后再返回。
+    /// 不要在这里进行条件反转。
+    /// &lt;/remarks&gt;
+    protected virtual Expression&lt;Func&lt;T, bool&gt;&gt;? BuildWherePredicate()
+    {
+        return null;
+    }
+
+    /// &lt;summary&gt;
+    /// 组合查询条件
+    /// &lt;/summary&gt;
+    /// &lt;param name="predicates"&gt;待组合的子条件&lt;/param&gt;
+    /// &lt;returns&gt;&lt;/returns&gt;
+    /// &lt;exception cref="NotSupportedException"&gt;&lt;/exception&gt;
+    protected Expression&lt;Func&lt;T, bool&gt;&gt;? CombinePredicates(IEnumerable&lt;Expression&lt;Func&lt;T, bool&gt;&gt;&gt;? predicates)
+    {
+        var predicate = predicates?.FirstOrDefault();
+        if (predicates?.Any() is true)
+        {
+            predicate = CombineType switch
+            {
+                PredicateCombineKind.And =&gt; predicates?.AndAlsoAll(),
+                PredicateCombineKind.Or =&gt; predicates?.OrElseAll(),
+                _ =&gt; throw new NotSupportedException(CombineType.ToString()),
+            };
+        }
+
+        return predicate;
+    }
+
+    /// &lt;inheritdoc/&gt;
+    /// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+    public Expression&lt;Func&lt;TOwner, bool&gt;&gt;? GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, T&gt;&gt; memberAccesser)
+    {
+        ArgumentNullException.ThrowIfNull(memberAccesser);
+
+        var where = GetWherePredicate();
+        if (where is null) return null;
+
+        MemberReplaceExpressionVisitor visitor = new();
+        var result = visitor.ReplaceMember(memberAccesser, where);
+
+        return result;
+    }
+
+    /// &lt;summary&gt;
+    /// 成员访问表达式替换访问器
+    /// &lt;/summary&gt;
+    private sealed class MemberReplaceExpressionVisitor : ExpressionVisitor
+    {
+        private readonly Lock _lock = new();
+
+        private volatile bool _calledFromReplaceMember = false;
+        private LambdaExpression? _memberAccesser;
+
+        /// &lt;summary&gt;
+        /// 把指定表达式的成员访问替换为新的成员访问。
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name="TOwner"&gt;拥有&lt;typeparamref name="TMember"/&gt;类型的成员的类型&lt;/typeparam&gt;
+        /// &lt;typeparam name="TMember"&gt;用于替换成员访问的类型&lt;/typeparam&gt;
+        /// &lt;typeparam name="TResult"&gt;返回值类型&lt;/typeparam&gt;
+        /// &lt;param name="memberAccessor"&gt;替换用的新成员访问表达式。&lt;/param&gt;
+        /// &lt;param name="resultAccessor"&gt;要替换成员访问的表达式。&lt;/param&gt;
+        /// &lt;returns&gt;已替换成员访问的表达式。&lt;/returns&gt;
+        /// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+        public Expression&lt;Func&lt;TOwner, TResult&gt;&gt; ReplaceMember&lt;TOwner, TMember, TResult&gt;(
+            Expression&lt;Func&lt;TOwner, TMember&gt;&gt; memberAccessor,
+            Expression&lt;Func&lt;TMember, TResult&gt;&gt; resultAccessor)
+        {
+            ArgumentNullException.ThrowIfNull(resultAccessor);
+            ArgumentNullException.ThrowIfNull(memberAccessor);
+
+            lock (_lock)
+            {
+                try
+                {
+                    _calledFromReplaceMember = true;
+                    _memberAccesser = memberAccessor;
+
+                    var newLambda = (LambdaExpression)Visit(resultAccessor);
+
+                    return Expression.Lambda&lt;Func&lt;TOwner, TResult&gt;&gt;(newLambda.Body, memberAccessor.Parameters);
+                }
+                catch
+                {
+                    throw;
+                }
+                finally
+                {
+                    _calledFromReplaceMember = false;
+                    _memberAccesser = null;
+                }
+            }
+        }
+
+        /// &lt;inheritdoc/&gt;
+        [return: NotNullIfNotNull(nameof(node))]
+        public override Expression? Visit(Expression? node)
+        {
+            if (!_calledFromReplaceMember) throw new InvalidOperationException($"Don't call directly, call {nameof(ReplaceMember)} instead.");
+
+            return base.Visit(node);
+        }
+
+        /// &lt;inheritdoc/&gt;
+        protected override Expression VisitMember(MemberExpression node)
+        {
+            if (node.Expression is ParameterExpression)
+            {
+                return Expression.PropertyOrField(_memberAccesser!.Body, node.Member.Name);
+            }
+
+            return base.VisitMember(node);
+        }
+    }
+}
+
+/// &lt;summary&gt;
+/// 条件谓词组合方式
+/// &lt;/summary&gt;
+public enum PredicateCombineKind
+{
+    /// &lt;summary&gt;
+    /// 且
+    /// &lt;/summary&gt;
+    And = 1,
+
+    /// &lt;summary&gt;
+    /// 或
+    /// &lt;/summary&gt;
+    Or = 2
+}
+
+/// &lt;summary&gt;
+/// 可反转谓词接口扩展
+/// &lt;/summary&gt;
+public static class PredicateReversibleExtensions
+{
+    /// &lt;summary&gt;
+    /// 应用可反转的谓词
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;谓词表达式的参数类型&lt;/typeparam&gt;
+    /// &lt;param name="reversible"&gt;可反转谓词接口的实例&lt;/param&gt;
+    /// &lt;param name="predicate"&gt;谓词表达式&lt;/param&gt;
+    /// &lt;returns&gt;&lt;/returns&gt;
+    public static Expression&lt;Func&lt;T, bool&gt;&gt;? ApplyReversiblePredicate&lt;T&gt;(
+        this IPredicateReversible reversible,
+        Expression&lt;Func&lt;T, bool&gt;&gt;? predicate)
+    {
+        return !reversible.Reverse ? predicate : predicate?.Not();
+    }
+}
+</code></pre>
+<p>在接口的<code>GetWherePredicate()</code>方法之外，增加一个内部的<code>BuildWherePredicate()</code>方法，把生成基本条件和反转条件隔离开并统一处理，确保反转条件只会在最后进行一次。</p>
+<h3 id="实现通用的基本类型过滤器表达式">实现通用的基本类型过滤器表达式</h3>
+<h4 id="定义操作类型">定义操作类型</h4>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 基本搜索操作
+/// &lt;/summary&gt;
+public enum BaseSearchOperator : uint
+{
+    /// &lt;summary&gt;
+    /// 等于
+    /// &lt;/summary&gt;
+    Equal = 1 &lt;&lt; 0,
+
+    /// &lt;summary&gt;
+    /// 是候选项之一
+    /// &lt;/summary&gt;
+    In = 1 &lt;&lt; 1,
+}
+
+/// &lt;summary&gt;
+/// 字符串搜索操作
+/// &lt;/summary&gt;
+public enum StringSearchOperator : uint
+{
+    /// &lt;summary&gt;
+    /// 等于
+    /// &lt;/summary&gt;
+    Equal = 1 &lt;&lt; 0,
+
+    /// &lt;summary&gt;
+    /// 是候选项之一
+    /// &lt;/summary&gt;
+    In = 1 &lt;&lt; 1,
+
+    /// &lt;summary&gt;
+    /// 包含
+    /// &lt;/summary&gt;
+    Contains = 1 &lt;&lt; 2,
+
+    /// &lt;summary&gt;
+    /// 包含全部候选项
+    /// &lt;/summary&gt;
+    EqualContains = Equal | Contains,
+
+    /// &lt;summary&gt;
+    /// 包含候选项之一
+    /// &lt;/summary&gt;
+    InContains = In | Contains,
+
+    /// &lt;summary&gt;
+    /// 开头是
+    /// &lt;/summary&gt;
+    StartsWith = 1 &lt;&lt; 3,
+
+    /// &lt;summary&gt;
+    /// 开头是候选项之一
+    /// &lt;/summary&gt;
+    InStartsWith = In | StartsWith,
+
+    /// &lt;summary&gt;
+    /// 结尾是
+    /// &lt;/summary&gt;
+    EndsWith = 1 &lt;&lt; 4,
+
+    /// &lt;summary&gt;
+    /// 结尾是候选项之一
+    /// &lt;/summary&gt;
+    InEndsWith = In | EndsWith,
+}
+
+/// &lt;summary&gt;
+/// 可排序数字搜索操作
+/// &lt;/summary&gt;
+public enum ComparableNumberSearchOperator : uint
+{
+    /// &lt;summary&gt;
+    /// 等于
+    /// &lt;/summary&gt;
+    Equal = 1 &lt;&lt; 0,
+
+    /// &lt;summary&gt;
+    /// 是候选项之一
+    /// &lt;/summary&gt;
+    In = 1 &lt;&lt; 1,
+
+    /// &lt;summary&gt;
+    /// 小于
+    /// &lt;/summary&gt;
+    LessThan = 1 &lt;&lt; 2,
+
+    /// &lt;summary&gt;
+    /// 小于等于
+    /// &lt;/summary&gt;
+    LessThanOrEqual = LessThan | Equal,
+
+    /// &lt;summary&gt;
+    /// 大于
+    /// &lt;/summary&gt;
+    GreaterThan = 1 &lt;&lt; 3,
+
+    /// &lt;summary&gt;
+    /// 大于等于
+    /// &lt;/summary&gt;
+    GreaterThanOrEqual = GreaterThan | Equal,
+
+    /// &lt;summary&gt;
+    /// 介于两个值之间，但不包含两边的边界值
+    /// &lt;/summary&gt;
+    BetweenOpen = 1 &lt;&lt; 4,
+
+    /// &lt;summary&gt;
+    /// 是多组介于两个值之间，但不包含两边的边界值的候选区间之一
+    /// &lt;/summary&gt;
+    InBetweenOpen = In | BetweenOpen,
+
+    /// &lt;summary&gt;
+    /// 介于两个值之间，包含左边界值，但不包含右边界值
+    /// &lt;/summary&gt;
+    BetweenLeftClosed = 1 &lt;&lt; 5,
+
+    /// &lt;summary&gt;
+    /// 是多组介于两个值之间，包含左边界值，但不包含右边界值的候选区间之一
+    /// &lt;/summary&gt;
+    InBetweenLeftClosed = In | BetweenLeftClosed,
+
+    /// &lt;summary&gt;
+    /// 介于两个值之间，包含右边界值，但不包含左边界值
+    /// &lt;/summary&gt;
+    BetweenRightClosed = 1 &lt;&lt; 6,
+
+    /// &lt;summary&gt;
+    /// 是多组介于两个值之间，包含右边界值，但不包含左边界值的候选区间之一
+    /// &lt;/summary&gt;
+    InBetweenRightClosed = In | BetweenRightClosed,
+
+    /// &lt;summary&gt;
+    /// 介于两个值之间，同时包含两边的边界值
+    /// &lt;/summary&gt;
+    BetweenClosed = BetweenOpen | BetweenLeftClosed | BetweenRightClosed,
+
+    /// &lt;summary&gt;
+    /// 是多组介于两个值之间，同时包含两边的边界值的候选区间之一
+    /// &lt;/summary&gt;
+    InBetweenClosed = In | BetweenClosed,
+}
+</code></pre>
+<p>类似不等于这种操作使用等于和反转条件的组合来表示。同时这些操作使用位枚举让每个位都能用于表达操作所具有的特征。</p>
+<h4 id="具体实现">具体实现</h4>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 值类型基本搜索过滤器
+/// &lt;/summary&gt;
+/// &lt;typeparam name="T"&gt;要搜索的值类型&lt;/typeparam&gt;
+public record StructSearchFilter&lt;T&gt;
+    : ISearchFilterStructKey&lt;T&gt;
+    , ISearchFilterOperator&lt;BaseSearchOperator&gt;
+    , IStructComposableFilterPredicateBuilder&lt;T&gt;
+    , IPredicateReversible
+    where T : struct
+{
+    private static readonly Type _baseType = typeof(T);
+    private static readonly Type _nullableType = typeof(T?);
+
+    private static readonly MethodInfo _enumerableContains = typeof(Enumerable)
+        .GetMethods()
+        .Where(static m =&gt; m.Name is nameof(Enumerable.Contains))
+        .Single(static m =&gt; m.GetParameters().Length is 2)
+        .MakeGenericMethod([_baseType]);
+
+    private static readonly MethodInfo _enumerableNullableContains = typeof(Enumerable)
+        .GetMethods()
+        .Where(static m =&gt; m.Name is nameof(Enumerable.Contains))
+        .Single(static m =&gt; m.GetParameters().Length is 2)
+        .MakeGenericMethod([_nullableType]);
+
+    /// &lt;summary&gt;
+    /// 初始化一个新实例
+    /// &lt;/summary&gt;
+    /// &lt;param name="keys"&gt;搜索关键字&lt;/param&gt;
+    /// &lt;param name="operator"&gt;搜索操作符&lt;/param&gt;
+    /// &lt;param name="reverse"&gt;是否反转条件&lt;/param&gt;
+    /// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidEnumArgumentException"&gt;&lt;/exception&gt;
+    public StructSearchFilter(
+        ImmutableList&lt;T?&gt; keys,
+        [EnumDataType(typeof(BaseSearchOperator))]
+        BaseSearchOperator @operator = BaseSearchOperator.Equal,
+        bool reverse = false)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(keys));
+        if (keys is null or { Count: 0 }) throw new ArgumentException("不能是空集。", nameof(keys));
+        if (!Enum.IsDefined(@operator)) throw new InvalidEnumArgumentException(nameof(@operator), (int)@operator, @operator.GetType());
+
+        if (@operator is BaseSearchOperator.In &amp;&amp; keys is null or { Count: &lt; 2 })
+        {
+            throw new ArgumentException($"当 {nameof(@operator)} 的值为 {@operator} 时必须设置多个元素。", nameof(keys));
+        }
+        else if (@operator is not BaseSearchOperator.In &amp;&amp; keys is { Count: &gt; 1 })
+        {
+            throw new ArgumentException($"当 {nameof(@operator)} 的值为 {@operator} 时必须设置一个元素。", nameof(keys));
+        }
+        else if (@operator is not (BaseSearchOperator.In or BaseSearchOperator.Equal) &amp;&amp; keys.Any(static n =&gt; Equals(n, null)))
+        {
+            throw new ArgumentException($"当 {nameof(@operator)} 的值为 {@operator} 时元素的值不能为空。", nameof(keys));
+        }
+
+        Keys = keys;
+        Operator = @operator;
+        Reverse = reverse;
+    }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual ImmutableList&lt;T?&gt; Keys { get; }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual BaseSearchOperator Operator { get; }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual bool Reverse { get; }
+
+    /// &lt;inheritdoc/&gt;
+    /// &lt;exception cref="InvalidOperationException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidDataException"&gt;&lt;/exception&gt;
+    public Expression&lt;Func&lt;TOwner, bool&gt;&gt; GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, T&gt;&gt; memberAccessor)
+    {
+        if (Keys.Any(static n =&gt; n is null)) throw new InvalidOperationException("不能使用值为空的元素搜索值不能为空的成员。");
+
+        Expression newBody = Operator switch
+        {
+            BaseSearchOperator.Equal =&gt; Expression.Equal(memberAccessor.Body, Expression.Constant(Keys.First(), _baseType)),
+            BaseSearchOperator.In =&gt; Expression.Call(null, _enumerableContains, [Expression.Constant(Keys.Cast&lt;T&gt;().ToList(), typeof(IEnumerable&lt;T&gt;)), memberAccessor.Body]),
+            _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+        };
+
+        if (Reverse) newBody = Expression.Not(newBody);
+
+        return Expression.Lambda&lt;Func&lt;TOwner, bool&gt;&gt;(newBody, memberAccessor.Parameters);
+    }
+
+    /// &lt;inheritdoc/&gt;
+    /// &lt;exception cref="InvalidOperationException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidDataException"&gt;&lt;/exception&gt;
+    public Expression&lt;Func&lt;TOwner, bool&gt;&gt; GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, T?&gt;&gt; memberAccessor)
+    {
+        Expression newBody = Operator switch
+        {
+            BaseSearchOperator.Equal =&gt; Expression.Equal(memberAccessor.Body, Expression.Constant(Keys.First(), _nullableType)),
+            BaseSearchOperator.In =&gt; Expression.Call(null, _enumerableNullableContains, [Expression.Constant(Keys, typeof(IEnumerable&lt;T?&gt;)), memberAccessor.Body]),
+            _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+        };
+
+        if (Reverse) newBody = Expression.Not(newBody);
+
+        return Expression.Lambda&lt;Func&lt;TOwner, bool&gt;&gt;(newBody, memberAccessor.Parameters);
+    }
+}
+
+/// &lt;summary&gt;
+/// 布尔搜索过滤器
+/// &lt;/summary&gt;
+public record BoolSearchFilter : StructSearchFilter&lt;bool&gt;
+{
+    /// &lt;inheritdoc/&gt;
+    public BoolSearchFilter(
+        ImmutableList&lt;bool?&gt; keys,
+        [EnumDataType(typeof(BaseSearchOperator))]
+        BaseSearchOperator @operator = BaseSearchOperator.Equal,
+        bool reversePredicate = false) : base(keys, @operator, reversePredicate)
+    {
+    }
+}
+
+/// &lt;summary&gt;
+/// 可排序数字搜索过滤器
+/// &lt;/summary&gt;
+/// &lt;typeparam name="TNumber"&gt;数字的类型&lt;/typeparam&gt;
+public record NumberSearchFilter&lt;TNumber&gt;
+    : IStructComposableFilterPredicateBuilder&lt;TNumber&gt;
+    , ISearchFilterStructKey&lt;TNumber&gt;
+    , ISearchFilterOperator&lt;ComparableNumberSearchOperator&gt;
+    , IPredicateReversible
+    where TNumber : struct, IComparisonOperators&lt;TNumber, TNumber, bool&gt;
+{
+    /// &lt;summary&gt;
+    /// 初始化一个新实例
+    /// &lt;/summary&gt;
+    /// &lt;param name="keys"&gt;搜索关键字&lt;/param&gt;
+    /// &lt;param name="operator"&gt;搜索操作符&lt;/param&gt;
+    /// &lt;param name="reverse"&gt;是否反转条件&lt;/param&gt;
+    /// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidEnumArgumentException"&gt;&lt;/exception&gt;
+    public NumberSearchFilter(
+        ImmutableList&lt;TNumber?&gt; keys,
+        [EnumDataType(typeof(ComparableNumberSearchOperator))]
+        ComparableNumberSearchOperator @operator = ComparableNumberSearchOperator.Equal,
+        bool reverse = false)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(keys));
+        if (keys is null or { Count: 0 }) throw new ArgumentException("不能是空集。", nameof(keys));
+        if (!Enum.IsDefined(@operator)) throw new InvalidEnumArgumentException(nameof(@operator), (int)@operator, @operator.GetType());
+
+        string? message = GetKeysCheckMessage(keys, @operator);
+        if (message is not null) throw new ArgumentException(message, nameof(keys));
+
+        Keys = keys;
+        Operator = @operator;
+        Reverse = reverse;
+    }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual ImmutableList&lt;TNumber?&gt; Keys { get; }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual ComparableNumberSearchOperator Operator { get; }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual bool Reverse { get; }
+
+    /// &lt;inheritdoc/&gt;
+    /// &lt;exception cref="InvalidOperationException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidDataException"&gt;&lt;/exception&gt;
+    public Expression&lt;Func&lt;TOwner, bool&gt;&gt; GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, TNumber&gt;&gt; memberAccessor)
+    {
+        NullKeyCheck(Keys);
+
+        var where = GetWherePredicateExtension(Keys, Operator, memberAccessor);
+        if (Reverse) where = where.Not();
+        return where;
+    }
+
+    /// &lt;inheritdoc/&gt;
+    /// &lt;exception cref="InvalidOperationException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidDataException"&gt;&lt;/exception&gt;
+    public Expression&lt;Func&lt;TOwner, bool&gt;&gt; GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, TNumber?&gt;&gt; memberAccessor)
+    {
+        var where = GetWherePredicateExtension(Keys, Operator, memberAccessor);
+        if (Reverse) where = where.Not();
+        return where;
+    }
+}
+
+/// &lt;summary&gt;
+/// 字符串搜索过滤器
+/// &lt;/summary&gt;
+public record StringSearchFilter
+    : IComposableFilterPredicateBuilder&lt;string&gt;
+    , ISearchFilterOperator&lt;StringSearchOperator&gt;
+    , ISearchFilterClassKey&lt;string&gt;
+    , IPredicateReversible
+{
+    private static readonly MethodInfo _contains = typeof(string)
+        .GetMethod(
+            nameof(string.Contains),
+            BindingFlags.Public | BindingFlags.Instance,
+            [typeof(string)]
+        )!;
+
+    private static readonly MethodInfo _startsWith = typeof(string)
+        .GetMethod(
+            nameof(string.StartsWith),
+            BindingFlags.Public | BindingFlags.Instance,
+            [typeof(string)]
+        )!;
+
+    private static readonly MethodInfo _endsWith = typeof(string)
+        .GetMethod(
+            nameof(string.EndsWith),
+            BindingFlags.Public | BindingFlags.Instance,
+            [typeof(string)]
+        )!;
+
+    private static readonly MethodInfo _equals = typeof(string)
+        .GetMethod(
+            nameof(string.Equals),
+            BindingFlags.Public | BindingFlags.Instance,
+            [typeof(string)]
+        )!;
+
+    private static readonly MethodInfo _enumerableContains = typeof(Enumerable)
+        .GetMethods()
+        .Where(static m =&gt; m.Name is nameof(Enumerable.Contains))
+        .Single(static m =&gt; m.GetParameters().Length is 2)
+        .MakeGenericMethod([typeof(string)]);
+
+    /// &lt;summary&gt;
+    /// 初始化一个新实例
+    /// &lt;/summary&gt;
+    /// &lt;param name="keys"&gt;搜索关键字&lt;/param&gt;
+    /// &lt;param name="operator"&gt;搜索操作符&lt;/param&gt;
+    /// &lt;param name="reverse"&gt;是否反转条件&lt;/param&gt;
+    /// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidEnumArgumentException"&gt;&lt;/exception&gt;
+    public StringSearchFilter(
+        ImmutableList&lt;string?&gt; keys,
+        [EnumDataType(typeof(StringSearchOperator))]
+        StringSearchOperator @operator = StringSearchOperator.Contains,
+        bool reverse = false)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(keys));
+        if (keys is null or { Count: 0 }) throw new ArgumentException("不能是空集。", nameof(keys));
+        if (!Enum.IsDefined(@operator)) throw new InvalidEnumArgumentException(nameof(@operator), (int)@operator, @operator.GetType());
+
+        string? exceptionHint = null;
+        switch (@operator)
+        {
+            case StringSearchOperator.Equal:
+                if (keys is { Count: &gt; 1 })
+                {
+                    exceptionHint = $"必须设置一个元素。";
+                    goto default;
+                }
+                break;
+            case StringSearchOperator.In:
+                if (keys is { Count: &lt; 2 })
+                {
+                    exceptionHint = $"必须设置多个元素。";
+                    goto default;
+                }
+                break;
+            case StringSearchOperator.Contains:
+                goto case StringSearchOperator.Equal;
+            case StringSearchOperator.EqualContains:
+                if (keys is { Count: &lt; 2 })
+                {
+                    exceptionHint = $"必须设置多个元素。";
+                    goto default;
+                }
+                else if (keys.Any(static key =&gt; key is null))
+                {
+                    exceptionHint = $"元素不能为空。";
+                    goto default;
+                }
+                break;
+            case StringSearchOperator.InContains:
+                goto case StringSearchOperator.EqualContains;
+            case StringSearchOperator.StartsWith:
+                if (keys is { Count: &gt; 2 })
+                {
+                    exceptionHint = $"必须设置一个元素。";
+                    goto default;
+                }
+                else if (keys.Any(static key =&gt; key is null))
+                {
+                    exceptionHint = $"元素不能为空。";
+                    goto default;
+                }
+                break;
+            case StringSearchOperator.InStartsWith:
+                goto case StringSearchOperator.EqualContains;
+            case StringSearchOperator.EndsWith:
+                goto case StringSearchOperator.StartsWith;
+            case StringSearchOperator.InEndsWith:
+                goto case StringSearchOperator.EqualContains;
+            default:
+                exceptionHint ??= "的元素数量错误。";
+                throw new ArgumentException($"当 {nameof(@operator)} 的值为 {@operator} 时{exceptionHint}", nameof(keys));
+        };
+
+        Keys = keys;
+        Operator = @operator;
+        Reverse = reverse;
+    }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual ImmutableList&lt;string?&gt; Keys { get; }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual StringSearchOperator Operator { get; }
+
+    /// &lt;inheritdoc/&gt;
+    public virtual bool Reverse { get; }
+
+    /// &lt;inheritdoc/&gt;
+    /// &lt;exception cref="InvalidDataException"&gt;&lt;/exception&gt;
+    public Expression&lt;Func&lt;TOwner, bool&gt;&gt; GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, string&gt;&gt; memberAccessor)
+    {
+        (MethodInfo method, object? value, Type type) = Operator switch
+        {
+            StringSearchOperator.Equal =&gt; (_equals, (object?)Keys![0], typeof(string)),
+            StringSearchOperator.In =&gt; (_enumerableContains, Keys, typeof(IEnumerable&lt;string?&gt;)),
+            StringSearchOperator.Contains =&gt; (_contains, Keys![0], typeof(string)),
+            StringSearchOperator.EqualContains =&gt; (_contains, Keys, typeof(string)),
+            StringSearchOperator.InContains =&gt; (_contains, Keys, typeof(string)),
+            StringSearchOperator.StartsWith =&gt; (_startsWith, Keys![0], typeof(string)),
+            StringSearchOperator.InStartsWith =&gt; (_startsWith, Keys, typeof(string)),
+            StringSearchOperator.EndsWith =&gt; (_endsWith, Keys![0], typeof(string)),
+            StringSearchOperator.InEndsWith =&gt; (_endsWith, Keys, typeof(string)),
+            _ =&gt; throw new InvalidDataException(nameof(StringSearchOperator))
+        };
+
+        Expression newBody;
+        switch (Operator)
+        {
+            case StringSearchOperator.Equal:
+                newBody = Expression.Call(memberAccessor.Body, method, Expression.Constant(value, type));
+                break;
+            case StringSearchOperator.In:
+                newBody = Expression.Call(null, method, [Expression.Constant(value, type), memberAccessor.Body]);
+                break;
+            case StringSearchOperator.Contains:
+                goto case StringSearchOperator.Equal;
+            case StringSearchOperator.EqualContains:
+                newBody = CombineIn((IReadOnlyList&lt;string?&gt;)value!, memberAccessor.Body, method, type, PredicateCombineKind.And);
+                break;
+            case StringSearchOperator.InContains:
+                newBody = CombineIn((IReadOnlyList&lt;string?&gt;)value!, memberAccessor.Body, method, type, PredicateCombineKind.Or);
+                break;
+            case StringSearchOperator.StartsWith:
+                goto case StringSearchOperator.Equal;
+            case StringSearchOperator.InStartsWith:
+                newBody = CombineIn((IReadOnlyList&lt;string?&gt;)value!, memberAccessor.Body, method, type, PredicateCombineKind.Or);
+                break;
+            case StringSearchOperator.EndsWith:
+                goto case StringSearchOperator.Equal;
+            case StringSearchOperator.InEndsWith:
+                goto case StringSearchOperator.InStartsWith;
+            default:
+                throw new InvalidDataException(nameof(StringSearchOperator));
+        }
+
+        if (Reverse) newBody = Expression.Not(newBody);
+
+        return Expression.Lambda&lt;Func&lt;TOwner, bool&gt;&gt;(newBody, memberAccessor.Parameters);
+
+        static Expression CombineIn(IReadOnlyList&lt;string?&gt; keys, Expression instance, MethodInfo method, Type type, PredicateCombineKind combineKind)
+        {
+            Expression expr = Expression.Call(instance, method, Expression.Constant(keys[0], type));
+
+            foreach (var key in keys.Skip(1))
+            {
+                expr = combineKind switch
+                {
+                    PredicateCombineKind.And =&gt; Expression.AndAlso(expr, Expression.Call(instance, method, Expression.Constant(key, type))),
+                    PredicateCombineKind.Or =&gt; Expression.OrElse(expr, Expression.Call(instance, method, Expression.Constant(key, type))),
+                    _ =&gt; throw new NotImplementedException(),
+                };
+            }
+
+            return expr;
+        }
+    }
+}
+</code></pre>
+<p>此处展示了一部分基础数据类型的过滤器定义。如果将来有自定义基本类型也可以照葫芦画瓢。</p>
+<h3 id="集合类型属性的实现">集合类型属性的实现</h3>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 复杂类型的集合属性搜索过滤器
+/// &lt;/summary&gt;
+/// &lt;typeparam name="TQueryBuilder"&gt;要搜索的集合元素类型的查询类型&lt;/typeparam&gt;
+/// &lt;typeparam name="T"&gt;要搜索的元素类型&lt;/typeparam&gt;
+public record CollectionMemberSearchFilter&lt;TQueryBuilder, T&gt;
+    : ICollectionComposableFilterPredicateBuilder&lt;T&gt;
+    , IPredicateReversible
+    where TQueryBuilder : IFilterPredicateBuilder&lt;T&gt;
+{
+    private static readonly MethodInfo _asQueryableOfT = typeof(Queryable)
+        .GetMethods()
+        .Single(static m =&gt; m.Name is nameof(Queryable.AsQueryable) &amp;&amp; m.IsGenericMethod);
+
+    private static readonly MethodInfo _queryableWhereOfT = typeof(Queryable)
+        .GetMethods()
+        .Single(static m =&gt;
+        {
+            return m.Name is nameof(Queryable.Where)
+                &amp;&amp; m.GetParameters()[1]
+                    .ParameterType
+                    .GenericTypeArguments[0]
+                    .GenericTypeArguments
+                    .Length is 2;
+        });
+
+    private static readonly MethodInfo _queryableCountOfT = typeof(Queryable)
+        .GetMethods()
+        .Single(static m =&gt; m.Name is nameof(Queryable.Count) &amp;&amp; m.GetParameters().Length is 1);
+
+    private static readonly MethodInfo _queryableAnyOfT = typeof(Queryable)
+        .GetMethods()
+        .Single(static m =&gt; m.Name is nameof(Queryable.Any) &amp;&amp; m.GetParameters().Length is 1);
+
+    private static readonly MethodInfo _enumerableContains = typeof(Enumerable)
+        .GetMethods()
+        .Where(static m =&gt; m.Name is nameof(Enumerable.Contains))
+        .Single(static m =&gt; m.GetParameters().Length is 2)
+        .MakeGenericMethod([typeof(T)]);
+
+    /// &lt;summary&gt;
+    /// 元素的查询
+    /// &lt;/summary&gt;
+    public TQueryBuilder? Query { get; }
+
+    /// &lt;summary&gt;
+    /// 计数搜索过滤器
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;和&lt;see cref="Percent"/&gt;只能存在一个。&lt;/remarks&gt;
+    public NumberSearchFilter&lt;int&gt;? Count { get; }
+
+    /// &lt;summary&gt;
+    /// 比例搜索过滤器
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// 和&lt;see cref="Count"/&gt;只能存在一个。
+    /// 如果存在，则&lt;see cref="Query"/&gt;也必须同时存在。
+    /// &lt;/remarks&gt;
+    public NumberSearchFilter&lt;double&gt;? Percent { get; }
+
+
+    /// &lt;inheritdoc/&gt;
+    public bool Reverse { get; }
+
+    /// &lt;summary&gt;
+    /// 初始化新的实例
+    /// &lt;/summary&gt;
+    /// &lt;param name="query"&gt;元素的查询&lt;/param&gt;
+    /// &lt;param name="count"&gt;计数搜索过滤器&lt;/param&gt;
+    /// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+    public CollectionMemberSearchFilter(
+        TQueryBuilder? query,
+        NumberSearchFilter&lt;int&gt; count,
+        bool reverse = false) : this(query, count, null, reverse)
+    {
+    }
+
+    /// &lt;summary&gt;
+    /// 初始化新的实例
+    /// &lt;/summary&gt;
+    /// &lt;param name="query"&gt;元素的查询&lt;/param&gt;
+    /// &lt;param name="percent"&gt;比例搜索过滤器&lt;/param&gt;
+    /// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+    public CollectionMemberSearchFilter(
+        TQueryBuilder query,
+        NumberSearchFilter&lt;double&gt; percent,
+        bool reverse = false) : this(query, null, percent, reverse)
+    {
+    }
+
+    /// &lt;summary&gt;
+    /// 初始化新的实例
+    /// &lt;/summary&gt;
+    /// &lt;param name="query"&gt;元素的查询&lt;/param&gt;
+    /// &lt;param name="count"&gt;计数搜索过滤器&lt;/param&gt;
+    /// &lt;param name="percent"&gt;比例搜索过滤器&lt;/param&gt;
+    /// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+    [JsonConstructor]
+    public CollectionMemberSearchFilter(
+        TQueryBuilder? query,
+        NumberSearchFilter&lt;int&gt;? count = null,
+        NumberSearchFilter&lt;double&gt;? percent = null,
+        bool reverse = false)
+    {
+        if (count is null &amp;&amp; percent is null || count is not null &amp;&amp; percent is not null)
+        {
+            throw new ArgumentException($"{nameof(count)} 和 {nameof(percent)} 必须设置且只能设置其中一个。");
+        }
+
+        if (percent is not null &amp;&amp; query is null)
+        {
+            throw new ArgumentException($"{nameof(percent)} 和 {nameof(query)} 必须同时设置。");
+        }
+
+        Query = query;
+        Count = count;
+        Percent = percent;
+        Reverse = reverse;
+    }
+
+    /// &lt;inheritdoc/&gt;
+    /// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="InvalidDataException"&gt;&lt;/exception&gt;
+    public Expression&lt;Func&lt;TOwner, bool&gt;&gt;? GetWherePredicate&lt;TOwner&gt;(Expression&lt;Func&lt;TOwner, IEnumerable&lt;T&gt;&gt;&gt; memberAccessor)
+    {
+        ArgumentNullException.ThrowIfNull(memberAccessor);
+
+        var asQueryable = _asQueryableOfT.MakeGenericMethod(typeof(T));
+        Expression queryable = Expression.Call(null, asQueryable, [memberAccessor.Body]);
+        Expression originalQueryable = queryable;
+
+        var queryCount = _queryableCountOfT.MakeGenericMethod(typeof(T));
+        Expression allCount = Expression.Call(null, queryCount, queryable);
+        Expression? whereCount = null;
+
+        var where = Query?.GetWherePredicate();
+        if (where != null)
+        {
+            var queryableWhere = _queryableWhereOfT.MakeGenericMethod(typeof(T));
+            queryable = Expression.Call(null, queryableWhere, [queryable, where]);
+
+            whereCount = Expression.Call(null, queryCount, queryable);
+        }
+
+        Expression? resultBody = null;
+        if (Count is not null)
+        {
+            var usedCount = whereCount ?? allCount;
+
+            resultBody = Count.Operator switch
+            {
+                ComparableNumberSearchOperator.Equal =&gt; TryUseAnyCall(Count.Operator, Count.Keys[0], queryable, out var anyCall)
+                    ? anyCall
+                    : Expression.Equal(usedCount, Expression.Constant(Count.Keys[0])),
+                ComparableNumberSearchOperator.In =&gt;
+                    Expression.Call(
+                        null,
+                        _enumerableContains,
+                        [Expression.Constant(Count.Keys, typeof(IEnumerable&lt;int&gt;)), usedCount]
+                    ),
+                ComparableNumberSearchOperator.LessThan =&gt; TryUseAnyCall(Count.Operator, Count.Keys[0], queryable, out var anyCall)
+                    ? anyCall
+                    : Expression.LessThan(usedCount, Expression.Constant(Count.Keys[0])),
+                ComparableNumberSearchOperator.LessThanOrEqual =&gt; TryUseAnyCall(Count.Operator, Count.Keys[0], queryable, out var anyCall)
+                    ? anyCall
+                    : Expression.LessThanOrEqual(usedCount, Expression.Constant(Count.Keys[0])),
+                ComparableNumberSearchOperator.GreaterThan =&gt; TryUseAnyCall(Count.Operator, Count.Keys[0], queryable, out var anyCall)
+                    ? anyCall
+                    : Expression.GreaterThan(usedCount, Expression.Constant(Count.Keys[0])),
+                ComparableNumberSearchOperator.GreaterThanOrEqual =&gt; TryUseAnyCall(Count.Operator, Count.Keys[0], queryable, out var anyCall)
+                    ? anyCall
+                    : Expression.GreaterThanOrEqual(usedCount, Expression.Constant(Count.Keys[0])),
+                ComparableNumberSearchOperator.BetweenOpen =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThan(usedCount, Expression.Constant(Count.Keys[0])),
+                        Expression.LessThan(usedCount, Expression.Constant(Count.Keys[1]))
+                    ),
+                ComparableNumberSearchOperator.BetweenLeftClosed =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThanOrEqual(usedCount, Expression.Constant(Count.Keys[0])),
+                        Expression.LessThan(usedCount, Expression.Constant(Count.Keys[1]))
+                    ),
+                ComparableNumberSearchOperator.BetweenRightClosed =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThan(usedCount, Expression.Constant(Count.Keys[0])),
+                        Expression.LessThanOrEqual(usedCount, Expression.Constant(Count.Keys[1]))
+                    ),
+                ComparableNumberSearchOperator.BetweenClosed =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThanOrEqual(usedCount, Expression.Constant(Count.Keys[0])),
+                        Expression.LessThanOrEqual(usedCount, Expression.Constant(Count.Keys[1]))
+                    ),
+                _ =&gt; throw new InvalidDataException(nameof(Count.Operator)),
+            };
+            if (Count.Reverse) resultBody = Expression.Not(resultBody);
+        }
+        else if (Percent is not null)
+        {
+            Debug.Assert(whereCount is not null);
+
+            Expression doubleAllCount = Expression.Convert(allCount, typeof(double));
+            whereCount = Expression.Convert(whereCount, typeof(double));
+            Expression usedPercent = Expression.Divide(whereCount, doubleAllCount);
+
+            var queryableAny = _queryableAnyOfT.MakeGenericMethod(typeof(T));
+            usedPercent = Expression.Condition(Expression.Not(Expression.Call(null, queryableAny, originalQueryable)), Expression.Constant(0.0), usedPercent);
+
+            resultBody = Percent.Operator switch
+            {
+                ComparableNumberSearchOperator.Equal =&gt; Expression.Equal(usedPercent, Expression.Constant(Percent.Keys[0])),
+                ComparableNumberSearchOperator.In =&gt;
+                    Expression.Call(
+                        null,
+                        _enumerableContains,
+                        [Expression.Constant(Percent.Keys, typeof(IEnumerable&lt;double&gt;)), usedPercent]
+                    ),
+                ComparableNumberSearchOperator.LessThan =&gt; Expression.LessThan(usedPercent, Expression.Constant(Percent.Keys[0])),
+                ComparableNumberSearchOperator.LessThanOrEqual =&gt; Expression.LessThanOrEqual(usedPercent, Expression.Constant(Percent.Keys[0])),
+                ComparableNumberSearchOperator.GreaterThan =&gt; Expression.GreaterThan(usedPercent, Expression.Constant(Percent.Keys[0])),
+                ComparableNumberSearchOperator.GreaterThanOrEqual =&gt; Expression.GreaterThanOrEqual(usedPercent, Expression.Constant(Percent.Keys[0])),
+                ComparableNumberSearchOperator.BetweenOpen =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThan(usedPercent, Expression.Constant(Percent.Keys[0])),
+                        Expression.LessThan(usedPercent, Expression.Constant(Percent.Keys[1]))
+                    ),
+                ComparableNumberSearchOperator.BetweenLeftClosed =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThanOrEqual(usedPercent, Expression.Constant(Percent.Keys[0])),
+                        Expression.LessThan(usedPercent, Expression.Constant(Percent.Keys[1]))
+                    ),
+                ComparableNumberSearchOperator.BetweenRightClosed =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThan(usedPercent, Expression.Constant(Percent.Keys[0])),
+                        Expression.LessThanOrEqual(usedPercent, Expression.Constant(Percent.Keys[1]))
+                    ),
+                ComparableNumberSearchOperator.BetweenClosed =&gt;
+                    Expression.AndAlso(
+                        Expression.GreaterThanOrEqual(usedPercent, Expression.Constant(Percent.Keys[0])),
+                        Expression.LessThanOrEqual(usedPercent, Expression.Constant(Percent.Keys[1]))
+                    ),
+                _ =&gt; throw new InvalidDataException(nameof(Percent.Operator)),
+            };
+            if (Percent.Reverse) resultBody = Expression.Not(resultBody);
+        }
+
+        Debug.Assert(resultBody is not null);
+
+        var result = Expression.Lambda&lt;Func&lt;TOwner, bool&gt;&gt;(resultBody, memberAccessor.Parameters);
+
+        return this.ApplyReversiblePredicate(result);
+
+        static bool TryUseAnyCall(
+            ComparableNumberSearchOperator @operator,
+            int? key,
+            Expression toCallAny,
+            [NotNullWhen(true)] out Expression? result)
+        {
+            ArgumentNullException.ThrowIfNull(toCallAny);
+
+            (bool shouldUseAny, bool shouldReverseAny) = (@operator, key) switch
+            {
+                (ComparableNumberSearchOperator.Equal, 0) =&gt; (true, true),
+                (ComparableNumberSearchOperator.LessThan, 1) =&gt; (true, true),
+                (ComparableNumberSearchOperator.LessThanOrEqual, 0) =&gt; (true, true),
+                (ComparableNumberSearchOperator.GreaterThan, 0) =&gt; (true, false),
+                (ComparableNumberSearchOperator.GreaterThanOrEqual, 1) =&gt; (true, false),
+                _ =&gt; (false, false),
+            };
+
+            result = null;
+            if (shouldUseAny)
+            {
+                result = Expression.Call(
+                    null,
+                    _queryableAnyOfT.MakeGenericMethod(typeof(T)),
+                    [toCallAny]
+                );
+
+                if (shouldReverseAny)
+                {
+                    result = Expression.Not(result);
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+    }
+}
+</code></pre>
+<p>对于集合类型的属性，笔者实现了计数和比例比较，用于筛选符合条件的元素数量或占比是否符合条件。如果需要，各种聚合条件也应该可以实现，此处不再列举。<code>TryUseAnyCall()</code>方法对计数条件尝试使用<code>Any()</code>替换<code>Count()</code>，例如<code>Count &gt; 0</code>等价于<code>Any()</code>，这可以在EF Core中生成更高效的SQL（据说EF Core准备在内部添加这个优化）。</p>
+<h3 id="辅助类型">辅助类型</h3>
+<pre><code class="language-csharp">internal static class ScalarSearchFilterExtensions
+{
+    private static readonly MethodInfo _enumerableContainsOfT = typeof(Enumerable)
+        .GetMethods()
+        .Where(static m =&gt; m.Name is nameof(Enumerable.Contains))
+        .Single(static m =&gt; m.GetParameters().Length is 2);
+
+    internal static string? GetKeysCheckMessage&lt;T&gt;(ICollection&lt;T&gt; keys, ComparableNumberSearchOperator @operator)
+    {
+        string? exceptionHint = null;
+        switch (@operator)
+        {
+            case ComparableNumberSearchOperator.Equal:
+                if (keys is { Count: &gt; 1 })
+                {
+                    exceptionHint = $"必须设置一个元素。";
+                }
+                break;
+            case ComparableNumberSearchOperator.In:
+                if (keys is { Count: &lt; 2 })
+                {
+                    exceptionHint = $"必须设置多个元素。";
+                }
+                break;
+            case ComparableNumberSearchOperator.LessThan:
+                goto case ComparableNumberSearchOperator.Equal;
+            case ComparableNumberSearchOperator.LessThanOrEqual:
+                goto case ComparableNumberSearchOperator.Equal;
+            case ComparableNumberSearchOperator.GreaterThan:
+                goto case ComparableNumberSearchOperator.Equal;
+            case ComparableNumberSearchOperator.GreaterThanOrEqual:
+                goto case ComparableNumberSearchOperator.Equal;
+            case ComparableNumberSearchOperator.BetweenOpen:
+                goto case ComparableNumberSearchOperator.BetweenClosed;
+            case ComparableNumberSearchOperator.BetweenLeftClosed:
+                goto case ComparableNumberSearchOperator.BetweenClosed;
+            case ComparableNumberSearchOperator.BetweenRightClosed:
+                goto case ComparableNumberSearchOperator.BetweenClosed;
+            case ComparableNumberSearchOperator.BetweenClosed:
+                if (keys is { Count: not 2 })
+                {
+                    exceptionHint = $"必须设置两个元素。";
+                }
+                break;
+            case ComparableNumberSearchOperator.InBetweenOpen:
+                if (keys is { Count: &lt; 4 } || keys.Count % 2 != 0)
+                {
+                    exceptionHint = $"必须设置不少于四个的偶数个元素。";
+                }
+                break;
+            case ComparableNumberSearchOperator.InBetweenLeftClosed:
+                goto case ComparableNumberSearchOperator.InBetweenOpen;
+            case ComparableNumberSearchOperator.InBetweenRightClosed:
+                goto case ComparableNumberSearchOperator.InBetweenOpen;
+            case ComparableNumberSearchOperator.InBetweenClosed:
+                goto case ComparableNumberSearchOperator.InBetweenOpen;
+            default:
+                exceptionHint = "的元素数量错误。";
+                break;
+        };
+
+        if (exceptionHint is not null) return $"当 {nameof(@operator)} 的值为 {@operator} 时{exceptionHint}";
+        else return null;
+    }
+
+    internal static void NullKeyCheck&lt;T&gt;(IReadOnlyList&lt;T?&gt; keys)
+        where T : struct
+    {
+        if (keys.Any(static n =&gt; n is null)) throw new InvalidOperationException("不能使用值为空的元素搜索值不能为空的成员。");
+    }
+
+    internal static Expression&lt;Func&lt;TOwner, bool&gt;&gt; GetWherePredicateExtension&lt;TOwner, TNumber&gt;(
+        IReadOnlyList&lt;TNumber?&gt; keys,
+        ComparableNumberSearchOperator @operator,
+        Expression&lt;Func&lt;TOwner, TNumber&gt;&gt; memberAccessor)
+        where TNumber : struct
+    {
+        var typeOfNumber = typeof(TNumber);
+        var _enumerableContains = @operator is ComparableNumberSearchOperator.In ? _enumerableContainsOfT.MakeGenericMethod([typeOfNumber]) : null;
+
+        Expression newBody = @operator switch
+        {
+            ComparableNumberSearchOperator.Equal =&gt; Expression.Equal(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)),
+            ComparableNumberSearchOperator.In =&gt; Expression.Call(null, _enumerableContains!, [Expression.Constant(keys.Cast&lt;TNumber&gt;().ToList(), typeof(IEnumerable&lt;TNumber&gt;)), memberAccessor.Body]),
+            ComparableNumberSearchOperator.LessThan =&gt; Expression.LessThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)),
+            ComparableNumberSearchOperator.LessThanOrEqual =&gt; Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)),
+            ComparableNumberSearchOperator.GreaterThan =&gt; Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)),
+            ComparableNumberSearchOperator.GreaterThanOrEqual =&gt; Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)),
+            ComparableNumberSearchOperator.BetweenOpen =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keys[1], typeOfNumber))),
+            ComparableNumberSearchOperator.BetweenLeftClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keys[1], typeOfNumber))),
+            ComparableNumberSearchOperator.BetweenRightClosed =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keys[1], typeOfNumber))),
+            ComparableNumberSearchOperator.BetweenClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keys[1], typeOfNumber))),
+            ComparableNumberSearchOperator.InBetweenOpen =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            ComparableNumberSearchOperator.InBetweenLeftClosed =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            ComparableNumberSearchOperator.InBetweenRightClosed =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            ComparableNumberSearchOperator.InBetweenClosed =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+        };
+
+        return Expression.Lambda&lt;Func&lt;TOwner, bool&gt;&gt;(newBody, memberAccessor.Parameters);
+    }
+
+    internal static Expression&lt;Func&lt;TOwner, bool&gt;&gt; GetWherePredicateExtension&lt;TOwner, TNumber&gt;(
+        IReadOnlyList&lt;TNumber?&gt; keys,
+        ComparableNumberSearchOperator @operator,
+        Expression&lt;Func&lt;TOwner, TNumber?&gt;&gt; memberAccessor)
+        where TNumber : struct
+    {
+        var typeOfNullableNumber = typeof(TNumber?);
+        var enumerableContains = @operator is ComparableNumberSearchOperator.In ? _enumerableContainsOfT.MakeGenericMethod([typeOfNullableNumber]) : null;
+
+        Expression newBody = @operator switch
+        {
+            ComparableNumberSearchOperator.Equal =&gt; Expression.Equal(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)),
+            ComparableNumberSearchOperator.In =&gt; Expression.Call(null, enumerableContains!, [Expression.Constant(keys, typeof(IEnumerable&lt;TNumber?&gt;)), memberAccessor.Body]),
+            ComparableNumberSearchOperator.LessThan =&gt; Expression.LessThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)),
+            ComparableNumberSearchOperator.LessThanOrEqual =&gt; Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)),
+            ComparableNumberSearchOperator.GreaterThan =&gt; Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)),
+            ComparableNumberSearchOperator.GreaterThanOrEqual =&gt; Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)),
+            ComparableNumberSearchOperator.BetweenOpen =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keys[1], typeOfNullableNumber))),
+            ComparableNumberSearchOperator.BetweenLeftClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keys[1], typeOfNullableNumber))),
+            ComparableNumberSearchOperator.BetweenRightClosed =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keys[1], typeOfNullableNumber))),
+            ComparableNumberSearchOperator.BetweenClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keys[0], typeOfNullableNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keys[1], typeOfNullableNumber))),
+            ComparableNumberSearchOperator.InBetweenOpen =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            ComparableNumberSearchOperator.InBetweenLeftClosed =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            ComparableNumberSearchOperator.InBetweenRightClosed =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            ComparableNumberSearchOperator.InBetweenClosed =&gt; CombineInBetweenBody(keys, @operator, memberAccessor),
+            _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+        };
+
+        return Expression.Lambda&lt;Func&lt;TOwner, bool&gt;&gt;(newBody, memberAccessor.Parameters);
+    }
+
+    private static Expression CombineInBetweenBody&lt;TOwner, TNumber&gt;(
+        IReadOnlyList&lt;TNumber?&gt; keys,
+        ComparableNumberSearchOperator @operator,
+        Expression&lt;Func&lt;TOwner, TNumber&gt;&gt; memberAccessor)
+        where TNumber : struct
+    {
+        var typeOfNumber = typeof(TNumber);
+        var keysGroups = keys.Chunk(2);
+
+        Expression newBody = @operator switch
+        {
+            ComparableNumberSearchOperator.InBetweenOpen =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNumber))),
+            ComparableNumberSearchOperator.InBetweenLeftClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNumber))),
+            ComparableNumberSearchOperator.InBetweenRightClosed =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNumber))),
+            ComparableNumberSearchOperator.InBetweenClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNumber))),
+            _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+        };
+
+        foreach (var inKeys in keysGroups.Skip(1))
+        {
+            newBody = @operator switch
+            {
+                ComparableNumberSearchOperator.InBetweenOpen =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNumber)))),
+                ComparableNumberSearchOperator.InBetweenLeftClosed =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNumber)))),
+                ComparableNumberSearchOperator.InBetweenRightClosed =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNumber)))),
+                ComparableNumberSearchOperator.InBetweenClosed =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNumber)))),
+                _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+            };
+        }
+
+        return newBody;
+    }
+
+    private static Expression CombineInBetweenBody&lt;TOwner, TNumber&gt;(
+        IReadOnlyList&lt;TNumber?&gt; keys,
+        ComparableNumberSearchOperator @operator,
+        Expression&lt;Func&lt;TOwner, TNumber?&gt;&gt; memberAccessor)
+        where TNumber : struct
+    {
+        var typeOfNullableNumber = typeof(TNumber?);
+
+        var keysGroups = keys.Chunk(2);
+
+        Expression newBody = @operator switch
+        {
+            ComparableNumberSearchOperator.InBetweenOpen =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNullableNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNullableNumber))),
+            ComparableNumberSearchOperator.InBetweenLeftClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNullableNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNullableNumber))),
+            ComparableNumberSearchOperator.InBetweenRightClosed =&gt; Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNullableNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNullableNumber))),
+            ComparableNumberSearchOperator.InBetweenClosed =&gt; Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[0], typeOfNullableNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(keysGroups.First()[1], typeOfNullableNumber))),
+            _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+        };
+
+        foreach (var inKeys in keysGroups.Skip(1))
+        {
+            newBody = @operator switch
+            {
+                ComparableNumberSearchOperator.InBetweenOpen =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNullableNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNullableNumber)))),
+                ComparableNumberSearchOperator.InBetweenLeftClosed =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNullableNumber)), Expression.LessThan(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNullableNumber)))),
+                ComparableNumberSearchOperator.InBetweenRightClosed =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThan(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNullableNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNullableNumber)))),
+                ComparableNumberSearchOperator.InBetweenClosed =&gt; Expression.OrElse(newBody, Expression.AndAlso(Expression.GreaterThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[0], typeOfNullableNumber)), Expression.LessThanOrEqual(memberAccessor.Body, Expression.Constant(inKeys[1], typeOfNullableNumber)))),
+                _ =&gt; throw new InvalidDataException(nameof(ComparableNumberSearchOperator))
+            };
+        }
+
+        return newBody;
+    }
+}
+</code></pre>
+<p>辅助类型用于统一定义表达式的拼接方式等，因为这些拼接对于大多数基础数据类型来说都是通用的。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 合并表达式 And Or Not扩展方法
+/// &lt;/summary&gt;
+public static class ExpressionExtensions
+{
+    /// &lt;summary&gt;
+    /// 合并表达式 expr1 AND expr2
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;表达式参数类型&lt;/typeparam&gt;
+    /// &lt;param name="expr1"&gt;待合并的表达式1&lt;/param&gt;
+    /// &lt;param name="expr2"&gt;待合并的表达式2&lt;/param&gt;
+    /// &lt;returns&gt;合并的表达式&lt;/returns&gt;
+    public static Expression&lt;Func&lt;T, bool&gt;&gt; AndAlso&lt;T&gt;(this Expression&lt;Func&lt;T, bool&gt;&gt; expr1, Expression&lt;Func&lt;T, bool&gt;&gt; expr2)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(expr1));
+        ArgumentNullException.ThrowIfNull(nameof(expr2));
+
+        ParameterReplaceExpressionVisitor visitor = new();
+        Dictionary&lt;ParameterExpression, ParameterExpression&gt; replaceMapping = [];
+
+        ParameterExpression newParameter = Expression.Parameter(typeof(T), expr1.Parameters[0].Name);
+        replaceMapping[expr1.Parameters[0]] = newParameter;
+
+        var left = visitor.ReplaceParameter(expr1, replaceMapping);
+
+        replaceMapping.Clear();
+        replaceMapping[expr2.Parameters[0]] = newParameter;
+        var right = visitor.ReplaceParameter(expr2, replaceMapping);
+
+        BinaryExpression body = Expression.AndAlso(left!.Body, right!.Body);
+        return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, newParameter);
+    }
+
+    /// &lt;summary&gt;
+    /// 合并多个表达式 expr1 AND expr2 AND ...
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;表达式参数类型&lt;/typeparam&gt;
+    /// &lt;param name="source"&gt;待合并的表达式集合&lt;/param&gt;
+    /// &lt;returns&gt;合并的表达式&lt;/returns&gt;
+    public static Expression&lt;Func&lt;T, bool&gt;&gt;? AndAlsoAll&lt;T&gt;(this IEnumerable&lt;Expression&lt;Func&lt;T, bool&gt;&gt;&gt; source)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(source));
+
+        if (!source.Any() || !source.Skip(1).Any()) return source.FirstOrDefault();
+
+        ParameterReplaceExpressionVisitor visitor = new();
+        Dictionary&lt;ParameterExpression, ParameterExpression&gt; replaceMapping = [];
+
+        var first = source.First();
+        ParameterExpression newParameter = Expression.Parameter(typeof(T), first.Parameters[0].Name);
+        replaceMapping[first.Parameters[0]] = newParameter;
+
+        var left = visitor.ReplaceParameter(first, replaceMapping);
+
+        List&lt;LambdaExpression&gt; rights = [];
+        foreach (var right in source.Skip(1))
+        {
+            replaceMapping.Clear();
+            replaceMapping[right.Parameters[0]] = newParameter;
+
+            rights.Add(visitor.ReplaceParameter(right, replaceMapping)!);
+        }
+
+        BinaryExpression body = Expression.AndAlso(left!.Body, rights[0].Body);
+        foreach (var right in rights.Skip(1))
+        {
+            body = Expression.AndAlso(body, right.Body);
+        }
+        return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, newParameter);
+    }
+
+    /// &lt;summary&gt;
+    /// 合并表达式 expr1 OR expr2
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;表达式参数类型&lt;/typeparam&gt;
+    /// &lt;param name="expr1"&gt;待合并的表达式1&lt;/param&gt;
+    /// &lt;param name="expr2"&gt;待合并的表达式2&lt;/param&gt;
+    /// &lt;returns&gt;合并的表达式&lt;/returns&gt;
+    public static Expression&lt;Func&lt;T, bool&gt;&gt; OrElse&lt;T&gt;(this Expression&lt;Func&lt;T, bool&gt;&gt; expr1, Expression&lt;Func&lt;T, bool&gt;&gt; expr2)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(expr1));
+        ArgumentNullException.ThrowIfNull(nameof(expr2));
+
+        ParameterReplaceExpressionVisitor visitor = new();
+        Dictionary&lt;ParameterExpression, ParameterExpression&gt; replaceMapping = [];
+
+        ParameterExpression newParameter = Expression.Parameter(typeof(T), expr1.Parameters[0].Name);
+        replaceMapping[expr1.Parameters[0]] = newParameter;
+
+        var left = visitor.ReplaceParameter(expr1, replaceMapping);
+
+        replaceMapping.Clear();
+        replaceMapping[expr2.Parameters[0]] = newParameter;
+        var right = visitor.ReplaceParameter(expr2, replaceMapping);
+
+        BinaryExpression body = Expression.OrElse(left!.Body, right!.Body);
+        return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, newParameter);
+    }
+
+    /// &lt;summary&gt;
+    /// 合并多个表达式 expr1 OR expr2 OR ...
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;表达式参数类型&lt;/typeparam&gt;
+    /// &lt;returns&gt;合并的表达式&lt;/returns&gt;
+    public static Expression&lt;Func&lt;T, bool&gt;&gt;? OrElseAll&lt;T&gt;(this IEnumerable&lt;Expression&lt;Func&lt;T, bool&gt;&gt;&gt; source)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(source));
+
+        if (!source.Any() || !source.Skip(1).Any()) return source.FirstOrDefault();
+
+        ParameterReplaceExpressionVisitor visitor = new();
+        Dictionary&lt;ParameterExpression, ParameterExpression&gt; replaceMapping = [];
+
+        var first = source.First();
+        ParameterExpression newParameter = Expression.Parameter(typeof(T), first.Parameters[0].Name);
+        replaceMapping[first.Parameters[0]] = newParameter;
+
+        var left = visitor.ReplaceParameter(first, replaceMapping);
+
+        List&lt;LambdaExpression&gt; rights = [];
+        foreach (var right in source.Skip(1))
+        {
+            replaceMapping.Clear();
+            replaceMapping[right.Parameters[0]] = newParameter;
+
+            rights.Add(visitor.ReplaceParameter(right, replaceMapping)!);
+        }
+
+        BinaryExpression body = Expression.OrElse(left!.Body, rights[0].Body);
+        foreach (var right in rights.Skip(1))
+        {
+            body = Expression.OrElse(body, right.Body);
+        }
+        return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, newParameter);
+    }
+
+    /// &lt;summary&gt;
+    /// 表达式取非 NOT
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;表达式参数类型&lt;/typeparam&gt;
+    /// &lt;param name="expr"&gt;原表达式&lt;/param&gt;
+    /// &lt;returns&gt;已经取非的表达式&lt;/returns&gt;
+    public static Expression&lt;Func&lt;T, bool&gt;&gt; Not&lt;T&gt;(this Expression&lt;Func&lt;T, bool&gt;&gt; expr)
+    {
+        ArgumentNullException.ThrowIfNull(nameof(expr));
+
+        UnaryExpression body = Expression.Not(expr.Body);
+        return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, expr.Parameters[0]);
+    }
+}
+
+/// &lt;summary&gt;
+/// 替换表达式参数的访问器
+/// &lt;/summary&gt;
+public sealed class ParameterReplaceExpressionVisitor : ExpressionVisitor
+{
+    private readonly Lock _lock = new();
+
+    private volatile bool _calledFromReplaceParameter = false;
+    private IReadOnlyDictionary&lt;ParameterExpression, ParameterExpression&gt;? _parameterReplaceMapping;
+
+    /// &lt;summary&gt;
+    /// 把指定表达式的参数替换为新的参数。
+    /// &lt;/summary&gt;
+    /// &lt;param name="expr"&gt;要替换参数的表达式。&lt;/param&gt;
+    /// &lt;param name="parameterReplaceMapping"&gt;替换用的新参数表达式映射。Key是表达式中的现有参数，Value是新参数。&lt;/param&gt;
+    /// &lt;returns&gt;已替换参数的表达式。&lt;/returns&gt;
+    /// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+    /// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+    public LambdaExpression? ReplaceParameter(LambdaExpression expr, IReadOnlyDictionary&lt;ParameterExpression, ParameterExpression&gt; parameterReplaceMapping)
+    {
+        ArgumentNullException.ThrowIfNull(expr);
+        ArgumentNullException.ThrowIfNull(parameterReplaceMapping);
+
+        if (expr.Parameters.Count == 0) throw new ArgumentException($"{nameof(expr)}不能是无参数表达式。", nameof(expr));
+
+        lock (_lock)
+        {
+            try
+            {
+                // 复制参数避免多线程修改损坏参数
+                var replaceCopy = parameterReplaceMapping.AsEnumerable().ToDictionary();
+
+                if (replaceCopy.Count == 0) throw new ArgumentException($"{nameof(parameterReplaceMapping)}不能没有元素。", nameof(parameterReplaceMapping));
+
+                if (expr.Parameters.Count &lt; replaceCopy.Count) throw new ArgumentException($"{nameof(parameterReplaceMapping)}的元素数量不能大于表达式的参数数量。", nameof(parameterReplaceMapping));
+
+                foreach (var mapping in replaceCopy)
+                {
+                    if (!expr.Parameters.Contains(mapping.Key))
+                        throw new ArgumentException("被替换的参数必须是表达式使用的参数。", nameof(parameterReplaceMapping));
+                }
+
+                _parameterReplaceMapping = replaceCopy;
+                _calledFromReplaceParameter = true;
+
+                var result = Visit(expr);
+
+                return result as LambdaExpression;
+            }
+            catch
+            {
+                throw;
+            }
+            finally
+            {
+                _calledFromReplaceParameter = false;
+                _parameterReplaceMapping = null;
+            }
+        }
+    }
+
+    [return: NotNullIfNotNull(nameof(node))]
+    public override Expression? Visit(Expression? node)
+    {
+        if (!_calledFromReplaceParameter) throw new InvalidOperationException($"Don't call directly, call {nameof(ReplaceParameter)} instead.");
+
+        return base.Visit(node);
+    }
+
+    protected override Expression VisitParameter(ParameterExpression node)
+    {
+        if (_parameterReplaceMapping!.TryGetValue(node, out var newParameter)) return newParameter;
+
+        return base.VisitParameter(node);
+    }
+}
+</code></pre>
+<p>专用于返回<code>bool</code>类型的表达式的合并扩展。</p>
+<h2 id="扩展复杂筛选支持">扩展复杂筛选支持</h2>
+<p>有时查询条件可能比较复杂，单个生成器无法表达。因此需要一个用于描述更复杂的条件的生成器，单个生成器无法描述的情况使用多个生成器组合来实现。既然复杂条件是由单个条件组合而来，最好能复用已经定义好的单个筛选器。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 支持复杂条件嵌套的高级查询条件构造器接口
+/// &lt;/summary&gt;
+/// &lt;typeparam name="TFilterPredicateBuilder"&gt;基础查询条件构造器&lt;/typeparam&gt;
+/// &lt;typeparam name="T"&gt;要查询的数据类型&lt;/typeparam&gt;
+public interface IAdvancedFilterPredicateBuilder&lt;out TFilterPredicateBuilder, T&gt; : IFilterPredicateBuilder&lt;T&gt;
+    where TFilterPredicateBuilder : IFilterPredicateBuilder&lt;T&gt;
+{
+    /// &lt;summary&gt;
+    /// 基础查询条件集合
+    /// &lt;/summary&gt;
+    IReadOnlyList&lt;TFilterPredicateBuilder&gt;? Filters { get; }
+
+    /// &lt;summary&gt;
+    /// 高级查询条件组集合
+    /// &lt;/summary&gt;
+    IReadOnlyList&lt;IAdvancedFilterPredicateBuilder&lt;TFilterPredicateBuilder, T&gt;&gt;? FilterGroups { get; }
+}
+</code></pre>
+<p>高级查询接口允许组合和嵌套任意多个筛选器以实现更复杂的条件。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 支持复杂条件嵌套的高级查询构造器
+/// &lt;/summary&gt;
+/// &lt;typeparam name="TQueryBuilder"&gt;基础查询构造器&lt;/typeparam&gt;
+/// &lt;typeparam name="T"&gt;要查询的数据类型&lt;/typeparam&gt;
+/// &lt;param name="Queries"&gt;基础查询条件集合&lt;/param&gt;
+/// &lt;param name="QueryGroups"&gt;高级查询条件组集合&lt;/param&gt;
+/// &lt;param name="CombineType"&gt;条件组合方式&lt;/param&gt;
+/// &lt;param name="Reverse"&gt;是否反转条件&lt;/param&gt;
+public record AdvancedQueryBuilder&lt;TQueryBuilder, T&gt;(
+    ImmutableList&lt;TQueryBuilder&gt;? Queries = null,
+    ImmutableList&lt;AdvancedQueryBuilder&lt;TQueryBuilder, T&gt;&gt;? QueryGroups = null,
+    [EnumDataType(typeof(PredicateCombineKind))]
+    PredicateCombineKind? CombineType = PredicateCombineKind.And,
+    bool Reverse = false)
+    : IAdvancedFilterPredicateBuilder&lt;TQueryBuilder, T&gt;
+    , IPredicateReversible
+    where TQueryBuilder : IFilterPredicateBuilder&lt;T&gt;
+{
+    /// &lt;inheritdoc/&gt;
+    public IReadOnlyList&lt;TQueryBuilder&gt;? Filters =&gt; Queries;
+
+    /// &lt;inheritdoc/&gt;
+    public IReadOnlyList&lt;IAdvancedFilterPredicateBuilder&lt;TQueryBuilder, T&gt;&gt;? FilterGroups =&gt; QueryGroups;
+
+    /// &lt;summary&gt;
+    /// 获取查询条件
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;组合完成的查询条件&lt;/returns&gt;
+    public Expression&lt;Func&lt;T, bool&gt;&gt;? GetWherePredicate()
+    {
+        var where = CombinePredicates(Queries?.Select(static q =&gt; q.GetWherePredicate())
+            .Concat(QueryGroups?.Select(static qg =&gt; qg.GetWherePredicate()) ?? [])
+            .Where(static p =&gt; p is not null)!);
+
+        return this.ApplyReversiblePredicate(where);
+    }
+
+    /// &lt;summary&gt;
+    /// 组合查询条件
+    /// &lt;/summary&gt;
+    /// &lt;param name="predicates"&gt;待组合的子条件&lt;/param&gt;
+    /// &lt;returns&gt;&lt;/returns&gt;
+    /// &lt;exception cref="NotSupportedException"&gt;&lt;/exception&gt;
+    protected Expression&lt;Func&lt;T, bool&gt;&gt;? CombinePredicates(IEnumerable&lt;Expression&lt;Func&lt;T, bool&gt;&gt;&gt;? predicates)
+    {
+        var predicate = predicates?.FirstOrDefault();
+        if (predicates?.Any() is true)
+        {
+            predicate = CombineType switch
+            {
+                PredicateCombineKind.And =&gt; predicates?.AndAlsoAll(),
+                PredicateCombineKind.Or =&gt; predicates?.OrElseAll(),
+                _ =&gt; throw new NotSupportedException(CombineType.ToString()),
+            };
+        }
+
+        return predicate;
+    }
+}
+</code></pre>
+<p>单个条件可以获取对应的筛选表达式，那么这些条件的组合也就是对这些表达式进行组合。</p>
+<h2 id="添加排序和分页支持">添加排序和分页支持</h2>
+<p>分页的前提是排序，否则分页的结果不稳定。对于分页，通常还想获得符合条件的数据总量用于计算页数，但是排序并不影响总数计算。如果能在计算总数时忽略排序，仅在获取某一页数据时使用排序最好。这就要求我们分别存储和处理筛选条件和排序条件。筛选条件的问题已经在前面解决了，这里只需要关注排序条件的问题。</p>
+<h3 id="排序的概念接口">排序的概念接口</h3>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 排序查询构造器接口
+/// &lt;/summary&gt;
+/// &lt;typeparam name="T"&gt;查询的元素类型&lt;/typeparam&gt;
+public interface IOrderedQueryBuilder&lt;T&gt;
+{
+    /// &lt;summary&gt;
+    /// 对查询应用排序
+    /// &lt;/summary&gt;
+    /// &lt;param name="query"&gt;原始查询&lt;/param&gt;
+    /// &lt;returns&gt;已排序的查询&lt;/returns&gt;
+    IOrderedQueryable&lt;T&gt; ApplyOrder(IQueryable&lt;T&gt; query);
+}
+
+/// &lt;summary&gt;
+/// 可排序查询接口
+/// &lt;/summary&gt;
+/// &lt;typeparam name="T"&gt;查询的元素类型&lt;/typeparam&gt;
+/// &lt;typeparam name="TOrderKey"&gt;可用的排序关键字枚举类型&lt;/typeparam&gt;
+
+public interface IKeySelectorOrderedQueryBuilder&lt;T, TOrderKey&gt; : IOrderedQueryBuilder&lt;T&gt;
+    where TOrderKey : struct, Enum
+{
+    /// &lt;summary&gt;
+    /// 获取支持的排序关键字选择器
+    /// &lt;/summary&gt;
+    IReadOnlyDictionary&lt;TOrderKey, Expression&lt;Func&lt;T, object?&gt;&gt;&gt; GetSupportedOrderKeySelectors();
+
+    /// &lt;summary&gt;
+    /// 排序关键字信息
+    /// &lt;/summary&gt;
+    ImmutableList&lt;OrderInfo&lt;TOrderKey&gt;&gt;? OrderKeys { get; }
+}
+
+/// &lt;summary&gt;
+/// 排序信息
+/// &lt;/summary&gt;
+/// &lt;typeparam name="T"&gt;排序对象的类型&lt;/typeparam&gt;
+/// &lt;param name="Key"&gt;排序关键字&lt;/param&gt;
+/// &lt;param name="OrderKind"&gt;排序方式&lt;/param&gt;
+public record OrderInfo&lt;T&gt;(
+    T Key,
+    [EnumDataType(typeof(OrderKind))]
+    OrderKind OrderKind = OrderKind.Asc)
+    where T : struct, Enum
+{
+    /// &lt;summary&gt;
+    /// 排序关键字
+    /// &lt;/summary&gt;
+    public T Key { get; } = CheckOrderKey(Key);
+
+    private static T CheckOrderKey(T value)
+    {
+        if (!Enum.IsDefined(value)) throw new InvalidEnumArgumentException(nameof(Key), int.Parse(value.ToString()), typeof(T));
+        return value;
+    }
+}
+
+/// &lt;summary&gt;
+/// 排序方式
+/// &lt;/summary&gt;
+public enum OrderKind
+{
+    /// &lt;summary&gt;
+    /// 升序
+    /// &lt;/summary&gt;
+    Asc = 1,
+
+    /// &lt;summary&gt;
+    /// 降序
+    /// &lt;/summary&gt;
+    Desc = 2,
+}
+</code></pre>
+<p>同样的，第一个接口只描述如何为查询附加排序，第二个接口描述序列化传输的方式。LINQ中的排序方法参数是一个排序关键字属性访问表达式，属性的类型就是表达式的返回值类型，属性类型千变万化，因此只能使用返回<code>object</code>的表达式来存储。表达式关键字本身无法序列化传输，因此笔者选择使用枚举来指代表达式，这也同时限定了可用于排序的属性，有利于安全。</p>
+<h3 id="分页的概念接口">分页的概念接口</h3>
+<p>目前有两种流行的分页方式，偏移量分页和游标分页。偏移量分页支持随机页码跳转，也需要提前计算数据总数，数据量大或访问尾部页码时性能会下降。游标分页则是根据唯一键游标排序来进行，可以是两个游标之间的数据或单个游标和获取数据量的组合。在返回的结果中需要附带相邻页面的起始游标，因此实际查询数据时需要多查一条数据，多查的这一条数据只需要游标值，不需要数据本身。本文以偏移量分页为例。</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 可页码分页查询接口
+/// &lt;/summary&gt;
+public interface IOffsetPagingSupport
+{
+    /// &lt;summary&gt;
+    /// 分页信息
+    /// &lt;/summary&gt;
+    OffsetPageInfo OffsetPage { get; }
+}
+
+/// &lt;summary&gt;
+/// 页码分页信息
+/// &lt;/summary&gt;
+/// &lt;param name="PageIndex"&gt;页码&lt;/param&gt;
+/// &lt;param name="PageSize"&gt;页面大小&lt;/param&gt;
+public record OffsetPageInfo(
+    [Range(1, int.MaxValue, ErrorMessage = DataAnnotationErrorMessageDefaults.Range)] int PageIndex = 1,
+    [Range(1, int.MaxValue, ErrorMessage = DataAnnotationErrorMessageDefaults.Range)] int PageSize = 10
+)
+{
+    /// &lt;summary&gt;
+    /// 跳过的页数
+    /// &lt;/summary&gt;
+    public int SkipedPageCount =&gt; PageIndex - 1;
+
+    /// &lt;summary&gt;
+    /// 跳过的元素数量
+    /// &lt;/summary&gt;
+    public int SkipedElementCount =&gt; SkipedPageCount * PageSize;
+}
+
+/// &lt;summary&gt;
+/// 页码分页查询构造扩展
+/// &lt;/summary&gt;
+public static class OffsetPageQueryBuilderExtensions
+{
+    /// &lt;summary&gt;
+    /// 页码分页
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;查询的元素类型&lt;/typeparam&gt;
+    /// &lt;param name="offsetPaging"&gt;分页信息&lt;/param&gt;
+    /// &lt;param name="query"&gt;要应用分页的查询&lt;/param&gt;
+    /// &lt;returns&gt;已页码分页的查询&lt;/returns&gt;
+    public static IQueryable&lt;T&gt; OffsetPage&lt;T&gt;(this IOffsetPagingSupport offsetPaging, IQueryable&lt;T&gt; query)
+    {
+        ArgumentNullException.ThrowIfNull(offsetPaging);
+        ArgumentNullException.ThrowIfNull(query);
+        var paging = offsetPaging.OffsetPage;
+
+        return query.Skip(paging.SkipedElementCount).Take(paging.PageSize);
+    }
+}
+</code></pre>
+<h3 id="完整的分页查询生成器">完整的分页查询生成器</h3>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 分页查询构造器
+/// &lt;/summary&gt;
+/// &lt;typeparam name="TQueryBuilder"&gt;查询构造器类型&lt;/typeparam&gt;
+/// &lt;typeparam name="T"&gt;查询的数据类型&lt;/typeparam&gt;
+/// &lt;param name="Query"&gt;基础查询&lt;/param&gt;
+/// &lt;param name="OffsetPage"&gt;分页信息&lt;/param&gt;
+public abstract record OffsetPagedQueryBuilder&lt;TQueryBuilder, T&gt;(
+    TQueryBuilder Query,
+    OffsetPageInfo? OffsetPage = null)
+    : IFilterPredicateBuilder&lt;T&gt;
+    , IOrderedQueryBuilder&lt;T&gt;
+    , IOffsetPagingSupport
+    where TQueryBuilder : IFilterPredicateBuilder&lt;T&gt;
+{
+    /// &lt;inheritdoc/&gt;
+    public Expression&lt;Func&lt;T, bool&gt;&gt;? GetWherePredicate() =&gt; Query.GetWherePredicate();
+
+    /// &lt;inheritdoc/&gt;
+    public virtual OffsetPageInfo OffsetPage { get; } = OffsetPage ?? new();
+
+    /// &lt;inheritdoc/&gt;
+    public abstract IOrderedQueryable&lt;T&gt; ApplyOrder(IQueryable&lt;T&gt; query);
+}
+
+/// &lt;summary&gt;
+/// 查询的排序方法
+/// &lt;/summary&gt;
+public enum QueryableOrderMethod
+{
+    /// &lt;summary&gt;
+    /// 优先升序
+    /// &lt;/summary&gt;
+    OrderBy = 1,
+
+    /// &lt;summary&gt;
+    /// 优先降序
+    /// &lt;/summary&gt;
+    OrderByDescending,
+
+    /// &lt;summary&gt;
+    /// 次一级升序
+    /// &lt;/summary&gt;
+    ThenBy,
+
+    /// &lt;summary&gt;
+    /// 次一级降序
+    /// &lt;/summary&gt;
+    ThenByDescending
+}
+
+/// &lt;summary&gt;
+/// 关键字排序查询构造器扩展
+/// &lt;/summary&gt;
+public static class KeySelectorOrderQueryBuilderExtensions
+{
+    private static readonly MethodInfo _queryableOederByOfT = typeof(Queryable).GetMethods()
+        .Single(static m =&gt; m.Name is nameof(Queryable.OrderBy) &amp;&amp; m.GetParameters().Length is 2);
+
+    private static readonly MethodInfo _queryableThenByOfT = typeof(Queryable).GetMethods()
+        .Single(static m =&gt; m.Name is nameof(Queryable.ThenBy) &amp;&amp; m.GetParameters().Length is 2);
+
+    private static readonly MethodInfo _queryableOrderByDescendingOfT = typeof(Queryable).GetMethods()
+        .Single(static m =&gt; m.Name is nameof(Queryable.OrderByDescending) &amp;&amp; m.GetParameters().Length is 2);
+
+    private static readonly MethodInfo _queryableThenByDescendingOfT = typeof(Queryable).GetMethods()
+        .Single(static m =&gt; m.Name is nameof(Queryable.ThenByDescending) &amp;&amp; m.GetParameters().Length is 2);
+
+    /// &lt;summary&gt;
+    /// 对查询应用关键字排序
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;查询的元素类型&lt;/typeparam&gt;
+    /// &lt;typeparam name="TOrderKey"&gt;可用的排序关键字类型&lt;/typeparam&gt;
+    /// &lt;param name="OrderInfos"&gt;排序信息&lt;/param&gt;
+    /// &lt;param name="query"&gt;原始查询&lt;/param&gt;
+    /// &lt;returns&gt;已排序的查询&lt;/returns&gt;
+    /// &lt;exception cref="InvalidDataException"&gt;&lt;/exception&gt;
+    public static IOrderedQueryable&lt;T&gt; ApplyKeyedOrder&lt;T, TOrderKey&gt;(this IKeySelectorOrderedQueryBuilder&lt;T, TOrderKey&gt; OrderInfos, IQueryable&lt;T&gt; query)
+        where TOrderKey : struct, Enum
+    {
+        ArgumentNullException.ThrowIfNull(OrderInfos);
+        ArgumentNullException.ThrowIfNull(query);
+        if (OrderInfos.GetSupportedOrderKeySelectors()?.Count &gt; 0 is false) throw new InvalidDataException($"{nameof(OrderInfos.GetSupportedOrderKeySelectors)}");
+
+        IOrderedQueryable&lt;T&gt; orderedQuery;
+        QueryableOrderMethod methodKind;
+        MethodInfo orderMethod;
+        Expression&lt;Func&lt;T, object?&gt;&gt; keySelector;
+
+        var firstOrder = OrderInfos.OrderKeys?.FirstOrDefault();
+        if (firstOrder is not null)
+        {
+            methodKind = firstOrder.OrderKind switch
+            {
+                OrderKind.Asc =&gt; QueryableOrderMethod.OrderBy,
+                OrderKind.Desc =&gt; QueryableOrderMethod.OrderByDescending,
+                _ =&gt; throw new InvalidDataException($"{nameof(OrderKind)}"),
+            };
+
+            keySelector = OrderInfos.GetSupportedOrderKeySelectors()[firstOrder.Key];
+            orderMethod = GetQueryOrderMethod&lt;T&gt;(methodKind, keySelector.ReturnType);
+            orderedQuery = (IOrderedQueryable&lt;T&gt;)orderMethod.Invoke(null, [query, keySelector])!;
+        }
+        else
+        {
+            keySelector = OrderInfos.GetSupportedOrderKeySelectors().First().Value;
+            orderedQuery = (IOrderedQueryable&lt;T&gt;)(GetQueryOrderMethod&lt;T&gt;(QueryableOrderMethod.OrderBy, keySelector.ReturnType)
+                .Invoke(null, [query, keySelector]))!;
+        }
+
+        foreach (var subsequentOrder in OrderInfos.OrderKeys?.Skip(1) ?? [])
+        {
+            if (subsequentOrder is not null)
+            {
+                methodKind = subsequentOrder.OrderKind switch
+                {
+                    OrderKind.Asc =&gt; QueryableOrderMethod.ThenBy,
+                    OrderKind.Desc =&gt; QueryableOrderMethod.ThenByDescending,
+                    _ =&gt; throw new InvalidDataException($"{nameof(OrderKind)}"),
+                };
+
+                keySelector = OrderInfos.GetSupportedOrderKeySelectors()[subsequentOrder.Key];
+                orderMethod = GetQueryOrderMethod&lt;T&gt;(methodKind, keySelector.ReturnType);
+                orderedQuery = (IOrderedQueryable&lt;T&gt;)orderMethod.Invoke(null, [orderedQuery, keySelector])!;
+            }
+        }
+
+        return orderedQuery;
+    }
+
+    private static MethodInfo GetQueryOrderMethod&lt;T&gt;(QueryableOrderMethod method, Type orderKeyType)
+    {
+        return method switch
+        {
+            QueryableOrderMethod.OrderBy =&gt; _queryableOederByOfT.MakeGenericMethod(typeof(T), orderKeyType),
+            QueryableOrderMethod.OrderByDescending =&gt; _queryableOrderByDescendingOfT.MakeGenericMethod(typeof(T), orderKeyType),
+            QueryableOrderMethod.ThenBy =&gt; _queryableThenByOfT.MakeGenericMethod(typeof(T), orderKeyType),
+            QueryableOrderMethod.ThenByDescending =&gt; _queryableThenByDescendingOfT.MakeGenericMethod(typeof(T), orderKeyType),
+            _ =&gt; throw new InvalidDataException($"{nameof(method)}"),
+        };
+    }
+}
+</code></pre>
+<p>此处的抽象基类不实现关键字排序是因为无法确定最终查询是否支持关键字排序，有可能是在代码中定义的静态排序规则。如果确实支持关键字排序，在最终类型上实现关键字排序接口即可。扩展类型则用于快速实现关键字排序表达式生成。</p>
+<h2 id="使用示例">使用示例</h2>
+<h3 id="演示用数据类型">演示用数据类型</h3>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// 示例1
+/// &lt;/summary&gt;
+public class Entity1
+{
+    public int Id { get; set; }
+
+    public string? Text1 { get; set; }
+
+    public Entity2? Entity2 { get; set; }
+
+    public List&lt;Entity3&gt; Entities3 { get; set; } = [];
+}
+
+/// &lt;summary&gt;
+/// 示例2
+/// &lt;/summary&gt;
+public class Entity2
+{
+    public int Id { get; set; }
+
+    public string? Text2 { get; set; }
+}
+
+/// &lt;summary&gt;
+/// 示例3
+/// &lt;/summary&gt;
+public class Entity3
+{
+    public int Id { get; set; }
+
+    public string? Text3 { get; set; }
+
+    public Entity1? Entity1 { get; set; }
+}
+</code></pre>
+<h3 id="基础查询定义">基础查询定义</h3>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// Entity1查询生成器
+/// &lt;/summary&gt;
+/// &lt;param name="Text1"&gt;Entity1文本&lt;/param&gt;
+/// &lt;param name="Id"&gt;Entity1的Id&lt;/param&gt;
+/// &lt;param name="Entity2"&gt;Entity1的Entity2筛选&lt;/param&gt;
+/// &lt;param name="Entities3"&gt;Entity1的Entity3集合筛选&lt;/param&gt;
+/// &lt;param name="Reverse"&gt;是否反转条件&lt;/param&gt;
+/// &lt;inheritdoc cref="QueryBuilderBase{T}"/&gt;
+/// &lt;remarks&gt;
+/// 反转条件由&lt;see cref="QueryBuilderBase{T}"/&gt;在&lt;see cref="QueryBuilderBase{T}.GetWherePredicate()"/&gt;中自动进行，此处不需要处理。
+/// &lt;/remarks&gt;
+public sealed record Entity1QueryBuilder(
+    NumberSearchFilter&lt;int&gt;? Id = null,
+    StringSearchFilter? Text1 = null,
+    Entity2QueryBuilder? Entity2 = null,
+    CollectionMemberSearchFilter&lt;Entity3QueryBuilder, Entity3&gt;? Entities3 = null,
+    [EnumDataType(typeof(PredicateCombineKind))]
+    PredicateCombineKind? CombineType = PredicateCombineKind.And,
+    bool Reverse = false)
+    : QueryBuilderBase&lt;Entity1&gt;(CombineType)
+    , IPredicateReversible
+{
+    /// &lt;inheritdoc/&gt;
+    protected override Expression&lt;Func&lt;Entity1, bool&gt;&gt;? BuildWherePredicate()
+    {
+        List&lt;Expression&lt;Func&lt;Entity1, bool&gt;&gt;&gt; predicates = [];
+
+        predicates.AddIfNotNull(Id?.GetWherePredicate&lt;Entity1&gt;(e1 =&gt; e1.Id));
+        predicates.AddIfNotNull(Text1?.GetWherePredicate&lt;Entity1&gt;(e1 =&gt; e1.Text1!));
+        predicates.AddIfNotNull(Entity2?.GetWherePredicate&lt;Entity1&gt;(e1 =&gt; e1.Entity2!));
+        predicates.AddIfNotNull(Entities3?.GetWherePredicate&lt;Entity1&gt;(e1 =&gt; e1.Entities3));
+        predicates.AddIfNotNull(base.BuildWherePredicate());
+
+        var where = CombinePredicates(predicates);
+
+        return where;
+    }
+}
+
+/// &lt;summary&gt;
+/// Entity2查询生成器
+/// &lt;/summary&gt;
+/// &lt;param name="Text2"&gt;Entity2文本&lt;/param&gt;
+/// &lt;param name="Id"&gt;Entity2的Id&lt;/param&gt;
+/// &lt;param name="Reverse"&gt;是否反转条件&lt;/param&gt;
+/// &lt;inheritdoc cref="QueryBuilderBase{T}"/&gt;
+public sealed record Entity2QueryBuilder(
+    NumberSearchFilter&lt;int&gt;? Id = null,
+    StringSearchFilter? Text2 = null,
+    [EnumDataType(typeof(PredicateCombineKind))]
+    PredicateCombineKind? CombineType = PredicateCombineKind.And,
+    bool Reverse = false)
+    : QueryBuilderBase&lt;Entity2&gt;(CombineType)
+    , IPredicateReversible
+{
+    /// &lt;inheritdoc/&gt;
+    protected override Expression&lt;Func&lt;Entity2, bool&gt;&gt;? BuildWherePredicate()
+    {
+        List&lt;Expression&lt;Func&lt;Entity2, bool&gt;&gt;&gt; predicates = [];
+
+        predicates.AddIfNotNull(Id?.GetWherePredicate&lt;Entity2&gt;(e1 =&gt; e1.Id));
+        predicates.AddIfNotNull(Text2?.GetWherePredicate&lt;Entity2&gt;(e2 =&gt; e2.Text2!));
+        predicates.AddIfNotNull(base.BuildWherePredicate());
+
+        var where = CombinePredicates(predicates);
+
+        return where;
+    }
+}
+
+/// &lt;summary&gt;
+/// Entity3查询生成器
+/// &lt;/summary&gt;
+/// &lt;param name="Text3"&gt;Entity3文本&lt;/param&gt;
+/// &lt;param name="Entity1"&gt;Entity3的Entity1筛选&lt;/param&gt;
+/// &lt;param name="Id"&gt;Entity3的Id&lt;/param&gt;
+/// &lt;param name="Reverse"&gt;是否反转条件&lt;/param&gt;
+/// &lt;inheritdoc cref="QueryBuilderBase{T}"/&gt;
+public sealed record Entity3QueryBuilder(
+    NumberSearchFilter&lt;int&gt;? Id = null,
+    StringSearchFilter? Text3 = null,
+    Entity1QueryBuilder? Entity1 = null,
+    [EnumDataType(typeof(PredicateCombineKind))]
+    PredicateCombineKind? CombineType = PredicateCombineKind.And,
+    bool Reverse = false)
+    : QueryBuilderBase&lt;Entity3&gt;(CombineType)
+    , IPredicateReversible
+{
+    /// &lt;inheritdoc/&gt;
+    protected override Expression&lt;Func&lt;Entity3, bool&gt;&gt;? BuildWherePredicate()
+    {
+        List&lt;Expression&lt;Func&lt;Entity3, bool&gt;&gt;&gt; predicates = [];
+
+        predicates.AddIfNotNull(Id?.GetWherePredicate&lt;Entity3&gt;(e3 =&gt; e3.Id));
+        predicates.AddIfNotNull(Text3?.GetWherePredicate&lt;Entity3&gt;(e3 =&gt; e3.Text3!));
+        predicates.AddIfNotNull(Entity1?.GetWherePredicate&lt;Entity3&gt;(e3 =&gt; e3.Entity1!));
+        predicates.AddIfNotNull(base.BuildWherePredicate());
+
+        var where = CombinePredicates(predicates);
+
+        return where;
+    }
+}
+
+public static class CollectionExtensions
+{
+    /// &lt;summary&gt;
+    /// 如果&lt;paramref name="item"/&gt;不是&lt;see langword="null"/&gt;，把&lt;paramref name="item"/&gt;添加到&lt;paramref name="collection"/&gt;。
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="T"&gt;集合的元素类型。&lt;/typeparam&gt;
+    /// &lt;param name="collection"&gt;待添加元素的集合。&lt;/param&gt;
+    /// &lt;param name="item"&gt;要添加的元素。&lt;/param&gt;
+    /// &lt;returns&gt;是否成功把元素添加到集合。&lt;/returns&gt;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool AddIfNotNull&lt;T&gt;(this ICollection&lt;T&gt; collection, T? item)
+    {
+        ArgumentNullException.ThrowIfNull(collection, nameof(collection));
+
+        if (item is not null)
+        {
+            collection.Add(item);
+            return true;
+        }
+
+        return false;
+    }
+}
+
+</code></pre>
+<p>从示例中可以看出，只需要针对数据类型的基础数据使用标量过滤器类型实现基础筛选，对于引用的其他数据类型，可以直接复用引用类型的查询生成器，并使用由组合查询生成接口提供的组合方法即可自动把复杂类型的筛选条件嵌套到当前类型的属性上。</p>
+<h3 id="分页查询">分页查询</h3>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// Entity1分页查询生成器
+/// &lt;/summary&gt;
+/// &lt;inheritdoc cref="OffsetPagedQueryBuilder{TQueryBuilder, T2}"/&gt;
+public sealed record OffsetPagedEntity1QueryBuilder(
+    Entity1QueryBuilder Query,
+    OffsetPageInfo? OffsetPage = null,
+    ImmutableList&lt;OrderInfo&lt;Entity1OrderKey&gt;&gt;? OrderKeys = null)
+    : OffsetPagedQueryBuilder&lt;Entity1QueryBuilder, Entity1&gt;(Query, OffsetPage)
+    , IKeySelectorOrderedQueryBuilder&lt;Entity1, Entity1OrderKey&gt;
+{
+    /// &lt;inheritdoc/&gt;
+    public IReadOnlyDictionary&lt;Entity1OrderKey, Expression&lt;Func&lt;Entity1, object?&gt;&gt;&gt; GetSupportedOrderKeySelectors() =&gt; Entity1OrderKeySelector.Content;
+
+    /// &lt;inheritdoc/&gt;
+    public override IOrderedQueryable&lt;Entity1&gt; ApplyOrder(IQueryable&lt;Entity1&gt; query) =&gt; this.ApplyKeyedOrder(query);
+}
+
+/// &lt;summary&gt;
+/// Entity1排序关键字
+/// &lt;/summary&gt;
+public enum Entity1OrderKey : uint
+{
+    /// &lt;summary&gt;
+    /// Id
+    /// &lt;/summary&gt;
+    Id = 1,
+
+    /// &lt;summary&gt;
+    /// Text1
+    /// &lt;/summary&gt;
+    Text1
+}
+
+internal static class Entity1OrderKeySelector
+{
+    public static IReadOnlyDictionary&lt;Entity1OrderKey, Expression&lt;Func&lt;Entity1, object?&gt;&gt;&gt; Content { get; } =
+        FrozenDictionary.ToFrozenDictionary&lt;Entity1OrderKey, Expression&lt;Func&lt;Entity1, object?&gt;&gt;&gt;([
+            new(Entity1OrderKey.Id, e1 =&gt; e1.Id),
+            new(Entity1OrderKey.Text1, e1 =&gt; e1.Text1),
+        ]);
+}
+</code></pre>
+<p>分页查询只要利用之前定义好的泛型基类填充类型参数即可。由于实例类型需要实现关键字排序，因此要实现相关接口。</p>
+<h3 id="高级分页查询">高级分页查询</h3>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// Entity1分页高级查询生成器
+/// &lt;/summary&gt;
+/// &lt;param name="OrderKeys"&gt;排序信息&lt;/param&gt;
+/// &lt;inheritdoc cref="OffsetPagedQueryBuilder{TQueryBuilder, T}"/&gt;
+public sealed record OffsetPagedAdvancedEntity1QueryBuilder(
+    AdvancedQueryBuilder&lt;Entity1QueryBuilder, Entity1&gt; Query,
+    ImmutableList&lt;OrderInfo&lt;Entity1OrderKey&gt;&gt;? OrderKeys = null,
+    OffsetPageInfo? OffsetPage = null)
+    : OffsetPagedQueryBuilder&lt;AdvancedQueryBuilder&lt;Entity1QueryBuilder, Entity1&gt;, Entity1&gt;(
+        Query,
+        OffsetPage)
+    , IKeySelectorOrderedQueryBuilder&lt;Entity1, Entity1OrderKey&gt;
+{
+    /// &lt;inheritdoc/&gt;
+    public IReadOnlyDictionary&lt;Entity1OrderKey, Expression&lt;Func&lt;Entity1, object?&gt;&gt;&gt; GetSupportedOrderKeySelectors() =&gt; Entity1OrderKeySelector.Content;
+
+    /// &lt;inheritdoc/&gt;
+    public override IOrderedQueryable&lt;Entity1&gt; ApplyOrder(IQueryable&lt;Entity1&gt; query) =&gt; this.ApplyKeyedOrder(query);
+}
+</code></pre>
+<p>高级分页查询同样只需要填充预定义泛型基类的类型参数即可。</p>
+<h3 id="实例化查询生成器对象">实例化查询生成器对象</h3>
+<pre><code class="language-csharp">OffsetPagedAdvancedEntity1QueryBuilder queryBuilder =
+    new OffsetPagedAdvancedEntity1QueryBuilder(
+        Query: new AdvancedQueryBuilder&lt;Entity1QueryBuilder, Entity1&gt;(
+            Queries: [ // ImmutableList&lt;Entity1QueryBuilder&gt;
+                new Entity1QueryBuilder (
+                    Id: new NumberSearchFilter&lt;int&gt;([2], ComparableNumberSearchOperator.GreaterThan),
+                    Text1: new StringSearchFilter(["aa"], StringSearchOperator.Contains),
+                    Entity2: new Entity2QueryBuilder(
+                        new NumberSearchFilter&lt;int&gt;([100]),
+                        new StringSearchFilter(["ccc"])
+                    ),
+                    Entities3: null,
+                    CombineType: PredicateCombineKind.Or,
+                    Reverse: false
+                ),
+                new Entity1QueryBuilder(
+                    Id: new NumberSearchFilter&lt;int&gt;([5], ComparableNumberSearchOperator.LessThan)
+                )
+            ],
+            QueryGroups: [ // ImmutableList&lt;AdvancedQueryBuilder&lt;Entity1QueryBuilder, Entity1&gt;&gt;
+                new AdvancedQueryBuilder&lt;Entity1QueryBuilder, Entity1&gt;(
+                    Queries: [ // ImmutableList&lt;Entity1QueryBuilder&gt;
+                        new Entity1QueryBuilder(
+                            Id: new NumberSearchFilter&lt;int&gt;([20], ComparableNumberSearchOperator.Equal),
+                            Text1: new StringSearchFilter(["bb"], StringSearchOperator.Contains),
+                            Entity2: null,
+                            Entities3: new CollectionMemberSearchFilter&lt;Entity3QueryBuilder, Entity3&gt;(
+                                query: new Entity3QueryBuilder(
+                                    Id: null,
+                                    Text3: new StringSearchFilter(["fff"], StringSearchOperator.StartsWith)
+                                ),
+                                count: new NumberSearchFilter &lt; int &gt;([50]),
+                                percent: null,
+                                reverse: false
+                            ),
+                            CombineType: PredicateCombineKind.And,
+                            Reverse: false
+                        )
+                    ],
+                    QueryGroups:[ // ImmutableList&lt;AdvancedQueryBuilder&lt;Entity1QueryBuilder, Entity1&gt;&gt;
+                    ],
+                    CombineType: PredicateCombineKind.Or,
+                    Reverse: true
+                )
+            ],
+            CombineType: PredicateCombineKind.And,
+            Reverse: true
+        ),
+        OrderKeys: [ // ImmutableList&lt;OrderInfo&lt;Entity1OrderKey&gt;&gt;
+            new OrderInfo&lt;Entity1OrderKey&gt;(Entity1OrderKey.Text1, OrderKind.Desc),
+            new OrderInfo&lt;Entity1OrderKey&gt;(Entity1OrderKey.Id),
+        ],
+        OffsetPage: new OffsetPageInfo(1,20)
+    );
+</code></pre>
+<h3 id="在集合中使用生成器">在集合中使用生成器</h3>
+<pre><code class="language-csharp">// 准备一个集合
+var entity1Arr = new Entity1[
+        new()
+    ];
+// 从生成器中获取筛选表达式
+var where = queryBuilder.GetWherePredicate();
+// 把集合转换为 IQueryable&lt;Entity1&gt; 使用表达式类型的参数
+var query = entity1Arr.AsQueryable().Where(where!);
+// 把排序应用到查询
+var ordered = builder.ApplyOrder(query);
+// 把分页应用到查询
+var paged = builder.OffsetPage(ordered);
+// 把表达式编译为委托
+var whereFunc = where.Compile();
+</code></pre>
+<h3 id="最终得到的筛选表达式">最终得到的筛选表达式</h3>
+<pre><code class="language-csharp">Expression&lt;Func&lt;Entity1, bool&gt;&gt; exp = e1 =&gt;
+!(
+    (
+        e1.Id &gt; 2
+        || e1.Text1.Contains("aa")
+        || (e1.Entity2.Id == 100 &amp;&amp; e1.Entity2.Text2.Contains("ccc"))
+    )
+    &amp;&amp; e1.Id &lt; 5
+    &amp;&amp; !(
+        e1.Id == 20
+        &amp;&amp; e1.Text1.Contains("bb")
+        &amp;&amp; e1.Entities3
+            .AsQueryable()
+            .Where((Entity3 e3) =&gt; e3.Text3.StartsWith("fff"))
+            .Count() == 50
+    )
+);
+</code></pre>
+<p>这个表达式是经过手动去除多余的括号，重新整理缩进后得到的版本。原始表达式像这样：<img src="https://img2024.cnblogs.com/blog/1512608/202505/1512608-20250530170749770-1692745091.png" alt="image" loading="lazy"></p>
+<p>在此也推荐这个好用的VS插件：<a href="https://marketplace.visualstudio.com/items?itemName=vs-publisher-1232914.ReadableExpressionsVisualizers" title="ReadableExpressions.Visualizers" target="_blank" rel="noopener nofollow">ReadableExpressions.Visualizers</a>。这个插件可以把表达式显示成代码编辑器里的样子，对各种语法要素也会着色，调试动态拼接的表达式时非常好用。</p>
+<h3 id="ef-core生成的sqlsql-server">EF Core生成的SQL(SQL Server)</h3>
+<pre><code class="language-sql">DECLARE @__p_0 int = 0;
+DECLARE @__p_1 int = 20;
+
+SELECT [e].[Id], [e].[Entity2Id], [e].[Text1]
+FROM [Entity1] AS [e]
+LEFT JOIN [Entity2] AS [e0] ON [e].[Entity2Id] = [e0].[Id]
+WHERE ([e].[Id] &lt;= 2 AND ([e].[Text1] NOT LIKE N'%aa%' OR [e].[Text1] IS NULL) AND ([e0].[Id] &lt;&gt; 100 OR [e0].[Id] IS NULL OR [e0].[Text2] NOT LIKE N'%ccc%' OR [e0].[Text2] IS NULL)) OR [e].[Id] &gt;= 5 OR ([e].[Id] = 20 AND [e].[Text1] LIKE N'%bb%' AND (
+    SELECT COUNT(*)
+    FROM [Entity3] AS [e1]
+    WHERE [e].[Id] = [e1].[Entity1Id] AND [e1].[Text3] LIKE N'fff%') = 50)
+ORDER BY [e].[Text1] DESC, [e].[Id]
+OFFSET @__p_0 ROWS FETCH NEXT @__p_1 ROWS ONLY
+</code></pre>
+<h3 id="等价的json表示">等价的JSON表示</h3>
+<pre><code class="language-json">{
+  "Query": {
+    "Queries": [
+      {
+        "Id": {
+          "Keys": [ 2 ],
+          "Operator": 8
+        },
+        "Text1": {
+          "Keys": [ "aa" ]
+        },
+        "Entity2": {
+          "Id": {
+            "Keys": [ 100 ]
+          },
+          "Text2": {
+            "Keys": [ "ccc" ]
+          }
+        },
+        "Entities3": null,
+        "CombineType": 2
+      },
+      {
+        "Id": {
+          "Keys": [ 5 ],
+          "Operator": 4
+        }
+      }
+    ],
+    "QueryGroups": [
+      {
+        "Queries": [
+          {
+            "Id": {
+              "Keys": [ 20 ]
+            },
+            "Text1": {
+              "Keys": [ "bb" ]
+            },
+            "Entity2": null,
+            "Entities3": {
+              "Query": {
+                "Id": null,
+                "Text3": {
+                  "Keys": [ "fff" ],
+                  "Operator": 8
+                }
+              },
+              "Count": {
+                "Keys": [ 50 ]
+              },
+              "Percent": null
+            }
+          }
+        ],
+        "QueryGroups": [],
+        "CombineType": 2,
+        "Reverse": true
+      }
+    ],
+    "Reverse": true
+  },
+  "OrderKeys": [
+    {
+      "Key": 2,
+      "OrderKind": 2
+    },
+    {
+      "Key": 1
+    }
+  ],
+  "OffsetPage": {
+    "PageIndex": 1,
+    "PageSize": 20
+  }
+}
+</code></pre>
+<p>JSON中的属性如果是类型定义时的默认值，可以省略不写。例如字符串搜索的默认操作是<code>包含子串</code>，条件反转的默认值是<code>false</code>等。</p>
+<h1 id="特点总结">特点总结</h1>
+<p>这套查询生成器是一个完全可组合的结构。从一组内置基础类型的筛选器开始组合出基层自定义类型的生成器，再通过基础筛选器和自定义生成器的组合继续组合出具有嵌套结构的类型的筛选器，最后通过泛型的分页和高级查询生成器组合出完整的查询生成器。这些查询生成器也可以独立使用，自由度很高。例如分页查询的总数计算，就可以只提取其中的筛选表达式部分来用，其中的各种自定义筛选器也都可以当作顶层筛选器来用。</p>
+<p>基础类型的筛选器只实现组合生成器接口，因为基础类型一定是作为其他类型的属性来用的，所以针对基础类型的条件也一定要嫁接到一个属性访问表达式上才有意义。对于自定义表达式生成器，当作为顶级类型来使用时，表现为直接生成器，以当前类型为目标生成表达式；当作为其他类型的属性时，又表现为组合生成器，把生成的条件嫁接到上层对象的属性上。</p>
+<p>筛选器的各个属性名和作用目标属性名完全无关，这样既隔离了内部代码和外部查询，使两边互不干扰，也能轻松对外部查询隐藏内部名称，降低安全风险。由于每个可查询的属性都是明确定义的，因此完全不存在恶意攻击的可能性，如果想对参数的范围之类的信息进行审查，结构化的查询数据也非常容易操作。从查询生成的定义中可以看出，查询的每一个片段都是静态表达式，因此生成器的所有部分都完全兼容静态编译检查和自动重构。</p>
+<p>这个查询生成器解决了<code>System.Linq.Dynamic.Core</code>和<code>LinqKit</code>的劣势，相比较可能唯一的不便之处是代码量稍大，等价的JSON表示内容量较大，但是就因此获得的组合灵活性、序列化传输兼容性和静态安全性而言，这点代价还是可以接受的。</p>
+<p>为了减少复杂查询的需要，笔者把查询关键字设计为数组类型，再根据操作检查具体数据。例如候选项查询，如果不直接支持，就只能使用高级查询生成器的基础生成器数组之间的<code>Or</code>连接来模拟。既然候选项查询必须使用数组型关键字，干脆充分利用这个数组的特点，直接提供区间查询，多个不连续区间查询等功能，最大程度减少对高级查询生成器的依赖，尽可能在简单查询生成器里实现绝大部分常见条件。</p>
+<p>如果直接把表达式编译成委托来用的话，可能会出现空引用异常，因为表达式不支持空传播运算符，只能直接访问。用EF Core生成SQL不会出现问题。</p>
+<h1 id="结语">结语</h1>
+<p>很久以前笔者就思考过，利用LINQ实现动态表达式生成应该怎么办。刚开始发现<code>JqGrid</code>这个表格组件支持嵌套的复杂条件，并以嵌套的JSON结构来表示。后来又惊叹于了<code>HotChocolate</code>的自动条件参数生成和架构修改配置。开始思考动态生成的问题后又先后研究了<code>System.Linq.Dynamic.Core</code>和<code>LinqKit</code>等方案，分析总结了他们的特点和优劣。几经周折终于实现了这个比较满意表达式生成器。</p>
+<p>像普通表达式生成器接口和组合表达式生成器接口就是研究过程中发现应该是两个不同的功能和接口才分离出来的。对于基础类型生成器，一定要嫁接到到其他类型的属性上才有用。而对于分页生成器来说又没有可组合的必要，要分页就说明应该是以顶级类型的身份来用。对于自定义类型的生成器来说又是两种都有可能。这样随着研究的深入问题逐步清晰的情况经常出现，而且构思阶段很难发现。</p>
+<p>最开始分页生成器是没有通用泛型类的，需要自己继承，但是用了一段时间发现这个东西形态固定，实际上可以用泛型类实现。自动化条件反转和防止重复反转也是后来才发现和解决。</p>
+<p>这次研究能顺利进行下去的一个关键是想到了对于复杂嵌套类型，可以把完整的条件表达式拆分为从顶级类型到目标类型的访问表达式和针对目标类型的条件表达式作为两个独立的部分来处理，然后使用表达式访问器拼合两个部分。这样使得生成器和数据类型一样可以自由组合。嵌套的表达式生成问题曾一直困扰着笔者，直到弄懂了表达式访问器的用法和打通了思路。</p>
+<p>经过这次研究，对表达式的使用也更加熟练，收获颇丰。欢迎园友体验交流。</p>
+<h2 id="qq群">QQ群</h2>
+<p>读者交流QQ群：540719365<br>
+<img src="https://img2023.cnblogs.com/blog/1512608/202303/1512608-20230324230411277-1947675739.png" alt="image" loading="lazy"></p>
+<p>欢迎读者和广大朋友一起交流，如发现本书错误也欢迎通过博客园、QQ群等方式告知笔者。</p>
+<p>本文地址：<a href="https://www.cnblogs.com/coredx/p/18900966" title="如何在 .NET 中构建一个好用的动态查询生成器" target="_blank">如何在 .NET 中构建一个好用的动态查询生成器</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="5.956016797445602" data-date-created="BlogServer.Application.Dto.BlogPost.BlogPostDto" data-date-updated="2025-05-30 17:25">2025-05-30 11:31</span>&nbsp;
+<a href="https://www.cnblogs.com/coredx">coredx</a>&nbsp;
+阅读(<span id="post_view_count">1310</span>)&nbsp;
+评论(<span id="post_comment_count">8</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18900966);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18900966', targetLink: 'https://www.cnblogs.com/coredx/p/18900966', title: '如何在 .NET 中构建一个好用的动态查询生成器' })">举报</a>
+</div>
+        
