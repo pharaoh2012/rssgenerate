@@ -1,0 +1,271 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/12lisu/p/18920430" title="发布于 2025-06-09 11:22">
+    <span role="heading" aria-level="2">假如给你1亿的Redis key，如何高效统计？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>有些小伙伴在工作中，可能遇到过这样的场景：老板突然要求统计Redis中所有key的数量，你随手执行了<code>KEYS *</code>命令，下一秒监控告警疯狂闪烁——整个Redis集群彻底卡死，线上服务大面积瘫痪。</p>
+<p>今天这篇文章就跟大家一起聊聊如果给你1亿个Redis key，如何高效统计这个话题，希望对你会有所帮助。</p>
+<h2 id="1-为什么不建议使用keys命令">1 为什么不建议使用KEYS命令？</h2>
+<p>Redis的单线程模型是其高性能的核心，但也是最大的软肋。</p>
+<p>当Redis执行 <code>KEYS *</code> 命令时，内部的流程如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250609112029328-1187073348.png" alt="image" loading="lazy"></p>
+<p>Redis的单线程模型是其高性能的核心，但同时也带来一个关键限制：所有命令都是串行执行的。</p>
+<p>当我们执行 KEYS * 命令时：</p>
+<p>Redis必须遍历整个key空间（时间复杂度O(N)）</p>
+<p>在遍历完成前，无法处理其他任何命令</p>
+<p>对于1亿个key，即使每个key查找只需0.1微秒，总耗时也高达10秒！</p>
+<p><strong>致命三连击</strong>：</p>
+<ol>
+<li><strong>时间复杂度</strong>：1亿key需要10秒+（实测单核CPU 0.1μs/key）</li>
+<li><strong>内存风暴</strong>：返回结果太多可能撑爆客户端内存</li>
+<li><strong>集群失效</strong>：在Cluster模式中只能查当前节点的数据。</li>
+</ol>
+<p>如果Redis一次性返回的数据太多，可能会有OOM问题：</p>
+<pre><code class="language-bash">127.0.0.1:6379&gt; KEYS *
+(卡死10秒...)
+(error) OOM command not allowed when used memory &gt; 'maxmemory'
+</code></pre>
+<p>超过了最大内存。</p>
+<p>那么，Redis中有1亿key，我们要如何统计数据呢？</p>
+<h2 id="2-scan命令">2 SCAN命令</h2>
+<p><code>SCAN</code>命令通过游标分批遍历，每次只返回少量key，避免阻塞。</p>
+<p>Java版基础SCAN的代码如下：</p>
+<pre><code class="language-java">public long safeCount(Jedis jedis) {
+    long total = 0;
+    String cursor = "0";
+    ScanParams params = new ScanParams().count(500); // 每批500个
+    
+    do {
+        ScanResult&lt;String&gt; rs = jedis.scan(cursor, params);
+        cursor = rs.getCursor();
+        total += rs.getResult().size();
+    } while (!"0".equals(cursor)); // 游标0表示结束
+    
+    return total;
+}
+</code></pre>
+<p>使用游标查询Redis中的数据，一次扫描500条数据。</p>
+<p>但问题来了：1亿key需要多久？</p>
+<ul>
+<li>每次SCAN耗时≈3ms</li>
+<li>每次返回500key</li>
+<li>总次数=1亿/500=20万次</li>
+<li>总耗时≈20万×3ms=600秒=10分钟！</li>
+</ul>
+<h2 id="3-多线程并发scan方案">3 多线程并发SCAN方案</h2>
+<p>现代服务器都是多核CPU，单线程扫描是资源浪费。</p>
+<p>看多线程优化方案如下：<br>
+<img src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250609112057075-1696672611.png" alt="image" loading="lazy"></p>
+<p>多线程并发SCAN代码如下：</p>
+<pre><code class="language-java">public long parallelCount(JedisPool pool, int threads) throws Exception {
+    ExecutorService executor = Executors.newFixedThreadPool(threads);
+    AtomicLong total = new AtomicLong(0);
+    
+    // 生成初始游标（实际需要更智能的分段）
+    List&lt;String&gt; cursors = new ArrayList&lt;&gt;();
+    for (int i = 0; i &lt; threads; i++) {
+        cursors.add(String.valueOf(i));
+    }
+
+    CountDownLatch latch = new CountDownLatch(threads);
+    
+    for (String cursor : cursors) {
+        executor.execute(() -&gt; {
+            try (Jedis jedis = pool.getResource()) {
+                String cur = cursor;
+                do {
+                    ScanResult&lt;String&gt; rs = jedis.scan(cur, new ScanParams().count(500));
+                    cur = rs.getCursor();
+                    total.addAndGet(rs.getResult().size());
+                } while (!"0".equals(cur));
+                latch.countDown();
+            }
+        });
+    }
+    
+    latch.await();
+    executor.shutdown();
+    return total.get();
+}
+</code></pre>
+<p>使用线程池、AtomicLong和CountDownLatch配合使用，实现了多线程扫描数据，最终将结果合并。</p>
+<p><strong>性能对比</strong>（32核CPU/1亿key）：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>线程数</th>
+<th>耗时</th>
+<th>资源占用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单线程SCAN</td>
+<td>1</td>
+<td>580s</td>
+<td>CPU 5%</td>
+</tr>
+<tr>
+<td>多线程SCAN</td>
+<td>32</td>
+<td>18s</td>
+<td>CPU 800%</td>
+</tr>
+</tbody>
+</table>
+<h2 id="4-分布式环境的分治策略">4 分布式环境的分治策略</h2>
+<p>如果你的系统重使用了Redis Cluster集群模式，该模式会将数据分散在16384个槽(slot)中，统计就需要节点协同。</p>
+<p>流程图如下：<br>
+<img src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250609112113878-1825530340.png" alt="image" loading="lazy"></p>
+<p>每一个Redis Cluster集群中的master服务节点，都负责统计一定范围的槽(slot)中的数据，最后将数据聚合起来返回。</p>
+<p>集群版并行统计代码如下：</p>
+<pre><code class="language-java">public long clusterCount(JedisCluster cluster) {
+    Map&lt;String, JedisPool&gt; nodes = cluster.getClusterNodes();
+    AtomicLong total = new AtomicLong(0);
+    
+    nodes.values().parallelStream().forEach(pool -&gt; {
+        try (Jedis jedis = pool.getResource()) {
+            // 跳过从节点
+            if (jedis.info("replication").contains("role:slave")) return; 
+            
+            String cursor = "0";
+            do {
+                ScanResult&lt;String&gt; rs = jedis.scan(cursor, new ScanParams().count(500));
+                total.addAndGet(rs.getResult().size());
+                cursor = rs.getCursor();
+            } while (!"0".equals(cursor));
+        }
+    });
+    
+    return total.get();
+}
+</code></pre>
+<p>这里使用了parallelStream，会并发统计Redis不同的master节点中的数据。</p>
+<h2 id="5-毫秒统计方案">5 毫秒统计方案</h2>
+<h3 id="方案1使用内置计数器">方案1：使用内置计数器</h3>
+<p>如果只想统计一个数量，可以使用Redis内置计数器，瞬时但非精确。</p>
+<pre><code class="language-bash">127.0.0.1:6379&gt; info keyspace
+# Keyspace
+db0:keys=100000000,expires=20000,avg_ttl=3600
+</code></pre>
+<p><strong>优点</strong>：毫秒级返回。</p>
+<p><strong>缺点</strong>：包含已过期未删除的key，法按模式过滤数据。</p>
+<h3 id="方案2实时增量统计">方案2：实时增量统计</h3>
+<p>实时增量统计方案精准但复杂。</p>
+<p>基于键空间通知的实时计数器，具体代码如下：</p>
+<pre><code class="language-java">@Configuration
+public class KeyCounterConfig {
+    
+    @Bean
+    public RedisMessageListenerContainer container(RedisConnectionFactory factory) {
+        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+        container.setConnectionFactory(factory);
+        
+        container.addMessageListener((message, pattern) -&gt; {
+            String event = new String(message.getBody());
+            if(event.startsWith("__keyevent@0__:set")) {
+                redisTemplate.opsForValue().increment("total_keys", 1);
+            } else if(event.startsWith("__keyevent@0__:del")) {
+                redisTemplate.opsForValue().decrement("total_keys", 1);
+            }
+        }, new PatternTopic("__keyevent@*"));
+        
+        return container;
+    }
+}
+</code></pre>
+<p>使用监听器统计数量。</p>
+<p><strong>成本分析</strong>：</p>
+<ul>
+<li>内存开销：额外存储计数器</li>
+<li>CPU开销：增加5%-10%处理通知</li>
+<li>网络开销：集群模式下需跨节点同步</li>
+</ul>
+<h2 id="6-如何选择方案">6 如何选择方案？</h2>
+<p>本文中列举出了多个统计Redis中key的方案，那么我们在实际工作中如何选择呢？</p>
+<p>下面用一张图给大家列举了选择路线：<br>
+<img src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250609112129491-1953700201.png" alt="image" loading="lazy"></p>
+<p>各方案的时间和空间复杂度如下：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>时间复杂度</th>
+<th>空间复杂度</th>
+<th>精度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>KEYS命令</td>
+<td>O(n)</td>
+<td>O(n)</td>
+<td>精确</td>
+</tr>
+<tr>
+<td>SCAN遍历</td>
+<td>O(n)</td>
+<td>O(1)</td>
+<td>精确</td>
+</tr>
+<tr>
+<td>内置计数器</td>
+<td>O(1)</td>
+<td>O(1)</td>
+<td>不精确</td>
+</tr>
+<tr>
+<td>增量统计</td>
+<td>O(1)</td>
+<td>O(1)</td>
+<td>精确</td>
+</tr>
+</tbody>
+</table>
+<p><strong>硬件法则：</strong></p>
+<ul>
+<li>CPU密集型：多线程数=CPU核心数×1.5</li>
+<li>IO密集型：线程数=CPU核心数×3</li>
+<li>内存限制：控制批次大小（count参数）</li>
+</ul>
+<p><strong>常见的业务场景：</strong></p>
+<ul>
+<li>电商实时大屏：增量计数器+RedisTimeSeries</li>
+<li>离线数据分析：SCAN导出到Spark</li>
+<li>安全审计：多节点并行SCAN</li>
+</ul>
+<p><strong>终极箴言</strong>：<br>
+✅ 精确统计用分治<br>
+✅ 实时查询用增量<br>
+✅ 趋势分析用采样<br>
+❌ 暴力遍历是自杀</p>
+<p><strong>真正的高手不是能解决难题的人，而是能预见并规避难题的人</strong>。</p>
+<p>在海量数据时代，选择比努力更重要——理解数据本质，才能驾驭数据洪流。</p>
+<h2 id="如果这篇文章对您有所帮助或者有所启发的话帮忙关注一下我的同名公众号苏三说技术我的所有文章都会在公众号上首发您的支持是我坚持写作最大的动力">如果这篇文章对您有所帮助，或者有所启发的话，帮忙关注一下我的同名公众号：苏三说技术，我的所有文章都会在公众号上首发，您的支持是我坚持写作最大的动力。</h2>
+<p>求一键三连：点赞、转发、在看。</p>
+<p>关注公众号：【苏三说技术】，在公众号中回复：进大厂，可以免费获取我最近整理的10万字的面试宝典，好多小伙伴靠这个宝典拿到了多家大厂的offer。</p>
+<p>本文收录于我的技术网站：<a href="http://www.susan.net.cn" target="_blank" rel="noopener nofollow">http://www.susan.net.cn</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.011805555555555555" data-date-updated="2025-06-09 11:39">2025-06-09 11:22</span>&nbsp;
+<a href="https://www.cnblogs.com/12lisu">苏三说技术</a>&nbsp;
+阅读(<span id="post_view_count">45</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18920430);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18920430', targetLink: 'https://www.cnblogs.com/12lisu/p/18920430', title: '假如给你1亿的Redis key，如何高效统计？' })">举报</a>
+</div>
+        
