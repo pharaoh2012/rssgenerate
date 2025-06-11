@@ -9,26 +9,26 @@ const tools = require("./tools")
 
 const Config =
     [
-    //     {
-    //     homt: 'https://www.cnblogs.com/pick/',
-    //     rss: 'cnblogs_fav',
-    //     title: "精华区 - 博客园"
-    // },
-    {
-        homt: 'https://www.cnblogs.com/',
-        rss: 'cnblogs_home',
-        title: "主页 - 博客园"
-    },    
-    {
-        homt: 'https://www.cnblogs.com/cate/108698/',
-        rss: 'cnblogs_net',
-        title: "c# - 博客园"
-    },
-    {
-        homt: 'https://www.cnblogs.com/cate/javascript/',
-        rss: 'cnblogs_js',
-        title: "js - 博客园"
-    },
+        {
+            homt: 'https://www.cnblogs.com/pick/',
+            rss: 'cnblogs_fav',
+            title: "精华区 - 博客园"
+        },
+        {
+            homt: 'https://www.cnblogs.com/',
+            rss: 'cnblogs_home',
+            title: "主页 - 博客园"
+        },
+        {
+            homt: 'https://www.cnblogs.com/cate/108698/',
+            rss: 'cnblogs_net',
+            title: "c# - 博客园"
+        },
+        {
+            homt: 'https://www.cnblogs.com/cate/javascript/',
+            rss: 'cnblogs_js',
+            title: "js - 博客园"
+        },
     ]
 
 
@@ -170,7 +170,7 @@ module.exports = {
     main: main
 }
 
-if(require.main === module) {
+if (require.main === module) {
     main();
 }
 
