@@ -1,0 +1,576 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/mjunz/p/18933087" title="发布于 2025-06-17 15:50">
+    <span role="heading" aria-level="2">商品中心—7.自研缓存框架的技术文档</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p data-track="175" data-pm-slice="0 0 []"><strong>大纲</strong></p>
+<p data-track="176"><strong>1.商品C端系统监听商品变更及刷新缓存</strong></p>
+<p data-track="177"><strong>2.自研缓存框架的数据表缓存组件</strong></p>
+<p data-track="178"><strong>3.自研缓存框架的通用缓存读写组件与DB操作组件</strong></p>
+<p data-track="179">&nbsp;</p>
+<p data-track="180"><strong>1.商品C端系统监听商品变更及刷新缓存</strong></p>
+<p data-track="181">FlushRedisCache的flushRedisStringData()方法刷新缓存的逻辑是：首先从DB查询最新的数据 -&gt; 然后删除旧缓存 -&gt; 最后更新缓存。</p>
+<pre class="highlighter-hljs"><code>@Configuration
+public class ConsumerBeanConfig {
+    //配置内容对象
+    @Autowired
+    private RocketMQProperties rocketMQProperties;
+    
+    //监听商品修改的MQ消息
+    @Bean("productUpdateTopic")
+    public DefaultMQPushConsumer productUpdateTopic(ProductUpdateListener productUpdateListener) throws MQClientException {
+        DefaultMQPushConsumer consumer = new DefaultMQPushConsumer(RocketMqConstant.PRODUCT_UPDATE_CONSUMER_GROUP);
+        consumer.setNamesrvAddr(rocketMQProperties.getNameServer());
+        consumer.subscribe(RocketMqConstant.PRODUCT_UPDATE_TOPIC, "*");
+        consumer.registerMessageListener(productUpdateListener);
+        consumer.start();
+        return consumer;
+    }
+}
+
+//商品变更时的缓存处理
+@Component
+public class ProductUpdateListener implements MessageListenerConcurrently {
+    @DubboReference(version = "1.0.0")
+    private TableDataUpdateApi tableDataUpdateApi;
+    
+    @Override
+    public ConsumeConcurrentlyStatus consumeMessage(List&lt;MessageExt&gt; list, ConsumeConcurrentlyContext consumeConcurrentlyContext) {
+        try {
+            for (MessageExt messageExt : list) {
+                //消息处理这里，涉及到sku的缓存更新以及对应的整个商品明细的缓存更新
+                String msg = new String(messageExt.getBody());
+                log.info("执行商品缓存数据更新逻辑，消息内容：{}", msg);
+  
+                TableDataChangeDTO tableDataChangeMessage = JsonUtil.json2Object(msg, TableDataChangeDTO.class);
+                //更新sku对应的商品缓存信息
+                tableDataUpdateApi.tableDataChange(tableDataChangeMessage);
+                //发送回调消息通知
+                tableDataUpdateApi.sendCallbackMessage(tableDataChangeMessage);
+            }
+        } catch (Exception e) {
+            log.error("consume error, 商品缓存更新失败", e);
+            //本次消费失败，下次重新消费
+            return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+        }
+        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+    }
+}
+
+//商品信息变更服务
+@DubboService(version = "1.0.0", interfaceClass = TableDataUpdateApi.class, retries = 0)
+public class TableDataUpdateApiImpl implements TableDataUpdateApi {
+    @Resource
+    private FlushRedisCache flushRedisCache;
+    
+    private ExecutorService executorService = Executors.newFixedThreadPool(10);
+   
+    //商品表数据变更逆向更新缓存
+    @Override
+    public JsonResult tableDataChange(TableDataChangeDTO tableDataChangeDTO) {
+        executorService.execute(() -&gt; {
+            try {
+                //刷新缓存数据
+                flushRedisCache.flushRedisStringData(false, tableDataChangeDTO.getTableName(), Sets.newHashSet(tableDataChangeDTO.getKeyId()));
+            } catch (Exception e) {
+                log.error("刷新string类型缓存异常，入参为tableDataChangeDTO={}", tableDataChangeDTO, e);
+            }
+            try {
+                flushRedisCache.flushRedisSetData(false, tableDataChangeDTO.getTableName(), Sets.newHashSet(tableDataChangeDTO.getKeyId()));
+            } catch (Exception e) {
+                log.error("刷新set类型缓存异常，入参为tableDataChangeDTO={}", tableDataChangeDTO, e);
+            }
+            try {
+                flushRedisCache.flushRedisSortedSetData(false, tableDataChangeDTO.getTableName(), Sets.newHashSet(tableDataChangeDTO.getKeyId()));
+            } catch (Exception e) {
+                log.error("刷新sortedset类型缓存异常，入参为tableDataChangeDTO={}", tableDataChangeDTO, e);
+            }
+        });
+        return JsonResult.buildSuccess();
+    }
+    ...
+}
+
+//数据变更—刷新缓存
+@Component
+public class FlushRedisCache {
+    //继承了AbstractRedisStringCache的缓存实例会被注入到abstractRedisStringCacheMap这个map中
+    //例如CategoryBaseCache、FrontCategoryCache、ItemCollectCache、ProductDetailCache、SkuCollectCache等
+    @Autowired
+    private Map&lt;String, AbstractRedisStringCache&gt; abstractRedisStringCacheMap;
+    
+    //更新string类型缓存
+    //@param flushAll  是否全量刷新
+    //@param tableName 表名
+    //@param idSet     主键ID集合
+    public void flushRedisStringData(boolean flushAll, String tableName, Set&lt;Long&gt; idSet) {
+        for (Map.Entry&lt;String, AbstractRedisStringCache&gt; entry : abstractRedisStringCacheMap.entrySet()) {
+            AbstractRedisStringCache stringCache = entry.getValue();
+            if (flushAll) {
+                stringCache.flushRedisStringDataByTableUpdateData();
+                continue;
+            }
+            //继承AbstractRedisStringCache的每个缓存实例都指定来表名，如下用于匹配出对应的缓存实例
+            if (stringCache.getTableName().contains(tableName)) {
+                stringCache.flushRedisStringDataByTableAndIdSet(tableName, idSet);
+            }
+        }
+    }
+    ...
+}
+
+//Redis(string)缓存抽象类
+public abstract class AbstractRedisStringCache&lt;DO, BO&gt; {
+    @Resource
+    private RedisReadWriteManager redisReadWriteManager;
+    ...
+    
+    //刷新缓存—根据主表ID集合（关联表变更需要查询主表）
+    public void flushRedisStringDataByTableAndIdSet(String tableName, Set&lt;Long&gt; idSet) {
+        Optional&lt;Set&lt;Long&gt;&gt; idSetOpt = getStringDatabase().getTableIdSetByRelationTableIdSet(tableName, idSet);
+        if (!idSetOpt.isPresent()) {
+            return;
+        }
+        flushRedisStringDataByIdSet(idSetOpt.get());
+    }
+    
+    //刷新缓存—根据主键ID集合
+    //@param idSet 数据表主键ID
+    private void flushRedisStringDataByIdSet(Set&lt;Long&gt; idSet) {
+        //根据id集合从数据库中查询出数据
+        Optional&lt;RedisStringCache&lt;DO&gt;&gt; stringSourceOpt = getStringDatabase().listTableDataByIdSet(idSet, queryType());
+        if (!stringSourceOpt.isPresent()) {
+            return;
+        }
+        RedisStringCache&lt;DO&gt; redisStringCache = stringSourceOpt.get();
+        if (!CollectionUtils.isEmpty(redisStringCache.getDeleteSet())) {
+            //通过缓存读写组件删除缓存
+            redisReadWriteManager.delete(redisStringCache.getDeleteSet().stream().map(this::getRedisKey).collect(toSet()).toArray(new String[]{}));
+        }
+        if (CollectionUtils.isEmpty(redisStringCache.getAddList())) {
+            return;
+        }
+        List&lt;BO&gt; boList = convertDO2BO(redisStringCache.getAddList());
+        Map&lt;String, BO&gt; redisMap = convertBO2Map(boList);
+        //通过缓存读写组件写入缓存
+        redisReadWriteManager.batchWriteRedisString(redisMap);
+    }
+    ...
+}
+
+//缓存读写管理
+@Service
+public class RedisReadWriteManager {
+    @Resource
+    private RedisCache redisCache;
+    ...
+    
+    //删除指定的key
+    public void delete(String... keys) {
+        Arrays.asList(keys).stream().forEach(key -&gt; redisCache.delete(key));
+    }
+    
+    //批量添加string缓存
+    public &lt;T&gt; void batchWriteRedisString(Map&lt;String, T&gt; redisMap) {
+        List&lt;Map.Entry&lt;String, T&gt;&gt; list = Lists.newArrayList(redisMap.entrySet());
+        try {
+            for (List&lt;Map.Entry&lt;String, T&gt;&gt; entries : Lists.partition(list, PAGE_SIZE_100)) {
+                for (Map.Entry&lt;String, T&gt; entry : entries) {
+                    redisCache.setex(true, entry.getKey(), JSON.toJSONString(entry.getValue()), RedisKeyUtils.redisKeyRandomTime(INT_EXPIRED_SEVEN_DAYS));
+                }
+                try {
+                    Thread.sleep(SLEEP_100);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+        } catch (Exception e) {
+            log.error("批量添加string缓存异常 redisMap={}", redisMap, e);
+        }
+    }
+    ...
+}</code></pre>
+<p data-track="183">&nbsp;</p>
+<p data-track="184"><strong>2.自研缓存框架的数据表缓存组件</strong></p>
+<p data-track="185"><strong>(1)自研缓存框架的目录结构</strong></p>
+<p data-track="186"><strong>(2)通过注解实现继承同一个抽象类的数据表缓存组件实例自动注入Map</strong></p>
+<p data-track="187">&nbsp;</p>
+<p data-track="188"><strong>(1)自研缓存框架的目录结构</strong></p>
+<div class="pgc-img"><img src="https://p3-sign.toutiaoimg.com/tos-cn-i-6w9my0ksvp/601e264287c34d3a85c083f27b143b4c~tplv-obj.image?lk3s=ef143cfe&amp;traceid=2025061715445998449BE07D45E8229B0E&amp;x-expires=2147483647&amp;x-signature=QJvZcbVWw1SY0x0QtagsU4sN0BI%3D" data-ic="false" data-width="1080" data-height="1336" data-ic-uri=""></div>
+<p data-track="189"><strong>(2)通过注解实现继承同一个抽象类的数据表缓存组件实例自动注入Map</strong></p>
+<p data-track="190">继承AbstractRedisStringCache的数据表缓存组件实例会被注入到Map中，之后通过Map便可以根据表名来获取对应的数据表缓存组件实例了。数据表缓存组件实例中会封装一些获取DB数据表数据、获取缓存key等方法，而其继承的抽象类会提供一些根据DB获取缓存、刷新缓存等模版方法。</p>
+<pre class="highlighter-hljs"><code>@Component
+public class FlushRedisCache {
+    //继承了AbstractRedisStringCache的缓存实例会被注入到abstractRedisStringCacheMap这个map中
+    //例如CategoryBaseCache、FrontCategoryCache、ItemCollectCache、ProductDetailCache、SkuCollectCache等
+    @Autowired
+    private Map&lt;String, AbstractRedisStringCache&gt; abstractRedisStringCacheMap;
+
+    //继承了AbstractRedisSortedSetCache的缓存实例会被注入到abstractRedisSortedSetCacheMap这个map中
+    //例如SkuSellerCache
+    @Autowired
+    private Map&lt;String, AbstractRedisSortedSetCache&gt; abstractRedisSortedSetCacheMap;
+    ...
+}
+
+@Service("productDetailCache")
+public class ProductDetailCache extends AbstractRedisStringCache&lt;ProductDetailDO, ProductDetailBO&gt; {
+    //DB操作组件
+    @Resource
+    private ProductDetailStringDatabase productDetailStringDatabase;
+    
+    @Resource
+    private ProductDetailConverter productDetailConverter;
+    
+    @Override
+    protected RedisStringDatabase&lt;ProductDetailDO&gt; getStringDatabase() {
+        return productDetailStringDatabase;
+    }
+    
+    @Override
+    protected String getPendingRedisKey() {
+        return AbstractRedisKeyConstants.PRODUCT_SKU_INFO_STRING;
+    }
+    
+    @Override
+    protected List&lt;ProductDetailBO&gt; convertDO2BO(Collection&lt;ProductDetailDO&gt; doList) {
+        return productDetailConverter.converterDetailList(doList);
+    }
+    
+    @Override
+    protected Map&lt;String, Object&gt; getTableFieldsMap(String key) {
+        Map&lt;String, Object&gt; dbInputMap = Maps.newHashMap();
+        dbInputMap.put(SkuCollectStringDatabase.SKU_ID, key);
+        return dbInputMap;
+    }
+    
+    @Override
+    protected Class&lt;ProductDetailBO&gt; getBOClass() {
+        return ProductDetailBO.class;
+    }
+    ...
+}
+
+//Redis(string)缓存抽象类
+//@param &lt;DO&gt; 数据对象
+//@param &lt;BO&gt; 缓存对象
+public abstract class AbstractRedisStringCache&lt;DO, BO&gt; {
+    @Resource
+    private RedisReadWriteManager redisReadWriteManager;
+    
+    //获取redis key
+    //@param key 需要替换的关键字
+    protected String getRedisKey(String key) {
+        return String.format(getPendingRedisKey(), key);
+    }
+    
+    //单个获取数据库表名
+    public String getTableName() {
+        return getStringDatabase().getTableName();
+    }
+    
+    //获取DB读取对象
+    protected abstract RedisStringDatabase&lt;DO&gt; getStringDatabase();
+    
+    //获取待处理的Redis key
+    protected abstract String getPendingRedisKey();
+    
+    //DO转BO
+    protected abstract List&lt;BO&gt; convertDO2BO(Collection&lt;DO&gt; doList);
+    
+    //关联表字段值
+    protected abstract Map&lt;String, Object&gt; getTableFieldsMap(String key);
+    
+    //获取BO对象的class
+    protected abstract Class&lt;BO&gt; getBOClass();
+    ...
+    
+    //模版方法：根据关键字批量获取数据
+    //@param useLocalCache 是否使用本地缓存
+    //@param keyList       入参关键字
+    public Optional&lt;List&lt;BO&gt;&gt; listRedisStringData(Boolean useLocalCache, List&lt;String&gt; keyList) {
+        if (CollectionUtils.isEmpty(keyList)) {
+            return Optional.empty();
+        }
+        Optional&lt;List&lt;BO&gt;&gt; boListOpt = redisReadWriteManager.listRedisStringDataByCache(useLocalCache, keyList,
+            getBloomKey(), getStringDatabase()::getTableSingleFiled, getStringDatabase().getBloomField(),
+            getBOClass(), this::getRedisKey, (key) -&gt; {
+                Map&lt;String, Object&gt; tableFieldsMap = getTableFieldsMap(key);
+                Optional&lt;DO&gt; doOpt;
+                try {
+                    doOpt = getStringDatabase().getTableData(tableFieldsMap, queryType());
+                } catch (Exception e) {
+                    log.error("根据关键字批量获取数据异常 key={},paramMap={}", key, tableFieldsMap, e);
+                    return Optional.empty();
+                }
+                if (!doOpt.isPresent()) {
+                    return Optional.empty();
+                }
+                List&lt;BO&gt; boList = convertDO2BO(Arrays.asList(doOpt.get()));
+                if (CollectionUtils.isEmpty(boList)) {
+                    return Optional.empty();
+                }
+                return Optional.of(boList.get(0));
+            }
+        );
+        return boListOpt;
+    }
+    
+    //模版方法：根据多关键字批量获取集合数据
+    //@param keyList    入参关键字
+    //@param requestMap key 数据库表字段，value 字段值，该map中的字段不要与getTableFieldsMap(key)获取的字段重复
+    public Optional&lt;List&lt;BO&gt;&gt; listRedisStringData(List&lt;String&gt; keyList, Map&lt;String, Object&gt; requestMap) {
+        if (CollectionUtils.isEmpty(keyList)) {
+            return Optional.empty();
+        }
+        Optional&lt;List&lt;BO&gt;&gt; boListOpt = redisReadWriteManager.listRedisStringDataByBatchCache(keyList, getBOClass(), this::getRedisKey, (key) -&gt; {
+            Map&lt;String, Object&gt; tableFieldsMap = getTableFieldsMap(key);
+            if (MapUtils.isNotEmpty(requestMap)) {
+                tableFieldsMap.putAll(requestMap);
+            }
+            Optional&lt;List&lt;DO&gt;&gt; doOpt;
+            try {
+                doOpt = getStringDatabase().listTableData(tableFieldsMap, queryType());
+            } catch (Exception e) {
+                log.error("根据关键字批量获取数据异常 key={},paramMap={}", key, tableFieldsMap, e);
+                return Optional.empty();
+            }
+            if (!doOpt.isPresent()) {
+                return Optional.empty();
+            }
+            List&lt;BO&gt; boList = convertDO2BO(doOpt.get());
+            if (CollectionUtils.isEmpty(boList)) {
+                return Optional.empty();
+            }
+            return Optional.of(boList);
+        });
+        return boListOpt;
+    }
+    
+    //模版方法：刷新缓存—根据主表ID集合（关联表变更需要查询主表）
+    //@param tableName 关联表名
+    //@param idSet     关联表主键集合
+    public void flushRedisStringDataByTableAndIdSet(String tableName, Set&lt;Long&gt; idSet) {
+        Optional&lt;Set&lt;Long&gt;&gt; idSetOpt = getStringDatabase().getTableIdSetByRelationTableIdSet(tableName, idSet);
+        if (!idSetOpt.isPresent()) {
+            return;
+        }
+        flushRedisStringDataByIdSet(idSetOpt.get());
+    }
+    
+    //模版方法：刷新缓存—根据表变更数据ID集合
+    public void flushRedisStringDataByTableUpdateData() {
+        Optional&lt;Set&lt;Long&gt;&gt; updateIdSetOpt = getStringDatabase().getTableUpdateIdSet();
+        if (!updateIdSetOpt.isPresent()) {
+            return;
+        }
+        flushRedisStringDataByIdSet(updateIdSetOpt.get());
+    }
+    
+    //模版方法：刷新缓存—根据主键ID集合
+    //@param idSet 数据表主键ID
+    private void flushRedisStringDataByIdSet(Set&lt;Long&gt; idSet) {
+        //根据id集合从数据库中查询出数据
+        Optional&lt;RedisStringCache&lt;DO&gt;&gt; stringSourceOpt = getStringDatabase().listTableDataByIdSet(idSet, queryType());
+        if (!stringSourceOpt.isPresent()) {
+            return;
+        }
+        RedisStringCache&lt;DO&gt; redisStringCache = stringSourceOpt.get();
+        if (!CollectionUtils.isEmpty(redisStringCache.getDeleteSet())) {
+            //通过缓存读写组件删除缓存
+            redisReadWriteManager.delete(redisStringCache.getDeleteSet().stream().map(this::getRedisKey).collect(toSet()).toArray(new String[]{}));
+        }
+        if (CollectionUtils.isEmpty(redisStringCache.getAddList())) {
+            return;
+        }
+        List&lt;BO&gt; boList = convertDO2BO(redisStringCache.getAddList());
+        Map&lt;String, BO&gt; redisMap = convertBO2Map(boList);
+        //通过缓存读写组件写入缓存
+        redisReadWriteManager.batchWriteRedisString(redisMap);
+    }
+    ...
+}</code></pre>
+<p data-track="192">&nbsp;</p>
+<p data-track="193"><strong>3.自研缓存框架的通用缓存读写组件与DB操作组件</strong></p>
+<p data-track="194"><strong>(1)通用缓存读写组件</strong></p>
+<p data-track="195"><strong>(2)数据表的DB操作组件</strong></p>
+<p data-track="196">&nbsp;</p>
+<p data-track="197">每个数据表缓存组件都会有至少两个必备组件：一个通用缓存读写组件 + 一个数据表的DB操作组件。</p>
+<p data-track="198">&nbsp;</p>
+<p data-track="199"><strong>(1)通用缓存读写组件</strong></p>
+<p data-track="200">通用缓存读写组件也包含两个必备组件：一个操作缓存的RedisCache组件 + 一个操作分布式锁的RedisLock组件。通用缓存读写组件封装了大量基础的缓存读写操作，这些基础的缓存读写操作会结合DB读库 + 缓存问题等解决方案来进行实现。</p>
+<pre class="highlighter-hljs"><code>//缓存读写管理
+@Service
+public class RedisReadWriteManager {
+    @Resource
+    private RedisCache redisCache;
+    
+    @Resource
+    private RedisLock redisLock;
+    ...
+    
+    //删除指定的key
+    public void delete(String... keys) {
+        Arrays.asList(keys).stream().forEach(key -&gt; redisCache.delete(key));
+    }
+    
+    //批量添加string缓存
+    public &lt;T&gt; void batchWriteRedisString(Map&lt;String, T&gt; redisMap) {
+        List&lt;Map.Entry&lt;String, T&gt;&gt; list = Lists.newArrayList(redisMap.entrySet());
+        try {
+            for (List&lt;Map.Entry&lt;String, T&gt;&gt; entries : Lists.partition(list, PAGE_SIZE_100)) {
+                for (Map.Entry&lt;String, T&gt; entry : entries) {
+                    redisCache.setex(true, entry.getKey(), JSON.toJSONString(entry.getValue()), RedisKeyUtils.redisKeyRandomTime(INT_EXPIRED_SEVEN_DAYS));
+                }
+                try {
+                    Thread.sleep(SLEEP_100);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+        } catch (Exception e) {
+            log.error("批量添加string缓存异常 redisMap={}", redisMap, e);
+        }
+    }
+    
+    //批量获取多缓存数据
+    public &lt;T&gt; Optional&lt;List&lt;T&gt;&gt; listRedisStringDataByBatchCache(List&lt;String&gt; keyList, Class&lt;T&gt; clazz, Function&lt;String, String&gt; getRedisKeyFunction, Function&lt;String, Optional&lt;List&lt;T&gt;&gt;&gt; getDbFuction) {
+        try {
+            List&lt;T&gt; list = Lists.newArrayList();
+            List&lt;String&gt; pendingKeyList = keyList.stream().distinct().collect(toList());
+            List&lt;String&gt; redisKeyList = pendingKeyList.stream().map(getRedisKeyFunction).distinct().collect(toList());
+            List&lt;String&gt; cacheList = redisCache.mget(redisKeyList);
+            for (int i = 0; i &lt; cacheList.size(); i++) {
+                String cache = cacheList.get(i);
+                //过滤无效缓存
+                if (EMPTY_OBJECT_STRING.equals(cache)) {
+                    continue;
+                }
+                if (StringUtils.isNotBlank(cache)) {
+                    List&lt;T&gt; tList = JSON.parseArray(cache, clazz);
+                    list.addAll(tList);
+                    continue;
+                }
+                //缓存没有则读库
+                Optional&lt;List&lt;T&gt;&gt; optional = listRedisStringDataByDb(pendingKeyList.get(i), getRedisKeyFunction, getDbFuction);
+                if (optional.isPresent()) {
+                    list.addAll(optional.get());
+                }
+            }
+            return CollectionUtils.isEmpty(list) ? Optional.empty() : Optional.of(list);
+        } catch (Exception e) {
+            log.error("批量获取缓存数据异常 keyList={},clazz={}", keyList, clazz, e);
+            throw e;
+        }
+    }
+    
+    //读取数据库表多数据赋值到Redis
+    public &lt;T&gt; Optional&lt;List&lt;T&gt;&gt; listRedisStringDataByDb(String key, Function&lt;String, String&gt; getRedisKeyFunction, Function&lt;String, Optional&lt;List&lt;T&gt;&gt;&gt; getDbFuction) {
+        if (StringUtils.isEmpty(key) || Objects.isNull(getDbFuction)) {
+            return Optional.empty();
+        }
+        try {
+            if (!redisLock.lock(key)) {
+                return Optional.empty();
+            }
+            String redisKey = getRedisKeyFunction.apply(key);
+            Optional&lt;List&lt;T&gt;&gt; optional = getDbFuction.apply(key);
+            if (!optional.isPresent()) {
+                //把空对象暂存到redis
+                redisCache.setex(true, redisKey, EMPTY_OBJECT_STRING, RedisKeyUtils.redisKeyRandomTime(INT_EXPIRED_ONE_DAY, TimeUnit.HOURS, NUMBER_24));
+                log.warn("发生缓存穿透 redisKey={}", redisKey);
+                return optional;
+            }
+            //把表数据对象存到redis
+            redisCache.setex(true, redisKey, JSON.toJSONString(optional.get()), RedisKeyUtils.redisKeyRandomTime(INT_EXPIRED_SEVEN_DAYS));
+            log.info("表数据对象存到Redis redisKey={}, data={}", redisKey, optional.get());
+            return optional;
+        } finally {
+            redisLock.unlock(key);
+        }
+    }
+    ...
+}</code></pre>
+<p data-track="202"><strong>(2)数据表的DB操作组件</strong></p>
+<p data-track="203">该组件主要提供对数据表数据的查询方法。</p>
+<pre class="highlighter-hljs"><code>@Service("productDetailStringDatabase")
+public class ProductDetailStringDatabase extends AbstractRedisStringDatabase&lt;ProductDetailDO&gt; {
+    public static final String SKU_ID = "skuId";
+    private static final String TABLE_NAME = "sku_info";
+    
+    @Resource
+    private ProductRepository productRepository;
+    
+    @Override
+    public String getTableName() {
+        return TABLE_NAME;
+    }
+    
+    @Override
+    public Set&lt;String&gt; getTableNameSet() {
+        return Sets.newHashSet(getTableName());
+    }
+    
+    @Override
+    public Optional&lt;ProductDetailDO&gt; getTableData(Map&lt;String, Object&gt; tableFieldsMap, String queryType) {
+        if (tableFieldsMap.containsKey(SKU_ID)) {
+            String skuId = (String) tableFieldsMap.get(SKU_ID);
+            ProductDetailDO productDetailDO = productRepository.queryProductDetail(skuId);
+            if (!Objects.isNull(productDetailDO) &amp;&amp; DelFlagEnum.EFFECTIVE.getCode().equals(productDetailDO.getDelFlag())) {
+                return Optional.of(productDetailDO);
+            }
+            return Optional.empty();
+        }
+        return Optional.empty();
+    }
+    
+    @Override
+    public Optional&lt;List&lt;ProductDetailDO&gt;&gt; listTableData(Map&lt;String, Object&gt; tableFieldsMap, String queryType) {
+        return Optional.empty();
+    }
+    
+    @Override
+    public Optional&lt;RedisStringCache&lt;ProductDetailDO&gt;&gt; listTableDataByIdSet(Set&lt;Long&gt; idSet, String queryType) {
+        RedisStringCache redisStringCache = new RedisStringCache();
+        List&lt;ProductDetailDO&gt; addList = new ArrayList&lt;&gt;();
+        for (Long skuId : idSet) {
+            ProductDetailDO productDetailDO = productRepository.queryProductDetail(String.valueOf(skuId));
+            if (!Objects.isNull(productDetailDO)) {
+                addList.add(productDetailDO);
+            }
+        }
+        redisStringCache.setAddList(addList);
+        return Optional.of(redisStringCache);
+    }
+    
+    @Override
+    public Optional&lt;RedisStringCache&lt;ProductDetailDO&gt;&gt; listTableDataByIdSet(List&lt;Long&gt; idSet, String queryType) {
+        Long skuId = idSet.get(0);
+        ProductDetailDO productDetailDO = productRepository.queryProductDetail(String.valueOf(skuId));
+        RedisStringCache redisStringCache = new RedisStringCache();
+        redisStringCache.setAddList(Arrays.asList(productDetailDO));
+        return Optional.of(redisStringCache);
+    }
+}</code></pre>
+<p>&nbsp;</p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-06-17 15:51">2025-06-17 15:50</span>&nbsp;
+<a href="https://www.cnblogs.com/mjunz">东阳马生架构</a>&nbsp;
+阅读(<span id="post_view_count">118</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18933087);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18933087', targetLink: 'https://www.cnblogs.com/mjunz/p/18933087', title: '商品中心—7.自研缓存框架的技术文档' })">举报</a>
+</div>
+        
