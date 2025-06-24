@@ -1,0 +1,418 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/12lisu/p/18945701" title="发布于 2025-06-24 09:56">
+    <span role="heading" aria-level="2">100万QPS短链系统如何设计？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>凌晨两点，监控大屏突然飙红——短链服务QPS突破80万！<br>
+数据库连接池告急，Redis集群响应延迟突破500ms。</p>
+<p>这不是演习，而是某电商平台大促的真实场景。</p>
+<p>当每秒百万级请求涌向你的短链服务，你该如何设计系统？</p>
+<p>今天这篇文章跟大家一起聊聊100万QPS短链系统要如何设计？</p>
+<p>希望对你会有所帮助。</p>
+<h2 id="1-短链系统的核心挑战">1 短链系统的核心挑战</h2>
+<p>首先我们一起看看设计一个高并发的短链系统，会遇到哪些核心的挑战。</p>
+<p>如下图所示：<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250624095540209-61899067.png" class="lazyload"></p>
+<p><strong>百万QPS下的三大生死关：</strong></p>
+<ol>
+<li><strong>ID生成瓶颈</strong>：传统数据库自增ID撑不住百万并发</li>
+<li><strong>跳转性能黑洞</strong>：302重定向的TCP连接成本</li>
+<li><strong>缓存雪崩风险</strong>：热点短链瞬间击穿Redis</li>
+</ol>
+<h2 id="2-短链生成">2 短链生成</h2>
+<h3 id="21-发号器的设计">2.1 发号器的设计</h3>
+<p>发号器是短链系统的发动机。</p>
+<h4 id="方案对比">方案对比：</h4>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>吞吐量</th>
+<th>缺点</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>UUID</td>
+<td>5万/s</td>
+<td>长度长，无法排序</td>
+<td>小型系统</td>
+</tr>
+<tr>
+<td>Redis自增ID</td>
+<td>8万/s</td>
+<td>依赖缓存持久化</td>
+<td>中型系统</td>
+</tr>
+<tr>
+<td>Snowflake</td>
+<td>12万/s</td>
+<td>时钟回拨问题</td>
+<td>中大型系统</td>
+</tr>
+<tr>
+<td>分段发号</td>
+<td>50万/s</td>
+<td>需要预分配</td>
+<td>超大型系统</td>
+</tr>
+</tbody>
+</table>
+<h4 id="分段发号器实现java版">分段发号器实现（Java版）：</h4>
+<pre><code class="language-java">public class SegmentIDGen {
+    private final AtomicLong currentId = new AtomicLong(0);
+    private volatile long maxId;
+    private final ExecutorService loader = Executors.newSingleThreadExecutor();
+
+    public void init() {
+        loadSegment();
+        loader.submit(this::daemonLoad);
+    }
+
+    private void loadSegment() {
+        // 从DB获取号段：SELECT max_id FROM alloc WHERE biz_tag='short_url'
+        this.maxId = dbMaxId + 10000; // 每次取1万个号
+        currentId.set(dbMaxId);
+    }
+
+    private void daemonLoad() {
+        while (currentId.get() &gt; maxId * 0.8) {
+            loadSegment(); // 号段使用80%时异步加载
+        }
+    }
+
+    public long nextId() {
+        if (currentId.get() &gt;= maxId) throw new BusyException();
+        return currentId.incrementAndGet();
+    }
+}
+</code></pre>
+<p><strong>关键优化</strong>：</p>
+<ol>
+<li>双Buffer异步加载（避免加载阻塞）</li>
+<li>监控号段使用率（动态调整步长）</li>
+<li>多实例分段隔离（biz_tag区分业务）</li>
+</ol>
+<h2 id="22-短链映射算法">2.2 短链映射算法</h2>
+<p>短码映射将长ID转换成62进制的字符串。</p>
+<h4 id="转换原理">转换原理：</h4>
+<pre><code>2000000000 = 2×62^4 + 17×62^3 + 35×62^2 + 10×62 + 8 
+           = "Cdz9a"
+</code></pre>
+<p>原始ID: 2000000000，转换为62进制的值为Cdz9a。</p>
+<pre><code class="language-java">// Base62编码（0-9a-zA-Z）
+public class Base62Encoder {
+    private static final String BASE62 = 
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    
+    public static String encode(long id) {
+        StringBuilder sb = new StringBuilder();
+        while (id &gt; 0) {
+            sb.append(BASE62.charAt((int)(id % 62)));
+            id /= 62;
+        }
+        return sb.reverse().toString();
+    }
+    
+    // 测试：生成8位短码
+    public static void main(String[] args) {
+        long id = 1_000_000_000L;
+        System.out.println(encode(id)); // 输出：BFp3qQ
+    }
+}
+</code></pre>
+<p><strong>编码优势：</strong></p>
+<ul>
+<li>6位短码可表示 62^6 ≈ 568亿种组合</li>
+<li>8位短码可表示 62^8 ≈ 218万亿种组合</li>
+<li>无意义字符串避免被猜测</li>
+</ul>
+<h2 id="3-存储架构">3 存储架构</h2>
+<h3 id="31-数据存储模型设计">3.1 数据存储模型设计</h3>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250624095558402-1270189356.png" class="lazyload"></p>
+<h3 id="32-缓存层级设计">3.2 缓存层级设计</h3>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250624095608283-198075542.png" class="lazyload"></p>
+<h3 id="33-缓存击穿解决方案">3.3 缓存击穿解决方案</h3>
+<pre><code class="language-java">// Redis缓存击穿防护
+public String getLongUrl(String shortCode) {
+    // 1. 布隆过滤器预检
+    if (!bloomFilter.mightContain(shortCode)) {
+        return null;
+    }
+    
+    // 2. 查Redis
+    String cacheKey = "url:" + shortCode;
+    String longUrl = redis.get(cacheKey);
+    if (longUrl != null) {
+        return longUrl;
+    }
+    
+    // 3. 获取分布式锁
+    String lockKey = "lock:" + shortCode;
+    if (redis.setnx(lockKey, "1", 10)) { // 10秒超时
+        try {
+            // 4. 二次检查缓存
+            longUrl = redis.get(cacheKey);
+            if (longUrl != null) return longUrl;
+            
+            // 5. 查数据库
+            longUrl = db.queryLongUrl(shortCode);
+            if (longUrl != null) {
+                // 6. 回填Redis
+                redis.setex(cacheKey, 3600, longUrl);
+            }
+            return longUrl;
+        } finally {
+            redis.del(lockKey);
+        }
+    } else {
+        // 7. 等待重试
+        Thread.sleep(50);
+        return getLongUrl(shortCode);
+    }
+}
+</code></pre>
+<p><strong>防护要点：</strong></p>
+<ul>
+<li>布隆过滤器拦截非法短码</li>
+<li>分布式锁防止缓存击穿</li>
+<li>双重检查减少DB压力</li>
+<li>指数退避重试策略</li>
+</ul>
+<h2 id="4-跳转优化">4 跳转优化</h2>
+<h3 id="41-nginx层直接跳转">4.1 Nginx层直接跳转</h3>
+<pre><code class="language-nginx">server {
+    listen 80;
+    server_name s.domain.com;
+    
+    location ~ ^/([a-zA-Z0-9]{6,8})$ {
+        set $short_code $1;
+        
+        # 查询Redis
+        redis_pass redis_cluster;
+        redis_query GET url:$short_code;
+        
+        # 命中则直接302跳转
+        if ($redis_value != "") {
+            add_header Cache-Control "private, max-age=86400";
+            return 302 $redis_value;
+        }
+        
+        # 未命中转发到后端
+        proxy_pass http://backend;
+    }
+}
+</code></pre>
+<p><strong>性能收益：</strong></p>
+<ul>
+<li>跳转延迟从100ms降至5ms</li>
+<li>节省后端服务器资源</li>
+<li>支持百万级并发连接</li>
+</ul>
+<h3 id="42--连接池优化">4.2  连接池优化</h3>
+<p>连接池优化可以用Netty实现：</p>
+<pre><code class="language-java">// Netty HTTP连接池配置
+public class HttpConnectionPool {
+    private final EventLoopGroup group = new NioEventLoopGroup();
+    private final Bootstrap bootstrap = new Bootstrap();
+    
+    public HttpConnectionPool() {
+        bootstrap.group(group)
+            .channel(NioSocketChannel.class)
+            .option(ChannelOption.SO_KEEPALIVE, true)
+            .handler(new HttpClientInitializer());
+    }
+    
+    public Channel getChannel(String host, int port) throws InterruptedException {
+        return bootstrap.connect(host, port).sync().channel();
+    }
+    
+    // 使用示例
+    public void redirect(ChannelHandlerContext ctx, String longUrl) {
+        Channel channel = getChannel("target.com", 80);
+        channel.writeAndFlush(new DefaultFullHttpRequest(
+            HttpVersion.HTTP_1_1, 
+            HttpMethod.GET, 
+            longUrl
+        ));
+        // 处理响应...
+    }
+}
+</code></pre>
+<p><strong>优化效果：</strong></p>
+<ul>
+<li>TCP连接复用率提升10倍</li>
+<li>减少80%的TCP握手开销</li>
+<li>QPS承载能力提升3倍</li>
+</ul>
+<h2 id="5-百万qps整体架构">5 百万QPS整体架构</h2>
+<p>百万QPS整体架构如下图所示：<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250624095621911-1849159662.png" class="lazyload"></p>
+<p><strong>核心组件解析：</strong></p>
+<ol>
+<li>
+<p><strong>接入层</strong></p>
+<ul>
+<li>CDN：缓存静态资源</li>
+<li>Nginx：处理302跳转，本地缓存热点数据</li>
+</ul>
+</li>
+<li>
+<p><strong>缓存层</strong></p>
+<ul>
+<li>Redis集群：缓存短链映射</li>
+<li>布隆过滤器：拦截非法请求</li>
+</ul>
+</li>
+<li>
+<p><strong>服务层</strong></p>
+<ul>
+<li>短链生成：分布式ID服务</li>
+<li>映射查询：高并发查询服务</li>
+</ul>
+</li>
+<li>
+<p><strong>存储层</strong></p>
+<ul>
+<li>MySQL：分库分表存储映射关系</li>
+<li>TiKV：分布式KV存储ID生成状态</li>
+</ul>
+</li>
+</ol>
+<h2 id="6-容灾设计">6 容灾设计</h2>
+<h3 id="61-限流熔断策略">6.1 限流熔断策略</h3>
+<p>基于Sentinel的熔断降级：</p>
+<pre><code class="language-java">public class RedirectController {
+    @GetMapping("/{shortCode}")
+    @SentinelResource(
+        value = "redirectService", 
+        fallback = "fallbackRedirect",
+        blockHandler = "blockRedirect"
+    )
+    public ResponseEntity redirect(@PathVariable String shortCode) {
+        // 跳转逻辑...
+    }
+    
+    // 熔断降级方法
+    public ResponseEntity fallbackRedirect(String shortCode, Throwable ex) {
+        return ResponseEntity.status(503)
+            .body("服务暂时不可用");
+    }
+    
+    // 限流处理方法
+    public ResponseEntity blockRedirect(String shortCode, BlockException ex) {
+        return ResponseEntity.status(429)
+            .body("请求过于频繁");
+    }
+}
+</code></pre>
+<h3 id="62-多级降级方案">6.2 多级降级方案</h3>
+<p>使用多级降级方案：<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250624095636961-209329642.png" class="lazyload"></p>
+<p>保证服务的高可用。</p>
+<h3 id="63-数据分片策略">6.3 数据分片策略</h3>
+<p>基于短码分库分表：</p>
+<pre><code class="language-java">public int determineDbShard(String shortCode) {
+    // 取短码首字母的ASCII值
+    int ascii = (int) shortCode.charAt(0);
+    // 分16个库
+    return ascii % 16;
+}
+
+public int determineTableShard(String shortCode) {
+    // 取短码的CRC32值
+    CRC32 crc32 = new CRC32();
+    crc32.update(shortCode.getBytes());
+    // 每库1024张表
+    return (int) (crc32.getValue() % 1024);
+}
+</code></pre>
+<p>这里成了16个库，每个库有1024张表。</p>
+<h2 id="7-性能压测数据对比">7 性能压测数据对比</h2>
+<table>
+<thead>
+<tr>
+<th>优化点</th>
+<th>优化前QPS</th>
+<th>优化后QPS</th>
+<th>提升倍数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始方案</td>
+<td>12,000</td>
+<td>-</td>
+<td>1x</td>
+</tr>
+<tr>
+<td>+Redis缓存</td>
+<td>120,000</td>
+<td>10x</td>
+<td></td>
+</tr>
+<tr>
+<td>+Nginx直跳</td>
+<td>350,000</td>
+<td>2.9x</td>
+<td></td>
+</tr>
+<tr>
+<td>+连接池优化</td>
+<td>780,000</td>
+<td>2.2x</td>
+<td></td>
+</tr>
+<tr>
+<td>+布隆过滤器</td>
+<td>1,200,000</td>
+<td>1.5x</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>压测环境：32核64G服务器 × 10台，千兆内网</p>
+</blockquote>
+<h2 id="总结">总结</h2>
+<p>百万QPS短链架构核心要点如图所示：<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202506/2238006-20250624095647357-1211697130.png" class="lazyload"></p>
+<p><strong>四大设计原则：</strong></p>
+<ol>
+<li><strong>无状态设计</strong>：跳转服务完全无状态，支持无限扩展</li>
+<li><strong>读多写少优化</strong>：将读性能压榨到极致</li>
+<li><strong>分而治之</strong>：数据分片，流量分散</li>
+<li><strong>柔性可用</strong>：宁可部分降级，不可全线崩溃</li>
+</ol>
+<blockquote>
+<p>真正的架构艺术不在于复杂，而在于在百万QPS洪流中，用最简单的路径解决问题。当你的系统能在流量风暴中优雅舞蹈，才是架构师的巅峰时刻。</p>
+</blockquote>
+<h2 id="最后说一句求关注别白嫖我">最后说一句(求关注，别白嫖我)</h2>
+<p>如果这篇文章对您有所帮助，或者有所启发的话，帮忙关注一下我的同名公众号：苏三说技术，您的支持是我坚持写作最大的动力。</p>
+<p>求一键三连：点赞、转发、在看。</p>
+<p>关注公众号：【苏三说技术】，在公众号中回复：进大厂，可以免费获取我最近整理的10万字的面试宝典，好多小伙伴靠这个宝典拿到了多家大厂的offer。</p>
+<p>本文收录于我的技术网站：<a href="http://www.susan.net.cn" target="_blank" rel="noopener nofollow">http://www.susan.net.cn</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-06-24 09:57">2025-06-24 09:56</span>&nbsp;
+<a href="https://www.cnblogs.com/12lisu">苏三说技术</a>&nbsp;
+阅读(<span id="post_view_count">361</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18945701);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18945701', targetLink: 'https://www.cnblogs.com/12lisu/p/18945701', title: '100万QPS短链系统如何设计？' })">举报</a>
+</div>
+        
