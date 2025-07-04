@@ -1,0 +1,304 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/pltrue/p/18965077" title="发布于 2025-07-04 09:54">
+    <span role="heading" aria-level="2">Go 重构案例分享：订单创建逻辑重构</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h3>背景：从 PHP (Laravel) 到 Go 的代码迁移</h3>
+<br>
+<ul>
+<li>原 PHP (Laravel) 实现思路：核心模式： “行为管道” (Behavior Pipeline)。</li>
+<li>如何工作： 将订单创建拆分成多个独立的小任务 (如：请求限流、素材验证、创建订单、调用支付、埋点)。每个任务是一个实现了特定接口 (BehaviorOrderCreateInterface) 的类。</li>
+<li>执行过程： 将这些任务类注册到一个列表中。创建订单时，按顺序执行列表里每个任务的 handle 方法。</li>
+<li>状态共享： 每个任务在执行时，能访问和修改同一个“订单创建服务”对象 (OrderCreateService)，通过它传递数据和状态（比如订单创建后，埋点任务需要用到订单ID）。</li>
+<li>异常处理： 使用 try-catch 捕获异常并进行事务回滚。</li>
+</ul>
+<br>
+<h4>makeOrder 创建订单方法</h4>
+<br>
+<p>实例化OrderCreateService类后，通过registerBehavior通过 registerBehavior 方法将行为类注册。<br>
+最后执行create方法</p>
+<pre><code class="language-PHP">/**
+     * 生成订单
+     * @param $params
+     * @return string[]
+     * @date 2023/6/6 13:30
+     * @throws \Exception
+     */
+    public function makeOrder($params): array
+    {
+        $db = DB::connection(DbEnum::MYSQL_RELEBOOK);
+        $db-&gt;beginTransaction();
+
+        try {
+            $data = (new OrderCreateService($params))-&gt;registerBehavior(
+                function () {
+                    return new RequestLimit();
+                },
+                function () {
+                    return new ResValidate();
+                },
+                function () {
+                    return new Order();
+                },
+                function () {
+                    return new Payment();
+                },
+                function () {
+                    return new OrderBuried();
+                },
+            )-&gt;create();
+
+            $db-&gt;commit();
+
+            return $data;
+        } catch (\LogicException $logicException) {
+            $db-&gt;rollback();
+            // 异常code码（CODE_117006008）返回素材信息，不直接抛异常
+            if ($logicException-&gt;getCode() == RelebookUserCodeEnum::CODE_117006008) {
+                $data = collect(json_decode($logicException-&gt;getMessage()))-&gt;toArray();
+                $data['order_no'] = '';
+                $data['pay_url'] = '';
+                return $data;
+            }
+            throw new \LogicException($logicException-&gt;getMessage(), $logicException-&gt;getCode());
+        } catch (\Exception $exception) {
+            $db-&gt;rollback();
+            throw new \Exception($exception-&gt;getMessage(), intval($exception-&gt;getCode()));
+        }
+    }
+</code></pre>
+<p>这些 行为类 都继承BehaviorOrderCreateInterface 接口</p>
+<pre><code class="language-PHP">interface BehaviorOrderCreateInterface
+{
+    public function handle(OrderCreateService $orderCreateService);
+
+}
+</code></pre>
+<p>最后让我们来瞧瞧OrderCreateService类的实现。<br>
+$behaviorList 用来存放 registerBehavior方法注册的行为类<br>
+最后在create方法里面运行</p>
+<pre><code class="language-PHP">class OrderCreateService
+{
+
+    public array $params;
+
+    public array $params;
+    /** 素材信息 **/
+    public array $res;
+    /**订单信息 **/
+    public array $order_info;
+    /**子订单信息 **/
+    public array $subOrders;
+    /**购物车信息 **/
+    public array $cartItem;
+    /**支付服务 **/
+    public PaymentInterface $paymentService;
+    /**支付信息 **/
+    public array $payment;
+
+    /**
+     * @var array|\Closure[]
+     */
+    private array $behaviorList = [];
+
+    public function __construct($params)
+    {
+        $this-&gt;params = $params;
+    }
+
+    /**
+     * 订单创建行为注册
+     * @param \Closure ...$callback
+     * @return $this
+     * @date 2023/6/29 13:58
+     */
+    public function registerBehavior(\Closure ...$callback): static
+    {
+        $this-&gt;behaviorList = array_merge($this-&gt;behaviorList,$callback);
+        return $this;
+    }
+
+ /**
+     * 创建订单
+     * @return mixed
+     * @date 2023/6/29 14:21
+     */
+    public function create()
+    {
+        $this-&gt;params['order_type'] = PayEnum::ORDER_TYPE_RES;
+
+        // A、执行订单创建行为
+        foreach ($this-&gt;behaviorList as $behavior) {
+            $behavior()-&gt;handle($this);
+        }
+
+        // B、订单返回数据
+        $this-&gt;data = array_merge($this-&gt;data, $this-&gt;payment);
+        $this-&gt;data['order_type'] = $this-&gt;params['order_type'];
+        $this-&gt;data['cash_type'] = $this-&gt;params['cash_type'];
+        $this-&gt;data['order_no'] = $this-&gt;order_info['order_no'];
+        $this-&gt;data['pay_url'] = $this-&gt;payment['pay_url'];
+        $this-&gt;data['type'] = RelebookUserOrder::ORDER_CREATE_STATUS_SUCCESS;
+        $this-&gt;data['res'] = [];
+
+        return $this-&gt;data;
+    }
+}
+</code></pre>
+<h3>Go重构的挑战与解决方案</h3>
+<br>
+<ol>
+<li>挑战 1：状态共享 (Go 没有类属性)问题： Go 没有类的概念，不同的小任务（函数/方法）不能直接共享一个“服务对象”的状态。解决方案： 引入 DTO (Data Transfer Object)。DTO 是什么？ 一个专门用来在不同部分之间传递数据的结构体。它就像是一个共享的“数据盒子”。作用： 将所有小任务需要共享的数据（请求参数、中间结果、最终响应、错误信息）都定义在这个结构体 (OrderBehaviorDTO) 里。如何工作： 每个小任务接收这个 DTO 指针作为参数，从中读取需要的数据，并将自己产生的结果写回到 DTO 中。这样，后续的任务就能访问到前面任务写入的数据。</li>
+<li>挑战 2：异常处理 (Go 没有 try-catch)问题： Go 通常通过函数返回 error 值来处理错误，不能像 PHP 那样在任意地方 throw 并被外层 catch。解决方案：在 DTO 中加入专门的错误字段 (Err)。每个小任务在执行过程中，如果遇到错误，不直接 panic 或抛异常，而是将错误信息设置到 DTO 的 Err 字段 (或 Response.Code/ErrMsg) 中，然后返回 DTO。主流程 (Handle 方法) 检查每个任务执行后 DTO 中的错误状态。一旦发现错误，立即终止后续任务并返回错误响应。</li>
+</ol>
+<h3>Go 实现的核心逻辑 (简化说明)</h3>
+<br>
+<ol>
+<li>定义 DTO 结构体 (OrderBehaviorDTO): 包含所有需要流转的数据（输入参数、支付结果、订单信息、错误码等）。</li>
+<li>定义任务接口 (BehaviorOrderCreateInterface): 要求所有小任务都必须实现一个 Handle(*OrderBehaviorDTO) *OrderBehaviorDTO 方法。</li>
+<li>创建主服务 (MakeOrderService):初始化时创建 DTO。将需要执行的小任务 (如 OrderValidate, OrderCreate, OrderPayment, OrderBuried) 添加到任务列表 (Behavior 切片)。</li>
+<li>执行主流程 (Handle 方法):按顺序遍历任务列表，调用每个任务的 Handle 方法，并传入 同一个 DTO 指针。每个任务从 DTO 读数据，处理业务，把结果写回 DTO。检查每个任务执行后 DTO 中的错误状态，遇错即停。</li>
+<li>组装最终响应： 所有任务成功后，从 DTO 中提取所需数据，组装成最终的订单创建响应 (OrderMakeResponse)。</li>
+</ol>
+<h3>关键优势 (使用 DTO + 接口模式)</h3>
+<br>
+<ul>
+<li>解耦清晰： 每个小任务只依赖 DTO 接口，不直接依赖其他任务的具体实现。</li>
+<li>状态管理： DTO 作为唯一的、明确的数据交换通道，解决了 Go 中跨函数/方法状态共享的问题。</li>
+<li>灵活可扩展： 添加新任务只需实现接口并注册到列表即可。</li>
+<li>错误处理适配 Go 习惯： 通过返回值和 DTO 中的错误状态显式处理错误，符合 Go 的 error 处理哲学。</li>
+</ul>
+<br>
+实现代码：
+<p>1.定义DTO结构体内容</p>
+<p>// OrderBehaviorDTO 用于解耦在不同结构体(服务)里面传递的数据结构体</p>
+<pre><code class="language-GO">type OrderBehaviorDTO struct {
+	Params    *order.OrderMakeRequest // 请求参数
+	Response  *order.OrderMakeResponse // 响应参数
+	UserId    int // 用户id
+	Uid       string // uid 
+	CartItem  []relebook.LlRelebookCartItem // 子服务查询产生的购物车信息
+	Res       map[int32]relebook.LlRelebookRes // 子服务查询产生的素材信息
+	Orders    OrderInfos  // 子服务创建的订单信息 -用于埋点
+	PayResult payment.PayResult // 支付子服务产生的支付信息 -用于埋点
+    Err Errer 
+}
+</code></pre>
+<p>// 响应参数的proto</p>
+<pre><code class="language-php">message OrderMakeResponse {
+  string order_no = 1;
+  string pay_url = 2;
+  string payment_intent_id = 3;
+  string client_secret = 4;
+  int32 order_type = 5;
+  int32 cash_type = 6;
+  int32 type = 7;
+  repeated Empty res = 8;
+  // 异常码和返回消息
+  int32 code = 9;
+  string err_msg = 10;
+}
+
+</code></pre>
+<ol>
+<li>将订单限流功能抽离成限流组件</li>
+<li>执行 orderService.NewMakeOrder方法 实例化订单创建服务并注入DTO结构体然后调用.Handle方法<br>
+<br></li>
+</ol>
+<pre><code class="language-go">func (*OrderLogic) OrderMake(ctx context.Context, in *order.OrderMakeRequest) (*order.OrderMakeResponse, error) {
+    // 订单请求限制
+    if utils.SlidingWindowRateLimiter(utils.GetLimitKey(ctx, "make_order"), 1, time.Second*1) != nil {
+        result := &amp;order.OrderMakeResponse{}
+        result.Code = code.CODE_117001011
+        result.ErrMsg = lang.OperatingLimit
+        return result, nil
+    }
+    // 开始执行业务
+    return orderService.NewMakeOrder(&amp;dto.OrderBehaviorDTO{
+        Params:   in,
+        Response: &amp;order.OrderMakeResponse{},
+        UserId:   cast.ToInt(trace.GetUserId(ctx)),
+        Uid:      in.Uid,
+    }).Handle()
+}
+</code></pre>
+<p>MakeOrderService结构体内容</p>
+<p>定义了支付、素材信息、素材封装数据DAO、用户id、以及DTO 和行为单元<br>
+最后执行 Handle方法进行行为服务执行。</p>
+<pre><code class="language-go">type MakeOrderService struct {
+	payService payment.PaymentInterface // 支付服务接口
+	resInfos   map[int32]relebook.LlRelebookRes // 订单支付的素材
+	resDAOImpl dao.ResDAOImpl // 素材表DAO封装的查询集合
+	userId     int // 用户id
+	Dto        *dto.OrderBehaviorDTO // DTO
+	Behavior   []BehaviorOrderCreateInterface // 行为单元
+}
+
+type BehaviorOrderCreateInterface interface {
+	Handle(Dto *dto.OrderBehaviorDTO) *dto.OrderBehaviorDTO
+}
+
+func (m *MakeOrderService) SetBehavior(behavior BehaviorOrderCreateInterface) *MakeOrderService {
+	m.Behavior = append(m.Behavior, behavior)
+	return m
+}
+
+func NewMakeOrder(Dto *dto.OrderBehaviorDTO) *MakeOrderService {
+	service, _ := payment.GetPaymentService(int(Dto.Params.CashType))
+	return &amp;MakeOrderService{
+		payService: service,
+		Dto:        Dto,
+	}
+}
+func (m *MakeOrderService) Handle() (*order.OrderMakeResponse, error) {
+	// 支付验签
+	if err := m.payService.Validate(payment.PaymentParams{}); err != nil {
+		m.Dto.Response.Code = code.CODE_117001001
+		m.Dto.Response.ErrMsg = err.Error()
+		return m.Dto.Response, nil
+	}
+	//设置需要写入的服务
+	m.SetBehavior(new(behavior_create.OrderValidate)).
+		SetBehavior(new(behavior_create.OrderCreate)).
+		SetBehavior(new(behavior_create.OrderPayment)).
+		SetBehavior(new(behavior_create.OrderBuried))
+	// 执行服务
+	for _, behavior := range m.Behavior {
+		if behavior.Handle(m.Dto).Response.Code != 0 {
+			return m.Dto.Response, nil
+		}
+	}
+	// 执行完成后
+	m.Dto.Response.ClientSecret = m.Dto.PayResult.ClientSecret
+	m.Dto.Response.PayUrl = m.Dto.PayResult.PaymentIntentId
+	m.Dto.Response.PayUrl = m.Dto.PayResult.PayUrl
+	m.Dto.Response.OrderType = m.Dto.Params.OrderType
+	m.Dto.Response.CashType = m.Dto.Params.CashType
+	m.Dto.Response.OrderNo = m.Dto.Orders.OrderInfo.OrderNo
+	m.Dto.Response.Type = relebook.ORDER_CREATE_STATUS_SUCCESS
+
+	return m.Dto.Response, nil
+}
+</code></pre>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.02847222222222222" data-date-updated="2025-07-04 10:35">2025-07-04 09:54</span>&nbsp;
+<a href="https://www.cnblogs.com/pltrue">pltrue</a>&nbsp;
+阅读(<span id="post_view_count">156</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18965077);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18965077', targetLink: 'https://www.cnblogs.com/pltrue/p/18965077', title: 'Go 重构案例分享：订单创建逻辑重构' })">举报</a>
+</div>
+        
