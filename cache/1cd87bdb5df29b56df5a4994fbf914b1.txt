@@ -1,0 +1,1048 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/KubeExplorer/p/18974335" title="发布于 2025-07-09 09:31">
+    <span role="heading" aria-level="2">开源 vGPU 方案 HAMi 原理分析 Part1：hami-device-plugin-nvidia 实现</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="hami-analyze-1-device-plugin-nvidia.png" loading="lazy" data-src="https://img.lixueduan.com/kubernetes/cover/hami-analyze-1-device-plugin-nvidia.png" class="lazyload"></p>
+<p>本文为开源的 vGPU 方案 HAMi 实现原理分析第一篇，主要分析 hami-device-plugin-nvidia 实现原理。</p>
+
+<p>之前在 <a href="https://www.lixueduan.com/posts/kubernetes/26-gpu-virtualization-hami/" target="_blank" rel="noopener nofollow">开源 vGPU 方案：HAMi,实现细粒度 GPU 切分</a> 介绍了 HAMi 是什么，然后在<a href="https://www.lixueduan.com/posts/kubernetes/28-hami-isolation-test/" target="_blank" rel="noopener nofollow">开源 vGPU 方案 HAMi: core&amp;memory 隔离测试</a> 中对 HAMi 提供的 vGPU 方案进行了测试。</p>
+<p>接下来则是逐步分析 HAMi 中的 vGPU 实现原理，涉及到的东西比较多，暂定分为几部分：</p>
+<ul>
+<li>1）hami-device-plugin-nvidia：HAMi 版本的 device plugin 中 GPU 感知以及分配逻辑是怎么实现的，和 NVIDIA 原生的 device-plugin 有和不同。</li>
+<li>2）HAMI-Scheduler：HAMi 是如何做调度的，binpack/spread 高级调度策略是怎么实现的</li>
+<li>3）HAMi-Core：这也是 vCUDA 方案最核心的部分，HAMi 是如何通过拦截 CUDA API 实现 Core&amp;Memory 隔离限制的</li>
+</ul>
+<p>本文为第一篇，分析 hami-device-plugin-nvidia 实现原理。</p>
+<h2 id="1-概述">1. 概述</h2>
+<p>NVIDIA 是有自己实现 device plugin 的，那么问题来了：<strong>HAMi 为什么还要自己实现一个 device plugin 呢？</strong></p>
+<p>是 <code>hami-device-plugin-nvidia</code> 是有哪些 NVIDIA 原生  device plugin 没有的功能吗？带着疑问，我们开始查看 hami-device-plugin-nvidia 源码。</p>
+<p>这部分需要大家对 GPU Operator、k8s device plugin 等比较熟悉阅读起来才比较丝滑。</p>
+<p><strong>推荐阅读</strong>：</p>
+<ul>
+<li>
+<p><a href="https://www.lixueduan.com/posts/ai/01-how-to-use-gpu/" target="_blank" rel="noopener nofollow">GPU 环境搭建指南：如何在裸机、Docker、K8s 等环境中使用 GPU</a></p>
+</li>
+<li>
+<p><a href="https://www.lixueduan.com/posts/ai/02-gpu-operator/" target="_blank" rel="noopener nofollow">GPU 环境搭建指南：使用 GPU Operator 加速 Kubernetes GPU 环境搭建</a></p>
+</li>
+<li>
+<p><a href="https://www.lixueduan.com/posts/kubernetes/21-device-plugin/" target="_blank" rel="noopener nofollow">Kubernetes教程(二一)—自定义资源支持：K8s Device Plugin 从原理到实现</a></p>
+</li>
+<li>
+<p><a href="https://www.lixueduan.com/posts/kubernetes/22-pod-use-gpu-in-k8s-analyze/" target="_blank" rel="noopener nofollow">Kubernetes教程(二二)—在 K8S 中创建 Pod 是如何使用到 GPU 的：device plugin&amp;nvidia-container-toolkit 源码分析</a></p>
+</li>
+</ul>
+<blockquote>
+<p>后续都默认大家都对这块比较熟悉了，特别是后两篇</p>
+</blockquote>
+<h2 id="2-程序入口">2. 程序入口</h2>
+<p>HAMi 首先支持的是 NVIDIA GPU，单独实现了一个 device plugin nvidia。</p>
+<ul>
+<li>
+<p>启动文件在 <a href="https://github.com/Project-HAMi/HAMi/tree/master/cmd/device-plugin/nvidia" target="_blank" rel="noopener nofollow">cmd/device-plugin/nvidia</a></p>
+</li>
+<li>
+<p>核心实现在 <a href="https://github.com/Project-HAMi/HAMi/tree/master/pkg/device-plugin/nvidiadevice/nvinternal" target="_blank" rel="noopener nofollow">pkg/device-plugin/nvidiadevice</a></p>
+</li>
+</ul>
+<blockquote>
+<p>默认大家都对 k8s 的 device plugin 机制比较熟悉了，因此这里只分析核心代码逻辑，不然篇幅就太长了。</p>
+</blockquote>
+<p>对于一个 device plugin 我们一般关注以下 3 个地方：</p>
+<ul>
+<li>
+<p><strong>Register</strong>：将插件注册到 Kubelet 的，参数 ResourceName 比较重要</p>
+</li>
+<li>
+<p><strong>ListAndWatch</strong>：device plugin 是怎么感知 GPU 并上报的</p>
+</li>
+<li>
+<p><strong>Allocate</strong>：device plugin 是如何将 GPU 分配给 Pod 的</p>
+</li>
+</ul>
+<p>启动命令在 <a href="https://github.com/Project-HAMi/HAMi/tree/master/cmd/device-plugin/nvidia" target="_blank" rel="noopener nofollow">/cmd/device-plugin/nvidia</a>，用的是 <code>github.com/urfave/cli/v2</code> 构建的一个命令行工具。</p>
+<pre><code class="language-go">func main() {
+    var configFile string
+
+    c := cli.NewApp()
+    c.Name = "NVIDIA Device Plugin"
+    c.Usage = "NVIDIA device plugin for Kubernetes"
+    c.Version = info.GetVersionString()
+    c.Action = func(ctx *cli.Context) error {
+       return start(ctx, c.Flags)
+    }
+
+    c.Flags = []cli.Flag{
+       &amp;cli.StringFlag{
+          Name:    "mig-strategy",
+          Value:   spec.MigStrategyNone,
+          Usage:   "the desired strategy for exposing MIG devices on GPUs that support it:\n\t\t[none | single | mixed]",
+          EnvVars: []string{"MIG_STRATEGY"},
+       },
+       &amp;cli.BoolFlag{
+          Name:    "fail-on-init-error",
+          Value:   true,
+          Usage:   "fail the plugin if an error is encountered during initialization, otherwise block indefinitely",
+          EnvVars: []string{"FAIL_ON_INIT_ERROR"},
+       },
+       &amp;cli.StringFlag{
+          Name:    "nvidia-driver-root",
+          Value:   "/",
+          Usage:   "the root path for the NVIDIA driver installation (typical values are '/' or '/run/nvidia/driver')",
+          EnvVars: []string{"NVIDIA_DRIVER_ROOT"},
+       },
+       &amp;cli.BoolFlag{
+          Name:    "pass-device-specs",
+          Value:   false,
+          Usage:   "pass the list of DeviceSpecs to the kubelet on Allocate()",
+          EnvVars: []string{"PASS_DEVICE_SPECS"},
+       },
+       &amp;cli.StringSliceFlag{
+          Name:    "device-list-strategy",
+          Value:   cli.NewStringSlice(string(spec.DeviceListStrategyEnvvar)),
+          Usage:   "the desired strategy for passing the device list to the underlying runtime:\n\t\t[envvar | volume-mounts | cdi-annotations]",
+          EnvVars: []string{"DEVICE_LIST_STRATEGY"},
+       },
+       &amp;cli.StringFlag{
+          Name:    "device-id-strategy",
+          Value:   spec.DeviceIDStrategyUUID,
+          Usage:   "the desired strategy for passing device IDs to the underlying runtime:\n\t\t[uuid | index]",
+          EnvVars: []string{"DEVICE_ID_STRATEGY"},
+       },
+       &amp;cli.BoolFlag{
+          Name:    "gds-enabled",
+          Usage:   "ensure that containers are started with NVIDIA_GDS=enabled",
+          EnvVars: []string{"GDS_ENABLED"},
+       },
+       &amp;cli.BoolFlag{
+          Name:    "mofed-enabled",
+          Usage:   "ensure that containers are started with NVIDIA_MOFED=enabled",
+          EnvVars: []string{"MOFED_ENABLED"},
+       },
+       &amp;cli.StringFlag{
+          Name:        "config-file",
+          Usage:       "the path to a config file as an alternative to command line options or environment variables",
+          Destination: &amp;configFile,
+          EnvVars:     []string{"CONFIG_FILE"},
+       },
+       &amp;cli.StringFlag{
+          Name:    "cdi-annotation-prefix",
+          Value:   spec.DefaultCDIAnnotationPrefix,
+          Usage:   "the prefix to use for CDI container annotation keys",
+          EnvVars: []string{"CDI_ANNOTATION_PREFIX"},
+       },
+       &amp;cli.StringFlag{
+          Name:    "nvidia-ctk-path",
+          Value:   spec.DefaultNvidiaCTKPath,
+          Usage:   "the path to use for the nvidia-ctk in the generated CDI specification",
+          EnvVars: []string{"NVIDIA_CTK_PATH"},
+       },
+       &amp;cli.StringFlag{
+          Name:    "container-driver-root",
+          Value:   spec.DefaultContainerDriverRoot,
+          Usage:   "the path where the NVIDIA driver root is mounted in the container; used for generating CDI specifications",
+          EnvVars: []string{"CONTAINER_DRIVER_ROOT"},
+       },
+    }
+    c.Flags = append(c.Flags, addFlags()...)
+    err := c.Run(os.Args)
+    if err != nil {
+       klog.Error(err)
+       os.Exit(1)
+    }
+}
+
+func addFlags() []cli.Flag {
+    addition := []cli.Flag{
+       &amp;cli.StringFlag{
+          Name:    "node-name",
+          Value:   os.Getenv(util.NodeNameEnvName),
+          Usage:   "node name",
+          EnvVars: []string{"NodeName"},
+       },
+       &amp;cli.UintFlag{
+          Name:    "device-split-count",
+          Value:   2,
+          Usage:   "the number for NVIDIA device split",
+          EnvVars: []string{"DEVICE_SPLIT_COUNT"},
+       },
+       &amp;cli.Float64Flag{
+          Name:    "device-memory-scaling",
+          Value:   1.0,
+          Usage:   "the ratio for NVIDIA device memory scaling",
+          EnvVars: []string{"DEVICE_MEMORY_SCALING"},
+       },
+       &amp;cli.Float64Flag{
+          Name:    "device-cores-scaling",
+          Value:   1.0,
+          Usage:   "the ratio for NVIDIA device cores scaling",
+          EnvVars: []string{"DEVICE_CORES_SCALING"},
+       },
+       &amp;cli.BoolFlag{
+          Name:    "disable-core-limit",
+          Value:   false,
+          Usage:   "If set, the core utilization limit will be ignored",
+          EnvVars: []string{"DISABLE_CORE_LIMIT"},
+       },
+       &amp;cli.StringFlag{
+          Name:  "resource-name",
+          Value: "nvidia.com/gpu",
+          Usage: "the name of field for number GPU visible in container",
+       },
+    }
+    return addition
+}
+</code></pre>
+<p>启动时做了两件事：</p>
+<ul>
+<li>
+<p>将插件注册到 Kubelet </p>
+</li>
+<li>
+<p>启动一个 gRPC 服务</p>
+</li>
+</ul>
+<p>我们只需要关注一下接收的几个参数：</p>
+<pre><code class="language-go">&amp;cli.UintFlag{
+    Name:    "device-split-count",
+    Value:   2,
+    Usage:   "the number for NVIDIA device split",
+    EnvVars: []string{"DEVICE_SPLIT_COUNT"},
+},
+&amp;cli.Float64Flag{
+    Name:    "device-memory-scaling",
+    Value:   1.0,
+    Usage:   "the ratio for NVIDIA device memory scaling",
+    EnvVars: []string{"DEVICE_MEMORY_SCALING"},
+},
+&amp;cli.Float64Flag{
+    Name:    "device-cores-scaling",
+    Value:   1.0,
+    Usage:   "the ratio for NVIDIA device cores scaling",
+    EnvVars: []string{"DEVICE_CORES_SCALING"},
+},
+&amp;cli.BoolFlag{
+    Name:    "disable-core-limit",
+    Value:   false,
+    Usage:   "If set, the core utilization limit will be ignored",
+    EnvVars: []string{"DISABLE_CORE_LIMIT"},
+},
+&amp;cli.StringFlag{
+    Name:  "resource-name",
+    Value: "nvidia.com/gpu",
+    Usage: "the name of field for number GPU visible in container",
+},
+</code></pre>
+<ul>
+<li>
+<p>device-split-count：表示 GPU 的分割数，每一张 GPU 都不能分配超过其配置数目的任务。若其配置为 N 的话，每个 GPU 上最多可以同时存在 N 个任务。</p>
+<ul>
+<li>建议根据 GPU 性能动态调整，一般建议大于 10。</li>
+</ul>
+</li>
+<li>
+<p>device-memory-scaling：表示 GPU memory 的 oversubscription(超额订阅)** **比例，默认 1.0，大于 1.0 则表示启用虚拟显存（实验功能），不建议修改。</p>
+</li>
+<li>
+<p>device-cores-scaling：表示 GPU core 的 oversubscription(超额订阅)比例，默认 1.0。</p>
+</li>
+<li>
+<p>disable-core-limit：是否关闭 GPU Core Limit，默认 false，不建议修改。</p>
+</li>
+<li>
+<p>resource-name：资源名称，建议改掉，不推荐使用默认的 <code>nvidia.com/gpu</code> 因为这个和 nvidia 原生的重复了。</p>
+</li>
+</ul>
+<h2 id="3-register">3. Register</h2>
+<h3 id="register">Register</h3>
+<p>Register 方法实现如下：</p>
+<pre><code class="language-go">// pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go#L222
+
+// Register registers the device plugin for the given resourceName with Kubelet.
+func (plugin *NvidiaDevicePlugin) Register() error {
+    conn, err := plugin.dial(kubeletdevicepluginv1beta1.KubeletSocket, 5*time.Second)
+    if err != nil {
+       return err
+    }
+    defer conn.Close()
+
+    client := kubeletdevicepluginv1beta1.NewRegistrationClient(conn)
+    reqt := &amp;kubeletdevicepluginv1beta1.RegisterRequest{
+       Version:      kubeletdevicepluginv1beta1.Version,
+       Endpoint:     path.Base(plugin.socket),
+       ResourceName: string(plugin.rm.Resource()),
+       Options: &amp;kubeletdevicepluginv1beta1.DevicePluginOptions{
+          GetPreferredAllocationAvailable: false,
+       },
+    }
+
+    _, err = client.Register(context.Background(), reqt)
+    if err != nil {
+       return err
+    }
+    return nil
+}
+</code></pre>
+<p> device plugin 注册时的几个核心信息：</p>
+<ul>
+<li>
+<p><strong>ResourceName</strong>：资源名称，这个和创建 Pod 时申请 vGPU 的资源名匹配时就会使用到该 device plugin。</p>
+<ul>
+<li>也是可以在 deivce plugin 启动时配置的，一般叫做 --resource-name=nvidia.com/vgpu</li>
+</ul>
+</li>
+<li>
+<p><strong>Version</strong>：device plugin 的版本，这里是 v1beta1</p>
+</li>
+<li>
+<p><strong>Endpoint</strong>：device plugin 的访问地址，Kubelet 会通过这个 sock 和 device plugin 进行交互。</p>
+<ul>
+<li>hami 用的格式为：<code>/var/lib/kubelet/device-plugins/nvidia-xxx.sock</code>，其中 xxx 是 从 ResourceName 中解析出来的，比如 nvidia.com/vgpu 那么这里的 xx 就是后面的 vgpu。</li>
+</ul>
+</li>
+</ul>
+<p>假设我们都使用默认值，ResourceName 为 <code>nvidia.com/vgpu</code>，Endpoint 为 <code>/var/lib/kubelet/device-plugins/nvidia-vgpu.sock</code>。</p>
+<ul>
+<li>
+<p>后续 Pod Resource 中申请使用 nvidia.com/vgpu 资源时，就会由该 device plugin 来处理，实现资源分配，Kubelet 则是通过 var/lib/kubelet/device-plugins/nvidia-vgpu.sock 这个 sock 文件调用 device plugin API。</p>
+</li>
+<li>
+<p>反之，我们在 Pod Resource 中申请使用 <code>nvidia.com/gpu</code> 时，这个 ResourceName 和 hami 插件不匹配，因此不由 hami device plugin nvidia 处理，而是由 nvidia 自己的  device plugin 进行处理。</p>
+</li>
+</ul>
+<h3 id="watchandregister">WatchAndRegister</h3>
+<p>这个是 HAMi device plugin 中的一个特殊逻辑，将 node 上的 GPU 信息以 annotations 的形式添加到 Node 对象上。</p>
+<blockquote>
+<p>这里是直接和 kube-apiserver 进行通信，而不是使用的传统的 device plugin 上报流程。</p>
+</blockquote>
+<p><strong>后续 HAMi-Scheduler 在进行调度时就会用到这边上报的 annotations 作为调度依据的一部分</strong>，分析 HAMi-Scheduler 时在仔细分析。</p>
+<pre><code class="language-go">func (plugin *NvidiaDevicePlugin) WatchAndRegister() {
+    klog.Info("Starting WatchAndRegister")
+    errorSleepInterval := time.Second * 5
+    successSleepInterval := time.Second * 30
+    for {
+       err := plugin.RegistrInAnnotation()
+       if err != nil {
+          klog.Errorf("Failed to register annotation: %v", err)
+          klog.Infof("Retrying in %v seconds...", errorSleepInterval)
+          time.Sleep(errorSleepInterval)
+       } else {
+          klog.Infof("Successfully registered annotation. Next check in %v seconds...", successSleepInterval)
+          time.Sleep(successSleepInterval)
+       }
+    }
+}
+</code></pre>
+<h4 id="getapidevices">getAPIDevices</h4>
+<p>获取 Node 上的 GPU 信息，并组装成 api.DeviceInfo 对象。</p>
+<pre><code class="language-go">func (plugin *NvidiaDevicePlugin) getAPIDevices() *[]*api.DeviceInfo {
+    devs := plugin.Devices()
+    nvml.Init()
+    res := make([]*api.DeviceInfo, 0, len(devs))
+    idx := 0
+    for idx &lt; len(devs) {
+       ndev, ret := nvml.DeviceGetHandleByIndex(idx)
+       //ndev, err := nvml.NewDevice(uint(idx))
+       //klog.V(3).Infoln("ndev type=", ndev.Model)
+       if ret != nvml.SUCCESS {
+          klog.Errorln("nvml new device by index error idx=", idx, "err=", ret)
+          panic(0)
+       }
+       memoryTotal := 0
+       memory, ret := ndev.GetMemoryInfo()
+       if ret == nvml.SUCCESS {
+          memoryTotal = int(memory.Total)
+       } else {
+          klog.Error("nvml get memory error ret=", ret)
+          panic(0)
+       }
+       UUID, ret := ndev.GetUUID()
+       if ret != nvml.SUCCESS {
+          klog.Error("nvml get uuid error ret=", ret)
+          panic(0)
+       }
+       Model, ret := ndev.GetName()
+       if ret != nvml.SUCCESS {
+          klog.Error("nvml get name error ret=", ret)
+          panic(0)
+       }
+
+       registeredmem := int32(memoryTotal / 1024 / 1024)
+       if *util.DeviceMemoryScaling != 1 {
+          registeredmem = int32(float64(registeredmem) * *util.DeviceMemoryScaling)
+       }
+       klog.Infoln("MemoryScaling=", *util.DeviceMemoryScaling, "registeredmem=", registeredmem)
+       health := true
+       for _, val := range devs {
+          if strings.Compare(val.ID, UUID) == 0 {
+             // when NVIDIA-Tesla P4, the device info is : ID:GPU-e290caca-2f0c-9582-acab-67a142b61ffa,Health:Healthy,Topology:nil,
+             // it is more reasonable to think of healthy as case-insensitive
+             if strings.EqualFold(val.Health, "healthy") {
+                health = true
+             } else {
+                health = false
+             }
+             break
+          }
+       }
+       numa, err := plugin.getNumaInformation(idx)
+       if err != nil {
+          klog.ErrorS(err, "failed to get numa information", "idx", idx)
+       }
+       res = append(res, &amp;api.DeviceInfo{
+          ID:      UUID,
+          Count:   int32(*util.DeviceSplitCount),
+          Devmem:  registeredmem,
+          Devcore: int32(*util.DeviceCoresScaling * 100),
+          Type:    fmt.Sprintf("%v-%v", "NVIDIA", Model),
+          Numa:    numa,
+          Health:  health,
+       })
+       idx++
+       klog.Infof("nvml registered device id=%v, memory=%v, type=%v, numa=%v", idx, registeredmem, Model, numa)
+    }
+    return &amp;res
+}
+</code></pre>
+<p>核心部分</p>
+<pre><code class="language-go">// 通过 nvml 库获取 GPU 信息
+ndev, ret := nvml.DeviceGetHandleByIndex(idx)
+memoryTotal := 0
+memory, ret := ndev.GetMemoryInfo()
+if ret == nvml.SUCCESS {
+    memoryTotal = int(memory.Total)
+} 
+UUID, ret := ndev.GetUUID()
+Model, ret := ndev.GetName()
+
+// 处理 Scaling
+registeredmem := int32(memoryTotal / 1024 / 1024)
+if *util.DeviceMemoryScaling != 1 {
+    registeredmem = int32(float64(registeredmem) * *util.DeviceMemoryScaling)
+}
+// 组装结果返回
+res = append(res, &amp;api.DeviceInfo{
+    ID:      UUID,
+    Count:   int32(*util.DeviceSplitCount),
+    Devmem:  registeredmem,
+    Devcore: int32(*util.DeviceCoresScaling * 100),
+    Type:    fmt.Sprintf("%v-%v", "NVIDIA", Model),
+    Numa:    numa,
+    Health:  health,
+})
+</code></pre>
+<h4 id="更新到-node-annoations">更新到 Node Annoations</h4>
+<p>拿到 Device 信息之后，调用 kube-apiserver 更新 Node 对象的 Annoations 把 Device 信息存起来。</p>
+<pre><code class="language-go">encodeddevices := util.EncodeNodeDevices(*devices)
+annos[nvidia.HandshakeAnnos] = "Reported " + time.Now().String()
+annos[nvidia.RegisterAnnos] = encodeddevices
+klog.Infof("patch node with the following annos %v", fmt.Sprintf("%v", annos))
+err = util.PatchNodeAnnotations(node, annos)
+</code></pre>
+<p>正常应该是走 k8s 的 device plugin 接口上报信息才对，这里是 HAMi 的特殊逻辑。</p>
+<h4 id="demo">Demo</h4>
+<p>查看 Node 上的 Annoations，看看这边记录了些什么数据</p>
+<pre><code class="language-bash">root@j99cloudvm:~# k get node j99cloudvm -oyaml
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    hami.io/node-handshake: Requesting_2024.09.25 07:48:26
+    hami.io/node-nvidia-register: 'GPU-03f69c50-207a-2038-9b45-23cac89cb67d,10,46068,100,NVIDIA-NVIDIA
+      A40,0,true:GPU-1afede84-4e70-2174-49af-f07ebb94d1ae,10,46068,100,NVIDIA-NVIDIA
+      A40,0,true:'
+</code></pre>
+<p>hami.io/node-nvidia-register 就是 HAMi 的 device plugin 更新到 Node 上的 GPU 信息，格式化一下</p>
+<pre><code class="language-bash">GPU-03f69c50-207a-2038-9b45-23cac89cb67d,10,46068,100,NVIDIA-NVIDIA A40,0,true:
+GPU-1afede84-4e70-2174-49af-f07ebb94d1ae,10,46068,100,NVIDIA-NVIDIA A40,0,true:
+</code></pre>
+<p>当前节点上是两张 A40 GPU，</p>
+<ul>
+<li>
+<p>GPU-03f69c50-207a-2038-9b45-23cac89cb67d：为 GPU 设备的 UUID</p>
+</li>
+<li>
+<p>10,46068,100： 切分为 10 份，每张卡 46068M 内存，core 为 100 个(说明没有配置 oversubscription)</p>
+</li>
+<li>
+<p>NVIDIA-NVIDIA：GPU 类型</p>
+</li>
+<li>
+<p>A40：GPU 型号</p>
+</li>
+<li>
+<p>0：表示 GPU 的 NUMA 结构</p>
+</li>
+<li>
+<p>true：表示该 GPU 是健康的</p>
+</li>
+<li>
+<p><code>:</code> 最后的冒号是分隔符</p>
+</li>
+</ul>
+<blockquote>
+<p>ps：这部分信息后续 hami-scheduler 进行调度时会用到，这里暂时不管。</p>
+</blockquote>
+<h3 id="小结">小结</h3>
+<p>Register 方法分为两部分：</p>
+<ul>
+<li>Register：将 device plugin 注册到 kubelet</li>
+<li>WatchAndRegister：感知 Node 上的 GPU 信息，并和 kube-apiserver 交互，将这部分信息以 annotations 的形式添加到 Node 对象上,以便后续 hami-scheduler 使用。</li>
+</ul>
+<h2 id="4-listandwatch">4. ListAndWatch</h2>
+<p>ListAndWatch 方法用于感知节点上的设备并上报给 Kubelet。</p>
+<p>由于需要将同一个 GPU 切分给多个 Pod 使用，因此 HAMi 的 device plugin 也会有类似 TimeSlicing 中的 Device 复制操作。</p>
+<p>具体实现如下：</p>
+<pre><code class="language-go">// ListAndWatch lists devices and update that list according to the health status
+func (plugin *NvidiaDevicePlugin) ListAndWatch(e *kubeletdevicepluginv1beta1.Empty, s kubeletdevicepluginv1beta1.DevicePlugin_ListAndWatchServer) error {
+    s.Send(&amp;kubeletdevicepluginv1beta1.ListAndWatchResponse{Devices: plugin.apiDevices()})
+
+    for {
+       select {
+       case &lt;-plugin.stop:
+          return nil
+       case d := &lt;-plugin.health:
+          // FIXME: there is no way to recover from the Unhealthy state.
+          d.Health = kubeletdevicepluginv1beta1.Unhealthy
+          klog.Infof("'%s' device marked unhealthy: %s", plugin.rm.Resource(), d.ID)
+          s.Send(&amp;kubeletdevicepluginv1beta1.ListAndWatchResponse{Devices: plugin.apiDevices()})
+       }
+    }
+}
+</code></pre>
+<p>具体实现在 <code>plugin.apiDevices</code>,跳转比较多，最终实现在 buildGPUDeviceMap 方法里：</p>
+<pre><code class="language-go">// VisitDevices visits each top-level device and invokes a callback function for it
+func (d *devicelib) VisitDevices(visit func(int, Device) error) error {
+    count, ret := d.nvml.DeviceGetCount()
+    if ret != nvml.SUCCESS {
+       return fmt.Errorf("error getting device count: %v", ret)
+    }
+
+    for i := 0; i &lt; count; i++ {
+       device, ret := d.nvml.DeviceGetHandleByIndex(i)
+       if ret != nvml.SUCCESS {
+          return fmt.Errorf("error getting device handle for index '%v': %v", i, ret)
+       }
+       dev, err := d.newDevice(device)
+       if err != nil {
+          return fmt.Errorf("error creating new device wrapper: %v", err)
+       }
+
+       isSkipped, err := dev.isSkipped()
+       if err != nil {
+          return fmt.Errorf("error checking whether device is skipped: %v", err)
+       }
+       if isSkipped {
+          continue
+       }
+
+       err = visit(i, dev)
+       if err != nil {
+          return fmt.Errorf("error visiting device: %v", err)
+       }
+    }
+    return nil
+}
+
+// buildGPUDeviceMap builds a map of resource names to GPU devices
+func (b *deviceMapBuilder) buildGPUDeviceMap() (DeviceMap, error) {
+    devices := make(DeviceMap)
+
+    b.VisitDevices(func(i int, gpu device.Device) error {
+       name, ret := gpu.GetName()
+       if ret != nvml.SUCCESS {
+          return fmt.Errorf("error getting product name for GPU: %v", ret)
+       }
+       migEnabled, err := gpu.IsMigEnabled()
+       if err != nil {
+          return fmt.Errorf("error checking if MIG is enabled on GPU: %v", err)
+       }
+       if migEnabled &amp;&amp; *b.config.Flags.MigStrategy != spec.MigStrategyNone {
+          return nil
+       }
+       for _, resource := range b.config.Resources.GPUs {
+          if resource.Pattern.Matches(name) {
+             index, info := newGPUDevice(i, gpu)
+             return devices.setEntry(resource.Name, index, info)
+          }
+       }
+       return fmt.Errorf("GPU name '%v' does not match any resource patterns", name)
+    })
+    return devices, nil
+}
+</code></pre>
+<p>也是直接使用 nvml 库获取 GPU 信息。</p>
+<p>然后和 TimeSlicing 类似，根据 DeviceSplitCount 对 GPU 进行复制：</p>
+<pre><code class="language-go">// GetPluginDevices returns the plugin Devices from all devices in the Devices
+func (ds Devices) GetPluginDevices() []*kubeletdevicepluginv1beta1.Device {
+    var res []*kubeletdevicepluginv1beta1.Device
+
+    if !strings.Contains(ds.GetIDs()[0], "MIG") {
+       for _, dev := range ds {
+          for i := uint(0); i &lt; *util.DeviceSplitCount; i++ {
+             id := fmt.Sprintf("%v-%v", dev.ID, i)
+             res = append(res, &amp;kubeletdevicepluginv1beta1.Device{
+                ID:       id,
+                Health:   dev.Health,
+                Topology: nil,
+             })
+          }
+       }
+    } else {
+       for _, d := range ds {
+          res = append(res, &amp;d.Device)
+       }
+
+    }
+
+    return res
+}
+</code></pre>
+<p>核心部分</p>
+<pre><code class="language-go">for _, dev := range ds {
+  for i := uint(0); i &lt; *util.DeviceSplitCount; i++ {
+     id := fmt.Sprintf("%v-%v", dev.ID, i)
+     res = append(res, &amp;kubeletdevicepluginv1beta1.Device{
+        ID:       id,
+        Health:   dev.Health,
+        Topology: nil,
+     })
+  }
+</code></pre>
+<h3 id="小结-1">小结</h3>
+<p>ListAndWatch 没有太多额外逻辑，主要和 TimeSlicing 类似的，根据 DeviceSplitCount 进行 Device 复制操作。</p>
+<p>因为虽然 HAMi 可以实现 GPU 切分，但是 k8s 中每个 Pod 都会把申请的 Resource 消耗掉，因此为了符合 k8s 逻辑，一般都会选择对物理 GPU 进行复制，便于运行更多的 GPU。</p>
+<h2 id="5-allocate">5. Allocate</h2>
+<p>HAMi 的 Allocate 实现中包含两部分：</p>
+<ul>
+<li>
+<p><strong>HAMi 的自定义逻辑</strong>：主要是根据 Pod Resource 中的申请资源数量设置对应的环境变量，以及挂载 libvgpu.so 以替换 Pod 中的原生驱动</p>
+</li>
+<li>
+<p><strong>NVIDIA 的原生逻辑</strong>：则是设置 <code>NVIDIA_VISIBLE_DEVICES</code> 这个环境变量，然后由 NVIDIA Container Toolkit 对该容器分配 GPU。</p>
+</li>
+</ul>
+<p>因为 HAMi 并没有为容器分配 GPU 的能力， 因此除了 HAMi 自定义的逻辑之外，还把 NVIDIA 的原生逻辑也加上了。</p>
+<p>这样 Pod 中有环境变量， NVIDIA Container Toolkit 就会为其分配 GPU，然后 HAMi 自定义逻辑中替换 libvgpu.so 和添加部分环境变量，以此来实现了对 GPU 的限制。</p>
+<h3 id="hami-自定义逻辑">HAMi 自定义逻辑</h3>
+<p>HAMi nvidia-device-plugin 的 Allocate 实现如下：</p>
+<pre><code class="language-go">// pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go#L290
+func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdevicepluginv1beta1.AllocateRequest) (*kubeletdevicepluginv1beta1.AllocateResponse, error) {
+    klog.InfoS("Allocate", "request", reqs)
+    responses := kubeletdevicepluginv1beta1.AllocateResponse{}
+    nodename := os.Getenv(util.NodeNameEnvName)
+    current, err := util.GetPendingPod(ctx, nodename)
+    if err != nil {
+       nodelock.ReleaseNodeLock(nodename, NodeLockNvidia)
+       return &amp;kubeletdevicepluginv1beta1.AllocateResponse{}, err
+    }
+    klog.V(5).Infof("allocate pod name is %s/%s, annotation is %+v", current.Namespace, current.Name, current.Annotations)
+
+    for idx, req := range reqs.ContainerRequests {
+       // If the devices being allocated are replicas, then (conditionally)
+       // error out if more than one resource is being allocated.
+
+       if strings.Contains(req.DevicesIDs[0], "MIG") {
+
+          if plugin.config.Sharing.TimeSlicing.FailRequestsGreaterThanOne &amp;&amp; rm.AnnotatedIDs(req.DevicesIDs).AnyHasAnnotations() {
+             if len(req.DevicesIDs) &gt; 1 {
+                return nil, fmt.Errorf("request for '%v: %v' too large: maximum request size for shared resources is 1", plugin.rm.Resource(), len(req.DevicesIDs))
+             }
+          }
+
+          for _, id := range req.DevicesIDs {
+             if !plugin.rm.Devices().Contains(id) {
+                return nil, fmt.Errorf("invalid allocation request for '%s': unknown device: %s", plugin.rm.Resource(), id)
+             }
+          }
+
+          response, err := plugin.getAllocateResponse(req.DevicesIDs)
+          if err != nil {
+             return nil, fmt.Errorf("failed to get allocate response: %v", err)
+          }
+          responses.ContainerResponses = append(responses.ContainerResponses, response)
+       } else {
+          currentCtr, devreq, err := util.GetNextDeviceRequest(nvidia.NvidiaGPUDevice, *current)
+          klog.Infoln("deviceAllocateFromAnnotation=", devreq)
+          if err != nil {
+             device.PodAllocationFailed(nodename, current, NodeLockNvidia)
+             return &amp;kubeletdevicepluginv1beta1.AllocateResponse{}, err
+          }
+          if len(devreq) != len(reqs.ContainerRequests[idx].DevicesIDs) {
+             device.PodAllocationFailed(nodename, current, NodeLockNvidia)
+             return &amp;kubeletdevicepluginv1beta1.AllocateResponse{}, errors.New("device number not matched")
+          }
+          response, err := plugin.getAllocateResponse(util.GetContainerDeviceStrArray(devreq))
+          if err != nil {
+             return nil, fmt.Errorf("failed to get allocate response: %v", err)
+          }
+
+          err = util.EraseNextDeviceTypeFromAnnotation(nvidia.NvidiaGPUDevice, *current)
+          if err != nil {
+             device.PodAllocationFailed(nodename, current, NodeLockNvidia)
+             return &amp;kubeletdevicepluginv1beta1.AllocateResponse{}, err
+          }
+
+          for i, dev := range devreq {
+             limitKey := fmt.Sprintf("CUDA_DEVICE_MEMORY_LIMIT_%v", i)
+             response.Envs[limitKey] = fmt.Sprintf("%vm", dev.Usedmem)
+
+             /*tmp := response.Envs["NVIDIA_VISIBLE_DEVICES"]
+             if i &gt; 0 {
+                response.Envs["NVIDIA_VISIBLE_DEVICES"] = fmt.Sprintf("%v,%v", tmp, dev.UUID)
+             } else {
+                response.Envs["NVIDIA_VISIBLE_DEVICES"] = dev.UUID
+             }*/
+          }
+          response.Envs["CUDA_DEVICE_SM_LIMIT"] = fmt.Sprint(devreq[0].Usedcores)
+          response.Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"] = fmt.Sprintf("%s/vgpu/%v.cache", hostHookPath, uuid.New().String())
+          if *util.DeviceMemoryScaling &gt; 1 {
+             response.Envs["CUDA_OVERSUBSCRIBE"] = "true"
+          }
+          if *util.DisableCoreLimit {
+             response.Envs[api.CoreLimitSwitch] = "disable"
+          }
+          cacheFileHostDirectory := fmt.Sprintf("%s/vgpu/containers/%s_%s", hostHookPath, current.UID, currentCtr.Name)
+          os.RemoveAll(cacheFileHostDirectory)
+
+          os.MkdirAll(cacheFileHostDirectory, 0777)
+          os.Chmod(cacheFileHostDirectory, 0777)
+          os.MkdirAll("/tmp/vgpulock", 0777)
+          os.Chmod("/tmp/vgpulock", 0777)
+          response.Mounts = append(response.Mounts,
+             &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: fmt.Sprintf("%s/vgpu/libvgpu.so", hostHookPath),
+                HostPath: hostHookPath + "/vgpu/libvgpu.so",
+                ReadOnly: true},
+             &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: fmt.Sprintf("%s/vgpu", hostHookPath),
+                HostPath: cacheFileHostDirectory,
+                ReadOnly: false},
+             &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: "/tmp/vgpulock",
+                HostPath: "/tmp/vgpulock",
+                ReadOnly: false},
+          )
+          found := false
+          for _, val := range currentCtr.Env {
+             if strings.Compare(val.Name, "CUDA_DISABLE_CONTROL") == 0 {
+                // if env existed but is set to false or can not be parsed, ignore
+                t, _ := strconv.ParseBool(val.Value)
+                if !t {
+                   continue
+                }
+                // only env existed and set to true, we mark it "found"
+                found = true
+                break
+             }
+          }
+          if !found {
+             response.Mounts = append(response.Mounts, &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: "/etc/ld.so.preload",
+                HostPath: hostHookPath + "/vgpu/ld.so.preload",
+                ReadOnly: true},
+             )
+          }
+          _, err = os.Stat(fmt.Sprintf("%s/vgpu/license", hostHookPath))
+          if err == nil {
+             response.Mounts = append(response.Mounts, &amp;kubeletdevicepluginv1beta1.Mount{
+                ContainerPath: "/tmp/license",
+                HostPath:      fmt.Sprintf("%s/vgpu/license", hostHookPath),
+                ReadOnly:      true,
+             })
+             response.Mounts = append(response.Mounts, &amp;kubeletdevicepluginv1beta1.Mount{
+                ContainerPath: "/usr/bin/vgpuvalidator",
+                HostPath:      fmt.Sprintf("%s/vgpu/vgpuvalidator", hostHookPath),
+                ReadOnly:      true,
+             })
+          }
+          responses.ContainerResponses = append(responses.ContainerResponses, response)
+       }
+    }
+    klog.Infoln("Allocate Response", responses.ContainerResponses)
+    device.PodAllocationTrySuccess(nodename, nvidia.NvidiaGPUDevice, NodeLockNvidia, current)
+    return &amp;responses, nil
+}
+</code></pre>
+<p>比较长，我们只需要关注核心部分，同时先忽略 MIG 相关的逻辑。</p>
+<p>首先是添加一个 CUDA_DEVICE_MEMORY_LIMIT_$Index 的环境变量，用于 gpu memory 限制。</p>
+<pre><code class="language-go">for i, dev := range devreq {
+    limitKey := fmt.Sprintf("CUDA_DEVICE_MEMORY_LIMIT_%v", i)
+    response.Envs[limitKey] = fmt.Sprintf("%vm", dev.Usedmem)
+
+    /*tmp := response.Envs["NVIDIA_VISIBLE_DEVICES"]
+    if i &gt; 0 {
+       response.Envs["NVIDIA_VISIBLE_DEVICES"] = fmt.Sprintf("%v,%v", tmp, dev.UUID)
+    } else {
+       response.Envs["NVIDIA_VISIBLE_DEVICES"] = dev.UUID
+    }*/
+}
+</code></pre>
+<p> 然后则是根据申请的 gpucores 配置 gpu core 限制的环境变量</p>
+<pre><code class="language-go">response.Envs["CUDA_DEVICE_SM_LIMIT"] = fmt.Sprint(devreq[0].Usedcores)
+</code></pre>
+<p>这个用于设置 share_region  mmap 文件在容器中的位置</p>
+<pre><code class="language-go">response.Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"] = fmt.Sprintf("%s/vgpu/%v.cache", hostHookPath, uuid.New().String())
+</code></pre>
+<p>Gpu memory 超额订阅</p>
+<pre><code class="language-go">if *util.DeviceMemoryScaling &gt; 1 {
+    response.Envs["CUDA_OVERSUBSCRIBE"] = "true"
+}
+</code></pre>
+<p>是否关闭算力限制</p>
+<pre><code class="language-go">if *util.DisableCoreLimit {
+    response.Envs[api.CoreLimitSwitch] = "disable"
+}
+</code></pre>
+<p>挂载 vgpu 相关文件</p>
+<blockquote>
+<p>这里就实现了 libvgpu.so 库的替换。</p>
+</blockquote>
+<pre><code class="language-go">// 缓存文件存放位置 /usr/local/vgpu/containers/xxx/xxx
+cacheFileHostDirectory := fmt.Sprintf("%s/vgpu/containers/%s_%s", hostHookPath, current.UID, currentCtr.Name)
+os.RemoveAll(cacheFileHostDirectory)
+
+os.MkdirAll(cacheFileHostDirectory, 0777)
+os.Chmod(cacheFileHostDirectory, 0777)
+os.MkdirAll("/tmp/vgpulock", 0777)
+os.Chmod("/tmp/vgpulock", 0777)
+
+response.Mounts = append(response.Mounts,
+    // 宿主机上的 libvgpu.so挂载到 pod 里替换 nvidia 默认的驱动
+    &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: fmt.Sprintf("%s/vgpu/libvgpu.so", hostHookPath),
+       HostPath: hostHookPath + "/vgpu/libvgpu.so",
+       ReadOnly: true},
+    // 随机的文件挂载进 pod 作为 vgpu 使用
+    &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: fmt.Sprintf("%s/vgpu", hostHookPath),
+       HostPath: cacheFileHostDirectory,
+       ReadOnly: false},
+    // 一个 lock 文件
+    &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: "/tmp/vgpulock",
+       HostPath: "/tmp/vgpulock",
+       ReadOnly: false},
+)
+</code></pre>
+<p>替换动态库,当没有指定  CUDA_DISABLE_CONTROL=true 时就会做该处理</p>
+<pre><code class="language-go">found := false
+for _, val := range currentCtr.Env {
+    if strings.Compare(val.Name, "CUDA_DISABLE_CONTROL") == 0 {
+       // if env existed but is set to false or can not be parsed, ignore
+       t, _ := strconv.ParseBool(val.Value)
+       if !t {
+          continue
+       }
+       // only env existed and set to true, we mark it "found"
+       found = true
+       break
+    }
+}
+if !found {
+    response.Mounts = append(response.Mounts, &amp;kubeletdevicepluginv1beta1.Mount{ContainerPath: "/etc/ld.so.preload",
+       HostPath: hostHookPath + "/vgpu/ld.so.preload",
+       ReadOnly: true},
+    )
+}
+</code></pre>
+<p>整个实现也算比较容易理解，就是给 Pod 增加了一系列环境变量，以及增加了替换 libvgpu.so 的 Mounts 配置，后续这个 libvgpu.so 就会根据这些环境变量做 Core&amp;Memory 的限制。</p>
+<h3 id="nvidia-原生逻辑">NVIDIA 原生逻辑</h3>
+<pre><code class="language-go">// pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go#L423
+func (plugin *NvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*kubeletdevicepluginv1beta1.ContainerAllocateResponse, error) {
+    deviceIDs := plugin.deviceIDsFromAnnotatedDeviceIDs(requestIds)
+
+    responseID := uuid.New().String()
+    response, err := plugin.getAllocateResponseForCDI(responseID, deviceIDs)
+    if err != nil {
+       return nil, fmt.Errorf("failed to get allocate response for CDI: %v", err)
+    }
+
+    response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, deviceIDs)
+    //if plugin.deviceListStrategies.Includes(spec.DeviceListStrategyVolumeMounts) || plugin.deviceListStrategies.Includes(spec.DeviceListStrategyEnvvar) {
+    // response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, deviceIDs)
+    //}
+    /*
+       if plugin.deviceListStrategies.Includes(spec.DeviceListStrategyVolumeMounts) {
+          response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, []string{deviceListAsVolumeMountsContainerPathRoot})
+          response.Mounts = plugin.apiMounts(deviceIDs)
+       }*/
+    if *plugin.config.Flags.Plugin.PassDeviceSpecs {
+       response.Devices = plugin.apiDeviceSpecs(*plugin.config.Flags.NvidiaDriverRoot, requestIds)
+    }
+    if *plugin.config.Flags.GDSEnabled {
+       response.Envs["NVIDIA_GDS"] = "enabled"
+    }
+    if *plugin.config.Flags.MOFEDEnabled {
+       response.Envs["NVIDIA_MOFED"] = "enabled"
+    }
+
+    return &amp;response, nil
+}
+</code></pre>
+<p>核心部分就是这一句，添加了一个环境变量</p>
+<pre><code class="language-go">response.Envs = plugin.apiEnvs(plugin.deviceListEnvvar, deviceIDs)
+</code></pre>
+<p>而 plugin.deviceListEnvvar 的值来自：</p>
+<pre><code class="language-go">// NewNvidiaDevicePlugin returns an initialized NvidiaDevicePlugin
+func NewNvidiaDevicePlugin(config *util.DeviceConfig, resourceManager rm.ResourceManager, cdiHandler cdi.Interface, cdiEnabled bool) *NvidiaDevicePlugin {
+    _, name := resourceManager.Resource().Split()
+
+    deviceListStrategies, _ := spec.NewDeviceListStrategies(*config.Flags.Plugin.DeviceListStrategy)
+
+    return &amp;NvidiaDevicePlugin{
+       rm:                   resourceManager,
+       config:               config,
+       deviceListEnvvar:     "NVIDIA_VISIBLE_DEVICES",
+       deviceListStrategies: deviceListStrategies,
+       socket:               kubeletdevicepluginv1beta1.DevicePluginPath + "nvidia-" + name + ".sock",
+       cdiHandler:           cdiHandler,
+       cdiEnabled:           cdiEnabled,
+       cdiAnnotationPrefix:  *config.Flags.Plugin.CDIAnnotationPrefix,
+
+       // These will be reinitialized every
+       // time the plugin server is restarted.
+       server: nil,
+       health: nil,
+       stop:   nil,
+    }
+}
+</code></pre>
+<p>即：<strong>NVIDIA_VISIBLE_DEVICES</strong></p>
+<p>正好，这个 ENV 就是 NVIDIA  deviceplugin 中的实现，设置该环境变量之后 nvidia-container-toolkit 会为有这个环境变量的容器分配 GPU。</p>
+<blockquote>
+<p>HAMi  这里则是复用了  nvidia-container-toolkit  的能力将 GPU 分配给 Pod。</p>
+</blockquote>
+<h3 id="小结-2">小结</h3>
+<p>Allocate 方法中核心部分包括三件事情：</p>
+<ul>
+<li>
+<p>HAMi 自定义逻辑</p>
+<ul>
+<li>
+<p>添加用于资源限制的环境变量<code>CUDA_DEVICE_MEMORY_LIMIT_X</code> 和 <code>CUDA_DEVICE_SM_LIMIT</code></p>
+</li>
+<li>
+<p>挂载 libvgpu.so 到 Pod 中进行替换</p>
+</li>
+</ul>
+</li>
+<li>
+<p>NVIDIA 原生逻辑</p>
+<ul>
+<li>添加用于分配 GPU 的 环境变量 <code>NVIDIA_VISIBLE_DEVICES</code>,借助 NVIDIA Container Toolkit 将 GPU 挂载到 Pod 里</li>
+</ul>
+</li>
+</ul>
+<h2 id="6-总结">6. 总结</h2>
+<p>至此，HAMi 的 NVIDIA device plugin 工作原理就很清晰了。</p>
+<ul>
+<li>
+<p>首先是 Register 插件注册，可以配置使用和原生 nvidia device plugin 不同的 ResourceName 来进行区分。</p>
+<ul>
+<li>另外会额外启动一个后台 goroutine WatchAndRegister 定时将 GPU 信息更新到 Node 对象的 Annoations 上便于 Scheduler 时使用。</li>
+</ul>
+</li>
+<li>
+<p>然后 ListAndWatch 感知设备时也根据配置对 Device 进行复制，让同一个设备能够分配给多个 Pod。</p>
+<ul>
+<li>这个和 TimeSlicing 方案一样</li>
+</ul>
+</li>
+<li>
+<p>最后 Allocate 方法中主要做三件事：</p>
+<ul>
+<li>
+<p>1）为容器中增加<code>NVIDIA_VISIBLE_DEVICES</code> 环境变量，借助 NVIDIA Container Toolkit 实现为容器分配 GPU</p>
+</li>
+<li>
+<p>2）增加 Mounts 配置，挂载 libvgpu.so 到容器中实现对原始驱动的替换</p>
+</li>
+<li>
+<p>3）为容器中增加部分 HAMi 自定义的环境变量 <code>CUDA_DEVICE_MEMORY_LIMIT_X</code> 和 <code>CUDA_DEVICE_SM_LIMIT</code> ，配合 ibvgpu.so 实现 GPU core、memory 的限制</p>
+</li>
+</ul>
+</li>
+</ul>
+<p><strong>核心其实就是在 Allocate 方法中，给容器中添加<code>CUDA_DEVICE_MEMORY_LIMIT_X</code> 和 <code>CUDA_DEVICE_SM_LIMIT</code>环境变量和挂载 libvgpu.so 到容器中实现对原始驱动的替换。</strong></p>
+<p>当容器启动后，CUDA API 请求先经过 libvgpu.so，然后 libvgpu.so 根据环境变量 <code>CUDA_DEVICE_MEMORY_LIMIT_X</code> 和 <code>CUDA_DEVICE_SM_LIMIT</code> 实现 Core &amp; Memory 限制。</p>
+<p>最后回答开篇提出的问题：<strong>HAMi 为什么要自己实现一个 device plugin 呢？hami-device-plugin-nvidia 是有哪些 NVIDIA 原生  device plugin 没有的功能吗？</strong></p>
+<p>在 hami device plugin 相比原生的 NVIDIA device plugin 做了几个修改：</p>
+<ul>
+<li>
+<p>1）注册时额外启动后台 goroutine WatchAndRegister 定时将 GPU 信息更新到 Node 对象的 Annoations 上便于 Scheduler 时使用。</p>
+</li>
+<li>
+<p>2）ListAndWatch 感知设备时也根据配置对 Device 进行复制，便于将同一个物理 GPU 分配给多个 Pod</p>
+<ul>
+<li>这个其实原生的 NVIDIA device plugin 也有，就是 TimeSlicing 方案。</li>
+</ul>
+</li>
+<li>
+<p>3）Allocate 中增加了 HAMi 自定义逻辑：</p>
+<ul>
+<li>
+<p>挂载 libvgpu.so 到容器中实现对原始驱动的替换</p>
+</li>
+<li>
+<p>指定部分 HAMi 自定义的环境变量<code>CUDA_DEVICE_MEMORY_LIMIT_X</code> 和 <code>CUDA_DEVICE_SM_LIMIT</code>，配合 ibvgpu.so 实现 GPU core、memory 的限制</p>
+</li>
+</ul>
+</li>
+</ul>
+<h2 id="7-faq">7. FAQ</h2>
+<h3 id="node-上的-libvgpuso-是怎么来的">Node 上的 libvgpu.so 是怎么来的</h3>
+<p>Allocate 方法中要将 libvgpu.so 挂载到 Pod 里，这里用的是 HostPath 方式挂载，说明这个 libvgpu.so 是存在于宿主机上的。</p>
+<p><strong>那么问题来了，宿主机上的 libvgpu.so 是怎么来的?</strong></p>
+<p>这个实际上是打包在 HAMi 提供的 device-plugin 镜像里的，device-plugin 启动时将其从 Pod 里复制到宿主机上，相关 yaml 如下：</p>
+<pre><code class="language-yaml">        - name: NVIDIA_MIG_MONITOR_DEVICES
+          value: all
+        - name: HOOK_PATH
+          value: /usr/local
+        image: 192.168.116.54:5000/projecthami/hami:v2.3.13
+        imagePullPolicy: IfNotPresent
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - cp -f /k8s-vgpu/lib/nvidia/* /usr/local/vgpu/
+        name: device-plugin
+        resources: {}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - SYS_ADMIN
+            drop:
+            - ALL
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/lib/kubelet/device-plugins
+          name: device-plugin
+        - mountPath: /usr/local/vgpu
+          name: lib
+</code></pre>
+<p>挂载了 hostPath 到容器里，然后容器里执行<code>cp -f /k8s-vgpu/lib/nvidia/* /usr/local/vgpu/</code> 命令将其复制到宿主机。</p>
+<hr>
+<p><strong>【Kubernetes 系列】</strong>持续更新中，搜索公众号【<strong>探索云原生</strong>】订阅，阅读更多文章。</p>
+<p><img alt="" loading="lazy" data-src="https://img.lixueduan.com/about/wechat/search.png" class="lazyload"></p>
+<hr>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-07-09 09:32">2025-07-09 09:31</span>&nbsp;
+<a href="https://www.cnblogs.com/KubeExplorer">探索云原生</a>&nbsp;
+阅读(<span id="post_view_count">3</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18974335);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18974335', targetLink: 'https://www.cnblogs.com/KubeExplorer/p/18974335', title: '开源 vGPU 方案 HAMi 原理分析 Part1：hami-device-plugin-nvidia 实现' })">举报</a>
+</div>
+        
