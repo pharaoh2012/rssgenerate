@@ -1,0 +1,812 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/goodcitizen/p/18933425/coroutines_without_schedulers_are_not_good_coroutines" title="发布于 2025-07-17 10:05">
+    <span role="heading" aria-level="2">没有调度器的协程不是好协程——零基础深入浅出 C++20 协程</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/1707550/202506/1707550-20250618173849646-1285475791.png" alt="没有调度器的协程不是好协程——零基础深入浅出 C++20 协程" class="desc_img">
+        网上 C++20 协程的例子为什么难懂？要么太复杂没有进行简化，要么太简单脱离了实际使用场景，特别是后者，虽然每一行代码都能看懂，但如何在实际场景中使用就一头雾水了。今天来看一个带简单调度器的协程例子，看看协程是怎么自己运行起来的吧~
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<h1>前言</h1>
+<p><span style="font-size: 18px">上一篇《<a id="cb_post_title_url" class="postTitle2 vertical-middle" title="发布于 2025-06-18 10:37" href="https://www.cnblogs.com/goodcitizen/p/18889661/cpp20_coroutine_is_equal_to_function_plus_state_machine"><span role="heading" aria-level="2">协程本质是函数加状态机</span></a>》谈到 C++20 协程的本质，是编译器基于 duff device 的精巧封装，经过一番乾坤大挪移，协程体内容被掉包只保留协程初始化代码，实际运行代码被包裹在编译器自动生成的 resume 函数中，这一点通过 C++ Insights 在线工具观察的一清二楚。</span></p>
+<p><span style="font-size: 18px">然而上一篇举的数列生成器例子中，协程的运行还是需要用户通过 while 循环来驱动，显得不够贴近实际，因此这一篇引入协程调度器，看看 C++20 协程是如何自动运行的，文章仍然遵守之前的创作原则：</span></p>
+<p><span style="font-size: 18px">* 选取合适的 demo 是头等大事</span></p>
+<p><span style="font-size: 18px">* 以协程为目标，涉及到的新语法会简单说明，不涉及的不旁征博引，很多新语法都是有了某种需求才创建的，理解这种需求本身比硬学语法规则更为重要</span></p>
+<p><span style="font-size: 18px">* 若语法的原理非常简单，也会简单展开讲讲，有利于透过现象看本质，用起来更得心应手</span></p>
+<p><span style="font-size: 18px">上一篇文章里不光探讨了协程的本质，还说明了一系列 C++20 协程概念：</span></p>
+<p><span style="font-size: 18px">* 协程体</span></p>
+<p><span style="font-size: 18px">* 协程状态</span></p>
+<p><span style="font-size: 18px">* 承诺对象</span></p>
+<p><span style="font-size: 18px">* 返回对象</span></p>
+<p><span style="font-size: 18px">* 协程句柄</span></p>
+<p><span style="font-size: 18px">及它们之间的关系：</span></p>
+<p><span style="font-size: 18px"><img src="https://img2024.cnblogs.com/blog/1707550/202506/1707550-20250623102317186-421914545.png" alt="" height="461" width="625"></span></p>
+<p><span style="font-size: 18px">并简单说明了接入 C++20 协程时用户需要实现的类型、接口、及其含义。如果没有这些内容铺垫，看本文时会有很多地方将会难以理解，还没看过的小伙伴，墙裂建议先看那篇。</span></p>
+<p><span style="font-size: 18px">工具还是之前介绍过的 <a href="https://cppinsights.io/" target="_blank" rel="noopener nofollow">C++ Insights</a> 和 <a href="https://gcc.godbolt.org/" target="_blank" rel="noopener nofollow">Compile Explorer</a>，也在上一篇中介绍过了，这里不再赘述。</span></p>
+<h1>协程调度器</h1>
+<p><span style="font-size: 18px">话不多说，直接上 demo：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>#include &lt;coroutine&gt;
+#include &lt;iostream&gt;
+#include &lt;queue&gt;
+#include &lt;functional&gt;
+#include &lt;thread&gt;
+
+class SingleThreadScheduler {
+public:
+    void schedule(std::function&lt;void()&gt; task) {
+        tasks.push(std::move(task));
+    }
+
+    void run() {
+        while (!tasks.empty()) {
+            auto task = tasks.front();
+            tasks.pop();
+            task();  
+        }
+    }
+
+private:
+    std::queue&lt;std::function&lt;void()&gt;&gt; tasks;
+};
+
+struct AsyncTask {
+    struct promise_type {
+        AsyncTask get_return_object() { 
+            return AsyncTask(std::coroutine_handle&lt;promise_type&gt;::from_promise(*this)); 
+        }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void() {}
+        void unhandled_exception() { std::terminate(); }
+    };
+
+    std::coroutine_handle&lt;promise_type&gt; handle;
+
+    explicit AsyncTask(std::coroutine_handle&lt;promise_type&gt; h) : handle(h) {}
+    ~AsyncTask() { if (handle) handle.destroy(); }
+};
+
+struct ScheduleAwaiter {
+    SingleThreadScheduler* scheduler;
+
+    bool await_ready() const { return false; }
+    void await_suspend(std::coroutine_handle&lt;&gt; h) {
+        scheduler-&gt;schedule([h] { h.resume(); });
+    }
+    void await_resume() {}
+};
+
+AsyncTask demo_coroutine(SingleThreadScheduler&amp; scheduler, int id) {
+    std::cout &lt;&lt; "Task " &lt;&lt; id &lt;&lt; " started on thread: " 
+              &lt;&lt; std::this_thread::get_id() &lt;&lt; std::endl;
+
+    co_await ScheduleAwaiter{&amp;scheduler}; 
+
+    std::cout &lt;&lt; "Task " &lt;&lt; id &lt;&lt; " resumed on thread: " 
+              &lt;&lt; std::this_thread::get_id() &lt;&lt; std::endl;
+  
+    co_await ScheduleAwaiter{&amp;scheduler}; 
+
+    std::cout &lt;&lt; "Task " &lt;&lt; id &lt;&lt; " finish on thread: " 
+              &lt;&lt; std::this_thread::get_id() &lt;&lt; std::endl;
+}
+
+int main() {
+    SingleThreadScheduler scheduler;
+
+    auto task1 = demo_coroutine(scheduler, 1);
+    auto task2 = demo_coroutine(scheduler, 2);
+    auto task3 = demo_coroutine(scheduler, 3);
+
+    std::cout &lt;&lt; "init done" &lt;&lt; std::endl;  
+    scheduler.run();
+}</code></pre>
+<p><span style="font-size: 18px">这个例子演示了拥有三个协程任务的单线程协程调度器，有如下输出：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>Task 1 started on thread: 128258074408768
+Task 2 started on thread: 128258074408768
+Task 3 started on thread: 128258074408768
+init done
+Task 1 resumed on thread: 128258074408768
+Task 2 resumed on thread: 128258074408768
+Task 3 resumed on thread: 128258074408768
+Task 1 finish on thread: 128258074408768
+Task 2 finish on thread: 128258074408768
+Task 3 finish on thread: 128258074408768</code></pre>
+<p><span style="font-size: 18px">用户只需要调用<code>SingleThreadScheduler::run</code> 方法，就可以源源不断的驱动注册在其上的协程运行了！</span></p>
+<p><span style="font-size: 18px">demo 比较长，下面分段看下。</span></p>
+<pre class="language-cpp highlighter-hljs"><code>#include &lt;coroutine&gt;
+#include &lt;iostream&gt;
+#include &lt;queue&gt;
+#include &lt;functional&gt;
+#include &lt;thread&gt;</code></pre>
+<p><span style="font-size: 14px">调度器类型，schedule 方法注册协程，run 会阻塞当前线程、不停的运行其上的协程，协程 resume 方法被包裹在 std::function 中，放置在先进先出的队列里，保证执行的先后顺序</span></p>
+<pre class="language-cpp highlighter-hljs"><code>class SingleThreadScheduler {
+public:
+    void schedule(std::function&lt;void()&gt; task) {
+        tasks.push(std::move(task));
+    }
+
+    void run() {
+        while (!tasks.empty()) {
+            auto task = tasks.front();
+            tasks.pop();
+            task();  
+        }
+    }
+
+private:
+    std::queue&lt;std::function&lt;void()&gt;&gt; tasks;
+};</code></pre>
+<p>协程返回对象的定义，与之前大体一样，包含了承诺对象与协程句柄，承诺对象主要的变化是：1) initial_suspend 不再挂起协程; 2) 增加了 return_void 接口; 3) 减少了 yield_value 接口;</p>
+<pre class="language-cpp highlighter-hljs"><code>struct AsyncTask {
+    struct promise_type {
+        AsyncTask get_return_object() { 
+            return AsyncTask(std::coroutine_handle&lt;promise_type&gt;::from_promise(*this)); 
+        }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void() {}
+        void unhandled_exception() { std::terminate(); }
+    };
+
+    std::coroutine_handle&lt;promise_type&gt; handle;
+
+    explicit AsyncTask(std::coroutine_handle&lt;promise_type&gt; h) : handle(h) {}
+    ~AsyncTask() { if (handle) handle.destroy(); }
+};</code></pre>
+<p>专用的等待对象，主要实现了 await_suspend 方法以便在协程挂起时、向调度器注册协程 resume 方法。增加这个等待对象一来可以挂起协程，二来方便获取协程句柄及其 resume 方法</p>
+<pre class="language-cpp highlighter-hljs"><code>struct ScheduleAwaiter {
+    SingleThreadScheduler* scheduler;
+
+    bool await_ready() const { return false; }
+    void await_suspend(std::coroutine_handle&lt;&gt; h) {
+        scheduler-&gt;schedule([h] { h.resume(); });
+    }
+    void await_resume() {}
+};</code></pre>
+<p>协程体，接收调度器、返回返回对象，内部 co_await 等待两次异步事件，会产生两次中断，每次中断前将 resume 注册到调度器，以便之后唤醒时继续执行，直到协程结束</p>
+<pre class="language-cpp highlighter-hljs"><code>AsyncTask demo_coroutine(SingleThreadScheduler&amp; scheduler, int id) {
+    std::cout &lt;&lt; "Task " &lt;&lt; id &lt;&lt; " started on thread: " 
+              &lt;&lt; std::this_thread::get_id() &lt;&lt; std::endl;
+
+    co_await ScheduleAwaiter{&amp;scheduler}; 
+
+    std::cout &lt;&lt; "Task " &lt;&lt; id &lt;&lt; " resumed on thread: " 
+              &lt;&lt; std::this_thread::get_id() &lt;&lt; std::endl;
+  
+    co_await ScheduleAwaiter{&amp;scheduler}; 
+
+    std::cout &lt;&lt; "Task " &lt;&lt; id &lt;&lt; " finish on thread: " 
+              &lt;&lt; std::this_thread::get_id() &lt;&lt; std::endl;
+}</code></pre>
+<p>程序入口，初始化调度器与三个协程任务，最后 run 搞定一切</p>
+<pre class="language-cpp highlighter-hljs"><code>int main() {
+    SingleThreadScheduler scheduler;
+
+    auto task1 = demo_coroutine(scheduler, 1);
+    auto task2 = demo_coroutine(scheduler, 2);
+    auto task3 = demo_coroutine(scheduler, 3);
+
+    std::cout &lt;&lt; "init done" &lt;&lt; std::endl; 
+    scheduler.run();
+}</code></pre>
+<p><span style="font-size: 18px">这里完善一条规则：</span></p>
+<p><span style="font-size: 18px">* 若协程体中有明确的 co_yield，则承诺对象必需实现 yield_value 接口；</span></p>
+<p><span style="font-size: 18px">* 若协程体中有明确的 co_return xxx，则承诺对象必需实现 return_value 接口；</span></p>
+<p><span style="font-size: 18px">* 若协程体中有明确的 co_return 或没有任何 co_return，则承诺对象至少需要实现 return_void 接口。</span></p>
+<p><span style="font-size: 18px">相比之前的例子，没有显式的 co_yield 和 co_return，这里承诺对象只需要实现 return_void 即可，规范上说没实现的话可能导致未定义行为，实测 clang 去掉没引发崩溃，不过最好还是带上。</span></p>
+<p><span style="font-size: 18px">老规矩，下面有请 C++ Insights 上场，看看编译器底层做的工作与之前相比有何差异：</span></p>
+<details>
+<summary>查看代码</summary>
+<pre class="language-cpp highlighter-hljs"><code>/*************************************************************************************
+ * NOTE: The coroutine transformation you've enabled is a hand coded transformation! *
+ *       Most of it is _not_ present in the AST. What you see is an approximation.   *
+ *************************************************************************************/
+#include &lt;coroutine&gt;
+#include &lt;iostream&gt;
+#include &lt;queue&gt;
+#include &lt;functional&gt;
+#include &lt;thread&gt;
+
+class SingleThreadScheduler
+{
+  
+  public: 
+  inline void schedule(std::function&lt;void ()&gt; task)
+  {
+    this-&gt;tasks.push(std::move(task));
+  }
+  
+  inline void run()
+  {
+    while(!this-&gt;tasks.empty()) {
+      std::function&lt;void ()&gt; task = std::function&lt;void ()&gt;(this-&gt;tasks.front());
+      this-&gt;tasks.pop();
+      task.operator()();
+    }
+    
+  }
+  
+  
+  private: 
+  std::queue&lt;std::function&lt;void ()&gt;, std::deque&lt;std::function&lt;void ()&gt;, std::allocator&lt;std::function&lt;void ()&gt; &gt; &gt; &gt; tasks;
+  public: 
+  // inline SingleThreadScheduler() noexcept(false) = default;
+  // inline ~SingleThreadScheduler() noexcept = default;
+};
+
+
+struct AsyncTask
+{
+  struct promise_type
+  {
+    inline AsyncTask get_return_object()
+    {
+      return AsyncTask(AsyncTask(std::coroutine_handle&lt;promise_type&gt;::from_promise(*this)));
+    }
+    
+    inline std::suspend_never initial_suspend()
+    {
+      return {};
+    }
+    
+    inline std::suspend_always final_suspend() noexcept
+    {
+      return {};
+    }
+    
+    inline void return_void()
+    {
+    }
+    
+    inline void unhandled_exception()
+    {
+      std::terminate();
+    }
+    
+    // inline constexpr promise_type() noexcept = default;
+  };
+  
+  std::coroutine_handle&lt;promise_type&gt; handle;
+  inline explicit AsyncTask(std::coroutine_handle&lt;promise_type&gt; h)
+  : handle{std::coroutine_handle&lt;promise_type&gt;(h)}
+  {
+  }
+  
+  inline ~AsyncTask() noexcept
+  {
+    if(this-&gt;handle.operator bool()) {
+      this-&gt;handle.destroy();
+    } 
+    
+  }
+  
+};
+
+
+struct ScheduleAwaiter
+{
+  SingleThreadScheduler * scheduler;
+  inline bool await_ready() const
+  {
+    return false;
+  }
+  
+  inline void await_suspend(std::coroutine_handle&lt;void&gt; h)
+  {
+        
+    class __lambda_47_29
+    {
+      public: 
+      inline /*constexpr */ void operator()() const
+      {
+        h.resume();
+      }
+      
+      private: 
+      std::coroutine_handle&lt;void&gt; h;
+      public: 
+      // inline /*constexpr */ __lambda_47_29(const __lambda_47_29 &amp;) noexcept = default;
+      // inline /*constexpr */ __lambda_47_29(__lambda_47_29 &amp;&amp;) noexcept = default;
+      __lambda_47_29(const std::coroutine_handle&lt;void&gt; &amp; _h)
+      : h{_h}
+      {}
+      
+    };
+    
+    this-&gt;scheduler-&gt;schedule(std::function&lt;void ()&gt;(__lambda_47_29{h}));
+  }
+  
+  inline void await_resume()
+  {
+  }
+  
+};
+
+
+struct __demo_coroutineFrame
+{
+  void (*resume_fn)(__demo_coroutineFrame *);
+  void (*destroy_fn)(__demo_coroutineFrame *);
+  std::__coroutine_traits_impl&lt;AsyncTask&gt;::promise_type __promise;
+  int __suspend_index;
+  bool __initial_await_suspend_called;
+  SingleThreadScheduler &amp; scheduler;
+  int id;
+  std::suspend_never __suspend_52_11;
+  ScheduleAwaiter __suspend_56_14;
+  ScheduleAwaiter __suspend_61_14;
+  std::suspend_always __suspend_52_11_1;
+};
+
+AsyncTask demo_coroutine(SingleThreadScheduler &amp; scheduler, int id)
+{
+  /* Allocate the frame including the promise */
+  /* Note: The actual parameter new is __builtin_coro_size */
+  __demo_coroutineFrame * __f = reinterpret_cast&lt;__demo_coroutineFrame *&gt;(operator new(sizeof(__demo_coroutineFrame)));
+  __f-&gt;__suspend_index = 0;
+  __f-&gt;__initial_await_suspend_called = false;
+  __f-&gt;scheduler = std::forward&lt;SingleThreadScheduler &amp;&gt;(scheduler);
+  __f-&gt;id = std::forward&lt;int&gt;(id);
+  
+  /* Construct the promise. */
+  new (&amp;__f-&gt;__promise)std::__coroutine_traits_impl&lt;AsyncTask&gt;::promise_type{};
+  
+  /* Forward declare the resume and destroy function. */
+  void __demo_coroutineResume(__demo_coroutineFrame * __f);
+  void __demo_coroutineDestroy(__demo_coroutineFrame * __f);
+  
+  /* Assign the resume and destroy function pointers. */
+  __f-&gt;resume_fn = &amp;__demo_coroutineResume;
+  __f-&gt;destroy_fn = &amp;__demo_coroutineDestroy;
+  
+  /* Call the made up function with the coroutine body for initial suspend.
+     This function will be called subsequently by coroutine_handle&lt;&gt;::resume()
+     which calls __builtin_coro_resume(__handle_) */
+  __demo_coroutineResume(__f);
+  
+  
+  return __f-&gt;__promise.get_return_object();
+}
+
+/* This function invoked by coroutine_handle&lt;&gt;::resume() */
+void __demo_coroutineResume(__demo_coroutineFrame * __f)
+{
+  try 
+  {
+    /* Create a switch to get to the correct resume point */
+    switch(__f-&gt;__suspend_index) {
+      case 0: break;
+      case 1: goto __resume_demo_coroutine_1;
+      case 2: goto __resume_demo_coroutine_2;
+      case 3: goto __resume_demo_coroutine_3;
+      case 4: goto __resume_demo_coroutine_4;
+    }
+    
+    /* co_await insights.cpp:52 */
+    __f-&gt;__suspend_52_11 = __f-&gt;__promise.initial_suspend();
+    if(!__f-&gt;__suspend_52_11.await_ready()) {
+      __f-&gt;__suspend_52_11.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+      __f-&gt;__suspend_index = 1;
+      __f-&gt;__initial_await_suspend_called = true;
+      return;
+    } 
+    
+    __resume_demo_coroutine_1:
+    __f-&gt;__suspend_52_11.await_resume();
+    std::operator&lt;&lt;(std::operator&lt;&lt;(std::operator&lt;&lt;(std::cout, "Task ").operator&lt;&lt;(__f-&gt;id), " started on thread: "), std::this_thread::get_id()).operator&lt;&lt;(std::endl);
+    
+    /* co_await insights.cpp:56 */
+    __f-&gt;__suspend_56_14 = ScheduleAwaiter{&amp;__f-&gt;scheduler};
+    if(!__f-&gt;__suspend_56_14.await_ready()) {
+      __f-&gt;__suspend_56_14.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+      __f-&gt;__suspend_index = 2;
+      return;
+    } 
+    
+    __resume_demo_coroutine_2:
+    __f-&gt;__suspend_56_14.await_resume();
+    std::operator&lt;&lt;(std::operator&lt;&lt;(std::operator&lt;&lt;(std::cout, "Task ").operator&lt;&lt;(__f-&gt;id), " resumed on thread: "), std::this_thread::get_id()).operator&lt;&lt;(std::endl);
+    
+    /* co_await insights.cpp:61 */
+    __f-&gt;__suspend_61_14 = ScheduleAwaiter{&amp;__f-&gt;scheduler};
+    if(!__f-&gt;__suspend_61_14.await_ready()) {
+      __f-&gt;__suspend_61_14.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+      __f-&gt;__suspend_index = 3;
+      return;
+    } 
+    
+    __resume_demo_coroutine_3:
+    __f-&gt;__suspend_61_14.await_resume();
+    std::operator&lt;&lt;(std::operator&lt;&lt;(std::operator&lt;&lt;(std::cout, "Task ").operator&lt;&lt;(__f-&gt;id), " finish on thread: "), std::this_thread::get_id()).operator&lt;&lt;(std::endl);
+    /* co_return insights.cpp:52 */
+    __f-&gt;__promise.return_void()/* implicit */;
+    goto __final_suspend;
+  } catch(...) {
+    if(!__f-&gt;__initial_await_suspend_called) {
+      throw ;
+    } 
+    
+    __f-&gt;__promise.unhandled_exception();
+  }
+  
+  __final_suspend:
+  
+  /* co_await insights.cpp:52 */
+  __f-&gt;__suspend_52_11_1 = __f-&gt;__promise.final_suspend();
+  if(!__f-&gt;__suspend_52_11_1.await_ready()) {
+    __f-&gt;__suspend_52_11_1.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+    __f-&gt;__suspend_index = 4;
+    return;
+  } 
+  
+  __resume_demo_coroutine_4:
+  __f-&gt;destroy_fn(__f);
+}
+
+/* This function invoked by coroutine_handle&lt;&gt;::destroy() */
+void __demo_coroutineDestroy(__demo_coroutineFrame * __f)
+{
+  /* destroy all variables with dtors */
+  __f-&gt;~__demo_coroutineFrame();
+  /* Deallocating the coroutine frame */
+  /* Note: The actual argument to delete is __builtin_coro_frame with the promise as parameter */
+  operator delete(static_cast&lt;void *&gt;(__f), sizeof(__demo_coroutineFrame));
+}
+
+
+int main()
+{
+  SingleThreadScheduler scheduler = SingleThreadScheduler();
+  AsyncTask task1 = demo_coroutine(scheduler, 1);
+  AsyncTask task2 = demo_coroutine(scheduler, 2);
+  AsyncTask task3 = demo_coroutine(scheduler, 3);
+  std::operator&lt;&lt;(std::cout, "init done").operator&lt;&lt;(std::endl);
+  scheduler.run();
+  return 0;
+}</code></pre>
+</details>
+<p><span style="font-size: 18px">内容比较多，只捡关键的看下：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>struct __demo_coroutineFrame
+{
+  void (*resume_fn)(__demo_coroutineFrame *);
+  void (*destroy_fn)(__demo_coroutineFrame *);
+  std::__coroutine_traits_impl&lt;AsyncTask&gt;::promise_type __promise;
+  int __suspend_index;
+  bool __initial_await_suspend_called;
+  SingleThreadScheduler &amp; scheduler;
+  int id;
+  std::suspend_never __suspend_52_11;         // initial_suspend
+  ScheduleAwaiter __suspend_56_14;            // 第一个 co_await
+  ScheduleAwaiter __suspend_61_14;            // 第二个 co_await
+  std::suspend_always __suspend_52_11_1;      // final_suspend
+};</code></pre>
+<p><span style="font-size: 18px">协程状态基本结构与之前一致，除了返回类型、参数、栈变量外，等待对象的数量与类型也发生了变更，看起来编译器根据返回值类型推导直接得到了成员类型 (<code>std::suspend_never</code>、<code>SchedulerAwaiter</code>、<code>suspend_always</code>等)。</span></p>
+<p><span style="font-size: 18px">下面进入协程的 resume 方法看看，它是整个协程的核心：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>/* This function invoked by coroutine_handle&lt;&gt;::resume() */
+void __demo_coroutineResume(__demo_coroutineFrame * __f)
+{
+  try 
+  {</code></pre>
+<p>熟悉的 duff device 上场</p>
+<pre class="language-cpp highlighter-hljs"><code>
+    /* Create a switch to get to the correct resume point */
+    switch(__f-&gt;__suspend_index) {
+      case 0: break;
+      case 1: goto __resume_demo_coroutine_1;
+      case 2: goto __resume_demo_coroutine_2;
+      case 3: goto __resume_demo_coroutine_3;
+      case 4: goto __resume_demo_coroutine_4;
+    }</code></pre>
+<p>&nbsp;promise_type::initial_suspend 返回 suspend_never 导致这里不挂起，协程直接略过这个条件继续运行，这也是 main 中 init done 输出位于 Task N start on thread 输出之后的原因，在构建并返回返回对象前就会向下执行到第一个 co_await</p>
+<pre class="language-cpp highlighter-hljs"><code>    /* co_await insights.cpp:52 */
+    __f-&gt;__suspend_52_11 = __f-&gt;__promise.initial_suspend();
+    if(!__f-&gt;__suspend_52_11.await_ready()) {
+      __f-&gt;__suspend_52_11.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+      __f-&gt;__suspend_index = 1;
+      __f-&gt;__initial_await_suspend_called = true;
+      return;
+    } 
+
+    __resume_demo_coroutine_1:
+    __f-&gt;__suspend_52_11.await_resume();
+    std::operator&lt;&lt;(std::operator&lt;&lt;(std::operator&lt;&lt;(std::cout, "Task ").operator&lt;&lt;(__f-&gt;id), " started on thread: "), std::this_thread::get_id()).operator&lt;&lt;(std::endl);
+    </code></pre>
+<p>&nbsp;第一个 co_await，ScheduleAwaiter 会挂起协程，挂起前调用的 ScheduleAwaiter::await_suspend 将 resume 添加到调度器队列，以便下次唤醒</p>
+<pre class="language-cpp highlighter-hljs"><code>    /* co_await insights.cpp:56 */
+    __f-&gt;__suspend_56_14 = ScheduleAwaiter{&amp;__f-&gt;scheduler};
+    if(!__f-&gt;__suspend_56_14.await_ready()) {
+      __f-&gt;__suspend_56_14.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+      __f-&gt;__suspend_index = 2;
+      return;
+    } </code></pre>
+<p>再次被调度器调度到时，根据状态值与 switch-case 直接跳转到这里执行。由于调度器内部使用先进先出队列，因此三个协程任务是严格按顺序执行的</p>
+<pre class="language-cpp highlighter-hljs"><code>    __resume_demo_coroutine_2:
+    __f-&gt;__suspend_56_14.await_resume();
+    std::operator&lt;&lt;(std::operator&lt;&lt;(std::operator&lt;&lt;(std::cout, "Task ").operator&lt;&lt;(__f-&gt;id), " resumed on thread: "), std::this_thread::get_id()).operator&lt;&lt;(std::endl);
+    </code></pre>
+<p>&nbsp;第二个 co_await，如法炮制</p>
+<pre class="language-cpp highlighter-hljs"><code>    /* co_await insights.cpp:61 */
+    __f-&gt;__suspend_61_14 = ScheduleAwaiter{&amp;__f-&gt;scheduler};
+    if(!__f-&gt;__suspend_61_14.await_ready()) {
+      __f-&gt;__suspend_61_14.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+      __f-&gt;__suspend_index = 3;
+      return;
+    } 
+    
+    __resume_demo_coroutine_3:
+    __f-&gt;__suspend_61_14.await_resume();
+    std::operator&lt;&lt;(std::operator&lt;&lt;(std::operator&lt;&lt;(std::cout, "Task ").operator&lt;&lt;(__f-&gt;id), " finish on thread: "), std::this_thread::get_id()).operator&lt;&lt;(std::endl);</code></pre>
+<p>协程退出前，没有 co_yield 或 co_return xxx 显示调用，则默认调用 co_return 无参版本，对应的就是 return_void 啦；如果有未捕获的异常，promise_type::unhandle_exception 将会被调用进而退出整个进程</p>
+<pre class="language-cpp highlighter-hljs"><code>    /* co_return insights.cpp:52 */
+    __f-&gt;__promise.return_void()/* implicit */;
+    goto __final_suspend;
+  } catch(...) {
+    if(!__f-&gt;__initial_await_suspend_called) {
+      throw ;
+    } 
+    
+    __f-&gt;__promise.unhandled_exception();
+  }</code></pre>
+<p>协程继续运行，promise_type::final_suspend 返回 suspend_always 会导致协程挂起，配合返回对象的析构函数可以销毁协程</p>
+<pre class="language-cpp highlighter-hljs"><code>  __final_suspend:
+  
+  /* co_await insights.cpp:52 */
+  __f-&gt;__suspend_52_11_1 = __f-&gt;__promise.final_suspend();
+  if(!__f-&gt;__suspend_52_11_1.await_ready()) {
+    __f-&gt;__suspend_52_11_1.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+    __f-&gt;__suspend_index = 4;
+    return;
+  } </code></pre>
+<p>就不会走到这里协程体的自动销毁逻辑啰</p>
+<pre class="language-cpp highlighter-hljs"><code>  __resume_demo_coroutine_4:
+  __f-&gt;destroy_fn(__f);
+}</code></pre>
+<p><span style="font-size: 18px">有上一篇文章的铺垫，看起来没什么尿点，下面来一张图总览下：</span></p>
+<p><img src="https://img2024.cnblogs.com/blog/1707550/202506/1707550-20250618173908278-1457862799.png" alt="" height="638" width="1371"></p>
+<p id="1750239192637"><span style="font-size: 18px">为了便于理解只画了一个协程任务的执行顺序，跟着箭头方向和标号就能梳理清楚啦。</span></p>
+<h1>final_suspend 与协程自清理</h1>
+<p><span style="font-size: 18px">上面例子中，每个协程的返回对象需要保存在临时变量 task1/2/3 中，不然在调度器运行时会因协程状态销毁而崩溃：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>int main() {
+    SingleThreadScheduler scheduler;
+
+    demo_coroutine(scheduler, 1);
+    demo_coroutine(scheduler, 2);
+    demo_coroutine(scheduler, 3);
+
+    std::cout &lt;&lt; "init done" &lt;&lt; std::endl;
+    scheduler.run();
+}</code></pre>
+<p><span style="font-size: 18px">输出：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>Task 1 started on thread: 124850410948416
+Task 2 started on thread: 124850410948416
+Task 3 started on thread: 124850410948416
+init done
+Program terminated with signal: SIGSEGV</code></pre>
+<p><span style="font-size: 18px">这主要是因为返回对象的析构有销毁协程状态的动作：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>    ~AsyncTask() { if (handle) handle.destroy(); }</code></pre>
+<p><span style="font-size: 18px">当不使用变量保持返回对象的生命周期时，临时对象走不到 <code>SingleTaskScheduler::run</code> 就被析构了，后面再引用时就会崩溃。</span></p>
+<p><span style="font-size: 18px">参考 C++ Insights 的输出，<code>__demo_corotineResume</code> 尾部有协程的自销毁逻辑，能否利用这个破解协程状态与返回对象的耦合关系呢？答案是肯定的。借助于 <code>promise_type::final_suspend</code>就能实现，下面是改进后的代码：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>struct AsyncTask {
+    struct promise_type {
+        AsyncTask get_return_object() { 
+            return AsyncTask(std::coroutine_handle&lt;promise_type&gt;::from_promise(*this)); 
+        }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() {}
+        void unhandled_exception() { std::terminate(); }
+      	~promise_type() { std::cout &lt;&lt; "promise_type destroy" &lt;&lt; std::endl; }
+    };
+
+    std::coroutine_handle&lt;promise_type&gt; handle;
+
+    explicit AsyncTask(std::coroutine_handle&lt;promise_type&gt; h) : handle(h) {}
+    ~AsyncTask() { /*if (handle) handle.destroy();*/ }
+};</code></pre>
+<p><span style="font-size: 18px">主要有三点：</span></p>
+<p><span style="font-size: 18px">* <code>promise_type::final_suspend</code> 返回 <code>std::suspend_never</code></span></p>
+<p><span style="font-size: 18px">* <code>AsyncTask</code> 析构不再调用 <code>handle.destroy()</code></span></p>
+<p><span style="font-size: 18px">* <code>promise_type</code> 增加析构输出日志，以确认协程状态被正确回收</span></p>
+<p><span style="font-size: 18px">main 中保持不接收返回对象，新的输出：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>Task 1 started on thread: 133157948458816
+Task 2 started on thread: 133157948458816
+Task 3 started on thread: 133157948458816
+init done
+Task 1 resumed on thread: 133157948458816
+Task 2 resumed on thread: 133157948458816
+Task 3 resumed on thread: 133157948458816
+Task 1 finish on thread: 133157948458816
+promise destroy
+Task 2 finish on thread: 133157948458816
+promise destroy
+Task 3 finish on thread: 133157948458816
+promise destroy</code></pre>
+<p><span style="font-size: 18px">程序是可以正常退出的，原理简单说明如下：</span></p>
+<p><span style="font-size: 18px">* <code>AsyncTask</code> 析构不再调用 <code>handle.destroy()</code>后，返回对象临时变量析构时不销毁底层的协程状态</span></p>
+<p><span style="font-size: 18px">* <code>promise_type::final_suspend</code> 返回 <code>std::suspend_never</code> 后，协程在最后一次 resume 时会一直运行到末尾，此时调用 <code>__demo_coroutineDestroy</code> 销毁协程状态及其成员承诺对象</span></p>
+<p><span style="font-size: 18px">借用上次写的关系图，稍做修改看下整个过程：</span></p>
+<p><span style="font-size: 18px"><img src="https://img2024.cnblogs.com/blog/1707550/202506/1707550-20250618181322322-1585945497.png"></span></p>
+<p><span style="font-size: 18px">出于清晰起见，返回对象的销毁使用数字标号，协程状态的销毁使用字母标号，表示他们是独立不相关的。图中，由于<code>AsyncTask</code>析构<code>destroy</code>协程的路线被中断了，且<code>final_suspend</code>不挂起协程，这里就走了协程自清理的逻辑，你看明白了吗？</span></p>
+<h1>coroutine_handle&lt;&gt; 与类型擦除</h1>
+<p><span style="font-size: 18px">程序逻辑梳理完了，回头来看个语法，注意等待对象的一个接口定义：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>    void await_suspend(std::coroutine_handle&lt;&gt; h) {
+        scheduler-&gt;schedule([h] { h.resume(); });
+    }</code></pre>
+<p><span style="font-size: 18px">这里参数是协程句柄，但奇怪的是模板参数空空如也，按理说不应该是 <code>coroutine_handle&lt;AsyncTask::promise_type&gt;</code>么？这涉及到一个 C++20 的新语法特性：类型擦除。</span></p>
+<p><span style="font-size: 18px">其实类型擦除算不上什么新鲜事，早在 C 语言中就有通过 void* 擦除类型的能力；后面 C++ 面向对象的虚函数也是如此，只关心接口不关心类型；不过他们都有这样那样的不足：C 语言的 void* 具有类型不安全的问题；面向对象虚函数又带来了指针跳转的性能损失、以及无法对三方库进行处理的问题。C++20 基于模板的类型擦除技术，既能忽略具体类型将关注点集中在通用操作层面，又能避免上述不足。</span></p>
+<p><span style="font-size: 18px">首先解释 <code>std::coroutine_handle&lt;&gt;</code> 类型，它实际上是 <code>std::coroutine_handle&lt;void&gt;</code> 的简写，后者是 <code>std::coroutine_handle&lt;T&gt;</code> 模板的一个特化。从上一篇的协程关系图可知，协程句柄底层持有的是一个协程状态的指针，<code>std::coroutine_handle&lt;void&gt;</code>封装了与底层指针直接相关的接口，包括：</span></p>
+<p><span style="font-size: 18px">* 构造、拷贝构造、赋值构造：接收一个协程状态指针，用于初始化内部指针</span></p>
+<p><span style="font-size: 18px">* address：返回协程状态指针</span></p>
+<p><span style="font-size: 18px">* from_address：接收一个协程状态指针，构建一个 <code>std::coroutine_handle&lt;void&gt;</code>并返回</span></p>
+<p><span style="font-size: 18px">* resume：委托给编译器内置的 __builtin_coro_resume</span></p>
+<p><span style="font-size: 18px">* done：委托给编译器内置的 __builtin_coro_done</span></p>
+<p><span style="font-size: 18px">* destroy：委托给编译器内置的 __builtin_coro_destroy</span></p>
+<p><span style="font-size: 18px">* operator bool：判断底层指针是否为空</span></p>
+<p><span style="font-size: 18px">* operator ()：调用 resume</span></p>
+<p><span style="font-size: 18px">像 resume、done、destroy 这些方法，都是委托给编译器内置接口来实现的，普通用户看不到也不用关心，这一点有点儿类似 void* 指针，本质上是个黑盒，因此直到这一步，协程中的类型擦除还和 void* 没有本质区别。</span></p>
+<p><span style="font-size: 18px">接着解释具体的 <code>std::coroutine_handle&lt;T&gt;</code> 类型，T 一般是 promise_type，不过不同的返回对象的这个 traits 类型也不同，目前我们已经见识过了 <code>Generator::promise_type</code> 和 <code>AsyncTask::promise_type</code>，每个用户协程都有自己独特的 promise_type，不胜枚举。它主要实现了三个额外的接口：</span></p>
+<p><span style="font-size: 18px">* promise：获取协程状态中的承诺对象</span></p>
+<p><span style="font-size: 18px">* from_promise：接收一个承诺对象，定位到包含它的协程状态地址，再基于此构造一个 <code>coroutine_handle&lt;void&gt;</code> 对象并返回</span></p>
+<p><span style="font-size: 18px">* operator coroutine_handle&lt;&gt;()：将自身显示转换为 <code>coroutine_handle&lt;void&gt;</code> 类型，就是基于底层指针直接构建一个 void 特化并返回，有点类似 from_address</span></p>
+<p><span style="font-size: 18px">这三个接口各有用处，之前的例子已经见识了前两个的用法：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>    int value() { return handle.promise().current_value; }</code></pre>
+<p><span style="font-size: 18px">回顾上一篇文章中 co_yield 生成数列值时，数值是保存在承诺对象中的，外部想要获取的话就是通过返回对象 -&gt; 协程句柄 -&gt; 承诺对象拿到的，这里用到了协程句柄的 promise 接口。</span></p>
+<pre class="language-cpp highlighter-hljs"><code>    struct promise_type {
+        int current_value;
+        auto get_return_object() { return Generator{this}; }
+        ...
+    }
+    ...
+    Generator(promise_type* p) : handle(std::coroutine_handle&lt;promise_type&gt;::from_promise(*p)) {}</code></pre>
+<pre class="language-cpp highlighter-hljs"><code>struct AsyncTask {
+    struct promise_type {
+        AsyncTask get_return_object() { 
+            return AsyncTask(std::coroutine_handle&lt;promise_type&gt;::from_promise(*this)); 
+        }
+        ...
+    };
+    ...
+    std::coroutine_handle&lt;promise_type&gt; handle;
+    explicit AsyncTask(std::coroutine_handle&lt;promise_type&gt; h) : handle(h) {}
+    ...
+};</code></pre>
+<p><span style="font-size: 18px">两个例子中的返回对象都是使用 from_promise 来构建协程句柄的，不同之处是前者构造函数传递的是 promise 对象，在内部通过 from_promise 生成协程句柄；后者是在 get_return_object 中直接生成协程句柄，再传递给构造函数。这个接口的存因也好理解，因为用户不知道有协程状态的存在，只能用承诺对象去构造。</span></p>
+<p><span style="font-size: 18px">第三个接口的调用点用户看不到，是编译器在底层自己做的：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>    __f-&gt;__suspend_52_11 = __f-&gt;__promise.initial_suspend();
+    if(!__f-&gt;__suspend_52_11.await_ready()) {
+      __f-&gt;__suspend_52_11.await_suspend(std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f)).operator std::coroutine_handle&lt;void&gt;());
+      __f-&gt;__suspend_index = 1;
+      __f-&gt;__initial_await_suspend_called = true;
+      return;
+    } </code></pre>
+<p><span style="font-size: 18px">这段经典的 co_await 翻译过来的 C++ 代码中，await_suspend 的参数大有讲究，这一长串代码可分两部分解读：</span></p>
+<p><span style="font-size: 18px">* <code>std::coroutine_handle&lt;AsyncTask::promise_type&gt;::from_address(static_cast&lt;void *&gt;(__f))</code>：根据协程状态调用 from_address 生成具象的协程句柄 <code>coroutine_handle&lt;AsyncTask::promise_type&gt;</code></span></p>
+<p><span style="font-size: 18px">* <code>operator std::coroutine_handle&lt;void&gt;()</code>：上面返回的临时对象上调用 <code>operator coroutine_handle&lt;void&gt;</code> 强转为通用的协程句柄</span></p>
+<p><span style="font-size: 18px">这样一来等待对象的 await_suspend 就可以不关心具象的、与用户承诺对象相关的协程句柄，因为它只依赖通用协程句柄的接口，反而大大拓宽了等待对象的使用范围，基本能用于任何用户定义的协程体中，你看明白了吗？</span></p>
+<p><span style="font-size: 18px">网上有一些文章，说具象的 <code>coroutine_handle&lt;AsyncTask::promise_type&gt;</code> 是派生于特化的 <code>coroutine_handle&lt;void&gt;</code>，这根本是无稽之谈，去看看标准库实现就能知道。虽然派生是类型擦除的一种途径，C++20 却没有采用这种方式，主要是为了避免面向对象继承和虚函数带来的性能负担，目前这种 operator 强转的方式，只是将底层的指针转移到新对象，性能开销非常小。</span></p>
+<p><span style="font-size: 18px">有心的读者可能问了，这里编译器为何不直接生成下面的代码：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>      __f-&gt;__suspend_52_11.await_suspend(std::coroutine_handle&lt;void&gt;::from_address(static_cast&lt;void *&gt;(__f)));</code></pre>
+<p><span style="font-size: 18px">反正最后参数是 <code>coroutine_handle&lt;&gt;</code>，我也觉得这样更简洁，而且强转后原来具象的协程句柄也没用了会自动销毁，至于编译器为什么不这样搞，搞不清楚。</span></p>
+<p><span style="font-size: 18px">最后来欣赏下 <code>coroutine_handle&lt;T&gt;</code> 的 from_promise &amp; promise 的实现：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>      static coroutine_handle from_promise(_Promise&amp; __p)
+      {
+        coroutine_handle __self;
+        __self._M_fr_ptr = __builtin_coro_promise((char*) &amp;__p, __alignof(_Promise), true);
+        return __self;
+      }
+
+      _Promise&amp; promise() const
+      {
+        void* __t = __builtin_coro_promise (_M_fr_ptr, __alignof(_Promise), false);
+        return *static_cast&lt;_Promise*&gt;(__t);
+      }</code></pre>
+<p><span style="font-size: 18px">多认识了一个内置函数 <code>__builtin_coro_promise</code>，它的作用是根据承诺对象寻找协程状态地址，或相反 (由最后的 bool 参数控制)，内部估计就是 offsetof 指针加减吧。</span></p>
+<p><span style="font-size: 18px">关于类型擦除，这是一个宏大的概念，跳出 C++20 协程的范畴考虑的话，还有很多其它方式，比如下面这个例子：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>#include &lt;iostream&gt;
+
+template &lt;typename T&gt;
+class Shape
+{ 
+public:
+    void Draw()
+    {
+        static_cast&lt;T*&gt;(this)-&gt;DrawImpl();
+    } 
+
+    void DrawImpl() { std::cout &lt;&lt; "Draw Shape\n"; } 
+}; 
+
+class Circle :public Shape&lt;Circle&gt;
+{
+public:
+    void DrawImpl() { std::cout &lt;&lt; "Draw Circle\n"; }
+};
+
+class Rect :public Shape&lt;Rect&gt;
+{
+public:
+    void DrawImpl() { std::cout &lt;&lt; "Draw Rect\n"; }
+};
+
+class Triangle :public Shape&lt;Triangle&gt; {};
+
+int main()
+{
+    Circle a;
+    a.Draw();        //Draw Circle
+    
+    Rect b;
+    b.Draw();        //Draw Rect
+
+    Triangle c;
+    c.Draw();        //Draw Shape
+}</code></pre>
+<p><span style="font-size: 18px">这种技术称为<strong>奇异递归模板模式 (CRTP</strong>, Curiously Recurring Template Pattern)，首先定义一个模板基类 (Shape)，它包含通用的对外接口 (Draw) 和对内实现 (DrawImpl) 两套接口，其中对外接口是委托给使用模板参数类型强制转换后的 this 的对内实现的接口，它们都是普通函数而非虚函数，因此没有虚函数表；接着基于模板基类进行派生 (Circle/Rect/Triangle)，而基类的模板参数恰好就是派生类自己，它会重写基类模板的对内实现接口，这样基类的对外接口其实最终调用的就是派生类的重写版本 (case a &amp; b)，如果派生类没有重写接口，则基类默认的实现会被调用 (case c)；由于接收派生类模板参数的模板类在编译期完成实例化，故无需借助虚函数就可以直接调用派生类的普通函数，这也称为编译期静态多态。这种手法的优点是减少了运行期虚函数开销，缺点是模板会拉长编译时间并增大代码体积。</span></p>
+<p><span style="font-size: 18px">回到 C++20 协程的场景，由于协程句柄是期望用户直接通过 <code>coroutine_handle&lt;T&gt;</code> 的形式使用，并不定义任何新类并派生于 <code>coroutine_handle&lt;void&gt;</code>，所以上面的方式并不适合。</span></p>
+<p><span style="font-size: 18px">最后，还有其它类型擦除技术，例如借助于 C++17 的 <code>std::variant</code>，关于这方面就不展开了，感兴趣的读者可以参考文末附录。</span></p>
+<h1>lambda 本质是仿函数</h1>
+<p><span style="font-size: 18px">这里插一个彩蛋，和 C++20 协程无关，不过正好看到了，就一起来分析下。例子中有一段 lambda 表达式：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>    bool await_suspend(std::coroutine_handle&lt;&gt; h) {
+        scheduler-&gt;schedule([h] { h.resume(); });
+        return true; 
+    }</code></pre>
+<p><span style="font-size: 18px">它捕获一个协程句柄 h，没有参数，函数体直接调用 resume 接口。看</span><span style="font-size: 18px">对应的 C++ Insights 解析结果：</span></p>
+<pre class="language-cpp highlighter-hljs"><code>  inline bool await_suspend(std::coroutine_handle&lt;void&gt; h)
+  {
+    class __lambda_47_29
+    {
+      public: 
+      inline /*constexpr */ void operator()() const
+      {
+        h.resume();
+      }
+      
+      private: 
+      std::coroutine_handle&lt;void&gt; h;
+      public: 
+      // inline /*constexpr */ __lambda_47_29(const __lambda_47_29 &amp;) noexcept = default;
+      // inline /*constexpr */ __lambda_47_29(__lambda_47_29 &amp;&amp;) noexcept = default;
+      __lambda_47_29(const std::coroutine_handle&lt;void&gt; &amp; _h)
+      : h{_h}
+      {}
+    };
+    
+    this-&gt;scheduler-&gt;schedule(std::function&lt;void ()&gt;(__lambda_47_29{h}));
+    return true;
+  }</code></pre>
+<p><span style="font-size: 18px">编译器将它翻译成了一个内置的仿函数类 <code>__lambda_47_29</code>，捕获列表转化为 private 成员变量，由构造函数初始化；调用参数将转化为成员<code>operator()</code> 的参数，这里没有；返回值转化为成员<code>operator()</code> 的返回值，这里为 void。最后在调用点生成仿函数的临时对象、并将捕获列表作为参数传入 <code>__lambda_47_29{h}</code>，由于 schedule 需要一个 std::function 类型，所以这里进行了显示转换。</span></p>
+<p><span style="font-size: 18px">看懂了这个戏法，再看 lambda 表达式的按引用捕获、按移动捕获、全部捕获、全部按引用捕获等，是不是就清晰多了? 其实就是一个推导成员变量类型的问题，按引用捕获的，成员变量也被声明为一个引用，那么它的生命周期管理就值得注意，需要保证 lambda 动作时相关的对象仍存在，避免发生悬空引用的问题。</span></p>
+<p><span style="font-size: 18px">不得不夸 C++ Insights 真是个好东西~</span></p>
+<h1>结语</h1>
+<p><span style="font-size: 18px">本文接续前一篇，进一步深化了 C++20 协程例子，通过使用调度器使协程的运行更符合实际使用场景。期间还分析了几个语法特性：final_suspend 与协程的自清理、协程句柄使用类型擦除来简化接口使用，lambda 表达式的本质是仿函数。不过这个例子还是只具有演示性质，毕竟在真实的等待异步事件场景中，协程是否继续是要要由异步事件是否完成来决定，而不是像目前这样“排排坐”执行。所以下一篇，将引入真正的异步网络、磁盘事件，看看 C++20 协程是如何包装它们的。</span></p>
+<h1>参考</h1>
+<p><span style="font-size: 18px">[1].&nbsp;<a href="https://whythz.github.io/posts/%E6%B5%85%E6%9E%90C++%E7%9A%84%E5%87%A0%E7%A7%8D%E7%B1%BB%E5%9E%8B%E6%93%A6%E9%99%A4%E5%AE%9E%E7%8E%B0/" target="_blank" rel="noopener nofollow">浅析C++的几种类型擦除实现</a></span></p>
+<p><span style="font-size: 18px">[2].&nbsp;<a href="https://zhuanlan.zhihu.com/p/624199149" target="_blank" rel="noopener nofollow">漫谈C++类型擦除(Type Erasure)</a></span></p>
+<p><span style="font-size: 18px">[3].&nbsp;<a href="https://www.webkt.com/article/9313" target="_blank" rel="noopener nofollow">C++协程的灵魂摆渡者？coroutine_handle 使用详解和高级特性剖析</a></span></p>
+<p><span style="font-size: 18px">[4]. <a href="https://github.com/gcc-mirror/gcc/blob/master/libstdc%2B%2B-v3/include/std/coroutine" target="_blank" rel="noopener nofollow">gcc/libstdc++-v3/include/std/coroutine</a></span></p>
+<p><span style="font-size: 18px">[5].&nbsp;<a href="https://nihil.cc/posts/coroutine/" target="_blank" rel="noopener nofollow">初探 C++20 Coroutine</a></span></p>
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/goodcitizen/" target="_blank">goodcitizen</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/goodcitizen/p/18933425/coroutines_without_schedulers_are_not_good_coroutines" target="_blank">https://www.cnblogs.com/goodcitizen/p/18933425/coroutines_without_schedulers_are_not_good_coroutines</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-07-17 10:06">2025-07-17 10:05</span>&nbsp;
+<a href="https://www.cnblogs.com/goodcitizen">goodcitizen</a>&nbsp;
+阅读(<span id="post_view_count">49</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18933425);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18933425', targetLink: 'https://www.cnblogs.com/goodcitizen/p/18933425/coroutines_without_schedulers_are_not_good_coroutines', title: '没有调度器的协程不是好协程——零基础深入浅出 C++20 协程' })">举报</a>
+</div>
+        
