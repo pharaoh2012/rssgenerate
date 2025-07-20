@@ -1,0 +1,182 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/san-mu/p/18990102" title="发布于 2025-07-19 15:24">
+    <span role="heading" aria-level="2">MySQL 17 如何正确地显示随机消息？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>假设有一个场景，一个英语学习APP首页有一个随机显示单词的功能，用户每次访问首页的时候，都会随机滚动显示三个单词。</p>
+<p>已知表里有10000条记录，来看看随机选择3个单词有什么方法，又存在什么问题。</p>
+<p>建表语句：</p>
+<pre><code class="language-sql">mysql&gt; CREATE TABLE `words` ( 
+    `id` int(11) NOT NULL AUTO_INCREMENT, 
+    `word` varchar(64) DEFAULT NULL, 
+    PRIMARY KEY (`id`)
+) ENGINE=InnoDB;
+</code></pre>
+<h3 id="内存临时表">内存临时表</h3>
+<p>首先，可以使用<code>order by rand()</code>来实现：</p>
+<pre><code class="language-sql">select word from words order by rand() limit 3;
+</code></pre>
+<p>该语句的执行情况：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250717173146245-1453546932.png" width="90%"></div>
+<p>Extra字段显示Using temporary，表示需要使用临时表；Using filesort，表示需要执行排序操作。</p>
+<p>为了更好地分析，这里引用上一篇文章中全字段排序和rowid排序的流程图：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250717173210133-996175686.png" width="40%"></div>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250717173235090-962908414.png" width="40%"></div>
+<p>那么对于临时内存表的排序来说，它会选择哪一种算法呢？</p>
+<p>对于内存表，回表过程只是简单根据数据行的位置，直接访问内存得到数据，不会导致多访问磁盘。这种情况下，优化器会考虑用于排序的行的大小，所以MySQL会选择rowid排序方法。</p>
+<p>因此该语句的执行流程为：</p>
+<ul>
+<li>
+<p>创建一个临时表，临时表用的是MEMORY引擎，表里有两个字段，第一个是double类型，记为字段R，第二个是varchar(64)类型，记为字段W，临时表<strong>没有建索引</strong>；</p>
+</li>
+<li>
+<p>从words表按主键顺序取出所有的word值，对于每一个word，调用rand()生成一个大于0小于1的随机数，并把这个随机数和word分别存入临时表的R和W字段中，该步骤扫描行数10000行；</p>
+</li>
+<li>
+<p>初始化sort_buffer，里面有两个字段，一个是double类型，另一个是整型；</p>
+</li>
+<li>
+<p>从内存临时表中逐行取出R值和“位置信息”（后面解释），分别存入sort_buffer中的两个字段里，这个过程要对内存临时表做全表扫描，该步骤扫描行数10000行；</p>
+</li>
+<li>
+<p>在sort_buffer中根据R值进行排序；</p>
+</li>
+<li>
+<p>排序完成后，取出前三个结果的位置信息，依次到内存临时表取出word值，返回给客户端。该步骤访问三行，因此总扫描行数变为20003。</p>
+</li>
+</ul>
+<p>完整的排序执行流程图：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250717173304869-515092956.png" width="40%"></div>
+<p><strong>位置信息</strong>本质是数据库引擎用来快速定位“一行数据”的唯一标识，一般称为rowid，在不同引擎中其具体形式不同：</p>
+<ul>
+<li>
+<p>对于有主键的InnoDB表，rowid就是主键ID；</p>
+</li>
+<li>
+<p>对于没有主键的InnoDB表，rowid是由系统生成的6字节的主键；</p>
+</li>
+<li>
+<p>对于MEMORY引擎，由于其不是索引组织表，可以认为是一个数组，因此rowid其实是数组的下标。</p>
+</li>
+</ul>
+<p>因此，可以总结：<code>order by rand()</code>使用了内存临时表，内存临时表排序时候使用了rowid排序方法。</p>
+<h3 id="磁盘临时表">磁盘临时表</h3>
+<p>并不是所有的临时表都是内存表，参数tmp_table_size配置限制了内存临时表的大小，默认是16M，如果临时表大小超过了配置值，内存临时表会转成磁盘临时表。</p>
+<p>磁盘临时表使用的引擎默认是InnoDB，是由参数internal_tmp_disk_storage_engine控制。</p>
+<p>当使用磁盘临时表，对应是一个没有显式索引的InnoDB表的排序过程。这里把tmp_table_size设为1024，sort_buffer_size设为32768，max_length_for_sort_data设为16，查看OPTIMIZER_TRACE，得到部分结果如下：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250717173334512-1118178130.png" width="30%"></div>
+<p>对于结果：</p>
+<ul>
+<li>
+<p>sort_mode里是rowid，这个符合预期，因为max_length_for_sort_data设为16，小于word字段的长度定义，因此使用rowid算法，参与排序是随机值R和6字节的主键；</p>
+</li>
+<li>
+<p><code>number_of_tmp_files=0</code>，没有用到临时文件是因为这个语句的排序用的是MySQL 5.6版本引入的优先队列排序算法。</p>
+</li>
+</ul>
+<p>对于取R值最小的3个rowid的目标，如果使用归并排序，在算法结束后已经将10000行数据都排好序了，其实浪费了比较多的计算量，而使用优先队列算法就可以精确只得到三个最小值，其执行流程为：</p>
+<ul>
+<li>
+<p>对于10000个准备排序的(R,rowid)，取前三行构造<strong>大根堆</strong>；</p>
+</li>
+<li>
+<p>取下一行(R',rowid')，与堆顶R比较，如果R'小于R，将堆顶弹出，放入(R',rowid')；</p>
+</li>
+<li>
+<p>重复上一步，直到第10000个数据完成比较；</p>
+</li>
+<li>
+<p>取出堆中的rowid，去临时表里拿到word字段。</p>
+</li>
+</ul>
+<p>在OPTIMIZER_TRACE结果中，filesort_priority_queue_optimization里的<code>chosen=true</code>，就表示使用了优先队列排序算法。</p>
+<p>那为什么上篇文章的查询语句（见下）没有使用优先队列呢？</p>
+<pre><code class="language-sql">select city,name,age from t where city='杭州' order by name limit 1000  ;
+</code></pre>
+<p>是因为如果使用优先队列，需要维护的堆的大小是1000行的(name,rowid)，超过了设置的sort_buffer_size大小，所以只能使用归并排序算法。</p>
+<p>不过，不论是使用内存临时表还是磁盘临时表，<code>order by rand()</code>这种方法都会让计算过程非常复杂，需要大量的扫描行数。</p>
+<h3 id="随机排序方法">随机排序方法</h3>
+<p>把问题简化一下，如果只随机选择一个word值，那么思路为：</p>
+<ul>
+<li>
+<p>取表的主键id的最大值M和最小值N；</p>
+</li>
+<li>
+<p>用随机函数生成一个最大值与最小值之间的数<span class="math inline">\(X=(M-N)*rand()+N\)</span>；</p>
+</li>
+<li>
+<p>取不小于X的第一个ID的行。</p>
+</li>
+</ul>
+<p>我们把这个算法称为算法1，其执行语句为：</p>
+<pre><code class="language-sql">mysql&gt; select max(id),min(id) into @M,@N from t ;
+set @X= floor((@M-@N+1)*rand() + @N);
+select * from t where id &gt;= @X limit 1;
+</code></pre>
+<p>算法1的效率很高，因为取最值都不需要扫描索引，而第三步的查询也能利用索引快速定位，可以认为总共就扫描了3行。但这个算法并不严格满足要求，因为ID中间可能有空洞，那么选择不同行的概率不一样，并不是真正的随机。</p>
+<p>比如4个id，分别是1、2、4、5，如果按照上面的方法，那么取到<code>id=4</code>的概率是取得其他行概率的两倍。</p>
+<p>为了做到严格随机，可以用下面流程：</p>
+<ul>
+<li>
+<p>取得整个表的行数C；</p>
+</li>
+<li>
+<p>取得<span class="math inline">\(Y=floor(C*rand())\)</span>；</p>
+</li>
+<li>
+<p>用<code>limit Y,1</code>取一行。</p>
+</li>
+</ul>
+<p>我们把这个算法称为算法2，其执行语句为：</p>
+<pre><code class="language-sql">mysql&gt; select count(*) into @C from t;
+set @Y = floor(@C * rand());
+set @sql = concat("select * from t limit ", @Y, ",1");
+prepare stmt from @sql;
+execute stmt;
+DEALLOCATE prepare stmt;
+</code></pre>
+<p>MySQL处理<code>limit Y,1</code>时会按顺序一个一个读出来，丢掉前Y个后将下一个记录返回，因此需要扫描Y+1行，算上计算行数扫描的C行，总共扫描C+Y+1行，执行代价高于算法1，但小于<code>order by rand()</code>。</p>
+<p>那么按照算法2的思路，随机取3个word值的做法为：</p>
+<ul>
+<li>
+<p>取得整个表的行数C；</p>
+</li>
+<li>
+<p>根据相同的随机方法取得Y1，Y2，Y3；</p>
+</li>
+<li>
+<p>执行三个<code>limit Y,1</code>取得三行数据。</p>
+</li>
+</ul>
+<p>其执行语句为：</p>
+<pre><code class="language-sql">mysql&gt; select count(*) into @C from t;
+set @Y1 = floor(@C * rand());
+set @Y2 = floor(@C * rand());
+set @Y3 = floor(@C * rand());
+select * from t limit @Y1，1； //在应用代码里面取Y1、Y2、Y3值，拼出SQL后执行
+select * from t limit @Y2，1；
+select * from t limit @Y3，1；
+</code></pre>
+<p>最后总结：对于随机排序，尽量避免使用<code>order by rand()</code>。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-07-19 15:24">2025-07-19 15:24</span>&nbsp;
+<a href="https://www.cnblogs.com/san-mu">叁沐</a>&nbsp;
+阅读(<span id="post_view_count">165</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18990102);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18990102', targetLink: 'https://www.cnblogs.com/san-mu/p/18990102', title: 'MySQL 17 如何正确地显示随机消息？' })">举报</a>
+</div>
+        
