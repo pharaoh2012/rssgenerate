@@ -1,0 +1,93 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/san-mu/p/18995415" title="发布于 2025-07-21 11:11">
+    <span role="heading" aria-level="2">MySQL 19 为什么我只查一行的语句，也执行这么慢？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>有些情况下，“查一行”也会执行特别慢，今天就看看什么情况会出现这个现象。</p>
+<p>如果MySQL本身有很大压力，导致数据库服务器CPU占有率很高或IO利用率很高，这种情况所有语句的执行都可能变慢，不在本文讨论范围内。</p>
+<p>为了分析，构建有10万行记录的表，建表语句如下：</p>
+<pre><code class="language-sql">CREATE TABLE `t` ( 
+    `id` int(11) NOT NULL, 
+    `c` int(11) DEFAULT NULL, 
+    PRIMARY KEY (`id`)
+) ENGINE=InnoDB;
+</code></pre>
+<h3 id="第一类查询长时间不返回">第一类：查询长时间不返回</h3>
+<p>比如执行语句：</p>
+<pre><code class="language-sql">select * from t where id=1;
+</code></pre>
+<p>查询结果长时间不返回：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105230441-1289180520.png" width="30%"></div>
+<p>一般碰到这种情况，大概率是表t被锁住。分析的时候，一般会先执行<code>show processlist</code>命令，查看当前语句处于什么状态，然后再针对每种状态分析它们产生的原因、如何复现，以及如何处理。</p>
+<h4 id="等mdl锁">等MDL锁</h4>
+<p>使用<code>show processlist</code>命令示意图如下：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105309912-1875185506.png" width="80%"></div>
+<p>其中Waiting for table metadata lock状态表示，现在有一个线程正在表t上请求或者持有MDL写锁，将select语句堵住了。</p>
+<p>比如有可能是如下的情况：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105344761-1747799961.png" width="60%"></div>
+<p>对于这种情况，可以通过查询sys.schema_table_lock_waits表，直接找出造成阻塞的process id，然后kill这个连接。</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105413408-2000559702.png" width="50%"></div>
+<h4 id="等flush">等flush</h4>
+<p>接下来看另外一种情况：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105518500-1775744209.png" width="80%"></div>
+<p>其中Waiting for table flush状态表示，现在有一个线程正要对表t做flush操作。MySQL里对表做flush操作的用法，一般有以下两个：</p>
+<pre><code class="language-sql">flush tables t with read lock;
+flush tables with read lock;
+</code></pre>
+<p>如果指定表t，代表只关闭表t；如果没有指定具体的表名，则表示关闭MySQL里所有打开的表。</p>
+<p>正常情况下，这两个语句执行起来都很快，除非它们也被别的线程堵住了。</p>
+<p>所以出现Waiting for table flush状态的可能情况是：有一个flush tables命令被别的语句堵住了，然后它又堵住了select语句。可能的情况如下：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105544956-1020707922.png" width="60%"></div>
+<p>在session A中，每行都调用一次sleep(1)，这样对于10万行的表，该语句默认执行10万秒，在这期间表t一直被session A“打开”着。然后，session B想要关闭表t就需要等session A查询结束，而session C会被flush命令堵住。</p>
+<p>可以用<code>show processlist</code>查看process状态，然后手动kill相关process。</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105609134-1889482053.png" width="80%"></div>
+<h4 id="等行锁">等行锁</h4>
+<p>由于访问<code>id=1</code>记录时要加读锁，如果这时候已经有一个事务在这行记录上持有一个写锁，select语句就会被堵住：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105642038-1518897315.png" width="60%"></div>
+<p>session A启动了事务，占有写锁还不提交，导致session B被堵住。</p>
+<p>可以通过sys.innodb_lock_waits表查看是谁占着写锁：</p>
+<pre><code class="language-sql">select * from t sys.innodb_lock_waits where locked_table='`test`.`t`'\G
+</code></pre>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105709388-759011373.png" width="50%"></div>
+<p>可以看到4号线程造成了堵塞，因此需要<code>kill 4</code>断开连接。当连接被断开，会自动回滚该连接里正在执行的流程，也就会释放<code>id=1</code>上的行锁。</p>
+<h3 id="第二类查询慢">第二类：查询慢</h3>
+<p>看一个只扫描一行，但执行很慢的语句：</p>
+<pre><code class="language-sql">select * from t where id=1;
+</code></pre>
+<p>其slow log如下：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105749523-1295659272.png" width="60%"></div>
+<p>可以发现，虽然扫描行数是1，但执行时间却长达800ms。</p>
+<p>继续看slow log下面的内容，是下一个语句，扫描行数1行，执行时间为0.2ms：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105816239-1626742850.png" width="60%"></div>
+<p>看起来有些奇怪，毕竟lock in share mode还要加锁，按理说时间会更长。</p>
+<p>查看这两个语句的执行输出结果：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105840781-1971588668.png" width="50%"></div>
+<p>第一个语句查询结果<code>c=1</code>，第二个语句查询结果<code>c=1000001</code>，所以里面有对c字段的改变，实际上对应下面这种情况：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105929557-1166442329.png" width="60%"></div>
+<p>session A先启动了事务，然后session B开始执行update语句。更新完成后，<code>id=1</code>对应的状态如下：</p>
+<div align="center"><img src="https://img2024.cnblogs.com/blog/3389949/202507/3389949-20250721105953430-529633022.png" width="50%"></div>
+<p>session B更新完，生成了100万个回滚日志。</p>
+<p>第二个查询语句是当前读，会直接读到1000001这个结果，所以速度很快；而第一个查询语句是一致性读，需要回滚100万次得到1这个结果，因此速度很慢。</p>
+<p>undo log里记录的其实是“把 2 改成 1”，“把 3 改成 2”这样的操作逻辑，画成减1是方便看图。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-07-21 11:12">2025-07-21 11:11</span>&nbsp;
+<a href="https://www.cnblogs.com/san-mu">叁沐</a>&nbsp;
+阅读(<span id="post_view_count">73</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(18995415);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '18995415', targetLink: 'https://www.cnblogs.com/san-mu/p/18995415', title: 'MySQL 19 为什么我只查一行的语句，也执行这么慢？' })">举报</a>
+</div>
+        
