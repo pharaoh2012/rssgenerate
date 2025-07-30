@@ -1,0 +1,626 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/booleandev/p/19012821" title="发布于 2025-07-30 14:18">
+    <span role="heading" aria-level="2">PostgreSQL 分区最佳实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="概述">概述</h2>
+<p>分区的本质是将一张大的物理表从逻辑上拆分，为 N 个较小的物理表。</p>
+<blockquote>
+<p>分区表按照官方的解释如下：</p>
+<p>The partitioned table itself is a “virtual” table having no storage of its own. Instead, the storage belongs to <em>partitions</em>, which are otherwise-ordinary tables associated with the partitioned  table. Each partition stores a subset of the data as defined by its <em>partition bounds</em>. All rows inserted into a partitioned table will be routed to the  appropriate one of the partitions based on the values of the partition  key column(s). Updating the partition key of a row will cause it to be  moved into a different partition if it no longer satisfies the partition bounds of its original partition.</p>
+<p>分区表本体作为 <code>「虚拟表」</code> ​存在，自身不持有实际存储空间。其物理存储由关联的分区（即普通物理表，子表）承担，每个分区通过预定义的分区边界（<code>Partition Bounds</code>）存储对应的数据子集。所有插入操作将依据分区键列（<code>Partition  Key</code>）的值自动路由到目标分区。若更新某行的分区键值导致其超出原分区的边界，该行将被迁移至新的分区。</p>
+</blockquote>
+<p>按照上面的解释，我们可以得出以下的一些结论：</p>
+<ul>
+<li>
+<p>数据存储：分区表的主表是一张逻辑表（虚拟表），它不负责存储数据，只负责数据的分发，所有的数据都是存储在子表中。因此，主表的数据操作是不会产生 WAL 日志，他的 WAL 日志会由基础的子表产生。所以，我们的数据实时同步，应该监听的是子表，才能获取到 WAL 日志。</p>
+</li>
+<li>
+<p>数据分发：当对主表的任何一个操作，PG 会经过处理转化下发到指定的子表。</p>
+<ul>
+<li>
+<p>数据插入&amp;删除：根据分区键的分区策略，将操作数据自动路由到指定子分区。</p>
+</li>
+<li>
+<p>数据更新：</p>
+<ul>
+<li>
+<p>路由查找：数据更新的 <code>WHERE</code> ​语句中包含分区键，则会自动到路由到指定的子表。如果没有，则会将此 <code>UPDATE</code> ​路由到所有的分区，找到待更新的数据。</p>
+</li>
+<li>
+<p>数据更新中带有分区字段：假如数据更新中，更新了分区字段，且此分区字段的值改变了此条数据的所属分区，则会执行两个操作：</p>
+<ul>
+<li>现所属分区删除数据：因为此数据已不属于该分区，所以此条更新的数据将从此分区删除。</li>
+<li>新分区插入数据：将 <code>UPDATE</code> ​后的数据 <code>INSERT</code> ​到新分区。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p>数据查询：</p>
+<ul>
+<li>查询条件中带有分区字段且能够定位到指定的一个分区：直接查询该分区的数据，然后返回。</li>
+<li>查询条件中无分区字段或分区字段的值只能定位到一个模糊的分区范围：查询定位到的 N 个分区，然后再把查询出来的数据，进行二次处理，返回。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p>DDL 操作：在父表上面的任何 DDL 操作，都会经过处理，分配到每个子表上面。</p>
+</li>
+</ul>
+<h2 id="分区方式">分区方式</h2>
+<p>PostgreSQL 提供了以下的分区方式</p>
+<h3 id="范围分区range-partitioning">范围分区（Range Partitioning)</h3>
+<p>基于分区键列（单列或多列）划分<strong>连续且互斥</strong>的数值区间。例如按日期范围（如 2023-Q1）或业务 ID 区间划分。边界规则：包含下限值，不包含上限值（即左闭右开）。<br>
+<em>示例：分区 A 范围[1,10)，分区 B 范围[10,20)，数值 10 归属分区 B。</em></p>
+<h3 id="列表分区-list-partitioning"><strong>列表分区 (List Partitioning)</strong></h3>
+<p>通过<strong>显式枚举分区键值</strong>定义分区。每个分区存储指定的离散值集合。<br>
+<em>示例：按地区分区，华东分区包含('上海','江苏','浙江')。</em></p>
+<h3 id="哈希分区-hash-partitioning"><strong>哈希分区 (Hash Partitioning)</strong></h3>
+<p>通过<strong>取模运算</strong>分配数据：指定模数（modulus）和余数（remainder），分区键哈希值取模后匹配余数的行存入对应分区。<br>
+<em>示例：模数=4，余数=0 的分区存储哈希值 mod 4</em>  <em>=</em>  <em>0 的数据行。</em></p>
+<h3 id="对比">对比</h3>
+<table>
+<thead>
+<tr>
+<th><strong>维度</strong></th>
+<th>范围分区 (Range)</th>
+<th>列表分区 (List)</th>
+<th>哈希分区 (Hash)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>分区逻辑</strong></td>
+<td>连续区间（数值/日期等）</td>
+<td>离散值枚举（地区/状态等）</td>
+<td>哈希取模运算</td>
+</tr>
+<tr>
+<td><strong>边界定义</strong></td>
+<td>​<code>FROM A TO B</code>（左闭右开）</td>
+<td>​<code>IN (v1, v2...)</code>​</td>
+<td>​<code>WITH (MODULUS N, REMAINDER M)</code>​</td>
+</tr>
+<tr>
+<td><strong>数据分布</strong></td>
+<td>可能不均匀（如历史数据集中）</td>
+<td>人工指定，灵活但需预定义</td>
+<td>强制均匀分布</td>
+</tr>
+<tr>
+<td><strong>查询优化</strong></td>
+<td>▶️ 高效支持范围查询<br>▶️ 分区剪枝优化</td>
+<td>▶️ 精准匹配查询快<br>▶️ 等值查询优化</td>
+<td>▶️ 等值查询快<br>▶️ 并行扫描均衡</td>
+</tr>
+<tr>
+<td><strong>典型场景</strong></td>
+<td>时间序列（日志、销售记录）</td>
+<td>业务分类（地区、产品线）</td>
+<td>分布式存储（用户 ID、随机键）</td>
+</tr>
+<tr>
+<td><strong>边界管理</strong></td>
+<td>需防区间重叠</td>
+<td>需防值重复</td>
+<td>余数需覆盖 0 到(modulus-1)</td>
+</tr>
+<tr>
+<td><strong>缩容成本</strong></td>
+<td>高（需重组相邻分区）</td>
+<td>中（修改枚举列表）</td>
+<td>极高（需重分布所有数据）</td>
+</tr>
+<tr>
+<td><strong>扩容成本</strong></td>
+<td>低（增加新分区即可）</td>
+<td>低（增加新分区即可）</td>
+<td>极高（需重分布所有数据）</td>
+</tr>
+<tr>
+<td><strong>子分区支持</strong></td>
+<td>✅ 多级分区（如年 → 月）</td>
+<td>✅ 多级分区（如国家 → 城市）</td>
+<td>⚠️ 仅单层</td>
+</tr>
+</tbody>
+</table>
+<h2 id="优缺点">优缺点</h2>
+<h3 id="优点"><strong>优点</strong></h3>
+<ol>
+<li>
+<p><strong>查询性能优化</strong></p>
+<ul>
+<li><strong>分区剪枝</strong>：自动跳过无关分区（如 <code>WHERE date &gt; '2023-01-01'</code> 仅扫描新分区）</li>
+<li><strong>局部索引</strong>：高频分区索引常驻内存，减少 I/O</li>
+<li><strong>并行扫描</strong>：不同分区可由多个 Worker 同时读取</li>
+</ul>
+</li>
+<li>
+<p><strong>数据管理高效</strong></p>
+<ul>
+<li><strong>秒级删除旧数据</strong>：<code>DROP TABLE partition_2020</code> 比 <code>DELETE</code> 快 1000 倍以上</li>
+<li><strong>零碎片化</strong>：避免 <code>DELETE</code> 导致的表膨胀和 <code>VACUUM</code> 压力</li>
+</ul>
+</li>
+<li>
+<p><strong>运维灵活性</strong></p>
+<ul>
+<li><strong>滚动维护</strong>：分区级 <code>VACUUM</code> 不锁全表</li>
+<li><strong>动态挂载</strong>：<code>ATTACH/DETACH PARTITION</code> 实现数据秒级切换</li>
+<li><strong>避免出现超级大表</strong>：超级大表的维护会异常的困难（例如添加索引、字段和修复数据等操作），消耗的性能和花费是时间都会让表的维护异常的困难！</li>
+</ul>
+</li>
+</ol>
+<h3 id="缺点"><strong>缺点</strong></h3>
+<ol>
+<li>
+<p><strong>设计复杂性</strong></p>
+<ul>
+<li><strong>需要合理的分区设计</strong>：需要合理的选择分区方案，假如分区方案选择不合理，会加大系统的负载和分区管理的复杂，导致运维起来更为复杂。</li>
+</ul>
+</li>
+<li>
+<p><strong>功能限制</strong></p>
+<ul>
+<li><strong>全局约束受限</strong>：唯一索引必须包含所有分区键</li>
+<li><strong>跨分区事务缺失</strong>：不支持分布式 ACID（如跨分区行级锁）</li>
+<li><strong>子分区扩展列禁止</strong>：所有分区必须与父表列完全一致</li>
+</ul>
+</li>
+<li>
+<p><strong>性能陷阱</strong></p>
+<ul>
+<li><strong>分区键更新代价高</strong>：触发行迁移（等效 <code>DELETE</code> + <code>INSERT</code>）</li>
+<li><strong>规划器超时风险</strong>：超过 1000 个分区时查询计划生成延迟显著增加</li>
+<li><strong>元数据内存膨胀</strong>：每个会话缓存分区树，消耗额外 RAM</li>
+</ul>
+</li>
+<li>
+<p><strong>运维成本</strong></p>
+<ul>
+<li><strong>统计信息收集繁琐</strong>：需对每个分区单独 <code>ANALYZE</code>​</li>
+<li><strong>工具链兼容性差</strong>：部分 ORM/备份工具无法正确处理分区表</li>
+<li><strong>版本升级风险</strong>：PG 10-13 的分区管理性能远低于 PG 14+</li>
+</ul>
+</li>
+<li>
+<p><strong>对开发要求更高：</strong></p>
+<ul>
+<li><strong>合理使用分区特性门槛较高：</strong> 分区表的高效查询插入需要指定条件才能触发，如果使用不当，反而会加大数据库的负载！</li>
+<li><strong>分区表日常维护更为复杂：</strong> 分区表的索引、字段和分区的维护比单表更为复杂，需要详细了解才能避免各种风险！</li>
+</ul>
+</li>
+</ol>
+<p>‍</p>
+<h2 id="分区操作">分区操作</h2>
+<p>下面以这张 <code>parcel</code> ​表来示例，我们是如何合理的进行分区操作：</p>
+<pre><code class="language-sql">CREATE TABLE parcel
+(
+    id              INTEGER      DEFAULT NEXTVAL('parcel_id_seq'::REGCLASS) NOT NULL,
+    tracking_number VARCHAR,
+    created_at      TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP                  NOT NULL,
+    updated_at      TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP,
+    transporter     VARCHAR(255),
+    platform        VARCHAR(50),
+    failed_count    INTEGER      DEFAULT 0,
+    server_name     VARCHAR(255),
+    archived        BOOLEAN      DEFAULT FALSE                              NOT NULL,
+    PRIMARY KEY (id)
+);
+</code></pre>
+<h3 id="分区规则">分区规则</h3>
+<p>首先，我们的分区规则如下：</p>
+<p>一级分区主要根据 archived 字段分区：</p>
+<ul>
+<li>archived=FALSE : 则数据保留在 ord_parcel_hot 子表中</li>
+<li>archived=TRUE : 则数据保留在 ord_parcel_history 子表中</li>
+</ul>
+<p>二级分区是再根据 created_at 等时间字段，在 ord_parcel_history 的基础上再进行划分分区</p>
+<ul>
+<li>archived=TRUE &amp; created_at = '2025-07-21 00:00:00' ：数据表留在 ord_parcel_history_2025 分区</li>
+<li>archived=TRUE &amp; created_at = '2024-07-21 00:00:00' ：数据表留在 ord_parcel_history_2024 分区</li>
+<li>...</li>
+</ul>
+<blockquote>
+<ol>
+<li>简单来说，archived 控制是否在 hot 表，还是在 history 表，created_at 控制在那张 history 表</li>
+<li>history 分区范围不一定要是按照年分区，假如数据量比较大，则也可以改为半年或季度分区，这个主要取决于数据量大小，建议单个 history 分区的数据量 &lt; 5000w</li>
+</ol>
+</blockquote>
+<p>分区表的结构如下：</p>
+<pre><code class="language-sh">--| parcel
+  └--|parcel_hot
+  └--|parcel_history
+     └--|parcel_2025
+     └--|parcel_2024
+     └--|parcel_2023
+     └--|parcel_xxxx
+     └--|parcel_before
+</code></pre>
+<h3 id="创建分区表">创建分区表</h3>
+<p>创建 <code>parcel</code> ​主表</p>
+<blockquote>
+<p>要点：</p>
+<ul>
+<li>
+<p>主键为 <code>(id, archived, created_at)</code>​</p>
+</li>
+<li>
+<p>分区方式和分区键：<code>PARTITION BY LIST (archived)</code>​</p>
+<ul>
+<li>分区方式为 <code>LIST</code> 分区</li>
+<li>分区键为 <code>archived</code> 字段</li>
+</ul>
+</li>
+</ul>
+</blockquote>
+<pre><code class="language-sql">CREATE TABLE parcel
+(
+    id              INTEGER      DEFAULT NEXTVAL('parcel_id_seq'::REGCLASS) NOT NULL,
+    tracking_number VARCHAR,
+    created_at      TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP                  NOT NULL,
+    updated_at      TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP,
+    transporter     VARCHAR(255),
+    platform        VARCHAR(50),
+    failed_count    INTEGER      DEFAULT 0,
+    server_name     VARCHAR(255),
+    archived        BOOLEAN      DEFAULT FALSE                              NOT NULL,
+    PRIMARY KEY (id, archived, created_at)
+)
+    PARTITION BY LIST (archived);
+</code></pre>
+<p>创建 <code>parcel_hot</code> 数据表挂载在 <code>parcel</code> ​数据表下面</p>
+<pre><code class="language-sql">-- 为 parcel 添加分区：
+-- 当 archived = FALSE，则分配至 hot 表
+CREATE TABLE parcel_hot PARTITION OF parcel 
+        FOR VALUES IN (FALSE);
+</code></pre>
+<p>创建二级分区的主表 <code>parcel_history</code>，挂载在 <code>parcel</code> ​数据表下面</p>
+<pre><code class="language-sql">-- 当 archived = TRUE，则分配至 history 表,且此表再根据 created_at 的 RANGE 分区方式，再进行分区
+CREATE TABLE parcel_history PARTITION OF parcel 
+    FOR VALUES IN (TRUE)
+    PARTITION BY RANGE (created_at);
+</code></pre>
+<p>创建 <code>parcel_history</code> ​下面的子表，均挂载到 <code>parcel_history</code> ​二级分区的主表下</p>
+<pre><code class="language-sql">-- 添加 clr_parcel_clearance_history_2025  至 clr_parcel_clearance_history
+CREATE TABLE parcel_history_2025  PARTITION OF parcel_history 
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE TABLE parcel_history_2024  PARTITION OF parcel_history
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE TABLE parcel_history_2023  PARTITION OF parcel_history 
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+</code></pre>
+<p>以上，就完成了一张分区表的创建！</p>
+<h3 id="索引维护">索引维护</h3>
+<blockquote>
+<p>官方文档：</p>
+<p>As mentioned earlier, it is possible to create indexes on partitioned  tables so that they are applied automatically to the entire hierarchy.  This can be very convenient as not only will all existing partitions be  indexed, but any future partitions will be as well. However, one  limitation when creating new indexes on partitioned tables is that it is not possible to use the <code>CONCURRENTLY</code> qualifier, which could lead to long lock times. To avoid this, you can use <code>CREATE INDEX ON ONLY</code> ​the partitioned table, which creates the new index marked as invalid,  preventing automatic application to existing partitions. Instead,  indexes can then be created individually on each partition using <code>CONCURRENTLY</code> and <em>attached</em> to the partitioned index on the parent using <code>ALTER INDEX ... ATTACH PARTITION</code>. Once indexes for all the partitions are attached to the parent index, the parent index will be marked valid automatically.</p>
+<p>如前所述，在分区表上创建索引时可使其自动应用于整个分区层次结构。这种方式非常便捷——不仅所有现有分区会建立索引，未来新增的分区也将自动同步创建。但需要注意，分区表创建新索引时存在一项限制：无法使用 <code>CONCURRENTLY</code> ​修饰符，这可能导致长时间锁定表。</p>
+<p>为避免此问题，可采用 <code>CREATE INDEX ... ONLY </code> ​语法在分区表上创建索引，此时新建索引会被标记为无效状态，且不会自动应用到现有分区。随后可执行以下操作：</p>
+<ol>
+<li>在每个分区上使用 <code>CONCURRENTLY</code> ​分别创建索引</li>
+<li>通过 <code> ALTER INDEX ... ATTACH PARTITION</code> 将分区索引挂载至父表的索引</li>
+</ol>
+<p>当所有分区索引都完成挂载后，父级索引将自动标记为生效状态。</p>
+</blockquote>
+<p>由上面的官方文档我们可以得知：</p>
+<ul>
+<li>
+<p>分区表的父表是虚拟表，所以它的索引也是虚拟索引，当操作父表的索引的时候，它会在所有的子表上面，都创建和父表等效的索引。</p>
+</li>
+<li>
+<p>创建主表的索引，无法使用 <code>CONCURRENTLY</code> ​关键字，这意味着在主表上面操作索引，会进行长时间的锁表。</p>
+<ul>
+<li>官方建议使用 <code>CREATE INDEX ... ONLY</code> 解决锁表问题</li>
+</ul>
+</li>
+</ul>
+<p>因此，我们创建索引有两种方式：父表创建索引和子表创建索引，两种创建索引的对比：</p>
+<table>
+<thead>
+<tr>
+<th><strong>特性</strong></th>
+<th><strong>父表（Partitioned Table）创建索引</strong></th>
+<th><strong>子表（Partition）创建索引</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>索引定义方式</strong></td>
+<td>​<code>CREATE INDEX idx_parent ON parent_table (key);</code>​<br>（自动级联到所有子表）</td>
+<td>需在每个子表单独创建：<br><code>CREATE INDEX idx_child1 ON child1 (key);</code>​</td>
+</tr>
+<tr>
+<td><strong>索引物理存储</strong></td>
+<td>虚拟索引（无实际数据），实际数据在各子表的本地索引</td>
+<td>独立的物理索引</td>
+</tr>
+<tr>
+<td><strong>查询优化器行为</strong></td>
+<td>自动识别分区剪枝，仅扫描相关分区的<strong>本地索引</strong></td>
+<td>需手动确保所有子表有索引，否则未索引分区全表扫描</td>
+</tr>
+<tr>
+<td><strong>新增分区支持</strong></td>
+<td>自动为新分区创建索引</td>
+<td>需手动为新分区创建索引</td>
+</tr>
+<tr>
+<td><strong>索引类型限制</strong></td>
+<td>不支持表达式索引/部分索引（需在子表单独创建）</td>
+<td>支持任意索引类型</td>
+</tr>
+<tr>
+<td><strong>唯一约束实现</strong></td>
+<td>必须包含分区键（全局唯一性难保障）</td>
+<td>可创建子表局部唯一索引（但无法跨分区唯一）</td>
+</tr>
+</tbody>
+</table>
+<h4 id="索引添加">索引添加</h4>
+<p>因此，根据以上的信息，假如我们需要在数据表上面添加索引，按照下面的例子：</p>
+<p>本次我们目前需要在 <code>parcel_history</code> ​上面添加 <code>tracking_number</code> ​索引。</p>
+<p>使用 <code>CREATE INDEX ... ONLY</code> ​关键字在主表 <code>parcel_history</code> ​上面添加索引：</p>
+<pre><code class="language-sql">-- 注意添加 ONLY 关键字
+CREATE INDEX idx_parcel_history_tracking_number
+    ON ONLY parcel_history (tracking_number);
+</code></pre>
+<p>使用此 <code>SQL</code> ​查询当前父表 <code>parcel_history</code> ​索引是否标记为有效：</p>
+<pre><code class="language-sql">-- 当前索引状态应该返回 FALSE
+SELECT
+    c.relname AS index_name,
+    i.indisvalid AS is_valid
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE c.relname = 'idx_parcel_history_tracking_number';
+</code></pre>
+<p>在对应子表上面使用 <code>CONCURRENTLY</code> ​关键字添加索引，避免锁表操作：</p>
+<pre><code class="language-sql">
+CREATE INDEX CONCURRENTLY idx_parcel_history_2025_tracking_number
+    ON parcel_history_2025 (tracking_number);
+
+CREATE INDEX CONCURRENTLY idx_parcel_history_2024_tracking_number
+    ON parcel_history_2024 (tracking_number);
+
+-- ...
+</code></pre>
+<p>将新加的索引，通过 <code>ATTACH PARTITION</code> ​操作，添加到 <code>parcel_history</code> ​表 <code>idx_parcel_history_tracking_number</code> ​上面：</p>
+<pre><code class="language-sql">ALTER INDEX idx_parcel_history_tracking_number
+    ATTACH PARTITION idx_parcel_history_2021_tracking_number;
+
+ALTER INDEX idx_parcel_history_tracking_number
+    ATTACH PARTITION idx_parcel_history_2022_tracking_number;
+</code></pre>
+<p>待所有子表都添加完索引后，校验父表 <code>parcel_history</code> ​索引标记是否有效：</p>
+<pre><code class="language-sql">-- 当前索引状态应该返回 TRUE
+SELECT
+    c.relname AS index_name,
+    i.indisvalid AS is_valid
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE c.relname = 'idx_parcel_history_tracking_number';
+</code></pre>
+<p>此步可忽略：校验阶段，添加一个新的分区表，查看新分区表是否添加了对应的索引：</p>
+<pre><code class="language-sql">CREATE TABLE parcel_history_2026  PARTITION OF parcel_history 
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+</code></pre>
+<h4 id="索引删除">索引删除</h4>
+<p>假如子表的索引是由父表进行维护，则当通过子表去删除索引的时候，这个操作是不允许的，<code>PostgreSQL</code> ​会直接拒绝掉这个操作：</p>
+<pre><code class="language-sql">DROP INDEX idx_parcel_history_2025_tracking_number;
+-- ERROR: cannot drop index parcel_2023_tracking_number_idx because index idx_parcel_history_tracking_number requires it
+-- 建议：You can drop index idx_parcel_history_tracking_number instead.
+</code></pre>
+<p>所以，假如需要某个分区表的索引，则一定需要删除父表索引，子表的索引就会自动删除！</p>
+<pre><code class="language-sql">DROP INDEX idx_parcel_history_tracking_number;
+-- completed in 400 ms
+</code></pre>
+<h3 id="创建新分区">创建新分区</h3>
+<p>在 <code>parcel_history</code> ​数据表上面，创建 <code>parcel_history_2026</code> ​新分区</p>
+<pre><code class="language-sql">CREATE TABLE parcel_history_2026  PARTITION OF parcel_history 
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+</code></pre>
+<h3 id="挂载分区">挂载分区</h3>
+<h4 id="流程介绍">流程介绍</h4>
+<p>挂载分区的操作和创建新分区来对比，复杂了很多！因为创建新分区是生成一张全新的数据表，PostgreSQL 只需要维护对应的元数据（字段、索引、分区约束和主键等等），而挂载新分区的时候，因为待挂载的分区已经存在大量的数据了，在挂载到分区表之前，PostgreSQL 需要做一堆数据校验工作，以下是 PostgreSQL 文档的原文：</p>
+<blockquote>
+<p>Note that when running the <code>ATTACH PARTITION</code> command, the table will be scanned to validate the partition constraint while holding an <code>ACCESS EXCLUSIVE</code> lock on that partition. As shown above, it is recommended to avoid this scan by creating a <code>CHECK</code> constraint matching the expected partition constraint on the table prior to attaching it. Once the <code>ATTACH PARTITION</code> is complete, it is recommended to drop the now-redundant <code>CHECK</code> ​constraint. If the table being attached is itself a partitioned table,  then each of its sub-partitions will be recursively locked and scanned  until either a suitable <code>CHECK</code> constraint is encountered or the leaf partitions are reached.</p>
+<p>请注意，执行 <code>ATTACH PARTITION</code> 命令时，<strong>将对分区表加</strong> <strong>​<code>ACCESS EXCLUSIVE</code>​</strong> <strong>锁</strong>，<strong>并扫描表内数据以验证分区约束</strong>。如前所述，建议在挂载分区<strong>之前</strong>，在目标表上<strong>预先创建一个与预期分区约束相匹配的</strong> <strong>​<code>CHECK</code>​</strong> <strong>约束</strong>，<strong>以规避此扫描操作</strong>。<code>ATTACH PARTITION</code> 操作完成后，<strong>建议删除此时已冗余的</strong> <strong>​<code>CHECK</code>​</strong> <strong>约束</strong>。<strong>如果待挂载的表本身也是一个分区表</strong>，那么它的<strong>每个子分区都将被递归地加锁并扫描</strong>，<strong>直到遇到匹配的</strong> <strong>​<code>CHECK</code>​</strong> <strong>约束或到达叶子分区为止</strong>。</p>
+<p>For each index in the target table, a corresponding one will be created  in the attached table; or, if an equivalent index already exists, it  will be attached to the target table's index, as if <code>ALTER INDEX ATTACH PARTITION</code> had been executed.</p>
+<p>对于目标表中的每个索引，系统<strong>将在被挂载的表中新建一个对应索引</strong>；或者，<strong>若该表上已存在结构等效的索引，则直接将该索引挂载至目标表的索引层级</strong>——该操作等同于<strong>自动执行了</strong> <strong>​<code>ALTER INDEX ATTACH PARTITION</code>​</strong> <strong>命令</strong>。</p>
+</blockquote>
+<p>根据上面的官网信息，我们可以得知以下几点：</p>
+<ul>
+<li>
+<p>​<code>ATTACH PARTITION</code> ​操作，会为数据表添加 <strong>​<code>ACCESS EXCLUSIVE</code>​</strong>（访问独占锁，阻塞该表的所有操作），这个操作将导致数据表锁死，严重影响业务系统的操作</p>
+</li>
+<li>
+<p>​<code>ATTACH PARTITION</code> ​操作，有两个比较耗时的操作，但是目前这两个操作，官方都提供了解决方案！</p>
+<ul>
+<li>对待添加的分区表添加 <strong>​<code>CHECK</code>​</strong> ​约束校验，校验改分区内的所有数据，是否都满足分区键的约束！</li>
+<li>校验待添加的分区表中，是否存在和父表的等效索引，以维护父表的索引在子表中的传递！</li>
+</ul>
+</li>
+</ul>
+<p>下面的流程图，是 <code>DeepSeek</code> ​对 1000w 的数据表执行 <code>ATTACH PARTITION</code> ​大致流程：</p>
+<p>‍</p>
+<div class="mermaid">graph TD
+    A[开始ATTACH PARTITION] --&gt; B[立即请求 ACCESS EXCLUSIVE 锁] 
+    B --&gt; C{是否预创建已验证的 CHECK 约束？}
+    C -- 是 --&gt; D[跳过全表扫描&lt;br&gt;直接信任约束]
+    C -- 否 --&gt; E[在锁保护下扫描数据&lt;br&gt;SSD:20-50min]
+    D --&gt; F{新分区是否有等效索引？}
+    E --&gt; F
+    F -- 无索引 --&gt; G[在锁保护下创建索引&lt;br&gt;SSD:10-30min]
+    F -- 有索引 --&gt; H[挂载索引&lt;br&gt;0.1-1s]
+    G --&gt; I[更新元数据]
+    H --&gt; I
+    I --&gt; J[删除预创建约束]
+    J --&gt; K[结束释放锁]
+
+    classDef red fill:#f9d5d5,stroke:#e88;
+    classDef green fill:#d5f0d5,stroke:#8e8;
+    class E,G red;
+    class D,H green;
+</div><p>由流程图可以得知，假如我们控制好约束和索引，则 <code>ATTACH PARTITION</code> ​基本上可以在秒级执行（这点我已经做过测试）！</p>
+<h4 id="实际操作-hot-表">实际操作-hot 表</h4>
+<p>目前我们需要将一张 4000w 的 <code>parcel_hot</code> ​挂载到 <code>parcel</code> ​数据表。</p>
+<p><code>parcel</code> ​表目前有如下特征：</p>
+<ul>
+<li>索引：有一个 <code>tracking_number</code> ​的索引，<code>idx_parcel_tracking_number</code>​</li>
+<li>主键：主键为 <code>id, archived, created_at</code>，主键名称为 <code>parcel_pkey</code>​</li>
+</ul>
+<p>​<code>parcel_hot</code> ​有如下特征：</p>
+<ul>
+<li>索引：无任何索引</li>
+<li>主键：有一个 <code>id, created_at</code> ​主键，主键名称为 <code>parcel_hot_pkey</code>​</li>
+</ul>
+<h5 id="分区校验">分区校验</h5>
+<p>首先，我们需要提前执行好 <code>parcel_hot</code> ​的分区约束，避免执行 <code>ATTACH PARTITION</code> ​时，锁表太长时间。<code>parcel_hot</code> ​分区约束比较简单：<code>archived=FALSE</code>。下面是约束执行的详细 SQL：</p>
+<pre><code class="language-sql">-- 添加 parcel_hot_archived_false 约束，并且只对新数据执行，老数据不执行校验
+ALTER TABLE parcel_hot
+    ADD CONSTRAINT parcel_hot_archived_false
+        CHECK (archived = FALSE) NOT VALID;
+-- completed in 244 ms
+
+-- 校验 parcel_hot_archived_false 老数据校验
+ALTER TABLE parcel_hot
+VALIDATE CONSTRAINT parcel_hot_archived_false;
+-- completed in 37 s 561 ms
+</code></pre>
+<h5 id="主键替换">主键替换</h5>
+<p>目前 <code>parcel_hot</code> ​的主键为 <code>id, created_at</code>，而 <code>parcel</code> ​的主键为 <code>id, archived, created_at</code>，而这主键不一致，因此无法进行挂载，所以需要我们手动更换主键，对齐两张数据表的主键！下面是更换主键的 SQL 操作：</p>
+<pre><code class="language-sql">-- 增加新的主键
+CREATE UNIQUE INDEX CONCURRENTLY parcel_hot_pkey_new
+ON parcel_hot (id, archived, created_at);
+-- Time: 160.987s
+
+-- 替换主键
+BEGIN;
+ALTER TABLE parcel_hot DROP CONSTRAINT parcel_hot_pkey;
+ALTER TABLE parcel_hot ADD PRIMARY KEY USING INDEX parcel_hot_pkey_new;
+COMMIT;
+-- 此事务 0.5s 左右
+</code></pre>
+<h5 id="等效索引">等效索引</h5>
+<p>目前 <code>parcel</code> ​有一个 <code>tracking_number</code> ​索引，而 <code>parcel_hot</code> ​无任何索引，因此需要在 <code>parcel_hot</code> ​也添加 <code>tracking_number</code> ​索引。下面是添加索引的 SQL：</p>
+<pre><code class="language-sql">CREATE INDEX CONCURRENTLY idx_parcel_hot_tracking_number
+    ON parcel_hot (tracking_number);
+-- completed in 53 s 704 ms
+</code></pre>
+<h5 id="挂载分区-1">挂载分区</h5>
+<p>以上的操作钧执行完成后，现在就可以执行挂载分区的操作了！</p>
+<pre><code class="language-sql">ALTER TABLE parcel ATTACH PARTITION parcel_hot
+    FOR VALUES IN (FALSE)
+-- Time: 0.277s
+</code></pre>
+<h5 id="删除分区校验">删除分区校验</h5>
+<pre><code class="language-sql">ALTER TABLE parcel_hot
+DROP CONSTRAINT parcel_hot_archived_false;
+</code></pre>
+<h4 id="实际操作-history">实际操作-history</h4>
+<p>目前我们需要将一张 4000w 的 <code>parcel_history_2023</code> ​挂载到 <code>parcel_history</code> ​数据表。</p>
+<p>​<code>parcel_history</code> ​表目前有如下特征：</p>
+<ul>
+<li>索引：有一个 <code>tracking_number</code> ​的索引，<code>idx_parcel_history_tracking_number</code>​</li>
+<li>主键：主键为 <code>id, archived, created_at</code>，主键名称为 <code>parcel_history_pkey</code>​</li>
+</ul>
+<p>​<code>parcel_history_2023</code> ​有如下特征：</p>
+<ul>
+<li>索引：无任何索引</li>
+<li>主键：有一个 <code>id, created_at</code> ​主键，主键名称为 <code>parcel_history_2023_pkey</code>​</li>
+</ul>
+<h5 id="分区校验-1">分区校验</h5>
+<p>首先，我们需要提前执行好 <code>parcel_history_2023</code> ​的分区约束，避免执行 <code>ATTACH PARTITION</code> ​时，锁表太长时间。<code>parcel_history_2023</code> ​分区约束比较简单：<code>archived=FALSE AND created_at &gt;= '2023-01-01' AND created_at &lt; '2024-01-01'</code>。</p>
+<blockquote>
+<p><strong>注意：一定不能够将分区条件写为下面这样：</strong> <code>archived=FALSE AND created_at BETWEEN '2023-01-01' AND '2024-01-01'</code>​</p>
+<p>因为 <code>FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')</code> ​的时间区间为：<code>['2023-01-01 00:00:00', '2024-01-01 00:00:00)</code>​</p>
+<p>而 <code>BETWEEN '2023-01-01' AND '2024-01-01'</code> ​的时间取件为：<code>['2023-01-01 00:00:00', '2024-12-01 00:00:00]</code>​</p>
+<p>当写成 <code>archived=FALSE AND created_at BETWEEN '2023-01-01' AND '2024-01-01'</code> ​这样，依旧会执行分区校验的 SQL，导致锁表时间大大的加长了！</p>
+</blockquote>
+<p>下面是约束执行的详细 SQL：</p>
+<pre><code class="language-sql">-- 添加 parcel_hot_archived_false 约束，并且只对新数据执行，老数据不执行校验
+ALTER TABLE parcel_history_2023
+    ADD CONSTRAINT parcel_history_2023_archived_true_created_at
+        CHECK (archived = TRUE AND created_at &gt;= '2023-01-01' AND created_at &lt; '2024-01-01') NOT VALID;
+-- Time: 0.194s
+
+-- completed in 244 ms
+
+-- 校验 parcel_hot_archived_false 老数据校验
+ALTER TABLE parcel_history_2023
+VALIDATE CONSTRAINT parcel_history_2023_archived_true_created_at;
+-- Time: 72.051s
+</code></pre>
+<h5 id="主键替换-1">主键替换</h5>
+<p>目前 <code>parcel_history_2023</code> ​的主键为 <code>id, created_at</code>，而 <code>parcel_history</code> ​的主键为 <code>id, archived, created_at</code>，而这主键不一致，因此无法进行挂载，所以需要我们手动更换主键，对齐两张数据表的主键！下面是更换主键的 SQL 操作：</p>
+<pre><code class="language-sql">-- 增加新的主键
+CREATE UNIQUE INDEX CONCURRENTLY parcel_history_2023_new_key
+ON parcel_history_2023 (id, archived, created_at);
+-- Time: 160.987s
+
+-- 替换主键
+BEGIN;
+ALTER TABLE parcel_hot DROP CONSTRAINT parcel_history_2023_pkey;
+ALTER TABLE parcel_hot ADD PRIMARY KEY USING INDEX parcel_history_2023_pkey_new;
+COMMIT;
+-- 此事务 0.5s 左右
+</code></pre>
+<h5 id="等效索引-1">等效索引</h5>
+<p>目前 <code>parcel_history</code> ​有一个 <code>tracking_number</code> ​索引，而 <code>parcel_history_2023</code> ​无任何索引，因此需要在 <code>parcel_history_2023</code> ​也添加 <code>tracking_number</code> ​索引。下面是添加索引的 SQL：</p>
+<pre><code class="language-sql">CREATE INDEX CONCURRENTLY idx_parcel_history_2023_tracking_number
+    ON parcel_history_2023 (tracking_number);
+-- completed in 53 s 704 ms
+</code></pre>
+<h5 id="挂载分区-2">挂载分区</h5>
+<p>以上的操作钧执行完成后，现在就可以执行挂载分区的操作了！</p>
+<pre><code class="language-sql">ALTER TABLE parcel_history ATTACH PARTITION parcel_history_2023
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01')
+-- Time: 0.277s
+</code></pre>
+<h5 id="删除分区校验-1">删除分区校验</h5>
+<pre><code class="language-sql">ALTER TABLE parcel_history_2023
+DROP CONSTRAINT parcel_history_2023_archived_true_created_at;
+</code></pre>
+<h2 id="卸载分区">卸载分区</h2>
+<p>卸载分区一般速度都比较快，所以相对来说比较安全。卸载分区后，卸载的分区将以独立的数据表存在，且不再与主表有任何关联。</p>
+<p>将 <code>parcel_history_2023</code> ​从 <code>parcel_history </code> ​分区卸载：</p>
+<p>锁表卸载分区（锁的时间很短）：</p>
+<pre><code class="language-sql">ALTER TABLE parcel_history  DETACH PARTITION parcel_history_2023;
+</code></pre>
+<p>并发卸载分区（不锁表）：</p>
+<pre><code class="language-sql">ALTER TABLE parcel_history  DETACH PARTITION parcel_history_2023 CONCURRENTLY;
+</code></pre>
+<p>‍</p>
+<p>‍</p>
+<hr>
+<h2 id="参考文档">参考文档</h2>
+<p><a href="https://www.postgresql.org/docs/current/sql-altertable.html" target="_blank" rel="noopener nofollow">PostgreSQL: Documentation: 17: ALTER TABLE</a>​</p>
+<p><a href="https://www.postgresql.org/docs/current/ddl-partitioning.html" target="_blank" rel="noopener nofollow">PostgreSQL: Documentation: 17: 5.12. Table Partitioning</a></p>
+<p>‍</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-07-30 14:19">2025-07-30 14:18</span>&nbsp;
+<a href="https://www.cnblogs.com/booleandev">booleandev</a>&nbsp;
+阅读(<span id="post_view_count">8</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19012821);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19012821', targetLink: 'https://www.cnblogs.com/booleandev/p/19012821', title: 'PostgreSQL 分区最佳实践' })">举报</a>
+</div>
+        
