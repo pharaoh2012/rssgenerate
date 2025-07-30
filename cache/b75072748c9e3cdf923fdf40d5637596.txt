@@ -1,0 +1,369 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MrVolleyball/p/19011064" title="发布于 2025-07-30 11:24">
+    <span role="heading" aria-level="2">返璞归真--从零开始建设k8s监控之thanos-sidecar（七）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>本文详细讨论一下thanos-sidecar</p>
+<h2 id="环境准备">环境准备</h2>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>版本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>操作系统</td>
+<td>Ubuntu 22.04.4 LTS</td>
+</tr>
+<tr>
+<td>docker</td>
+<td>24.0.7</td>
+</tr>
+<tr>
+<td>thanos</td>
+<td>0.36.1</td>
+</tr>
+</tbody>
+</table>
+<h2 id="thanos概述">thanos概述</h2>
+<p>thanos主要有4个组件</p>
+<ul>
+<li>receive：独立部署，提供了数据写入的api，prometheus通过这个api把数据推送到receive的对象存储</li>
+<li>sidecar：与prometheus部署在一起，成为prometheus的sidecar，负责把prometheus本地的数据上传至对象存储当中</li>
+<li>query：独立部署，是一个兼容了prometheus的查询组件，汇总了来自不同来源的查询结果，并且可以从Sidecar和Store中读取数据</li>
+<li>store：独立部署，提供了对象数据存储功能，并且提供相关的api，query通过该api查询历史数据</li>
+</ul>
+<h2 id="sidecar模式">sidecar模式</h2>
+<p>Sidecar 与prometheus绑定在一起，负责处理与其绑定的prometheus各种监控数据的处理</p>
+<p><img alt="prometheus_7_1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202507/1416773-20250729162439959-2030433152.png" class="lazyload"></p>
+<h3 id="1-k8s安装sidecar">1. k8s安装sidecar</h3>
+<h4 id="11-改造prometheus-configmap">1.1 改造prometheus configmap</h4>
+<p>加入重要的external label</p>
+<pre><code>apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-cm
+  labels:
+    name: prometheus-cm
+  namespace: prometheus
+data:
+  prometheus.yml: |-
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+
+      # 新增外部标签
+      external_labels:
+        cluster: "prometheus-k8s"
+      # 新增结束
+
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+        - targets: ['localhost:9090']
+
+      - job_name: "prometheus-kube-state-metrics"
+        static_configs:
+          - targets: ["kube-state-metrics.kube-system:8080"]
+</code></pre>
+<h4 id="12-改造prometheus-deployment">1.2 改造prometheus deployment</h4>
+<p>加入thanos sidecar</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-deploy
+  namespace: prometheus
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: registry.cn-beijing.aliyuncs.com/wilsonchai/prometheus:v2.54.1
+          args:
+            - "--storage.tsdb.retention.time=12h"
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus/"
+            - "--storage.tsdb.min-block-duration=30m"
+            - "--storage.tsdb.max-block-duration=30m"
+            - --web.enable-lifecycle
+          ports:
+            - containerPort: 9090
+          resources:
+            requests:
+              cpu: 500m
+              memory: 500M
+            limits:
+              cpu: 1
+              memory: 1Gi
+          volumeMounts:
+            - name: prometheus-config
+              mountPath: /etc/prometheus/
+            - name: prometheus-data
+              mountPath: /prometheus
+        # 新增thanos-sidecar
+        - name: thanos
+          image: registry.cn-beijing.aliyuncs.com/wilsonchai/thanos:0.36.1
+          args:
+            - "sidecar"
+            - "--prometheus.url=http://localhost:9090"
+            - "--tsdb.path=/prometheus"
+          volumeMounts:
+            - name: prometheus-data
+              mountPath: /prometheus
+        # 新增结束
+      volumes:
+        - name: prometheus-config
+          configMap:
+            defaultMode: 420
+            name: prometheus-cm
+        - emptyDir: {}
+          name: prometheus-data
+
+</code></pre>
+<h4 id="13-新增thanos的service">1.3 新增thanos的service</h4>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: thanos-sidecar-service
+  namespace: prometheus
+spec:
+  ports:
+    - name: thanos-sidecar-port
+      port: 10901
+      protocol: TCP
+      targetPort: 10901
+  selector:
+    app: prometheus
+  type: NodePort
+
+</code></pre>
+<p>照葫芦画瓢，改造另一个prometheus，专门采集node监控数据的</p>
+<h3 id="2-部署thanos-query">2. 部署thanos-query</h3>
+<pre><code>docker run -d --net=host \
+  --name thanos-query \
+  registry.cn-beijing.aliyuncs.com/wilsonchai/thanos:0.36.1 \
+  query \
+    --http-address "0.0.0.0:39090" \
+    --grpc-address "0.0.0.0:39091" \
+    --store "192.168.49.2:30139" \
+    --store "192.168.49.2:31165"
+</code></pre>
+<p>需要注意一下<code>192.168.49.2:30139</code>与<code>192.168.49.2:31165</code>，这里ip是thanos-sidecar所在pod的node ip，端口则是映射出来的nodeport</p>
+<p>打开thanos-query页面检查</p>
+<p><img alt="prometheus_7_2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202507/1416773-20250729162523299-917179594.png" class="lazyload"></p>
+<h3 id="3-部署对象存储minio">3. 部署对象存储minio</h3>
+<p><img alt="prometheus_7_3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202507/1416773-20250729162546233-1822520435.png" class="lazyload"></p>
+<h4 id="31-部署方式同receive">3.1 部署方式同receive</h4>
+<h4 id="32-新增sidecar-configmap">3.2 新增sidecar configmap</h4>
+<p>首先准备bucket.yml，由于thanos-sidecar在k8s里面，所以做成configmap</p>
+<pre><code>apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bucket-cm
+  labels:
+    name: bucket-cm
+  namespace: prometheus
+data:
+  bucket.yml: |-
+    type: S3
+    config:
+      bucket: "wilson-test"
+      endpoint: "10.22.11.156:9090"
+      access_key: "zzUrkBzyqcCDXySsMLlS"
+      secret_key: "nWCcztESnxnUZIKSKsELGEFdg6l6fjzhtqkARJB8"
+      insecure: true
+</code></pre>
+<h4 id="33-改造thanos-sidecar">3.3 改造thanos-sidecar</h4>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-deploy
+  namespace: prometheus
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: registry.cn-beijing.aliyuncs.com/wilsonchai/prometheus:v2.54.1
+          args:
+            - "--storage.tsdb.retention.time=12h"
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus/"
+            - "--storage.tsdb.min-block-duration=30m"
+            - "--storage.tsdb.max-block-duration=30m"
+            - --web.enable-lifecycle
+          ports:
+            - containerPort: 9090
+          resources:
+            requests:
+              cpu: 500m
+              memory: 500M
+            limits:
+              cpu: 1
+              memory: 1Gi
+          volumeMounts:
+            - name: prometheus-config
+              mountPath: /etc/prometheus/
+            - name: prometheus-data
+              mountPath: /prometheus
+        - name: thanos
+          image: registry.cn-beijing.aliyuncs.com/wilsonchai/thanos:0.36.1
+          args:
+            - "sidecar"
+            - "--prometheus.url=http://localhost:9090"
+            - "--tsdb.path=/prometheus"
+            - "--objstore.config-file=/etc/thanos/bucket.yml"
+          volumeMounts:
+            - name: prometheus-data
+              mountPath: /prometheus
+            - name: bucket-config
+              mountPath: /etc/thanos/
+      volumes:
+        - name: prometheus-config
+          configMap:
+            defaultMode: 420
+            name: prometheus-cm
+        - name: bucket-config
+          configMap:
+            defaultMode: 420
+            name: bucket-cm
+        - emptyDir: {}
+          name: prometheus-data
+</code></pre>
+<p>由于上传对象存储的时间是30m，所以我们先继续下面的步骤，一会回头过来再回来检查minio中是否有文件上传</p>
+<h3 id="4-部署thanos-store">4. 部署thanos-store</h3>
+<p><img alt="prometheus_7_4" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202507/1416773-20250729162603710-1267283452.png" class="lazyload"></p>
+<p>部署方式同receive</p>
+<p>调整thanos-query的配置，新增thanos-store的地址</p>
+<pre><code>docker run -d --net=host \
+  --name thanos-query \
+  registry.cn-beijing.aliyuncs.com/wilsonchai/thanos:0.36.1 \
+  query \
+    --http-address "0.0.0.0:39090" \
+    --grpc-address "0.0.0.0:39091" \
+    --store "192.168.49.2:30139" \
+    --store "192.168.49.2:31165" \
+    --store "10.22.11.156:10901"
+</code></pre>
+<p>添加完毕后，检查thanos-query的web页面</p>
+<p><img alt="prometheus_7_5" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202507/1416773-20250729162616225-991509131.png" class="lazyload"></p>
+<h3 id="5-pod权限调整">5. pod权限调整</h3>
+<p>万事俱备，回头去看看minio是否有文件上传，打开之后空空如也，怎么回事，去看一下thanos-sidecar的日志</p>
+<pre><code>▶ kubectl -n prometheus logs prometheus-deploy-6f8c5549b9-rqqk6 -c thanos
+...
+ts=2024-10-30T06:03:23.704299583Z caller=sidecar.go:410 level=warn err="upload 01JBDQNT0RZH4GFCFC564RWZT7: hard link block: hard link file chunks/000001: link /prometheus/01JBDQNT0RZH4GFCFC564RWZT7/chunks/000001 /prometheus/thanos/upload/01JBDQNT0RZH4GFCFC564RWZT7/chunks/000001: operation not permitted" uploaded=0
+</code></pre>
+<p>怎么回事？没有权限，冷静分析一下thanos-sidecar的上传逻辑</p>
+<ul>
+<li>首先数据文件是由prometheus产生的，thanos-sidecar上传文件应该直接使用prometheus产生的数据文件，这样是最简便的策略，不需要把文件复制到自己的目录，带来额外的磁盘消耗，</li>
+<li>由于1个pod当中有2个container，带来的问题就是启动进程的用户与组是不一样的，再加上prometheus与thanos-sidecar使用同一个目录<code>/prometheus</code>，2个pod分别在该目录下创建的子目录或文件权限不一致，到此初步判断是 因为2个pod不同的启动用户导致权限有问题</li>
+<li>登录到prometheus的pod之后进入<code>/prometheus</code>证实</li>
+</ul>
+<pre><code>/prometheus $ ls -lrt                                                                                                                                                                                     
+total 44                                                                                                                                                                                                  
+-rw-r--r--    1 nobody   nobody       20001 Oct 30 02:46 queries.active                                                                                                                                   
+-rw-r--r--    1 nobody   nobody           0 Oct 30 02:46 lock                                                                                                                                             
+-rw-r--r--    1 1001     root            37 Oct 30 03:31 thanos.shipper.json                                                                                                                              
+drwxr-xr-x    3 nobody   nobody        4096 Oct 30 03:31 01JBDQNT0RZH4GFCFC564RWZT7
+</code></pre>
+<ul>
+<li>再加上日志，源文件是在<code>/prometheus</code>下，而thanos-sidecar会在<code>/prometheus/thanos/</code>下对源文件创建硬链接，先检查一下源文件</li>
+</ul>
+<pre><code>/prometheus/01JBDQNT0RZH4GFCFC564RWZT7/chunks $ ls -lrt
+total 96
+-rw-r--r--    1 nobody   nobody       88911 Oct 30 03:31 000001
+</code></pre>
+<ul>
+<li>源文件没有组的写权限，垂死病中惊坐起！创建硬链接是需要写权限的，快速验证一下</li>
+</ul>
+<pre><code>▶ id
+uid=1000(wilson) gid=1000(wilson) groups=1000(wilson)
+
+▶ touch /tmp/test
+
+▶ sudo chown root.root /tmp/test
+
+▶ sudo chmod 644 /tmp/test
+
+▶ ln /tmp/test /tmp/ttttt
+ln: failed to create hard link '/tmp/ttttt' =&gt; '/tmp/test': Operation not permitted
+
+</code></pre>
+<p>到此为止，问题已经比较明朗了，1个pod的2个container，使用了不同的启动用户，创建出来的文件是不同用户的权限，同时他们共享了同一个目录，而prometheus创建的数据文件是644的权限，没有三方写权限。而thanos-sidecar需要把prometheus创建的数据文件创建硬链接到自己的目录，由于没有写权限，创建硬链接失败</p>
+<p>解决方案有很多种，这里给出最简单的一种，因为是部署在k8s中的1个pod，只需要指定同一个启动用户去启动不同container即可</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: prometheus
+  name: prometheus-deploy
+  namespace: prometheus
+spec:
+...
+  template:
+...
+    spec:
+      securityContext:
+        runAsUser: 555
+      containers:
+...
+
+</code></pre>
+<p>加入<code>securityContext</code>，并且随便指定一个用户id，这里我随便指定了一个555，重启之后再登录prometheus查看</p>
+<p><img alt="prometheus_7_6" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202507/1416773-20250729162631800-1978617841.png" class="lazyload"></p>
+<p>问题解决</p>
+<h2 id="联系我">联系我</h2>
+<ul>
+<li>联系我，做深入的交流<br>
+<img alt="" width="500" height="200" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202411/1416773-20241121135740959-1907948957.png#" class="lazyload"></li>
+</ul>
+<hr>
+<p>至此，本文结束<br>
+在下才疏学浅，有撒汤漏水的，请各位不吝赐教...</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/MrVolleyball/" target="_blank">it排球君</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/MrVolleyball/p/19011064" target="_blank">https://www.cnblogs.com/MrVolleyball/p/19011064</a></p>
+<div>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须在文章页面给出原文连接，否则保留追究法律责任的权利。 </div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-07-30 11:24">2025-07-30 11:24</span>&nbsp;
+<a href="https://www.cnblogs.com/MrVolleyball">it排球君</a>&nbsp;
+阅读(<span id="post_view_count">13</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19011064);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19011064', targetLink: 'https://www.cnblogs.com/MrVolleyball/p/19011064', title: '返璞归真--从零开始建设k8s监控之thanos-sidecar（七）' })">举报</a>
+</div>
+        
