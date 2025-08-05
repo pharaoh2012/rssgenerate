@@ -1,18 +1,15 @@
 //cron: 3/20 7-23 * * *
-//new Env('52pojie吾爱破解RSS');
+//new Env('60s 看世界');
 
 
 const fetch = require('node-fetch');
 const tools = require("./tools")
 
-const rootUrl = `https://60s.viki.moe/v2/60s?encoding=text`;
+// https://github.com/vikiboss/60s
+
 const HOME_URL = "https://60s.viki.moe/v2/60s?encoding=text"
 const title = "60s 看世界";
 const RSS_NAME = "60s";
-
-const skipWords = [];
-
-let cookie;
 
 async function main() {
     let today = getToday();
@@ -21,9 +18,6 @@ async function main() {
 
     console.info(items);
     let xml = tools.getRssXml(title,HOME_URL,items);
-
-    // fs.writeFileSync(`${tools.RSSOUT}/${RSS_NAME}.json`, JSON.stringify(items));
-    // fs.writeFileSync(`${tools.RSSOUT}/${RSS_NAME}.xml`, xml);
 
     //upload
     await tools.uploadJson(title, HOME_URL, items, RSS_NAME)

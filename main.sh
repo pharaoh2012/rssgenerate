@@ -21,11 +21,12 @@ runscript() {
 # 调用 runscript 函数执行指定的JS文件
 
 # runscript "./rss/51credit.js"
+runscript "./rss/60s.js"
 runscript "./rss/52pojie.js"
 runscript "./rss/cnblogs.js"
 runscript "./rss/juejin.js"
 runscript "./rss/smzdm.js"
 runscript "./rss/52pojie_aiqiyi.js"
-runscript "./rss/60s.js"
+
 # 0818tuan长期超时，禁用
 # runscript "./rss/0818tuan.js"
