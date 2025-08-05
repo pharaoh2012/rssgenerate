@@ -26,5 +26,6 @@ runscript "./rss/cnblogs.js"
 runscript "./rss/juejin.js"
 runscript "./rss/smzdm.js"
 runscript "./rss/52pojie_aiqiyi.js"
+runscript "./rss/60s.js"
 # 0818tuan长期超时，禁用
 # runscript "./rss/0818tuan.js"
