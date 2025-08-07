@@ -1,0 +1,274 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/vivotech/p/19026603" title="发布于 2025-08-07 11:34">
+    <span role="heading" aria-level="2">慢SQL优化实战：从一例线上慢SQL探究执行引擎工作过程</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文通过一个线上慢SQL案例，介绍了Join的两种算法和Order by的工作原理，并通过Explain和Optimizer_trace工具完整推演了慢SQL的执行过程。基于对原理和执行过程的分析，本文给出一种“引导执行引擎选择效率更高的算法”的方案，从而使查询性能得到大幅提升。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>作者： vivo 互联网服务器团队- Li Xin</p>
+<p>本文通过一个线上慢SQL案例，介绍了Join的两种算法和Order by的工作原理，并通过Explain和Optimizer_trace工具完整推演了慢SQL的执行过程。基于对原理和执行过程的分析，本文给出一种“引导执行引擎选择效率更高的算法”的方案，从而使查询性能得到大幅提升。</p>
+</blockquote>
+<h1 id="1线上慢-sql-背景">1、线上慢 SQL 背景</h1>
+<p>慢 SQL 会影响用户使用体验，降低数据库的整体性能，严重的甚至会导致服务器挂掉、整个系统瘫痪。笔者通过监控平台发现线上存在这样一条慢SQL（原始SQL已脱敏，表结构出于简化的目的做了一定删减，实际执行耗时以文中提供数据为准），其执行耗时在分钟级。</p>
+<pre><code>select&nbsp;t1.*,t2.x&nbsp;from&nbsp;t_table1 t1 leftjoin t_table2 t2&nbsp;on&nbsp;t1.a = t2.a&nbsp;orderby&nbsp;t1.c desc;
+
+</code></pre>
+<p>表结构如下：</p>
+<pre><code>CREATETABLE&nbsp;`t_table1`&nbsp;(
+&nbsp;&nbsp;`id`&nbsp;bigint(20) unsigned&nbsp;NOTNULL&nbsp;AUTO_INCREMENT&nbsp;COMMENT&nbsp;'主键',
+&nbsp;&nbsp;`a`&nbsp;varchar(64)&nbsp;NOTNULL,
+&nbsp;&nbsp;`b`&nbsp;varchar(64)&nbsp;NOTNULL,
+&nbsp;&nbsp;`c`&nbsp;varchar(20)&nbsp;NOTNULL,
+&nbsp;&nbsp;PRIMARYKEY&nbsp;(`id`),
+&nbsp;&nbsp;KEY&nbsp;`idx_a`&nbsp;(`a`)
+)&nbsp;ENGINE=InnoDB&nbsp;AUTO_INCREMENT=0DEFAULT&nbsp;CHARSET=utf8mb4;
+
+CREATETABLE&nbsp;`t_table2`&nbsp;(
+&nbsp;&nbsp;`id`&nbsp;bigint(20) unsigned&nbsp;NOTNULL&nbsp;AUTO_INCREMENT&nbsp;COMMENT&nbsp;'主键',
+&nbsp;&nbsp;`a`&nbsp;varchar(64)&nbsp;NOTNULL,
+&nbsp;&nbsp;`x`&nbsp;varchar(64)&nbsp;NOTNULL,
+&nbsp;&nbsp;`y`&nbsp;varchar(20)&nbsp;NOTNULL,
+&nbsp;&nbsp;PRIMARYKEY&nbsp;(`id`)
+)&nbsp;ENGINE=InnoDB&nbsp;AUTO_INCREMENT=0DEFAULT&nbsp;CHARSET=utf8mb4;
+
+</code></pre>
+<p>其他信息：</p>
+<p><img alt="" loading="lazy" data-src="https://static001.geekbang.org/infoq/b6/b6d3dd02b7c1dde85561715f07cbc8e5.png" class="lazyload"></p>
+<p>当发现慢SQL时，笔者的第一反应是使用Explain查看SQL的执行计划，结果如下：</p>
+<p><img alt="图片" loading="lazy" data-src="https://static001.geekbang.org/infoq/d8/d80e469be4c5bf6a591e0f15e9ce7329.png" class="lazyload"></p>
+<p>通过Explain初步分析：两张表均执行了全表扫描，结合两张表的数据规模分析全表扫描并非耗时达到分钟级的主要原因。另外执行计划extra种提示的Using temporary; Using filesort; Using join buffer (Block Nested Loop)又分别代表什么含义呢？</p>
+<h1 id="2原理探究">2、原理探究</h1>
+<h2 id="21-join-算法原理">2.1 Join 算法原理</h2>
+<h3 id="211-驱动表和被驱动表">2.1.1 驱动表和被驱动表</h3>
+<p>在Join语句中，执行引擎优先扫描的表被称为驱动表，另一张表被称为被驱动表。执行引擎在选择驱动表时，除了必须要遵守的特定语义外，最重要的考虑便是执行效率。</p>
+<p>首先列举两种特定语义约束驱动表选取的<strong>场景</strong>：</p>
+<blockquote>
+<p><strong>场景一：</strong>Straight join指定连接顺序，强制要求执行引擎优先扫描左侧的表。</p>
+<p><strong>场景二：</strong>Left/Right [outer] join，方向连接的特点是反方向表中如果不存在关联的数据则填充NULL值，这一特性要求方向查询时优先扫描相同方向的表。倘若where条件中明确指明反方向表中的部分列非空，则驱动表的选择就不受此语义的限制，执行引擎会依据效率选取驱动表。</p>
+</blockquote>
+<p>当没有特定语义的约束时，执行引擎便会依据执行效率选取驱动表，如何判断哪张表作为驱动表的效率更高呢？下文会结合Join的两种算法更深入地探讨这个问题。</p>
+<h3 id="212-block-nested-loop-join">2.1.2 Block Nested-Loop Join</h3>
+<p>假设一个数据量为m行的驱动表与一个数据量为n行的被驱动表进行join查询。</p>
+<p>最简单的一种算法：</p>
+<blockquote>
+<ol>
+<li>
+<p>从驱动表扫描一行数据；</p>
+</li>
+<li>
+<p>对被驱动表进行全表扫描，得到的结果依次与驱动表的数据进行join并把满足条件的数据加入结果集；</p>
+</li>
+<li>
+<p>接着扫描驱动表，每扫描一行数据，均重复执行一次步骤2，直至驱动表的全部数据被扫描完毕。</p>
+</li>
+</ol>
+</blockquote>
+<p>这种算法的磁盘扫描开销为m*n，非常低效，MySQL在实际中并未直接使用该算法，而是采用缓存的思想（分配一块Join buffer）对该算法进行改进，并命名为Block Nested-Loop join(BNL)。</p>
+<p>BNL的算法<strong>步骤</strong>为：</p>
+<blockquote>
+<ol>
+<li>
+<p>从驱动表一次扫描K条数据，并把数据缓存在Join buffer；</p>
+</li>
+<li>
+<p>对被驱动表进行全表扫描，得到的结果依次与驱动表的K条数据进行join并把满足条件的数据加入结果集；</p>
+</li>
+<li>
+<p>清空join_buffer；</p>
+</li>
+<li>
+<p>接着从驱动表再取出K条数据，重复步骤2、3，直至扫描完驱动表的全部数据。</p>
+</li>
+</ol>
+</blockquote>
+<p>上述算法中，驱动表分段取数的次数记为l，整个算法的磁盘扫描开销为m+ln。由于分段的次数与驱动表的数据成正相关，所以公式可以记为m+λmn，λ的取值范围为(0,1)。</p>
+<p>当两张表的行数（m、n大小）固定的情况下，m对结果的影响更大，m越小整体扫描的代价越小，所以执行引擎优先选择数据量更小的表作为驱动表(符合“小表驱动大表”的说法)。</p>
+<h3 id="213-index-nested-loop-join">2.1.3 Index Nested-Loop Join</h3>
+<p>BNL算法使用了Join buffer结构，虽然有可能通过减少重复扫描来降低磁盘扫描开销，然而驱动表分段扫描的次数过多依然可能会导致查询的低效。索引是MySQL查询提效的重要结构，当被驱动表的关联键存在索引时，MySQL会使用Index Nested-Loop Join（NLJ）算法。</p>
+<p>该算法的步骤为：</p>
+<blockquote>
+<ol>
+<li>
+<p>从驱动表扫描一行数据；</p>
+</li>
+<li>
+<p>使用驱动表的关联键搜索被驱动表的索引树，通过被驱动表的索引结构找到被驱动表的主键，再通过主键回表查询出被驱动表的关联数据（暂不考虑覆盖索引的情况）；</p>
+</li>
+<li>
+<p>接着扫描驱动表，每扫描一行数据，均重复执行一次步骤2，直至驱动表的全部数据被扫描完毕。</p>
+</li>
+</ol>
+</blockquote>
+<p>每次搜索一棵树的复杂度近似为log2 n，上述过程在被驱动表扫描一行数据的时间复杂度是2log2 n，算法的整体复杂度为m+2mlog2 n，在该算法中，依旧是m对结果的影响更大，m越小整体扫描的代价越小，所以执行引擎总是选择数据量更小的表作为驱动表(符合“小表驱动大表”的说法)。</p>
+<h2 id="22-order-by-算法原理">2.2 Order by 算法原理</h2>
+<h4 id="221-全字段排序">2.2.1 全字段排序</h4>
+<p>MySQL会为每个线程分配一块内存（Sort buffer）用于排序，当Sort buffer的空间不足时（通过系统参数sort_buffer_size设置Sort buffer的大小），执行引擎不得不开辟磁盘临时文件用于排序，此时排序的性能也会大幅降低。</p>
+<p>全字段排序是将查询需要的所有字段进行暂存，并按照排序字段进行排序，并将排序后的结果集直接返回。</p>
+<h3 id="222-rowid-排序">2.2.2 Rowid 排序</h3>
+<p>若要查询的数据单行占用空间较大，Sort buffer中可以容纳的排序行数将会减少，此时使用磁盘临时文件进行排序的概率将会增大。为了提高排序性能，执行引擎提供一种只存储排序字段的算法，称为Rowid排序算法。</p>
+<p>该算法的<strong>步骤</strong>为：</p>
+<blockquote>
+<ol>
+<li>
+<p>将参与排序的字段和主键进行临时存储；</p>
+</li>
+<li>
+<p>按照排序字段进行排序，得到有序的主键；</p>
+</li>
+<li>
+<p>根据有序的主键进行回表，按顺序将所有要查询的数据返回。</p>
+</li>
+</ol>
+</blockquote>
+<p>Rowid排序在单行查询数据较大时可以通过节省临时排序空间从而达到降低排序开销的目的，然而该算法的代价是会增加磁盘扫描的次数（主键回表），所以是否选择使用该算法需要根据实际情况进行取舍（通过系统参数max_length_for_sort_data设置）。</p>
+<h1 id="3调优过程">3、调优过程</h1>
+<h2 id="31-执行过程分析">3.1 执行过程分析</h2>
+<p>了解了Join和Order by的工作原理，我们推测执行计划的大致<strong>过程</strong>为：</p>
+<blockquote>
+<ol>
+<li>
+<p>t_table_1与t_table_2进行Join查询，使用了BNL算法（Using join buffer (Block Nested Loop)）</p>
+</li>
+<li>
+<p>将Join的结果暂存临时表（Using temporary）</p>
+</li>
+<li>
+<p>对临时表中的数据进行排序后返回（Using filesort）</p>
+</li>
+</ol>
+</blockquote>
+<p>为了佐证笔者的推测以及了解每一步的开销情况，Optimizer_trace命令可以提供更多执行过程细节。</p>
+<pre><code>{
+&nbsp; &nbsp; &nbsp;"considered_execution_plans":&nbsp;[
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"table":&nbsp;"`t_table1` `t1`",
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"best_access_path":&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"considered_access_paths":&nbsp;[
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"rows_to_scan":&nbsp;3000,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"access_type":&nbsp;"scan",
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"resulting_rows":&nbsp;3000,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"cost":&nbsp;615,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"chosen":&nbsp;true,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"use_tmp_table":&nbsp;true
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;]&nbsp;/* considered_access_paths */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}&nbsp;/* best_access_path */,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"rest_of_plan":&nbsp;[
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"table":&nbsp;"`t_table2` `t2`",
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"best_access_path":&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"considered_access_paths":&nbsp;[
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"rows_to_scan":&nbsp;69882,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"access_type":&nbsp;"scan",
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"using_join_cache":&nbsp;true,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"buffers_needed":&nbsp;5,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"resulting_rows":&nbsp;69882,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"cost":&nbsp;4.19e7,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"chosen":&nbsp;true
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;]&nbsp;/* considered_access_paths */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}&nbsp;/* best_access_path */,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"rows_for_plan":&nbsp;2.1e8,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"cost_for_plan":&nbsp;4.19e7,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"sort_cost":&nbsp;2.1e8,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"new_cost_for_plan":&nbsp;2.52e8,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"chosen":&nbsp;true
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;]&nbsp;/* rest_of_plan */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;]&nbsp;/* considered_execution_plans */
+&nbsp; &nbsp;}
+
+</code></pre>
+<p>上图展示的即为执行引擎预估的执行计划，从Optimizer_trace的输出结果中可以佐证上述对于执行过程的推测。另外我们可以得到执行代价的结果为：</p>
+<blockquote>
+<ul>
+<li>
+<p>t_table1的扫描行数为3000，代价为615;</p>
+</li>
+<li>
+<p>t_table2的扫描行数为69882，由于BNL算法t_table2会被多次全表扫描，整体代价为4.19e7;</p>
+</li>
+<li>
+<p>对Join结果进行排序的开销为2.1e8。</p>
+</li>
+</ul>
+</blockquote>
+<p>从执行引擎预估的执行计划可以看出执行引擎认为排序的开销最大，另外由于使用BNL算法会导致被驱动表执行多次全表扫描，其执行代价仅次于排序。然而预估的执行计划并不代表真正的执行结果，下面展示Optimizer_trace命令对于真实执行结果部分参数：</p>
+<pre><code>{
+&nbsp; &nbsp; &nbsp; &nbsp;"join_execution":&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"select#":&nbsp;1,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"steps":&nbsp;[
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"creating_tmp_table":&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"tmp_table_info":&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"table":&nbsp;"intermediate_tmp_table",
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"row_length":&nbsp;655,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"key_length":&nbsp;0,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"unique_constraint":&nbsp;false,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"location":&nbsp;"memory (heap)",
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"row_limit_estimate":&nbsp;25614
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}&nbsp;/* tmp_table_info */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}&nbsp;/* creating_tmp_table */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;},
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"filesort_summary":&nbsp;{
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"rows":&nbsp;3000,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"examined_rows":&nbsp;3000,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_tmp_files":&nbsp;0,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"sort_buffer_size":&nbsp;60200,
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"sort_mode":&nbsp;"&lt;sort_key, rowid&gt;"
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}&nbsp;/* filesort_summary */
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp;]&nbsp;/* steps */
+&nbsp; &nbsp; &nbsp; &nbsp;}&nbsp;/* join_execution */
+}
+
+</code></pre>
+<p>从执行结果参数来看：</p>
+<blockquote>
+<ul>
+<li>
+<p>执行引擎使用临时表保存Join的结果，且临时表是一张内存表。</p>
+</li>
+<li>
+<p>参与排序的数据行数为3000行，没有使用磁盘临时文件进行排序，排序算法选择的是Rowid排序。</p>
+</li>
+</ul>
+</blockquote>
+<p>综合执行引擎的预估的执行计划和真实的执行结果参数可以得出，执行引擎预估最大的执行开销为排序，但实际上排序并未使用到磁盘临时文件，且Rowid排序的回表操作是在内存中进行的（在内存临时表中进行回表），3000条数据的内存排序开销是极快的，所以真实的最大开销是BNL算法导致的对被驱动表多次进行全表扫描的开销。</p>
+<h2 id="32-最终的优化">3.2 最终的优化</h2>
+<p>对于BNL算法，可以通过在被驱动表添加索引使其转化为NLJ算法来进行优化（此处注意一些索引失效的场景，笔者在实际调优中遇到了字符集不同导致的索引失效场景）。在t_table2表添加索引后，观察一周内的SQL监控如下，可以看到SQL最大响应时间不超过20ms，执行效率得到了大幅提升。</p>
+<p><img alt="图片" loading="lazy" data-src="https://static001.geekbang.org/infoq/47/475398e816de211f42468bc73336a5fa.png" class="lazyload"></p>
+<h1 id="4总结">4、总结</h1>
+<p>本文完整的介绍了一个SQL调优案例，通过这个案例可以归纳出SQL调优的基本思想。首先，需要了解SQL语句中的关键字（Join、Order by...）的基本工作原理，并辅助一些执行过程数据（Explain、Optimizer_trace），通过实验验证猜想，最终达成调优的目的。</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    分享 vivo 互联网技术干货与沙龙活动，推荐最新行业动态与热门会议。
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-08-07 11:35">2025-08-07 11:34</span>&nbsp;
+<a href="https://www.cnblogs.com/vivotech">vivo互联网技术</a>&nbsp;
+阅读(<span id="post_view_count">156</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19026603);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19026603', targetLink: 'https://www.cnblogs.com/vivotech/p/19026603', title: '慢SQL优化实战：从一例线上慢SQL探究执行引擎工作过程' })">举报</a>
+</div>
+        
