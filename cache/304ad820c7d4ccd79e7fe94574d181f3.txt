@@ -1,0 +1,224 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/tylerw/p/19044710" title="发布于 2025-08-18 15:01">
+    <span role="heading" aria-level="2">【EDK2】在UDK2018中实现兼容Vscode中的Edk2Code插件</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="原理">原理</h1>
+<p><strong>新版 EDK2</strong> 的确把“生成编译信息（compile_commands.json 等）”做在 <strong>BaseTools/Source/Python/build/BuildReport.py</strong> 里的 <strong>BuildReport</strong> 类里，并通过 <code>-Y COMPILE_INFO -y BuildReport.log</code> 开关触发。</p>
+<p>官方 issue / 文档和扩展插件都在用这个开关（不是 REPORT_INFO）来生成 <code>Build/…/CompileInfo/compile_commands.json</code> 等文件。</p>
+<p>其中<code>-Y COMPILE_INFO -y BuildReport.log</code>编译选项是近期才加上的，不能兼容老版本的UDK2018，很多现有的项目是基于老版EDK2，因此，需要改动做一些兼容。</p>
+<h1 id="代码修改">代码修改</h1>
+<h2 id="改动一buildreportpy">改动一：BuildReport.py</h2>
+<blockquote>
+<p>文件：<code>BaseTools/Source/Python/build/BuildReport.py</code></p>
+</blockquote>
+<p>1）在文件顶部 import 区补充（如已有相同 import 可略过）：</p>
+<pre><code>import json
+
+from Common.Misc import SaveFileOnChange
+from Common.DataType import TAB_COMPILER_MSFT
+</code></pre>
+<p>2）在 <code>class BuildReport():</code> 内添加方法：</p>
+<pre><code>   def GenerateCompileInfo(self):
+       """
+       生成供 IDE/clangd/vscode 使用的编译数据库，以及辅助文件。
+       输出目录：&lt;Build&gt;/&lt;BuildTarget&gt;/&lt;ToolChain&gt;/CompileInfo/
+       输出文件：compile_commands.json, cscope.files, module_report.json
+       """
+       try:
+           compile_commands = []
+           used_files = set()
+           module_report = []
+           # self.ReportList 由现有 BuildReport 逻辑维护（与原有报表一致）
+           for (Wa, MaList) in self.ReportList:
+               # 工作区已处理文件（尽可能多地记录）
+               try:
+                   for fp in Wa._GetMetaFiles(Wa.BuildTarget, Wa.ToolChain):
+                       used_files.add(fp)
+               except Exception:
+                   pass
+               for autogen in Wa.AutoGenObjectList:
+                   # 遍历模块与库（与新版 EDK2 的思路一致）
+                   for module in (autogen.LibraryAutoGenList + autogen.ModuleAutoGenList):
+                       used_files.add(module.MetaFile.Path)
+                       # —— 可选：模块摘要（用于 module_report.json）——
+                       md = {
+                           "Name": module.Name,
+                           "Arch": module.Arch,
+                           "Path": module.MetaFile.Path,
+                           "Guid": getattr(module, "Guid", ""),
+                           "BuildType": getattr(module, "BuildType", ""),
+                           "IsLibrary": getattr(module, "IsLibrary", False),
+                           "SourceDir": getattr(module, "SourceDir", ""),
+                           "Files": [],
+                           "Libraries": [],
+                           "Packages": [],
+                           "PPI": [],
+                           "Protocol": [],
+                           "Pcd": []
+                       }
+                       for sf in module.SourceFileList:
+                           md["Files"].append({"Name": sf.Name, "Path": sf.Path})
+                       for libag in getattr(module, "LibraryAutoGenList", []):
+                           md["Libraries"].append({"Path": libag.MetaFile.Path})
+                       for pkg in getattr(module, "PackageList", []):
+                           entry = {"Path": pkg.MetaFile.Path, "Includes": []}
+                           for inc in getattr(pkg, "Includes", []):
+                               entry["Includes"].append(inc.Path)
+                           md["Packages"].append(entry)
+                       for k in getattr(module, "PpiList", {}).keys():
+                           md["PPI"].append({"Name": k, "Guid": module.PpiList[k]})
+                       for k in getattr(module, "ProtocolList", {}).keys():
+                           md["Protocol"].append({"Name": k, "Guid": module.ProtocolList[k]})
+                       for pcd in getattr(module, "LibraryPcdList", []):
+                           md["Pcd"].append({
+                               "Space": getattr(pcd, "TokenSpaceGuidCName", ""),
+                               "Name": getattr(pcd, "TokenCName", ""),
+                               "Value": getattr(pcd, "TokenValue", ""),
+                               "Guid": getattr(pcd, "TokenSpaceGuidValue", ""),
+                               "DatumType": getattr(pcd, "DatumType", ""),
+                               "Type": getattr(pcd, "Type", ""),
+                               "DefaultValue": getattr(pcd, "DefaultValue", "")
+                           })
+                       module_report.append(md)
+                       # 生成 compile_commands 项（仅 C/C++ 源）
+                       inc_flag = "/I" if module.BuildRuleFamily == TAB_COMPILER_MSFT else "-I"
+                       for src in module.SourceFileList:
+                           used_files.add(src.Path)
+                           if src.Ext not in [".c", ".cc", ".cpp", ".cxx"]:
+                               continue
+                           # 基于 BuildRules 获取单条编译命令模板
+                           try:
+                               rule_cmd = module.BuildRules[src.Ext].CommandList[0]
+                           except Exception:
+                               # 回退：无法解析就跳过该文件
+                               continue
+                           # 展开 $(VAR) 变量（与新版实现思路一致，尽量保守）
+                           def _expand_var(m):
+                               token = m.group(1)
+                               parts = token.split("_")
+                               try:
+                                   if len(parts) == 1:
+                                       return module.BuildOption[parts[0]]["PATH"]
+                                   else:
+                                       return module.BuildOption[parts[0]][parts[1]]
+                               except Exception:
+                                   return ""
+                           build_cmd = re.sub(r"\$\((.*?)\)", _expand_var, rule_cmd)
+                           # 处理常见占位：${src}（包含路径列表），${dst}（输出目录）
+                           try:
+                               incs = getattr(module, "IncludePathList", [])
+                               # 构造 “/Ipath1 /Ipath2 …”
+                               inc_blob = " ".join([(inc_flag + "\"" + inc + "\"") if " " in inc else (inc_flag + inc) for inc in incs])
+                                build_cmd = build_cmd.replace("${src}", inc_blob)
+                                build_cmd = build_cmd.replace("${dst}", getattr(module, "OutputDir", ""))
+                            except Exception:
+                                pass
+
+                            # 清理未展开残留形如 $(XXX) 的片段
+                            build_cmd = re.sub(r"\$\((?:.*?)\)", "", build_cmd).strip()
+
+                            # compilation database 条目
+                            entry = {
+                                "file": src.Path,                 # 保持与 EDK2 新版一致：绝对路径
+                                "directory": src.Dir,             # 编译时工作目录
+                                "command": build_cmd              # MSVC 风格 cl.exe 命令
+                            }
+                            compile_commands.append(entry)
+
+            # 输出目录：Build/.../CompileInfo
+            compile_info_dir = os.path.join(Wa.BuildDir, "CompileInfo")
+            if not os.path.isdir(compile_info_dir):
+                try:
+                    os.makedirs(compile_info_dir)
+                except Exception:
+                    pass
+
+            # 排序并写出
+            compile_commands.sort(key=lambda x: x["file"])
+            SaveFileOnChange(os.path.join(compile_info_dir, "compile_commands.json"),
+                             json.dumps(compile_commands, indent=2), False)
+            SaveFileOnChange(os.path.join(compile_info_dir, "cscope.files"),
+                             "\n".join(sorted(used_files)), False)
+            module_report.sort(key=lambda x: x["Path"])
+            SaveFileOnChange(os.path.join(compile_info_dir, "module_report.json"),
+                             json.dumps(module_report, indent=2), False)
+
+        except Exception:
+            from Common import EdkLogger
+            import traceback, platform, sys
+            EdkLogger.error("BuildReport", 0, "Unknown fatal error when generating compile information",
+                            ExtraData=getattr(self, "ReportFile", None), RaiseError=False)
+            EdkLogger.quiet("(Python %s on %s\n%s)" % (platform.python_version(), sys.platform, traceback.format_exc()))
+
+</code></pre>
+<p><strong>3）在生成报表的入口处挂钩调用（<code>GenerateReport</code> 里追加判断）：</strong><br>
+找到 <code>def GenerateReport(self, BuildDuration, AutoGenTime, MakeTime, GenFdsTime):</code>在它写日志/报表的 try 块开头，加上：<br>
+<img alt="img" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3273121/202508/3273121-20250818145928429-1368279527.png" class="lazyload"></p>
+
+<p><strong>4）在下图所示加入一行：</strong><br>
+<img alt="img" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3273121/202508/3273121-20250818145939608-1457769020.png" class="lazyload"></p>
+
+<h2 id="改动二buildpy给--y-添加-compile_info-选项">改动二：build.py（给 <code>-Y</code> 添加 <code>COMPILE_INFO</code> 选项）</h2>
+<blockquote>
+<p>文件：<code>BaseTools/Source/Python/build/build.py</code></p>
+</blockquote>
+<p>找到命令行解析对 <code>-Y/--report-type</code> 的定义，把允许值里<strong>加入</strong> <code>COMPILE_INFO</code>。</p>
+<pre><code>    Parser.add_option("-Y", "--report-type", action="append", type="choice", choices=['PCD', 'LIBRARY', 'FLASH', 'DEPEX', 'BUILD_FLAGS', 'FIXED_ADDRESS', 'HASH', 'EXECUTION_ORDER', 'COMPILE_INFO'], dest="ReportType", default=[],
+        help="Flags that control the type of build report to generate.  Must be one of: [PCD, LIBRARY, FLASH, DEPEX, BUILD_FLAGS, FIXED_ADDRESS, HASH, EXECUTION_ORDER, COMPILE_INFO].  "\
+</code></pre>
+<h2 id="改动三commondatatypepy">改动三：Common/Datatype.py</h2>
+<blockquote>
+<p>文件：<code>BaseTools/Source/Python/Common/Datatype.py</code></p>
+</blockquote>
+<p>在最后一行加上</p>
+<pre><code>TAB_COMPILER_MSFT = 'MSFT'
+</code></pre>
+<h1 id="使用与验证">使用与验证</h1>
+<h2 id="使用python编译">使用python编译</h2>
+<ol>
+<li><code>edksetup.bat</code>执行后，<code>build -h</code>查看<code>-Y </code> 选项下是否有<code>COMPILE_INFO</code>如果有，说明build使用的是python脚本。</li>
+<li>正常编译，但增加（注意要使用Python2.7编译UDK2018）：<br>
+<code>build -p &lt;YourDsc&gt; -a IA32 -t VS2015x86 -b DEBUG -Y COMPILE_INFO -y BuildReport.log</code> ^a359b1</li>
+<li>在你的 build 产物目录（例如 <code>Build/NT32IA32/DEBUG_VS2015x86/CompileInfo/</code>）应出现：</li>
+</ol>
+<ul>
+<li><code>compile_commands.json</code></li>
+<li><code>cscope.files</code></li>
+<li><code>module_report.json</code></li>
+</ul>
+<p>VS Code（MS 的 C/C++ 插件）设置 <strong>C/C++: Compile Commands</strong> 指向上面的 <code>compile_commands.json</code>。<strong>我推荐使用clangd，因为生成的这个json文件很大，C/C++插件总是索引很慢，知道怎么解决的大佬请留言，感谢！</strong></p>
+<p>安装了Edk2Code插件后，<code>ctrl + shift + p</code> 输入<code>EDK2: rebuild index database</code>，选择你编译后的<code>./EDK2/Build</code>目录，让 Edk2Code正确索引database。官方与社区都推荐用这个流程。</p>
+<p><mark>如果发现<code>build -h</code>的<code>-Y</code>没有<code>COMPILE_INFO</code>，则证明使用的是build.exe编译</mark>，可以将<code>EDK2/BaseTools/Bin/Win32/build.exe</code>重命名为<code>1build.exe</code>，这样EDK2会自动使用python编译。</p>
+<h2 id="使用buildexe编译">使用build.exe编译</h2>
+<p>如果没有环境，无法使用python编译，则麻烦一些，需要将build.py 编译为build.exe。</p>
+<ol>
+<li>python注意版本是2.7.14，另外还需要<mark>安装<code>cx_Freeze-4.2.3.win-amd64-py2.7.msi</code></mark>，这个版本的<code>cx_Freeze</code>不好找，如果需要可以联系我。</li>
+<li>备份一个<code>EDK2/Basetools</code>整个目录</li>
+<li>在<code>EDK2/Basetools/</code> 目录下，进入cmd，运行<code>nmake /f Makefile clean</code>，再运行<code>nmake /f Makefile</code></li>
+<li>将编译好的<code>build.exe</code>以及<code>Genfds.exe</code>替换原来的，这样就可以使用<code>build.exe</code></li>
+<li>按照<a href="#%5Ea359b1" rel="noopener nofollow">从这开始的操作步骤</a>，一步步也可以生成<code>Build/.../CompileInfo</code>整个文件夹。</li>
+</ol>
+<h2 id="点个赞再走"><mark><strong>点个赞再走!!!!!</strong></mark></h2>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-08-18 15:02">2025-08-18 15:01</span>&nbsp;
+<a href="https://www.cnblogs.com/tylerw">Tyler77</a>&nbsp;
+阅读(<span id="post_view_count">71</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19044710);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19044710', targetLink: 'https://www.cnblogs.com/tylerw/p/19044710', title: '【EDK2】在UDK2018中实现兼容Vscode中的Edk2Code插件' })">举报</a>
+</div>
+        
