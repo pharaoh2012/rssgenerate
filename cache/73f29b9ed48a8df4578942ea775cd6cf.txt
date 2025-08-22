@@ -1,0 +1,548 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MarkGuo/p/19053055" title="发布于 2025-08-22 16:32">
+    <span role="heading" aria-level="2">容器云后端存储NFS高可用适配</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="容器云后端存储nfs高可用适配方案">容器云后端存储NFS高可用适配方案</h1>
+<h2 id="1-背景及痛点">1. 背景及痛点</h2>
+<p>​		经规划数据中心生产环境各大生产业务系统将全部迁移至长沙，为提高数据安全性，在存储架构上首先应该保障高可用，并做备份方案！但是容器云KubeGien本身自带的存储方案 NFS，是不具备高可用性的，这受限于NFS本身的单点架构特点，因此准备做此次适配。</p>
+<h2 id="2-方案选型">2. 方案选型</h2>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>数据同步</th>
+<th>VIP 漂移</th>
+<th>DRBD 主备切换</th>
+<th>是否自动故障转移</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>NFS + DRBD + Keepalived</strong></td>
+<td>✅ 自动</td>
+<td>✅ 自动</td>
+<td>❌ 需手动</td>
+<td>❌ 手动干预</td>
+<td>Split-brain 风险低</td>
+</tr>
+<tr>
+<td><strong>NFS + DRBD + Pacemaker/Corosync</strong></td>
+<td>✅ 自动</td>
+<td>✅ 自动</td>
+<td>✅ 自动</td>
+<td>✅ 全自动</td>
+<td>如果没配 STONITH，split-brain 风险高</td>
+</tr>
+<tr>
+<td><strong>分布式存储（CephFS/GlusterFS/XSKY）</strong></td>
+<td>✅ 自动多副本</td>
+<td>✅ VIP/原生访问</td>
+<td>无需切换</td>
+<td>✅ 天生高可用</td>
+<td>成本高，架构复杂</td>
+</tr>
+</tbody>
+</table>
+<p>目前，已经做了XSKY的适配和测试，但是由于内部环境的一些限制，XSKY暂时还不满足现状，所以选用NFS+DRBD+Pacemaker/Corosync的方案，前期为了低风险，防止出现 Split-Brain（脑裂），暂时不启用Pacemaker/Corosync，选用<strong>NFS + DRBD + Keepalived</strong>架构方案。</p>
+<h2 id="3-架构概览">3. 架构概览</h2>
+<h3 id="31-架构原理">3.1 架构原理</h3>
+<ul>
+<li>两台服务器通过 <strong>DRBD</strong> 做 <strong>块级别同步（主从）</strong>，同步模式选 <strong>Protocol C（同步写）</strong>，保证数据写入安全。</li>
+<li>两台机器运行 NFS 服务，只有主节点对外提供 NFS（通过 Keepalived 提供 VIP），主节点挂了时 VIP 漂移到备节点并把 DRBD 切换为主，从而继续提供 NFS。</li>
+<li>Kubernetes 指向 VIP 挂载 NFS（StorageClass / PersistentVolume 的 server 使用 VIP）。</li>
+</ul>
+<p>优点：实现近实时（同步）数据一致性、主节点故障后自动切换；对现有 NFS 工作负载透明。</p>
+<ul>
+<li><strong>Pacemaker/Corosync</strong>： 集群管理软件。负责：
+<ul>
+<li>监控两台服务器的健康状态（心跳）。</li>
+<li>管理一个<strong>虚拟IP（VIP）</strong>，客户端只连接这个IP。</li>
+<li>提升DRBD资源为主（Primary）或降为备（Secondary）。</li>
+<li>挂载DRBD设备（现在是<code>/dev/drbd0</code>）到目录（如<code>/nfs_share</code>）。</li>
+<li>启动和停止NFS服务。</li>
+</ul>
+</li>
+</ul>
+<h3 id="32-数据流向">3.2 数据流向</h3>
+<ol>
+<li>客户端通过 <strong>VIP</strong> 写入数据到 <strong>主节点</strong> 的NFS服务。</li>
+<li>主节点的NFS服务将数据写入它挂载的目录 <code>/nfs_share</code>。</li>
+<li><code>/nfs_share</code> 对应着块设备 <code>/dev/drbd0</code>。</li>
+<li><strong>DRBD</strong> 立即将写入 <code>/dev/drbd0</code> 的块数据，通过网络同步到<strong>备节点</strong>的 <code>/dev/drbd0</code> 设备上。</li>
+<li><strong>至此，数据已经安全地存在了两台服务器的硬盘上。</strong></li>
+</ol>
+<h3 id="33-故障切换failover">3.3 故障切换<strong>（Failover）</strong>：</h3>
+<p>在加入<strong>Pacemaker/Corosync</strong>集群前，采用人工切换方式，大概1-2分钟，具体切换方案这里不再赘述！</p>
+<p>加入<strong>Pacemaker/Corosync</strong>集群后：</p>
+<ul>
+<li>主节点宕机后， Pacemaker 会检测到。</li>
+<li>在备节点上执行以下操作：<br>
+a. 将备节点的 DRBD 设备提升为 <strong>主（Primary）</strong>。<br>
+b. 将 DRBD 设备挂载到 <code>/nfs_share</code>。<br>
+c. 启动 NFS 服务。<br>
+d. 将 <strong>VIP</strong> 绑定到备节点的网卡上。</li>
+<li>客户端重连 VIP，服务恢复。整个过程数据零丢失（因为是同步复制）。</li>
+</ul>
+<h2 id="4-方案落地">4. 方案落地</h2>
+<h3 id="41-环境准备">4.1 环境准备</h3>
+<p>假设我们有两台服务器，保证时钟同步（建议 chrony/ntp）：</p>
+<ul>
+<li><strong>nfs-node1</strong>: 10.62.107.14</li>
+<li><strong>nfs-node2</strong>:  10.62.107.15</li>
+<li><strong>虚拟IP (VIP)</strong>:  10.62.107.16</li>
+<li><strong>共享数据目录</strong>: <code>/nfs_share</code></li>
+<li><strong>DRBD 资源名</strong>: <code>nfs_res</code></li>
+<li><strong>DRBD 使用的磁盘</strong>: 两台服务器上各有一块未使用的磁盘 <code>/dev/sdb</code></li>
+<li>双向网络连通、无防火墙阻挡（drbd 使用 7789、keepalived 使用 VRRP 协议 112；NFS 视版本开放相应端口）</li>
+</ul>
+<h3 id="42-部署安装">4.2 部署安装</h3>
+<p>在两台主机上执行（替换 yum -&gt; dnf 若为 Rocky8/centos8）：</p>
+<pre><code class="language-bash"># 启用 EPEL
+sudo yum install -y epel-release
+
+# 安装 drbd-utils/drbd kernel module 以及 nfs + keepalived
+sudo yum install -y drbd-utils kmod-drbd nfs-utils keepalived   # 如在现有容器云操作nfs已安装则不需要再安装nfs-utils
+
+# 开启并启用必要服务（先手动启动配置）
+sudo systemctl enable --now nfs-server
+sudo systemctl enable --now keepalived
+# drbd module 会随 drbdadm 操作加载
+## 验证
+drbdadm --version
+cat /proc/drbd
+
+
+------------------------------------------------------------------------------------------------------
+# 针对 银河麒麟这样的国产化机器，可能无法加载epel-release，也下载不了drbd-utils 用户态工具，则可以按照下面的方法：
+#1. 一般都内置 DRBD 模块，开启即可
+modprobe drbd
+lsmod | grep drbd
+#2 源码安装drbd-utils 和 kmod-drbd
+# 2.1 安装编译工具
+yum groupinstall -y "Development Tools"
+yum install -y gcc gcc-c++ make automake autoconf libtool flex bison kernel-devel-$(uname -r) kernel-headers-$(uname -r)
+# 2.2 获取源码
+git clone https://github.com/LINBIT/drbd-utils.git
+cd drbd-utils
+./autogen.sh
+./configure --prefix=/usr --localstatedir=/var --sysconfdir=/etc --without-manual
+make
+make install
+
+# DRBD 内核模块如果系统没有，需要从 drbd 仓库编译：
+git clone https://github.com/LINBIT/drbd.git
+cd drbd
+make KDIR=/lib/modules/$(uname -r)/build
+make install
+
+## 验证
+drbdadm --version
+cat /proc/drbd
+
+</code></pre>
+<h3 id="43-配置-drbd-在两台节点上执行">4.3 配置 DRBD (在两台节点上执行)</h3>
+<ol>
+<li>磁盘及分区准备：</li>
+</ol>
+<pre><code class="language-bash"># 清理分区表（谨慎）
+sudo sgdisk --zap-all /dev/sdb
+
+# 创建一个 single partition covering whole disk (example)
+/sbin/parted -s /dev/sdb mklabel gpt mkpart primary 1MiB 100%
+# 使用 /dev/sdb1 作为后端，或直接用 /dev/sdb
+</code></pre>
+<ol start="2">
+<li><strong>创建 DRBD 配置文件 <code>/etc/drbd.d/nfs_res.res</code></strong></li>
+</ol>
+<p>在两台节点上创建 <code>/etc/drbd.d/nfs_res.res</code>（注意：resource name 与 device/hosts）：</p>
+<pre><code class="language-bash">cat &gt; /etc/drbd.d/nfs_res.res &lt;&lt; EOF
+resource nfs_res {
+    protocol C;  # 使用同步协议，确保数据强一致性
+#    startup {
+#        become-primary-on both;
+#    }
+#    disk {
+#        on-io-error detach;
+#    }
+#    net {
+#        cram-hmac-alg "sha1";
+#        shared-secret "my-secret-key"; # 设置一个密钥用于通信验证
+#        after-sb-0pri discard-zero-changes;
+#        after-sb-1pri discard-secondary;
+#        after-sb-2pri disconnect;
+#    }
+    on kubegien-arm-02 {
+        device    /dev/drbd0;
+        disk      /dev/vdb1;
+        address   10.62.107.14:7788;
+        meta-disk internal;
+    }
+    on kubegien-arm-03 {
+        device    /dev/drbd0;
+        disk      /dev/vdb1;
+        address   10.62.107.15:7788;
+        meta-disk internal;
+    }
+}
+
+EOF
+</code></pre>
+<ol start="3">
+<li><strong>初始化并启动 DRBD</strong> （两台主机都执行）</li>
+</ol>
+<pre><code class="language-bash"># 创建资源元数据
+drbdadm create-md nfs_res
+# 启用资源
+drbdadm up nfs_res
+# 在主节点上强制把数据覆盖到备（首次初始化仅在确认主节点数据为准时使用）
+drbdadm -- --overwrite-data-of-peer primary nfs_res
+</code></pre>
+<ol start="4">
+<li><strong>在初始节点（nfs-node1）上强制设置为 Primary</strong></li>
+</ol>
+<pre><code class="language-bash"># 在 nfs-node1 上执行
+drbdadm primary nfs_res --force
+</code></pre>
+<ol start="5">
+<li><strong>查看同步状态</strong></li>
+</ol>
+<pre><code class="language-bash">watch -n 1 'drbdadm status nfs_res'
+# 或
+cat /proc/drbd
+</code></pre>
+<p>等待 <code>status</code> 从 <code>Inconsistent</code> 变为 <code>UpToDate</code>，表示初始同步完成。同步速度取决于磁盘大小和网络速度。</p>
+<blockquote>
+<p>注意: 如果配置使用<strong>Pacemaker/Corosync</strong>集群管理 则不需要执行下面的操作：</p>
+</blockquote>
+<ol start="6">
+<li>创建文件系统并挂载（仅在主节点，已做 overwrite 时）</li>
+</ol>
+<p>在主节点（当前为 PRIMARY）：</p>
+<pre><code class="language-bash"># 等 drbd 同步完成（watch cat /proc/drbd 同步状态）
+sudo mkfs.xfs -f /dev/drbd0          # 或 ext4: mkfs.ext4 /dev/drbd0
+sudo mkdir -p /srv/nfs/share
+sudo mount /dev/drbd0 /srv/nfs/share
+# 可加入 /etc/fstab 持久挂载（use _netdev? 但 DRBD 管理下慎放）
+echo '/dev/drbd0 /srv/nfs/share xfs defaults 0 0' | sudo tee -a /etc/fstab
+</code></pre>
+<ol start="7">
+<li>配置 NFS 导出</li>
+</ol>
+<p>编辑 <code>/etc/exports</code>：</p>
+<pre><code class="language-bash">/srv/nfs/share 10.0.0.0/24(rw,sync,no_subtree_check,no_root_squash)
+</code></pre>
+<p>然后 reload exports：</p>
+<pre><code class="language-bash">sudo exportfs -ra
+sudo systemctl restart nfs-server
+</code></pre>
+<p>确认 NFS 服务监听 VIP 所在接口（但 VIP 还没配置前是当前主机 IP）。</p>
+<ol start="8">
+<li>Keepalived 配置 VIP（高可用 IP 提供）</li>
+</ol>
+<p>在两台机器上分别创建 <code>/etc/keepalived/keepalived.conf</code>，主/备两份配置主要 <code>state</code> 不同，或使用相同并以优先级区分。</p>
+<p>8.1 先写一个检测 NFS 服务是否健康的脚本，比如 <code>/usr/local/bin/check_nfs.sh</code>：</p>
+<pre><code class="language-bash">#!/bin/bash
+# 检查 DRBD + NFS 状态 (CSI NFS 场景)
+# 只有 Primary 且内核 nfsd 线程存在时返回 0
+
+# 1. 检查 DRBD 是否是 Primary
+if ! grep -q 'ro:Primary' /proc/drbd; then
+    exit 1
+fi
+
+# 2. 检查 NFS 内核线程是否存在
+if ! ps -ef | grep -q "[n]fsd"; then
+    exit 1
+fi
+
+# 3. 可选：确认导出目录是否存在
+if ! exportfs -v 2&gt;/dev/null | grep -q '/YuanQiNFS'; then
+    exit 1
+fi
+
+exit 0
+
+</code></pre>
+<p>加权限：</p>
+<pre><code class="language-bash">chmod +x /usr/local/bin/check_nfs.sh
+</code></pre>
+<p>8.2 主节点配置 <code>/etc/keepalived/keepalived.conf</code></p>
+<blockquote>
+<p><strong>重要</strong>：把 <code>interface eth0</code> 改为实际网卡名。<br>
+两台机器的 <code>virtual_router_id</code> 必须一致（如 51），<code>auth_pass</code> 一致。<br>
+<strong>主节点优先级高</strong>（如 150），<strong>备节点低</strong>（如 100）。</p>
+</blockquote>
+<p>示例（nfs-node1 主机，priority 150）：</p>
+<pre><code class="language-yaml">! Configuration for Keepalived (NFS + DRBD)
+
+global_defs {
+    router_id NFS_HA
+}
+
+vrrp_script chk_nfs {
+    script "/usr/local/bin/check_nfs.sh"
+    interval 2
+    weight -20
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_NFS {
+    state MASTER
+    interface eth0              # 替换为实际网卡名
+    virtual_router_id 51
+    priority 150                # 主节点优先级高
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass nfsdrbd
+    }
+    virtual_ipaddress {
+        10.62.107.200/24        # 设置 VIP，必须在 NFS 网络段内
+    }
+    track_script {
+        chk_nfs
+    }
+}
+
+</code></pre>
+<p>8.3 备节点配置 <code>/etc/keepalived/keepalived.conf</code></p>
+<p>在nfs-node2（备）上 <code>state BACKUP</code>，<code>priority 100</code>。<code>virtual_router_id</code> 保持一致。</p>
+<p><code>check_nfs.sh</code> 示例（放 <code>/usr/local/bin/check_nfs.sh</code>，确保可执行）：</p>
+<pre><code class="language-yaml">global_defs {
+    router_id NFS_HA
+}
+
+vrrp_script chk_nfs {
+    script "/usr/local/bin/check_nfs.sh"
+    interval 2
+    weight -20
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_NFS {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 100                # 比主节点低
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass nfsdrbd
+    }
+    virtual_ipaddress {
+        10.62.107.200/24
+    }
+    track_script {
+        chk_nfs
+    }
+}
+
+</code></pre>
+<p>启动 Keepalived：</p>
+<pre><code class="language-bash">systemctl enable --now keepalived
+</code></pre>
+<p>检查 VIP 是否在主机上（<code>ip addr</code>）并能被其他机器 ping 通。</p>
+<pre><code class="language-bash">ip addr show  enp1s0 | grep VIP
+</code></pre>
+<ul>
+<li>
+<p>在主节点应该能看到 VIP <code>10.62.107.200</code></p>
+</li>
+<li>
+<p>停止主节点 <code>systemctl stop nfs-server</code>，VIP 应该漂移到备节点</p>
+</li>
+<li>
+<p>恢复主节点 <code>systemctl start nfs-server</code>，VIP 会回切</p>
+</li>
+</ul>
+<h3 id="44-首次同步与切换验证">4.4 首次同步与切换验证</h3>
+<ol>
+<li>主nfs节点创建测试文件：</li>
+</ol>
+<pre><code class="language-bash">echo "hello from a" | sudo tee /YuanQiNFS/hello_a.txt
+</code></pre>
+<ol start="2">
+<li>
+<p>在备机上查看（在备机如果未挂载 /dev/drbd0 为 Secondary，它 <strong>不能</strong> 直接 mount 为读写。可临时把它切换为 Primary 来检查数据，或使用 <code>drbdadm role</code> 查看状态）。但可以使用 drbd-tools 命令查看同步状态。</p>
+</li>
+<li>
+<p>测试 VIP 漂移：</p>
+</li>
+</ol>
+<ul>
+<li>模拟主节点失败：<code>sudo systemctl stop keepalived nfs-server</code> 或断网。</li>
+<li>备机应接管 VIP：<code>ip addr</code> on nfs-b shows VIP.</li>
+<li>在备机上把 DRBD 升为 PRIMARY（如果自动没有切换）：</li>
+</ul>
+<p><strong>手动操作指南</strong>：</p>
+<hr>
+<pre><code class="language-bash"># 在备机上  手动操作指南：
+sudo drbdadm primary --force nfs_res
+sudo mount /dev/drbd0 /YuanQiNFS    # 备机现在可以挂载并提供 NFS
+sudo systemctl start nfs-server
+</code></pre>
+<blockquote>
+<p>建议通过 Keepalived 的健康脚本在主故障时自动让备机提升为 Primary。但自动提升有风险（可能导致 split-brain）——务必确保网络隔离场景有明确策略。</p>
+</blockquote>
+<h2 id="5-容器云集成">5. 容器云集成</h2>
+<p>Kubernetes 中所有 NFS PersistentVolumes / StorageClass 的 <code>server</code> 字段改为 VIP <code>xxx</code></p>
+<h2 id="6-扩展-----pacemakercorosync-集群管理">6. 扩展---  Pacemaker/Corosync 集群管理</h2>
+<h3 id="配置-pacemakercorosync-集群">配置 Pacemaker/Corosync 集群</h3>
+<ol>
+<li>
+<p><strong>启动并启用 pcsd 服务 (在两台节点上执行)</strong></p>
+<pre><code class="language-bash">systemctl start pcsd
+systemctl enable pcsd
+</code></pre>
+</li>
+<li>
+<p><strong>在其中一个节点上完成集群认证和初始化</strong></p>
+<pre><code class="language-bash"># 1. 先设置集群用户密码 (在两台节点上设置相同的密码)
+echo 'hacluster:your_secure_password' | chpasswd
+
+# 2. 在 nfs-node1 上执行
+pcs cluster auth nfs-node1 nfs-node2 -u hacluster -p 'your_secure_password' --force
+pcs cluster setup --name nfs_cluster nfs-node1 nfs-node2 --force
+pcs cluster start --all
+pcs cluster enable --all
+</code></pre>
+</li>
+<li>
+<p><strong>禁用无关服务并设置集群属性</strong></p>
+<pre><code class="language-bash">pcs property set stonith-enabled=false # 没有STONITH设备先禁用
+pcs property set no-quorum-policy=ignore # 两节点集群需要忽略quorum
+</code></pre>
+</li>
+</ol>
+<h3 id="第四步创建-pacemaker-集群资源">第四步：创建 Pacemaker 集群资源</h3>
+<p><strong>非常重要：以下所有 <code>pcs</code> 命令只需在其中一个节点（如 nfs-node1）上执行一次即可。</strong></p>
+<ol>
+<li>
+<p><strong>创建 DRBD 资源</strong></p>
+<pre><code class="language-bash">pcs resource create drbd_res ocf:linbit:drbd \
+    drbd_resource=nfs_res \
+    op monitor interval=20s \
+    op start timeout=240s \
+    op stop timeout=120s
+</code></pre>
+</li>
+<li>
+<p><strong>创建 DRBD 主从Promotion约束</strong></p>
+<pre><code class="language-bash">pcs resource master drbd_clone drbd_res \
+    master-max=1 master-node-max=1 \
+    clone-max=2 clone-node-max=1 \
+    notify=true
+</code></pre>
+</li>
+<li>
+<p><strong>创建文件系统资源（用于格式化并挂载DRBD设备）</strong></p>
+<pre><code class="language-bash">pcs resource create nfs_fs ocf:heartbeat:Filesystem \
+    device="/dev/drbd0" \
+    directory="/nfs_share" \
+    fstype="ext4" \
+    op monitor interval=20s \
+    op start timeout=60s \
+    op stop timeout=120s
+# 约束：文件系统必须在 DRBD Primary 的节点上启动
+pcs constraint colocation add nfs_fs with drbd_clone INFINITY with-rsc-role=Master
+pcs constraint order promote drbd_clone then start nfs_fs
+</code></pre>
+</li>
+<li>
+<p><strong>创建虚拟IP（VIP）资源</strong></p>
+<pre><code class="language-bash">pcs resource create nfs_vip ocf:heartbeat:IPaddr2 \
+    ip=192.168.1.100 \
+    cidr_netmask=24 \
+    op monitor interval=10s
+# 约束：VIP 必须在文件系统所在的节点上
+pcs constraint colocation add nfs_vip with nfs_fs INFINITY
+pcs constraint order nfs_fs then nfs_vip
+</code></pre>
+</li>
+<li>
+<p><strong>创建NFS服务资源</strong></p>
+<pre><code class="language-bash"># 导出配置（可选，也可手动编辑/etc/exports）
+echo "/nfs_share *(rw,sync,no_root_squash,no_subtree_check)" &gt; /etc/exports
+
+pcs resource create nfs_server systemd:nfs-server \
+    op monitor interval=30s \
+    op start timeout=60s \
+    op stop timeout=120s
+# 约束：NFS服务必须在文件系统和VIP都启动后再启动
+pcs constraint colocation add nfs_server with nfs_vip INFINITY
+pcs constraint order nfs_vip then nfs_server
+</code></pre>
+</li>
+</ol>
+<h3 id="第五步验证和测试">第五步：验证和测试</h3>
+<ol>
+<li>
+<p><strong>检查集群状态</strong></p>
+<pre><code class="language-bash">pcs status
+</code></pre>
+<p>你应该看到所有资源都在一个节点（如 nfs-node1）上正常运行 (<code>Started</code>)。</p>
+</li>
+<li>
+<p><strong>在客户端挂载测试</strong><br>
+在另一台Linux客户端上：</p>
+<pre><code class="language-bash">mount -t nfs 192.168.1.100:/nfs_share /mnt
+cd /mnt
+touch test_file
+ls -l
+</code></pre>
+</li>
+<li>
+<p><strong>模拟故障转移测试 (非常重要!)</strong></p>
+<ul>
+<li>
+<p><strong>方法A：手动切换</strong></p>
+<pre><code class="language-bash">pcs resource move drbd_clone nfs-node2
+# 查看 pcs status，等待所有资源都切换到 nfs-node2 上
+# 在客户端检查文件是否还在，是否可以继续写入
+</code></pre>
+</li>
+<li>
+<p><strong>方法B：暴力测试</strong><br>
+直接在 nfs-node1 上执行 <code>reboot</code> 或 <code>echo c &gt; /proc/sysrq-trigger</code> (触发内核崩溃)。然后观察集群状态，资源应该会自动转移到 nfs-node2 上。</p>
+</li>
+</ul>
+</li>
+</ol>
+<h3 id="故障排除常用命令">故障排除常用命令</h3>
+<ul>
+<li><code>pcs status</code> - 查看集群整体状态</li>
+<li><code>pcs resource debug-start &lt;resource_name&gt;</code> - 尝试手动启动一个资源并输出详细日志</li>
+<li><code>drbdadm status &lt;resource_name&gt;</code> - 查看DRBD状态</li>
+<li><code>journalctl -xe</code> - 查看系统日志</li>
+<li><code>pcs constraint</code> - 查看所有约束</li>
+<li><code>mount | grep drbd</code> - 检查DRBD设备是否已挂载</li>
+</ul>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    本人从事IT行业，目前在企业做私有云，擅长openstack、ceph、k8s、python等技术，欢迎一起学习!
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-08-22 16:32">2025-08-22 16:32</span>&nbsp;
+<a href="https://www.cnblogs.com/MarkGuo">IT人生--MarkGuo</a>&nbsp;
+阅读(<span id="post_view_count">46</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19053055);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19053055', targetLink: 'https://www.cnblogs.com/MarkGuo/p/19053055', title: '容器云后端存储NFS高可用适配' })">举报</a>
+</div>
+        
