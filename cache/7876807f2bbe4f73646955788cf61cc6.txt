@@ -1,0 +1,410 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/decaday/p/19070400/embassy-exti" title="发布于 2025-09-02 17:31">
+    <span role="heading" aria-level="2">从EXTI实现看Embassy: 异步Rust嵌入式框架</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3603177/202509/3603177-20250902172931665-910778270.png" alt="从EXTI实现看Embassy: 异步Rust嵌入式框架" class="desc_img">
+        本文以STM32的EXTI驱动为例，深入解析了异步嵌入式Rust框架Embassy的设计理念与实现。文章探讨了Embassy如何通过精巧的类型系统确保硬件操作的编译时安全，并详细揭示了其基于Future和Waker的异步中断处理机制。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="从exti实现看embassy-异步rust嵌入式框架">从EXTI实现看Embassy: 异步Rust嵌入式框架</h1>
+<p>原文链接：<a href="https://decaday.github.io/blog/embassy-exti/" target="_blank" rel="noopener nofollow">https://decaday.github.io/blog/embassy-exti/</a></p>
+<p>Embassy是一个基于Rust的异步嵌入式开发框架：</p>
+<p><a href="https://embassy.dev/" target="_blank" rel="noopener nofollow">Embassy: The next-generation framework for embedded applications</a></p>
+<p>Embassy不仅包含了异步运行时，还提供了STM32、RP2xxx，NRF等芯片的异步HAL实现、usb、[蓝牙(trouble)](<a href="https://github.com/embassy-rs/trouble/" target="_blank" rel="noopener nofollow">embassy-rs/trouble: A Rust Host BLE stack with a future goal of qualification.</a>)等，乐鑫官方的<a href="https://github.com/esp-rs" target="_blank" rel="noopener nofollow">esp-rs</a>也是将embassy作为默认框架使用。</p>
+<p>最近研究了embassy-stm32的部分实现，写在博客里作为记录吧。Exti最简单也有点Async味，就先写这个吧。</p>
+<p>注意：本文撰写时，Embassy尚未1.0 release，此文可能在您读的时候已经过时。为了博客的清晰，部分代码被简化。</p>
+<h2 id="exti">EXTI</h2>
+<p><strong>EXTI</strong> 是 Extended Interrupts and Events Controller 的缩写，即“扩展中断和事件控制器”。</p>
+<p>它的核心作用可以概括为一句话：让STM32能够响应来自外部（或内部通道）的异步信号，如IO上升沿、IO高电平，并在这些事件发生时触发中断或事件请求，从而执行特定的任务，尤其擅长将MCU从低功耗模式中唤醒。</p>
+<p>embassy-stm32的exti驱动，我们从顶向下看。</p>
+<p>源码链接：<a href="https://github.com/embassy-rs/embassy/blob/1b440342085a0a4f752c795937cc038b41ca1e78/embassy-stm32/src/exti.rs" target="_blank" rel="noopener nofollow">embassy/embassy-stm32/src · embassy-rs/embassy</a></p>
+<p>整个代码的逻辑如下：</p>
+<p><img alt="exti-embassy-sequence" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3603177/202509/3603177-20250902172316192-628277976.png" class="lazyload"></p>
+<h2 id="extiinputd">ExtiInput&lt;'d&gt;</h2>
+<pre><code class="language-rust">/// EXTI input driver.
+///
+/// This driver augments a GPIO `Input` with EXTI functionality. EXTI is not
+/// built into `Input` itself because it needs to take ownership of the corresponding
+/// EXTI channel, which is a limited resource.
+///
+/// Pins PA5, PB5, PC5... all use EXTI channel 5, so you can't use EXTI on, say, PA5 and PC5 at the same time.
+pub struct ExtiInput&lt;'d&gt; {
+  pin: Input&lt;'d&gt;,
+}
+</code></pre>
+<p>这是可被用户直接使用的<code>ExtiInput</code>类型。</p>
+<p>其内部包含了一个Input类型（其实Input类型内部也是包含了一个<code>FlexPin</code>类型）</p>
+<h3 id="构造函数">构造函数</h3>
+<pre><code class="language-rust">impl&lt;'d&gt; ExtiInput&lt;'d&gt; {
+    /// Create an EXTI input.
+    pub fn new&lt;T: GpioPin&gt;(
+        pin: impl Peripheral&lt;P = T&gt; + 'd,
+        ch: impl Peripheral&lt;P = T::ExtiChannel&gt; + 'd,
+        pull: Pull,
+    ) -&gt; Self {
+        into_ref!(pin, ch);
+
+        // Needed if using AnyPin+AnyChannel.
+        assert_eq!(pin.pin(), ch.number());
+
+        Self {
+            pin: Input::new(pin, pull),
+        }
+    }
+    ...
+</code></pre>
+<p>new函数我们主要说一下 <code>impl Peripheral&lt;P = T::ExtiChannel&gt;</code>：</p>
+<ul>
+<li><code>impl Peripheral&lt;...&gt;</code>: 表明 <code>pin</code> 必须是一个实现了 <code>Peripheral</code> trait 的类型。 <code>Peripheral</code> 用来标记硬件外设所有权，来自<a href="https://github.com/embassy-rs/embassy/tree/main/embassy-hal-internal" target="_blank" rel="noopener nofollow">embassy-hal-internal</a>。</li>
+<li><code>&lt;P = T&gt;</code>: 这是一个关联类型约束，意味着这个外设的实体类型就是泛型 <code>T</code>（比如 <code>peripherals::PA4</code>）。</li>
+<li><code>&lt;P = T::ExtiChannel&gt;</code>：<code>T::ExtiChannel</code>是Trait <code>T</code>的关联类型，这个我们将在下面看到。它意味着这个外设的实体类型要与 “与T对应的ExtiChannel” 的类型匹配。</li>
+<li><code>+ 'd</code>: 这是一个生命周期约束，确保传入的外设引用至少和 <code>ExtiInput</code> 实例活得一样长。这在处理外设的可变借用时非常重要。</li>
+</ul>
+<p>这个类型限制是这样的：</p>
+<p><code>T</code>是GpioPin，是某个引脚的类型（比如PA4，PA5，都是单独的类型，都可以是<code>T</code>）</p>
+<p><code>pin</code> 参数要走了 <code>T</code> 的所有权，目的是使得用户无法直接将PA4再用作I2C。其形式通常是单例Singleton，也就是传统rust hal库结构的<code>let p = Peripheral.take()</code> 所获得的外设的所有权（以后可能单独写博客讲单例）。</p>
+<p><code>ch</code> 参数限定了其自身必须是<code>T</code>的关联类型<code>ExtiChannel</code> （<code>P = T::ExtiChannel</code>），我们在下面细说，这要求了channel必须与pin对应，比如PA4必须提供EXTI4。</p>
+<h3 id="类型系统">类型系统</h3>
+<p>EXTI单例（Singleton）类型的定义在<code>_generated.rs</code>（由<code>build.rs</code>生成的）中的<code>embassy_hal_internal::peripherals_definition!</code>宏中。</p>
+<pre><code class="language-rust">// （embassy-stm32/target/thumbv7em-none-eabi/.../out/_generated.rs）
+embassy_hal_internal::peripherals_definition!(
+    ADC1,
+    ...
+    EXTI0,
+    EXTI1,
+    EXTI2,
+    EXTI3,
+    ...
+)
+</code></pre>
+<p>这些外设信息来自芯片的CubeMX数据库。经过<a href="https://github.com/embassy-rs/stm32-data" target="_blank" rel="noopener nofollow">stm32-data</a>和embassy-stm32宏的层层处理，实现了完善的类型限制和不同型号间高度的代码复用。</p>
+<h4 id="channel-trait"><code>Channel</code> Trait</h4>
+<p>Exit的<code>Channel</code> Trait使用了密封（Sealed）Trait，这样可以保证Channel Trait在包外可见，但是不能在外部被实现（因为外部实现privite trait <code>SealedChannel</code> ）</p>
+<pre><code class="language-rust">trait SealedChannel {}
+#[allow(private_bounds)]
+pub trait Channel: SealedChannel + Sized {
+    /// Get the EXTI channel number.
+    fn number(&amp;self) -&gt; u8;
+
+    /// Type-erase (degrade) this channel into an `AnyChannel`.
+    ///
+    /// This converts EXTI channel singletons (`EXTI0`, `EXTI1`, ...), which
+    /// are all different types, into the same type. It is useful for
+    /// creating arrays of channels, or avoiding generics.
+    fn degrade(self) -&gt; AnyChannel {
+        AnyChannel { number: self.number() as u8, }
+    }
+}
+</code></pre>
+<p>在实现上比较简单，embassy-stm32使用宏来简化了代码。</p>
+<pre><code class="language-rust">macro_rules! impl_exti {
+    ($type:ident, $number:expr) =&gt; {
+        impl SealedChannel for peripherals::$type {}
+        impl Channel for peripherals::$type {
+            fn number(&amp;self) -&gt; u8 {
+                $number
+            }
+        }
+    };
+}
+
+impl_exti!(EXTI0, 0);
+impl_exti!(EXTI1, 1);
+impl_exti!(EXTI2, 2);
+impl_exti!(EXTI3, 3);
+// ...
+</code></pre>
+<h4 id="pin-trait"><code>Pin</code> Trait</h4>
+<p><code>Pin</code> Trait同样使用了Sealed Trait。AnyPin部分我们先不研究，我们只看Exti部分：Pin Trait设置了一个关联类型，指向<code>exti::Channel</code> Trait。</p>
+<pre><code class="language-rust">// embassy-stm32/src/gpio.rs
+
+pub trait Pin: Peripheral&lt;P = Self&gt; + Into&lt;AnyPin&gt; + SealedPin + Sized + 'static {
+    /// EXTI channel assigned to this pin. For example, PC4 uses EXTI4.
+    #[cfg(feature = "exti")]
+    type ExtiChannel: crate::exti::Channel;
+
+    
+    #[inline] // Number of the pin within the port (0..31)
+    fn pin(&amp;self) -&gt; u8 { self._pin() }
+
+    #[inline] // Port of the pin
+    fn port(&amp;self) -&gt; u8 { self._port() }
+
+    /// Type-erase (degrade) this pin into an `AnyPin`.
+    ///
+    /// This converts pin singletons (`PA5`, `PB6`, ...), which
+    /// are all different types, into the same type. It is useful for
+    /// creating arrays of pins, or avoiding generics.
+    #[inline]
+    fn degrade(self) -&gt; AnyPin {
+        AnyPin {
+            pin_port: self.pin_port(),
+        }
+    }
+}
+</code></pre>
+<p>在Impl上也是用了大量的codegen和宏，其最终是 <code>foreach_pin</code> 这个宏：(foreach_pin的原型在build.rs生成的<code>_macro.rs</code>内，稍微有点绕，不再详细叙述)</p>
+<pre><code class="language-rust">// （embassy-stm32/src/gpio.rs）
+foreach_pin!(
+    ($pin_name:ident, $port_name:ident, $port_num:expr, $pin_num:expr, $exti_ch:ident) =&gt; {
+        impl Pin for peripherals::$pin_name {
+            #[cfg(feature = "exti")]
+            type ExtiChannel = peripherals::$exti_ch;
+        }
+        impl SealedPin for peripherals::$pin_name { /* ... */} 
+        impl From&lt;peripherals::$pin_name&gt; for AnyPin { /* ... */} 
+    };
+);
+</code></pre>
+<p>其它IO复用也是通过codegen和宏实现的。比如，经过数据处理后，可能生成这样的代码：</p>
+<pre><code class="language-rust">// （_generated.rs）
+impl_adc_pin!(ADC3, PC2, 12u8);
+impl_adc_pin!(ADC3, PC3, 13u8);
+pin_trait_impl!(crate::can::RxPin, CAN1, PA11, 9u8);
+pin_trait_impl!(crate::can::TxPin, CAN1, PA12, 9u8);
+</code></pre>
+<p>这种情况下就限制死了alternate function，从而在编译期就能发现问题，而且通过代码提示就能获知可用的IO而不用翻手册。不得不说，这就是人们希望类型系统所做到的！</p>
+<h3 id="wait_for_high">wait_for_high</h3>
+<pre><code class="language-rust">/// Asynchronously wait until the pin is high.
+///
+/// This returns immediately if the pin is already high.
+pub async fn wait_for_high(&amp;mut self) {
+    let fut = ExtiInputFuture::new(self.pin.pin.pin.pin(), self.pin.pin.pin.port(), true, false);
+    if self.is_high() {
+        return;
+    }
+    fut.await
+}
+...
+/// Asynchronously wait until the pin sees a rising edge.
+///
+/// If the pin is already high, it will wait for it to go low then back high.
+pub async fn wait_for_rising_edge(&amp;mut self) {
+    ExtiInputFuture::new(self.pin.pin.pin.pin(), self.pin.pin.pin.port(), true, false).await
+}
+...
+</code></pre>
+<p>这个self.pin.pin.pin.pin()有够吐槽的。解释起来是这样的： <code>ExtiInput.Input.FlexPin.PeripheralRef&lt;AnyPin&gt;.pin()</code>。</p>
+<p>我们看见的<code>wait_for_high</code>或是<code>wait_for_rising_edge</code>新建了一个<code>ExtiInputFuture</code>，我们来看看：</p>
+<h2 id="extiinputfuturea">ExtiInputFuture&lt;'a&gt;</h2>
+<pre><code>#[must_use = "futures do nothing unless you `.await` or poll them"]
+struct ExtiInputFuture&lt;'a&gt; {
+    pin: u8,
+    phantom: PhantomData&lt;&amp;'a mut AnyPin&gt;,
+}
+</code></pre>
+<p>ExtiInputFuture并不存储外设实例，而只存一个pin_num，这有利于所有权的编写和更加灵活。实际上，STM32也只有16个Channel嘛，我们可以用一些全局标志位。</p>
+<h3 id="new和drop">new和drop</h3>
+<pre><code class="language-rust">    fn new(pin: u8, port: u8, rising: bool, falling: bool) -&gt; Self {
+        critical_section::with(|_| {
+            let pin = pin as usize;
+            exticr_regs().exticr(pin / 4).modify(|w| w.set_exti(pin % 4, port));
+            EXTI.rtsr(0).modify(|w| w.set_line(pin, rising));
+            EXTI.ftsr(0).modify(|w| w.set_line(pin, falling));
+
+            // clear pending bit
+            #[cfg(not(any(exti_c0, exti_g0, exti_u0, exti_l5, exti_u5, exti_h5, exti_h50)))]
+            EXTI.pr(0).write(|w| w.set_line(pin, true));
+            #[cfg(any(exti_c0, exti_g0, exti_u0, exti_l5, exti_u5, exti_h5, exti_h50))]
+            {
+                EXTI.rpr(0).write(|w| w.set_line(pin, true));
+                EXTI.fpr(0).write(|w| w.set_line(pin, true));
+            }
+
+            cpu_regs().imr(0).modify(|w| w.set_line(pin, true));
+        });
+
+        Self {
+            pin,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl&lt;'a&gt; Drop for ExtiInputFuture&lt;'a&gt; {
+    fn drop(&amp;mut self) {
+        critical_section::with(|_| {
+            let pin = self.pin as _;
+            cpu_regs().imr(0).modify(|w| w.set_line(pin, false));
+        });
+    }
+}
+</code></pre>
+<p>new函数使用了一个<a href="https://docs.rs/critical-section/latest/critical_section/" target="_blank" rel="noopener nofollow">critical_section</a>。“<code>critical_section::with</code> 创建了一个<code>临界区</code>。在嵌入式系统中，临界区是一段在执行期间不会被中断打断的代码。对于单核微控制器，最简单的实现方式就是临时禁用所有中断（这也是默认实现）。这确保了在配置 EXTI 寄存器这种需要多个步骤的操作时，不会被一个突如其来的中断打乱，从而保证了操作的原子性。</p>
+<p><code>new</code>函数初始化了选择引脚端口、设置触发边沿等与EXTI相关的寄存器（就不展开细看了），最后一行设置了IMR（Interrupt mask register）寄存器，表示取消屏蔽（Mask）该位，此时该通道可产生中断。</p>
+<p><img alt="image-20241021110821260" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3603177/202509/3603177-20250902172336057-1513327749.png" class="lazyload"></p>
+<h3 id="impl-future-poll">impl Future (poll)</h3>
+<pre><code class="language-rust">const EXTI_COUNT: usize = 16;
+const NEW_AW: AtomicWaker = AtomicWaker::new();
+static EXTI_WAKERS: [AtomicWaker; EXTI_COUNT] = [NEW_AW; EXTI_COUNT];
+...
+...
+impl&lt;'a&gt; Future for ExtiInputFuture&lt;'a&gt; {
+    type Output = ();
+
+    fn poll(self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;Self::Output&gt; {
+        EXTI_WAKERS[self.pin as usize].register(cx.waker());
+
+        let imr = cpu_regs().imr(0).read();
+        if !imr.line(self.pin as _) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+</code></pre>
+<p>在这里我们实现了 <code>Future</code> trait。使得 <code>ExtiInputFuture</code> 可以用于 <code>async</code>/<code>await</code> 机制。</p>
+<p><code>Future</code> trait 代表一个异步计算/运行的结果，可以被执行器（executor）轮询（poll）以检查是否完成。 在 <code>poll</code> 方法中，我们做了以下几件事：</p>
+<ol>
+<li>
+<p><strong>注册 <code>waker</code></strong> ： waker是唤醒器。因为持续的轮询会消耗大量的cpu资源(如果持续poll，那就是<a href="https://docs.rs/nb/1.1.0/nb/" target="_blank" rel="noopener nofollow">nb模式</a>）。所以，一个聪明的executor仅第一次和被<code>waker</code>唤醒后，才会执行一次poll。这里的唤醒者是中断函数。</p>
+<p><code>EXTI_WAKERS</code> 是一个全局的 <code>AtomicWaker</code> 数组，每个 <code>pin</code> 对应一个 <code>AtomicWaker</code>，用于存储 <code>waker</code>。 <code>poll</code> 调用时会将 <code>waker</code> 存入 <code>EXTI_WAKERS[self.pine]</code>，这样当中断发生时，可以使用这个 <code>waker</code> 唤醒 <code>Future</code>。</p>
+</li>
+<li>
+<p><strong>检查中断是否发生</strong>：它通过检查IMR寄存器判断中断是否发生。<strong>因为我们的中断函数(<code>on_irq</code>)在触发后会立刻通过<code>imr(0).modify(|w| w.0 &amp;= !bits)</code>来屏蔽该中断线</strong>。所以，如果在<code>poll</code>时发现IMR位被清零了（即被屏蔽了），就说明在我们<code>await</code>的这段时间里，中断已经来过了。这时就可以返回<code>Poll::Ready</code>了。如果IMR位仍然是1（未屏蔽），则说明中断还没来，返回<code>Poll::Pending</code>继续等待。” 这样就把<code>poll</code>和<code>on_irq</code>的行为联系起来了，逻辑更清晰。</p>
+</li>
+</ol>
+<p>提一下，AtomicWaker这个底层实现在<a href="https://crates.io/crates/embassy-sync" target="_blank" rel="noopener nofollow">embassy-sync</a>中，平台有Atomic的情况下用AtomicPtr实现，没有的话用Mutex实现。</p>
+<h2 id="中断">中断</h2>
+<h3 id="on_irq">on_irq</h3>
+<pre><code class="language-rust">unsafe fn on_irq() {
+    #[cfg(not(any(exti_c0, exti_g0, exti_u0, exti_l5, exti_u5, exti_h5, exti_h50)))]
+    let bits = EXTI.pr(0).read().0;
+    #[cfg(any(exti_c0, exti_g0, exti_u0, exti_l5, exti_u5, exti_h5, exti_h50))]
+    let bits = EXTI.rpr(0).read().0 | EXTI.fpr(0).read().0;
+    // ...
+
+    // Mask all the channels that fired.
+    cpu_regs().imr(0).modify(|w| w.0 &amp;= !bits);
+
+    // Wake the tasks
+    for pin in BitIter(bits) {
+        EXTI_WAKERS[pin as usize].wake();
+    }
+
+    // Clear pending
+    EXTI.pr(0).write_value(Lines(bits));
+    ...
+}
+</code></pre>
+<p><code>on_irq</code> 函数的主要作用是在外部中断发生时，处理触发的 <code>ExtiChannel</code> 并唤醒相应的 <code>Future</code>。</p>
+<ol>
+<li>读取<code>PR</code>（Pending Register）或者 <code>RPR/FPR</code>（Rising/Falling Edge Pending Register）因为多个EXTI线可能共用一个中断向量，所以<code>on_irq</code>首先读取<code>PR</code>来确定具体是哪些线触发了中断。</li>
+<li>通过修改 <code>IMR</code>（Interrupt Mask Register），屏蔽已触发的中断通道，以防止重复触发。</li>
+<li>为了处理多个Channel都触发的情况，Embassy通过 <code>BitIter(bits)</code> 遍历所有触发的 <code>pin</code>，并调用 <code>EXTI_WAKERS[pin as usize].wake()</code> 唤醒相应的 <code>Future</code>。这个<code>BitIter</code>会在下面讲到。</li>
+<li>在 <code>EXTI.pr</code> 或 <code>EXTI.rpr/EXTI.fpr</code> 中清除对应的位，以便后续的中断可以正确触发。</li>
+</ol>
+<h3 id="绑定">绑定</h3>
+<p>Embassy通过一系列宏将EXTI中断绑定到on_irq上。</p>
+<pre><code class="language-rust">macro_rules! foreach_exti_irq {
+    ($action:ident) =&gt; {
+        foreach_interrupt!(
+            (EXTI0)  =&gt; { $action!(EXTI0); };
+            (EXTI1)  =&gt; { $action!(EXTI1); };
+			...
+            // plus the weird ones
+            (EXTI0_1)   =&gt; { $action!( EXTI0_1 ); };
+            (EXTI15_10) =&gt; { $action!(EXTI15_10); };
+			...
+        );
+    };
+}
+
+macro_rules! impl_irq {
+    ($e:ident) =&gt; {
+        #[allow(non_snake_case)]
+        #[cfg(feature = "rt")]
+        #[interrupt]
+        unsafe fn $e() {
+            on_irq()
+        }
+    };
+}
+</code></pre>
+<p>因为EXTI中断比较复杂，有多个外设共用一个中断向量的情况，而且不同的系列共用中断向量的情况还不一样，在exti上难以使用<code>bind_irqs!</code>这样的模式、embassy_stm32的其它外设，以及embassy_rp等hal都是使用的<code>bind_irqs!</code>。这其实是将更多的中断访问权交给了用户。</p>
+<p>但是exti就不行了，想要让hal不占用中断向量，就只能关闭<code>exti</code> feature来关闭整个模块，或者关闭<code>rt</code> feature，自行管理启动和所有中断。</p>
+<h3 id="bititer">BitIter</h3>
+<pre><code class="language-rust">struct BitIter(u32);
+
+impl Iterator for BitIter {
+    type Item = u32;
+
+    fn next(&amp;mut self) -&gt; Option&lt;Self::Item&gt; {
+        match self.0.trailing_zeros() {
+            32 =&gt; None,
+            b =&gt; {
+                self.0 &amp;= !(1 &lt;&lt; b);
+                Some(b)
+            }
+        }
+    }
+}
+</code></pre>
+<p><code>BitIter</code> 是一个简单的位迭代器，用于遍历 <code>bits</code> 中的所有 <code>1</code> 位。</p>
+<p><code>trailing_zeros()</code> 返回最低有效位（LSB）之前 <code>0</code> 的个数。然后<code>self.0 &amp;= !(1 &lt;&lt; b)</code> 清除该位，以便在下一次 <code>next()</code> 调用时继续遍历。</p>
+<p>这种方式确保了 <code>on_irq</code> 处理多个 <code>EXTI</code> 事件时能够逐一唤醒对应的 <code>Future</code>。</p>
+<h2 id="embedded_hal">embedded_hal</h2>
+<p>exti.rs还提供了embedded_hal（略） 和 embedded_hal_async Trait的实现：</p>
+<pre><code class="language-rust">impl&lt;'d&gt; embedded_hal_async::digital::Wait for ExtiInput&lt;'d&gt; {
+    async fn wait_for_high(&amp;mut self) -&gt; Result&lt;(), Self::Error&gt; {
+        self.wait_for_high().await;
+        Ok(())
+    }
+
+    async fn wait_for_low(&amp;mut self) -&gt; Result&lt;(), Self::Error&gt; {
+        self.wait_for_low().await;
+        Ok(())
+    }
+
+    async fn wait_for_rising_edge(&amp;mut self) -&gt; Result&lt;(), Self::Error&gt; {
+        self.wait_for_rising_edge().await;
+        Ok(())
+    }
+
+    async fn wait_for_falling_edge(&amp;mut self) -&gt; Result&lt;(), Self::Error&gt; {
+        self.wait_for_falling_edge().await;
+        Ok(())
+    }
+
+    async fn wait_for_any_edge(&amp;mut self) -&gt; Result&lt;(), Self::Error&gt; {
+        self.wait_for_any_edge().await;
+        Ok(())
+    }
+}
+</code></pre>
+<p>然后我们就可以愉快地使用：</p>
+<p><code>button.wait_for_low().await</code>啦！</p>
+<h1 id="总结">总结</h1>
+<p>这个EXTI模块复杂性比较低，主要用于EXTI最低级也是最常用的用法：等待上升沿、等待高电平等。</p>
+<p>但是由于stm32系列太多，又有很多<code>EXTI15_10</code>这种共用向量情况，embassy-stm32直接接管了所有EXTI中断（对于普通向量则一般使用bind_interrupts的模式），所以如果用户想用EXTI完成更加复杂和即时的操作，就只能关闭<code>exti</code> feature来关闭整个模块，或者关闭<code>rt</code> feature，自行管理启动和所有中断。</p>
+<p>Embassy HAL设计了一套优秀的类型系统和HAL范式，为社区提供了学习榜样。其类型系统一部分在<a href="https://github.com/embassy-rs/embassy/tree/main/embassy-hal-internal" target="_blank" rel="noopener nofollow">embassy-hal-internal</a>中完成，一部分在HAL内部完成。通过这套类型系统和约束，我们可以避免很多恼人的错误，也能很大程度上简化代码（比如，永远不会设置错、忘设置IO AF，也不用再去查AF表）。</p>
+<p><a href="https://github.com/embassy-rs/embassy/tree/main/embassy-stm32" target="_blank" rel="noopener nofollow">embassy-stm32</a> 的创新主要是其codegen和metapac：使用了复杂的数据预处理和codegen实现了对stm32外设的包罗万象。<a href="https://github.com/embassy-rs/stm32-data" target="_blank" rel="noopener nofollow">stm32-data</a> 通过来自CubeMX等的数据，生成带有元数据的PAC：stm32-metapac，避免了像<a href="https://github.com/stm32-rs" target="_blank" rel="noopener nofollow">stm32-rs</a> 一样的重复和分散、不统一的代码。</p>
+<p>当然，包罗万象是有代价的。我们日后可以详细聊聊。</p>
+<p>在Embassy范式的影响下，我编写和维护了<a href="https://github.com/py32-rs/py32-hal" target="_blank" rel="noopener nofollow">py32-hal</a> 和 <a href="https://github.com/OpenSiFli/sifli-rs" target="_blank" rel="noopener nofollow">sifli-rs</a> ，包含了对embassy大量的直接 <s>Copy</s> 借鉴，这两套hal分别针对Puya的低成本MCU如PY32F002和SiFli的M33蓝牙MCU SF32LB52。了解一下？</p>
+<p>原文链接：<a href="https://decaday.github.io/blog/embassy-exti/" target="_blank" rel="noopener nofollow">https://decaday.github.io/blog/embassy-exti/</a></p>
+<p>我的github: <a href="https://github.com/decaday" target="_blank" rel="noopener nofollow">https://github.com/decaday</a></p>
+<p><strong>本文以<a href="https://creativecommons.org/licenses/by-nc/4.0/" target="_blank" rel="noopener nofollow">CC-BY-NC</a>许可发布，当您转载该文章时，需要保留署名，且不能用于商业用途。特别地，不能转载到C**N平台。</strong></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-09-02 17:32">2025-09-02 17:31</span>&nbsp;
+<a href="https://www.cnblogs.com/decaday">decaday</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19070400);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19070400', targetLink: 'https://www.cnblogs.com/decaday/p/19070400/embassy-exti', title: '从EXTI实现看Embassy: 异步Rust嵌入式框架' })">举报</a>
+</div>
+        
