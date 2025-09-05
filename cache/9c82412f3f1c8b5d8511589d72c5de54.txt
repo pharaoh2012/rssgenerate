@@ -1,0 +1,188 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/huangxincheng/p/19075037" title="发布于 2025-09-05 11:01">
+    <span role="heading" aria-level="2">聊一聊 .NET 中的 CancellationTokenSource</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一背景">一：背景</h2>
+<h3 id="1-讲故事">1. 讲故事</h3>
+<p>在<code>.NET高级调试</code>中，我们需要知道很多的<code>C#</code>底层细节，如果搞不清这些底层细节，那与之相关的故障可能就搞不定，所以调试这个东西需要我们有一个比较广的知识面，痛苦哈，比如这篇跟大家聊到的 CancellationTokenSource 。</p>
+<h2 id="二cancellationtokensource-分析">二：CancellationTokenSource 分析</h2>
+<h3 id="1-一个简单的案例">1. 一个简单的案例</h3>
+<p>在<code>.NET SDK</code>框架代码中有大量的 CancellationTokenSource 应用，也是被遗弃的<code>Thread.Abort</code>的替代品，为了方便讲述，先写一段简单的代码，通过CancelAfter 让执行流在 2s 后实现中断，参考代码如下：</p>
+<pre><code class="language-C#">
+    static void Main()
+    {
+        var cts = new CancellationTokenSource();
+
+        // 注册取消回调
+        cts.Token.Register(() =&gt; { Console.WriteLine("1. 取消回调被执行..."); });
+        cts.Token.Register(() =&gt; Console.WriteLine("2. 取消回调被执行..."));
+
+        cts.CancelAfter(2000); // 2秒后自动取消
+        Console.WriteLine("任务开始，2秒后自动取消...");
+
+        try
+        {
+            for (int i = 0; i &lt; 10; i++)
+            {
+                cts.Token.ThrowIfCancellationRequested();
+                Console.WriteLine($"处理 {i}");
+                Thread.Sleep(500);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("任务被取消！");
+        }
+
+        Console.ReadKey();
+    }
+
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202509/214741-20250905110117268-836838602.png" alt="" loading="lazy"></p>
+<p>代码看起来好像是这么一回事，但很少人知道 <code>Register</code>,<code>CancelAfter</code> 底层到底都发生了什么？这也是本篇需要探索的东西，为了能够让大家手握地图，我花了点时间看了下代码画了如下的架构图，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202509/214741-20250905110117297-1064079978.png" alt="" loading="lazy"></p>
+<h3 id="2-tokenregister-底层发生了什么">2. Token.Register 底层发生了什么</h3>
+<p>根据地图描述，每一个 Register 函数都被封装成一个 CallbackNode 节点，并最终构建出一个 <code>双向链表</code>，这个链表的头节点会记录到 <code>Registrations.Callbacks</code> 字段上，简化后的代码如下：</p>
+<pre><code class="language-C#">
+internal CancellationTokenRegistration Register(Delegate callback, object stateForCallback, SynchronizationContext syncContext, ExecutionContext executionContext)
+{
+    if (!this.IsCancellationRequested)
+    {
+        long id = 0L;
+        if (callbackNode == null)
+        {
+            callbackNode = new CancellationTokenSource.CallbackNode(registrations);
+            callbackNode.Callback = callback;
+            callbackNode.CallbackState = stateForCallback;
+            callbackNode.ExecutionContext = executionContext;
+            callbackNode.SynchronizationContext = syncContext;
+            registrations.EnterLock();
+            try
+            {
+                CancellationTokenSource.CallbackNode callbackNode3 = callbackNode;
+                CancellationTokenSource.Registrations registrations3 = registrations;
+                long nextAvailableId = registrations3.NextAvailableId;
+                registrations3.NextAvailableId = nextAvailableId + 1L;
+                id = (callbackNode3.Id = nextAvailableId);
+                callbackNode.Next = registrations.Callbacks;
+                if (callbackNode.Next != null)
+                {
+                    callbackNode.Next.Prev = callbackNode;
+                }
+                registrations.Callbacks = callbackNode;
+            }
+            finally
+            {
+                registrations.ExitLock();
+            }
+        }
+}
+
+</code></pre>
+<p>接下来就是如何眼见为实？可以使用 dnspy 来调试，在 <code>registrations.ExitLock();</code> 处下一个断点，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202509/214741-20250905110117312-958438504.png" alt="" loading="lazy"></p>
+<p>从卦中可以看到如下信息：</p>
+<ol>
+<li>从 <code>callbackNode.id</code>来看，这个链表采用头插法，即注册的Register是<code>后进先出</code>。</li>
+<li>CallbackState 存放着我们自定义的回调。</li>
+<li>NextAvailableId 记录着接下来需要分配的 <code>callbackNode.id</code> 。</li>
+</ol>
+<p>链表构建好之后，接下来就是如何调用了。</p>
+<h3 id="3-ctscancelafter-底层发生了什么">3. cts.CancelAfter 底层发生了什么</h3>
+<p>可以使用 dnspy 调试源代码，观察下如何实现 2s 后自动触发取消操作，简化后核心代码如下：</p>
+<pre><code class="language-C#">
+private void CancelAfter(uint millisecondsDelay)
+{
+    ITimer timer = this._timer;
+    if (timer == null)
+    {
+        timer = new TimerQueueTimer(CancellationTokenSource.s_timerCallback, this, uint.MaxValue, uint.MaxValue, false);
+    }
+    timer.Change((millisecondsDelay == uint.MaxValue) ? Timeout.InfiniteTimeSpan : TimeSpan.FromMilliseconds(millisecondsDelay), Timeout.InfiniteTimeSpan);
+}
+
+private static readonly TimerCallback s_timerCallback = delegate (object obj)
+{
+    ((CancellationTokenSource)obj).NotifyCancellation(throwOnFirstException: false);
+};
+
+</code></pre>
+<p>从卦中可以看到，所谓的 <code>CancelAfter(2000)</code> 是用Timer定时器来实现的，时间一到自会执行 <code>s_timerCallback</code> 回调函数。</p>
+<p>接下来继续研究下内部的 NotifyCancellation 方法，根据前面的分析应该就是把 <code>Registrations.Callbacks</code> 中的节点全部提取出来，简化后的核心代码如下：</p>
+<pre><code class="language-C#">
+private void ExecuteCallbackHandlers(bool throwOnFirstException)
+{
+    registrations.ThreadIDExecutingCallbacks = Environment.CurrentManagedThreadId;
+
+    for (; ; )
+    {
+        registrations.EnterLock();
+        CancellationTokenSource.CallbackNode callbacks;
+        try
+        {
+            callbacks = registrations.Callbacks;
+            if (callbacks == null)
+            {
+                break;
+            }
+            if (callbacks.Next != null)
+            {
+                callbacks.Next.Prev = null;
+            }
+            registrations.Callbacks = callbacks.Next;
+            registrations.ExecutingCallbackId = callbacks.Id;
+            callbacks.Id = 0L;
+        }
+        finally
+        {
+            registrations.ExitLock();
+        }
+
+        callbacks.ExecuteCallback();
+    }
+}
+
+public void ExecuteCallback()
+{
+    ExecutionContext.RunInternal(executionContext, delegate (object s)
+    {
+        CancellationTokenSource.CallbackNode callbackNode = (CancellationTokenSource.CallbackNode)s;
+        CancellationTokenSource.Invoke(callbackNode.Callback, callbackNode.CallbackState, callbackNode.Registrations.Source);
+    }, this);
+}
+
+</code></pre>
+<p>从卦中代码可以提取到如下几点信息。</p>
+<ol>
+<li>ThreadIDExecutingCallbacks 这是一个很好的统计字段，记录着当前谁正在执行 Cancel 方法。</li>
+<li>ExecutingCallbackId  同样一个很好的统计字段，记录着从链表 registrations.Callbacks 中已提取出来的 Node 信息。</li>
+<li>for 循环一次性的提取 registrations.Callbacks 中的所有节点。</li>
+</ol>
+<p>最后我们用 dnspy 在 <code>callbacks.ExecuteCallback()</code> 函数末尾处下一个断点，截图如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/214741/202509/214741-20250905110117280-723941173.png" alt="" loading="lazy"></p>
+<p>从卦中可以看到，Callbacks已被清空，最后一个函数节点是 <code>CallbackNode.id=1</code> ，并且执行这个 Cancel() 方法的线程是<code>5号</code>线程。</p>
+<h2 id="三总结">三：总结</h2>
+<p>如今越来越多的底层方法加上了 CancellationTokenSource 取消机制以及 CompositeChangeToken，一旦开发者使用不当导致底层产生了卡死，死锁等一系列问题时，对我们调试者来说真的是亚历山大。</p>
+<img src="https://images.cnblogs.com/cnblogs_com/huangxincheng/345039/o_210929020104最新消息优惠促销公众号关注二维码.jpg" width="700" height="300" alt="图片名称" align="center">
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-09-05 11:02">2025-09-05 11:01</span>&nbsp;
+<a href="https://www.cnblogs.com/huangxincheng">一线码农</a>&nbsp;
+阅读(<span id="post_view_count">68</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19075037);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19075037', targetLink: 'https://www.cnblogs.com/huangxincheng/p/19075037', title: '聊一聊 .NET 中的 CancellationTokenSource' })">举报</a>
+</div>
+        
