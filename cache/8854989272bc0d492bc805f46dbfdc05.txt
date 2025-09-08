@@ -1,0 +1,349 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/gogoSandy/p/19079039" title="发布于 2025-09-08 07:42">
+    <span role="heading" aria-level="2">解密prompt系列60. Agent实战：从0搭建Jupter数据分析智能体</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/1326688/202509/1326688-20250908074115464-911536554.png" alt="解密prompt系列60. Agent实战：从0搭建Jupter数据分析智能体" class="desc_img">
+        本文将带你从零搭建一个数据分析智能体，实现用户上传Excel并给出指令后，智能体能够深入分析数据、进行可视化，并以Jupyter Notebook形式返回结果。我们将重点讨论以下核心要点：智能体设计模式、Context Engineering、复杂任务Prompt设计
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>本文将带你从零搭建一个数据分析智能体，实现用户上传Excel并给出指令后，智能体能够深入分析数据、进行可视化，并以Jupyter Notebook形式返回结果。我们将重点讨论以下核心要点：</p>
+<ul>
+<li>智能体设计模式：为何全自动React模式可行但并非最优解</li>
+<li>Context Engineering：如何通过上下文管理思路优化效果</li>
+<li>复杂任务Prompt设计：Meta Prompt + 领域最佳实践的高效组合</li>
+</ul>
+<p>完整Agent代码详见<a href="https://github.com/DSXiangLi/DAAgent" target="_blank" rel="noopener nofollow">DAAgent</a></p>
+<h2 id="智能体设计">智能体设计</h2>
+<p>数据分析智能体本质上是具备编码能力、能够使用编程工具的智能体。考虑到单次编码可能不完善，需要多轮迭代调试优化，最简单的实现方式是采用React策略，让模型不断编写和优化代码。</p>
+<p>但线性React模式很快会遇到两个关键问题：</p>
+<ul>
+<li><strong>模型上文很快耗尽</strong>：coding是很费token的，尤其traceback更是长的离谱，所以很快就报token limit了</li>
+<li><strong>线性模式存在推理惯性</strong>：同样因为上文太长，模型在修复问题时会让分析也限于局部优化，整个数据分析会简单，广度和深度都不足</li>
+</ul>
+<p>为解决以上<strong>线性REACT</strong>的问题，我们加入Plan模块，先对问题进行拆解，再让REACT去解决每个局部问题，只要<strong>子问题足够聚焦</strong>，以上两个问题就都能规避。</p>
+<p>于是我们第一版Data Agent的设计思路就有了，包含以下3个模块</p>
+<ul>
+<li>Planner：将数据分析任务拆解为多个串联步骤</li>
+<li>Publisher：遍历Plan生成的步骤，分发给Coder执行</li>
+<li>coder：基于当前步骤生成代码，通过多轮循环优化直至执行成功</li>
+</ul>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1326688/202509/1326688-20250908074012936-1749990558.png" class="lazyload"></p>
+<p>下面我们依次说下这三个模块，和中间涉及到的context engineering，meta prompting，MCP使用的一些问题和细节。</p>
+<h2 id="planner">Planner</h2>
+<p>Planner采用结构化推理，输出以下Plan结构体。我们使用一次性规划模式，输入仅包含文件预览和用户查询，不基于后续编码反馈调整规划（简单架构能避免许多复杂问题）。</p>
+<pre><code class="language-python">class Plan(BaseModel):
+    reasoning: str = Field(description='step by step的分析')
+    task: str = Field(description='分析任务名称')
+    steps: List[str] = Field(description='拆解的分析步骤')
+
+class Status(str, Enum):
+    waiting = 'WAITING'
+    finish = 'FINISH'
+    fail = 'FAIL'
+    in_progress = 'IN-PROGRESS'
+
+
+class StepStatus(TypedDict):
+    description: str
+    observation: str
+    status: Status
+async def plan(state: CodeState, config: RunnableConfig, writer: StreamWriter):
+    """
+    创建数据分析计划
+    """
+    configurable = Configuration.from_runnable_config(config)
+    llm = ChatDeepSeek(
+        api_key=os.environ['LLM_APIKEY'],
+        api_base=os.environ['LLM_URL'],
+        model=configurable.plan_model
+    )
+
+    prompt = get_prompt_template(name="plan", input_vars={"table": state['data'].head(10).to_markdown()})
+
+    messages = [{"role": "system", "content": prompt},
+                {"role": "user", "content": state["query"]}]
+
+    output = llm.with_structured_output(Plan, method='json_mode').invoke(messages)
+    writer(f'创建数据分析计划：{output.task}\n' + '\n'.join(output.steps))
+    steps = [StepStatus(description=i, observation='', status=Status.waiting) for i in output.steps]
+
+    return {"task": output.task, "steps": steps}
+</code></pre>
+<p>Plan的System Prompt，我使用了Meta-prompting配合模型梳理的数据分析（EDA）的最佳实践指南来生成。前面在<a href="https://cloud.tencent.com/developer/article/2541926" target="_blank" rel="noopener nofollow">Agent Context Engineering - 多智能体代码剖析</a>我们有提过meta-prompting，今天再增加一个就是<strong>领域最佳实践</strong>概念。</p>
+<p>标准化任务如编码、写作都可以用MetaPrompt自动补充任务细节，但这样生成的Prompt往往普通，因为它只是随机采样的一条可行路径而非最优路径。</p>
+<p>这时就有两种简单的优化思路：</p>
+<ul>
+<li><strong>前置引入专家经验</strong>：基于该领域专家经验抽象成最佳实践</li>
+<li><strong>后置不断总结经验</strong>：基于测试集运行的结果进行常见问题的抽象并优化prompt（并不推荐人工总结，因为human prior!=machine prior）</li>
+</ul>
+<p>这里我们采用方案1，直接用DeepSeek联网总结Kaagle GrandMaster在数据EDA上的专家经验和流程再输入Meta Prompt就得到了以下system Prompt</p>
+<pre><code class="language-markdown">作为Google的顶尖数据分析和可视化专家，请严格按以下数据分析步骤和分析要点处理用户提交的Excel表格和分析要求,并按照输出格式直接输出JSON
+
+## Excel表格
+
+{{table}}
+
+## 当前时间
+
+{{current_date}}
+
+## 数据分析步骤
+
+1. 数据初窥与质量评估
+   **目标**：了解数据原始面貌和基本健康状况
+   - 查看数据形状、类型和基本统计信息
+   - 识别缺失值和重复值
+   - 理解字段业务含义
+
+2. 数据清洗与预处理
+   **目标**：解决数据质量问题，准备干净数据
+   - 按策略处理缺失值（删除/填充/标记）
+   - 识别并合理处理异常值（不盲目删除）
+   - 统一数据格式和类别命名
+
+3. 单变量分析
+   **目标**：深入理解每个变量的分布特征
+   - 数值变量：分析分布、偏度和峰度
+   - 分类变量：检查频次和类别平衡
+   - 记录需要进行的转换（如对数变换）
+
+4. 多变量分析与可视化
+   **目标**：探索变量间关系，发现数据模式
+   - 数值vs数值：散点图+相关矩阵
+   - 分类vs数值：小提琴图/箱线图
+   - 分类vs分类：堆叠条形图+卡方检验
+   - 时间序列：折线图+滚动统计量
+
+5. 简单建模辅助分析
+   **目标**：用量化方法验证分析发现
+   - 线性回归：关注系数而非R²
+   - 决策树/随机森林：分析特征重要性
+   - 所有分析以理解关系为目的，而非预测精度
+
+6. 报告生成
+   **输出**：包含数据质量报告、关键发现、可视化图表和建议的数据分析报告
+
+## 数据分析要点
+
+1. **需求解析**
+    - 明确用户核心分析目标及潜在需求
+    - 判断需加强分析的隐藏维度（如数据对比/聚合维度）
+2. **方案设计**
+    - 基于目标定制分析路径（描述性/预测性/诊断性分析）
+    - 按优先级匹配可视化方案（如动态仪表盘&gt;静态图表）
+3. **反向工程验证**
+    - 论证每个分析步骤如何解决核心需求
+    - 确认可视化类型与数据特性的适配性
+
+## 关键要求
+
+- ❗ 推理(reasoning)必须包含：数据特征发现 → 需求拆解 → 方案推导的完整逻辑链
+- ✖️ 禁止在reasoning出现结论性语句（结论仅出现在steps中）
+- 使用方括号标注示例中的动态参数（如 [指标名]）
+- JSON键名严格保持原文格式，不添加注释或额外字段
+- steps需包含具体技术实现（如："使用PCA降维后生成3D散点图"）
+- 若原始需求模糊，需在reasoning中反推合理分析路径
+- 无需输出```json```，直接输出JSON
+
+## 输出格式
+
+{
+"reasoning": "分步数据观察和需求解析过程（先分析后结论）",
+"task": "≤15字分析任务标题",
+"steps": [
+    "步骤1: [如: 观测表格数据并检查数据质量]",
+    "步骤2: [如: 进行数据清洗和必要字段归一化处理]",
+]
+}
+</code></pre>
+<p>以下就是结构化推理得到的数据分析任务和8个串联的执行步骤</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1326688/202509/1326688-20250908074012931-2128699887.png" class="lazyload"></p>
+<blockquote>
+<p>个人还是比较倾向于直接使用官方API，而非langchian包装的各种structure output，bind tools啥的llm推理接口，因为langchain增加了报错排查的难度以及问题隐藏的深度。有个梗就是开发越快的工具debug越慢~</p>
+</blockquote>
+<h2 id="publisher">Publisher</h2>
+<p>生成分析任务后就会进入任务分发节点，这个节点不做模型推理，只做任务状态管理和分发，属于中转节点。coding每完成一个step任务，会重新回到publisher，修改任务状态，再进入新的一轮任务执行，如下</p>
+<pre><code class="language-python">async def publisher(state: CodeState, writer: StreamWriter) -&gt; Command[Literal["__end__", "coding"]]:
+    """
+    分发数据分析任务，判断任务完成状态
+    """
+    steps = state['steps']
+    # 每次进入都尝试获取最新的ipynb
+    tools = await mcp_client.get_tools()
+    stop_tool = [i for i in tools if i.name == 'close_sandbox'][0]
+    # 所有任务都执行则判断完成
+    if all([i['status'] != Status.waiting for i in steps]):
+        writer('所有步骤执行完毕！')
+        return Command(goto='__end__')
+
+    # 找到下一个待执行的任务,清空历史code message和observations并开始执行
+    for step in steps:
+        if step['status'] == Status.waiting:
+            step['status'] = Status.in_progress
+            writer(f'执行步骤-{step["description"]}')
+            break
+
+    return Command(goto='coding', update={"steps": steps,
+                                          # 清空step内传递信息
+                                          "code_messages": ["CLEAR"],
+                                          "step_observations": ["CLEAR"],
+                                          "step_observations_clean": ["CLEAR"],
+                                          "code_round": 0,
+                                          # 多步step信息累计
+                                          "observations": state["step_observations_clean"]})
+
+</code></pre>
+<p>这里用到<strong>Context Engineer-过滤大法</strong>，从任务分发上可以看出，也就是多个Step的coding任务之间，<strong>不传递code message，只传递过滤Error的bservation，可以大大减少上文Token量级</strong>。那要如何设计coding任务才能之基于观测进行串行任务编程呢？咱接着往后聊~</p>
+<h3 id="coding">Coding</h3>
+<p>Coding是最核心的任务。虽然Plan的任务分解通过降低子任务复杂度来减少Step内部的上下文长度，但我们仍需处理多编码步骤间的信息传递问题。这里选择了内外层消息隔离的模式</p>
+<ul>
+<li>内层（单个Step内）：消息线性增长，每一步向后传递code + execution result。同时通过指令让模型<strong>print所有代码执行过程中的必要观测，并对所有数据分析的中间结果进行持久化存储</strong></li>
+<li>外层（多个step之间）：因为观测和中间结果都在Studout中直观显示，所以多步之间只需传递过滤Error的Execution Result，后面章节我们再考虑引入更多压缩和反思极值进一步提升信息密度，来应对更复杂的问题。</li>
+</ul>
+<p>以下是关于持久化和stdout输出的相关指令，完整指令详见<a href="https://github.com/DSXiangLi/DAAgent" target="_blank" rel="noopener nofollow">DAAgent</a></p>
+<pre><code class="language-markdown">3. **数据流规范**：禁止使用全局变量传递数据，使用持久化文件进行信息传递，例如
+   | 步骤类型 | 输入文件          | 输出文件格式要求         |
+   |----------|-------------------|------------------------|
+   | 数据加载 | raw_data.csv      | /                      |
+   | 中间处理 | [上一步].csv      | 带时间戳的CSV/JSON文件 |
+   | 可视化   | processed_data/* | 600dpi PNG（带图例）   |
+4. **分析结果和观测显性化**：print所有结果
+   | 步骤类型 | print       | 
+   |----------|-------------------|
+   | 文件输出 | 🗂️数据已保存到...     | 
+   | 数据统计 | 📊 数据基本统计...     | 
+   | 可视化 | 📈绘制关键指标...|
+   | 核心发现|🎯 数据核心发现...|
+</code></pre>
+<p>以上指令的效果如下<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1326688/202509/1326688-20250908074013007-563923107.png" class="lazyload"></p>
+<p>整个Coding节点的配置比较简单，就是线性的REACT，当然也可以直接用langgraph prebuild react来实现，但个人不太喜欢用high level的封装哈哈感觉看懂别人代码的复杂度&gt;&gt;自己写，毕竟人人都有小巧思哈哈哈~（笔者也不推荐不知其所以然就直接无脑使用）</p>
+<pre><code class="language-python">async def coding(state: CodeState, config: RunnableConfig, writer: StreamWriter) -&gt; Command[
+    Literal["publisher", "coding"]]:
+    """模型写代码:进入write + execute循环模式"""
+    configurable = Configuration.from_runnable_config(config)
+    # 超过单轮最大coding次数则判断为失败退出
+    if configurable.max_code_loops &lt; state["code_round"]:
+        writer('超过单step最大执行次数退出')
+        for step in state["steps"]:
+            if step['status'] == Status.in_progress:
+                step['status'] = Status.fail
+        return Command(goto='publisher', update={"steps": state['steps']})
+    prompt = get_prompt_template('code', input_vars={'steps': state['steps'],
+                                                     "observations": state['observations']})
+    llm = ChatDeepSeek(
+        api_key=os.environ['LLM_APIKEY'],
+        api_base=os.environ['LLM_URL'],
+        model=configurable.code_model
+    )
+    if not state["code_messages"]:
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "请开始数据分析"}
+        ]
+    else:
+        messages = state["code_messages"]
+    tools = await mcp_client.get_tools()
+    code_tool = [i for i in tools if i.name == 'execute_code'][0]
+    message = await llm.bind_tools([code_tool, task_finish], tool_choice='required', strict=True).ainvoke(messages)
+    writer(f'Thinking: {message.content}')
+    if len(message.tool_calls) &gt; 0:
+        for tool_call in message.tool_calls:
+            if tool_call.get("name", "") not in ["execute_code", "task_finish"]:
+                # 出现模型推理错误判断为失败返回Publisher，也可以增加重试，这种情况发生暂时为发生过
+                writer('模型调用工具异常，出现非定义工具调用退出当前Step')
+                steps = state["steps"]
+                for step in steps:
+                    if step['status'] == Status.in_progress:
+                        step['status'] = Status.fail
+                        writer(f"{step['description']} failed execution")
+                        break
+                return Command(goto='publisher', update={"steps": state['steps']})
+            elif tool_call.get("name") == 'execute_code':
+                writer('Execute Code Tool calling')
+                code = tool_call.get("args", {"code": ""})["code"]
+                writer(f'Code:\n{code}')
+
+                execution = await code_tool.ainvoke(tool_call.get("args", {}))
+                observation = execution_to_llm(execution)
+                print(f"Execution\n:{observation}")
+
+                observation_without_error = execution_to_llm(execution, exclude_error=True)
+                # TODO：因为存在工具调用失败，因此这里使用user而非ToolMessage
+                if state["code_round"] == 0:
+                    messages += [AIMessage(content=message.content, tool_calls=[tool_call]),
+                                 ToolMessage(content=observation, tool_call_id=tool_call.get("id"))]
+                else:
+                    messages = [AIMessage(content=message.content, tool_calls=[tool_call]),
+                                ToolMessage(content=observation, tool_call_id=tool_call.get("id"))]
+                return Command(goto='coding',
+                               update={
+                                   "code_round": state["code_round"] + 1,
+                                   "code_messages": messages,
+                                   "step_observations": [observation],
+                                   "step_observations_clean": [observation_without_error]  # 覆盖式写入
+                               })
+            else:
+                writer('Finish Task Tool calling')
+                steps = state["steps"]
+                for step in steps:
+                    if step['status'] == Status.in_progress:
+                        step['status'] = Status.finish
+                        writer(f"{step['description']} finish execution")
+                        break
+                return Command(goto='publisher', update={"steps": state['steps']})
+    else:
+        writer('模型调用工具异常出现无工具调用情形，退出当前Step')
+        steps = state["steps"]
+        for step in steps:
+            if step['status'] == Status.in_progress:
+                step['status'] = Status.fail
+                writer(f"{step['description']} failed execution")
+                break
+        return Command(goto='publisher', update={"steps": state['steps']})
+</code></pre>
+<p>最终呈现出来的效果就是下面这样了,这里我用了字节刚发布的wide search数据集<a href="https://hf-mirror.com/datasets/ByteDance-Seed/WideSearch?viewer_api=true" target="_blank" rel="noopener nofollow">ByteDance-Seed/WideSearch</a></p>
+<p><img alt="DAAgent (1)" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1326688/202509/1326688-20250908074047925-321006261.gif" class="lazyload"></p>
+<h3 id="踩过的坑">踩过的坑</h3>
+<p>这里再分享几个踩过的小坑</p>
+<ol>
+<li><strong>Stdio适合无状态工具</strong></li>
+</ol>
+<p>之前对stdio和http这两种mcp通信只理解到，一个是本地启动一个是远程服务，本地更快能保证数据安全。而另一个差异在于<strong>stdio无状态</strong>。因为stdio本质其实就是spawn的一个子进程，整个生命周期由客户端启动和链接，所以工具调用完毕进程就会关闭，自然也就无法在多次调用之间共享状态。当然你可以用一些外部存储来记录状态，但本质上stdio更适合在客户端来管理状态。因此考虑到我是在服务端记录多次代码执行得到jupyter notebook，因此我暂时调整成了http。</p>
+<p>哈哈这一章来不及调整了，后面感觉合理的解法还是stdio模式，第一是更快速适合大数据分析中大量数据传输，其次是数据分析会有建模场景，不过把Jupyter Notebook的数据管理迁移到客户端来搞</p>
+<ol start="2">
+<li><strong>工具调用受到上文Message格式影响较大</strong></li>
+</ol>
+<p>个人经验（无客观消融实验）表明，在某些模型上结构化推理的稳定性更高，工具使用的幻觉率（如不调用工具）更低，DeepSeek模型相比Qwen尤其明显。如果上文Message包含与工具内容相似但格式不同的内容，会进一步增加无工具调用的比例，需要特别注意。</p>
+<h2 id="next">Next?</h2>
+<p>这一版只是数据分析智能体的雏形，后面我们一边探索一些新的思路，一边把UI展示搞出来，感觉一些值得尝试的点包括</p>
+<ul>
+<li><strong>经验总结机制</strong>：如何让模型不断总结抽象自己Coding过程中的报错并落到notes里，在不断实践中降低bug rate。感觉当前数据分析上多数浅层error都来自API版本迭代带来的不兼容问题，完全可以通过“Past Experience Summary”机制解决</li>
+<li><strong>反思机制探索</strong>：反思在数据分析任务上能提升分析深度么？</li>
+<li><strong>高效Bug修复</strong>除了重写代码，有其他更高效的推理方式进行Bug修复么？</li>
+<li><strong>前端展示</strong>：如何设计一个前端页面来展示数据分析的结果</li>
+</ul>
+<p>想看更全的大模型论文·Agent·开源框架·AIGC应用 &gt;&gt; <a href="https://github.com/DSXiangLi/DecryptPrompt" target="_blank" rel="noopener nofollow">DecryPrompt</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-09-08 07:42">2025-09-08 07:42</span>&nbsp;
+<a href="https://www.cnblogs.com/gogoSandy">风雨中的小七</a>&nbsp;
+阅读(<span id="post_view_count">9</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19079039);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19079039', targetLink: 'https://www.cnblogs.com/gogoSandy/p/19079039', title: '解密prompt系列60. Agent实战：从0搭建Jupter数据分析智能体' })">举报</a>
+</div>
+        
