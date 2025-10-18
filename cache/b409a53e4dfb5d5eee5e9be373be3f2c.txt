@@ -1,0 +1,138 @@
+
+	<h1 class="postTitle"><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yuweijie/p/19133994" title="发布于 2025-10-17 22:56">
+    <span role="heading" aria-level="2">ysyx学习：移植rt-thread</span>
+    
+
+</a>
+</h1>
+	<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><strong>OS中的上下文切换</strong></p>
+<p>上一期我们搞懂了<code>yield-os.c</code>的原理如何，我们理解   玩上下文切换的核心细节之后，我们可以把这些原理迁移到RT-Thread这个更大的操作系统中。<br>
+RT-Thread中有两个抽象层, 一个是BSP(Board Support Package), 另一个是libcpu。</p>
+<p>负责把 RT-Thread 的线程结构（PCB）和抽象机器（AM）的上下文切换接口连接起来：调用处把目标/来源上下文地址临时放到线程的 user_data，触发 yield()，AM 回调读出这些信息并完成实际的上下文切换；另外还准备线程首次运行时的栈/参数（通过 kcontext）。</p>
+<p>对于上下文的创建，需要先实现<code>rt_uint8_t *rt_hw_stack_init(void *tentry, void *parameter, rt_uint8_t *stack_addr, void *texit)</code>函数。</p>
+<pre><code>rt_uint8_t* rt_hw_stack_init(void* tentry, void* parameter, rt_uint8_t* stack_addr, void* texit) {
+
+    stack_addr = (rt_uint8_t*)(((uintptr_t)stack_addr + sizeof(uintptr_t) - 1) &amp; ~(sizeof(uintptr_t) - 1));
+
+    stack_addr -= sizeof(temp_args); 
+    temp_args* args = (temp_args*)stack_addr; // 在栈上保存 入口 参数 出口 等信息
+
+    // 设置参数
+    args-&gt;tentry = (void (*)(void*))tentry;   // tentry是“接受一个 void* 参数、返回 void 的函数指针”
+    args-&gt;parameter = parameter;
+    args-&gt;texit = (void (*)(void))texit;      // texit是“不接受参数、返回 void 的函数指针”
+
+    rt_uint8_t* c = (rt_uint8_t*)kcontext((Area){ stack_addr - sizeof(Area) , stack_addr }, (void*)wrap, args);
+
+    return c;
+}
+</code></pre>
+<p>一开始先对齐，然后拉出栈的位置，在栈上保存 入口 参数 出口 等信息，然后使用<code>kcontext</code>函数(详情见之前的随笔)，将控制状态寄存器<code>mepc</code>设置为函数的地址，当你执行mret指令的时候就会跳转到该函数中去，因此会跳转到wrap中，附带参数args。</p>
+<p>这个<code>wrap()</code>函数如下,这个是包裹函数，讲义中提到<code>让包裹函数来调用tentry, 并在tentry返回后调用texit，T-Thread会保证代码不会从texit中返回</code>，因此我这个代码这么写。<br>
+执行入口函数，并附带上参数，执行完之后执行退出函数。</p>
+<pre><code>void wrap(temp_args* args) {
+    args-&gt;tentry(args-&gt;parameter);
+    args-&gt;texit();
+
+    // 不应该执行于此，RT-Thread会保证代码不会从texit中返回
+    while (1);
+}
+</code></pre>
+<p>接下来来看<code>main</code>函数，<code>main</code>函数代码如下：</p>
+<pre><code>int main() {
+  ioe_init();
+#ifdef __ISA_NATIVE__
+  // trigger the real initialization of IOE to
+  // perform SDL initialization int this main thread with large stack
+  io_read(AM_TIMER_CONFIG);
+#endif
+  extern void __am_cte_init();
+  __am_cte_init();
+  extern int entry(void);
+  entry();
+  return 0;
+}
+</code></pre>
+<p>先初始化一下ioe外设，在调用<code>__am_cte_init()</code>函数初始化cte。</p>
+<pre><code>void __am_cte_init() {
+  cte_init(ev_handler); 
+} 
+</code></pre>
+<p>意思就是把<code>__am_asm_trap</code>赋值给mtvec，方便后面ecall的时候直接跳进去<code>__am_asm_trap</code>函数。<br>
+然后把<code>ev_handler</code>函数注册进回调函数中。</p>
+<p><code>ev_handler</code>函数如下：定义一个当前的线程，可以通过<code>rt_thread_self()</code>这个函数获取当前线程，再使用这个线程中的<code>user_data</code>，可以用<code>current-&gt;user_data</code>来使用他，为什么用这个呢，因为这个<code>user_data</code>它用于存放线程的私有数据, 这意味着RT-Thread中调度相关的代码必定不会使用这个成员, 因此它很适合我们用来传递<code>from</code>和<code>to</code>的信息，这里的<code>from</code>是当前线程，这个<code>to</code>是你要跳往的线程，这里的<code>ev_handler</code>是回调函数，当系统陷入<code>yield</code>的时候，执行完一些列操作(看以前的随笔)后会执行这个回调函数了。这个函数主要作用就是把当前上下文保存到<code>from</code>中然后利用<code>to</code>作为下一个上下文进行跳转。</p>
+<pre><code>static Context* ev_handler(Event e, Context* c) {
+    rt_thread_t current;
+    rt_ubase_t* para;
+
+    switch (e.event) {
+        case EVENT_YIELD:
+            current = rt_thread_self();
+            para = (rt_ubase_t*)current-&gt;user_data;
+
+            rt_ubase_t from = para[0];
+            rt_ubase_t to = para[1];
+
+            if (from) {
+                *((Context**)from) = c; //保存上下文到from中
+            }
+            c = *(Context**)to;  // 返回to作为下一个上下文
+            break;
+        case EVENT_IRQ_TIMER:
+            return c;
+        default:
+            printf("Unhandled event ID = %d\n", e.event);
+            assert(0);
+    }
+
+    return c;
+}
+</code></pre>
+<p>具体怎么上下文的切换呢，看这两个函数<code>void rt_hw_context_switch_to(rt_ubase_t to)</code>//切换到to的上下文<br>
+<code>void rt_hw_context_switch(rt_ubase_t from, rt_ubase_t to)</code>//切换到to的上下文，又要保存当前上下文到from上。</p>
+<pre><code>void rt_hw_context_switch_to(rt_ubase_t to) {
+    rt_ubase_t data[2];
+    rt_thread_t current = rt_thread_self();
+    rt_ubase_t temp_ud = current-&gt;user_data;   //保存原来的 from 和 to
+
+    data[1] = to;
+    current-&gt;user_data = (rt_ubase_t)data;
+    
+    yield();
+
+    current-&gt;user_data = temp_ud;
+}
+</code></pre>
+<pre><code>void rt_hw_context_switch(rt_ubase_t from, rt_ubase_t to) {
+    rt_ubase_t data[2];
+    rt_thread_t current = rt_thread_self();
+    rt_ubase_t temp_ud = current-&gt;user_data;   //保存原来的 from 和 to
+
+    data[0] = from;
+    data[1] = to;
+
+    current-&gt;user_data = (rt_ubase_t)data;
+
+    yield();
+
+    current-&gt;user_data = temp_ud;
+}
+</code></pre>
+<p>这两个函数实现起来基本差不多，使用刚刚的<code>user_data</code>保存完<code>from</code>和<code>to</code>之后将，切换线程，然后切换完之后再将原先的<code>user_data</code>数据还回去。</p>
+<p>然后启动rt-thread，成功！！！</p>
+<p>但是很奇怪，我每次输入完一行命令，下次那一行命令会多一个<code>/&gt;</code>，之前貌似不会，不知道改了什么之后就会了。<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3426739/202510/3426739-20251017225500764-1992074889.png" class="lazyload"></p>
+
+</div>
+<div class="clear"></div>
+
+	<div class="postDesc">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-10-17 22:56">2025-10-17 22:56</span>&nbsp;
+<a href="https://www.cnblogs.com/yuweijie">yuweijie0124</a>&nbsp;
+阅读(<span id="post_view_count">39</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19133994);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19133994', targetLink: 'https://www.cnblogs.com/yuweijie/p/19133994', title: 'ysyx学习：移植rt-thread' })">举报</a>
+</div>
