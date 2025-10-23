@@ -1,0 +1,276 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/didispace/p/19159887" title="发布于 2025-10-23 10:36">
+    <span role="heading" aria-level="2">@Autowired 的Bug让我们白忙三天</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>凌晨两点，支付服务的告警像雪崩一样砸来，你在控制台和栈跟踪间疯狂穿梭，却始终想不明白：Spring 的依赖注入，怎么会在生产里突然“失手”？我最近读到一篇事故复盘，讲的是两个看似无害的改动如何在生产环境联手把系统击穿，分析深入、启发很大。于是我把它完整翻译出来，分享给大家，希望能帮你少走弯路。</p>
+<blockquote>
+<p>以下内容翻译自：<a href="https://medium.com/javarevisited/the-autowired-bug-that-cost-us-3-days-7d24a1e31435" target="_blank" rel="noopener nofollow">https://medium.com/javarevisited/the-autowired-bug-that-cost-us-3-days-7d24a1e31435</a></p>
+</blockquote>
+<p>两个“看似无害”的 PR 如何在凌晨 2 点联手击碎生产环境的依赖注入。</p>
+<p>我们的首席架构师在一个构造器上加了 <code>@Autowired</code>，应用能编译。测试通过。代码评审也过了。</p>
+<p>然后凌晨两点，生产炸了，<code>NullPointerException</code> 到处都是。</p>
+<h2 id="故事从一次简单的重构开始">故事从一次“简单”的重构开始</h2>
+<p>如果你曾在周五合并过一个“很安全”的重构，你大概知道故事怎么发展。</p>
+<p>我们在支付服务里清理技术债。没啥花哨的——把一个巨型类拆成更小、更可测的组件而已。</p>
+<pre><code class="language-java">@Service
+public class PaymentProcessor {
+    
+    @Autowired
+    private PaymentGateway gateway;
+    
+    @Autowired
+    private FraudDetector fraudDetector;
+    
+    @Autowired
+    private NotificationService notificationService;
+    
+    // 847 行业务逻辑...
+}
+</code></pre>
+<p>我们的架构师，就叫他 Dave，决定改用构造器注入。“最佳实践”，他说。干净、不可变、易测试。</p>
+<p>听起来很合理，对吧？</p>
+<pre><code class="language-java">@Service
+public class PaymentProcessor {
+    
+    private final PaymentGateway gateway;
+    private final FraudDetector fraudDetector;
+    private final NotificationService notificationService;
+    
+    @Autowired
+    public PaymentProcessor(
+        PaymentGateway gateway,
+        FraudDetector fraudDetector,
+        NotificationService notificationService
+    ) {
+        this.gateway = gateway;
+        this.fraudDetector = fraudDetector;
+        this.notificationService = notificationService;
+    }
+    
+    // 业务逻辑...
+}
+</code></pre>
+<p>完美。<code>final</code> 字段、构造器注入，跟每篇 Spring Boot 教程教的一样。</p>
+<p>周四发版。周五风平浪静。周末也很安稳。</p>
+<p>周一清晨，地狱之门打开。</p>
+<h2 id="凌晨两点一切开始崩坏">凌晨两点：一切开始崩坏</h2>
+<p>我们 Slack 的 #incidents 频道像圣诞树一样亮了起来。</p>
+<pre><code class="language-java">PagerDuty: 🚨 CRITICAL: Payment Service - Error rate 34%
+DataDog: Payment processing failures spiking
+AWS CloudWatch: 500 errors on /api/payments/process
+</code></pre>
+<p>我是当周值班工程师。真“幸运”。</p>
+<p>日志像噩梦：</p>
+<pre><code class="language-java">java.lang.NullPointerException: Cannot invoke "FraudDetector.check()" because "this.fraudDetector" is null
+    at PaymentProcessor.processPayment(PaymentProcessor.java:67)
+    at PaymentController.createPayment(PaymentController.java:45)
+</code></pre>
+<p>等等，啥？</p>
+<p><code>fraudDetector</code> 是 null？可它是 <code>@Autowired</code> 的依赖啊。Spring 不应该给它注入吗？这不就是 Spring 的工作嘛。</p>
+<p>我检查了 Bean 配置。<code>FraudDetector</code> 的 Bean 存在、已注册，其他服务用它也都没问题。</p>
+<p>我重启了服务。还是一样的错误。</p>
+<p>我看了下构造器。<code>@Autowired</code> 注解也在。</p>
+<p>这到底怎么回事？</p>
+<h2 id="事情并不随机">事情并不随机</h2>
+<p>然后事情开始变得诡异。</p>
+<p>有些支付成功。大多数失败。</p>
+<p>但并非随机。它有规律：</p>
+<ul>
+<li>小额支付（&lt;$100）：成功</li>
+<li>大额支付（&gt;$100）：抛 <code>NullPointerException</code></li>
+</ul>
+<p>这完全说不通。支付金额不应该影响依赖注入。这不是 Spring 的工作方式。</p>
+<p>我到处加了调试日志：</p>
+<pre><code class="language-java">@Autowired
+public PaymentProcessor(
+    PaymentGateway gateway,
+    FraudDetector fraudDetector,
+    NotificationService notificationService
+) {
+    System.out.println("Constructor called!");
+    System.out.println("Gateway: " + gateway);
+    System.out.println("FraudDetector: " + fraudDetector);
+    System.out.println("NotificationService: " + notificationService);
+    
+    this.gateway = gateway;
+    this.fraudDetector = fraudDetector;
+    this.notificationService = notificationService;
+}
+</code></pre>
+<p>日志显示构造器在启动时只被调用了一次。所有依赖都注入正确。</p>
+<p>那运行期为什么 <code>fraudDetector</code> 会是 null？</p>
+<h2 id="周二早晨git-blame-揭晓谜底">周二早晨：Git Blame 揭晓谜底</h2>
+<p>周二早上，Dave 来了。我给他看日志。他很困惑。</p>
+<p>“不可能，”他说，“构造器注入可以保证不可变。”</p>
+<p>我打开 git diff。他的重构 PR——改了 47 个文件。</p>
+<p>然后我看到了——埋在 diff 中间的那一行。</p>
+<pre><code class="language-java">@Service
+@Scope("prototype")  // 就是这一行
+public class PaymentProcessor {
+    // ...
+}
+</code></pre>
+<p>有人给这个类加了 <code>@Scope("prototype")</code>。</p>
+<p>不是 Dave。是上周另一个 PR。一个“性能优化”——一位初级同事以为每次创建新实例可以防止内存泄漏。</p>
+<p>两个 PR 分别合并。没有冲突。评审都通过。各自看也都合理。</p>
+<p>但放在一起？灾难。</p>
+<h2 id="技术拆解为什么会炸">技术拆解：为什么会炸</h2>
+<p>来解释一下 <code>@Scope("prototype")</code> 到底做了什么。</p>
+<table>
+<thead>
+<tr>
+<th>范围（Scope）</th>
+<th>实例生命周期</th>
+<th>常见陷阱</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Singleton</td>
+<td>启动时创建一次</td>
+<td>与构造器依赖注入组合安全</td>
+</tr>
+<tr>
+<td>Prototype</td>
+<td>每次请求创建一个</td>
+<td>与字段访问组合会出现问题</td>
+</tr>
+</tbody>
+</table>
+<p>普通 Spring Bean（单例）：</p>
+<ol>
+<li>Spring 在启动时创建一个实例</li>
+<li>构造器只执行一次</li>
+<li>依赖只注入一次</li>
+<li>该实例服务所有请求</li>
+</ol>
+<p>原型范围（prototype）的 Bean：</p>
+<ol>
+<li>每次获取都会创建一个新实例</li>
+<li>构造器每次都会执行</li>
+<li>依赖也应该每次都被注入</li>
+</ol>
+<p>但关键点在这里：</p>
+<p>当其他服务（比如我们的 <code>PaymentController</code>）通过 <code>@Autowired</code> 注入 <code>PaymentProcessor</code> 时，Spring 注入的不是每次都创建的新实例，而是一个<strong>代理（proxy）</strong>。</p>
+<p>这个代理会在“方法调用”时创建新实例，而不是在“字段访问”时创建。</p>
+<p>所以这段代码：</p>
+<pre><code class="language-java">@RestController
+public class PaymentController {
+    
+    @Autowired
+    private PaymentProcessor processor;
+    
+    public void handlePayment(Payment payment) {
+        processor.processPayment(payment);  // 在这里触发创建新实例
+    }
+}
+</code></pre>
+<p>工作正常。方法调用会触发实例创建。</p>
+<p>但我们还有第二条代码路径：</p>
+<pre><code class="language-java">@Component
+public class ScheduledPaymentJob {
+    
+    @Autowired
+    private PaymentProcessor processor;
+    
+    @Scheduled(fixedRate = 60000)
+    public void processScheduledPayments() {
+        List&lt;Payment&gt; pending = getPendingPayments();
+        
+        for (Payment p : pending) {
+            // 直接字段访问！
+            if (processor.fraudDetector.isHighRisk(p)) {
+                processor.processManually(p);
+            } else {
+                processor.processPayment(p);
+            }
+        }
+    }
+}
+</code></pre>
+<p>看出问题了吗？</p>
+<p><code>processor.fraudDetector</code> 是直接字段访问，不是方法调用。代理不会拦截它。不会创建新实例。字段自然就是 null。</p>
+<p>小额支付走控制器路径（方法调用 = 正常）。</p>
+<p>大额支付触发了定时任务里的人工复核路径（字段访问 = <code>NullPointerException</code>）。</p>
+<p>这就是为什么它不是随机的。它非常“合情合理”，只不过很隐蔽。</p>
+<h2 id="周三并不简单的修复">周三：并不简单的“修复”</h2>
+<p>第一反应：移除 <code>@Scope("prototype")</code>，改回单例。</p>
+<p>问题：初级同事加它是有理由的。我们之前看到过“内存泄漏”。移除它可能把旧问题带回来。</p>
+<p>第二个想法：保留 prototype，但修代理行为。</p>
+<p>问题：你无法用 prototype Bean 修复代理的拦截行为。这是 Spring 的基本限制。</p>
+<p>第三个想法：原型 Bean 不用 <code>@Autowired</code>，改成手动从 <code>ApplicationContext.getBean()</code> 获取。</p>
+<pre><code class="language-java">@Component
+public class ScheduledPaymentJob {
+    
+    @Autowired
+    private ApplicationContext context;
+    
+    @Scheduled(fixedRate = 60000)
+    public void processScheduledPayments() {
+        List&lt;Payment&gt; pending = getPendingPayments();
+        
+        for (Payment p : pending) {
+            // 每次获取一个全新实例
+            PaymentProcessor processor = context.getBean(PaymentProcessor.class);
+            
+            if (processor.getFraudDetector().isHighRisk(p)) {
+                processor.processManually(p);
+            } else {
+                processor.processPayment(p);
+            }
+        }
+    }
+}
+</code></pre>
+<p>问题：这太丑了。手动查找 Bean 违背了依赖注入的初衷。</p>
+<p>第四个想法（最终有效的那个）：</p>
+<p>停止使用 prototype 范围。去修真正的内存问题。</p>
+<p>结果发现，“内存泄漏”只是误解。初级同事看到堆内存使用上升，就以为是泄漏。其实不是，是 G1GC 下 JVM 的正常行为。</p>
+<p>我们移除了 <code>@Scope("prototype")</code>。内存使用保持稳定。问题解决。</p>
+<h2 id="真正的教训">真正的教训</h2>
+<p>出了什么问题：</p>
+<ol>
+<li>我们在不理解的情况下信任了注解。<code>@Scope("prototype")</code> 看起来无害，其实会改变 Spring 的整个对象生命周期。</li>
+<li>我们把 PR 当作孤立改动来评审。Dave 的重构看起来没问题；Scope 的改动也看起来没问题；放到一起就是灾难。</li>
+<li>我们的测试没覆盖到所有路径。集成测试只跑了控制器路径（它是正常的），没人测定时任务路径。</li>
+<li>我们以为字段注入和构造器注入是等价的。不是。构造器注入 + prototype 范围 + 字段访问 = 空引用。</li>
+</ol>
+<h2 id="我们之后的改进">我们之后的改进</h2>
+<p>新的团队规则：</p>
+<ul>
+<li>✅ 未经明确审批，不得使用 prototype 范围。需要时必须在 wiki 里写明理由和使用方式。</li>
+<li>✅ 只用构造器注入（一个例外）。字段注入被禁用。唯一的例外是环状依赖（然后我们会尽快重构掉它）。</li>
+<li>✅ 集成测试必须覆盖所有代码路径。不只“快乐路径”。要测定时任务、边界场景。</li>
+<li>✅ 代码评审要检查交互效应。合并前要看近期有哪些 PR 动过同一服务。</li>
+<li>✅ 内存“泄漏”必须用性能分析工具证明。没有 YourKit 或 VisualVM 的证据，就不能叫“泄漏”。</li>
+</ul>
+<h2 id="不那么舒适的真相">不那么舒适的真相</h2>
+<p>Spring 让依赖注入看起来很有“魔法”。90% 的时候，它确实很好用。</p>
+<p>但“魔法”也有边角。原型 Bean 与代理、构造器注入中的环状依赖、<code>@Transactional</code> 的内部方法调用等等。</p>
+<p>文档都写了。这些坑也都被记录了。但没人会在写一个 <code>@Service</code> 类之前，把 500 页的 Spring 参考手册通读一遍。</p>
+<p>我们都是在翻车中学习。这次我们在凌晨两点炸了生产，花了三天时间才搞清楚一个注解背后的交互效应。</p>
+<p>Dave 的重构并没有错。prototype 范围也不是绝对错误。错的是它们的组合——只在生产、只在某些代码路径、只在两个 PR 都合并之后才显现的问题。</p>
+<p>这就是“魔法”框架的真实代价：顺的时候很妙；不顺的时候，你需要一个 Spring 内部机制博士学位。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-10-23 10:37">2025-10-23 10:36</span>&nbsp;
+<a href="https://www.cnblogs.com/didispace">程序猿DD</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19159887);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19159887', targetLink: 'https://www.cnblogs.com/didispace/p/19159887', title: '@Autowired 的Bug让我们白忙三天' })">举报</a>
+</div>
+        
