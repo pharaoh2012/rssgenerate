@@ -1,0 +1,369 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/wasp520/p/19249628" title="发布于 2025-11-20 21:32">
+    <span role="heading" aria-level="2">Spring AI 代码分析（三）--集成LLM</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="大模型集成实现分析">大模型集成实现分析</h1>
+<p>请关注微信公众号：<a href="https://mp.weixin.qq.com/s/1POBRXDahByqmKNZ5Y5MZA" target="_blank" rel="noopener nofollow">阿呆-bot</a></p>
+<h2 id="1-工程结构概览">1. 工程结构概览</h2>
+<p>Spring AI 支持多种大模型提供商，每个提供商都有独立的实现模块。虽然实现细节不同，但它们都遵循统一的抽象模式。下面我们来看看主要的模型实现：</p>
+<pre><code>models/
+├── spring-ai-openai/          # OpenAI 实现
+│   ├── OpenAiChatModel.java
+│   ├── OpenAiEmbeddingModel.java
+│   └── api/                   # 底层 API 客户端
+│       └── OpenAiApi.java
+│
+├── spring-ai-deepseek/        # DeepSeek 实现
+│   ├── DeepSeekChatModel.java
+│   └── api/
+│       └── DeepSeekApi.java
+│
+├── spring-ai-oci-genai/       # Oracle OCI GenAI 实现
+│   ├── OCICohereChatModel.java
+│   └── OCIEmbeddingModel.java
+│
+└── spring-ai-transformers/     # 本地 Transformer 模型
+    └── TransformersEmbeddingModel.java
+</code></pre>
+<h2 id="2-通用实现模式">2. 通用实现模式</h2>
+<p>所有大模型实现都遵循相同的模式：</p>
+<ol>
+<li><strong>实现核心接口</strong>：实现 <code>ChatModel</code> 或 <code>EmbeddingModel</code></li>
+<li><strong>底层 API 客户端</strong>：封装提供商的 HTTP API</li>
+<li><strong>选项管理</strong>：每个模型有自己的 Options 类</li>
+<li><strong>密钥管理</strong>：通过 <code>ApiKey</code> 接口管理认证</li>
+<li><strong>重试机制</strong>：集成 Spring Retry</li>
+<li><strong>观察性</strong>：集成 Micrometer</li>
+</ol>
+<h2 id="3-实现模式关系图">3. 实现模式关系图</h2>
+<p><img src="https://img2024.cnblogs.com/blog/15798/202511/15798-20251120213220233-1282257797.png" alt="image.png" loading="lazy"></p>
+<h2 id="4-密钥管理机制">4. 密钥管理机制</h2>
+<h3 id="41-apikey-接口设计">4.1 ApiKey 接口设计</h3>
+<p>Spring AI 使用 <code>ApiKey</code> 接口统一管理所有模型的密钥：</p>
+<pre><code class="language-java">public interface ApiKey {
+    String getValue();  // 获取当前有效的密钥
+}
+</code></pre>
+<p>这个设计的巧妙之处在于：</p>
+<ul>
+<li><strong>支持静态密钥</strong>：<code>SimpleApiKey</code> 直接存储密钥</li>
+<li><strong>支持动态刷新</strong>：可以实现自动刷新的密钥（比如 GCP 的短期密钥）</li>
+<li><strong>类型安全</strong>：所有模型都使用相同的接口</li>
+</ul>
+<h3 id="42-密钥使用方式">4.2 密钥使用方式</h3>
+<p>在 API 客户端中，密钥通过 HTTP Header 传递：</p>
+<pre><code class="language-java">// OpenAiApi 中的密钥使用
+this.restClient = restClientBuilder.clone()
+    .baseUrl(baseUrl)
+    .defaultRequest(requestHeadersSpec -&gt; {
+        if (!(apiKey instanceof NoopApiKey)) {
+            requestHeadersSpec.header(HttpHeaders.AUTHORIZATION, 
+                "Bearer " + apiKey.getValue());
+        }
+    })
+    .build();
+</code></pre>
+<p>每次请求都会调用 <code>apiKey.getValue()</code>，这样如果密钥需要刷新，实现类可以在内部处理。</p>
+<h3 id="43-密钥配置方式">4.3 密钥配置方式</h3>
+<p>密钥可以通过多种方式配置：</p>
+<p><strong>方式一：配置文件</strong></p>
+<pre><code class="language-properties">spring.ai.openai.api-key=${OPENAI_API_KEY}
+</code></pre>
+<p><strong>方式二：环境变量</strong></p>
+<pre><code class="language-bash">export OPENAI_API_KEY=sk-xxx
+</code></pre>
+<p><strong>方式三：程序化配置</strong></p>
+<pre><code class="language-java">OpenAiApi api = OpenAiApi.builder()
+    .apiKey(new SimpleApiKey("sk-xxx"))
+    .build();
+</code></pre>
+<h2 id="5-具体实现分析">5. 具体实现分析</h2>
+<h3 id="51-openai-实现">5.1 OpenAI 实现</h3>
+<p>OpenAI 的实现是最完整的，支持同步和流式调用：</p>
+<pre><code class="language-java">public class OpenAiChatModel implements ChatModel {
+    private final OpenAiApi openAiApi;
+    private final OpenAiChatOptions defaultOptions;
+    private final RetryTemplate retryTemplate;
+    private final ToolCallingManager toolCallingManager;
+    
+    @Override
+    public ChatResponse call(Prompt prompt) {
+        // 1. 构建请求 Prompt（处理工具调用）
+        Prompt requestPrompt = buildRequestPrompt(prompt);
+        
+        // 2. 调用底层 API
+        ResponseEntity&lt;ChatCompletion&gt; response = retryTemplate.execute(
+            ctx -&gt; openAiApi.chatCompletion(toRequest(requestPrompt))
+        );
+        
+        // 3. 转换响应
+        return toChatResponse(response);
+    }
+    
+    @Override
+    public Flux&lt;ChatResponse&gt; stream(Prompt prompt) {
+        // 流式调用类似，但返回 Flux
+        return openAiApi.chatCompletionStream(toRequest(prompt))
+            .map(this::toChatResponse);
+    }
+}
+</code></pre>
+<p><strong>特点</strong>：</p>
+<ul>
+<li>完整的工具调用支持</li>
+<li>支持流式响应</li>
+<li>完善的错误处理和重试</li>
+<li>支持多模态（图像、音频）</li>
+</ul>
+<h3 id="52-deepseek-实现">5.2 DeepSeek 实现</h3>
+<p>DeepSeek 的实现与 OpenAI 类似，但更简洁：</p>
+<pre><code class="language-java">public class DeepSeekChatModel implements ChatModel {
+    private final DeepSeekApi deepSeekApi;
+    private final DeepSeekChatOptions defaultOptions;
+    
+    @Override
+    public ChatResponse call(Prompt prompt) {
+        Prompt requestPrompt = buildRequestPrompt(prompt);
+        ChatModelObservationContext context = ChatModelObservationContext.builder()
+            .prompt(requestPrompt)
+            .provider("DEEPSEEK")
+            .build();
+        
+        return ChatModelObservationDocumentation.CHAT_MODEL_OPERATION
+            .observation(...)
+            .observe(() -&gt; {
+                ResponseEntity&lt;ChatCompletion&gt; response = 
+                    deepSeekApi.chatCompletion(toRequest(requestPrompt));
+                return toChatResponse(response);
+            });
+    }
+}
+</code></pre>
+<p><strong>特点</strong>：</p>
+<ul>
+<li>结构清晰，代码简洁</li>
+<li>支持观察性（Micrometer）</li>
+<li>支持工具调用</li>
+</ul>
+<h3 id="53-oci-genai-实现">5.3 OCI GenAI 实现</h3>
+<p>OCI 的实现使用了 Oracle 的官方 SDK：</p>
+<pre><code class="language-java">public class OCICohereChatModel implements ChatModel {
+    private final GenerativeAiInference genAi;  // OCI SDK 客户端
+    private final OCICohereChatOptions defaultOptions;
+    
+    @Override
+    public ChatResponse call(Prompt prompt) {
+        // 使用 OCI SDK 调用
+        ChatRequest request = toCohereChatRequest(prompt, options);
+        ChatResponse ociResponse = this.genAi.chat(request);
+        return toGenerations(ociResponse, options);
+    }
+}
+</code></pre>
+<p><strong>特点</strong>：</p>
+<ul>
+<li>使用官方 OCI SDK</li>
+<li>需要配置 compartment 和 serving mode</li>
+<li>支持 Cohere 模型</li>
+</ul>
+<h3 id="54-transformers-实现本地模型">5.4 Transformers 实现（本地模型）</h3>
+<p>Transformers 实现比较特殊，它不调用远程 API，而是在本地运行 ONNX 模型：</p>
+<pre><code class="language-java">public class TransformersEmbeddingModel extends AbstractEmbeddingModel {
+    private OrtSession session;  // ONNX Runtime 会话
+    private HuggingFaceTokenizer tokenizer;
+    
+    @Override
+    public EmbeddingResponse call(EmbeddingRequest request) {
+        // 1. Tokenize 输入文本
+        Encoding encoding = tokenizer.encode(request.getInstructions());
+        
+        // 2. 运行 ONNX 模型
+        OnnxTensor inputTensor = OnnxTensor.createTensor(
+            ortEnvironment, 
+            encoding.getIds()
+        );
+        OrtSession.Result result = session.run(
+            Map.of("input_ids", inputTensor)
+        );
+        
+        // 3. 提取嵌入向量
+        float[] embedding = extractEmbedding(result);
+        
+        return new EmbeddingResponse(List.of(new Embedding(embedding)));
+    }
+}
+</code></pre>
+<p><strong>特点</strong>：</p>
+<ul>
+<li><strong>完全本地运行</strong>：不需要 API 密钥</li>
+<li><strong>使用 ONNX Runtime</strong>：高性能推理引擎</li>
+<li><strong>支持 GPU 加速</strong>：可以配置 GPU 推理</li>
+<li><strong>模型缓存</strong>：自动下载和缓存模型文件</li>
+</ul>
+<h2 id="6-实现对比分析">6. 实现对比分析</h2>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>OpenAI</th>
+<th>DeepSeek</th>
+<th>OCI</th>
+<th>Transformers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>API 类型</strong></td>
+<td>REST API</td>
+<td>REST API</td>
+<td>OCI SDK</td>
+<td>本地 ONNX</td>
+</tr>
+<tr>
+<td><strong>密钥管理</strong></td>
+<td>ApiKey 接口</td>
+<td>ApiKey 接口</td>
+<td>OCI 认证</td>
+<td>无需密钥</td>
+</tr>
+<tr>
+<td><strong>流式支持</strong></td>
+<td>✅</td>
+<td>✅</td>
+<td>❌</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong>工具调用</strong></td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td><strong>多模态</strong></td>
+<td>✅</td>
+<td>❌</td>
+<td>❌</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td><strong>重试机制</strong></td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>N/A</td>
+</tr>
+<tr>
+<td><strong>观察性</strong></td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="7-关键实现细节">7. 关键实现细节</h2>
+<h3 id="71-请求构建模式">7.1 请求构建模式</h3>
+<p>所有实现都遵循相同的请求构建模式：</p>
+<pre><code class="language-java">// 1. 合并默认选项和运行时选项
+ChatOptions requestOptions = ModelOptionsUtils.merge(
+    prompt.getOptions(), 
+    this.defaultOptions, 
+    ChatOptions.class
+);
+
+// 2. 转换为提供商特定的请求对象
+ProviderRequest providerRequest = toProviderRequest(prompt, requestOptions);
+
+// 3. 调用底层 API
+ProviderResponse providerResponse = apiClient.call(providerRequest);
+
+// 4. 转换为 Spring AI 响应
+ChatResponse chatResponse = toChatResponse(providerResponse);
+</code></pre>
+<h3 id="72-工具调用处理">7.2 工具调用处理</h3>
+<p>支持工具调用的模型（如 OpenAI、DeepSeek）都实现了类似的工具调用流程：</p>
+<pre><code class="language-java">// 1. 解析工具定义
+List&lt;ToolDefinition&gt; toolDefinitions = 
+    toolCallingManager.resolveToolDefinitions(options);
+
+// 2. 将工具定义添加到请求中
+request.setTools(toolDefinitions);
+
+// 3. 调用模型
+ChatResponse response = apiClient.call(request);
+
+// 4. 检查是否有工具调用请求
+if (response.hasToolCalls()) {
+    // 5. 执行工具调用
+    ToolExecutionResult toolResult = 
+        toolCallingManager.executeToolCalls(prompt, response);
+    
+    // 6. 将工具结果作为新的 Prompt 再次调用
+    return call(new Prompt(toolResult.getConversationHistory()));
+}
+</code></pre>
+<h3 id="73-流式处理实现">7.3 流式处理实现</h3>
+<p>流式处理使用 Reactor 的 <code>Flux</code>：</p>
+<pre><code class="language-java">@Override
+public Flux&lt;ChatResponse&gt; stream(Prompt prompt) {
+    return webClient.post()
+        .uri("/v1/chat/completions")
+        .bodyValue(toRequest(prompt))
+        .retrieve()
+        .bodyToFlux(ServerSentEvent.class)
+        .filter(event -&gt; !"[DONE]".equals(event.data()))
+        .map(this::toChatResponse);
+}
+</code></pre>
+<h2 id="8-外部依赖">8. 外部依赖</h2>
+<p>不同实现的依赖差异：</p>
+<h3 id="81-openaideepseek">8.1 OpenAI/DeepSeek</h3>
+<ul>
+<li><strong>Spring Web</strong>：RestClient 和 WebClient</li>
+<li><strong>Jackson</strong>：JSON 处理</li>
+<li><strong>Spring Retry</strong>：重试机制</li>
+</ul>
+<h3 id="82-oci-genai">8.2 OCI GenAI</h3>
+<ul>
+<li><strong>OCI SDK</strong>：Oracle 官方 SDK</li>
+<li><strong>Spring Web</strong>：HTTP 客户端（如果需要）</li>
+</ul>
+<h3 id="83-transformers">8.3 Transformers</h3>
+<ul>
+<li><strong>ONNX Runtime</strong>：ONNX 模型推理</li>
+<li><strong>DJL</strong>：Deep Java Library（Tokenizer）</li>
+<li><strong>无网络依赖</strong>：完全本地运行</li>
+</ul>
+<h2 id="9-工程总结">9. 工程总结</h2>
+<p>Spring AI 的大模型集成实现有几个亮点：</p>
+<p><strong>统一抽象，灵活实现</strong>。所有模型都实现相同的接口（<code>ChatModel</code>、<code>EmbeddingModel</code>），但底层实现可以完全不同。这种设计让用户可以轻松切换模型，而不需要改业务代码。今天用 OpenAI，明天想换 DeepSeek？改个配置就行。</p>
+<p><strong>密钥管理统一化</strong>。通过 <code>ApiKey</code> 接口，所有模型使用相同的密钥管理方式。这简化了配置，也为未来的动态密钥刷新提供了扩展点。想从配置中心动态获取密钥？实现 <code>ApiKey</code> 接口就行。</p>
+<p><strong>选项合并机制</strong>。<code>ModelOptionsUtils.merge()</code> 提供了灵活的选项合并机制，支持默认选项和运行时选项的合并，让配置既灵活又简单。默认配置在 <code>application.yml</code>，运行时可以动态调整。</p>
+<p><strong>观察性内置</strong>。所有实现都集成了 Micrometer，提供了完善的指标和追踪能力。这对于生产环境非常重要，可以监控模型调用次数、延迟、错误率等。</p>
+<p><strong>本地模型支持</strong>。Transformers 实现展示了如何在本地运行模型，这对于数据隐私要求高的场景非常有价值。数据不出本地，完全可控。</p>
+<p>总的来说，Spring AI 的大模型集成实现<strong>既统一又灵活</strong>。统一的接口让代码简洁，灵活的实现让每个提供商都能发挥自己的优势。这种设计让 Spring AI 能够支持 20+ 种不同的模型提供商，同时保持代码的可维护性。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-11-20 21:32">2025-11-20 21:32</span>&nbsp;
+<a href="https://www.cnblogs.com/wasp520">wasp</a>&nbsp;
+阅读(<span id="post_view_count">4</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19249628);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19249628', targetLink: 'https://www.cnblogs.com/wasp520/p/19249628', title: 'Spring AI 代码分析（三）--集成LLM' })">举报</a>
+</div>
+        
