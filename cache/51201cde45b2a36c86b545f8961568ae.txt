@@ -1,0 +1,404 @@
+
+		<h1 class="postTitle">
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xingzheanan/p/19263509" title="发布于 2025-11-24 12:08">
+    <span role="heading" aria-level="2">go ants pool 协程池学习笔记</span>
+    
+
+</a>
+
+		</h1>
+		<div class="clear"></div>
+		<div class="postBody">
+			<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<hr>
+<h1 id="概述">概述</h1>
+<p>使用 Go 开发并发程序很容易，一个 <code>go</code> 关键字就可以启动协程处理任务。Go 创建一个 goroutine 只需要 2K 内存空间，并且 go 协程上下文信息仅存储在两个寄存器中，对于 Go 运行时来说，切换上下文特别快。</p>
+<p>不过凡事不加限制就会出问题，如果不加节制的滥用 goroutine 就可能导致内存泄露，增加 Go 运行时调度负担等。</p>
+<p>下面看一段 Go http 标准库的代码：</p>
+<pre><code class="language-go">func (s *Server) Serve(l net.Listener) error {
+	for {
+	   ...
+	   c := s.newConn(rw)
+	   go c.serve(connCtx)  
+	}  
+}
+</code></pre>
+<p>当来一个 http 请求，http 会启动一个协程 <code>Server.serve()</code> 处理该请求。<br>
+这种方式对于请求的响应很快，但是如果有恶意大规模并发请求，就可能导致后端服务内存爆增，响应慢等问题。</p>
+<p>测试千万并发的内存使用情况如下：</p>
+<pre><code class="language-go">const n = 10000000
+    
+func demoFunc() {  
+    time.Sleep(time.Duration(BenchParam) * time.Millisecond)  
+}
+
+func TestNoPool(t *testing.T) {  
+    var start, end runtime.MemStats  
+    runtime.ReadMemStats(&amp;start)  
+    var wg sync.WaitGroup  
+    for i := 0; i &lt; n; i++ {  
+       wg.Add(1)  
+       go func() {  
+          demoFunc()  
+          wg.Done()  
+       }()  
+    }  
+    wg.Wait()  
+    runtime.ReadMemStats(&amp;end)  
+    usageMem := end.TotalAlloc/MiB - start.TotalAlloc/MiB  
+    t.Logf("memory usage:%d MB", usageMem)  
+}
+</code></pre>
+<p>测试结果：</p>
+<pre><code class="language-bash"> go test -v -bench=. -benchmem -run=TestNoPool
+=== RUN   TestNoPool
+    ants_test.go:41: memory usage:1304 M
+--- PASS: TestNoPool (5.70s）
+</code></pre>
+<p>当并发量到千万时，内存使用率达到了 1 个多 G，看起来好像不多。不过可别忘了，这里处理的任务只是 <code>time.Sleep</code>，如果每个协程处理内存型或 IO 型任务，那该是多大内存或者 CPU 的消耗，并且调度如此多的协程也会让 Go 运行时（调度器，GC）的压力非常大。</p>
+<p>因此，需要协程池来限制协程的使用，起到稳定内存使用率，减轻 Go 运行时负担的目的。</p>
+<h1 id="协程池">协程池</h1>
+<p>既然协程池的主要任务是限制协程的数量，那么作为池应该有几个需求是要实现的：</p>
+<ul>
+<li>协程池生命周期管理，包括创建，释放等操作；</li>
+<li>协程池的扩缩容，按需使用；</li>
+<li>协程池中过期协程的清理；</li>
+</ul>
+<p><a href="https://github.com/panjf2000/ants" target="_blank" rel="noopener nofollow">ants</a> 是一个满足上述需求的高性能协程池。本文重点学习 <code>ants</code> 的源码了解协程池。</p>
+<h1 id="ants-协程池">ants 协程池</h1>
+<h2 id="结构">结构</h2>
+<p>首先看代码的层次结构，作为一个协程池库，ants 很扁平，只有一层：</p>
+<pre><code class="language-bash">tree
+.
+├── CODE_OF_CONDUCT.md
+├── CONTRIBUTING.md
+├── LICENSE
+├── README.md
+├── README_ZH.md
+├── ants.go
+├── ants_benchmark_test.go
+├── ants_test.go
+├── example_test.go
+├── go.mod
+├── go.sum
+├── multipool.go
+├── multipool_func.go
+├── multipool_func_generic.go
+├── options.go
+├── pkg
+│&nbsp;&nbsp; └── sync
+│&nbsp;&nbsp;     ├── spinlock.go
+│&nbsp;&nbsp;     ├── spinlock_test.go
+│&nbsp;&nbsp;     └── sync.go
+├── pool.go
+├── pool_func.go
+├── pool_func_generic.go
+├── worker.go
+├── worker_func.go
+├── worker_func_generic.go
+├── worker_loop_queue.go
+├── worker_loop_queue_test.go
+├── worker_queue.go
+├── worker_stack.go
+└── worker_stack_test.go
+</code></pre>
+<p>从结构可以看出，主要分为三类：</p>
+<ul>
+<li>pool：实现了协程池，是暴露给用户调用的对象；</li>
+<li>workqueue：工作队列，负责装载工作协程，其接口实现是 <code>worker_stack</code> 和 <code>worker_loop_queue</code> 对象；</li>
+<li>worker：工作协程，是实际执行任务的协程；</li>
+</ul>
+<p>这个结构还是很清晰的，就不画 UML 图表示了。</p>
+<h2 id="流程">流程</h2>
+<h3 id="设计">设计</h3>
+<p>在看流程图之前，先自己想一下，如果让我设计协程池该如何做呢？</p>
+<p>平时开发用的比较多的是类似这样的写法：</p>
+<pre><code class="language-go">for i := 0; i &lt; workerNumber; i++ {
+	go worker()
+}
+
+func worker() {
+	for task := range taskC {
+		doTask()
+	}
+}
+</code></pre>
+<p>程序运行时启动 <code>workerNumber</code> 个协程监听同一个通道 <code>taskC</code>，如果 <code>taskC</code> 有 <code>task</code>，多个协程 <code>worker</code> 会抢 <code>task</code> 并调用 <code>doTask()</code> 处理任务。</p>
+<p>这种写法的好处在于简单，缺点在于协程数固定，不能按需灵活使用，而且在程序启动时，<code>workerNumber</code> 个协程就开始运行，如果没有 <code>task</code> 会造成资源浪费。</p>
+<p>这种写法对于数量少的协程还行，如果并发过大则需要上协程池了。</p>
+<p>使用协程池，还是让 <code>worker</code> 去监听 <code>taskC</code>，不同的是每个 <code>worker</code> 都有自己的 <code>taskC</code>，这样设计的好处是协程 <code>worker</code> 不会打架。</p>
+<p>让每个 <code>worker</code> 监听自己的通道，那谁来管理这些 <code>worker</code> 呢？我们可以将这些 <code>worker</code> 存入容器（堆或栈）中。让容器对象来管理 <code>worker</code>，包括插入 <code>worker</code> 到容器，弹出 <code>worker</code> 出容器等。</p>
+<p>现在 <code>worker</code> 在容器中了，那什么时候该插入 <code>worker</code> 到容器，什么时候该弹出 <code>worker</code> 呢？</p>
+<p>我们想每个 <code>worker</code> 都监听自己的通道，如果 <code>worker</code> 执行完任务就可以插入 <code>worker</code> 到容器，插入 <code>worker</code> 到容器的意思是，该 <code>worker</code> 可用，可以被拿出来执行任务。<br>
+这是插入逻辑，对于弹出，如果生产者需要往 <code>worker</code> 的通道中写任务，发现容器中有一个 <code>worker</code> 可用，就可以从容器中弹出 <code>worker</code> 给生产者使用。弹出的意思是，该 <code>worker</code> 我用了，别人不能在用了。</p>
+<p>那么，谁是生产者呢？<br>
+生产者是客户端调用 <code>pool</code> 方法将任务写入 <code>pool</code> 对象，<code>pool</code> 对象从容器中获取可用的 <code>worker</code>，并往该 <code>worker</code> 的通道写入任务。</p>
+<p>至此，主要的逻辑都走通了。</p>
+<p>还有一点是容器该用栈还是用队列呢？<br>
+<code>worker</code> 写入容器后，如果长时间不用的话需要清理，清理需要按照时间排序。队列是符合这种需求的数据结构（按时间顺序，先进先出）。</p>
+<h3 id="流程图">流程图</h3>
+<p><code>ants</code> 的流程图如下：</p>
+<p><img alt="ants_pool" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1498760/202511/1498760-20251124120717644-1366900017.png" class="lazyload"></p>
+<p><em>图片来源于 <a href="https://github.com/panjf2000/ants/blob/dev/README_ZH.md" target="_blank" rel="noopener nofollow">Github ants</a></em></p>
+<p>结合图片看源码应该会很清晰，这里不在赘述了。</p>
+<h2 id="ants-源码实现">ants 源码实现</h2>
+<p>光了解流程还不够，<code>ants</code> 能在众多协程池中脱颖而出，肯定有它的过人之处。下面从细节出发看源码中有哪些过人之处，毕竟细节是魔鬼。</p>
+<h3 id="syncpool-对象复用">sync.Pool 对象复用</h3>
+<p>作为协程池，需要频繁创建 <code>worker</code> 对象。<code>ants</code> 使用 <code>sync.Pool</code> 作为对象缓存，复用 <code>worker</code> 对象，降低频繁创建销毁对象导致的内存开销。</p>
+<pre><code class="language-go">type poolCommon struct {
+	workerCache sync.Pool
+}
+
+func NewPool(size int, options ...Option) (*Pool, error) {  
+    ...
+    
+    // sync.Pool 创建对象
+    pool.workerCache.New = func() any {  
+       return &amp;goWorker{  
+          pool: pool,  
+          task: make(chan func(), workerChanCap),  
+       }  
+    }  
+  
+    return pool, nil  
+}
+
+func (p *poolCommon) retrieveWorker() (w worker, err error) {
+	...
+	if capacity := p.Cap(); capacity == -1 || capacity &gt; p.Running() {  
+    p.lock.Unlock()  
+    // 从 sync.Pool 中取 worker 对象
+    w = p.workerCache.Get().(worker)  
+    w.run()  
+    return  
+}
+</code></pre>
+<h3 id="syncspinlock">sync.spinLock</h3>
+<p><code>ants</code> 实现了指数退避锁，如下：</p>
+<pre><code class="language-go">type spinLock uint32  
+  
+const maxBackoff = 16  
+  
+func (sl *spinLock) Lock() {  
+    backoff := 1  
+    for !atomic.CompareAndSwapUint32((*uint32)(sl), 0, 1) {  
+       // Leverage the exponential backoff algorithm, see https://en.wikipedia.org/wiki/Exponential_backoff.  
+       for i := 0; i &lt; backoff; i++ {  
+          runtime.Gosched()  
+       }  
+       if backoff &lt; maxBackoff {  
+          backoff &lt;&lt;= 1  
+       }  
+    }  
+}
+</code></pre>
+<p>作为高并发协程池，多个协程抢锁是常态。如果协程长期占有锁，其它协程一直在抢锁会造成资源浪费。<code>ants</code> 使用指数退避算法抢锁减少长时间占有锁的资源抢占。</p>
+<p>并且，当抢不到锁时 <code>ants</code> 使用 <code>runtime.Gosched</code> 出让 <code>CPU</code>，而不是空转等待锁（空转协程会一直占用 CPU）。主动出让，而不是被动等待运行时请出 CPU 更加合理且快速，也让其它协程更快的执行抢占逻辑，雨露均沾。</p>
+<p>执行基准测试看几种类型锁的执行性能：</p>
+<pre><code class="language-go">func BenchmarkMutex(b *testing.B) {  
+    m := sync.Mutex{}  
+    b.RunParallel(func(pb *testing.PB) {  
+       for pb.Next() {  
+          m.Lock()  
+          //nolint:staticcheck  
+          m.Unlock()  
+       }  
+    })  
+}  
+  
+type spinLock uint32  
+  
+func (s *spinLock) Lock() {  
+    for !atomic.CompareAndSwapUint32((*uint32)(s), 0, 1) {  
+    }  
+}  
+  
+func (s *spinLock) Unlock() {  
+    atomic.StoreUint32((*uint32)(s), 0)  
+}  
+  
+func newSpinLock() *spinLock {  
+    return (*spinLock)(new(uint32))  
+}  
+  
+func BenchmarkSpinLock(b *testing.B) {  
+    m := newSpinLock()  
+    b.RunParallel(func(pb *testing.PB) {  
+       for pb.Next() {  
+          m.Lock()  
+          //nolint:staticcheck  
+          m.Unlock()  
+       }  
+    })  
+}  
+  
+type backoffSpinLock uint32  
+  
+var backoff = 16  
+  
+func (s *backoffSpinLock) Lock() {  
+    i := 1  
+    for !atomic.CompareAndSwapUint32((*uint32)(s), 0, 1) {  
+       if i == backoff {  
+          continue  
+       }  
+       i &lt;&lt;= 1  
+    }  
+}  
+  
+func (s *backoffSpinLock) Unlock() {  
+    atomic.StoreUint32((*uint32)(s), 0)  
+}  
+  
+func newBackoffSpinLock() *backoffSpinLock {  
+    return (*backoffSpinLock)(new(uint32))  
+}  
+  
+func BenchmarkBackoffSpinLock(b *testing.B) {  
+    m := newBackoffSpinLock()  
+    b.RunParallel(func(pb *testing.PB) {  
+       for pb.Next() {  
+          m.Lock()  
+          //nolint:staticcheck  
+          m.Unlock()  
+       }  
+    })  
+}  
+  
+type spinSchedLock uint32  
+  
+func (s *spinSchedLock) Lock() {  
+    for !atomic.CompareAndSwapUint32((*uint32)(s), 0, 1) {  
+       runtime.Gosched()  
+    }  
+}  
+  
+func (s *spinSchedLock) Unlock() {  
+    atomic.StoreUint32((*uint32)(s), 0)  
+}  
+  
+func newSpinSchedLock() *spinSchedLock {  
+    return (*spinSchedLock)(new(uint32))  
+}  
+  
+func BenchmarkSpinSchedLock(b *testing.B) {  
+    m := newSpinSchedLock()  
+    b.RunParallel(func(pb *testing.PB) {  
+       for pb.Next() {  
+          m.Lock()  
+          //nolint:staticcheck  
+          m.Unlock()  
+       }  
+    })  
+}  
+  
+type backoffSpinSchedLock uint32  
+  
+var maxBackoff = 16  
+  
+func (s *backoffSpinSchedLock) Lock() {  
+    backoff := 1  
+    for !atomic.CompareAndSwapUint32((*uint32)(s), 0, 1) {  
+       for i := 0; i &lt; backoff; i++ {  
+          runtime.Gosched()  
+       }  
+       if backoff &lt; maxBackoff {  
+          backoff &lt;&lt;= 1  
+       }  
+    }  
+}  
+  
+func (s *backoffSpinSchedLock) Unlock() {  
+    atomic.StoreUint32((*uint32)(s), 0)  
+}  
+  
+func newBackoffSpinSchedLock() *backoffSpinSchedLock {  
+    return (*backoffSpinSchedLock)(new(uint32))  
+}  
+  
+func BenchmarkBackoffSpinSchedLock(b *testing.B) {  
+    m := newBackoffSpinSchedLock()  
+    b.RunParallel(func(pb *testing.PB) {  
+       for pb.Next() {  
+          m.Lock()  
+          //nolint:staticcheck  
+          m.Unlock()  
+       }  
+    })  
+}
+</code></pre>
+<p>测试结果：</p>
+<pre><code class="language-bash"> go test -v -bench=. -benchmem -run=^$
+goos: darwin
+goarch: arm64
+pkg: github.com/xiahuyun/go-library/ants
+cpu: Apple M3
+BenchmarkMutex
+BenchmarkMutex-8                        17903019                69.40 ns/op            0 B/op          0 allocs/op
+BenchmarkSpinLock
+BenchmarkSpinLock-8                     15894223               130.3 ns/op             0 B/op          0 allocs/op
+BenchmarkBackoffSpinLock
+BenchmarkBackoffSpinLock-8              10448190               124.0 ns/op             0 B/op          0 allocs/op
+BenchmarkSpinSchedLock
+BenchmarkSpinSchedLock-8                339347601                3.026 ns/op           0 B/op          0 allocs/op
+BenchmarkBackoffSpinSchedLock
+BenchmarkBackoffSpinSchedLock-8         400970906                2.641 ns/op           0 B/op          0 allocs/op
+</code></pre>
+<p>可以看到在众多锁中 <code>ants</code> 的指数退避锁表现最好。</p>
+<h3 id="purge-worker">purge worker</h3>
+<p><code>ants</code> 使用一个清理协程定时清理 <code>workerQueue</code> 中的协程（ants 通过二分查找确定哪些协程是过期需要清理的，非常高效）：</p>
+<h3 id="ticktock">ticktock</h3>
+<p><code>ants</code> 中 <code>worker</code> 在放入队列时需要记录自己放入队列的时间，<code>purgeWorker</code> 会根据该时间确定哪些 <code>worker</code> 需要清理。</p>
+<p>如果每个 <code>worker</code> 调用 <code>time.Now()</code> 记录时间，会造成系统资源浪费，<code>time.Now</code> 会执行系统调用，涉及内核态/用户态的切换。</p>
+<p><code>ants</code> 使用 <code>ticktock</code> 协程周期性的调用 <code>time.Now</code> 生成时间戳并存到 <code>pool</code> 对象池中。<code>worker</code> 在记录时间放入队列时，只需要从对象池拿时间戳就行，显著避免系统资源消耗：</p>
+<pre><code class="language-go">func (p *poolCommon) ticktock() {  
+    ticker := time.NewTicker(nowTimeUpdateInterval)  
+    defer func() {  
+       ticker.Stop()  
+       atomic.StoreInt32(&amp;p.ticktockDone, 1)  
+    }()  
+  
+    ticktockCtx := p.ticktockCtx // copy to the local variable to avoid race from Reboot()  
+    for {  
+       select {  
+       case &lt;-ticktockCtx.Done():  
+          return  
+       case &lt;-ticker.C:  
+       }  
+  
+       if p.IsClosed() {  
+          break  
+       }  
+  
+	   // 记录当前时间到 pool 对象池
+       p.now.Store(time.Now())  
+    }  
+}
+</code></pre>
+<h1 id="总结">总结</h1>
+<p><code>ants</code> 是一个被广泛使用的高性能协程池，特别适合学习，了解协程池的实现。本文从整体到细节介绍 <code>ants</code> 的实现，希望对大家有所帮助，感谢。</p>
+<h1 id="参考资料">参考资料</h1>
+<ul>
+<li><a href="https://strikefreedom.top/archives/high-performance-implementation-of-goroutine-pool" target="_blank" rel="noopener nofollow">GMP 并发调度器深度解析之手撸一个高性能 goroutine pool</a></li>
+<li><a href="https://www.cnblogs.com/yjf512/p/18058462" target="_blank">ants - 目前开源最优的协程池</a></li>
+<li><a href="https://www.cnblogs.com/xingzheanan/p/19204669" target="_blank">go sync.pool 学习笔记</a></li>
+</ul>
+<hr>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    芝兰生于空谷，不以无人而不芳。
+</div>
+<div class="clear"></div>
+
+		</div>
+		<div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.001388888888888889" data-date-updated="2025-11-24 12:10">2025-11-24 12:08</span>&nbsp;
+<a href="https://www.cnblogs.com/xingzheanan">胡云Troy</a>&nbsp;
+阅读(<span id="post_view_count">1</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19263509);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19263509', targetLink: 'https://www.cnblogs.com/xingzheanan/p/19263509', title: 'go ants pool 协程池学习笔记' })">举报</a>
+</div>
+	
