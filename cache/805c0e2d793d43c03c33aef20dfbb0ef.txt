@@ -1,0 +1,316 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/lylhqy/p/19290670" title="发布于 2025-12-01 11:41">
+    <span role="heading" aria-level="2">申威 SW64 适配 Nacos 2.x/3.x：RocksDB  编译、瘦身与完整打包指南</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<hr>
+<h1 id="实战-申威-sw64-适配-nacos-2x3xrocksdb-881-编译瘦身与完整打包指南">[实战] 申威 SW64 适配 Nacos 2.x/3.x：RocksDB 8.8.1 编译、瘦身与完整打包指南</h1>
+<h2 id="前言">前言</h2>
+<p>在信创国产化替代的大背景下，将中间件迁移至 <strong>申威 SW64（sw_64）</strong> 架构是常见需求。Nacos 2.x 版本（1.4前没有）引入了 JRaft 协议，底层强依赖 <strong>RocksDB</strong> 进行数据存储。</p>
+<p>然而，官方发布的 Nacos 包中内置的 RocksDB 动态库缺少申威的 <code>librocksdbjni.so</code>，在申威服务器上启动时会报 <code>UnsatisfiedLinkError</code>。此外，由于 SW64 架构特性，直接编译源码会因“无硬件计时器”报 <code>No timer implementation</code> 错误。</p>
+<p>本文记录了在 <strong>SW64 + glibc 2.28</strong> 环境下，从源码编译 RocksDB 8.8.1，<strong>解决计时器报错</strong>，并通过 <strong>Release 模式与 Strip 优化</strong> 将动态库体积从 200MB+ 缩减至 20MB 左右，最后演示如何通过<strong>手动替换</strong>或<strong>Maven集成</strong>的方式，将其无缝替换进 Nacos，截止25.12.01，<code>nacos2.5.x-3.x</code>,都使用的<code>RocksDB 8.8.1</code>（2023年发布版本）</p>
+<h2 id="1-环境信息">1. 环境信息</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">项目</th>
+<th style="text-align: left">值</th>
+<th style="text-align: left">说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left"><strong>CPU</strong></td>
+<td style="text-align: left">sunway/(3231/WX-8000)</td>
+<td style="text-align: left">sw_64 架构</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>OS</strong></td>
+<td style="text-align: left">麒麟 / 统信 UOS</td>
+<td style="text-align: left">基于 glibc 2.28</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>JDK</strong></td>
+<td style="text-align: left">SWJDK 8u312</td>
+<td style="text-align: left">必须包含 <code>javac</code> 和 <code>jni.h</code></td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>RocksDB</strong></td>
+<td style="text-align: left">8.8.1</td>
+<td style="text-align: left">Nacos 2.x/3.x 依赖版本（截止25.12.01）</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>GCC</strong></td>
+<td style="text-align: left">8.3.0+</td>
+<td style="text-align: left">支持 sw_64 指令集即可</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>Maven</strong></td>
+<td style="text-align: left">3.6.0+</td>
+<td style="text-align: left">建议较新版本，用于依赖管理</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>注意问题</strong>：SW64 用户态没有可读的 Cycle Counter 寄存器，导致 RocksDB 默认计时逻辑在编译时就会报错，需手动补全，当然很久接触内核cpu之类的，可能是我没找到。</p>
+</blockquote>
+<h2 id="2-准备编译环境">2. 准备编译环境</h2>
+<p>RocksDB 的 JNI 编译需要 JDK 开发包（Headers）以及一系列压缩库的开发包。</p>
+<pre><code class="language-bash"># 1. 安装 SWJDK 开发包 (确保有 javac)
+sudo yum install -y java-1.8.0-swjdk-devel.sw_64
+
+# 2. 设置环境变量 (编译脚本强依赖 JAVA_HOME)
+export JAVA_HOME=/usr/lib/jvm/java-1.8.0-swjdk-8u312.sw_64
+export PATH=$JAVA_HOME/bin:$PATH
+
+# 3. 安装 C++ 编译工具链及压缩库依赖
+# zlib, snappy, lz4, zstd 是 RocksDB 性能关键
+sudo yum install -y gcc gcc-c++ make cmake \
+  zlib-devel snappy-devel lz4-devel zstd-devel
+</code></pre>
+<h2 id="3-源码下载与-sw64-计时器补丁">3. 源码下载与 SW64 计时器补丁</h2>
+<p>RocksDB 内部使用 <code>toku_time</code> 获取高精度时间，源码中未适配 SW64。如果不修改，执行 <code>make</code> 时会直接报错 <code>#error No timer implementation</code>。</p>
+<h3 id="31-下载源码">3.1 下载源码</h3>
+<pre><code class="language-bash">wget https://github.com/facebook/rocksdb/archive/refs/tags/v8.8.1.tar.gz
+tar xf v8.8.1.tar.gz
+cd rocksdb-8.8.1
+</code></pre>
+<h3 id="32-修复-no-timer-implementation-关键">3.2 修复 <code>No timer implementation</code> (关键)</h3>
+<p>编辑文件：<code>utilities/transactions/lock/range/range_tree/lib/portability/toku_time.h</code></p>
+<p>在文件末尾的 <code>#elif defined(...)</code> 链条中，加入 SW64 的 <code>clock_gettime</code> 实现。</p>
+<p><strong>修改方法</strong>：找到 <code>#else #error No timer implementation...</code> 之前，插入以下代码：</p>
+<pre><code class="language-cpp">// ----------------- 新增开始 -----------------
+#elif defined(__sw_64__) || defined(__SW64__) || defined(__sw_64)
+  // SW64 补丁：使用 clock_gettime 替代硬件计数器
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &amp;ts);
+  // 返回纳秒级时间，符合 tokutime_t 特性
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+// ----------------- 新增结束 -----------------
+
+#else
+#error No timer implementation for this platform
+#endif
+</code></pre>
+<h2 id="4-编译优化与瘦身关键步骤">4. 编译优化与瘦身（关键步骤）</h2>
+<p>很多同学编译出来的 <code>librocksdbjni.so</code> 动辄 300MB，这在生产环境是不可接受的。<br>
+<strong>原因分析</strong>：</p>
+<ol>
+<li><strong>未 Strip</strong>：包含了大量供 GDB 使用的调试信息。</li>
+<li><strong>静态链接</strong>：RocksDB 为了可移植性（Portable），将 Snappy/Zstd 等库静态打入了 so 中。</li>
+<li><strong>Debug 模式</strong>：默认 CMake 配置可能未开启 <code>-O3</code> 优化。</li>
+</ol>
+<h3 id="41-执行优化编译">4.1 执行优化编译</h3>
+<p>我们显式指定 <code>Release</code> 模式，并在编译后执行 <code>strip</code>。</p>
+<pre><code class="language-bash"># 1. 创建构建目录
+mkdir build-sw64-opt &amp;&amp; cd build-sw64-opt
+# 2. CMake 配置
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFAIL_ON_WARNINGS=OFF \
+  -DWITH_JEMALLOC=OFF \
+  -DWITH_SNAPPY=ON \
+  -DWITH_LZ4=ON \
+  -DWITH_ZLIB=ON \
+  -DWITH_ZSTD=ON \
+  -DPORTABLE=ON
+
+# 3. 并行编译核心库与 JNI 接口
+# PORTABLE=1 确保生成的指令集通用性
+# nproc代表多少个线程
+PORTABLE=1 make rocksdbjava -j$(nproc)
+</code></pre>
+<h3 id="42-手动瘦身-strip">4.2 手动瘦身 (Strip)</h3>
+<p>编译完成后，在 <code>java/target/</code> 下会生成库文件（通常是 <code>librocksdbjni-8.8.1-linux.so</code>）。</p>
+<pre><code class="language-bash">cd ../java/target/
+
+# 查看原始大小
+ls -lh librocksdbjni*.so
+
+# 【建议】方案 A：仅移除 Debug 信息（安全，保留符号表供 Java 调用）
+strip --strip-debug librocksdbjni-8.8.1-linux*.so
+
+# 【激进】方案 B：移除所有符号（体积最小，可能丢失部分堆栈信息）
+# sudo strip --strip-unneeded librocksdbjni-8.8.1-linux*.so
+
+# 再次查看大小，通常在 10MB - 20MB 之间，完美！
+ls -lh librocksdbjni*.so
+</code></pre>
+<hr>
+<h2 id="5-两种适配路径源码修改-vs-暴力替换">5. 两种适配路径：源码修改 vs 暴力替换</h2>
+<p>你可以选择 <strong>"正确" (修改 Java 源码)</strong> 或者 <strong>"邪道" (重命名库文件)</strong>。</p>
+<h3 id="路径一源码级适配推荐彻底解决">路径一：源码级适配（推荐，彻底解决）</h3>
+<p>我们修改 RocksDB 的 Java 源码，让它完美支持申威架构。</p>
+<h4 id="1-修改-environmentjava">1. 修改 <code>Environment.java</code></h4>
+<p>文件：<code>java/src/main/java/org/rocksdb/util/Environment.java</code><br>
+<strong>Step 1: 添加 <code>isSW64()</code> 方法</strong></p>
+<pre><code class="language-java">  private static boolean isSW64() {
+    // 申威架构在 Java os.arch 中通常返回 "sw_64"，为了保险把 "sw64" 也加上
+    return ARCH.equals("sw_64") || ARCH.equals("sw64");
+  }
+</code></pre>
+<p><strong>Step 2: 修改 <code>getJniLibraryName</code> 方法</strong></p>
+<pre><code class="language-java">  public static String getJniLibraryName(final String name) {
+    if (isUnix()) {
+      final String arch = is64Bit() ? "64" : "32";
+      if (isPowerPC() || isAarch64()) {
+        return String.format("%sjni-linux-%s%s", name, ARCH, getLibcPostfix());
+      }
+      // ... (其他分支)
+      // ----------------- 新增 SW64 分支 -----------------
+      else if (isSW64()) {
+        // 强制返回 "rocksdbjni-linux-sw_64"
+        // 这样 NativeLibraryLoader 就会去拼成 librocksdbjni-linux-sw_64.so
+        return String.format("%sjni-linux-sw_64", name);
+      }
+      // ----------------- 新增结束 -----------------
+      else {
+        return String.format("%sjni-linux%s%s", name, arch, getLibcPostfix());
+      }
+    }
+    // ...
+</code></pre>
+<h4 id="2-修改-makefile-可选">2. 修改 <code>Makefile</code> (可选)</h4>
+<p>为了让 <code>make</code> 自动生成的 so 文件名带上 <code>sw_64</code> 后缀：</p>
+<pre><code class="language-makefile"># 找到判断 MACHINE 的部分，添加 sw_64
+ifneq (,$(filter ppc% s390x arm64 aarch64 sparc64 loongarch64 sw_64, $(MACHINE)))
+	ROCKSDBJNILIB = librocksdbjni-linux-$(MACHINE)$(JNI_LIBC_POSTFIX).so
+else
+	ROCKSDBJNILIB = librocksdbjni-linux$(ARCH)$(JNI_LIBC_POSTFIX).so
+endif
+</code></pre>
+<h4 id="3-重新编译-jar-包">3. 重新编译 JAR 包</h4>
+<pre><code class="language-bash"># 回到 rocksdb 根目录
+cd ../..
+export JAVA_HOME=/usr/lib/jvm/java-1.8.0-swjdk-8u312.sw_64
+
+# 清理并重新编译
+make jclean
+make rocksdbjava -j$(nproc)
+</code></pre>
+<p>此时 <code>java/target/</code> 下的 jar 包已经是包含 <code>librocksdbjni-linux-sw_64.so</code> 的完全体了。</p>
+<h3 id="路径二暴力替换重命名欺骗">路径二：暴力替换（重命名欺骗）</h3>
+<p>如果不想改代码，可以将编译出的 <code>sw_64</code> so 文件重命名为 <code>librocksdbjni-linux64.so</code>。<br>
+<strong>原理</strong>：官方 JNI 加载器在匹配不到架构时，通常会回退尝试加载 <code>linux64</code> 的库。</p>
+<ol>
+<li>将 <code>librocksdbjni-8.8.1-linux.so</code> 重命名为 <code>librocksdbjni-linux64.so</code>。</li>
+<li>更新到 jar 包中：<pre><code class="language-bash">jar uf rocksdbjni-8.8.1.jar librocksdbjni-linux64.so
+</code></pre>
+</li>
+</ol>
+<hr>
+<h2 id="6-nacos-集成方案">6. Nacos 集成方案</h2>
+<h3 id="方案-amaven-本地安装最规范适合重编译-nacos">方案 A：Maven 本地安装（最规范，适合重编译 Nacos）</h3>
+<p>如果你有 Nacos 源码，想重新打个干净的包：</p>
+<pre><code class="language-bash"># 1. 安装到本地 Maven 仓库
+# 假设你在 rocksdb-8.8.1/java/target 目录下
+mvn install:install-file \
+  -Dfile=rocksdbjni-8.8.1.jar \
+  -DgroupId=org.rocksdb \
+  -DartifactId=rocksdbjni \
+  -Dversion=8.8.1 \
+  -Dpackaging=jar
+
+# 2. 编译 Nacos
+cd nacos-source
+mvn -Prelease-nacos -Dmaven.test.skip=true clean install -U
+</code></pre>
+<h3 id="方案-bjar-包修改最实战适合已有-nacos-包">方案 B：Jar 包修改（最实战，适合已有 Nacos 包）</h3>
+<p>Nacos Server 是一个 Spring Boot Fat Jar，内部嵌套了多层 Jar 包。直接解压替换容易导致签名错误或包结构损坏，请严格按以下步骤操作。</p>
+<p><strong>假设</strong>：</p>
+<ul>
+<li>Nacos 安装包：<code>nacos-server.jar</code></li>
+<li>新编译的库：<code>rocksdbjni-8.8.1.jar</code> (上面编译出来的)</li>
+</ul>
+<h4 id="步骤-1解压外层-jar">步骤 1：解压外层 Jar</h4>
+<pre><code class="language-bash">mkdir work_dir &amp;&amp; cd work_dir
+cp /path/to/nacos-server.jar .
+
+# 解压
+jar -xf nacos-server.jar
+# 此时目录包含：BOOT-INF, META-INF, org ...
+</code></pre>
+<h4 id="步骤-2定位并替换-rocksdb-依赖">步骤 2：定位并替换 RocksDB 依赖</h4>
+<p>RocksDB 的 Jar 包位于 <code>BOOT-INF/lib/</code> 下。</p>
+<pre><code class="language-bash">cd BOOT-INF/lib/
+
+# 备份原版
+mv rocksdbjni-8.8.1.jar rocksdbjni-8.8.1.jar.bak
+
+# 【关键】将我们编译好的 jar 拷贝进来
+cp /path/to/your/compiled/rocksdbjni-8.8.1.jar .
+</code></pre>
+<blockquote>
+<p><strong>补充：如果你只有 .so 文件，想手动塞进这个 jar：</strong></p>
+<pre><code class="language-bash">mkdir temp_rocks &amp;&amp; cd temp_rocks
+jar -xf ../rocksdbjni-8.8.1.jar
+cp /path/to/your/librocksdbjni-linux-sw_64.so .
+jar -cfM ../rocksdbjni-8.8.1.jar .
+cd .. &amp;&amp; rm -rf temp_rocks
+</code></pre>
+</blockquote>
+<h4 id="步骤-3重新打包外层-nacos-jar-必须注意压缩参数">步骤 3：重新打包外层 Nacos Jar (必须注意压缩参数)</h4>
+<p>回到 <code>work_dir</code> 根目录。</p>
+<pre><code class="language-bash">cd ../.. 
+
+# 重新打包为 nacos-server-sw64.jar
+# -0 (数字0): 仅存储不压缩。Spring Boot 外层 Jar 推荐不压缩，提高启动速度，防止 Loader 报错
+# -c 创建, -f 文件, -M 不生成新清单
+jar -cfM0 nacos-server-sw64.jar .
+</code></pre>
+<hr>
+<h2 id="7-验证与总结">7. 验证与总结</h2>
+<p>将生成的 <code>nacos-server-sw64.jar</code> 部署到申威服务器。</p>
+<h3 id="71-启动验证">7.1 启动验证</h3>
+<pre><code class="language-bash">sh bin/startup.sh -m standalone
+</code></pre>
+<h3 id="72-日志检查">7.2 日志检查</h3>
+<p>查看 <code>logs/nacos.log</code>，重点关注是否有以下报错：</p>
+<ul>
+<li><code>UnsatisfiedLinkError</code>: 说明 so 文件没加载到，或者名字不对。</li>
+<li><code>SIGILL</code> (非法指令): 说明编译时没加 <code>PORTABLE=ON</code>，或者用了错误的 GCC。<br>
+正常的话<br>
+<img src="https://img2024.cnblogs.com/blog/2112865/202512/2112865-20251201100411292-628613963.png" alt="8c4e6239ee0631a0f1dc804c2a07a997" loading="lazy"></li>
+</ul>
+<h3 id="73-无-vnc-环境验证-curl-测试">7.3 无 VNC 环境验证 (Curl 测试)</h3>
+<p>在没有图形界面的情况下，使用 curl 验证 RocksDB 功能。</p>
+<p><strong>测试配置写入 (Write Test):</strong></p>
+<pre><code class="language-bash">curl -X POST 'http://127.0.0.1:8848/nacos/v1/cs/configs' \
+-d 'dataId=sw64-test' \
+-d 'group=DEFAULT_GROUP' \
+-d 'content=RocksDB_Works_On_SW64'
+# 预期返回: ok之类
+</code></pre>
+<p><strong>测试配置读取 (Read Test):</strong></p>
+<pre><code class="language-bash">curl -X GET 'http://127.0.0.1:8848/nacos/v1/cs/configs?dataId=sw64-test&amp;group=DEFAULT_GROUP'
+# 预期返回: RocksDB_Works_On_SW64
+</code></pre>
+<h3 id="避坑指南总结">避坑指南总结</h3>
+<ol>
+<li><strong>必须补全代码</strong>：没有 <code>toku_time</code> 的 sw_64 分支，RocksDB 无法编译。</li>
+<li><strong>一定要 Strip</strong>：不 strip 的库文件巨大，不仅占磁盘，Nacos 启动加载会非常慢。</li>
+<li><strong>打包参数</strong>：重打 Spring Boot Jar 时，务必使用 <code>jar -cfM0</code>，不要用 Zip 工具，否则大概率报 <code>Unable to find main class</code>。</li>
+<li><strong>Java 版本</strong>：编译 JNI 时，<code>JAVA_HOME</code> 必须指向 SWJDK 的 devel 包路径，否则找不到 <code>jni.h</code>。</li>
+</ol>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-12-01 11:41">2025-12-01 11:41</span>&nbsp;
+<a href="https://www.cnblogs.com/lylhqy">旧信</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19290670);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19290670', targetLink: 'https://www.cnblogs.com/lylhqy/p/19290670', title: '申威 SW64 适配 Nacos 2.x/3.x：RocksDB  编译、瘦身与完整打包指南' })">举报</a>
+</div>
+        

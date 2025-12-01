@@ -1,0 +1,375 @@
+
+		<h1 class="postTitle">
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/imadc/p/19002991" title="发布于 2025-07-24 20:08">
+    <span role="heading" aria-level="2">本可避免的P1事故：Nginx变更导致网关请求均响应400</span>
+    
+
+</a>
+
+		</h1>
+		<div class="clear"></div>
+		<div class="postBody">
+			<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h5 id="问题背景">问题背景</h5>
+<p>项目上使用SpringCloudGateway作为网关承接公网上各个业务线进来的请求流量，在网关的前面有两台Nginx反向代理了网关，网关做了一系列的前置处理后转发请求到后面各个业务线的服务，简要的网络链路为：</p>
+<pre><code class="language-tex">网关域名(wmg.test.com) -&gt; ... -&gt; Nginx -&gt;F5(硬负载域名fp.wmg.test) -&gt; 网关 -&gt; 业务系统
+</code></pre>
+<p>某天，负责运维Nginx的团队要增加两台新的Nginx机器，原因说来话长，按下不表，使用两台新的Nginx机器替代掉原先反向代理网关的两台Nginx。</p>
+<h5 id="sre等级定性p1">SRE等级定性P1</h5>
+<p>一个月黑风高的夜晚，负责运维Nginx的团队进行了生产变更，在两台新机器上部署了Nginx，然后让网络团队将网关域名的流量切换到了两台新的Nginx机器上，刚切换完，立马有业务线团队的人反应，过网关的接口请求都变成400了。负责运维Nginx的团队又让网络团队将网关域名流量切回到原有的两台Nginx上，业务线过网关的接口请求恢复正常，持续了两分多钟，SRE等级定性P1。</p>
+<p>负责运维Nginx的团队说，两台新的Nginx配置和原有的两台Nginx配置一样，看不出什么问题，找到我，让我从网关排查有没有什么错误日志。</p>
+<p>不太可能吧，如果新的两台Nginx配置和原有的两台Nginx配置一样的话，不会出现请求都是400的问题啊，我心想，不过还是去看了网关上的日志，在那个时间段，网关没有错误日志出现。</p>
+<p>看了下新Nginx的日志，Options请求正常返回204，其它的GET、POST请求都是400，Options是预检请求，在Nginx层面就处理返回了，新Nginx的日志示例如下：</p>
+<pre><code class="language-shell">10.x.x.x:63048 &gt; -  &gt; 10.x.x.x:8099 &gt; [2025-07-17T10:36:26+08:00] &gt; 10.x.x.x:8099  OPTIONS /api/xxx HTTP/1.1 &gt; 204 &gt; 0 &gt; https://domain/ &gt; Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 &gt; - &gt; [req_time:0.000 s] &gt;[upstream_connect_time:- s]&gt; [upstream_header_time:- s] &gt; [upstream_resp_time:- s] [-]
+10.x.x.x:63048 &gt; -  &gt; 10.x.x.x:8099 &gt; [2025-07-17T10:36:26+08:00] &gt; 10.x.x.x:8099  POST /api/xxx HTTP/1.1 &gt; 400 &gt; 0 &gt; https://domain/ &gt; Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 &gt; - &gt; [req_time:0.001 s] &gt;[upstream_connect_time:0.000 s]&gt; [upstream_header_time:0.001 s] &gt; [upstream_resp_time:0.001 s] [10.x.x.x:8082]
+</code></pre>
+<p>去找了网络团队，从流量回溯设备上看到400确实是网关返回的，还没有到后面的业务系统，400代表BadRequest，我怀疑是不是请求体的问题，想让网络将那个时间段的流量包数据取下来分析，网络没给，只给我了业务报文参数，走网关请求的业务参数报文是加密的，我本地运行程序可以正常解密报文，我反馈给了负责运维Nginx的团队。</p>
+<p>负责运维Nginx的团队又花了一段时间定位问题，还是没有头绪，又找到我，让我帮忙分析调查下。</p>
+<h5 id="介入调查">介入调查</h5>
+<p>我说测试环境地址是啥，我先在测试环境看下能不能复现，负责运维Nginx的团队成员说，没有在测试环境搭建测试，这一次变更是另一个成员直接生产变更。</p>
+<p>😓</p>
+<p>我要来了新的Nginx配置文件和老的Nginx配置文件比对了下，发现有不一样的地方，老Nginx上反向代理网关的配置如下：</p>
+<pre><code class="language-shell">server {
+    listen 8080;
+    server_name wmg.test.com;
+    
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+	
+    location / {
+        proxy_hide_header  host;
+        client_max_body_size    100m;
+        add_header 'Access-Control-Allow-Origin' "$http_origin" always;
+        add_header 'Access-Control-Allow-Credentials' 'true' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT';
+        add_header 'Access-Control-Allow-Headers' '...';
+        if ($request_method = 'OPTIONS') {
+            return 204;
+        }
+        proxy_pass http://fp.wmg.test:8090;
+    }
+}
+</code></pre>
+<p>新Nginx配置如下：</p>
+<pre><code class="language-shell">upstream http_gateways{
+  server fp.wmg.test:8090;
+  keepalive 30;
+}
+
+server {
+    listen 8080 backlog=512;
+    server_name wmg.test.com;
+    
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    
+    location / {
+        proxy_hide_header  host;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        client_max_body_size    100m;
+        add_header 'Access-Control-Allow-Origin' "$http_origin" always;
+        add_header 'Access-Control-Allow-Credentials' 'true' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT';
+        add_header 'Access-Control-Allow-Headers' '...';
+        if ($request_method = 'OPTIONS') {
+            return 204;
+        }
+        proxy_pass http://http_gateways;
+    }
+}
+</code></pre>
+<p>新Nginx代理网关的配置与原有Nginx上的配置区别在于：</p>
+<ul>
+<li>
+<p>使用upstream配置了网关的F5负载均衡地址：</p>
+<pre><code>upstream http_gateways{
+  server fp.wmg.test:8090;
+  keepalive 30;
+}
+</code></pre>
+</li>
+<li>
+<p>设置http协议为1.1，启用长连接</p>
+<pre><code class="language-shell">proxy_http_version 1.1;
+proxy_set_header Connection "";
+</code></pre>
+</li>
+</ul>
+<p>我让负责运维Nginx的团队在测试环境的Nginx上按照新的Nginx配置模拟了生产环境：</p>
+<p>Nginx：10.100.8.11 监听9104端口</p>
+<p>网关：10.100.22.48 监听8081端口</p>
+<p>Nginx的9104端口转发到网关的8081端口，配置如下：</p>
+<pre><code class="language-shell">upstream http_gateways{
+  server 10.100.22.48:8081;
+  keepalive 30;
+}
+
+server {
+    listen 9104 backlog=512;
+    server_name localhost;
+
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+
+    location / {
+        proxy_hide_header  host;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        client_max_body_size    100m;
+        add_header 'Access-Control-Allow-Origin' "$http_origin" always;
+        add_header 'Access-Control-Allow-Credentials' 'true' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT';
+        add_header 'Access-Control-Allow-Headers' '...';
+        if ($request_method = 'OPTIONS') {
+            return 204;
+        }
+        proxy_pass http://http_gateways;
+    }
+}
+</code></pre>
+<h5 id="问题复现">问题复现</h5>
+<p>通过Nginx请求网关到后端服务接口，问题复现，请求响应400：</p>
+<pre><code class="language-shell">curl -v -X GET http://10.100.8.11:9104/wechat-web/actuator/info
+</code></pre>
+<p>去掉下面的两个配置，请求正常响应200：</p>
+<pre><code class="language-shell">proxy_http_version 1.1;
+proxy_set_header Connection "";
+</code></pre>
+<h5 id="天外来锅">天外来锅</h5>
+<p>将这个现象反馈给了负责运维Nginx的团队，结果负责运维Nginx的团队查了半天说网关不支持长连接，要让网关改造。</p>
+<p>😓</p>
+<p>不应该啊，以往网关发版的时候，是滚动发版的，F5上先下掉一个机器的流量，停启这个机器上的网关服务，然后F5上流量，F5下流量的时候是有长连接存在的，每次都会等个5分钟左右才能下掉一路的流量。</p>
+<p>得，先放下手头的工作，花点时间来证明网关是支持长连接的。</p>
+<p>在Nginx机器上通过命令行指定长连接方式访问网关请求后端服务接口：</p>
+<pre><code class="language-shell">wget -d --header="Connection: keepalive" http://10.100.22.48:8081/wechat-web/actuator/info http://10.100.22.48:8081/wechat-web/actuator/info http://10.100.22.48:8081/wechat-web/actuator/info
+</code></pre>
+<p>回车出现如下日志：</p>
+<pre><code class="language-shell">Setting --header (header) to Connection: keepalive
+DEBUG output created by Wget 1.14 on linux-gnu.
+
+URI encoding = ‘UTF-8’
+Converted file name 'info' (UTF-8) -&gt; 'info' (UTF-8)
+Converted file name 'info' (UTF-8) -&gt; 'info' (UTF-8)
+--2025-07-17 13:45:08--  http://10.100.22.48:8081/wechat-web/actuator/info
+Connecting to 10.100.22.48:8081... connected.
+Created socket 3.
+Releasing 0x0000000000c95a90 (new refcount 0).
+Deleting unused 0x0000000000c95a90.
+
+---request begin---
+GET /wechat-web/actuator/info HTTP/1.1
+User-Agent: Wget/1.14 (linux-gnu)
+Accept: */*
+Host: 10.100.22.48:8081
+Connection: keepalive
+
+---request end---
+HTTP request sent, awaiting response... 
+---response begin---
+HTTP/1.1 200 OK
+transfer-encoding: chunked
+Content-Type: application/vnd.spring-boot.actuator.v3+json
+Date: Thu, 17 Jul 2025 05:25:34 GMT
+
+---response end---
+200 OK
+Registered socket 3 for persistent reuse.
+Length: unspecified [application/vnd.spring-boot.actuator.v3+json]
+Saving to: ‘info’
+
+    [ &lt;=&gt;                                                                                                                                                              ] 83          --.-K/s   in 0s      
+
+2025-07-17 13:45:08 (7.75 MB/s) - ‘info’ saved [83]
+
+URI encoding = ‘UTF-8’
+Converted file name 'info' (UTF-8) -&gt; 'info' (UTF-8)
+Converted file name 'info' (UTF-8) -&gt; 'info' (UTF-8)
+--2025-07-17 13:45:08--  http://10.100.22.48:8081/wechat-web/actuator/info
+Reusing existing connection to 10.100.22.48:8081.
+Reusing fd 3.
+
+---request begin---
+GET /wechat-web/actuator/info HTTP/1.1
+User-Agent: Wget/1.14 (linux-gnu)
+Accept: */*
+Host: 10.100.22.48:8081
+Connection: keepalive
+
+---request end---
+HTTP request sent, awaiting response... 
+---response begin---
+HTTP/1.1 200 OK
+transfer-encoding: chunked
+Content-Type: application/vnd.spring-boot.actuator.v3+json
+Date: Thu, 17 Jul 2025 05:25:34 GMT
+
+---response end---
+200 OK
+Length: unspecified [application/vnd.spring-boot.actuator.v3+json]
+Saving to: ‘info.1’
+
+    [ &lt;=&gt;                                                                                                                                                              ] 83          --.-K/s   in 0s      
+
+2025-07-17 13:45:08 (9.47 MB/s) - ‘info.1’ saved [83]
+
+URI encoding = ‘UTF-8’
+Converted file name 'info' (UTF-8) -&gt; 'info' (UTF-8)
+Converted file name 'info' (UTF-8) -&gt; 'info' (UTF-8)
+--2025-07-17 13:45:08--  http://10.100.22.48:8081/wechat-web/actuator/info
+Reusing existing connection to 10.100.22.48:8081.
+Reusing fd 3.
+
+---request begin---
+GET /wechat-web/actuator/info HTTP/1.1
+User-Agent: Wget/1.14 (linux-gnu)
+Accept: */*
+Host: 10.100.22.48:8081
+Connection: keepalive
+
+---request end---
+HTTP request sent, awaiting response... 
+---response begin---
+HTTP/1.1 200 OK
+transfer-encoding: chunked
+Content-Type: application/vnd.spring-boot.actuator.v3+json
+Date: Thu, 17 Jul 2025 05:25:34 GMT
+
+---response end---
+200 OK
+Length: unspecified [application/vnd.spring-boot.actuator.v3+json]
+Saving to: ‘info.2’
+
+    [ &lt;=&gt;                                                                                                                                                              ] 83          --.-K/s   in 0s      
+
+2025-07-17 13:45:08 (11.1 MB/s) - ‘info.2’ saved [83]
+
+FINISHED --2025-07-17 13:45:08--
+Total wall clock time: 0.1s
+Downloaded: 3 files, 249 in 0s (9.25 MB/s)
+
+</code></pre>
+<p>可以看到第一个请求建立了socket 3，Connection: keepalive，请求成功，http响应状态码为200</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1407141/202507/1407141-20250724151519794-1361370271.png" class="lazyload"></p>
+<p>第二个请求重用了第一个连接，socket 3，Connection: keepalive，请求成功，http响应状态码为200</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1407141/202507/1407141-20250724151528366-612035678.png" class="lazyload"></p>
+<p>第三个请求依然重用了第一个连接，socket 3，Connection: keepalive，请求成功，http响应状态码为200</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1407141/202507/1407141-20250724151537229-1743932975.png" class="lazyload"></p>
+<p>网关是支持长连接的，反馈给负责运维Nginx的团队，负责运维Nginx的团队又查了半天，又找到我说还是得拜托我来调查解决掉这个问题。</p>
+<h5 id="深度调查">深度调查</h5>
+<p>在测试环境Nginx机器10.100.8.11上使用tcpdump命令抓取与网关相关的流量包：</p>
+<pre><code class="language-shell">tcpdump -vv -i ens192 host 10.100.22.48 and tcp port 8081 -w /tmp/ng400.cap
+</code></pre>
+<p>找到出现http响应码为400的请求，可以看到流量包中的wechat-web/actuator/info请求响应为：HTTP/1.1 400 Bad Request</p>
+<p>观察请求体，其中一个请求头Host的值为：http_gateways，这引起了我的注意：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1407141/202507/1407141-20250724193744202-2086782784.png" class="lazyload"></p>
+<p>查阅资料得到，HTTP/1.1协议规范定义HTTP/1.1版本必须传递Host请求头</p>
+<pre><code class="language-tex">- Both clients and servers MUST support the Host request-header.
+- A client that sends an HTTP/1.1 request MUST send a Host header.
+- Servers MUST report a 400 (Bad Request) error if an HTTP/1.1
+        request does not include a Host request-header.
+- Servers MUST accept absolute URIs.
+</code></pre>
+<p><a href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html#sec5.2" target="_blank" rel="noopener nofollow">https://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html#sec5.2</a></p>
+<p><a href="https://www.w3.org/Protocols/rfc2616/rfc2616-sec19.html#sec19.6.1.1" target="_blank" rel="noopener nofollow">https://www.w3.org/Protocols/rfc2616/rfc2616-sec19.html#sec19.6.1.1</a></p>
+<p>Host的格式可以包含：. 和 - 特殊符号，_ 不被支持</p>
+<p>查阅Nginx的官方文档得知，<em>proxy_set_header</em> 有两个默认配置：</p>
+<pre><code>proxy_set_header Host       $proxy_host;
+proxy_set_header Connection close;
+</code></pre>
+<p><a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header" target="_blank" rel="noopener nofollow">https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header</a></p>
+<p>可以看出Nginx启用了HTTP/1.1协议，Host如果没有指定会取$proxy_host，那么使用upstream的情况下，$proxy_host就是upstream的名称，而此处的upstream中包含_，不是合法的Host格式。</p>
+<p>HTTP/1.1规定必须传递Host的一方面原因就是为了支持单IP地址托管多域名的虚拟主机功能，方便后端服务根据不同来源Host做不同的处理。</p>
+<pre><code class="language-tex">Older HTTP/1.0 clients assumed a one-to-one relationship of IP addresses and servers; there was no other established mechanism for distinguishing the intended server of a request than the IP address to which that request was directed. The changes outlined above will allow the Internet, once older HTTP clients are no longer common, to support multiple Web sites from a single IP address, greatly simplifying large operational Web servers, where allocation of many IP addresses to a single host has created serious problems. 
+</code></pre>
+<p>那么只要遵循了HTTP/1.1协议规范的框架（Tomcat、SpringCloudGateway、...）在解析Host时发现Host不是合法的格式时，就响应了400。</p>
+<p>本地搭建了一个测试环境，debug了下网关的代码，在SpringCloudGateway解析http请求类ReactorHttpHandlerAdapter中的apply方法里面可以看到，解析Host失败会响应400：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1407141/202507/1407141-20250724151449498-927084501.png" class="lazyload"></p>
+<p>下面是SpringCloudGateway解析http请求类ReactorHttpHandlerAdapter中的apply方法逻辑：</p>
+<pre><code class="language-java">public Mono&lt;Void&gt; apply(HttpServerRequest reactorRequest, HttpServerResponse reactorResponse) {
+	NettyDataBufferFactory bufferFactory = new NettyDataBufferFactory(reactorResponse.alloc());
+	try {
+		ReactorServerHttpRequest request = new ReactorServerHttpRequest(reactorRequest, bufferFactory);
+		ServerHttpResponse response = new ReactorServerHttpResponse(reactorResponse, bufferFactory);
+		if (request.getMethod() == HttpMethod.HEAD) {
+			response = new HttpHeadResponseDecorator(response);
+		}
+		return this.httpHandler.handle(request, response)
+				.doOnError(ex -&gt; logger.trace(request.getLogPrefix() + "Failed to complete: " + ex.getMessage()))
+				.doOnSuccess(aVoid -&gt; logger.trace(request.getLogPrefix() + "Handling completed"));
+	}
+	catch (URISyntaxException ex) {
+		if (logger.isDebugEnabled()) {
+			logger.debug("Failed to get request URI: " + ex.getMessage());
+		}
+		reactorResponse.status(HttpResponseStatus.BAD_REQUEST);
+		return Mono.empty();
+	}
+}
+</code></pre>
+<p>SpringCloudGateway通过debug级别日志输出这类不符合协议规范的日志，生产日志级别为info，因此不会打印这样异常的日志。</p>
+<h5 id="解决方案">解决方案</h5>
+<p>既然HTTP/1.1协议规定必须传递Host且没有通过配置显式指定Nginx传递的Host时Nginx会有默认值，那么在Nginx的配置中增加传递Host的配置覆盖默认值的逻辑，查阅Nginx的文档，可以通过增加下面的配置解决：</p>
+<pre><code class="language-shell">proxy_set_header Host       $host;
+</code></pre>
+<p>在测试环境Nginx9104端口代理配置中增加上面的配置，再次执行，请求正常响应200。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1407141/202507/1407141-20250724151427627-1307945051.png" class="lazyload"></p>
+<p>完整配置如下：</p>
+<pre><code class="language-shell">upstream http_gateways{
+  server 10.100.22.48:8081;
+  keepalive 30;
+}
+
+server {
+    listen 9104 backlog=512;
+    server_name wmg.test.com;
+    
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    
+    location / {
+        proxy_set_header Host       $host;
+        proxy_hide_header  host;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        client_max_body_size    100m;
+        add_header 'Access-Control-Allow-Origin' "$http_origin" always;
+        add_header 'Access-Control-Allow-Credentials' 'true' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, DELETE, PUT';
+        add_header 'Access-Control-Allow-Headers' '...';
+        if ($request_method = 'OPTIONS') {
+            return 204;
+        }
+        proxy_pass http://http_gateways;
+    }
+}
+</code></pre>
+<p>解决方案不止一个:</p>
+<ul>
+<li>可以修改upstream的名称，去掉不支持的_，比如更换为：http-gateways、httpgateways</li>
+<li>还可以直接指定Host的值为域名（domain），proxy_set_header Host       'doamin';</li>
+</ul>
+<h5 id="总结">总结</h5>
+<p>这个问题只要在测试环境测试下，是必现的，不属于测试case没有覆盖到的范畴，一定要重视测试流程，很多流程看似繁琐，其实都是血与泪的教训得来的。</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/imadc/" target="_blank">杜劲松</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/imadc/p/19002991" target="_blank">https://www.cnblogs.com/imadc/p/19002991</a></p>
+</div>
+<div class="clear"></div>
+
+		</div>
+		<div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-07-24 20:08">2025-07-24 20:08</span>&nbsp;
+<a href="https://www.cnblogs.com/imadc">杜劲松</a>&nbsp;
+阅读(<span id="post_view_count">4486</span>)&nbsp;
+评论(<span id="post_comment_count">27</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19002991);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19002991', targetLink: 'https://www.cnblogs.com/imadc/p/19002991', title: '本可避免的P1事故：Nginx变更导致网关请求均响应400' })">举报</a>
+</div>
+	
