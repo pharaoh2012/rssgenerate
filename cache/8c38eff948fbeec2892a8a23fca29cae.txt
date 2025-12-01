@@ -1,0 +1,462 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sun-10387834/p/19286322" title="发布于 2025-12-01 10:25">
+    <span role="heading" aria-level="2">Kafka深度剖析：Topic-Partition-Segment 关系、分区策略与数据可靠性实现</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一引言">一、引言</h2>
+<p>Kafka 的高吞吐、低延迟与可靠性，本质上依赖于 <strong>“分层存储”</strong>（Topic-Partition-Segment）和 <strong>“分区并行”</strong> 的设计。本文将深入剖析三者的关系、分区策略的细节，以及如何通过事务、ACK、偏移量管理等机制保障数据可靠性，结合图示与代码实现，助你彻底掌握 Kafka 核心原理。</p>
+<h2 id="二topic-partition-segment-关系分层存储架构">二、Topic-Partition-Segment 关系：分层存储架构</h2>
+<p>Kafka 的消息存储采用 <strong>“逻辑分类→物理分片→文件单元”</strong> 的三层结构，三者协同实现高效的消息持久化与检索。</p>
+<h3 id="1-核心定义与层级关系">1. 核心定义与层级关系</h3>
+<table>
+<thead>
+<tr>
+<th><strong>组件</strong></th>
+<th><strong>定义</strong></th>
+<th><strong>作用</strong></th>
+<th><strong>类比</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Topic</strong></td>
+<td>消息的逻辑分类（如 <code>order-topic</code>），全局唯一，包含多个 Partition。</td>
+<td>隔离业务消息（如订单、日志分属不同 Topic）</td>
+<td>图书馆的“文学区”“科技区”</td>
+</tr>
+<tr>
+<td><strong>Partition</strong></td>
+<td>Topic 的物理分片（有序日志文件），分布式存储的基本单位，可跨 Broker。</td>
+<td>并行处理（多 Partition 并行读写）、扩展容量</td>
+<td>文学区的“第 1 排书架”</td>
+</tr>
+<tr>
+<td><strong>Segment</strong></td>
+<td>Partition 的物理存储单元（由多个 Segment 文件组成），默认 1GB/Segment。</td>
+<td>高效存储（小文件 IO 友好）、快速检索（索引）</td>
+<td>书架上的“第 1 册书”（含目录页）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="2-层级结构与存储细节">2. 层级结构与存储细节</h3>
+<h4 id="1层级关系图mermaid">（1）层级关系图（Mermaid）</h4>
+<div class="mermaid">graph TD
+    subgraph Kafka Cluster
+        Broker1[Broker 1&lt;br/&gt;broker.id=0]
+        Broker2[Broker 2&lt;br/&gt;broker.id=1]
+    end
+    
+    Topic[Topic: order-topic&lt;br/&gt;逻辑分类]
+    Partition0[Partition 0&lt;br/&gt;物理分片 Leader: Broker1]
+    Partition1[Partition 1&lt;br/&gt;物理分片 Leader: Broker2]
+    Segment00[Segment 0&lt;br/&gt;00000000000000000000.log&lt;br/&gt;00000000000000000000.index&lt;br/&gt;00000000000000000000.timeindex]
+    Segment01[Segment 1&lt;br/&gt;00000000000001000000.log]
+    Segment10[Segment 0&lt;br/&gt;00000000000000000000.log]
+    
+    Topic --&gt; Partition0 &amp; Partition1
+    Partition0 --&gt;|分布| Broker1
+    Partition1 --&gt;|分布| Broker2
+    Partition0 --&gt; Segment00 &amp; Segment01
+    Partition1 --&gt; Segment10
+</div><h4 id="2segment-文件组成">（2）Segment 文件组成</h4>
+<p>每个 Segment 包含 3 类文件（以 Partition 0 的第一个 Segment 为例）：</p>
+<ul>
+<li><strong>数据文件</strong>：<code>00000000000000000000.log</code>（存储实际消息，文件名前缀为 Segment 起始 Offset）。</li>
+<li><strong>偏移量索引文件</strong>：<code>00000000000000000000.index</code>（记录 Offset→物理位置的映射，稀疏索引，默认每 4KB 消息记录一条）。</li>
+<li><strong>时间戳索引文件</strong>：<code>00000000000000000000.timeindex</code>（记录 Timestamp→Offset 的映射，用于按时间范围查询）。</li>
+</ul>
+<h3 id="3-代码示例创建-topic-与查看-segment">3. 代码示例：创建 Topic 与查看 Segment</h3>
+<h4 id="1创建-topic3-分区">（1）创建 Topic（3 分区）</h4>
+<pre><code class="language-bash"># 使用 Kafka 命令行工具创建 Topic（3 分区，1 副本）
+bin/kafka-topics.sh --create \
+  --topic order-topic \
+  --bootstrap-server localhost:9092 \
+  --partitions 3 \
+  --replication-factor 1
+</code></pre>
+<h4 id="2查看-segment-文件">（2）查看 Segment 文件</h4>
+<p>Kafka 消息存储在 <code>log.dirs</code> 配置的目录下（默认 <code>/tmp/kafka-logs</code>）：</p>
+<pre><code class="language-bash"># 查看 order-topic 的 Partition 目录（3 个 Partition）
+ls /tmp/kafka-logs/order-topic-0/  # Partition 0 的 Segment 文件
+# 输出示例：00000000000000000000.log  00000000000000000000.index  00000000000000000000.timeindex
+</code></pre>
+<h2 id="三分区策略剖析生产者与消费者的分区逻辑">三、分区策略剖析：生产者与消费者的分区逻辑</h2>
+<p>分区策略决定了消息如何路由到 Partition（生产者）以及如何分配给消费者（消费者组），直接影响并行度与负载均衡。</p>
+<h3 id="1-生产者分区策略">1. 生产者分区策略</h3>
+<p>生产者通过 <strong>分区器（Partitioner）</strong> 将消息分配到 Partition，核心目标是 <strong>负载均衡</strong> 与 <strong>顺序性保障</strong>。</p>
+<h4 id="1默认分区策略kafka-24">（1）默认分区策略（Kafka 2.4+）</h4>
+<ul>
+<li>
+<p><strong>有 Key 的消息</strong>（<code>key != null</code>）：<br>
+使用 <strong>MurmurHash2 算法</strong> 对 Key 哈希，再对 Partition 数取模，确保相同 Key 的消息进入同一 Partition（保证顺序性）。</p>
+<pre><code class="language-java">// 伪代码：默认分区器逻辑（有 Key）
+int partition = Math.abs(MurmurHash2.hash(key)) % partitionCount;
+</code></pre>
+</li>
+<li>
+<p><strong>无 Key 的消息</strong>（<code>key == null</code>）：<br>
+使用 <strong>粘性分区策略（Sticky Partitioner）</strong>：优先将一批消息（Batch）“粘”在同一 Partition，直到 Batch 填满或超时，再切换到新 Partition（提升批量写入吞吐量）。</p>
+</li>
+</ul>
+<h4 id="2自定义生产者分区器代码示例">（2）自定义生产者分区器（代码示例）</h4>
+<p><strong>需求</strong>：按订单金额区间分区（0-100 元→P0，100-200→P1，200+→P2）。</p>
+<pre><code class="language-java">import org.apache.kafka.clients.producer.Partitioner;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.utils.Utils;
+import java.util.Map;
+
+/**
+ * 自定义分区器：按订单金额区间分区
+ */
+public class AmountPartitioner implements Partitioner {
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
+        // 1. 获取 Topic 的 Partition 数量
+        int partitionCount = cluster.partitionCountForTopic(topic);
+        if (partitionCount &lt;= 0) return 0;
+
+        // 2. 解析金额（假设 value 是 Order 对象的 JSON 字符串）
+        double amount = parseAmountFromJson(new String(valueBytes));
+        
+        // 3. 按金额区间分区（0-100→0，100-200→1，200+→2，超出分区数则取模）
+        int partition;
+        if (amount &lt; 100) partition = 0;
+        else if (amount &lt; 200) partition = 1;
+        else partition = 2;
+        return Utils.toPositive(partition) % partitionCount; // 确保分区号非负
+    }
+
+    // 解析 JSON 中的金额字段（简化示例，实际用 Jackson 解析）
+    private double parseAmountFromJson(String json) {
+        return Double.parseDouble(json.split("\"amount\":")[1].split(",")[0]);
+    }
+
+    @Override public void close() {} // 释放资源
+    @Override public void configure(Map&lt;String, ?&gt; configs) {} // 初始化配置
+}
+</code></pre>
+<p><strong>配置生产者使用自定义分区器</strong>（<code>application.yml</code>）：</p>
+<pre><code class="language-yaml">spring:
+  kafka:
+    producer:
+      properties:
+        partitioner.class: com.example.partitioner.AmountPartitioner  # 自定义分区器全类名
+</code></pre>
+<h3 id="2-消费者分区策略">2. 消费者分区策略</h3>
+<p>消费者通过 <strong>消费者组（Consumer Group）</strong> 实现负载均衡：组内消费者共同消费 Topic 的所有 Partition，<strong>一个 Partition 仅被组内一个消费者消费</strong>。</p>
+<h4 id="1分区分配策略partition-assignment-strategy">（1）分区分配策略（Partition Assignment Strategy）</h4>
+<p>Kafka 支持多种分配策略，默认使用 <strong>RangeAssignor</strong>（按消费者订阅的 Topic 分区范围分配）：</p>
+<table>
+<thead>
+<tr>
+<th><strong>策略</strong></th>
+<th><strong>逻辑</strong></th>
+<th><strong>优点</strong></th>
+<th><strong>缺点</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Range</strong></td>
+<td>按 Partition 序号范围分配（如 3 分区，2 消费者→P0-P1 给 C1，P2 给 C2）</td>
+<td>实现简单</td>
+<td>分区数不能被消费者数整除时负载不均</td>
+</tr>
+<tr>
+<td><strong>RoundRobin</strong></td>
+<td>按消费者顺序轮询分配 Partition</td>
+<td>负载更均衡</td>
+<td>需消费者订阅相同 Topic 集合</td>
+</tr>
+<tr>
+<td><strong>Sticky</strong></td>
+<td>优先保持现有分配，仅调整必要分区（减少 rebalance 影响）</td>
+<td>最小化分区移动</td>
+<td>实现复杂</td>
+</tr>
+</tbody>
+</table>
+<h4 id="2代码示例消费者组分区分配">（2）代码示例：消费者组分区分配</h4>
+<p><strong>场景</strong>：3 个 Partition（<code>order-topic-0/1/2</code>），2 个消费者（<code>C1</code>、<code>C2</code>）组成的消费者组。</p>
+<pre><code class="language-java">import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.Properties;
+
+public class ConsumerGroupExample {
+    public static void main(String[] args) {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "order-group"); // 消费者组 ID
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, 
+                   "org.apache.kafka.clients.consumer.RangeAssignor"); // 显式指定 Range 策略
+
+        KafkaConsumer&lt;String, String&gt; consumer = new KafkaConsumer&lt;&gt;(props);
+        consumer.subscribe(Collections.singletonList("order-topic")); // 订阅 Topic
+
+        while (true) {
+            ConsumerRecords&lt;String, String&gt; records = consumer.poll(Duration.ofMillis(100));
+            records.forEach(record -&gt; 
+                System.out.printf("消费者 %s 消费：partition=%d, offset=%d, value=%s%n",
+                    Thread.currentThread().getName(), record.partition(), record.offset(), record.value())
+            );
+        }
+    }
+}
+</code></pre>
+<p><strong>分配结果</strong>（Range 策略）：</p>
+<ul>
+<li><code>C1</code> 消费 <code>order-topic-0</code>、<code>order-topic-1</code>；</li>
+<li><code>C2</code> 消费 <code>order-topic-2</code>。</li>
+</ul>
+<h2 id="四数据可靠性实现事务ack偏移量与序列化">四、数据可靠性实现：事务、ACK、偏移量与序列化</h2>
+<p>Kafka 通过 <strong>生产者端保障→Broker 端存储→消费者端处理</strong> 三层机制，确保数据“不丢失、不重复、有序”。</p>
+<h3 id="1-生产者端确保消息发得出不丢不重">1. 生产者端：确保消息“发得出、不丢不重”</h3>
+<h4 id="1ack-机制控制消息写入确认级别">（1）ACK 机制：控制消息写入确认级别</h4>
+<p><code>acks</code> 参数定义 Leader 副本需等待多少副本确认后才向生产者返回 ACK：</p>
+<table>
+<thead>
+<tr>
+<th><strong>acks 值</strong></th>
+<th><strong>确认逻辑</strong></th>
+<th><strong>可靠性</strong></th>
+<th><strong>配置示例</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0</code></td>
+<td>不等待确认（发后即忘）</td>
+<td>最低</td>
+<td><code>spring.kafka.producer.acks=0</code></td>
+</tr>
+<tr>
+<td><code>1</code></td>
+<td>仅等待 Leader 副本写入成功</td>
+<td>中等</td>
+<td><code>spring.kafka.producer.acks=1</code></td>
+</tr>
+<tr>
+<td><code>all</code>（-1）</td>
+<td>等待 Leader + 所有 ISR 副本同步成功（最高可靠）</td>
+<td>最高</td>
+<td><code>spring.kafka.producer.acks=all</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="2重试与幂等性避免重复与丢失">（2）重试与幂等性：避免重复与丢失</h4>
+<ul>
+<li><strong>重试</strong>：<code>retries</code> 配置重试次数（默认 0），配合 <code>retry.backoff.ms</code>（重试间隔）应对网络抖动。</li>
+<li><strong>幂等性</strong>：<code>enable.idempotence=true</code>（默认 false），通过 <strong>PID（生产者 ID）+ Sequence Number（序列号）</strong> 确保同一消息仅写入一次。</li>
+</ul>
+<p><strong>生产者事务</strong>（跨分区原子性）：<br>
+通过 <code>transactional.id</code> 标识生产者事务上下文，确保一批消息要么全成功，要么全失败。</p>
+<pre><code class="language-java">import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class TransactionalProducer {
+    private final KafkaTemplate&lt;String, String&gt; kafkaTemplate;
+
+    // 注入 KafkaTemplate（需配置 transaction-id-prefix）
+    public TransactionalProducer(KafkaTemplate&lt;String, String&gt; kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    @Transactional  // 声明事务
+    public void sendTransactionalMessage(String topic, String key, String value) {
+        kafkaTemplate.send(topic, key, value); // 事务内发送消息
+        // 可发送多条消息，全部成功或失败
+    }
+}
+</code></pre>
+<p><strong>配置事务</strong>（<code>application.yml</code>）：</p>
+<pre><code class="language-yaml">spring:
+  kafka:
+    producer:
+      transaction-id-prefix: tx-order-  # 事务 ID 前缀（每个生产者实例唯一）
+      enable-idempotence: true  # 事务需开启幂等性
+      acks: all  # 事务需最高可靠性
+</code></pre>
+<h4 id="3序列化确保消息正确编码">（3）序列化：确保消息正确编码</h4>
+<p>生产者需将消息对象序列化为字节数组，常用 <strong>JSON 序列化</strong>（Spring Kafka 默认）或 <strong>Avro</strong>（高性能二进制）。</p>
+<pre><code class="language-java">// 生产者配置 JSON 序列化（Spring Boot 自动配置）
+spring.kafka.producer.value-serializer: org.springframework.kafka.support.serialization.JsonSerializer
+</code></pre>
+<h3 id="2-broker-端存储与副本机制保障存得稳">2. Broker 端：存储与副本机制保障“存得稳”</h3>
+<h4 id="1副本机制与-isr-同步">（1）副本机制与 ISR 同步</h4>
+<ul>
+<li><strong>副本（Replica）</strong>：每个 Partition 包含 1 个 Leader 副本（处理读写）和 N 个 Follower 副本（同步数据）。</li>
+<li><strong>ISR（In-Sync Replicas）</strong>：与 Leader 数据同步的副本集合（包含 Leader），<code>acks=all</code> 时需等待所有 ISR 副本确认。</li>
+</ul>
+<p><strong>ISR 同步流程图</strong>（Mermaid）：</p>
+<div class="mermaid">sequenceDiagram
+    participant P as Producer
+    participant L as Leader Replica
+    participant F1 as Follower 1 (ISR)
+    participant F2 as Follower 2 (Not in ISR)
+    P-&gt;&gt;L: 发送消息（acks=all）
+    L-&gt;&gt;L: 写入本地日志（LEO=100）
+    L-&gt;&gt;F1: 同步消息（LEO=100）
+    L-&gt;&gt;F2: 同步消息（LEO=80，滞后）
+    F1-&gt;&gt;L: 确认同步（LEO=100）
+    F2-&gt;&gt;L: 未同步（滞后超 30s，被踢出 ISR）
+    L-&gt;&gt;P: 等待所有 ISR 确认（仅 F1 确认）→ 超时？不，ISR 仅含 F1 时，等待 F1 确认即可
+    Note right of L: ISR 动态维护：F2 同步追上后重新加入
+</div><h4 id="2hw-与-leo控制消息可见性">（2）HW 与 LEO：控制消息可见性</h4>
+<ul>
+<li><strong>LEO（Log End Offset）</strong>：副本的日志末尾偏移量（下一条消息位置）。</li>
+<li><strong>HW（High Watermark）</strong>：所有 ISR 副本中最小 LEO，消费者仅能看到 HW 之前的消息（已提交消息）。</li>
+</ul>
+<h3 id="3-消费者端确保收得到不漏不错">3. 消费者端：确保“收得到、不漏不错”</h3>
+<h4 id="1偏移量管理手动提交与自动提交">（1）偏移量管理：手动提交与自动提交</h4>
+<ul>
+<li><strong>自动提交</strong>（<code>enable.auto.commit=true</code>，默认 5s 提交一次）：可能丢失未提交消息（消费者崩溃）。</li>
+<li><strong>手动提交</strong>（<code>enable.auto.commit=false</code>）：处理成功后显式提交偏移量（<code>acknowledge()</code>），确保“至少一次”语义。</li>
+</ul>
+<p><strong>代码示例：消费者手动提交偏移量</strong></p>
+<pre><code class="language-java">import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ManualCommitConsumer {
+    @KafkaListener(topics = "order-topic", groupId = "order-group")
+    public void consume(ConsumerRecord&lt;String, String&gt; record, Acknowledgment ack) {
+        try {
+            // 处理消息（如扣减库存）
+            System.out.printf("消费消息：%s%n", record.value());
+            ack.acknowledge(); // 手动提交偏移量（处理成功后）
+        } catch (Exception e) {
+            // 处理失败，不提交偏移量（消息会重试）
+        }
+    }
+}
+</code></pre>
+<h4 id="2重试与死信队列dlq">（2）重试与死信队列（DLQ）</h4>
+<p>消息处理失败时，通过重试机制（默认 3 次）和死信队列避免无限阻塞：</p>
+<pre><code class="language-java">import org.springframework.kafka.annotation.DltHandler;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.annotation.RetryableTopic;
+import org.springframework.stereotype.Service;
+
+@Service
+public class RetryAndDltConsumer {
+    // 重试 3 次（初始间隔 1s，乘数 2，最大 5s）
+    @RetryableTopic(attempts = "3", backoff = @org.springframework.retry.annotation.Backoff(delay = 1000, multiplier = 2, maxDelay = 5000))
+    @KafkaListener(topics = "order-topic")
+    public void consumeWithRetry(String message) {
+        if (Math.random() &lt; 0.5) { // 模拟 50% 失败率
+            throw new RuntimeException("处理失败，触发重试");
+        }
+        System.out.println("处理成功：" + message);
+    }
+
+    // 死信队列处理（重试耗尽后进入 order-topic-dlq）
+    @DltHandler
+    public void handleDlt(String message) {
+        System.err.println("死信队列消息：" + message);
+        // 保存到数据库或人工介入
+    }
+}
+</code></pre>
+<h2 id="五总结">五、总结</h2>
+<p>Kafka 的可靠性与高性能源于 <strong>“分层存储+分区并行+多层保障”</strong>：</p>
+<ul>
+<li><strong>Topic-Partition-Segment</strong> 实现逻辑分类与物理分片，Segment 优化存储效率；</li>
+<li><strong>分区策略</strong> 平衡负载与顺序性，生产者按 Key 哈希/粘性分区，消费者组负载均衡；</li>
+<li><strong>数据可靠性</strong> 通过生产者 ACK/事务/幂等性、Broker 副本/ISR、消费者手动 ACK/死信队列三层保障。</li>
+</ul>
+<p>掌握这些原理后，可根据业务场景灵活配置（如核心交易用 <code>acks=all</code>+事务，日志收集用 <code>acks=1</code>+自动提交），实现高可靠消息流转。</p>
+<p><strong>附录：核心配置速查表</strong></p>
+<table>
+<thead>
+<tr>
+<th><strong>组件</strong></th>
+<th><strong>配置项</strong></th>
+<th><strong>推荐值</strong></th>
+<th><strong>作用</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>生产者</td>
+<td><code>acks</code></td>
+<td><code>all</code></td>
+<td>最高可靠性（等待所有 ISR 确认）</td>
+</tr>
+<tr>
+<td>生产者</td>
+<td><code>enable.idempotence</code></td>
+<td><code>true</code></td>
+<td>启用幂等性（防重复）</td>
+</tr>
+<tr>
+<td>生产者</td>
+<td><code>transaction-id-prefix</code></td>
+<td><code>tx-{业务名}-</code></td>
+<td>开启事务（跨分区原子性）</td>
+</tr>
+<tr>
+<td>Broker</td>
+<td><code>default.replication.factor</code></td>
+<td><code>3</code></td>
+<td>默认副本数（高可用）</td>
+</tr>
+<tr>
+<td>Broker</td>
+<td><code>min.insync.replicas</code></td>
+<td><code>2</code></td>
+<td>最小 ISR 副本数（与 <code>acks=all</code> 配合）</td>
+</tr>
+<tr>
+<td>消费者</td>
+<td><code>enable.auto.commit</code></td>
+<td><code>false</code></td>
+<td>关闭自动提交，手动 ACK</td>
+</tr>
+<tr>
+<td>消费者</td>
+<td><code>ack-mode</code></td>
+<td><code>manual_immediate</code></td>
+<td>手动立即提交偏移量</td>
+</tr>
+</tbody>
+</table>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    
+<p>❤️ 如果你喜欢这篇文章，请点赞支持！ 👍 同时欢迎关注我的博客，获取更多精彩内容！</p>
+
+<p>本文来自博客园，作者：<a href="https://www.cnblogs.com/sun-10387834/" target="_blank">佛祖让我来巡山</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/sun-10387834/p/19286322" target="_blank">https://www.cnblogs.com/sun-10387834/p/19286322</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-12-01 10:26">2025-12-01 10:25</span>&nbsp;
+<a href="https://www.cnblogs.com/sun-10387834">佛祖让我来巡山</a>&nbsp;
+阅读(<span id="post_view_count">43</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19286322);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19286322', targetLink: 'https://www.cnblogs.com/sun-10387834/p/19286322', title: 'Kafka深度剖析：Topic-Partition-Segment 关系、分区策略与数据可靠性实现' })">举报</a>
+</div>
+        
