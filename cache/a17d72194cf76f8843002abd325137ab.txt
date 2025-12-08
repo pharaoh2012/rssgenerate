@@ -1,0 +1,255 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MrVolleyball/p/19321441" title="发布于 2025-12-08 13:55">
+    <span role="heading" aria-level="2">链路追踪--使用nginx-ingress-controller记录后端pod真实ip</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        nginx迁移到k8s中，access_log中的upstream_addr只记录service_ip。为了更方便的链路追踪，怎么记录pod_id？本文主要分享怎么利用nginx-ingress-controller来记录真实pod_id
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>常见的nginx做反向代理架构，nginx转发到后端的多台服务</p>
+<pre><code>                 ┌─────────┐
+                 │backend-1│
+                 └─────────┘
+
+                 ┌─────────┐
+┌─────┐          │backend-2│
+│nginx│  ────►   └─────────┘
+└─────┘
+                     ...
+
+                 ┌─────────┐
+                 │backend-n│
+                 └─────────┘
+</code></pre>
+<p>在传统的部署，如直接部署在nginx上，或者部署在docker中，nginx转发到后面的的backend是固定在nginx的配置文件中的，这也很方便排查问题节点在哪儿：直接看<code>access_log</code>中的<code>upstream_addr</code>即可</p>
+<p>该部署的优点非常明显，简单高效易维护，每一条链路，每一个状态都非常清晰。但是缺点也很明显，扩缩容艰难，一旦需要扩容backend，就非常麻烦了，需要首先部署backend，修改nginx转发配置，最后重启nginx</p>
+<p>为了提高扩缩容效率，将该架构搬到k8s中</p>
+<pre><code>                                        ┌─────────┐
+                                        │backend-1│
+                                        └─────────┘
+                                        ┌─────────┐
+┌─────┐       ┌───────────────┐         │backend-2│
+│nginx│ ────► │backend-service│ ────►   └─────────┘
+└─────┘       └───────────────┘            ...
+                                        ┌─────────┐
+                                        │backend-n│
+                                        └─────────┘
+</code></pre>
+<p>通过k8s-service的能力，自动做服务发现，每当上/下线一个backend，就会动态发现backend的个数，从此之后，扩缩容就会变得非常简单</p>
+<p>但是新的问题来了，问题出现时，比如某个backend出现问题，导致从nginx的日志出现了502，在<code>access_log</code>中显示的<code>upstream_addr</code>并不是后端backend的地址，而是backend-service的地址，无法立刻知道到底是哪个backend 出问题</p>
+<p>问题出现了，如何跟踪一条request，能够明确知道它进入了哪一个pod，就是本文需要探索的内容</p>
+<h2 id="nginx-ingress">nginx-ingress</h2>
+<p>如果架构迁移还在方案验证阶段，那么恭喜，这个方法可以一劳永逸的解决nginx的问题，那就是利用nginx-ingress-controller来作为入口</p>
+<h4 id="安装">安装</h4>
+<p>这个就不班门弄斧了，直接祭出官网</p>
+<ul>
+<li><a href="https://github.com/kubernetes/ingress-nginx" target="_blank" rel="noopener nofollow">github仓库地址</a></li>
+<li><a href="https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.14.0/deploy/static/provider/cloud/deploy.yaml" target="_blank" rel="noopener nofollow">安装脚本地址</a></li>
+</ul>
+<p>这一步需要注意的点不多，就是镜像的问题，镜像有可能拉不下来，至于怎么解决，大家可以看我之前的文章，关于如何拉镜像</p>
+<p>安装完成之后</p>
+<pre><code>▶ kubectl -n ingress-nginx get pod
+NAME                                        READY   STATUS    RESTARTS       AGE
+ingress-nginx-controller-78f7f8bd46-tqjm4   1/1     Running   0              1m
+
+</code></pre>
+<p>nginx-ingress-controller本质和其他的nginx没有什么区别，只不过有一些额外的功能来辅助nginx提供更好的服务，这个一会再讨论</p>
+<h4 id="backend后端服务">backend后端服务</h4>
+<p>接着创建一个backend服务，使用最简单的python tornado作为web容器</p>
+<p>test.py</p>
+<pre><code>from tornado.ioloop import IOLoop
+import tornado.httpserver as httpserver
+import tornado.web
+import os
+
+class TestFlow(tornado.web.RequestHandler):
+    def get(self):
+        ret = 'i am backend in {}'.format(os.environ['HOSTNAME'])
+        self.write(ret)
+
+    def post(self, *args, **kwargs):
+        print(self.request.body.decode('utf-8'))
+
+
+def applications():
+    urls = []
+    urls.append([r'/', TestFlow])
+    urls.append([r'/test', TestFlow])
+    return tornado.web.Application(urls)
+
+def main():
+    app = applications()
+    server = httpserver.HTTPServer(app)
+    server.bind(10000, '0.0.0.0')
+    server.start(1)
+    IOLoop.current().start()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt as e:
+        IOLoop.current().stop()
+    finally:
+        IOLoop.current().close()
+</code></pre>
+<p>将其打包成镜像</p>
+<p>Dockerfile</p>
+<pre><code>FROM python:3.11-alpine
+
+WORKDIR /opt
+RUN pip3 install tornado  -i https://mirrors.aliyun.com/pypi/simple/
+ADD test.py /opt/test.py
+
+CMD ["python3", "test.py"]
+
+</code></pre>
+<pre><code>docker build . -t backend-service:v1
+</code></pre>
+<p>制作完成之后将其放入k8s，并且使用一个service作为访问入口</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - image: backend-service:v1
+        imagePullPolicy: Never
+        name: backend
+        ports:
+        - containerPort: 10000
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: default
+spec:
+  ports:
+  - port: 10000
+    protocol: TCP
+    targetPort: 10000
+  selector:
+    app: backend
+  type: ClusterIP
+
+</code></pre>
+<pre><code>NAME                          READY   STATUS    RESTARTS   AGE     IP            NODE     NOMINATED NODE   READINESS GATES
+backend-6d4cdd4c68-mqzgj      1/1     Running   0          2m      10.244.0.40   wilson   &lt;none&gt;           &lt;none&gt;
+backend-6d4cdd4c68-qjp9m      1/1     Running   0          2m      10.244.0.60   wilson   &lt;none&gt;           &lt;none&gt;
+</code></pre>
+<p>大功告成</p>
+<h4 id="创建ingress">创建ingress</h4>
+<p>继续创建ingress，ingress其实就是nginx转发到后端服务的配置</p>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-test-ingress
+  namespace: default
+spec:
+  rules:
+  - host: wilsonchai.com
+    http:
+      paths:
+      - backend:
+          service:
+            name: backend-service
+            port:
+              number: 10000
+        path: /
+        pathType: Prefix
+
+</code></pre>
+<h4 id="测试结果">测试结果</h4>
+<p>折腾了半天，先捋一下整个的路径，我们创建了nginx-ingress-controller，它是整个系统的入口，其次创建了后端服务backend，请求的终点是该服务，还创建了一系列的service以及ingress，他们的关系如图所示</p>
+<p><img alt="watermarked-nginx-ingress_1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202512/1416773-20251208112201016-85732967.png" class="lazyload"></p>
+<ul>
+<li>请求通过nodePort进来进入nginx-ingress。<pre><code>▶ kubectl -n ingress-nginx get svc
+NAME                                 TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller             LoadBalancer   10.98.224.124   &lt;pending&gt;     80:30296/TCP,443:31592/TCP   30m
+</code></pre>
+</li>
+<li>nginx-ingress检查ingress规则，将请求转发至backend-service<pre><code>▶ kubectl  get svc backend-service
+NAME              TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)     AGE
+backend-service   ClusterIP   10.105.148.194   &lt;none&gt;        10000/TCP   30m
+</code></pre>
+</li>
+<li>backend-service随机转发该流量进入一个pod<pre><code>▶ kubectl  get pod -owide
+NAME                          READY   STATUS    RESTARTS   AGE     IP            NODE     NOMINATED NODE   READINESS GATES
+backend-6d4cdd4c68-mqzgj      1/1     Running   0          30m     10.244.0.40   wilson   &lt;none&gt;           &lt;none&gt;
+backend-6d4cdd4c68-qjp9m      1/1     Running   0          30m     10.244.0.60   wilson   &lt;none&gt;           &lt;none&gt;
+</code></pre>
+</li>
+</ul>
+<p>访问集群： <code>curl -H "host: wilsonchai.com" 127.0.0.1:30296</code></p>
+<pre><code>▶ curl -H "host: wilsonchai.com" 127.0.0.1:30296
+i am backend in backend-6d4cdd4c68-qjp9m
+</code></pre>
+<p>请求顺利到达了backend，再检查一下nginx-ingress的日志</p>
+<pre><code>10.244.0.1 - - [28/Nov/2025:09:28:45 +0000] "GET / HTTP/1.1" 200 40 "-" "curl/7.81.0" 78 0.001 [default-backend-service-10000] [] 10.244.0.60:10000 40 0.001 200 1896b48d60ef31861478e713d65c9660
+</code></pre>
+<p>在<code>upstream_addr</code>上面，显示的就是后端pod的ip： 10.244.0.60</p>
+<p>至此，终于解决了开篇提出的问题，如果有request报错502、503等，可以精准的定位到时哪个pod出现了问题</p>
+<h2 id="小结">小结</h2>
+<p>Nginx Ingress Controller 能够直接记录后端 Pod IP，是因为它在转发流量时，绕过了 Service 的 Cluster IP，直接与后端 Pod 建立连接，Nginx Ingress Controller 并不是一个普通的客户端，而是一个特殊的 K8s Controller</p>
+<ul>
+<li>Service 与 Endpoints： 当创建一个 Service 时，K8s 会自动创建一个相应的 Endpoints 对象（或 EndpointSlice）。这个 Endpoints 对象会实时记录所有与 Service 标签匹配的 后端 Pod 的实际 IP 地址和端口</li>
+<li>Controller 实时同步： Nginx Ingress Controller 会持续监听 K8s API Server 中所有 Service 对应的 Endpoints 对象的变化（即 Pod 的创建、删除、就绪状态改变）</li>
+</ul>
+<p>检验一下，再次访问： <code>curl -H "host: wilsonchai.com" 127.0.0.1:30296</code></p>
+<p>登录到nginx-ingress-controller容器，使用netstat检查连接状态</p>
+<pre><code>ingress-nginx-controller-78f7f8bd46-tqjm4:/etc/nginx$ netstat -anpt | grep ESTABLISH
+tcp        0      0 10.244.0.16:36074       10.244.0.40:10000       ESTABLISHED -
+</code></pre>
+<p>果然直接与后端的pod建立了连接</p>
+<h2 id="后记">后记</h2>
+<p>盲目的搬进k8s真的是完全错误的，解决了新的问题，又带来更多不可控的问题，所以架构迁移真的需要做好调研：新架构能够满足需求，并且新架构的缺点也能够克服或者忍受，方可行动</p>
+<p>有位兄弟说了，如果没有使用nginx-ingress-controller，而是直接把nginx直接搬迁到k8s，那怎么办？并且该文只是解决了nginx访问后端的问题，如果是服务之间的访问，又该怎么办呢？并且这是http协议，如果是其他协议， 比如gRPC，又该怎么办呢？</p>
+<p>大家稍安勿躁，本文只是一个引子，后面会把这些问题统统说清楚，敬请期待</p>
+<h2 id="联系我">联系我</h2>
+<ul>
+<li>联系我，做深入的交流</li>
+</ul>
+<p><img alt="" width="500" height="200" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202411/1416773-20241121135740959-1907948957.png#" class="lazyload"></p>
+<hr>
+<p>至此，本文结束<br>
+在下才疏学浅，有撒汤漏水的，请各位不吝赐教...</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/MrVolleyball/" target="_blank">it排球君</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/MrVolleyball/p/19321441" target="_blank">https://www.cnblogs.com/MrVolleyball/p/19321441</a></p>
+<div>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须在文章页面给出原文连接，否则保留追究法律责任的权利。 </div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-12-08 13:55">2025-12-08 13:55</span>&nbsp;
+<a href="https://www.cnblogs.com/MrVolleyball">it排球君</a>&nbsp;
+阅读(<span id="post_view_count">6</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19321441);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19321441', targetLink: 'https://www.cnblogs.com/MrVolleyball/p/19321441', title: '链路追踪--使用nginx-ingress-controller记录后端pod真实ip' })">举报</a>
+</div>
+        
