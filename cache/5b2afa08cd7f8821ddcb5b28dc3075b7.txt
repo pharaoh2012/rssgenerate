@@ -1,0 +1,331 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MrVolleyball/p/19360725" title="发布于 2025-12-17 10:29">
+    <span role="heading" aria-level="2">追踪链路--使用iptables/ipvs来记录后端pod真实ip</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>之前使用nginx-ingress-controller来记录后端真实ip，但是有位老哥说了，我没有用nginx-ingress-controller，而是用的原生nginx，这时候又当如何记录后端真实ip的问题呢</p>
+<h2 id="环境准备">环境准备</h2>
+<p>nginx:</p>
+<pre><code>upstream backend_ups {
+    server backend-service:10000;
+}
+
+server {
+    listen       80;
+    listen  [::]:80;
+    server_name  localhost;
+
+    location /test {
+        proxy_pass http://backend_ups;
+    }
+}
+
+</code></pre>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-test
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: nginx-test
+  template:
+    metadata:
+      labels:
+        app: nginx-test
+    spec:
+      containers:
+      - image: registry.cn-beijing.aliyuncs.com/wilsonchai/nginx:latest
+        imagePullPolicy: IfNotPresent
+        name: nginx-test
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        volumeMounts:
+        - mountPath: /etc/nginx/conf.d/default.conf
+          name: nginx-config
+          subPath: default.conf
+        - mountPath: /etc/nginx/nginx.conf
+          name: nginx-base-config
+          subPath: nginx.conf
+      volumes:
+      - configMap:
+          defaultMode: 420
+          name: nginx-config
+        name: nginx-config
+      - configMap:
+          defaultMode: 420
+          name: nginx-base-config
+        name: nginx-base-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-test
+  namespace: default
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: nginx-test
+  type: NodePort
+
+</code></pre>
+<p>backend:</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - image: backend-service:v1
+        imagePullPolicy: Never
+        name: backend
+        ports:
+        - containerPort: 10000
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: default
+spec:
+  ports:
+  - port: 10000
+    protocol: TCP
+    targetPort: 10000
+  selector:
+    app: backend
+  type: ClusterIP
+
+</code></pre>
+<p>部署完毕，检查一下</p>
+<pre><code>▶ kubectl get pod -owide
+NAME                         READY   STATUS    RESTARTS      AGE     IP            NODE     NOMINATED NODE   READINESS GATES
+backend-6d4cdd4c68-mqzgj     1/1     Running   0             6m3s    10.244.0.64   wilson   &lt;none&gt;           &lt;none&gt;
+backend-6d4cdd4c68-qjp9m     1/1     Running   0             6m5s    10.244.0.66   wilson   &lt;none&gt;           &lt;none&gt;
+nginx-test-b9bcf66d7-2phvh   1/1     Running   0             6m20s   10.244.0.67   wilson   &lt;none&gt;           &lt;none&gt;
+</code></pre>
+<pre><code>▶ kubectl get svc
+NAME              TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)                          AGE
+backend-service   ClusterIP   10.105.148.194   &lt;none&gt;        10000/TCP                        5m
+nginx-test        NodePort    10.110.71.55     &lt;none&gt;        80:30785/TCP                     5m2s
+</code></pre>
+<p>现在的架构大概是这个样子：</p>
+<p><img alt="watermarked-iptables_ipvs_1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202512/1416773-20251217101544698-1932761968.png" class="lazyload"></p>
+<p>尝试访问一下nginx：</p>
+<pre><code>▶ curl 127.0.0.1:30785/test
+i am backend in backend-6d4cdd4c68-qjp9m
+</code></pre>
+<p>已经反向代理到后端，再看看nginx日志</p>
+<pre><code>10.244.0.1 - - [04/Dec/2025:07:27:17 +0000] "GET /test HTTP/1.1" 200 10.105.148.194:10000 40 "-" "curl/7.81.0" "-"
+</code></pre>
+<ul>
+<li>不出意外的，其中10.105.148.194是backend-service的ip，并非是pod ip</li>
+<li>在nginx配置中，upstream的配置是backend-service，使用了k8s的service做了负载均衡，所以在nginx这层无论如何也是拿不到后端pod的ip的</li>
+<li>现在需要在真正负载均衡那一层把日志打开，就可以看到转发的real server了</li>
+</ul>
+<h2 id="iptables">iptables</h2>
+<p>如果用的是iptables做的转发，那就需要复习一下iptables的转发原理了</p>
+<p><img alt="watermarked-iptables_ipvs_2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202512/1416773-20251217101554272-539457840.png" class="lazyload"></p>
+<ul>
+<li>当包进入网卡之后，就进入了PREROUTING</li>
+<li>其次进入路由，根据目的地址，就分为两个部分：
+<ul>
+<li>进入本机，走INPUT，随后进入更高层的应用程序处理</li>
+<li>非本机的包，进入FORWARD，再进入POSTROUTING</li>
+</ul>
+</li>
+</ul>
+<h4 id="规则探索">规则探索</h4>
+<p>我们来看看具体的规则：</p>
+<ul>
+<li>
+<p>首先先检查PREROUTING，就发现了k8s添加的链表，<code>KUBE-SERVICES</code></p>
+<pre><code>▶ sudo iptables -L PREROUTING -t nat
+Chain PREROUTING (policy ACCEPT)
+target     prot opt source               destination
+KUBE-SERVICES  all  --  anywhere             anywhere             /* kubernetes service portals */
+...
+</code></pre>
+</li>
+<li>
+<p>继续检查<code>KUBE-SERVICES</code>，发现了很多service的规则</p>
+<pre><code>▶ sudo iptables -L KUBE-SERVICES -t nat
+Chain KUBE-SERVICES (2 references)
+target     prot opt source               destination
+KUBE-SVC-W67AXLFK7VEUVN6G  tcp  --  anywhere             10.110.71.55         /* default/nginx-test cluster IP */
+KUBE-SVC-EDNDUDH2C75GIR6O  tcp  --  anywhere             10.98.224.124        /* ingress-nginx/ingress-nginx-controller:https cluster IP */
+KUBE-SVC-ERIFXISQEP7F7OF4  tcp  --  anywhere             10.96.0.10           /* kube-system/kube-dns:dns-tcp cluster IP */
+KUBE-SVC-JD5MR3NA4I4DYORP  tcp  --  anywhere             10.96.0.10           /* kube-system/kube-dns:metrics cluster IP */
+KUBE-SVC-ZZAJ2COS27FT6J6V  tcp  --  anywhere             10.105.148.194       /* default/backend-service cluster IP */
+KUBE-SVC-NPX46M4PTMTKRN6Y  tcp  --  anywhere             10.96.0.1            /* default/kubernetes:https cluster IP */
+KUBE-SVC-CG5I4G2RS3ZVWGLK  tcp  --  anywhere             10.98.224.124        /* ingress-nginx/ingress-nginx-controller:http cluster IP */
+KUBE-SVC-EZYNCFY2F7N6OQA2  tcp  --  anywhere             10.101.164.9         /* ingress-nginx/ingress-nginx-controller-admission:https-webhook cluster IP */
+KUBE-SVC-TCOU7JCQXEZGVUNU  udp  --  anywhere             10.96.0.10           /* kube-system/kube-dns:dns cluster IP */
+</code></pre>
+</li>
+<li>
+<p>找到目标service：backend-service对应的链规则<code>KUBE-SVC-ZZAJ2COS27FT6J6V</code>，继续检查</p>
+<pre><code>▶ sudo iptables -L KUBE-SVC-ZZAJ2COS27FT6J6V -t nat
+Chain KUBE-SVC-ZZAJ2COS27FT6J6V (1 references)
+target     prot opt source               destination
+KUBE-MARK-MASQ  tcp  -- !10.244.0.0/16        10.105.148.194       /* default/backend-service cluster IP */
+KUBE-SEP-GYMSSX4TMUPRH3OB  all  --  anywhere             anywhere             /* default/backend-service -&gt; 10.244.0.64:10000 */ statistic mode random probability 0.50000000000
+KUBE-SEP-EZWMSI6QFXP3WRHV  all  --  anywhere             anywhere             /* default/backend-service -&gt; 10.244.0.66:10000 */
+</code></pre>
+</li>
+<li>
+<p>这里已经有明显的结论了，有2条链，对应的了两个pod，再深入检查其中一条链，<code>KUBE-SEP-GYMSSX4TMUPRH3OB</code></p>
+<pre><code>▶ sudo iptables -L KUBE-SEP-GYMSSX4TMUPRH3OB -t nat
+Chain KUBE-SEP-GYMSSX4TMUPRH3OB (1 references)
+target     prot opt source               destination
+KUBE-MARK-MASQ  all  --  10.244.0.64          anywhere             /* default/backend-service */
+DNAT       tcp  --  anywhere             anywhere             /* default/backend-service */ tcp to:10.244.0.64:10000
+</code></pre>
+</li>
+<li>
+<p>从这里的规则能够知晓，进入<code>KUBE-SEP-GYMSSX4TMUPRH3OB</code>，会进行DNAT转换，把目标的ip转换成：10.244.0.64；那同理可知，另外一条链会将目标ip转换成：10.244.0.66。所以我们只需要在这个地方加入日志记录，就可以 追踪对端的ip是哪个了</p>
+<pre><code>sudo iptables -t nat -I KUBE-SEP-GYMSSX4TMUPRH3OB 1 -j LOG --log-prefix "backend-service-pod: " --log-level 4
+sudo iptables -t nat -I KUBE-SEP-EZWMSI6QFXP3WRHV 1 -j LOG --log-prefix "backend-service-pod: " --log-level 4
+</code></pre>
+</li>
+<li>
+<p>来看下整体的效果</p>
+<pre><code>▶ sudo iptables -L KUBE-SEP-GYMSSX4TMUPRH3OB -t nat
+Chain KUBE-SEP-GYMSSX4TMUPRH3OB (1 references)
+target     prot opt source               destination
+LOG        all  --  anywhere             anywhere             LOG level warning prefix "backend-service-pod: "
+KUBE-MARK-MASQ  all  --  10.244.0.64          anywhere             /* default/backend-service */
+DNAT       tcp  --  anywhere             anywhere             /* default/backend-service */ tcp to:10.244.0.64:10000
+
+wilson.chai-ubuntu [ 17:18:03 ]  /usr/src/trojan
+▶ sudo iptables -L KUBE-SEP-EZWMSI6QFXP3WRHV -t nat
+Chain KUBE-SEP-EZWMSI6QFXP3WRHV (1 references)
+target     prot opt source               destination
+LOG        all  --  anywhere             anywhere             LOG level warning prefix "backend-service-pod: "
+KUBE-MARK-MASQ  all  --  10.244.0.66          anywhere             /* default/backend-service */
+DNAT       tcp  --  anywhere             anywhere             /* default/backend-service */ tcp to:10.244.0.66:10000
+</code></pre>
+</li>
+<li>
+<p>都已经做了对应的日志记录了，开始测试</p>
+<ul>
+<li>请求nginx：<code>curl 127.0.0.1:30785/test</code></li>
+<li>查看日志<pre><code>tail -f /var/log/syslog | grep backend-service
+Dec  4 17:17:30 wilson kernel: [109258.569426] backend-service-pod: IN=cni0 OUT= PHYSIN=veth1dc60dd3 MAC=76:d8:f3:a1:f8:1b:a2:79:4b:23:58:d8:08:00 SRC=10.244.0.70 DST=10.105.148.194 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=64486 DF PROTO=TCP SPT=51596 DPT=10000 WINDOW=64860 RES=0x00 SYN URGP=0
+</code></pre>
+</li>
+</ul>
+</li>
+</ul>
+<p>什么？！为什么DST依然显示的是10.105.148.194</p>
+<h4 id="问题解决">问题解决</h4>
+<ul>
+<li>
+<p>再次查看链规则，在日志记录的时候，还没有做DNAT，所以DST依然是service ip，但是如果将LOG规则写在DNAT之后，那DNAT匹配之后就不会再进入LOG，那依然不能记录</p>
+<pre><code>▶ sudo iptables -L KUBE-SEP-GYMSSX4TMUPRH3OB -t nat
+Chain KUBE-SEP-GYMSSX4TMUPRH3OB (1 references)
+target     prot opt source               destination
+LOG        all  --  anywhere             anywhere             LOG level warning prefix "backend-service-pod: "
+KUBE-MARK-MASQ  all  --  10.244.0.64          anywhere             /* default/backend-service */
+DNAT       tcp  --  anywhere             anywhere             /* default/backend-service */ tcp to:10.244.0.64:10000
+</code></pre>
+</li>
+<li>
+<p>还是要回到iptables的工作原理，我们的请求先进入<code>PREROUTING</code>链，再进入<code>FORWARD</code>链，最后进入<code>POSTROUTING</code>链，请求进入在<code>PREROUTING</code>中已经进行了DNAT的转换，那其实就可以在后面两个链表中记录日志。这里选择在<code>POSTROUTING</code>中记录日志</p>
+<pre><code>iptables -t nat -I POSTROUTING -p tcp -d 10.244.0.64 -j LOG --log-prefix "backend-service: "
+iptables -t nat -I POSTROUTING -p tcp -d 10.244.0.66 -j LOG --log-prefix "backend-service: "
+</code></pre>
+<pre><code>▶ sudo iptables -L POSTROUTING -t nat
+Chain POSTROUTING (policy ACCEPT)
+target     prot opt source               destination
+LOG        tcp  --  anywhere             10.244.0.66          LOG level warning prefix "backend-service: "
+LOG        tcp  --  anywhere             10.244.0.64          LOG level warning prefix "backend-service: "
+...
+</code></pre>
+</li>
+<li>
+<p>在测试一次</p>
+<pre><code>Dec  4 17:33:23 wilson kernel: [110211.770728] backend-service: IN= OUT=cni0 PHYSIN=veth1dc60dd3 PHYSOUT=vetha515043b SRC=10.244.0.70 DST=10.244.0.64 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=59709 DF PROTO=TCP SPT=33454 DPT=10000 WINDOW=64860 RES=0x00 SYN URGP=0
+Dec  4 17:33:24 wilson kernel: [110213.141975] backend-service: IN= OUT=cni0 PHYSIN=veth1dc60dd3 PHYSOUT=veth0a8a2dd3 SRC=10.244.0.70 DST=10.244.0.66 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=54719 DF PROTO=TCP SPT=33468 DPT=10000 WINDOW=64860 RES=0x00 SYN URGP=0
+</code></pre>
+</li>
+</ul>
+<h4 id="iptables小结">iptables小结</h4>
+<p>这个测试验证了，用linux的iptables规则，依然可以追踪每一条请求的链路，并且回顾了iptables的工作原理，以及探索了k8s基于iptables的转发规则的原理，但是这里有几个问题</p>
+<ul>
+<li>一旦pod的ip变化，那日志规则也要改变，这在pod随时变化的环境中，需要大量精力维护</li>
+<li>新增k8s node 节点，依然需要手动添加规则，这也需要大量维护</li>
+<li>这个方法涉及到了根本的转发规则，一旦处理不当，错误的增删改，将导致不可预知的风险，甚至集群由此崩溃</li>
+</ul>
+<p>所以这种方法是不太能够在生产环境当中使用的</p>
+<p>在这里做了详细的分析，只是为了证明我们的思路没错，只要在负载均衡那一层进行日志记录，就能拿到real server</p>
+<h2 id="ipvs">ipvs</h2>
+<p>ipvs 是内核转发，并不会记录访问日志，但是依然可以使用 iptables的方法来记录，就是在POSTROUTING链上记录日志</p>
+<p>如果k8s的转发模式是ipvs，并不意味着只需要用ipvs就可以完成转发工作，它需要ipvs与iptables共同协作才能完成</p>
+<p>内置于Linux内核中的核心技术模块，它工作在Netfilter框架的INPUT之前的hook点</p>
+<p><img alt="watermarked-iptables_ipvs_3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202512/1416773-20251217101608386-410756725.png" class="lazyload"></p>
+<p>当请求的目标ip是ipvs的vip时，ipvs就会接入工作，将数据包“劫持”过来，然后进行规则匹配并修改，比如进行DNAT</p>
+<pre><code>TCP  10.105.148.194:10000 rr
+  -&gt; 10.244.0.73:10000            Masq    1      0          0
+  -&gt; 10.244.0.74:10000            Masq    1      0          0
+</code></pre>
+<ul>
+<li>如果修改后的目标ip就是本机ip，那ipvs就直接交给上层应用程序处理</li>
+<li>如果修改后的目标ip不是本机ip，那该数据包会重新进入路由，然后通过FORWARD，POSTROUTING转发出去</li>
+</ul>
+<h2 id="小结">小结</h2>
+<p>本文复习了linux传统的知识点，iptables与ipvs的工作原理，</p>
+<p>并且详细讨论了，如果不加任何插件的情况下，使用操作系统自带的追踪方式查看后端真实的pod，但是这些都不适合在生产环境使用，因为它太底层了，日常的操作不应该去操作底层的配置，就算要用，也应该做一些自动化的脚 本或者插件封装一次才能使用</p>
+<p>在不使用nginx-ingress-controller，或者我想记录服务间转发的真实pod，有没有可以直接使用的插件或者组件帮我们完成这个工作呢，答案肯定是有的，那这就是下一期的内容，敬请期待</p>
+<h2 id="联系我">联系我</h2>
+<ul>
+<li>联系我，做深入的交流</li>
+</ul>
+<p><img alt="" width="500" height="200" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202411/1416773-20241121135740959-1907948957.png#" class="lazyload"></p>
+<hr>
+<p>至此，本文结束<br>
+在下才疏学浅，有撒汤漏水的，请各位不吝赐教...</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/MrVolleyball/" target="_blank">it排球君</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/MrVolleyball/p/19360725" target="_blank">https://www.cnblogs.com/MrVolleyball/p/19360725</a></p>
+<div>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须在文章页面给出原文连接，否则保留追究法律责任的权利。 </div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-12-17 10:29">2025-12-17 10:29</span>&nbsp;
+<a href="https://www.cnblogs.com/MrVolleyball">it排球君</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19360725);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19360725', targetLink: 'https://www.cnblogs.com/MrVolleyball/p/19360725', title: '追踪链路--使用iptables/ipvs来记录后端pod真实ip' })">举报</a>
+</div>
+        
