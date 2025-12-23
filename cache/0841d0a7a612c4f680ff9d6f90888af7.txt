@@ -1,0 +1,355 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/JulianHuang/p/19388140" title="发布于 2025-12-23 17:12">
+    <span role="heading" aria-level="2">🚀糟糕，我实现的k8s informer好像是依托答辩</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>💡 糟糕，k8s informer我好像拉一坨大的</p>
+<p>近段时间在做云原生AI算力平台，之前提到使用k8s informer机制管控多渠道提交的训练任务。</p>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202512/587720-20251223171050915-2063071702.png" alt="image" loading="lazy"></p>
+<p>上面第4点：</p>
+<p>informer会监听通过cli和网页portal提交的job， 回显到portal平台，并在job发生状态变更时通知用户。</p>
+<h2 id="1-informer是实现声明式controller设计的核心">1. informer是实现声明式controller设计的核心</h2>
+<p>k8s采用声明式设计， 以结果为导向， 实现这一关键能力的组件是k8s各种controller：</p>
+<p>定义某对象的期望状态，实时监控并达成这个状态（调谐Reconcile） 就是控制器做的事情， No signal was sent. No webhook fired。</p>
+<p>informer是k8s client-go库的一部分：</p>
+<ul>
+<li>① 监听资源</li>
+<li>② 并本地缓存</li>
+<li>③ 通知上层应用发生了一些事件（job创建、job pending、job运行、job完成/失败）</li>
+</ul>
+<p>减少了apiserver的调用流量、优化性能、反应式自动化运维  （我当前的需求有点类似于反应式自动化运维😄）。</p>
+<h2 id="2-informer核心使用流程">2. informer核心使用流程</h2>
+<p>运行一个完整的informer： list ---&gt; watch ---&gt; cache---&gt; react。</p>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202512/587720-20251223171110014-1231938720.png" alt="image" loading="lazy"></p>
+<p>① 从apiserver拉取指定的gvr资源, 形成首次资源快照</p>
+<p>② 持续监听资源的变更事件进deltaFIFO队列，这里是通过HTTP/1.1 的<code>Chunked Transfer Encoding</code>（分块传输编码）来实现的</p>
+<p>③ 通过上述①②两步得到资源的最新状态并缓存，注意，缓存的是资源对象，而不是资源变更事件， 另外是线程安全的存储。</p>
+<p>④ 事件处理，应用在业务层面的动作，可以写日志，可以做controller的Reconcile动作。</p>
+<p>开发者主要考量在<code>react（EventHandler）</code>阶段，其余能力client-go sdk会提供。</p>
+<p>apiserver--&gt;reflector(拉取/监听)--&gt;DeltaFiFO(队列)--&gt; Process（处理）--&gt;Handler（用户代码）</p>
+<h3 id="21-watch机制-chunked-transfer-encoding">2.1 Watch机制： chunked transfer encoding</h3>
+<p>分块传输能力是http1.1 常见功能，不需要像websocket那样升级协议到帧格式，http连接中每个事件是独立的，直到连接关闭。</p>
+<p>请求spiserver时查询参数加上<code>watch=true</code>, 会提示服务器本次是监听请求<br>
+响应核心特征是响应头包含<code>Transfer-Encoding: chunked</code></p>
+<p>验证</p>
+<pre><code>终端1：kubectl proxy --port=8081  ： 在主机上8081端口代理aiserver服务
+
+终端2： curl "http://localhost:8081/api/v1/namespaces/team-a/pods?watch=true"  --verbose
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202512/587720-20251223171121777-240153264.png" alt="image" loading="lazy"></p>
+<p>在client-go sdk中会为informer watch建立稳定的长连接（断线重连、重试等）</p>
+<h2 id="3-一个常规的informer实践">3. 一个常规的informer实践</h2>
+<p>利用kubeconfig创建informer（绑定gvr）， 启动informer（带终止信道）</p>
+<pre><code>package main
+
+import (
+	"fmt"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+func main() {
+	config, _ := clientcmd.BuildConfigFromFlags("", "/home/user/.kube/config")
+	clientset, _ := kubernetes.NewForConfig(config)
+
+	podInformer := cache.NewSharedIndexInformer(
+		cache.NewListWatchFromClient(
+			clientset.CoreV1().RESTClient(),
+			"pods",
+			v1.NamespaceAll,
+			fields.Everything(),
+		),
+		&amp;v1.Pod{},
+		time.Minute*10, // resync 周期
+		cache.Indexers{ // cache上的快速过滤器
+			"byNode": func(obj interface{}) ([]string, error) {
+				pod := obj.(*v1.Pod)
+				return []string{pod.Spec.NodeName}, nil
+			}},
+	)
+
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(obj interface{}) {
+			pod := obj.(*v1.Pod)
+			fmt.Printf("[DELETED] Pod: %s/%s\n", pod.Namespace, pod.Name)
+		},
+	})
+
+	// 启动 informer (必须在独立goroutine中，因为Run方法是同步方法)
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	go func() {
+		fmt.Println("Starting PodInformer...")
+		podInformer.Run(stopCh) // 同步方法，会阻塞直到 stopCh 关闭
+		fmt.Println("PodInformer stopped")
+	}()
+
+	//  等待缓存同步就绪
+	if !cache.WaitForCacheSync(stopCh, podInformer.HasSynced) {
+		panic("failed to wait for cache sync")
+	}
+	&lt;-stopCh
+}
+</code></pre>
+<ul>
+<li>
+<p>informer有<code>resync</code>机制： 周期性重放数据，目的是为业务提供补偿机会，上面设置了10分钟重放周期, =0或者不设置则不重放。</p>
+</li>
+<li>
+<p>使用<code>cache.NewListWatchFromClient</code>设置了informer的<code>local cache</code>， 开发者可以直接把<code>local cache</code>当成监听对象的集合,client-go会确保local cache正确反映当前的资源对象。</p>
+</li>
+<li>
+<p><code>informer.Run(stopCh)</code> 是一个同步的函数，持续执行list-watch-cache-react这个引擎， 在应用层面需要以子goroutine形式，client-go另有informer工厂，informerFactory.Start(stopCh) 内部也是启协程，这里也要认识到信道stopCh在golang中的通信作用。</p>
+</li>
+</ul>
+<blockquote>
+<p>为加快这个informer cache访问速度，还可以给这个cache加上索引器<code>Indexers</code>, 后面可直接使用索引器访问cache。</p>
+</blockquote>
+<h3 id="31-拉了一坨大的">3.1 拉了一坨大的</h3>
+<p>如果把业务需求都做在EventHandler里面，长此以往会拉一坨大的。</p>
+<p>首先这是一个<strong>事件队列消费模型</strong>，Add/Update/Delete变更事件是从一个叫<code>deltaFIFO</code>队列中pop出来的， 既然是队列模型，那么队列消费的高可用、高性能、可扩展问题就避免不了：</p>
+<ul>
+<li>
+<p>事件需要同步挨个处理，否则控制器侧拿到的最终资源状态可能不对，那么这种挨个处理也就谈不上高性能。</p>
+</li>
+<li>
+<p>但是应用又是多实例部署， 多个informer都走同样的list-watch-cache-react流程， 客观上围绕informer deltaFIIO又形成多生产者=&gt;多消费者模型，这种局面EventHandler就要考量幂等和资源一致性问题。</p>
+</li>
+<li>
+<p>队列常规的高可用考量：① 消费者宕机时事件丢失  ② 消费失败如何重试（重试又有幂等性问题）</p>
+</li>
+<li>
+<p>informer有<code>resync</code>机制：会对<code>local cache</code>中的资源构造<code>onUpdate事件</code>，也会走EventHandler, 所以EventHandler做的很重，会很麻烦。</p>
+</li>
+</ul>
+<p>如果业务逻辑很重或者强依赖重试，推荐上<code>[workQueue](https://pkg.go.dev/k8s.io/client-go@v0.35.0/util/workqueue "workQueue")</code>, 支持以下功能：</p>
+<ul>
+<li>
+<p>公平：按添加顺序处理元素</p>
+</li>
+<li>
+<p>元素去重：单个item不会被并发消费多次；如果一个item在消费前被多次添加，它只会被消费一次</p>
+</li>
+<li>
+<p>多个消费者和生产者， 支持消费时重排</p>
+</li>
+<li>
+<p>关闭通知</p>
+</li>
+</ul>
+<h2 id="4-controller调谐设计">4. <a href="https://medium.com/@dhruvbhl/informers-listers-workqueues-the-brain-behind-your-controller-f5b0967026de" title="controller调谐设计" target="_blank" rel="noopener nofollow">controller调谐设计</a></h2>
+<p>学习controller的设计：除了informer，还提供了额外的工具，帮助开发者高效感知最新的资源，执行调谐工作。</p>
+<table>
+<thead>
+<tr>
+<th>package</th>
+<th>role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>informer</td>
+<td>Eyes(watch and cache them)</td>
+</tr>
+<tr>
+<td>lister</td>
+<td>Memory(read from lcoal cache)</td>
+</tr>
+<tr>
+<td>workQueue</td>
+<td>task list (reconcile work)</td>
+</tr>
+</tbody>
+</table>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202512/587720-20251223171139498-1459677859.png" alt="image" loading="lazy"></p>
+<pre><code>type PodController struct {
+	clientset kubernetes.Interface
+	queue     workqueue.TypedRateLimitingInterface[string]
+	informer  cache.SharedIndexInformer
+	indexer   cache.Indexer
+}
+
+func NewPodController(clientset kubernetes.Interface) *PodController {
+	// 创建 Pod informer
+	podInformer := cache.NewSharedIndexInformer(
+		cache.NewListWatchFromClient(
+			clientset.CoreV1().RESTClient(),
+			"pods",
+			v1.NamespaceAll,
+			fields.Everything(),
+		),
+		&amp;v1.Pod{},
+		time.Minute*10, // resync 周期
+		cache.Indexers{
+			"byNode": func(obj interface{}) ([]string, error) {
+				pod := obj.(*v1.Pod)
+				return []string{pod.Spec.NodeName}, nil
+			}},
+	)
+
+	// 创建控制器
+	controller := &amp;PodController{
+		clientset: clientset,
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[string]( "string"),
+		),
+		informer: podInformer,
+		indexer:  podInformer.GetIndexer(),
+	}
+
+	// 注册事件处理器
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    controller.handleAdd,
+		UpdateFunc: controller.handleUpdate,
+		DeleteFunc: controller.handleDelete,
+	})
+
+	return controller
+}
+</code></pre>
+<h3 id="--informers-the-eyes-on-the-cluster">①  Informers: The Eyes on the Cluster</h3>
+<p>informer是一个管道，当发生变化时，该informer管道可确保：</p>
+<ul>
+<li>本地缓存local cache已更新</li>
+<li>任何已注册的事件处理程序(add/update/delete)都会收到通知</li>
+</ul>
+<p>informer不会直接调用控制器的Reconcile方法，事件处理程序的唯一工作是将<code>key (namespace/name)</code>入队（workQueue）</p>
+<blockquote>
+<p>为什么使用key？<br>
+资源对象变化很快→键更稳定→更适合数据去重。</p>
+</blockquote>
+<pre><code>func (c *PodController) handleAdd(obj interface{}) {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		klog.Errorf("Couldn't get key for object %+v: %v", obj, err)
+		return
+	}
+	c.queue.Add(key)
+}
+</code></pre>
+<h3 id="-key一旦入队就由workqueue接管">② key一旦入队，就由workQueue接管</h3>
+<ul>
+<li>去重</li>
+<li>重试、出队消费失败重排： 队列行为增强系统可用性</li>
+<li>限速： 弹性设计，增强可用性和效率</li>
+</ul>
+<h3 id="-lister其实就是indexers索引器">③ lister：其实就是Indexers索引器</h3>
+<p>使用lister从local cache 读取最新的资源状态（不需要从api server读取），</p>
+<p>最终执行控制器的<code>Reconcile</code>逻辑。</p>
+<p><img src="https://img2024.cnblogs.com/blog/587720/202512/587720-20251223171158516-1068437746.png" alt="image" loading="lazy"></p>
+<p>通过<code>workQueue</code>将架构从基于资源事件的队列转换为基于资源的队列 。</p>
+<p>注意：这个时候的workQueue有事件压缩的效果： 在被消费之前，如果该资源有多个变更事件，只会保留首次入队（更新时间戳）。</p>
+<p>这非常适合控制器的声明式设计：Controller不关心对象如何到达当前状态，只关心当前状态是否与期望状态一致，并采取行动使其一致。</p>
+<pre><code>func (c *PodController) Run(workers int, stopCh &lt;-chan struct{}) {
+	defer c.queue.ShutDown()
+
+	klog.Info("Starting Pod controller")
+
+	go c.informer.Run(stopCh)
+
+	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
+		klog.Error("Timed out waiting for caches to sync")
+		return
+	}
+
+	for i := 0; i &lt; workers; i++ {
+		go wait.Until(c.runWorker, time.Second, stopCh)
+	}
+
+	&lt;-stopCh
+	klog.Info("Stopping Pod controller")
+}
+
+func (c *PodController) runWorker() {
+	for c.processNextWorkItem() {
+	}
+}
+
+func (c *PodController) processNextWorkItem() bool {
+	key, quit := c.queue.Get()
+	if quit {
+		return false
+	}
+
+	defer c.queue.Done(key)
+
+	err := c.syncPod(key)
+	if err != nil {
+		klog.Errorf("Error syncing pod %s: %v", key, err)
+		c.queue.AddRateLimited(key)
+		return true
+	}
+
+	c.queue.Forget(key)
+	return true
+}
+
+func main() {
+	// 创建 clientset
+	// config, _ := rest.InClusterConfig()
+
+	homepath := homedir.HomeDir()
+	kubeconfig := filepath.Join(homepath, ".kube", "config")
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig) // 集群外认证访问 apiserver
+	if err != nil {
+		klog.Errorf("Error building kubeconfig: %v", err)
+	}
+	clientset, _ := kubernetes.NewForConfig(config)
+
+	controller := NewPodController(clientset)
+	stopCh := make(chan struct{})
+	controller.Run(3, stopCh)
+}
+</code></pre>
+<hr>
+<h3 id="41--屎上雕花">4.1  屎上雕花</h3>
+<p>上文产生的"一坨大的"是一个重度的事件处理行为：sync到mysql并做出通知。</p>
+<p>咱就缺一个队列，可以使用workQueue， 但是本次需求要跟踪每次状态变更，于是要规避workQueue的事件压缩效果。</p>
+<p>于是本次将(原资源key+ 资源版本+ 资源状态)整体作为入队元素。</p>
+<pre><code> item := QueueItem{
+        Key:     fmt.Sprintf("%s/%s", pod.Namespace, pod.Name),
+        Version: pod.ResourceVersion,
+        Status ： pod.Status，
+    }
+</code></pre>
+<p>利用队列削峰填谷，满足了业务的需求和高可用、可扩展要求。</p>
+<p>注意出队消费时仍要保证幂等操作， 可采用（资源key+资源version) 作为幂等键实现幂等的判定。</p>
+<p>这就是某企业项目屎上雕花的经历， 老鸟轻喷。</p>
+<p>🤖 🚀 👑 🛠️ 💡 🌟 🤖 ☕ 🔗 📄 📖 🌏 💼 🗣️<br>
+🐳🚜👍🔎😄🌐</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <hr style="FILTER: alpha(opacity=100,finishopacity=0,style=3)" width="80%" color="#987cb9" size="3">
+<div style="text-align:center;">
+<p>本文来自博客园，作者：{有态度的马甲}，转载请注明原文链接：<a href="https://www.cnblogs.com/JulianHuang/p/19388140" target="_blank">https://www.cnblogs.com/JulianHuang/p/19388140</a></p>
+<strong style="color: red; ">欢迎关注我的原创技术、职场公众号， 加好友谈天说地，一起进化</strong>
+<div><img style="width: 250px;height:250px;" src="https://blog-static.cnblogs.com/files/JulianHuang/QR.gif"> </div>
+
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2025-12-23 17:12">2025-12-23 17:12</span>&nbsp;
+<a href="https://www.cnblogs.com/JulianHuang">码甲哥不卷</a>&nbsp;
+阅读(<span id="post_view_count">63</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19388140);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19388140', targetLink: 'https://www.cnblogs.com/JulianHuang/p/19388140', title: '&amp;#128640;糟糕，我实现的k8s informer好像是依托答辩' })">举报</a>
+</div>
+        
