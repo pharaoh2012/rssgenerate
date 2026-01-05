@@ -1,0 +1,292 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MrVolleyball/p/19441540" title="发布于 2026-01-05 11:04">
+    <span role="heading" aria-level="2">从手动到自动：基于 Mutating Admission Webhook 实现 Envoy Sidecar 自动注入</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        在微服务规模不断扩大的场景下，手动为每个 Pod 注入 Envoy Sidecar 已经难以维护。本文从实际工程问题出发，详细讲解如何利用 Kubernetes 的 Mutating Admission Webhook 机制，实现 Envoy Sidecar 的自动注入。内容涵盖证书生成、Webhook 配置、注入服务实现，以及基于 Namespace / Pod Label 的精细化注入控制
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>上一小节我们详细讨论了如何做流量劫持，并且使用initContainers来做自动劫持的配置。但是目前还有一个问题，如果我们的系统有好几百个微服务，那作为重要的代理envoy，是手动注入的，难道每个微服务都要手动编辑一次 ？这显然是不可承受的，所以这一节，我们来详细讨论一下自动注入的问题</p>
+<h2 id="环境准备">环境准备</h2>
+<p>由于本节只讨论容器注入，所以只需要准备一个普通的deployment就行了</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - image: backend-service:v1
+        imagePullPolicy: Never
+        name: backend
+        ports:
+        - containerPort: 10000
+          protocol: TCP
+        resources: {}
+      restartPolicy: Always
+</code></pre>
+<h2 id="mutating-admission-webhooks">mutating admission webhooks</h2>
+<p><img alt="auto_injection_1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202601/1416773-20260105102513029-709020086.png" class="lazyload"></p>
+<p>简单来说，就是当pod重启的时候，会发起一系列的过程，其中在mutating admission controller 这里，k8s提供了一个webhooks，可以回调到指定的地方去，所以我们需要创建一个server来处理该回调，添加一个容器进去，完成容器注入的工作</p>
+<h4 id="创建相关证书">创建相关证书</h4>
+<pre><code>cd /etc/kubernetes/pki
+</code></pre>
+<p>创建openssl.cnf</p>
+<pre><code>[ req ]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[ req_distinguished_name ]
+CN = sidecar-webhook.default.svc
+
+[ v3_req ]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = sidecar-webhook
+DNS.2 = sidecar-webhook.default
+DNS.3 = sidecar-webhook.default.svc
+
+</code></pre>
+<p>从k8s根证书中创建证书</p>
+<pre><code>sudo openssl req -x509 -newkey rsa:2048 \
+  -keyout tls.key \
+  -out tls.crt \
+  -days 365 -nodes \
+  -config openssl.cnf \
+  -extensions v3_req
+</code></pre>
+<h4 id="创建mutatingwebhookconfiguration">创建MutatingWebhookConfiguration</h4>
+<pre><code>mytls=`cat tls.crt | base64 | tr -d '\n'`
+
+echo 'apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+webhooks:
+- name: sidecar.demo.io
+  clientConfig:
+    service:
+      name: sidecar-webhook
+      namespace: default
+      path: /mutate
+    caBundle: '$mytls'
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    operations: ["CREATE"]
+    resources: ["pods"]
+  admissionReviewVersions: ["v1"]
+  sideEffects: None' | kubectl apply -f -
+
+</code></pre>
+<h4 id="创建服务来接收webhook">创建服务来接收webhook</h4>
+<p><a href="https://github.com/wilsonchai8/myblog/blob/main/micro_service/injection/inject.go" target="_blank" rel="noopener nofollow">自动注入服务</a></p>
+<p>这没什么可说的，需要注意的就是注入pod的配置直接写在了代码里面，并且注入了2个部分，首先是sidecar container，其次是sidecar的volumes配置（pod级别的）</p>
+<pre><code>        patch := []map[string]interface{}{
+                {
+                        "op":   "add",
+                        "path": "/spec/containers/-",
+                        "value": map[string]interface{}{
+                                "image":           "registry.cn-beijing.aliyuncs.com/wilsonchai/envoy:v1.32-latest",
+                                "imagePullPolicy": "IfNotPresent",
+                                "name":            "envoy",
+                                "args":            []string{"-c", "/etc/envoy/envoy.yaml"},
+                                "volumeMounts": []map[string]interface{}{
+                                        {
+                                                "mountPath": "/etc/envoy",
+                                                "name":      "envoy-config",
+                                        },
+                                },
+                        },
+                },
+                {
+                        "op":   "add",
+                        "path": "/spec/volumes/-",
+                        "value": map[string]interface{}{
+                                "configMap": map[string]interface{}{
+                                        "defaultMode": 420,
+                                        "name":        "envoy-config",
+                                },
+                                "name": "envoy-config",
+                        },
+                },
+        }
+
+</code></pre>
+<pre><code>▶ go run inject.go
+2025/12/29 14:58:19 Webhook listening on :8443
+
+</code></pre>
+<p>打开8443端口以便接收请求</p>
+<h4 id="创建访问路径">创建访问路径</h4>
+<p>我们的服务在集群外，所以创建一个endpoint指向集群之外</p>
+<pre><code>echo 'apiVersion: v1
+kind: Service
+metadata:
+  name: sidecar-webhook
+spec:
+  ports:
+  - port: 443
+    targetPort: 8443
+    protocol: TCP
+  type: ClusterIP
+
+---
+
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: sidecar-webhook
+  namespace: default
+subsets:
+- addresses:
+  - ip: 10.22.12.178
+  ports:
+  - port: 8443
+    protocol: TCP' | kubectl apply -f -
+</code></pre>
+<h4 id="验证">验证</h4>
+<p>重启backend服务，<code>kubectl rollout restart deploy backend</code></p>
+<pre><code>cannot bind '0.0.0.0:10000': Address already in use
+
+</code></pre>
+<p>出现了报错，这应该是由于envoy是监听10000端口，backend服务监听的也是10000端口，现在它们在一个net namespace，就肯定要报错了，所以改一下envoy的配置，监听另外一个端口吧，10000改成10001</p>
+<pre><code>      listeners:
+        - name: ingress_listener
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 10001
+</code></pre>
+<p>再次重启查看pod状态</p>
+<pre><code>▶ kubectl get pod -owide -l app=backend
+NAME                       READY   STATUS    RESTARTS   AGE    IP             NODE     NOMINATED NODE   READINESS GATES
+backend-6bdf5d484b-5czgx   2/2     Running   0          100s   10.244.0.184   wilson   &lt;none&gt;           &lt;none&gt;
+
+</code></pre>
+<p>查看详情</p>
+<p><img alt="auto_injection_2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202601/1416773-20260105102617163-829810931.png" class="lazyload"></p>
+<p>自动注入了envoy容器</p>
+<p>至此，架构图如下：</p>
+<p><img alt="auto_injection_3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202601/1416773-20260105102624936-2006056597.png" class="lazyload"></p>
+<h2 id="精细化注入">精细化注入</h2>
+<p>按照目前的配置，只要有pod create，就立刻回调集群外的注入服务，如果k8s集群的服务很多，并且频繁的create/destroy，那就会对注入服务产生较大的压力。如果在这些服务中，只有一些服务是需要使用自动注入功能的，那 就需要更精细化的注入管理</p>
+<h4 id="namespace打标签">namespace打标签</h4>
+<p>首先要调整一下MutatingWebhookConfiguration</p>
+<pre><code>apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+webhooks:
+- name: sidecar.demo.io
+  namespaceSelector:
+    matchLabels:
+      sidecar-inject: "true"
+...
+</code></pre>
+<p>加上标签 <code>sidecar-inject: "true"</code>，只有满足这个标签，才会回调到外部的注入服务，这样就可以大大减轻注入服务的压力了</p>
+<p>再给namespace打上标签</p>
+<pre><code>kubectl label ns default sidecar-inject=true
+</code></pre>
+<p>default namespace里面所有的pod，都会回调至外部注入服务</p>
+<h4 id="pod-打标签">pod 打标签</h4>
+<p>这次不在namespace下，而是基于某个pod label</p>
+<pre><code>apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: sidecar-injector
+webhooks:
+- name: sidecar.demo.io
+  objectSelector:
+    matchLabels:
+      sidecar-inject-pod: "true"
+...
+</code></pre>
+<p>然后再给deployment打标签，这里要注意打的是pod的标签</p>
+<pre><code>kubectl patch deployment backend \
+  --type='merge' \
+  -p '{
+    "spec": {
+      "template": {
+        "metadata": {
+          "labels": {
+            "sidecar-inject-pod": "true"
+          }
+        }
+      }
+    }
+  }'
+</code></pre>
+<h2 id="小结">小结</h2>
+<p>本文详细描述了怎么做自动注入：k8s配置修改+外部注入服务。其中需要注入的pod是写死在注入服务的，这部分可以抽出来，将配置写成configmap，或者在其他的配置中心中，这样就不用频繁的修改注入服务了</p>
+<p>另外mutating webhooks可以拦截大部分k8s支持的资源，并且发送到所配置的外部服务中进行需要的配置，这就不单单是pod自动注入，而是资源拦截。比如我需要拦截configmap</p>
+<pre><code>echo 'apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: callback-configmap
+webhooks:
+- name: sidecar.demo.io
+  clientConfig:
+    service:
+      name: sidecar-webhook
+      namespace: default
+      path: /mutate
+    caBundle: '$mytls'
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    operations: ["CREATE", "UPDATE"]
+    resources: ["configmaps"]
+  admissionReviewVersions: ["v1"]
+  sideEffects: None' | kubectl apply -f -
+</code></pre>
+<p>resources变更为configmap之后，就可以直接回调到外部服务。本章由于篇幅有限，就不对这个话题展开了，这个以后有需要再来详细讨论</p>
+<h2 id="联系我">联系我</h2>
+<ul>
+<li>联系我，做深入的交流</li>
+</ul>
+<p><img alt="" width="500" height="200" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202411/1416773-20241121135740959-1907948957.png#" class="lazyload"></p>
+<hr>
+<p>至此，本文结束<br>
+在下才疏学浅，有撒汤漏水的，请各位不吝赐教...</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/MrVolleyball/" target="_blank">it排球君</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/MrVolleyball/p/19441540" target="_blank">https://www.cnblogs.com/MrVolleyball/p/19441540</a></p>
+<div>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须在文章页面给出原文连接，否则保留追究法律责任的权利。 </div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-01-05 11:04">2026-01-05 11:04</span>&nbsp;
+<a href="https://www.cnblogs.com/MrVolleyball">it排球君</a>&nbsp;
+阅读(<span id="post_view_count">36</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19441540);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19441540', targetLink: 'https://www.cnblogs.com/MrVolleyball/p/19441540', title: '从手动到自动：基于 Mutating Admission Webhook 实现 Envoy Sidecar 自动注入' })">举报</a>
+</div>
+        
