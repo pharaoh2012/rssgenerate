@@ -1,0 +1,153 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ixbwer/p/19451924" title="发布于 2026-01-07 13:50">
+    <span role="heading" aria-level="2">BLE 4.2 Controller：高精度调度器与冲突仲裁</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>由于芯片通常只有一个 Radio（单射频），我们不能同时进行广播、扫描和保持连接。如果我在 37 信道广播时，连接的锚点（Anchor Point）也到了，该怎么办？如果我正在扫描，突然需要回复一个连接请求，怎么保证时间差精确在 150µs？</p>
+<p>这就是我们需要一个<strong>高精度调度器（High-Precision Scheduler）</strong> 的原因。通用的 RTOS（如 FreeRTOS）基于 SysTick 的 1ms 调度精度在这里完全不够看，我们需要的是微秒级的控制。</p>
+<h1 id="1-设计哲学时间轴上的俄罗斯方块">1 设计哲学：时间轴上的俄罗斯方块</h1>
+<p>BLE Controller 的调度本质上是<strong>时分复用（TDM）</strong>。我们可以把时间看作一条无限延伸的单行铁轨，而每一个任务（广播一次、连接交互一次）就是一列列火车。</p>
+<p>我们的调度器只有两个核心目标：</p>
+<ol>
+<li><strong>不撞车：</strong> 保证任意两个任务在时间轴上不重叠。</li>
+<li><strong>准点率：</strong> 任务必须在预定的微秒时刻触发（误差 &lt; 2µs）。<br>
+<img src="https://img2024.cnblogs.com/blog/2160691/202601/2160691-20260107134613379-1261820989.png" alt="image" loading="lazy"></li>
+</ol>
+<p>为了实现这一点，我们需要抛弃“线程优先级”的概念，转而使用<strong>基于绝对时间的有序链表</strong>。</p>
+<h1 id="2-冲突仲裁">2 冲突仲裁</h1>
+<p>显然，这样插入非常容易出现时间上的重叠。但幸好，蓝牙中并不是所有事件都对时间要求非常严格，为了解决冲突，可以根据事件的<strong>优先级</strong>和<strong>一定的策略</strong>调整不同事件开始的时间。<br>
+<img src="https://img2024.cnblogs.com/blog/2160691/202601/2160691-20260107134626263-1664847779.png" alt="image" loading="lazy"></p>
+<p>下面以 Cordio 源码为例，分析不同情况的处理方法。</p>
+<h3 id="211-新事件优先级更高">2.1.1 新事件优先级更高</h3>
+<p>如果新事件优先级更高，新事件获胜，则移除旧的事件，插入新的事件，然后通过回调函数 <code>abortCback</code> 通知旧事件被取消了。回调函数针对不同的事件单独实现。</p>
+<pre><code class="language-c">static bool_t SchResolveConflict(BbOpDesc_t *pItem, BbOpDesc_t *pTgt)
+{
+  schRemoveForConflict(pTgt);
+  schInsertToEmptyList(pItem);
+
+  if (pDeleted-&gt;abortCback) {
+    pDeleted-&gt;abortCback(pDeleted);  
+  }
+  
+  return TRUE;
+}
+</code></pre>
+<h3 id="212-优先级相同">2.1.2 优先级相同</h3>
+<p>如果新事件优先级相同，就使用冲突回调函数 <code>conflictCback</code> 来决定怎么处理。回调函数针对不同的事件单独实现。</p>
+<pre><code class="language-c">static bool_t SchIsBodResolvable(
+  BbOpDesc_t *pItem,           // 新BOD
+  BbOpDesc_t *pTgt,            // 现有BOD
+  BbConflictAct_t conflictCback
+)
+{
+  // 策略1: 比较重调度策略（优先级）
+  if (pItem-&gt;reschPolicy &lt; pTgt-&gt;reschPolicy) {
+    return TRUE;  // 新BOD优先级更高，可以抢占
+  }
+  
+  // 策略2: 优先级相同，使用冲突回调
+  else if ((pItem-&gt;reschPolicy == pTgt-&gt;reschPolicy) &amp;&amp; 
+           conflictCback) {
+    if (conflictCback(pItem, pTgt) == pItem) {
+      return TRUE;  // 回调选择了新BOD
+    }
+  }
+  
+  // 策略3: 新BOD优先级更低或相同但无回调
+  else {
+    LL_TRACE_WARN2("!!! Scheduling conflict: existing=%u vs incoming=%u", 
+                   pTgt-&gt;reschPolicy, pItem-&gt;reschPolicy);
+    return FALSE;  // 保留现有BOD
+  }
+  
+  return FALSE;
+}
+</code></pre>
+<h3 id="213-新事件优先级更低">2.1.3 新事件优先级更低</h3>
+<p>如果新事件优先级更低，则保留旧事件，调整新事件的事件重新尝试插入。<br>
+例如一个普通的广播事件在调度时碰到了更高优先级的连接事件，广播事件重新计算下一次的广播事件，然后重新尝试调度。对于广播，错过一次几乎不影响用户体验。</p>
+<p><img src="https://img2024.cnblogs.com/blog/2160691/202601/2160691-20260107134641658-910925783.png" alt="image" loading="lazy"></p>
+<pre><code class="language-c">static bool_t SchResolveConflict(
+  BbOpDesc_t *pItem,  // 要插入的BOD
+  BbOpDesc_t *pTgt    // 冲突的BOD
+)
+{
+  BbOpDesc_t *pCur = pTgt;
+  int numDeletedBod = 0;
+  BbOpDesc_t *pDeleted[SCH_MAX_DELETE_BOD];  // 最多删除8个
+  
+  // 1. 遍历并移除所有冲突的BOD
+  while (TRUE) {
+    
+    // 防止删除过多
+    if (numDeletedBod == SCH_MAX_DELETE_BOD) {
+      result = FALSE;
+      break;
+    }
+    
+    pDeleted[numDeletedBod++] = pCur;
+    
+    // 如果只与pCur冲突
+    if ((pCur-&gt;pNext == NULL) || 
+        SCH_IS_DONE_BEFORE(pItem, pCur-&gt;pNext)) {
+      result = schRemoveForConflict(pCur);
+      break;
+    }
+    
+    // 继续移除下一个冲突的BOD
+    if (!schRemoveForConflict(pCur)) {
+      result = FALSE;
+      break;
+    }
+    
+    pCur = pCur-&gt;pNext;
+  }
+  
+  // 2. 如果成功移除，插入新BOD
+  if (result == TRUE) {
+    if (pCur-&gt;pNext) {
+      schInsertBefore(pItem, pCur-&gt;pNext);
+    }
+    else if (pTgt-&gt;pPrev) {
+      schInsertAfter(pItem, pTgt-&gt;pPrev);
+    }
+    else {
+      schInsertToEmptyList(pItem);
+    }
+    
+    // 3. 调用所有被移除BOD的中止回调
+    for (int i = 0; i &lt; numDeletedBod; i++) {
+      if (pDeleted[i]-&gt;abortCback) {
+        pDeleted[i]-&gt;abortCback(pDeleted[i]);
+      }
+    }
+  }
+  
+  return result;
+}
+</code></pre>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文版权归作者：<a href="https://www.cnblogs.com/ixbwer/" target="_blank">ixbwer</a>所有，转载请注明原文链接：<a href="https://www.cnblogs.com/ixbwer/p/19451924" target="_blank">https://www.cnblogs.com/ixbwer/p/19451924</a>，否则保留追究法律责任的权利。</p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-01-07 13:50">2026-01-07 13:50</span>&nbsp;
+<a href="https://www.cnblogs.com/ixbwer">ixbwer</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19451924);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19451924', targetLink: 'https://www.cnblogs.com/ixbwer/p/19451924', title: 'BLE 4.2 Controller：高精度调度器与冲突仲裁' })">举报</a>
+</div>
+        
