@@ -1,0 +1,1222 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/mudtools/p/19469184" title="发布于 2026-01-11 23:00">
+    <span role="heading" aria-level="2">飞书 .NET SDK 事件处理的幂等性与去重机制</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>飞书事件处理过程中如何让你的应用不再"重复劳动"，如何用三层防护筑起安全墙，结合内存与 Redis 双重保障，让你的飞书应用稳如磐石——不再重复处理，告别混乱状态。</p>
+</blockquote>
+<hr>
+<h2 id="为什么需要去重">为什么需要"去重"？</h2>
+<p>想象一下这样的场景：</p>
+<p>你在飞书里收到一条消息，应用收到通知后创建了待办事项。但因为网络不稳定，飞书以为你没收到，又发了一遍同样的通知——结果呢？你的应用又创建了一次待办，同一个任务出现了两次。</p>
+<p>这就是我们所说的"重复处理"问题。</p>
+<hr>
+<h3 id="什么时候会出现这种情况">什么时候会出现这种情况？</h3>
+<p>在飞书事件驱动的世界里，以下情况都可能导致<strong>同一事件被多次送达</strong>：</p>
+<ul>
+<li>📡 <strong>网络波动</strong>：飞书服务器没收到你的确认，于是重发</li>
+<li>🔄 <strong>服务重启</strong>：内存清空，之前的事件又来了</li>
+<li>👥 <strong>多实例运行</strong>：多个实例同时收到同一事件</li>
+<li>🔌 <strong>断线重连</strong>：WebSocket 重连后可能重复消息</li>
+</ul>
+<h3 id="真实案例一分钟内的混乱">真实案例：一分钟内的混乱</h3>
+<pre><code>时间线：
+─────────────────────────────────────────────────────────────
+09:00:00  飞书推送：收到一条新消息
+09:00:01  实例A 接收并处理 → 创建待办 ✅
+09:00:05  飞书没收到确认，再次推送
+09:00:06  实例B 接收并处理 → 又创建待办 ❌
+─────────────────────────────────────────────────────────────
+</code></pre>
+<p><strong>后果有多严重？</strong></p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>实际影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>📉 数据重复</td>
+<td>用户收到两条相同的待办</td>
+</tr>
+<tr>
+<td>💰 资金损失</td>
+<td>订单重复扣款，退钱都退不完</td>
+</tr>
+<tr>
+<td>📧 骚扰用户</td>
+<td>同一条通知发十次</td>
+</tr>
+<tr>
+<td>🔄 状态混乱</td>
+<td>数据库里说"已处理"，实际只做了一半</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="三层防护像保安一样层层把关">三层防护：像保安一样层层把关</h2>
+<p>Mud.Feishu SDK 设计了一套<strong>三层递进式防护机制</strong>，就像小区的三道岗哨，从外到内层层把关，确保不会有"坏人"（重复事件）混进来。</p>
+<div class="mermaid">graph TB
+    subgraph AppLayer["应用层去重（业务键）"]
+        AppHandler["IdempotentFeishuEventHandler&lt;T&gt;"]
+        AppDesc["基于业务主键（消息ID、订单ID等）去重"]
+    end
+
+    subgraph DispatchLayer["分发层去重（EventId）"]
+        EventDedup["IFeishuEventDeduplicator / IFeishuEventDistributedDeduplicator"]
+        EventDesc["基于飞书事件ID去重，24小时窗口期"]
+    end
+
+    subgraph ProtocolLayer["协议层去重（SeqID/Nonce）"]
+        WS_Dedup["WebSocket: IFeishuSeqIDDeduplicator"]
+        Webhook_Dedup["Webhook: IFeishuNonceDistributedDeduplicator"]
+        ProtoDesc["基于消息序列号去重，过滤重复消息"]
+    end
+
+    AppHandler --&gt;|处理器内部业务逻辑| EventDedup
+    EventDedup --&gt;|事件路由与分发| WS_Dedup
+    EventDedup --&gt;|事件路由与分发| Webhook_Dedup
+
+    style AppLayer fill:#e1f5ff
+    style DispatchLayer fill:#fff4e1
+    style ProtocolLayer fill:#ffe1e1
+</div><h3 id="这三层分别负责什么">这三层分别负责什么？</h3>
+<p>可以把这三层想象成工厂流水线上的三个质检员：</p>
+<table>
+<thead>
+<tr>
+<th>质检员</th>
+<th>检查什么？</th>
+<th>在哪检查？</th>
+<th>过滤范围</th>
+<th>适合什么时候用？</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>协议层</strong></td>
+<td>消息编号（SeqID）</td>
+<td>消息刚到达时</td>
+<td>每条消息</td>
+<td>过滤网络重复，最外层防护</td>
+</tr>
+<tr>
+<td><strong>分发层</strong></td>
+<td>事件ID（EventId）</td>
+<td>事件分发前</td>
+<td>每个事件</td>
+<td>过滤飞书重发，中间层防护</td>
+</tr>
+<tr>
+<td><strong>应用层</strong></td>
+<td>业务键（TaskId）</td>
+<td>业务处理时</td>
+<td>每次业务操作</td>
+<td>防止逻辑重复，最后一道防线</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="分发层事件的身份证检查">分发层：事件的"身份证检查"</h2>
+<p>这是最核心的一层，就像门口的保安，每个进来的事件都要先出示身份证（EventId），保安查过记录后才能放行。</p>
+<pre><code class="language-csharp">public interface IFeishuEventDeduplicator
+{
+    /// &lt;summary&gt;
+    /// 尝试标记事件为处理中
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;
+    /// true: 已处理或正在处理中（跳过）
+    /// false: 新事件（继续处理）
+    /// &lt;/returns&gt;
+    bool TryMarkAsProcessing(string eventId);
+
+    /// &lt;summary&gt;
+    /// 标记事件为已完成
+    /// &lt;/summary&gt;
+    void MarkAsCompleted(string eventId);
+
+    /// &lt;summary&gt;
+    /// 回滚处理中状态（异常时调用）
+    /// &lt;/summary&gt;
+    void RollbackProcessing(string eventId);
+
+    /// &lt;summary&gt;
+    /// 检查事件是否已处理
+    /// &lt;/summary&gt;
+    bool IsProcessed(string eventId);
+}
+</code></pre>
+<h3 id="事件的一生三种状态流转">事件的一生：三种状态流转</h3>
+<p>每个事件在去重系统里都像过安检一样，经历三种状态的变化：</p>
+<div class="mermaid">stateDiagram-v2
+    [*] --&gt; Pending: 收到新事件
+    Pending --&gt; Processing: TryMarkAsProcessing()
+    Processing --&gt; Completed: 处理成功
+    Processing --&gt; Pending: 超时/异常（Rollback）
+    Completed --&gt; Pending: 缓存过期（24小时后）
+
+    note right of Processing
+        处理中超时（默认5分钟）
+        允许重新处理
+    end note
+
+    note right of Completed
+        24小时后自动清理
+        支持TTL配置
+    end note
+</div><h3 id="真实场景websocket-是怎么去重的">真实场景：WebSocket 是怎么去重的？</h3>
+<p>来看看 WebSocket 收到事件后做了什么（<code>FeishuEventMessageHandler.cs#104-147</code>）：</p>
+<pre><code class="language-csharp">// 1. 去重检查
+bool isProcessing = false;
+
+if (_options.EnableDistributedDeduplication &amp;&amp; _distributedDeduplicator != null)
+{
+    // 优先使用分布式去重（Redis）
+    isProcessing = await _distributedDeduplicator.TryMarkAsProcessedAsync(
+        eventData.EventId, 
+        cancellationToken: cancellationToken);
+}
+else if (_options.EnableEventDeduplication &amp;&amp; _deduplicator != null)
+{
+    // 使用内存去重
+    isProcessing = _deduplicator.TryMarkAsProcessing(eventData.EventId);
+}
+
+// 2. 跳过已处理事件
+if (isProcessing)
+{
+    _logger.LogDebug("事件 {EventId} 已在处理中或已处理，跳过", eventData.EventId);
+    return;
+}
+
+// 3. 处理事件
+try
+{
+    await _eventHandlerFactory.HandleEventParallelAsync(
+        eventData.EventType, 
+        eventData, 
+        cancellationToken);
+
+    // 4. 处理成功，标记为已完成
+    if (_options.EnableEventDeduplication &amp;&amp; _deduplicator != null)
+    {
+        _deduplicator.MarkAsCompleted(eventData.EventId);
+    }
+}
+catch (Exception ex)
+{
+    // 5. 处理失败，回滚状态
+    if (_options.EnableEventDeduplication &amp;&amp; _deduplicator != null)
+    {
+        _deduplicator.RollbackProcessing(eventData.EventId);
+    }
+    throw;
+}
+</code></pre>
+<h3 id="方案一内存去重适合开发和小规模应用">方案一：内存去重（适合开发和小规模应用）</h3>
+<p><strong>就像在大脑里记笔记</strong>：把每个事件ID记在内存里，收到新事件时先查查笔记，如果有就跳过。</p>
+<p><strong>特点</strong>：</p>
+<ul>
+<li>🧠 <strong>全靠脑子记</strong>：所有数据存在内存里</li>
+<li>⏰ <strong>记24小时</strong>：超过时间就自动忘掉</li>
+<li>🧹 <strong>定期打扫</strong>：每5分钟清理一次过期的记录</li>
+<li>⏱️ <strong>超时保护</strong>：处理超过5分钟还没完成，就允许重试</li>
+</ul>
+<p><strong>核心代码</strong>（<code>FeishuEventDeduplicator.cs#86-135</code>）：</p>
+<pre><code class="language-csharp">public bool TryMarkAsProcessing(string eventId)
+{
+    lock (_lock)
+    {
+        // 检查是否已存在
+        if (_eventCache.TryGetValue(eventId, out var entry))
+        {
+            // 如果已处理，返回 true（跳过）
+            if (entry.Status == DeduplicationStatus.Completed)
+                return true;
+
+            // 如果已在处理中，检查是否超时
+            if (entry.Status == DeduplicationStatus.Processing)
+            {
+                if (DateTimeOffset.UtcNow - entry.ProcessedAt &gt; _processingTimeout)
+                {
+                    // 处理中超时，允许重新处理
+                    _logger?.LogWarning("事件 {EventId} 处理中超时，允许重新处理", eventId);
+                    _eventCache.Remove(eventId);
+                    // 继续处理
+                }
+                else
+                {
+                    // 仍在处理中，跳过
+                    return true;
+                }
+            }
+        }
+
+        // 标记为处理中
+        _eventCache[eventId] = new EventCacheEntry
+        {
+            ProcessedAt = DateTimeOffset.UtcNow,
+            EventId = eventId,
+            Status = DeduplicationStatus.Processing
+        };
+
+        return false; // 未处理，新事件
+    }
+}
+</code></pre>
+<h3 id="方案二redis-分布式去重生产环境首选">方案二：Redis 分布式去重（生产环境首选）</h3>
+<p><strong>就像共享笔记本</strong>：用 Redis 把去重记录记在外部，所有实例都能查到。就算重启服务，笔记本还在，不会忘记。</p>
+<p><strong>特点</strong>：</p>
+<ul>
+<li>📒 <strong>写在共享笔记本上</strong>：所有实例一起看</li>
+<li>🔄 <strong>自动翻页</strong>：到期自动清理，不用管</li>
+<li>🤝 <strong>大家一起用</strong>：多实例部署没问题</li>
+<li>⚡ <strong>原子操作</strong>：SETNX + EXPIRE 确保不会写错</li>
+</ul>
+<p><strong>核心代码</strong>（<code>RedisFeishuEventDistributedDeduplicator.cs#53-89</code>）：</p>
+<pre><code class="language-csharp">public async Task&lt;bool&gt; TryMarkAsProcessedAsync(
+    string eventId, 
+    TimeSpan? ttl = null, 
+    CancellationToken cancellationToken = default)
+{
+    var actualTtl = ttl ?? _defaultCacheExpiration;
+    var redisKey = $"{_keyPrefix}{eventId}";
+
+    // 使用 SETNX + EXPIRE 实现原子性去重
+    // 仅当键不存在时设置，并设置过期时间
+    var setResult = await _database.StringSetAsync(
+        redisKey,
+        "1",
+        actualTtl,
+        When.NotExists);
+
+    if (!setResult)
+    {
+        _logger?.LogDebug("事件 {EventId} 已处理过，跳过", eventId);
+        return true; // 已处理
+    }
+
+    _logger?.LogDebug("事件 {EventId} 标记为已处理，TTL: {Ttl}", eventId, actualTtl);
+    return false; // 未处理，新事件
+}
+</code></pre>
+<h3 id="两种方案怎么选">两种方案怎么选？</h3>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>内存去重（自己记）</th>
+<th>Redis 去重（共享笔记本）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>速度</strong></td>
+<td>⚡ 像闪电一样快（直接读内存）</td>
+<td>🚀 很快（但需要网络）</td>
+</tr>
+<tr>
+<td><strong>可靠性</strong></td>
+<td>⚠️ 重启就忘光</td>
+<td>✅ 永远记着，重启也还在</td>
+</tr>
+<tr>
+<td><strong>多实例</strong></td>
+<td>❌ 每个人各记各的</td>
+<td>✅ 大家一起看同一本笔记</td>
+</tr>
+<tr>
+<td><strong>麻烦程度</strong></td>
+<td>🟢 零依赖，开箱即用</td>
+<td>🟡 需要部署 Redis</td>
+</tr>
+<tr>
+<td><strong>适合谁</strong></td>
+<td>🏠 开发环境、单机运行</td>
+<td>🏢 生产环境、多实例部署</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="协议层消息的排队号检查">协议层：消息的"排队号检查"</h2>
+<h3 id="websocket-的-seqid-是什么">WebSocket 的 SeqID 是什么？</h3>
+<p>飞书 WebSocket 用的是 ProtoBuf 二进制协议，每条消息都带着一个<strong>递增的序号</strong>，就像去银行办事拿的排队号。通过记住已经处理过的排队号，就能在消息层面就把重复的挡在外面。</p>
+<h4 id="seqid-去重怎么工作">SeqID 去重怎么工作？</h4>
+<pre><code class="language-csharp">public interface IFeishuSeqIDDeduplicator
+{
+    /// &lt;summary&gt;
+    /// 尝试标记 SeqID 为已处理
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;
+    /// true: 已处理过（跳过）
+    /// false: 新消息（继续处理）
+    /// &lt;/returns&gt;
+    bool TryMarkAsProcessed(ulong seqId);
+
+    /// &lt;summary&gt;
+    /// 检查 SeqID 是否已处理
+    /// &lt;/summary&gt;
+    bool IsProcessed(ulong seqId);
+
+    /// &lt;summary&gt;
+    /// 异步检查 SeqID 是否已处理
+    /// &lt;/summary&gt;
+    Task&lt;bool&gt; IsProcessedAsync(ulong seqId);
+
+    /// &lt;summary&gt;
+    /// 清空缓存
+    /// &lt;/summary&gt;
+    void ClearCache();
+
+    /// &lt;summary&gt;
+    /// 获取缓存中的 SeqID 数量
+    /// &lt;/summary&gt;
+    int GetCacheCount();
+
+    /// &lt;summary&gt;
+    /// 获取已处理的最大 SeqID
+    /// &lt;/summary&gt;
+    ulong GetMaxProcessedSeqId();
+}
+</code></pre>
+<h4 id="实现机制">实现机制</h4>
+<div class="mermaid">graph LR
+    A[收到ProtoBuf消息] --&gt; B{SeqID检查}
+    B --&gt;|已处理| C[跳过消息]
+    B --&gt;|未处理| D[记录SeqID]
+    D --&gt; E[处理消息]
+    E --&gt; F[发送ACK确认]
+    D --&gt; G[更新最大SeqID]
+    G --&gt; H[定时清理过期SeqID]
+</div><h4 id="核心实现">核心实现</h4>
+<p><strong>内存实现</strong>（<code>FeishuSeqIDDeduplicator.cs</code>）：</p>
+<pre><code class="language-csharp">public bool TryMarkAsProcessed(ulong seqId)
+{
+    lock (_lock)
+    {
+        // 检查是否已存在
+        if (_processedSeqIds.Contains(seqId))
+        {
+            _logger?.LogDebug("SeqID {SeqId} 已处理过，跳过", seqId);
+            return true; // 已处理
+        }
+
+        // 记录新 SeqID
+        _processedSeqIds.Add(seqId);
+        _seqIdTimestamps[seqId] = DateTimeOffset.UtcNow;
+
+        // 更新最大 SeqID
+        if (seqId &gt; _maxProcessedSeqId)
+        {
+            _maxProcessedSeqId = seqId;
+        }
+
+        return false; // 未处理，新消息
+    }
+}
+</code></pre>
+<p><strong>使用位置</strong>（<code>BinaryMessageProcessor.cs#186-194</code>）：</p>
+<pre><code class="language-csharp">// SeqID 去重检查
+if (_seqIdDeduplicator != null &amp;&amp; _seqIdDeduplicator.TryMarkAsProcessed(frame.SeqID))
+{
+    _logger.LogDebug("SeqID {SeqID} 已处理过，跳过", frame.SeqID);
+    eventArgs.SkipReason = $"SeqID {frame.SeqID} 已处理过";
+    BinaryMessageReceived?.Invoke(this, eventArgs);
+    
+    // 仍然发送ACK确认
+    await SendAckMessageAsync(frame, true, cancellationToken);
+    return;
+}
+</code></pre>
+<h4 id="特性总结">特性总结</h4>
+<ul>
+<li>✅ <strong>基于 HashSet 高效查找</strong>：O(1) 查询复杂度</li>
+<li>✅ <strong>自动跟踪最大 SeqID</strong>：支持顺序性验证</li>
+<li>✅ <strong>24小时过期机制</strong>：定期清理历史数据</li>
+<li>✅ <strong>内存友好</strong>：仅存储 SeqID，不存储完整消息</li>
+</ul>
+<h3 id="webhook-的-nonce防重放攻击的秘密武器">Webhook 的 Nonce：防重放攻击的秘密武器</h3>
+<p>飞书 Webhook 的请求里带有一个 <code>nonce</code>（随机数），这就像一次性密码——用过的密码就不能再用了，这样就能防止"重放攻击"（坏人拿同一个请求重复发送）。</p>
+<h4 id="防重放攻击流程">防重放攻击流程</h4>
+<pre><code>攻击者尝试重放请求：
+─────────────────────────────────────────────────────────────
+原始请求：Nonce="abc123", Timestamp="1234567890"
+✅ 正常处理（首次接收）
+
+重放请求：Nonce="abc123", Timestamp="1234567890"
+❌ 拒绝处理（Nonce 已记录）
+─────────────────────────────────────────────────────────────
+</code></pre>
+<h4 id="redis-实现">Redis 实现</h4>
+<pre><code class="language-csharp">public class RedisFeishuNonceDistributedDeduplicator : IFeishuNonceDistributedDeduplicator
+{
+    private readonly IDatabase _database;
+    private readonly TimeSpan _defaultTtl = TimeSpan.FromMinutes(5); // 5分钟过期
+
+    public async Task&lt;bool&gt; TryMarkAsProcessedAsync(string nonce, CancellationToken cancellationToken = default)
+    {
+        var redisKey = $"{_keyPrefix}{nonce}";
+
+        // SETNX + EXPIRE：5分钟内重复 nonce 会被拒绝
+        var setResult = await _database.StringSetAsync(
+            redisKey,
+            "1",
+            _defaultTtl,
+            When.NotExists);
+
+        if (!setResult)
+        {
+            _logger?.LogWarning("检测到重复的 Nonce: {Nonce}，可能为重放攻击", nonce);
+            return true; // 已处理，拒绝
+        }
+
+        return false; // 首次处理
+    }
+}
+</code></pre>
+<hr>
+<h2 id="应用层给每个业务操作发身份证">应用层：给每个业务操作发"身份证"</h2>
+<h3 id="为什么还需要这一层">为什么还需要这一层？</h3>
+<p>就算前面两层都挡住了，业务逻辑还是有可能重复执行，比如：</p>
+<ul>
+<li>🔀 同一事件触发了多个处理器（并行处理）</li>
+<li>🔄 处理器内部多次访问同一个资源</li>
+<li>📡 第三方接口重试导致重复调用</li>
+</ul>
+<h3 id="实际的幂等性实现方式">实际的幂等性实现方式</h3>
+<p>在实际的 Mud.Feishu SDK 中，业务层幂等性主要通过以下两种方式实现：</p>
+<p><strong>方式1：使用 <code>DefaultFeishuObjectEventHandler&lt;T&gt;</code>（推荐）</strong><br>
+SDK 提供了 <code>DefaultFeishuObjectEventHandler&lt;T&gt;</code> 基类，专门用于处理对象类型的事件。你只需要继承这个基类，并在业务逻辑中检查数据是否已存在即可。</p>
+<p><strong>方式2：使用 <code>IdempotentFeishuEventHandler&lt;T&gt;</code></strong><br>
+SDK 还提供了一个 <code>IdempotentFeishuEventHandler&lt;T&gt;</code> 基类，提供了基于业务键的自动去重能力。你需要重写 <code>GetBusinessKey()</code> 方法和 <code>HandleEventInternalAsync()</code> 方法，基类会自动处理业务去重。</p>
+<hr>
+<h3 id="手把手教你用三个实际案例">手把手教你用：三个实际案例</h3>
+<h4 id="案例-1消息处理防止重复创建待办">案例 1：消息处理——防止重复创建待办</h4>
+<pre><code class="language-csharp">public class MessageEventHandler : DefaultFeishuObjectEventHandler&lt;MessageReceiveResult&gt;
+{
+    private readonly IMessageService _messageService;
+
+    public MessageEventHandler(
+        ILogger&lt;MessageEventHandler&gt; logger,
+        IMessageService messageService)
+        : base(logger)
+    {
+        _messageService = messageService;
+    }
+
+    protected override async Task ProcessBusinessLogicAsync(
+        EventData eventData,
+        ObjectEventResult&lt;MessageReceiveResult&gt;? messageData,
+        CancellationToken cancellationToken = default)
+    {
+        if (eventData == null)
+            throw new ArgumentNullException(nameof(eventData));
+
+        // 检查消息是否已处理（业务层幂等性）
+        var messageId = messageData?.Object.MessageId;
+        if (string.IsNullOrEmpty(messageId))
+        {
+            _logger.LogWarning("消息ID为空，跳过处理");
+            return;
+        }
+
+        var alreadyProcessed = await _messageService.IsMessageProcessedAsync(messageId, cancellationToken);
+        if (alreadyProcessed)
+        {
+            _logger.LogInformation("消息 {MessageId} 已处理，跳过", messageId);
+            return;
+        }
+
+        // 处理消息
+        await _messageService.ProcessMessageAsync(messageData!.Object, cancellationToken);
+    }
+}
+</code></pre>
+<h4 id="案例-2部门处理避免重复创建">案例 2：部门处理——避免重复创建</h4>
+<pre><code class="language-csharp">public class DepartmentCreatedEventHandler : DefaultFeishuObjectEventHandler&lt;DepartmentCreatedResult&gt;
+{
+    private readonly IDepartmentService _departmentService;
+
+    public DepartmentCreatedEventHandler(
+        ILogger&lt;DepartmentCreatedEventHandler&gt; logger,
+        IDepartmentService departmentService)
+        : base(logger)
+    {
+        _departmentService = departmentService;
+    }
+
+    protected override async Task ProcessBusinessLogicAsync(
+        EventData eventData,
+        ObjectEventResult&lt;DepartmentCreatedResult&gt;? departmentData,
+        CancellationToken cancellationToken = default)
+    {
+        if (eventData == null)
+            throw new ArgumentNullException(nameof(eventData));
+
+        if (departmentData?.Object == null)
+        {
+            _logger.LogWarning("部门数据为空，跳过处理");
+            return;
+        }
+
+        // 检查部门是否已存在（业务层幂等性）
+        var departmentId = departmentData.Object.DepartmentId;
+        var exists = await _departmentService.ExistsAsync(departmentId, cancellationToken);
+
+        if (exists)
+        {
+            _logger.LogInformation("部门 {DepartmentId} 已存在，跳过创建", departmentId);
+            return;
+        }
+
+        // 创建部门
+        await _departmentService.CreateAsync(departmentData.Object, cancellationToken);
+    }
+}
+</code></pre>
+<h4 id="案例-3用户创建避免重复注册">案例 3：用户创建——避免重复注册</h4>
+<pre><code class="language-csharp">public class UserCreatedEventHandler : DefaultFeishuObjectEventHandler&lt;UserCreatedResult&gt;
+{
+    private readonly IUserService _userService;
+
+    public UserCreatedEventHandler(
+        ILogger&lt;UserCreatedEventHandler&gt; logger,
+        IUserService userService)
+        : base(logger)
+    {
+        _userService = userService;
+    }
+
+    protected override async Task ProcessBusinessLogicAsync(
+        EventData eventData,
+        ObjectEventResult&lt;UserCreatedResult&gt;? userData,
+        CancellationToken cancellationToken = default)
+    {
+        if (eventData == null)
+            throw new ArgumentNullException(nameof(eventData));
+
+        if (userData?.Object == null)
+        {
+            _logger.LogWarning("用户数据为空，跳过处理");
+            return;
+        }
+
+        // 检查用户是否已存在（业务层幂等性）
+        var userId = userData.Object.UserId;
+        var exists = await _userService.ExistsAsync(userId, cancellationToken);
+
+        if (exists)
+        {
+            _logger.LogInformation("用户 {UserId} 已存在，跳过创建", userId);
+            return;
+        }
+
+        // 创建用户
+        await _userService.CreateAsync(userData.Object, cancellationToken);
+    }
+}
+</code></pre>
+<h3 id="怎么设计业务键有套路吗">怎么设计业务键？有套路吗？</h3>
+<table>
+<thead>
+<tr>
+<th>业务场景</th>
+<th>业务键长什么样？</th>
+<th>为什么这么设计？</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>收到消息</td>
+<td><code>im.message.receive_v1:om_xxxxxxxxxx</code></td>
+<td>事件类型 + 消息ID，一眼看出是哪条消息</td>
+</tr>
+<tr>
+<td>创建部门</td>
+<td><code>contact.department.created_v3:od_xxxxxxxxxx</code></td>
+<td>事件类型 + 部门ID，避免和其他ID冲突</td>
+</tr>
+<tr>
+<td>创建用户</td>
+<td><code>contact.user.created_v3:ou_xxxxxxxxxx</code></td>
+<td>事件类型 + 用户ID，唯一标识用户</td>
+</tr>
+<tr>
+<td>删除部门</td>
+<td><code>contact.department.deleted_v3:od_xxxxxxxxxx</code></td>
+<td>事件类型 + 部门ID，处理删除事件</td>
+</tr>
+<tr>
+<td>消息已读</td>
+<td><code>im.message.message_read_v1:ou_xxxxxxxxxx:om_xxxxxxxxxx</code></td>
+<td>事件类型 + 用户ID + 消息ID</td>
+</tr>
+</tbody>
+</table>
+<p><strong>四条黄金法则</strong>：</p>
+<ol>
+<li>🔑 <strong>唯一性</strong>：一个操作对应一个键，不能有两个操作撞车</li>
+<li>👀 <strong>可读性</strong>：看日志时能快速知道这是什么</li>
+<li>🧱 <strong>稳定性</strong>：别用时间戳这种会变的字段做键</li>
+<li>✂️ <strong>简洁性</strong>：别写太长，省内存、好查询</li>
+</ol>
+<hr>
+<h2 id="配置实战开发-vs-生产环境">配置实战：开发 vs 生产环境</h2>
+<h3 id="websocket-怎么配置">WebSocket 怎么配置？</h3>
+<pre><code class="language-csharp">// 使用建造者模式配置 WebSocket
+builder.Services.AddFeishuWebSocketServiceBuilder(configuration)
+    .ConfigureOptions(options =&gt;
+    {
+        // 事件去重配置
+        options.EnableEventDeduplication = true;           // 启用事件去重
+        options.EnableDistributedDeduplication = false;    // 单机场景使用内存去重
+        options.EventDeduplicationCacheExpirationMs = 86400000;  // 24小时过期
+        options.EventDeduplicationCleanupIntervalMs = 300000;    // 5分钟清理间隔
+    });
+</code></pre>
+<h4 id="生产环境必备配置一定要看">生产环境必备配置（一定要看！）</h4>
+<pre><code class="language-csharp">// 1. 配置 Redis（在 appsettings.json 中）
+// {
+//   "Feishu": {
+//     "Redis": {
+//       "ConnectionString": "your-redis-server"
+//     }
+//   }
+// }
+
+// 2. 注册 Redis 服务和去重服务
+builder.Services
+    .AddFeishuRedis()
+    .AddFeishuRedisDeduplicators();
+
+// 3. 启用分布式去重
+builder.Services.AddFeishuWebSocketServiceBuilder(configuration)
+    .ConfigureOptions(options =&gt;
+    {
+        options.EnableDistributedDeduplication = true;   // 启用分布式去重
+        options.EventDeduplicationCacheExpirationMs = 86400000;  // 24小时
+    });
+</code></pre>
+<h3 id="webhook-配置">Webhook 配置</h3>
+<pre><code class="language-csharp">// 注册 Webhook 服务
+builder.Services.AddFeishuWebhookServiceBuilder(configuration)
+    .ConfigureOptions(options =&gt;
+    {
+        options.VerificationToken = "your_verification_token";
+        options.EncryptKey = "your_encrypt_key";
+        options.EventHandlingTimeoutMs = 30000;          // 30秒超时
+        options.MaxConcurrentEvents = 10;                // 最大并发数
+    });
+
+// 注册 Redis 去重
+builder.Services
+    .AddFeishuRedis()
+    .AddFeishuRedisEventDeduplicator();
+</code></pre>
+<h3 id="一张表看懂开发与生产的区别">一张表看懂开发与生产的区别</h3>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>开发环境</th>
+<th>生产环境</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>EnableEventDeduplication</code></td>
+<td><code>true</code></td>
+<td><code>true</code></td>
+<td>始终启用内存去重</td>
+</tr>
+<tr>
+<td><code>EnableDistributedDeduplication</code></td>
+<td><code>false</code></td>
+<td><code>true</code></td>
+<td>生产环境启用Redis去重</td>
+</tr>
+<tr>
+<td><code>EventDeduplicationCacheExpirationMs</code></td>
+<td><code>3600000</code> (1小时)</td>
+<td><code>86400000</code> (24小时)</td>
+<td>生产环境延长窗口期</td>
+</tr>
+<tr>
+<td><code>EventDeduplicationCleanupIntervalMs</code></td>
+<td><code>60000</code> (1分钟)</td>
+<td><code>300000</code> (5分钟)</td>
+<td>生产环境降低清理频率</td>
+</tr>
+</tbody>
+</table>
+<h3 id="完整配置从零到上线一次搞定">完整配置：从零到上线一次搞定</h3>
+<pre><code class="language-csharp">public void ConfigureServices(IServiceCollection services)
+{
+    // 配置 Redis（appsettings.json 中配置）
+    services
+        .AddFeishuRedis()
+        .AddFeishuRedisDeduplicators();
+
+    // 注册 WebSocket 服务
+    services.AddFeishuWebSocketServiceBuilder(configuration)
+        .ConfigureOptions(wsOptions =&gt;
+        {
+            wsOptions.EnableEventDeduplication = true;
+            wsOptions.EnableDistributedDeduplication = true;
+            wsOptions.EventDeduplicationCacheExpirationMs = 86400000;
+            wsOptions.AutoReconnect = true;
+            wsOptions.MaxReconnectAttempts = 5;
+            wsOptions.HeartbeatIntervalMs = 30000;
+        })
+        .AddHandler&lt;MessageEventHandler&gt;()
+        .AddHandler&lt;DepartmentCreatedEventHandler&gt;()
+        .Build();
+
+    // 注册 Webhook 服务
+    services.AddFeishuWebhookServiceBuilder(configuration)
+        .ConfigureOptions(webhookOptions =&gt;
+        {
+            webhookOptions.VerificationToken = "your_token";
+            webhookOptions.EncryptKey = "your_key";
+            webhookOptions.EventHandlingTimeoutMs = 30000;
+            webhookOptions.MaxConcurrentEvents = 20;
+        })
+        .AddHandler&lt;UserCreatedEventHandler&gt;()
+        .Build();
+}
+</code></pre>
+<h3 id="还有个贴心功能配置错误自动提醒">还有个贴心功能：配置错误自动提醒</h3>
+<p>SDK 会自动检查配置，如果你把去重功能全关了，它会直接报错提醒你：</p>
+<pre><code class="language-csharp">// FeishuWebSocketOptions.Validate() 自动执行
+// SDK 会在服务启动时检查配置，如果去重功能全关闭会抛出警告
+</code></pre>
+<hr>
+<h2 id="踩坑指南五个常见问题和解决方案">踩坑指南：五个常见问题和解决方案</h2>
+<h3 id="问题-1服务重启重复事件又来了">问题 1：服务重启，重复事件又来了</h3>
+<p><strong>现场是这样的</strong>：</p>
+<p><strong>现象</strong>：</p>
+<pre><code>09:00 服务接收 EventId="evt_123" ✅ 处理成功
+09:05 服务重启（内存缓存清空）
+09:06 飞书重发 EventId="evt_123" ❌ 重复处理
+</code></pre>
+<p><strong>为什么？</strong></p>
+<ul>
+<li>🧠 内存去重就像短期记忆，重启就忘光了</li>
+<li>📡 飞书没收到你的确认，以为你没收到，继续发</li>
+</ul>
+<p><strong>怎么解决？</strong></p>
+<p>✅ <strong>方案1：启用 Redis 分布式去重（推荐）</strong></p>
+<pre><code class="language-csharp">// 配置 Redis（appsettings.json 中配置连接信息）
+services
+    .AddFeishuRedis()
+    .AddFeishuRedisDeduplicators();
+
+services.AddFeishuWebSocketServiceBuilder(configuration)
+    .ConfigureOptions(options =&gt;
+    {
+        options.EnableDistributedDeduplication = true; // 使用Redis
+        options.EnableEventDeduplication = false;    // 禁用内存去重
+    });
+</code></pre>
+<p>✅ <strong>方案2：实现去重状态持久化</strong></p>
+<pre><code class="language-csharp">public class PersistentEventDeduplicator : IFeishuEventDeduplicator
+{
+    private readonly IDatabase _database;
+
+    public bool TryMarkAsProcessing(string eventId)
+    {
+        // 尝试写入数据库
+        var exists = _database.EventExists(eventId);
+        if (!exists)
+        {
+            _database.MarkProcessing(eventId);
+            return false;
+        }
+        return true;
+    }
+}
+</code></pre>
+<hr>
+<h3 id="问题-2多实例一起跑重复处理挡不住">问题 2：多实例一起跑，重复处理挡不住</h3>
+<p><strong>现场是这样的</strong>：</p>
+<pre><code>实例A 和 实例B 同时启动
+飞书推送 EventId="evt_123"
+实例A 收到 → 处理 ✅
+实例B 收到 → 处理 ❌ (重复！)
+</code></pre>
+<p><strong>为什么？</strong></p>
+<ul>
+<li>🧠 每个实例都有自己独立的"小本本"</li>
+<li>🚫 实例之间互相看不到对方的记录</li>
+</ul>
+<p><strong>怎么解决？</strong></p>
+<p>✅ <strong>必须使用 Redis 分布式去重</strong></p>
+<pre><code class="language-csharp">// 所有实例连接到同一个 Redis（在配置文件中配置）
+services
+    .AddFeishuRedis()
+    .AddFeishuRedisDeduplicators();
+
+services.AddFeishuWebSocketServiceBuilder(configuration)
+    .ConfigureOptions(options =&gt;
+    {
+        options.EnableDistributedDeduplication = true;
+    });
+</code></pre>
+<p><strong>一张图看懂区别</strong>：</p>
+<div class="mermaid">graph TB
+    subgraph Wrong["❌ 错误架构（内存去重）"]
+        A1["实例A&lt;br/&gt;内存缓存A&lt;br/&gt;evt_123 ✅"]
+        A2["实例B&lt;br/&gt;内存缓存B&lt;br/&gt;evt_123 ❌"]
+    end
+
+    subgraph Right["✅ 正确架构（Redis去重）"]
+        B1["实例A"]
+        B2["实例B"]
+        Redis["Redis 去重&lt;br/&gt;evt_123 ✅"]
+    end
+
+    B1 --&gt; Redis
+    B2 --&gt; Redis
+
+    style Wrong fill:#ffebee
+    style Right fill:#e8f5e9
+    style Redis fill:#e3f2fd
+</div><hr>
+<h3 id="问题-3处理超时重复事件趁虚而入">问题 3：处理超时，重复事件趁虚而入</h3>
+<p><strong>现场是这样的</strong>：</p>
+<pre><code>09:00 开始处理 EventId="evt_123"
+09:01 处理超时（超时30秒）
+09:01 回滚 Processing 状态
+09:02 飞书重发 EventId="evt_123"
+09:02 重复处理 ❌ (实际已成功！)
+</code></pre>
+<p><strong>为什么？</strong></p>
+<ul>
+<li>⏱️ 超时后系统以为没完成，把"处理中"标记撤回了</li>
+<li>✅ 但业务可能已经做完了，只是响应慢了一点点</li>
+</ul>
+<p><strong>怎么解决？</strong></p>
+<p>✅ <strong>方案1：增加最终一致性检查</strong></p>
+<pre><code class="language-csharp">public class DepartmentCreatedEventHandler : DefaultFeishuObjectEventHandler&lt;DepartmentCreatedResult&gt;
+{
+    private readonly IDepartmentService _departmentService;
+
+    protected override async Task ProcessBusinessLogicAsync(
+        EventData eventData,
+        ObjectEventResult&lt;DepartmentCreatedResult&gt;? departmentData,
+        CancellationToken ct)
+    {
+        if (departmentData?.Object == null)
+            return;
+
+        var departmentId = departmentData.Object.DepartmentId;
+
+        // 先检查部门是否已存在（幂等性）
+        var existingDepartment = await _departmentService.GetAsync(departmentId, ct);
+        if (existingDepartment != null)
+        {
+            _logger.LogInformation("部门 {DepartmentId} 已存在，跳过创建", departmentId);
+            return;
+        }
+
+        // 创建部门
+        await _departmentService.CreateAsync(departmentData.Object, ct);
+    }
+}
+</code></pre>
+<p>✅ <strong>方案2：实现处理续期机制</strong></p>
+<pre><code class="language-csharp">public class LongRunningTaskHandler : DefaultFeishuEventHandler
+{
+    private readonly IFeishuEventDeduplicator _deduplicator;
+
+    protected override async Task ProcessBusinessLogicAsync(EventData eventData, CancellationToken ct)
+    {
+        var eventId = eventData.EventId;
+
+        // 定期续期处理时间（每30秒）
+        var renewalTask = Task.Run(async () =&gt;
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(30000, ct);
+                _deduplicator.RenewProcessing(eventId);
+            }
+        }, ct);
+
+        try
+        {
+            await ProcessLongRunningTask(eventData, ct);
+        }
+        finally
+        {
+            await renewalTask;
+        }
+    }
+}
+</code></pre>
+<hr>
+<h3 id="问题-4redis-宕机去重防护全失效">问题 4：Redis 宕机，去重防护全失效</h3>
+<p><strong>现场是这样的</strong>：</p>
+<pre><code>Redis 宕机
+服务无法调用 TryMarkAsProcessedAsync()
+返回 false（允许处理）
+多个实例重复处理同一事件 ❌
+</code></pre>
+<p><strong>为什么？</strong></p>
+<ul>
+<li>🚫 Redis 挂了，代码为了不阻塞选择"允许处理"</li>
+<li>❌ 结果重复事件全涌进来</li>
+</ul>
+<p><strong>怎么解决？</strong></p>
+<p>✅ <strong>方案1：实现降级到内存去重</strong></p>
+<pre><code class="language-csharp">public class HybridEventDeduplicator : IFeishuEventDeduplicator
+{
+    private readonly IFeishuEventDistributedDeduplicator _redis;
+    private readonly IFeishuEventDeduplicator _memory;
+
+    public bool TryMarkAsProcessing(string eventId)
+    {
+        try
+        {
+            // 优先使用 Redis
+            return _redis.TryMarkAsProcessedAsync(eventId).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Redis去重失败，降级到内存去重");
+            // 降级到内存去重
+            return _memory.TryMarkAsProcessing(eventId);
+        }
+    }
+}
+</code></pre>
+<p>✅ <strong>方案2：配置熔断机制</strong></p>
+<pre><code class="language-csharp">public class CircuitBreakerEventDeduplicator : IFeishuEventDeduplicator
+{
+    private readonly CircuitBreaker _circuitBreaker;
+    private int _failureCount;
+    private DateTime _lastFailureTime;
+
+    public bool TryMarkAsProcessing(string eventId)
+    {
+        if (_circuitBreaker.IsOpen())
+        {
+            _logger.LogWarning("Redis去重熔断，拒绝处理");
+            return true; // 拒绝处理，保护下游
+        }
+
+        try
+        {
+            var result = _redis.TryMarkAsProcessedAsync(eventId).GetAwaiter().GetResult();
+            _circuitBreaker.RecordSuccess();
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _circuitBreaker.RecordFailure();
+            throw;
+        }
+    }
+}
+</code></pre>
+<hr>
+<h3 id="问题-5缓存越积越多内存快爆了">问题 5：缓存越积越多，内存快爆了</h3>
+<p><strong>现场是这样的</strong>：</p>
+<pre><code>服务运行24小时
+去重缓存条目：100万+
+内存占用：超过500MB
+GC压力增大，性能下降
+</code></pre>
+<p><strong>为什么？</strong></p>
+<ul>
+<li>📈 高频事件（比如接收消息）一天能产生几十万条记录</li>
+<li>🕐 清理间隔太长，旧记录堆积如山</li>
+</ul>
+<p><strong>怎么解决？</strong></p>
+<p>✅ <strong>方案1：缩短缓存过期时间</strong></p>
+<pre><code class="language-csharp">services.AddFeishuWebSocketServiceBuilder(configuration)
+    .ConfigureOptions(options =&gt;
+    {
+        // 根据实际业务调整
+        options.EventDeduplicationCacheExpirationMs = 3600000;  // 缩短为1小时
+        options.EventDeduplicationCleanupIntervalMs = 60000;    // 提高清理频率为1分钟
+    });
+</code></pre>
+<p>✅ <strong>方案2：使用 LRU 缓存</strong></p>
+<pre><code class="language-csharp">public class LRUEventDeduplicator : IFeishuEventDeduplicator
+{
+    private readonly LRUCache&lt;string, EventCacheEntry&gt; _cache;
+    private const int MaxCacheSize = 10000; // 最多保留1万条
+
+    public LRUEventDeduplicator()
+    {
+        _cache = new LRUCache&lt;string, EventCacheEntry&gt;(MaxCacheSize);
+    }
+
+    public bool TryMarkAsProcessing(string eventId)
+    {
+        if (_cache.TryGetValue(eventId, out var entry))
+            return true;
+
+        _cache.Add(eventId, new EventCacheEntry { /* ... */ });
+        return false;
+    }
+}
+</code></pre>
+<p>✅ <strong>方案3：业务层优化</strong></p>
+<pre><code class="language-csharp">// 某些高频事件不需要去重
+public class SystemEventHandler : DefaultFeishuEventHandler
+{
+    // 不继承 IdempotentFeishuEventHandler
+    // 直接处理，减少业务层去重压力
+
+    protected override Task ProcessBusinessLogicAsync(EventData eventData, CancellationToken ct)
+    {
+        // 仅记录日志，不进行业务操作
+        _logger.LogInformation("系统事件：{EventType}", eventData.EventType);
+        return Task.CompletedTask;
+    }
+}
+</code></pre>
+<hr>
+<h2 id="给系统做体检监控与调试">给系统做体检：监控与调试</h2>
+<h3 id="采集什么数据最有效">采集什么数据最有效？</h3>
+<pre><code class="language-csharp">public class DeduplicatorMetrics
+{
+    public long TotalProcessed { get; set; }
+    public long DuplicateSkipped { get; set; }
+    public long ProcessingTimeout { get; set; }
+    public long CacheHitCount { get; set; }
+    public long CacheMissCount { get; set; }
+
+    public double DuplicateRate =&gt; 
+        TotalProcessed &gt; 0 ? (double)DuplicateSkipped / TotalProcessed : 0;
+
+    public double CacheHitRate =&gt;
+        (CacheHitCount + CacheMissCount) &gt; 0 
+            ? (double)CacheHitCount / (CacheHitCount + CacheMissCount) 
+            : 0;
+}
+</code></pre>
+<h3 id="暴露一个接口随时查看健康状态">暴露一个接口，随时查看健康状态</h3>
+<pre><code class="language-csharp">[ApiController]
+[Route("api/[controller]")]
+public class DeduplicatorController : ControllerBase
+{
+    private readonly IFeishuEventDeduplicator _deduplicator;
+
+    [HttpGet("stats")]
+    public ActionResult&lt;DeduplicatorStats&gt; GetStats()
+    {
+        return Ok(new DeduplicatorStats
+        {
+            CacheCount = _deduplicator.GetCacheCount(),
+            MaxProcessedSeqId = _seqIdDeduplicator?.GetMaxProcessedSeqId(),
+            DuplicateRate = _metrics.DuplicateRate,
+            CacheHitRate = _metrics.CacheHitRate
+        });
+    }
+
+    [HttpGet("check/{eventId}")]
+    public ActionResult&lt;bool&gt; CheckEventId(string eventId)
+    {
+        var isProcessed = _deduplicator.IsProcessed(eventId);
+        return Ok(new { eventId, isProcessed });
+    }
+}
+</code></pre>
+<h3 id="日志怎么写才容易排查问题">日志怎么写才容易排查问题？</h3>
+<pre><code class="language-csharp">public class EnhancedEventDeduplicator : IFeishuEventDeduplicator
+{
+    private readonly ILogger&lt;EnhancedEventDeduplicator&gt; _logger;
+
+    public bool TryMarkAsProcessing(string eventId)
+    {
+        lock (_lock)
+        {
+            if (_eventCache.TryGetValue(eventId, out var entry))
+            {
+                // 详细记录去重命中原因
+                _logger.LogInformation(
+                    "[Deduplication] EventId={EventId} 已处理，" +
+                    "Status={Status}, ProcessedAt={ProcessedAt}",
+                    eventId,
+                    entry.Status,
+                    entry.ProcessedAt);
+
+                return true;
+            }
+
+            _logger.LogDebug("[Deduplication] EventId={EventId} 新事件", eventId);
+            // ...
+            return false;
+        }
+    }
+}
+</code></pre>
+<hr>
+<h2 id="快速回顾与行动清单">快速回顾与行动清单</h2>
+<h3 id="三层防护一表览">三层防护一表览</h3>
+<table>
+<thead>
+<tr>
+<th>去重层级</th>
+<th>去重依据</th>
+<th>实现方式</th>
+<th>推荐配置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>协议层</strong></td>
+<td>SeqID / Nonce</td>
+<td><code>IFeishuSeqIDDeduplicator</code> / <code>IFeishuNonceDistributedDeduplicator</code></td>
+<td>始终启用</td>
+</tr>
+<tr>
+<td><strong>分发层</strong></td>
+<td>EventId</td>
+<td><code>IFeishuEventDeduplicator</code> / <code>IFeishuEventDistributedDeduplicator</code></td>
+<td>生产环境启用 Redis</td>
+</tr>
+<tr>
+<td><strong>应用层</strong></td>
+<td>数据存在性检查</td>
+<td><code>DefaultFeishuObjectEventHandler&lt;T&gt;</code> 中的业务逻辑</td>
+<td>按需实现</td>
+</tr>
+</tbody>
+</table>
+<h3 id="还想了解更多">还想了解更多？</h3>
+<ul>
+<li>📖 <a href="https://open.feishu.cn/document/server-docs/event-subscription-guide/overview" target="_blank" rel="noopener nofollow">飞书官方文档：事件订阅</a></li>
+<li>💻 <a href="https://github.com/mudtools/MudFeishu" target="_blank" rel="noopener nofollow">MudFeishu GitHub 仓库</a></li>
+<li>💻 <a href="https://gitee.com/mudtools/MudFeishu" target="_blank" rel="noopener nofollow">MudFeishu Gitee 仓库</a></li>
+<li>🔒 <a href="https://redis.io/topics/distlock" target="_blank" rel="noopener nofollow">Redis 分布式锁最佳实践</a></li>
+</ul>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-01-11 23:01">2026-01-11 23:00</span>&nbsp;
+<a href="https://www.cnblogs.com/mudtools">玩泥巴的|mudtools.cn</a>&nbsp;
+阅读(<span id="post_view_count">263</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19469184);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19469184', targetLink: 'https://www.cnblogs.com/mudtools/p/19469184', title: '飞书 .NET SDK 事件处理的幂等性与去重机制' })">举报</a>
+</div>
+        
