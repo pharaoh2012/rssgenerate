@@ -1,0 +1,495 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Jackeyzhe/p/19508927" title="发布于 2026-01-20 22:03">
+    <span role="heading" aria-level="2">Flink源码阅读：Kafka Connector</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/1828322/202601/1828322-20260120220247061-350106518.png" alt="Flink源码阅读：Kafka Connector" class="desc_img">
+        本文我们来梳理 Kafka Connector 相关的源码。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>本文我们来梳理 Kafka Connector 相关的源码。</p>
+<h3 id="自定义-source-和-sink">自定义 Source 和 Sink</h3>
+<p>在介绍 Kafka Connector 之前，我们先来看一下在 Flink 中是如何支持自定义 Source 和 Sink 的。我们来看一张 Flink 官方文档提供的图。</p>
+<p><img alt="tableconnector" loading="lazy" data-src="https://res.cloudinary.com/dxydgihag/image/upload/v1768288302/Blog/flink/22/table_connectors.png" class="lazyload"></p>
+<p>这张图展示了 Connector 的基本体系结构，三层架构也非常清晰。</p>
+<h4 id="metadata">Metadata</h4>
+<p>首先是最上层的 MetaData，CREATE TABLE 会更新 Catalog，然后被转换为 TableAPI 的 CatalogTable，CatalogTable 实例用于表示动态表（Source 或 Sink 表）的元信息。</p>
+<h4 id="planning">Planning</h4>
+<p>在解析和优化程序时，会将 CatalogTable 转换为 DynamicTableSource 和 DynamicTableSink，分别用于查询和插入数据，这两个实例的创建都需要对应的工厂类，工厂类的完整路径需要放到这个配置文件中。</p>
+<pre><code class="language-bash">META-INF/services/org.apache.flink.table.factories.Factory
+</code></pre>
+<p>如果有需要的话，我们还可以在解析过程中配置编码和解码方法。</p>
+<p>在 Source 端，通过三个接口支持不同的查询能力。</p>
+<ul>
+<li>
+<p>ScanTableSource：用于消费 changelog 流，扫描的数据支持 insert、updata、delete 三种类型。ScanTableSource 还支持很多其他的功能， 都是通过接口提供的。具体可以看参考这个连接</p>
+<pre><code class="language-bash">https://nightlies.apache.org/flink/flink-docs-release-2.2/docs/dev/table/sourcessinks/#source-abilities
+</code></pre>
+</li>
+<li>
+<p>LookupTableSource：LookupTableSource 不会全量读取表的数据，它在需要时会发送请求，懒加载数据。目前只支持 insert-only 变更模式。</p>
+</li>
+<li>
+<p>VectorSearchTableSource：使用一个输入向量来搜索数据，并返回最相似的 Top-K 行数据。</p>
+</li>
+</ul>
+<p>在 Sink 端，通过 DynamicTableSink 来实现具体的写入逻辑，这里也提供了一些用于扩展能力的接口。具体参考</p>
+<pre><code class="language-bash">https://nightlies.apache.org/flink/flink-docs-release-2.2/docs/dev/table/sourcessinks/#sink-abilities
+</code></pre>
+<h4 id="runtime">Runtime</h4>
+<p>逻辑解析完成后，会到 Runtime 层。这里就是定义几个 Provider，在 Provider 中实现和连接器具体的交互逻辑。</p>
+<h4 id="小结">小结</h4>
+<p>当我们需要创建一个自定义的 Source 和 Sink 时，就可以通过以下步骤实现。</p>
+<ol>
+<li>
+<p>定义 Flink SQL 的 DDL，需要定义相应的 Options。</p>
+</li>
+<li>
+<p>实现 DynamicTableSourceFactory 和 DynamicTableSinkFactory，并把实现类的具体路径写到配置文件中。</p>
+</li>
+<li>
+<p>实现 DynamicTableSource 和 DynamicTableSink，这里需要处理 SQL 层的元数据。</p>
+</li>
+<li>
+<p>提供 Provider，将逻辑层与底层 DataStream 关联起来。</p>
+</li>
+<li>
+<p>编写底层算子，实现 Source 和 Sink 接口。</p>
+</li>
+</ol>
+<h3 id="kafka-connector-的实现">Kafka Connector 的实现</h3>
+<p>带着这些知识，我们一起来看一下 Kafka Connector 相关的源码。</p>
+<p>Kafka Connector 代码目前已经是一个独立的项目了。项目地址是</p>
+<pre><code class="language-bash">https://github.com/apache/flink-connector-kafka
+</code></pre>
+<h4 id="factory">Factory</h4>
+<p>我们首先找到定义的工厂类</p>
+<pre><code class="language-java">org.apache.flink.streaming.connectors.kafka.table.KafkaDynamicTableFactory
+org.apache.flink.streaming.connectors.kafka.table.UpsertKafkaDynamicTableFactory
+</code></pre>
+<p>以 KafkaDynamicTableFactory 为例，它同时实现了 DynamicTableSourceFactory 和 DynamicTableSinkFactory 两个接口。</p>
+<p>KafkaDynamicTableFactory 包含以下几个方法。</p>
+<p><img alt="KafkaDynamicTableFactory" loading="lazy" data-src="https://res.cloudinary.com/dxydgihag/image/upload/v1768294001/Blog/flink/22/KafkaDynamicTableFactory.png" class="lazyload"></p>
+<ul>
+<li>
+<p>factoryIdentifier：返回一个唯一标识符，对应 Flink SQL 中 connector='xxx' 这个配置。</p>
+</li>
+<li>
+<p>requiredOptions：必填配置集合。</p>
+</li>
+<li>
+<p>optionalOptions：选填配置集合。</p>
+</li>
+<li>
+<p>forwardOptions：直接传递到 Runtime 层的配置集合。</p>
+</li>
+<li>
+<p>createDynamicTableSource：创建 DynamicTableSource。</p>
+</li>
+<li>
+<p>createDynamicTableSink：创建 DynamicTableSink。</p>
+</li>
+</ul>
+<h4 id="source-端">Source 端</h4>
+<p>工厂类的 createDynamicTableSource 方法创建了 DynamicTableSource，我们来看一下创建的逻辑。</p>
+<pre><code class="language-java">public DynamicTableSource createDynamicTableSource(Context context) {
+    final TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
+
+    final Optional&lt;DecodingFormat&lt;DeserializationSchema&lt;RowData&gt;&gt;&gt; keyDecodingFormat =
+            getKeyDecodingFormat(helper);
+
+    final DecodingFormat&lt;DeserializationSchema&lt;RowData&gt;&gt; valueDecodingFormat =
+            getValueDecodingFormat(helper);
+
+    helper.validateExcept(PROPERTIES_PREFIX);
+
+    final ReadableConfig tableOptions = helper.getOptions();
+
+    validateTableSourceOptions(tableOptions);
+
+    validatePKConstraints(
+            context.getObjectIdentifier(),
+            context.getPrimaryKeyIndexes(),
+            context.getCatalogTable().getOptions(),
+            valueDecodingFormat);
+
+    final StartupOptions startupOptions = getStartupOptions(tableOptions);
+
+    final BoundedOptions boundedOptions = getBoundedOptions(tableOptions);
+
+    final Properties properties = getKafkaProperties(context.getCatalogTable().getOptions());
+
+    // add topic-partition discovery
+    final Duration partitionDiscoveryInterval =
+            tableOptions.get(SCAN_TOPIC_PARTITION_DISCOVERY);
+    properties.setProperty(
+            KafkaSourceOptions.PARTITION_DISCOVERY_INTERVAL_MS.key(),
+            Long.toString(partitionDiscoveryInterval.toMillis()));
+
+    final DataType physicalDataType = context.getPhysicalRowDataType();
+
+    final int[] keyProjection = createKeyFormatProjection(tableOptions, physicalDataType);
+
+    final int[] valueProjection = createValueFormatProjection(tableOptions, physicalDataType);
+
+    final String keyPrefix = tableOptions.getOptional(KEY_FIELDS_PREFIX).orElse(null);
+
+    final Integer parallelism = tableOptions.getOptional(SCAN_PARALLELISM).orElse(null);
+
+    return createKafkaTableSource(
+            physicalDataType,
+            keyDecodingFormat.orElse(null),
+            valueDecodingFormat,
+            keyProjection,
+            valueProjection,
+            keyPrefix,
+            getTopics(tableOptions),
+            getTopicPattern(tableOptions),
+            properties,
+            startupOptions.startupMode,
+            startupOptions.specificOffsets,
+            startupOptions.startupTimestampMillis,
+            boundedOptions.boundedMode,
+            boundedOptions.specificOffsets,
+            boundedOptions.boundedTimestampMillis,
+            context.getObjectIdentifier().asSummaryString(),
+            parallelism);
+}
+</code></pre>
+<p>在这个方法中，首先要获取到 key 和 value 的解码格式。接着是各种参数校验和获取必要的属性。最后创建 KafkaDynamicSource 实例。</p>
+<p>获取解码格式需要用到 DeserializationFormatFactory 工厂，DeserializationFormatFactory 有多个实现类，对应了多种格式的反序列化方法。</p>
+<p><img alt="DeserializationFormatFactory" loading="lazy" data-src="https://res.cloudinary.com/dxydgihag/image/upload/v1768297428/Blog/flink/22/DeserializationFormatFactory.png" class="lazyload"></p>
+<p>我们来看比较常见的 Json 格式的工厂 JsonFormatFactory。</p>
+<pre><code class="language-java">public DecodingFormat&lt;DeserializationSchema&lt;RowData&gt;&gt; createDecodingFormat(
+        DynamicTableFactory.Context context, ReadableConfig formatOptions) {
+    FactoryUtil.validateFactoryOptions(this, formatOptions);
+    JsonFormatOptionsUtil.validateDecodingFormatOptions(formatOptions);
+
+    final boolean failOnMissingField = formatOptions.get(FAIL_ON_MISSING_FIELD);
+    final boolean ignoreParseErrors = formatOptions.get(IGNORE_PARSE_ERRORS);
+    final boolean jsonParserEnabled = formatOptions.get(DECODE_JSON_PARSER_ENABLED);
+    TimestampFormat timestampOption = JsonFormatOptionsUtil.getTimestampFormat(formatOptions);
+
+    return new ProjectableDecodingFormat&lt;DeserializationSchema&lt;RowData&gt;&gt;() {
+        @Override
+        public DeserializationSchema&lt;RowData&gt; createRuntimeDecoder(
+                DynamicTableSource.Context context,
+                DataType physicalDataType,
+                int[][] projections) {
+            final DataType producedDataType =
+                    Projection.of(projections).project(physicalDataType);
+            final RowType rowType = (RowType) producedDataType.getLogicalType();
+            final TypeInformation&lt;RowData&gt; rowDataTypeInfo =
+                    context.createTypeInformation(producedDataType);
+            if (jsonParserEnabled) {
+                return new JsonParserRowDataDeserializationSchema(
+                        rowType,
+                        rowDataTypeInfo,
+                        failOnMissingField,
+                        ignoreParseErrors,
+                        timestampOption,
+                        toProjectedNames(
+                                (RowType) physicalDataType.getLogicalType(), projections));
+            } else {
+                return new JsonRowDataDeserializationSchema(
+                        rowType,
+                        rowDataTypeInfo,
+                        failOnMissingField,
+                        ignoreParseErrors,
+                        timestampOption);
+            }
+        }
+
+        @Override
+        public ChangelogMode getChangelogMode() {
+            return ChangelogMode.insertOnly();
+        }
+
+        @Override
+        public boolean supportsNestedProjection() {
+            return jsonParserEnabled;
+        }
+    };
+}
+</code></pre>
+<p>在创建解码格式时，最重要的是创建运行时的解码器，也就是 DeserializationSchema，在 JsonFormatFactory 中，有 JsonParserRowDataDeserializationSchema 和 JsonRowDataDeserializationSchema 两种实现，分别是用于将 JsonParser 和 JsonNode 转换成为 RowData，具体的逻辑都在 createNotNullConverter 方法中。</p>
+<p>了解完解码格式后，我们把视角拉回到 KafkaDynamicSource，它实现了三个接口 ScanTableSource、SupportsReadingMetadata、SupportsWatermarkPushDown。分别用于消费数据，读取元数据和生成水印。</p>
+<pre><code class="language-java">public ScanRuntimeProvider getScanRuntimeProvider(ScanContext context) {
+    final DeserializationSchema&lt;RowData&gt; keyDeserialization =
+            createDeserialization(context, keyDecodingFormat, keyProjection, keyPrefix);
+
+    final DeserializationSchema&lt;RowData&gt; valueDeserialization =
+            createDeserialization(context, valueDecodingFormat, valueProjection, null);
+
+    final TypeInformation&lt;RowData&gt; producedTypeInfo =
+            context.createTypeInformation(producedDataType);
+
+    final KafkaSource&lt;RowData&gt; kafkaSource =
+            createKafkaSource(keyDeserialization, valueDeserialization, producedTypeInfo);
+
+    return new DataStreamScanProvider() {
+        @Override
+        public DataStream&lt;RowData&gt; produceDataStream(
+                ProviderContext providerContext, StreamExecutionEnvironment execEnv) {
+            if (watermarkStrategy == null) {
+                watermarkStrategy = WatermarkStrategy.noWatermarks();
+            }
+            DataStreamSource&lt;RowData&gt; sourceStream =
+                    execEnv.fromSource(
+                            kafkaSource, watermarkStrategy, "KafkaSource-" + tableIdentifier);
+            providerContext.generateUid(KAFKA_TRANSFORMATION).ifPresent(sourceStream::uid);
+            return sourceStream;
+        }
+
+        @Override
+        public boolean isBounded() {
+            return kafkaSource.getBoundedness() == Boundedness.BOUNDED;
+        }
+
+        @Override
+        public Optional&lt;Integer&gt; getParallelism() {
+            return Optional.ofNullable(parallelism);
+        }
+    };
+}
+</code></pre>
+<p>在 ScanRuntimeProvider 的逻辑中，先获取到反序列化器，也就是刚刚我们提到的 DeserializationSchema。</p>
+<p><img alt="KafkaSource" loading="lazy" data-src="https://res.cloudinary.com/dxydgihag/image/upload/v1768318497/Blog/flink/22/KafkaSource.png" class="lazyload"></p>
+<p>然后开始创建 KafkaSource 实例，它是 Source 的实现类，也就是执行引擎层了，这个过程会依次创建图中这些类。</p>
+<p>KafkaSource 中主要是创建 KafkaSourceReader 和 KafkaSourceEnumerator，KafkaSourceEnumerator 是负责和分片相关的逻辑，包括分片分配和分片发现等。</p>
+<p>KafkaSourceReader 中主要是和 State 相关的逻辑，包括触发快照和完成 Checkpoint 通知的方法。当做 Snapshot 时，会记录活跃 split 的 offset，同时将 split 作为状态提交。当 Checkpoint 完成时，会调用 <code>KafkaSourceFetcherManager.commitOffsets</code> 提交 offset。</p>
+<pre><code class="language-java">public List&lt;KafkaPartitionSplit&gt; snapshotState(long checkpointId) {
+    List&lt;KafkaPartitionSplit&gt; splits = super.snapshotState(checkpointId);
+    if (!commitOffsetsOnCheckpoint) {
+        return splits;
+    }
+
+    if (splits.isEmpty() &amp;&amp; offsetsOfFinishedSplits.isEmpty()) {
+        offsetsToCommit.put(checkpointId, Collections.emptyMap());
+    } else {
+        Map&lt;TopicPartition, OffsetAndMetadata&gt; offsetsMap =
+                offsetsToCommit.computeIfAbsent(checkpointId, id -&gt; new HashMap&lt;&gt;());
+        // Put the offsets of the active splits.
+        for (KafkaPartitionSplit split : splits) {
+            // If the checkpoint is triggered before the partition starting offsets
+            // is retrieved, do not commit the offsets for those partitions.
+            if (split.getStartingOffset() &gt;= 0) {
+                offsetsMap.put(
+                        split.getTopicPartition(),
+                        new OffsetAndMetadata(split.getStartingOffset()));
+            }
+        }
+        // Put offsets of all the finished splits.
+        offsetsMap.putAll(offsetsOfFinishedSplits);
+    }
+    return splits;
+}
+
+
+public void notifyCheckpointComplete(long checkpointId) throws Exception {
+    LOG.debug("Committing offsets for checkpoint {}", checkpointId);
+    ...
+
+    ((KafkaSourceFetcherManager) splitFetcherManager)
+            .commitOffsets(
+                    committedPartitions,
+                    (ignored, e) -&gt; {...});
+}
+</code></pre>
+<p>KafkaSourceFetcherManager 负责管理 fetcher 线程，提交 Offset。</p>
+<p>KafkaPartitionSplitReader 的 fetch 方法用来消费 Kafka 的数据。</p>
+<pre><code class="language-java">public RecordsWithSplitIds&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; fetch() throws IOException {
+    ConsumerRecords&lt;byte[], byte[]&gt; consumerRecords;
+    try {
+        consumerRecords = consumer.poll(Duration.ofMillis(POLL_TIMEOUT));
+    } catch (WakeupException | IllegalStateException e) {
+        // IllegalStateException will be thrown if the consumer is not assigned any partitions.
+        // This happens if all assigned partitions are invalid or empty (starting offset &gt;=
+        // stopping offset). We just mark empty partitions as finished and return an empty
+        // record container, and this consumer will be closed by SplitFetcherManager.
+        KafkaPartitionSplitRecords recordsBySplits =
+                new KafkaPartitionSplitRecords(
+                        ConsumerRecords.empty(), kafkaSourceReaderMetrics);
+        markEmptySplitsAsFinished(recordsBySplits);
+        return recordsBySplits;
+    }
+    KafkaPartitionSplitRecords recordsBySplits =
+            new KafkaPartitionSplitRecords(consumerRecords, kafkaSourceReaderMetrics);
+    List&lt;TopicPartition&gt; finishedPartitions = new ArrayList&lt;&gt;();
+    for (TopicPartition tp : consumer.assignment()) {
+        long stoppingOffset = getStoppingOffset(tp);
+        long consumerPosition = getConsumerPosition(tp, "retrieving consumer position");
+        // Stop fetching when the consumer's position reaches the stoppingOffset.
+        // Control messages may follow the last record; therefore, using the last record's
+        // offset as a stopping condition could result in indefinite blocking.
+        if (consumerPosition &gt;= stoppingOffset) {
+            LOG.debug(
+                    "Position of {}: {}, has reached stopping offset: {}",
+                    tp,
+                    consumerPosition,
+                    stoppingOffset);
+            recordsBySplits.setPartitionStoppingOffset(tp, stoppingOffset);
+            finishSplitAtRecord(
+                    tp, stoppingOffset, consumerPosition, finishedPartitions, recordsBySplits);
+        }
+    }
+
+    // Only track non-empty partition's record lag if it never appears before
+    consumerRecords
+            .partitions()
+            .forEach(
+                    trackTp -&gt; {
+                        kafkaSourceReaderMetrics.maybeAddRecordsLagMetric(consumer, trackTp);
+                    });
+
+    markEmptySplitsAsFinished(recordsBySplits);
+
+    // Unassign the partitions that has finished.
+    if (!finishedPartitions.isEmpty()) {
+        finishedPartitions.forEach(kafkaSourceReaderMetrics::removeRecordsLagMetric);
+        unassignPartitions(finishedPartitions);
+    }
+
+    // Update numBytesIn
+    kafkaSourceReaderMetrics.updateNumBytesInCounter();
+
+    return recordsBySplits;
+}
+</code></pre>
+<p>至此，Source 端相关的源码我们就梳理完了。接下来我们再看 Sink 端的代码。</p>
+<h4 id="sink-端">Sink 端</h4>
+<p>我们从工厂类中的 createDynamicTableSink 方法开始。</p>
+<pre><code class="language-java">public DynamicTableSink createDynamicTableSink(Context context) {
+    final TableFactoryHelper helper =
+            FactoryUtil.createTableFactoryHelper(
+                    this, autoCompleteSchemaRegistrySubject(context));
+
+    final Optional&lt;EncodingFormat&lt;SerializationSchema&lt;RowData&gt;&gt;&gt; keyEncodingFormat =
+            getKeyEncodingFormat(helper);
+
+    final EncodingFormat&lt;SerializationSchema&lt;RowData&gt;&gt; valueEncodingFormat =
+            getValueEncodingFormat(helper);
+
+    helper.validateExcept(PROPERTIES_PREFIX);
+
+    final ReadableConfig tableOptions = helper.getOptions();
+
+    final DeliveryGuarantee deliveryGuarantee = validateDeprecatedSemantic(tableOptions);
+    validateTableSinkOptions(tableOptions);
+
+    KafkaConnectorOptionsUtil.validateDeliveryGuarantee(tableOptions);
+
+    validatePKConstraints(
+            context.getObjectIdentifier(),
+            context.getPrimaryKeyIndexes(),
+            context.getCatalogTable().getOptions(),
+            valueEncodingFormat);
+
+    final DataType physicalDataType = context.getPhysicalRowDataType();
+
+    final int[] keyProjection = createKeyFormatProjection(tableOptions, physicalDataType);
+
+    final int[] valueProjection = createValueFormatProjection(tableOptions, physicalDataType);
+
+    final String keyPrefix = tableOptions.getOptional(KEY_FIELDS_PREFIX).orElse(null);
+
+    final Integer parallelism = tableOptions.getOptional(SINK_PARALLELISM).orElse(null);
+
+    return createKafkaTableSink(
+            physicalDataType,
+            keyEncodingFormat.orElse(null),
+            valueEncodingFormat,
+            keyProjection,
+            valueProjection,
+            keyPrefix,
+            getTopics(tableOptions),
+            getTopicPattern(tableOptions),
+            getKafkaProperties(context.getCatalogTable().getOptions()),
+            getFlinkKafkaPartitioner(tableOptions, context.getClassLoader()).orElse(null),
+            deliveryGuarantee,
+            parallelism,
+            tableOptions.get(TRANSACTIONAL_ID_PREFIX),
+            tableOptions.get(TRANSACTION_NAMING_STRATEGY));
+}
+</code></pre>
+<p>和 Source 的流程很相似，这里首先是获取 key 和 value 的编码格式，然后做了很多校验，最后是创建 KafkaDynamicSink 实例。</p>
+<p>获取编码格式用到的工厂类是 SerializationFormatFactory，我们前面介绍的 JsonFormatFactory 也实现了 SerializationFormatFactory，因此它既提供了解码格式，又提供了编码格式。编码格式用到的编码器是 JsonRowDataSerializationSchema，通过 RowDataToJsonConverters 将 RowData 转换成 JsonNode。</p>
+<p>在 KafkaDynamicSink 的 getSinkRuntimeProvider 方法中，主要就是创建 KafkaSink 实例。</p>
+<p><img alt="KafkaSink" loading="lazy" data-src="https://res.cloudinary.com/dxydgihag/image/upload/v1768363734/Blog/flink/22/KafkaSink.png" class="lazyload"></p>
+<p>KafkaSink 类实现了 TwoPhaseCommittingStatefulSink 接口，即支持两阶段提交。它创建了 KafkaWrter 和 KafkaCommiter。</p>
+<p>创建 KafkaWriter 时，如果配置的是 ExactlyOnce 模式，则会创建出 ExactlyOnceKafkaWriter，否则创建 KafkaWriter。Writer 真正实现两阶段提交的是 ExactlyOnceKafkaWriter。它在启动时，会调用 <code>producer.beginTransaction</code> 开启一个事务。数据写入时会调用 <code>KafkaWriter.write</code> 方法，此操作会被标记为事务内的操作。当 Sink 收到 Barrier 时，会先调用 flush 方法，将缓冲区的数据都发送到 Kafka Broker，然后调用 prepareCommit 方法预提交。预提交方法中记录 epoch 和 transactionalId 返回给框架层。</p>
+<pre><code class="language-java">public Collection&lt;KafkaCommittable&gt; prepareCommit() {
+    // only return a KafkaCommittable if the current transaction has been written some data
+    if (currentProducer.hasRecordsInTransaction()) {
+        KafkaCommittable committable = KafkaCommittable.of(currentProducer);
+        LOG.debug("Prepare {}.", committable);
+        currentProducer.precommitTransaction();
+        return Collections.singletonList(committable);
+    }
+
+    // otherwise, we recycle the producer (the pool will reset the transaction state)
+    producerPool.recycle(currentProducer);
+    return Collections.emptyList();
+}
+</code></pre>
+<p>状态保存时，会将预提交的 transactionalId 存到状态中。</p>
+<pre><code class="language-java">public List&lt;KafkaWriterState&gt; snapshotState(long checkpointId) throws IOException {
+    // recycle committed producers
+    TransactionFinished finishedTransaction;
+    while ((finishedTransaction = backchannel.poll()) != null) {
+        producerPool.recycleByTransactionId(
+                finishedTransaction.getTransactionId(), finishedTransaction.isSuccess());
+    }
+    // persist the ongoing transactions into the state; these will not be aborted on restart
+    Collection&lt;CheckpointTransaction&gt; ongoingTransactions =
+            producerPool.getOngoingTransactions();
+    currentProducer = startTransaction(checkpointId + 1);
+    return createSnapshots(ongoingTransactions);
+}
+
+private List&lt;KafkaWriterState&gt; createSnapshots(
+        Collection&lt;CheckpointTransaction&gt; ongoingTransactions) {
+    List&lt;KafkaWriterState&gt; states = new ArrayList&lt;&gt;();
+    int[] subtaskIds = this.ownedSubtaskIds;
+    for (int index = 0; index &lt; subtaskIds.length; index++) {
+        int ownedSubtask = subtaskIds[index];
+        states.add(
+                new KafkaWriterState(
+                        transactionalIdPrefix,
+                        ownedSubtask,
+                        totalNumberOfOwnedSubtasks,
+                        transactionNamingStrategy.getOwnership(),
+                        // new transactions are only created with the first owned subtask id
+                        index == 0 ? ongoingTransactions : List.of()));
+    }
+    LOG.debug("Snapshotting state {}", states);
+    return states;
+}
+</code></pre>
+<p>当 Checkpoint 完成时，会调用 <code>KafkaCommitter.commit</code> 方法。在 commit 方法中会调用 <code>producer.commitTransaction</code> 正式提交事务。</p>
+<p>FlinkKafkaInternalProducer 是 Flink 内部封装的与 Kafka 生产者的交互类，所有与 Kafka 生产者的交互都通过它执行。</p>
+<p>关于 Kafka Connector 的 Sink 端的源码我们就梳理到这里。</p>
+<h3 id="总结">总结</h3>
+<p>最后还是总结一下。本文我们先了解了 Flink 中自定义 Source 和 Sink 的流程。按照这个流程，我们梳理了 Kafka Connector 的源码。在 Source 端，Flink Kafka 封装了对消费者 Offset 的提交逻辑。在 Sink 端结合了 Kafka 提供的事务支持实现了两阶段提交的逻辑。</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-01-20 22:03">2026-01-20 22:03</span>&nbsp;
+<a href="https://www.cnblogs.com/Jackeyzhe">Jackeyzhe</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19508927);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19508927', targetLink: 'https://www.cnblogs.com/Jackeyzhe/p/19508927', title: 'Flink源码阅读：Kafka Connector' })">举报</a>
+</div>
+        
