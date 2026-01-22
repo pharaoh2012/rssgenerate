@@ -1,0 +1,493 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/deali/p/19514332" title="发布于 2026-01-21 23:16">
+    <span role="heading" aria-level="2">AspNetCore开发笔记：WebApi项目集成企业微信和公众号</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>很久没写文章了，现在有了AI，其实已经不怎么需要写文章，反正不懂就问AI嘛。</p>
+<p>不过AI总是有盲区的，就比如国内的微信开发。</p>
+<p>微信的文档是公认的烂，而且经常悄咪咪改接口又不更新文档，所以AI对微信开发的API其实不怎么熟悉，经常给出一些错误的回复。</p>
+<p>本文记录一下最近我使用 C# WebApi 项目接入企业微信和公众号的过程，主要是用到自动回复功能。</p>
+<h2 id="前置工作">前置工作</h2>
+<h3 id="依赖库">依赖库</h3>
+<p>我用到了 <strong>SKIT.FlurlHttpClient.Wechat</strong> 这个系列的库：<a href="https://github.com/fudiwei/DotNetCore.SKIT.FlurlHttpClient.Wechat" target="_blank" rel="noopener nofollow">https://github.com/fudiwei/DotNetCore.SKIT.FlurlHttpClient.Wechat</a></p>
+<p>原本想直接用 Flurl 对接的，毕竟现在手里有了锤子（AI），看啥都是钉子，啥都想造轮子。</p>
+<p>不过搜了一下我的收藏夹，发现有这个项目，封装了微信的大部分接口，那还要啥自行车，直接用就完事儿了。</p>
+<p>其中：</p>
+<ul>
+<li>企业微信：SKIT.FlurlHttpClient.Wechat.Work</li>
+<li>公众号：SKIT.FlurlHttpClient.Wechat.Api</li>
+</ul>
+<h3 id="微信配置信息">微信配置信息</h3>
+<p>需要准备这些配置信息：</p>
+<p>企业微信：</p>
+<pre><code class="language-c#">public class WechatWorkOptions {
+    public string CorpId { get; set; } = string.Empty;
+    // 应用ID
+    public int AgentId { get; set; }
+    // 应用密钥
+    public string Secret { get; set; } = string.Empty;
+    // 回调 Token
+    public string CallbackToken { get; set; } = string.Empty;
+    // 回调 EncodingAESKey
+    public string CallbackEncodingAESKey { get; set; } = string.Empty;
+}
+</code></pre>
+<p>公众号：</p>
+<pre><code class="language-c#">public class WechatApiClientOptions {
+    public string AppId { get; set; } = string.Empty;
+    public string AppSecret { get; set; } = string.Empty;
+    public string CallbackToken { get; set; } = string.Empty;
+    public string CallbackEncodingAESKey { get; set; } = string.Empty;
+}
+</code></pre>
+<h3 id="注册服务">注册服务</h3>
+<pre><code class="language-c#">// 企业微信
+builder.Services.AddSingleton&lt;WechatWorkClient&gt;(sp =&gt; {
+    var options = sp.GetRequiredService&lt;IOptions&lt;WechatWorkOptions&gt;&gt;().Value;
+    return WechatWorkClientBuilder.Create(options).Build();
+});
+
+// 公众号
+builder.Services.AddSingleton&lt;WechatApiClient&gt;(sp =&gt; {
+    var options = sp.GetRequiredService&lt;IOptions&lt;WechatMpOptions&gt;&gt;().Value;
+    return WechatApiClientBuilder.Create(options).Build();
+});
+</code></pre>
+<p>准备工作就搞定了。</p>
+<h2 id="管理token">管理token</h2>
+<p>微信的接口都需要用 AccessToken 才能调用，但微信又不想开发者每次都去请求获取token，所以只能获取一次然后自己保存了。</p>
+<p>C# 可以用 IMemoryCache 组件，很方便的管理这些临时存储的数据；Django框架也有内置的cache机制，其他语言框架可以用Redis这类NoSQL数据库来存储。扯远了，本文还是介绍C#的。</p>
+<p>我用一个 <code>WechatWorkTokenService</code> 服务来管理企业微信的token（公众号、小程序这种也是同理）</p>
+<pre><code class="language-c#">public class WechatWorkTokenService(
+    WechatWorkClient client,
+    IMemoryCache cache,
+    IOptions&lt;WechatWorkOptions&gt; options
+) : IWechatWorkTokenService {
+    private const string CacheKey = "WechatWorkAccessToken";
+
+    // 用于并发控制，防止瞬间高并发导致多次请求 Token 接口
+    private static readonly SemaphoreSlim Semaphore = new SemaphoreSlim(1, 1);
+
+    /// &lt;summary&gt;
+    /// 获取 AccessToken
+    /// &lt;/summary&gt;
+    public async Task&lt;string&gt; GetAccessTokenAsync(CancellationToken cancellationToken = default) {
+        // 1. 尝试从缓存获取
+        if (cache.TryGetValue(CacheKey, out string? accessToken) &amp;&amp; !string.IsNullOrEmpty(accessToken)) {
+            return accessToken;
+        }
+
+        // 2. 缓存未命中，加锁请求
+        await Semaphore.WaitAsync(cancellationToken);
+        try {
+            // 双重检查，防止排队等待的线程再次请求
+            if (cache.TryGetValue(CacheKey, out accessToken) &amp;&amp; !string.IsNullOrEmpty(accessToken)) {
+                return accessToken;
+            }
+
+            // 3. 调用接口获取 Token
+            var request = new CgibinGetTokenRequest();
+            var response = await client.ExecuteCgibinGetTokenAsync(request, cancellationToken);
+
+            if (!response.IsSuccessful()) {
+                throw new Exception($"获取 AccessToken 失败: {response.ErrorMessage} (Code: {response.ErrorCode})");
+            }
+
+            accessToken = response.AccessToken;
+
+            // 4. 设置缓存
+            // 提前 5 分钟过期，确保在过期前刷新
+            // 如果 ExpiresIn 小于 300 秒，则设为一半时间
+            var expirySeconds = response.ExpiresIn &gt; 300 ? response.ExpiresIn - 300 : response.ExpiresIn / 2;
+            var cacheEntryOptions = new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(TimeSpan.FromSeconds(expirySeconds));
+
+            cache.Set(CacheKey, accessToken, cacheEntryOptions);
+
+            return accessToken;
+        }
+        finally {
+            Semaphore.Release();
+        }
+    }
+}
+</code></pre>
+<h2 id="企业微信">企业微信</h2>
+<p>企业微信的限制比较少，可以主动给用户发信息，所以可以把接收和发送信息分开，例如调用LLM处理回复的时候，会比较慢，可以把回复放到异步任务队列里去实现。</p>
+<h3 id="验证回调">验证回调</h3>
+<p>直接上接口代码。</p>
+<p>在配置企业微信应用URL的时候，微信服务器会发送一个GET请求到配置的URL进行验证，后端程序需要验证签名，解密后把内容复读给微信服务器。</p>
+<p>下面这个接口就实现了这个验证方法。</p>
+<p>这样实现之后填写 <code>https://example.com/api/wechat/work/callback</code> 这个地址就好了。</p>
+<pre><code class="language-c#">[ApiController]
+[AllowAnonymous]
+[Route("api/wechat/work/callback")]
+public class WechatWorkController(
+    WechatWorkClient client,
+    IBackgroundTaskQueue queue,
+    ILogger&lt;WechatWorkController&gt; logger
+) : ControllerBase {
+    /// &lt;summary&gt;
+    /// 回调验证 (GET)
+    /// &lt;/summary&gt;
+    [HttpGet]
+    public IActionResult Echo(
+        [FromQuery(Name = "msg_signature")] string msgSignature,
+        [FromQuery(Name = "timestamp")] string timestamp,
+        [FromQuery(Name = "nonce")] string nonce,
+        [FromQuery(Name = "echostr")] string echoStr
+    ) {
+        // 验证签名
+        var verifyResult = client.VerifyEventSignatureForEcho(
+            timestamp, nonce, echoStr, msgSignature, out string? replyEcho
+        );
+
+        if (verifyResult.Result) {
+            logger.LogInformation("Echo verification successful. ReplyEcho: {ReplyEcho}", replyEcho);
+            return Content(replyEcho ?? string.Empty);
+        }
+
+        logger.LogWarning("Echo verification failed. Error: {Error}", verifyResult.Error?.Message);
+        return BadRequest($"Verify signature failed: {verifyResult.Error?.Message}");
+    }
+}
+</code></pre>
+<h3 id="接收信息">接收信息</h3>
+<p>接收信息和上面的验证都是一个URL，区别是接收信息时，微信服务器会向URL发POST请求。</p>
+<p>代码里有详细注释了，应该不用解释太多。</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 接收消息 (POST)
+/// &lt;/summary&gt;
+[HttpPost]
+public async Task&lt;IActionResult&gt; Callback(
+    [FromQuery(Name = "msg_signature")] string msgSignature,
+    [FromQuery(Name = "timestamp")] string timestamp,
+    [FromQuery(Name = "nonce")] string nonce
+) {
+    // 必须读取原始 Request Body 流，而不能使用 [FromBody] 绑定
+    // 原因：
+    // 1. 微信签名验证依赖于原始请求体，任何空格、换行符的差异都会导致签名校验失败
+    // 2. 推送内容通常是加密的 XML，需要先获取原始字符串传给 SDK 进行解密
+    using var reader = new StreamReader(Request.Body);
+    var xml = await reader.ReadToEndAsync();
+
+    logger.LogDebug("Callback Body (Length: {Length}): {Xml}", xml.Length, xml);
+
+    // 1. 验证签名
+    // 虽然 DeserializeEventFromXml 内部可能会包含解密过程，但显式验证签名是更安全的做法
+    var verifyResult = client.VerifyEventSignatureFromXml(timestamp, nonce, xml, msgSignature);
+    if (!verifyResult.Result) {
+        logger.LogWarning("Callback signature verification failed. Error: {Error}", verifyResult.Error?.Message);
+        return BadRequest($"Verify signature failed: {verifyResult.Error?.Message}");
+    }
+
+    // 2. 使用 SKIT 库提供的扩展方法自动解密并反序列化
+    // 注意：需要在 WechatWorkClientOptions 中配置 PushToken 和 PushEncodingAESKey
+    WechatWorkEvent wechatEvent;
+    try {
+        wechatEvent = client.DeserializeEventFromXml(xml);
+        logger.LogInformation("Callback deserialized successfully. MessageType: {MessageType}, FromUser: {FromUser}, ToUser: {ToUser}", wechatEvent.MessageType, wechatEvent.FromUserName, wechatEvent.ToUserName);
+    } catch (Exception ex) {
+        // 反序列化失败（通常是因为签名验证失败或解密失败）
+        logger.LogError(ex, "Callback deserialization failed.");
+        return BadRequest($"Deserialization failed: {ex.Message}");
+    }
+
+    // 处理逻辑
+    if (string.Equals(wechatEvent.MessageType, "TEXT", StringComparison.OrdinalIgnoreCase)) {
+        // 再次反序列化为具体的文本消息事件以获取 Content
+        var textEvent = client.DeserializeEventFromXml&lt;TextMessageEvent&gt;(xml);
+        if (textEvent != null &amp;&amp; !string.IsNullOrEmpty(textEvent.Content) &amp;&amp;
+            !string.IsNullOrEmpty(textEvent.FromUserName)) {
+            logger.LogInformation("Processing TEXT message from {FromUser}: {Content}", textEvent.FromUserName, textEvent.Content);
+            await ProcessTextMessageAsync(textEvent.FromUserName, textEvent.Content);
+        }
+    }
+    else if (string.Equals(wechatEvent.MessageType, "IMAGE", StringComparison.OrdinalIgnoreCase)) {
+        var imageEvent = client.DeserializeEventFromXml&lt;ImageMessageEvent&gt;(xml);
+        if (imageEvent != null &amp;&amp; !string.IsNullOrEmpty(imageEvent.MediaId) &amp;&amp;
+            !string.IsNullOrEmpty(imageEvent.FromUserName)) {
+            logger.LogInformation("Processing IMAGE message from {FromUser}: {MediaId}", imageEvent.FromUserName, imageEvent.MediaId);
+            await ProcessImageMessageAsync(imageEvent.FromUserName, imageEvent.MediaId);
+        }
+    }
+    else {
+        logger.LogInformation("Ignored message type: {MessageType}", wechatEvent.MessageType);
+    }
+
+    return Ok("success");
+}
+
+</code></pre>
+<h3 id="异步处理信息">异步处理信息</h3>
+<p>因为企业微信可以主动给用户发信息，所以可以把接收和发送信息分开，例如调用LLM处理回复的时候，会比较慢，可以把回复放到异步任务队列里去实现。</p>
+<h4 id="文本信息">文本信息</h4>
+<p>纯文本处理起来还是比较简单的。</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 异步处理文本消息
+/// &lt;/summary&gt;
+private async Task ProcessTextMessageAsync(string toUser, string content) {
+    await queue.QueueBackgroundWorkItemAsync(async (serviceProvider, token) =&gt; {
+        // 在后台任务中解析 Scoped 服务
+        var chatBot = serviceProvider.GetRequiredService&lt;IChatBotService&gt;();
+        var logger = serviceProvider.GetRequiredService&lt;ILogger&lt;WechatWorkController&gt;&gt;();
+
+        try {
+            logger.LogInformation("Processing background task for user {ToUser}", toUser);
+
+            // 1. 调用 ChatBot 获取回复
+            string reply = await chatBot.ProcessMessageAsync(content);
+
+            // 2. 发送回复
+            var accessToken = await _tokenService.GetAccessTokenAsync();
+            var request = new CgibinMessageSendRequest {
+                AccessToken = accessToken,
+                AgentId = _agentId,
+                ToUserIdList = [toUser],
+                MessageType = "text",
+                MessageContentAsText = new CgibinMessageSendRequest.Types.TextMessage {
+                    Content = content
+                }
+            };
+            var response = await _client.ExecuteCgibinMessageSendAsync(request);
+            if (!response.IsSuccessful()){
+                throw new Exception($"发送企业微信消息失败: {response.ErrorMessage} (Code: {response.ErrorCode})");
+            }
+
+            logger.LogInformation("Reply sent to {ToUser}: {ReplyContent}", toUser, reply);
+        } catch (Exception ex) {
+            logger.LogError(ex, "Failed to process message for {ToUser}", toUser);
+        }
+    });
+}
+</code></pre>
+<h4 id="图片信息">图片信息</h4>
+<p>图片麻烦一点，微信不会直接把图片数据发来，而是搞了个 mediaId，要我们手动去下载。</p>
+<p>C# 这里还是方便的，直接把图片下载放到内存里交给第三方服务处理（如OCR），然后再把结果发出来。</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 异步处理图片消息
+/// &lt;/summary&gt;
+private async Task ProcessImageMessageAsync(string toUser, string mediaId) {
+    await queue.QueueBackgroundWorkItemAsync(async (serviceProvider, token) =&gt; {
+        var chatBot = serviceProvider.GetRequiredService&lt;IChatBotService&gt;();
+        var wechatService = serviceProvider.GetRequiredService&lt;IWechatWorkService&gt;();
+        var tokenService = serviceProvider.GetRequiredService&lt;IWechatWorkTokenService&gt;();
+        var logger = serviceProvider.GetRequiredService&lt;ILogger&lt;WechatWorkController&gt;&gt;();
+        var wechatClient = serviceProvider.GetRequiredService&lt;WechatWorkClient&gt;();
+
+        try {
+            logger.LogInformation("Processing background image task for user {ToUser}", toUser);
+
+            // 1. Download Image
+            var accessToken = await tokenService.GetAccessTokenAsync(token);
+            var request = new CgibinMediaGetRequest {
+                AccessToken = accessToken,
+                MediaId = mediaId
+            };
+            var resp = await wechatClient.ExecuteCgibinMediaGetAsync(request, cancellationToken: token);
+
+            if (!resp.IsSuccessful()) {
+                logger.LogError("Failed to download image: {Error}", resp.ErrorMessage);
+                await wechatService.SendTextMessageAsync(toUser, "抱歉，无法获取图片内容。");
+                return;
+            }
+
+            var bytes = resp.GetRawBytes();
+            var mimeType = "image/jpeg";
+            if (bytes.Length &gt; 0 &amp;&amp; bytes[0] == 0x89 &amp;&amp; bytes[1] == 0x50 &amp;&amp; bytes[2] == 0x4E &amp;&amp; bytes[3] == 0x47) {
+                mimeType = "image/png";
+            }
+
+            var items = new ChatMessageContentItemCollection {
+                new ImageContent(bytes, mimeType)
+            };
+
+            // 2. Call ChatBot
+            var chatMessage = new ChatMessageContent(AuthorRole.User, items);
+            var reply = await chatBot.ProcessMessageAsync(chatMessage);
+
+            // 3. Send Reply
+            await wechatService.SendTextMessageAsync(toUser, reply);
+
+            logger.LogInformation("Reply sent to {ToUser}", toUser);
+        } catch (Exception ex) {
+            logger.LogError(ex, "Failed to process image message for {ToUser}", toUser);
+        }
+    });
+}
+</code></pre>
+<h2 id="公众号">公众号</h2>
+<p>好，企业微信搞定了。接下来看看公众号。</p>
+<p>公众号和企业微信不一样，无法主动发信息，所以在收到用户信息时，要返回XML格式的相应，作为回复内容，5秒内必须回复。</p>
+<p>验证回调这里就不重复了，和企业微信是一样的。</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 接收消息 (POST)
+/// &lt;/summary&gt;
+[HttpPost]
+public async Task&lt;IActionResult&gt; Callback(
+    [FromQuery(Name = "msg_signature")] string? msgSignature,
+    [FromQuery(Name = "signature")] string? signature,
+    [FromQuery(Name = "timestamp")] string timestamp,
+    [FromQuery(Name = "nonce")] string nonce,
+    [FromQuery(Name = "encrypt_type")] string? encryptType
+) {
+    using var reader = new StreamReader(Request.Body);
+    var xml = await reader.ReadToEndAsync();
+
+    _logger.LogDebug("Callback Body (Length: {Length}): {Xml}", xml.Length, xml);
+
+    // 1. 验证签名
+    // 如果是安全模式 (encryptType == "aes")，使用 VerifyEventSignatureFromXml (需要 msg_signature)
+    // 如果是明文模式，SDK 内部 DeserializeEventFromXml 也会做一些校验，但通常明文模式签名校验使用 signature (VerifyEventSignatureForEcho logic)
+    // 这里主要处理安全模式，因为明文模式下通常不需要复杂的解密验证
+    if (string.Equals(encryptType, "aes", StringComparison.OrdinalIgnoreCase)) {
+        if (string.IsNullOrEmpty(msgSignature)) {
+            return BadRequest("msg_signature is required for aes encryption");
+        }
+
+        var verifyResult = _client.VerifyEventSignatureFromXml(timestamp, nonce, xml, msgSignature);
+        if (!verifyResult.Result) {
+            _logger.LogWarning("Callback signature verification failed. Error: {Error}", verifyResult.Error?.Message);
+            return BadRequest($"Verify signature failed: {verifyResult.Error?.Message}");
+        }
+    }
+    else {
+        // 明文模式，可以使用 signature 验证 (可选)
+        // var verifyResult = _client.VerifyEventSignatureForEcho(timestamp, nonce, signature);
+    }
+
+    // 2. 使用 SKIT 库自动解密并反序列化
+    WechatApiEvent wechatEvent;
+    try {
+        wechatEvent = _client.DeserializeEventFromXml(xml);
+        _logger.LogInformation("Callback deserialized successfully. MessageType: {MessageType}, FromUser: {FromUser}, ToUser: {ToUser}",
+                               wechatEvent.MessageType, wechatEvent.FromUserName, wechatEvent.ToUserName);
+    } catch (Exception ex) {
+        _logger.LogError(ex, "Callback deserialization failed.");
+        return BadRequest($"Deserialization failed: {ex.Message}");
+    }
+
+    switch (wechatEvent.MessageType?.ToLower()) {
+        case "text":
+            var textEvent = _client.DeserializeEventFromXml&lt;TextMessageEvent&gt;(xml);
+            if (!string.IsNullOrEmpty(textEvent.Content) &amp;&amp;
+                !string.IsNullOrEmpty(textEvent.FromUserName)) {
+                _logger.LogInformation("Processing TEXT message from {FromUser}: {Content}", textEvent.FromUserName, textEvent.Content);
+
+                var isSafetyMode = string.Equals(encryptType, "aes", StringComparison.OrdinalIgnoreCase);
+
+                var textReply = new TextMessageReply {
+                    ToUserName = textEvent.FromUserName,
+                    FromUserName = textEvent.ToUserName,
+                    MessageType = "text",
+                    Content = "这里是回复给用户的内容",
+                    CreateTimestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                };
+
+                var replyXml = _client.SerializeEventToXml(textReply, isSafetyMode);
+                return Content(replyXml, "application/xml");
+            }
+            break;
+
+        default:
+            _logger.LogInformation("Ignored message type: {MessageType}", wechatEvent.MessageType);
+            break;
+    }
+
+    return Ok("success");
+}
+</code></pre>
+<p>可以看到代码里判断是 text 类型后，构造了 TextMessageReply 类型的数据，然后调用 SKIT.FlurlHttpClient.Wechat 库提供的 XML 序列化方法。</p>
+<p>这个库封装了直接序列化被动回复事件的扩展方法，默认会序列化为安全模式。</p>
+<h2 id="接入登录">接入登录</h2>
+<p>微信登录和大部分第三方单点认证流程差不多，已经写过好多次了。</p>
+<p>不再赘述这个流程，感兴趣的同学可以看这篇文章: <a href="https://blog.deali.cn/p/django-taro-wechat-work-login" target="_blank" rel="noopener nofollow">Django+Taro项目实现企业微信登录</a></p>
+<p>本次我没有接入登录，而是用了另一种方式实现微信和平台用户的关联，就是平台上生成一个key，让用户在微信发送，感觉还挺有意思的，另辟蹊径。</p>
+<p>所以这里搬运一下我之前做的单点认证项目里的代码吧，详情可以看这篇文章: <a href="https://blog.deali.cn/p/almost-abandoned-project-open-source" target="_blank" rel="noopener nofollow">IdentityServerLite项目和近期的开源计划</a></p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 企业微信登录 - 使用回调的 code 登录
+/// &lt;/summary&gt;
+/// &lt;param name="code"&gt;&lt;/param&gt;
+/// &lt;param name="state"&gt;一些让微信转发传给后端的参数，这里是单点认证项目的session_id&lt;/param&gt;
+[HttpGet("wecom/login")]
+public async Task&lt;IActionResult&gt; WecomLogin(string code, string? state = null) {
+    logger.LogInformation("企业微信登录，code: {code}, state: {state}, crop: {cropTag}", code, state, cropTag);
+
+    if (string.IsNullOrWhiteSpace(state)) {
+        return BadRequest(new ApiResponse { Message = "企业微信登录的 state 为空，无法获取 session" });
+    }
+
+    var session = await authService.GetSession(state);
+    if (session == null) {
+        return NotFound(new ApiResponse { Message = $"session {state} 不存在！" });
+    }
+
+    var userInfo = await wecomService.GetUserInfo(code);
+    if (userInfo == null) {
+        return BadRequest(new ApiResponse { Message = "获取 userinfo 错误！" });
+    }
+
+    if (userInfo.Errcode != 0) {
+        return BadRequest(new ApiResponse { Message = $"获取用户信息失败，企微错误信息: {userInfo.Errmsg}" });
+    }
+
+    var wechatUser = await wecomService.GetUser(userInfo.Userid);
+    if (wechatUser == null) {
+        return BadRequest(new ApiResponse { Message = "获取 user 错误！" });
+    }
+
+    var user = await userRepo.Where(a =&gt; a.PhoneNumber == wechatUser.Userid).FirstAsync();
+    // 用户不存在的话，自动创建用户
+    if (user == null) {
+        user = await accountService.CreateUser(
+            await accountService.GenerateUsername(wechatUser.Name),
+            wechatUser.Userid,
+            wechatUser.Name
+        );
+
+        logger.LogInformation("用户 {Phone} 不存在，已创建新用户 {UserId}", 
+                              wechatUser.Userid, user.Id);
+        // return NotFound(new ApiResponse { Message = $"用户 {wechatUser.Userid} 不存在！" });
+    }
+
+    try {
+        var url = await authService.LoginSessionAndGetUri(session, user, true);
+        logger.LogInformation("企业微信登录成功，跳转到链接: {url}", url);
+        return Redirect(url);
+    }
+    catch (Exception ex) {
+        ex.ToExceptionless().Submit();
+        return Problem($"企业微信登录失败: LoginSessionAndGetUri 失败 - {ex.Message}");
+    }
+}
+</code></pre>
+<h2 id="小结">小结</h2>
+<p>大概就是这些了，很繁琐，不过还挺好用的，这些代码写完后几乎是一次就对接通过，想起来以前反复调试的经历，感叹：日子也是好起来了呀！😄</p>
+<p>另一点感叹：Semantic Kernel真好用，我用了太久langchain，应该早点上semantic kernel的。</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    微信公众号：「程序设计实验室」
+专注于互联网热门新技术探索与团队敏捷开发实践，包括架构设计、机器学习与数据分析算法、移动端开发、Linux、Web前后端开发等，欢迎一起探讨技术，分享学习实践经验。
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-01-21 23:17">2026-01-21 23:16</span>&nbsp;
+<a href="https://www.cnblogs.com/deali">程序设计实验室</a>&nbsp;
+阅读(<span id="post_view_count">179</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19514332);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19514332', targetLink: 'https://www.cnblogs.com/deali/p/19514332', title: 'AspNetCore开发笔记：WebApi项目集成企业微信和公众号' })">举报</a>
+</div>
+        
