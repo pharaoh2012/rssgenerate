@@ -1,0 +1,360 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xzqcsj/p/19573422" title="发布于 2026-02-04 11:49">
+    <span role="heading" aria-level="2">Redisson 使用手册：从 API 误区到看门狗失效，在此终结分布式锁的噩梦</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3703499/202602/3703499-20260204114906823-385277354.png" alt="Redisson 使用手册：从 API 误区到看门狗失效，在此终结分布式锁的噩梦" class="desc_img">
+        在上一篇《分布式锁的代价与选择：为什么我们最终拥抱了Redisson？》中，我们聊到了手写 SETNX 的"茹毛饮血"时代。既然选择了 Redisson，就意味着我们已经告别了那些让人提心吊胆的死锁噩梦。
+很多时候，我们以为只是调用了一个简单的 lock.lock()，但背后其实是一整套复杂的自动续期、Lua 脚本原子执行和发布订阅机制在默默支撑。
+这篇文章不讲虚的，我们从常用的 API 起手，一路通过生产环境的避坑实战，最后钻进底层数据结构与 Lua 源码里，把 Redisson 彻底扒个干干净净。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>写在前面</strong></p>
+<p>在上一篇<a href="https://mp.weixin.qq.com/s/IkRhzVdLvjr4V3ojdu_4gA" target="_blank" rel="noopener nofollow">《分布式锁的代价与选择：为什么我们最终拥抱了Redisson？》</a>中，我们聊到了手写 <code>SETNX</code> 的"茹毛饮血"时代。既然选择了 <strong>Redisson</strong>，就意味着我们已经告别了那些让人提心吊胆的死锁噩梦。</p>
+<p>很多时候，我们以为只是调用了一个简单的 <code>lock.lock()</code>，但背后其实是一整套复杂的<strong>自动续期</strong>、<strong>Lua 脚本原子执行</strong>和<strong>发布订阅机制</strong>在默默支撑。</p>
+<p>这篇文章不讲虚的，我们从<strong>常用的 API</strong> 起手，一路通过<strong>生产环境的避坑实战</strong>，最后钻进<strong>底层数据结构与 Lua 源码</strong>里，把 Redisson 彻底扒个干干净净。</p>
+</blockquote>
+<hr>
+<h2 id="一不仅是-lock-这么简单核心-api-全景">一、不仅是 Lock 这么简单：核心 API 全景</h2>
+<p>Redisson 之所以受欢迎，是因为它把分布式锁封装成了我们最熟悉的 <code>java.util.concurrent.locks.Lock</code> 接口风格，<strong>极大地降低了学习成本</strong>。但除了最基础的 <code>lock()</code>，还有核心功能是你必须掌握的。</p>
+<h3 id="1-基础那把锁rlock">1. 基础那把锁：<code>RLock</code></h3>
+<p>这是 <strong>90% 场景下</strong>的默认选择。它对应 Redis 底层的 <strong>Hash</strong> 结构。</p>
+<pre><code class="language-java">RLock lock = redisson.getLock("order:1001");
+lock.lock(); // 阻塞式等待，默认 30秒过期，自带看门狗
+try {
+   // 业务逻辑
+} finally {
+   lock.unlock();
+}
+</code></pre>
+<h3 id="2-更聪明的锁trylock-️推荐">2. 更聪明的锁：<code>tryLock</code> (⚡️推荐)</h3>
+<p>在实际业务中，我们往往不希望线程无限死等，浪费资源。这里有两种常见姿势：</p>
+<h4 id="姿势-a要等待--启用看门狗-最常用">姿势 A：要等待 + 启用看门狗 (最常用)</h4>
+<p>只指定 <code>waitTime</code>，不指定 <code>leaseTime</code>。这是<strong>既想要非阻塞（或有限等待），又想要自动续期</strong>的最佳实践。</p>
+<pre><code class="language-java">// 参数1：wait time，我只愿意排队 3秒，拿不到就走人
+// 参数2：时间单位
+// 重点：没传 leaseTime，所以看门狗机制会自动生效！
+boolean res = lock.tryLock(3, TimeUnit.SECONDS);
+
+if (res) {
+   try {
+     // 处理业务（哪怕跑 5分钟 也不怕锁过期）
+   } finally {
+     lock.unlock();
+   }
+} else {
+   log.warn("抢锁失败，别挤了！");
+}
+</code></pre>
+<h4 id="姿势-b要等待--自动过期-慎用">姿势 B：要等待 + 自动过期 (慎用)</h4>
+<p>指定了 <code>leaseTime</code>，看门狗会失效。</p>
+<pre><code class="language-java">// 参数1：wait time，排队 3秒
+// 参数2：lease time，上锁后 10秒 自动强制释放（注意：指定 leaseTime 会让看门狗失效！）
+// 参数3：时间单位
+boolean res = lock.tryLock(3, 10, TimeUnit.SECONDS);
+
+if (res) {
+   try {
+     // 处理业务，必须保证在 10秒 内完成！
+   } finally {
+     lock.unlock();
+   }
+}
+</code></pre>
+<h3 id="3-文明的排队公平锁-fairlock">3. 文明的排队：公平锁 <code>FairLock</code></h3>
+<p>默认的锁是<strong>非公平</strong>的（Non-Fair），线程抢锁全靠 CPU 调度，谁快谁得。但如果你的业务要求"先来后到"（比如抢票排队），请务必使用公平锁。</p>
+<pre><code class="language-java">// 内部利用 Redis 的 List（作为线程等待队列）和 Hash（作为超时记录）实现
+RLock fairLock = redisson.getFairLock("ticket:queue");
+fairLock.lock();
+</code></pre>
+<h3 id="4-读多写少的神器读写锁-readwritelock">4. 读多写少的神器：读写锁 <code>ReadWriteLock</code></h3>
+<p>这个场景太经典了：商品详情页，读的人多（10000次/秒），改库存的人少（1次/秒）。如果全互斥，性能直接崩盘。</p>
+<pre><code class="language-java">RReadWriteLock rwLock = redisson.getReadWriteLock("product:stock:101");
+
+// 读锁：多个线程可以同时加读锁，只要没有写锁
+rwLock.readLock().lock();
+
+// 写锁：必须等所有读锁和写锁都释放了才能加，全互斥
+rwLock.writeLock().lock();
+</code></pre>
+<h3 id="5-联锁-multilock-原子性加多把锁">5. 联锁 <code>MultiLock</code> (原子性加多把锁)</h3>
+<p>有时候我们需要同时锁定多个资源，比如"库存"和"余额"，要么都锁住，要么都不锁，<strong>防止死锁</strong>。</p>
+<pre><code class="language-java">RLock lock1 = redisson.getLock("lock:order");
+RLock lock2 = redisson.getLock("lock:stock");
+// 同时加锁：lock1 lock2
+RedissonMultiLock lock = new RedissonMultiLock(lock1, lock2);
+lock.lock();
+</code></pre>
+<hr>
+<h2 id="二扒开底层hash-结构与-lua-脚本">二、扒开底层：Hash 结构与 Lua 脚本</h2>
+<blockquote>
+<p>以下源码基于 <strong>Redisson 3.16+</strong> 版本（目前生产环境主流版本）分析。</p>
+</blockquote>
+<p>Redisson 为什么能实现<strong>可重入锁</strong>？为什么它比我们自己写的 SETNX 强？<br>
+答案藏在 Redis 的数据结构里。Redisson 并没有使用简单的 <code>String</code> 类型，而是使用了 <strong><code>Hash</code></strong>。</p>
+<h3 id="1-redis-里的样子">1. Redis 里的样子</h3>
+<p>假设我们对 <code>order:1001</code> 加锁，Redis 里实际存储的数据长这样：</p>
+<pre><code class="language-bash">KEY: order:1001
+TYPE: Hash
+
+# hash 对应 value 内容
+{
+    "UUID:ThreadID" : 1  # 锁的持有者 : 重入次数
+}
+</code></pre>
+<ul>
+<li><strong>KEY</strong>: 锁的名字。</li>
+<li><strong>FIELD</strong> (Key): <code>UUID:ThreadId</code>。这里由客户端生成的唯一 UUID 加上当前线程 ID 拼接而成。<strong>为什么要加 UUID？</strong> 因为不同服务器上的 JVM 进程 ID 可能一样，必须通过客户端启动时生成的 UUID（ConnectionManagerId）来唯一标识一个 Redisson 实例。</li>
+<li><strong>VALUE</strong>: <code>1</code>。这是重入计数器。如果同一个线程再 lock 一次，这里变成 2。</li>
+</ul>
+<h3 id="2-加锁的-lua-脚本">2. 加锁的 Lua 脚本</h3>
+<p>Redisson 为了保证一系列判断和写入是原子的，把它封装在 Lua 脚本里发给 Redis。</p>
+<pre><code class="language-lua">-- KEYS[1] = 锁名称
+-- ARGV[1] = 过期时间 (默认 30000ms)
+-- ARGV[2] = 锁持有者唯一ID (UUID:ThreadId)
+
+-- 情况 1：锁根本不存在
+if (redis.call('exists', KEYS[1]) == 0) then
+    -- 创建 Hash，设置重入次数为 1
+    redis.call('hincrby', KEYS[1], ARGV[2], 1);
+    -- 设置过期时间
+    redis.call('pexpire', KEYS[1], ARGV[1]);
+    return nil; -- 返回 null 表示加锁成功
+end;
+
+-- 情况 2：锁存在，且持有者就是我（重入）
+if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then
+    -- 重入次数 +1
+    redis.call('hincrby', KEYS[1], ARGV[2], 1);
+    -- 重新续期
+    redis.call('pexpire', KEYS[1], ARGV[1]);
+    return nil;
+end;
+
+-- 情况 3：锁存在，但不是我
+-- 返回当前锁还剩多少毫秒过期，方便客户端等待
+return redis.call('pttl', KEYS[1]);
+</code></pre>
+<p>这段脚本完美解释了：</p>
+<ol>
+<li><strong>原子性</strong>：这一大坨逻辑在 Redis 里是原子执行的，不会插队。</li>
+<li><strong>可重入</strong>：通过 <code>hexists</code> 判断是不是自己，是的话就 <code>hincrby</code>。</li>
+<li><strong>互斥性</strong>：如果既不是新锁，也不是自己的锁，直接返回剩余时间，让你可以去睡一会儿再来。</li>
+</ol>
+<hr>
+<h2 id="三拆开看门狗的黑盒源码漫游">三、拆开看门狗的黑盒：源码漫游</h2>
+<p>经常听说"看门狗"，它到底长什么样？<br>
+其实，它本质上是一个 <strong>HashedWheelTimer（时间轮）</strong> 驱动的定时任务。</p>
+<h3 id="1-启动入口">1. 启动入口</h3>
+<p>当我们调用 <code>lock()</code> <strong>不传时间</strong>时，最终会走到这里：</p>
+<pre><code class="language-java">// RedissonLock.java
+private void lock(long leaseTime, TimeUnit unit, boolean interruptibly) throws InterruptedException {
+    long threadId = Thread.currentThread().getId();
+    Long ttl = tryAcquire(leaseTime, unit, threadId);
+
+    // 如果 lock 成功，ttl 会返回 null
+    if (ttl == null) {
+        return;
+    }
+    
+    // 如果失败，会订阅一个 Redis Channel，等待锁释放的消息（不用死循环空转）
+    // ... 省略订阅逻辑
+}
+</code></pre>
+<p>关键在 <code>tryAcquireAsync</code> 里：</p>
+<pre><code class="language-java">private &lt;T&gt; RFuture&lt;Long&gt; tryAcquireAsync(long leaseTime, TimeUnit unit, long threadId) {
+    if (leaseTime != -1) {
+        // 如果你传了时间，就按你的时间走，不启动看门狗
+        return tryLockInnerAsync(leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
+    }
+    
+    // 没传时间（leaseTime = -1）
+    // 先设置默认 30秒 过期
+    RFuture&lt;Long&gt; ttlRemainingFuture = tryLockInnerAsync(commandExecutor.getConnectionManager().getCfg().getLockWatchdogTimeout(), TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
+    
+    // 加锁成功后，开启续期任务
+    ttlRemainingFuture.onComplete((ttlRemaining, e) -&gt; {
+        if (e == null) {
+           if (ttlRemaining == null) {
+               // 重点：启动定时续期
+               scheduleExpirationRenewal(threadId);
+           }
+        }
+    });
+    return ttlRemainingFuture;
+}
+</code></pre>
+<h3 id="2-续期的无限套娃">2. 续期的无限套娃</h3>
+<p><code>scheduleExpirationRenewal</code> 最终会调用 <code>renewExpiration</code>：</p>
+<pre><code class="language-java">private void renewExpiration() {
+    // 这里的 1/3 是硬编码的规则
+    // 默认 lockWatchdogTimeout 是 30000ms
+    // 所以每 10000ms 执行一次
+    Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
+        @Override
+        public void run(Timeout timeout) throws Exception {
+            
+            // 执行 Lua 脚本，把 ttl 重新刷回 30秒
+            RFuture&lt;Boolean&gt; future = renewExpirationAsync(threadId);
+            
+            future.onComplete((res, e) -&gt; {
+                if (res) {
+                    // 如果续期成功，这就形成了递归调用：自己调自己
+                    renewExpiration();
+                }
+            });
+        }
+    }, internalLockLeaseTime / 3, TimeUnit.MILLISECONDS);
+}
+</code></pre>
+<p><strong>核心逻辑总结</strong>：</p>
+<ol>
+<li><strong>三分之一原则</strong>：每隔锁超时时间的 1/3（默认10秒），检查一次。</li>
+<li><strong>无限递归</strong>：只要检查到锁还在，就重置过期时间，并注册下一次检查。</li>
+<li><strong>生死绑定</strong>：这个任务跑在客户端进程里，如果客户端宕机，任务停止，Redis 里的锁在 30秒 后自动过期。</li>
+</ol>
+<hr>
+<h2 id="四我在生产环境踩过的坑避坑实战">四、我在生产环境踩过的坑：避坑实战</h2>
+<p>API 谁都会调，但能避开坑的才是老司机。这六个坑，都是真金白银换来的教训。</p>
+<h3 id="-陷阱一好心办坏事--弄死看门狗">💣 陷阱一：好心办坏事 —— 弄死看门狗</h3>
+<p>这是新手最容易犯的错。</p>
+<p><strong>❌ 错误姿势</strong>：</p>
+<pre><code class="language-java">// 我怕死锁，所以强行指定 10秒 过期
+lock.lock(10, TimeUnit.SECONDS); 
+// 或者
+lock.tryLock(1, 10, TimeUnit.SECONDS);
+</code></pre>
+<p><strong>⚠️ 后果</strong>：<br>
+<strong>Redisson 的看门狗（WatchDog）机制只有在你<code>未指定</code>锁过期时间时才会生效！</strong><br>
+一旦你手动传了 <code>leaseTime</code>，Redisson 就会认为你有自己的想法，不再插手。如果你的业务因为数据库卡顿跑了 15秒，第 10秒 时锁就会强制过期，其他线程长驱直入，爆发并发事故。</p>
+<p><strong>✅ 正确姿势</strong>：<br>
+除非你非常确定业务能在指定时间内跑完，否则<strong>尽量不要传 leaseTime，让看门狗帮你自动续期</strong>。</p>
+<h3 id="-陷阱二锁粒度太粗--全服暂停键">💣 陷阱二：锁粒度太粗 —— 全服暂停键</h3>
+<p><strong>❌ 错误姿势</strong>：</p>
+<pre><code class="language-java">// 所有订单共用一把锁
+RLock lock = redisson.getLock("LOCK_ORDER");
+</code></pre>
+<p><strong>⚠️ 后果</strong>：<br>
+这相当于把高速公路封成了独木桥。不管有多少个用户下单，同一时间只能处理一个。性能直接归零。</p>
+<p><strong>✅ 正确姿势</strong>：<br>
+<strong>锁的粒度越细越好</strong>。只锁那个具体产生竞争的资源 ID。</p>
+<pre><code class="language-java">// 只锁这个订单
+RLock lock = redisson.getLock("order:pay:" + orderId);
+</code></pre>
+<h3 id="-陷阱三解锁的艺术--谁加的锁谁来解">💣 陷阱三：解锁的艺术 —— 谁加的锁谁来解</h3>
+<p><strong>❌ 错误姿势</strong>：</p>
+<pre><code class="language-java">try {
+    // 业务逻辑
+} finally {
+    lock.unlock(); // 直接解锁
+}
+</code></pre>
+<p><strong>⚠️ 后果</strong>：</p>
+<ol>
+<li>如果业务执行超时，锁已经被自动释放了，你再去 <code>unlock</code> 会抛出 <code>IllegalMonitorStateException</code>。</li>
+<li>如果不小心解了别人的锁（虽然 Redisson 有 ID 校验防止误删，但异常处理依然重要）。</li>
+</ol>
+<p><strong>✅ 正确姿势</strong>：</p>
+<pre><code class="language-java">if (lock.isLocked() &amp;&amp; lock.isHeldByCurrentThread()) {
+    lock.unlock();
+}
+</code></pre>
+<h3 id="-陷阱四重入锁的递归噩梦">💣 陷阱四：重入锁的"递归噩梦"</h3>
+<p>Redisson 的锁虽然是可重入的（Reentrant），但如果你在递归或嵌套调用中不注意，很容易逻辑混乱。</p>
+<p><strong>❌ 风险代码</strong>：</p>
+<pre><code class="language-java">void methodA() {
+    lock.lock();
+    try {
+        methodB(); // methodB 里又 lock 了一次
+    } finally {
+        lock.unlock(); // 只解了一层
+    }
+}
+</code></pre>
+<p><strong>⚠️ 后果</strong>：<br>
+Redis 里的锁计数器（Counter）如果不归零，锁是不会释放的。确保你的加锁次数和解锁次数<strong>严格匹配</strong>。</p>
+<h3 id="-陷阱五主从切换的幽灵锁">💣 陷阱五：主从切换的"幽灵锁"</h3>
+<p>这是 Redis 架构天生的短板。</p>
+<ol>
+<li>Client A 在 <strong>Master</strong> 节点拿到了锁。</li>
+<li>Master 还没来得及把锁同步给 Slave，就<strong>宕机</strong>了。</li>
+<li>Slave 升级为新的 Master。</li>
+<li>Client B 来加锁，发现新 Master 上没锁，于是也<strong>加锁成功</strong>。</li>
+</ol>
+<p><strong>⚠️ 后果</strong>：<br>
+A 和 B 同时持有了锁。<br>
+<strong>解法</strong>：如果你不能容忍这个概率（极低），请看下文的 RedLock，或者转投 Zookeeper。对于 99% 的业务，我们选择<strong>接受</strong>这个风险。</p>
+<hr>
+<h2 id="五redlock-的爱恨情仇">五、RedLock 的爱恨情仇</h2>
+<p>有些面试官特别喜欢问 RedLock，但在实际工作中，它是一个让人爱恨交加的存在。</p>
+<h3 id="1-它是为了解决什么">1. 它是为了解决什么？</h3>
+<p>解决 Redis 主从集群在 Failover（故障转移）时可能丢锁的问题。</p>
+<h3 id="2-怎么用">2. 怎么用？</h3>
+<p>你需要准备 <strong>3个或5个</strong> 完全独立的 Redis 实例（不是 Cluster，不是 Sentinel，就是干干净净的单实例）。</p>
+<pre><code class="language-java">RLock lock1 = redissonInstance1.getLock("lock");
+RLock lock2 = redissonInstance2.getLock("lock");
+RLock lock3 = redissonInstance3.getLock("lock");
+
+// 创建红锁
+RedissonRedLock lock = new RedissonRedLock(lock1, lock2, lock3);
+
+try {
+    // 同时向 3个 Redis 申请锁
+    // 只要有 &gt; 1.5个 (即2个) 申请成功，就算赢
+    lock.lock();
+    // 业务逻辑
+} finally {
+    lock.unlock();
+}
+</code></pre>
+<h3 id="3-灵魂拷问值得吗">3. 灵魂拷问：值得吗？</h3>
+<p>我的看法是：<strong>不值得</strong>。</p>
+<ul>
+<li><strong>运维成本飙升</strong>：为了个锁，我要多维护好几个独立的 Redis？</li>
+<li><strong>性能打折</strong>：串行或者并发去多个节点请求，网络开销大。</li>
+<li><strong>并非绝对安全</strong>：Martin Kleppmann 指出，如果发生 STW（Stop-The-World）GC，或者时钟发生跳跃，RedLock 依然可能失效。</li>
+</ul>
+<p><strong>建议</strong>：<br>
+如果你在做银行核心账务系统，请用 <strong>Zookeeper</strong> 或 <strong>Etcd</strong>。<br>
+除此之外的 99% 的场景，<strong>Redisson 配合主从集群</strong> 已经足够优秀了。</p>
+<hr>
+<blockquote>
+<p><strong>结语</strong></p>
+<p>很多时候，我们在技术选型时容易陷入"既要又要"的怪圈。但软件工程的本质，就是<strong>权衡</strong>（Trade-off）。</p>
+<p><strong>Redisson</strong> 不是神，它只是一把被打磨得足够锋利的刀。它不能解决所有的一致性问题，但它在<strong>易用性</strong>、<strong>性能</strong>和<strong>可靠性</strong>之间找到了一个极佳的平衡点。</p>
+<p>希望这篇文章能帮你不仅"会用"锁，更能"懂"锁。愿你的系统在洪峰流量下，依然稳如泰山；愿你的代码，既有逻辑的骨架，又有温度的血肉。、</p>
+</blockquote>
+<hr>
+<blockquote>
+<p>文章的最后，想和你多聊两句。</p>
+<p>技术之路，常常是热闹与孤独并存。那些深夜的调试、灵光一闪的方案、还有踩坑爬起后的顿悟，如果能有人一起聊聊，该多好。</p>
+<p>为此，我建了一个小花园——我的微信公众号「<strong>[努力的小郑]</strong>」。</p>
+<p>这里没有高深莫测的理论堆砌，只有我对后端开发、系统设计和工程实践的持续思考与沉淀。它更像我的<strong>数字笔记本</strong>，记录着那些值得被记住的解决方案和思维火花。</p>
+<p>如果你觉得今天的文章还有一点启发，或者单纯想找一个同行者偶尔聊聊技术、谈谈思考，那么，欢迎你来坐坐。<br>
+<img alt="85f114bceb12e933bb817ec5fecdfef7" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3703499/202601/3703499-20260105210259813-964799315.jpg" class="lazyload"></p>
+<p>愿你前行路上，总有代码可写，有梦可追，也有灯火可亲。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-02-04 11:50">2026-02-04 11:49</span>&nbsp;
+<a href="https://www.cnblogs.com/xzqcsj">一旅人</a>&nbsp;
+阅读(<span id="post_view_count">22</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19573422);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19573422', targetLink: 'https://www.cnblogs.com/xzqcsj/p/19573422', title: 'Redisson 使用手册：从 API 误区到看门狗失效，在此终结分布式锁的噩梦' })">举报</a>
+</div>
+        
