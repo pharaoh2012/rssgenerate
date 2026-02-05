@@ -1,0 +1,285 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xzqcsj/p/19577555" title="发布于 2026-02-05 09:49">
+    <span role="heading" aria-level="2">Redis 事务的“原子性”迷思：为什么我们最终选择了 Lua 脚本</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3703499/202602/3703499-20260205094823688-1305507315.png" alt="Redis 事务的“原子性”迷思：为什么我们最终选择了 Lua 脚本" class="desc_img">
+        作为一个长期和关系型数据库（RDBMS）打交道的开发者，初次查阅 Redis 文档时，看到 MULTI、EXEC、DISCARD 这些指令，心中难免涌起一股由于熟悉而带来的安全感。
+我们的大脑会自动建立映射：MULTI 就是 BEGIN，EXEC 就是 COMMIT，DISCARD 就是 ROLLBACK。这套组合拳打下来，所有的业务逻辑似乎都应该具备了“不成功便成仁”的原子性保障。
+但这恰恰是 Redis 给我上的第一课：相似的命名背后，往往藏着截然不同的灵魂。 当你把 MySQL 的事务观生搬硬套到 Redis 身上时，错付就已经开始了。
+这篇文章将带你剥开 Redis 事务的外衣，从“原子性”的定义偏差说起，聊聊为什么在现代开发中，我们越来越倾向于用 Lua 脚本来替代它。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>写在前面的话</strong></p>
+<p>作为一个长期和关系型数据库（RDBMS）打交道的开发者，初次查阅 Redis 文档时，看到 <code>MULTI</code>、<code>EXEC</code>、<code>DISCARD</code> 这些指令，心中难免涌起一股由于熟悉而带来的安全感。</p>
+<p>我们的大脑会自动建立映射：<code>MULTI</code> 就是 <code>BEGIN</code>，<code>EXEC</code> 就是 <code>COMMIT</code>，<code>DISCARD</code> 就是 <code>ROLLBACK</code>。这套组合拳打下来，所有的业务逻辑似乎都应该具备了“不成功便成仁”的原子性保障。</p>
+<p>但这恰恰是 Redis 给我上的第一课：<strong>相似的命名背后，往往藏着截然不同的灵魂。</strong> 当你把 MySQL 的事务观生搬硬套到 Redis 身上时，错付就已经开始了。</p>
+<p>这篇文章将带你剥开 <strong>Redis 事务</strong>的外衣，从“原子性”的定义偏差说起，聊聊为什么在现代开发中，我们越来越倾向于<strong>用 Lua 脚本来替代它。</strong></p>
+</blockquote>
+<hr>
+<h2 id="一先把误会解开redis-事务不是-acid">一、先把误会解开：Redis 事务不是 ACID</h2>
+<p><strong>在关系型数据库的世界里，“事务”二字重若千钧</strong>，它几乎等同于 <strong>ACID</strong>（原子性、一致性、隔离性、持久性）。我们习惯了“要么全有，要么全无”的安全感。</p>
+<p>而在 Redis 的世界里，<code>MULTI</code> 和 <code>EXEC</code> 更像是一个<strong>批处理信号</strong>：</p>
+<blockquote>
+<p><strong>把一堆命令先放进队列里排队，等到 <code>EXEC</code> 时，一次性、按顺序地执行它们。</strong></p>
+</blockquote>
+<p>这里有一个巨大的认知偏差。当我们谈论 Redis 的“原子性”时，Redis 指的其实是 <strong>隔离性（Isolation）</strong>，而不是 <strong>回滚（Rollback）</strong>。</p>
+<ul>
+<li><strong>它保证的是</strong>：<strong>我执行这段命令的时候，别人不能插队（独占执行）。</strong></li>
+<li><strong>它不保证的是</strong>：<strong>如果我执行到一半报错了，我会帮你把前面的操作撤销（失败回滚）。</strong></li>
+</ul>
+<p>为了更直观地理解，我们可以对比一下 Redis 事务和标准 ACID 事务的区别：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">特性</th>
+<th style="text-align: left">关系型数据库 (MySQL)</th>
+<th style="text-align: left">Redis 事务</th>
+<th style="text-align: left">差异解读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left"><strong>原子性 (Atomicity)</strong></td>
+<td style="text-align: left"><strong>All or Nothing</strong> <br> 失败即回滚，如同未发生过</td>
+<td style="text-align: left"><strong>All or Partial</strong> <br> 没得商量，错了就错了，剩下的接着干</td>
+<td style="text-align: left">Redis 不支持 Rollback，部分成功是常态</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>一致性 (Consistency)</strong></td>
+<td style="text-align: left">强一致性 <br> 约束必须满足</td>
+<td style="text-align: left">弱一致性 <br> 依赖业务代码保障</td>
+<td style="text-align: left">Redis 不会校验业务约束（如外键、非空等）</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>隔离性 (Isolation)</strong></td>
+<td style="text-align: left">有多种隔离级别 (RC/RR/Serializable)</td>
+<td style="text-align: left"><strong>串行化执行</strong> <br> 执行期间不可被打断</td>
+<td style="text-align: left">得益于单线程模型，<code>EXEC</code> 期间天然隔离</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>持久性 (Durability)</strong></td>
+<td style="text-align: left">WAL 日志保障 <br> 掉电不丢失</td>
+<td style="text-align: left">取决于 AOF/RDB 配置</td>
+<td style="text-align: left">默认配置下通常有数据丢失风险</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>一句话总结：</strong><br>
+<strong>Redis 事务是“命令队列 + 独占执行”，绝不是“失败回滚 + 强一致”。</strong></p>
+</blockquote>
+<hr>
+<h2 id="二残酷的真相它真的不包回滚">二、残酷的真相：它真的不包回滚</h2>
+<p>为了把这个概念刻进 DNA，我们看两种真实的错误场景。</p>
+<h3 id="1-入队时的低级错误全员连坐">1. 入队时的“低级错误”（全员连坐）</h3>
+<p>如果你在<strong>命令入队阶段</strong>就犯了语法错误（比如参数写少了），Redis 还是讲道理的，它会直接拒绝整个事务。</p>
+<pre><code class="language-bash">127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379&gt; SET key1 value1
+QUEUED
+127.0.0.1:6379&gt; SET key2      # &lt;--- 语法错误：少了参数
+(error) ERR wrong number of arguments for 'set' command
+127.0.0.1:6379&gt; EXEC
+(error) EXECABORT Transaction discarded because of previous errors.
+</code></pre>
+<p>这时候，<strong>所有命令都不会执行</strong>。这符合我们对“事务”的预期。</p>
+<h3 id="2-执行时的运行时错误虽死犹进">2. 执行时的“运行时错误”（虽死犹进）</h3>
+<p>这才是真正的坑。假设语法没问题，但在<strong>执行期间</strong>，某条命令因为数据类型不匹配报错了：</p>
+<pre><code class="language-bash">127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379&gt; SET user:A:points 100
+QUEUED
+127.0.0.1:6379&gt; LPUSH user:A:points "error_data"  # &lt;--- 对 String 类型做 List 操作，注定运行报错
+QUEUED
+127.0.0.1:6379&gt; INCR user:A:points                 # &lt;--- 后续命令
+QUEUED
+
+127.0.0.1:6379&gt; EXEC
+1) OK
+2) (error) WRONGTYPE Operation against a key holding the wrong kind of value  &lt;--- 报错！
+3) (integer) 101                                                              &lt;--- 依然成功了！
+</code></pre>
+<p><strong>目瞪口呆了吗？</strong><br>
+第二条命令报错了，但第三条命令依然欢快地执行了。数据出现了中间态：即所谓的“不一致”。</p>
+<p>Redis 官方对此的解释非常“直男”：</p>
+<blockquote>
+<p>“只有语法错误才会被拦截，运行时错误属于程序员的逻辑 Bug（比如把 String 当 List 用）。<strong>数据库不应该为了程序员的 Bug 买单，去搞复杂的回滚机制。</strong>”</p>
+</blockquote>
+<hr>
+<h2 id="三进阶之路从原生批量到-lua-脚本">三、进阶之路：从原生批量到 Lua 脚本</h2>
+<blockquote>
+<p><strong>💡 预备知识：RTT 是性能杀手</strong></p>
+<p>一个 Redis 命令的执行可以简化为 4 步：<strong>发送命令 → 命令排队 → 命令执行 → 返回结果</strong>。</p>
+<p>其中，第 1 步和第 4 步的时间之和称为 <strong>RTT (往返时间)</strong>。如果我有 100 个命令，一个个发就需要 100 次 RTT，大部分时间都浪费在网络传输上。<br>
+<strong>批量操作的核心意义，就是把 100 次 RTT 压缩成 1 次。</strong></p>
+</blockquote>
+<p>既然 <code>MULTI/EXEC</code> 这么“头铁”，那我们在实际开发中到底该怎么选？我们可以把 Redis 的批量操作能力分为几个段位。</p>
+<h3 id="lv1-原生批量命令-mset--mget">Lv1. 原生批量命令 (MSET / MGET)</h3>
+<p>这是最简单、最快的方式。</p>
+<ul>
+<li><strong>特点</strong>：原生的原子性。<code>MSET key1 val1 key2 val2</code> 是一个原子操作，<strong>要么都成功，要么都失败</strong>（在 Redis 层面）。</li>
+<li><strong>示例</strong>：<pre><code class="language-bash">MSET key1 "Hello" key2 "World"
+</code></pre>
+</li>
+<li><strong>局限</strong>：只能处理同一种命令，逻辑死板。</li>
+</ul>
+<h3 id="lv2-管道-pipeline">Lv2. 管道 (Pipeline)</h3>
+<p>当你需要批量执行几十个不同的命令，且不需要它们之间有逻辑依赖时，Pipeline 是首选。</p>
+<ul>
+<li><strong>特点</strong>：<strong>唯快不破</strong>。它把几十个命令打包，一次网络请求（RTT）发给服务器，服务器执行完再一次性返回。</li>
+<li><strong>形象理解</strong>：<strong>下 100 个单 -&gt; 一次性收 100 个快递 (1 次 RTT)</strong>。</li>
+<li><strong>与事务的区别</strong>：
+<ul>
+<li><strong>非原子性</strong>：Pipeline 只是打包发送，Redis 可能会在处理 Pipeline 中间穿插执行其他客户端的命令（交错执行）。</li>
+<li><strong>效率更高</strong>：不需要像事务那样每个命令都发一次，只需要发送一次。</li>
+</ul>
+</li>
+</ul>
+<h3 id="lv3-事务-multi--exec">Lv3. 事务 (MULTI / EXEC)</h3>
+<p>比 Pipeline 多了一层保障：<strong>独占执行</strong>。</p>
+<ul>
+<li><strong>特点</strong>：<strong>原子操作（隔离性）</strong>。
+<ul>
+<li><strong>两个不同的事务不会同时运行</strong>。在 <code>EXEC</code> 执行期间，Redis 会“以此为尊”，保证没有其他客户端能插队。</li>
+</ul>
+</li>
+<li><strong>缺点</strong>：
+<ul>
+<li><strong>RTT 开销大</strong>：事务中 <strong>每个命令都需要单独发送</strong> 到服务端入队，请求次数并没有减少。</li>
+<li><strong>不支持回滚</strong>，不支持在事务中间做逻辑判断。</li>
+</ul>
+</li>
+</ul>
+<h3 id="lv31-事务--watch-乐观锁">Lv3.1 事务 + WATCH (乐观锁)</h3>
+<p>单纯的 <code>MULTI/EXEC</code> 往往比较鸡肋，因为它无法感知中间状态。<strong>但这套机制唯一的“王牌”组合是配合 <code>WATCH</code> 命令，实现乐观锁 (CAS)。</strong></p>
+<ul>
+<li>
+<p><strong>场景</strong>：秒杀扣减库存。</p>
+<ul>
+<li>在 <code>MULTI</code> 之前 <code>WATCH stock</code>。</li>
+<li>如果在 <code>EXEC</code> 执行前 <code>stock</code> 被别人改了，整个事务原地取消（返回 nil）。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码示例</strong>：</p>
+<pre><code class="language-bash">WATCH stock:001                # 1. 监视库存
+GET stock:001                  # 2. 读库存，发现是 10
+MULTI                          # 3. 开启事务 (开始排队)
+DECR stock:001                 # 4. 减库存
+EXEC                           # 5. 执行
+# 如果在步骤 1-5 之间，别人改了 stock:001，这里会返回 (nil)，事务回滚。
+</code></pre>
+</li>
+<li>
+<p><strong>致命弱点</strong>：<strong>高并发下性能极差</strong>。</p>
+<ul>
+<li>就像一群人抢一个麦克风，一个人抢到了，其他人的 <code>CAS</code> 全部失败，只能客户端重试（自旋）。</li>
+<li><strong>竞争越激烈，重试越频繁，CPU 空转越严重。</strong></li>
+</ul>
+</li>
+</ul>
+<h3 id="lv4-最终兵器--lua-脚本">Lv4. 最终兵器 —— Lua 脚本</h3>
+<p>从 Redis 2.6 开始，Lua 脚本成为了解决复杂原子性问题的核心方案，它完美替代了 <code>WATCH</code> 事务。</p>
+<p><strong>为什么它比事务强？</strong></p>
+<ol>
+<li><strong>逻辑原子性</strong>：一段 Lua 脚本被视作一条命令。Redis 保证脚本执行期间，<strong>不会有任何其他脚本或命令插入</strong>。</li>
+<li><strong>效率更高</strong>：不需要像 <code>WATCH</code> 那样反复重试。脚本在服务器端执行，只有一次 RTT。</li>
+</ol>
+<p><strong>示例：安全的“先查后改”</strong></p>
+<pre><code class="language-lua">-- 判断 key 是否等于预期值，如果是则删除
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+</code></pre>
+<p><strong>⚠️ 必须警惕的缺陷：Lua 也不回滚！</strong><br>
+虽然 Lua 脚本被称为“原子操作”，但请注意：它的原子性依然指的是<strong>不被打扰</strong>，而不是<strong>失败回滚</strong>。</p>
+<blockquote>
+<p><strong>如果 Lua 脚本运行到中途出错（比如调用了不存在的命令，或显式报错退出），脚本会停止执行，但之前已经执行过的写操作，是不会被撤销的！</strong></p>
+</blockquote>
+<p>这意味着，即使是 Lua，也不能给你带来 RDBMS 那种“回滚一切”的安全感。你依然需要在代码层面保证逻辑的严密性。</p>
+<hr>
+<h2 id="四总结选型决策表">四、总结：选型决策表</h2>
+<p>为了让你在实际业务中不再纠结，我整理了一份简单的决策表：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">需求场景</th>
+<th style="text-align: left">推荐方案</th>
+<th style="text-align: left">核心理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left"><strong>简单批量读写 (KV)</strong></td>
+<td style="text-align: left"><strong>MSET / MGET</strong></td>
+<td style="text-align: left">原生命令，最快，最省心。</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>大量离散命令 (无关联)</strong></td>
+<td style="text-align: left"><strong>Pipeline</strong></td>
+<td style="text-align: left">网络开销最低，吞吐量最高。</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>需要 CAS (低并发)</strong></td>
+<td style="text-align: left"><strong>WATCH + MULTI</strong></td>
+<td style="text-align: left"><strong>事务唯一的用武之地。</strong> 适合低频竞争，实现简单。</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>复杂逻辑 / 高并发</strong></td>
+<td style="text-align: left"><strong>Lua 脚本</strong></td>
+<td style="text-align: left"><strong>行业标准。</strong> 避免了 CAS 自旋的性能开销，原子性强。</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>即使报错也要回滚</strong></td>
+<td style="text-align: left"><strong>MySQL / RDBMS</strong></td>
+<td style="text-align: left"><strong>别为难 Redis。</strong> 它没有 Undo Log，做不到真正的回滚。</td>
+</tr>
+</tbody>
+</table>
+<h2 id="写在最后">写在最后</h2>
+<p>回头看，<strong>Redis 事务这套机制，就像是一个“如果不仔细读说明书一定会用错”的半成品。</strong></p>
+<p>但正是这个“半成品”，折射出了 Redis 最底层的价值观：<strong>为了性能，可以牺牲一切“看起来很美”的抽象</strong>。它拒绝了沉重的 Undo Log，拒绝了复杂的隔离级别，只留下了一个最简单的“排队执行”逻辑。</p>
+<p>所以，当我们下次再写下 <code>MULTI</code> 的时候，心里要清楚：</p>
+<ul>
+<li>如果只是为了快，<strong>Pipeline</strong> 才是那个不讲武德的“加速器”。</li>
+<li>如果只是为了防插队，<strong>Transaction</strong> 够用了，但在高并发下，它脆弱得像个易碎品。</li>
+<li>如果要处理真正的复杂逻辑，请毫不犹豫地拥抱 <strong>Lua</strong> —— 虽然它也不会回滚，但至少在“执行原子性”上，它是我们手里最稳的那张牌。</li>
+</ul>
+<p>真正的技术成熟，不是背诵八股文里的 ACID 定义，而是懂得在<strong>由于物理限制而满是遗憾的真实世界里</strong>，做出那个最不坏的选择。</p>
+<hr>
+<blockquote>
+<p>文章的最后，想和你多聊两句。</p>
+<p>技术之路，常常是热闹与孤独并存。那些深夜的调试、灵光一闪的方案、还有踩坑爬起后的顿悟，如果能有人一起聊聊，该多好。</p>
+<p>为此，我建了一个小花园——我的微信公众号「<strong>[努力的小郑]</strong>」。</p>
+<p>这里没有高深莫测的理论堆砌，只有我对后端开发、系统设计和工程实践的持续思考与沉淀。它更像我的<strong>数字笔记本</strong>，记录着那些值得被记住的解决方案和思维火花。</p>
+<p>如果你觉得今天的文章还有一点启发，或者单纯想找一个同行者偶尔聊聊技术、谈谈思考，那么，欢迎你来坐坐。<br>
+<img alt="85f114bceb12e933bb817ec5fecdfef7" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3703499/202601/3703499-20260105210259813-964799315.jpg" class="lazyload"></p>
+<p>愿你前行路上，总有代码可写，有梦可追，也有灯火可亲。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-02-05 09:50">2026-02-05 09:49</span>&nbsp;
+<a href="https://www.cnblogs.com/xzqcsj">一旅人</a>&nbsp;
+阅读(<span id="post_view_count">134</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19577555);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19577555', targetLink: 'https://www.cnblogs.com/xzqcsj/p/19577555', title: 'Redis 事务的“原子性”迷思：为什么我们最终选择了 Lua 脚本' })">举报</a>
+</div>
+        
