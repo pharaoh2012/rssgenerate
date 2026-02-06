@@ -1,0 +1,232 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ClownLMe/p/19581710" title="发布于 2026-02-05 22:54">
+    <span role="heading" aria-level="2">LLVM的混淆之旅(五)-手动实现控制流平坦化混淆</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="简介">简介</h1>
+<p>之前的教学中，简单的演示了LLVM的基本用法，下面，展示一个实战项目。</p>
+<h1 id="编译目标">编译目标</h1>
+<p>本次的实验编译样例是下面判断正数，负数，和零的代码</p>
+<pre><code class="language-c">#include &lt;stdio.h&gt;
+
+int main() {
+    int a = 9;
+    scanf_s("%d", &amp;a);
+    if (a &lt; 0) {
+        printf("Negative number!\n");
+    } else if(a &gt; 0) {
+        printf("Positive number!\n");
+    } else {
+        printf("Zero!\n");
+    }
+    
+    printf("Done.\n");
+    return 0;
+} 
+</code></pre>
+<h1 id="一控制流混淆平坦化">一，控制流混淆平坦化</h1>
+<h3 id="简介-1">简介</h3>
+<p>什么是控制流平坦化？简单来说，就是让原本垂直的流程分支平摊到水平方向上，使用这种方法可以提高逆向难度，软件更耐造。</p>
+<pre><code>            +-----------------------+
+            |        [开始]          |
+            |    设定初始状态 = 1     |
+            +-----------|-----------+
+                        |
+      +----------------&gt;V&lt;----------------+
+      |       +-------------------+       |
+      |       |    循环控制中心     |       | 
+      |       |     (分发器)       |       |
+      |       +---------|---------+       |
+      |                 |                 |
+      |        _________V_________        |
+      |       |                   |       |
+      |       |  switch(状态变量)  |       | 
+      |       |___________________|       |
+      |          /      |      \          |
+      |         /       |       \         |
+      |   [状态 1]   [状态 2]    [退出]     |
+      |   +-----+    +-----+    +-----+   |
+      |   | 块 1|    | 块 2 |    |结束 |   |
+      |   |     |    |     |    +-----+   |
+      |   |更新 |    | 更新  |             |
+      |   |状态 |    | 状态  |             |
+      |   +--|--+    +--|--+              |
+      |      |          |                 |
+      +------+----------+-----------------+
+</code></pre>
+<h3 id="实现控制流平坦化pass的核心代码">实现控制流平坦化Pass的核心代码</h3>
+<p><strong>代码流程：</strong><br>
+识别与收集分支路径（代码块）-&gt; 构建控制骨架 -&gt; 初始化状态变量 -&gt; 配置分发器 -&gt; 重构跳转逻辑<br>
+<mark>我将代码的解释都标注在注释中</mark></p>
+<pre><code class="language-cpp">namespace{
+    struct mypass : public PassInfoMixin&lt;mypass&gt;{
+        PreservedAnalyses run(Function &amp;F, FunctionAnalysisManager &amp;AM){
+	        //这里为了演示只混淆main函数
+            if(F.getName() != "main"){
+                return PreservedAnalyses::all();
+            }
+
+            errs() &lt;&lt; "My Flattening Function:" &lt;&lt; F.getName() &lt;&lt; "\n";
+			
+			//通过遍历，获取main函数中的所有代码块
+            std::vector&lt;BasicBlock*&gt; OrigBBs;
+            DenseMap&lt;BasicBlock*, int&gt; BBtoID;
+            BasicBlock &amp;EntryBB = F.getEntryBlock();
+            int id_counter = 0;
+
+            for(BasicBlock &amp;BB : F){
+	            //这里去除首代码块
+                if(&amp;BB == &amp;EntryBB) continue;
+                //记录代码块并给代码块标序号
+                //这里主要方便case中使用，可以是很复杂的独一无二的数字
+                OrigBBs.push_back(&amp;BB);
+                BBtoID[&amp;BB] = id_counter++;
+            }
+			
+			//判断收集到的分支是否存在，如果没有分支，就
+            if(OrigBBs.empty()){
+                return PreservedAnalyses::all();
+            }
+			
+			//创建循环控制代码块
+            BasicBlock *LoopEntry = BasicBlock::Create(F.getContext(), "loop_entry", &amp;F);
+            //控制流分发器代码块
+            BasicBlock *SwitchBB = BasicBlock::Create(F.getContext(), "switch_block", &amp;F);
+            //循环分发器尾部（用于兜底，可以不使用）
+            BasicBlock *LoopEnd = BasicBlock::Create(F.getContext(), "loop_end", &amp;F);
+			
+			//在首代码块中，创建初始状态变量，用于获取刚开始跳转的状态量
+            IRBuilder&lt;&gt; builderEntry(&amp;EntryBB);
+            Instruction *EntryTerm = EntryBB.getTerminator();
+            if (EntryTerm) builderEntry.SetInsertPoint(EntryTerm);
+            AllocaInst *SwitchVar = builderEntry.CreateAlloca(builderEntry.getInt32Ty(), nullptr, "switchVar");
+			//获取跳转指令
+            if(BranchInst *BI = dyn_cast_or_null&lt;BranchInst&gt;(EntryTerm)){
+	            //判断是否是条件跳转
+	            //如果是，则直接获取跳转后的代码块序号
+                if(BI-&gt;isUnconditional()){
+                    BasicBlock *Target = BI-&gt;getSuccessor(0);
+                    if(BBtoID.count(Target)){
+                        builderEntry.CreateStore(builderEntry.getInt32(BBtoID[Target]), SwitchVar);
+                    }
+                    //如果是条件跳转
+                    //创建一条条件判断指令
+                }else if(BI-&gt;isConditional()){
+                    Value *Cond = BI-&gt;getCondition();
+                    BasicBlock *TrueBB = BI-&gt;getSuccessor(0);
+                    BasicBlock *FalseBB = BI-&gt;getSuccessor(1);
+                    if(BBtoID.count(TrueBB) &amp;&amp; BBtoID.count(FalseBB)){
+                        Value*Select = builderEntry.CreateSelect(
+                            Cond, 
+                            builderEntry.getInt32(BBtoID[TrueBB]), 
+                            builderEntry.getInt32(BBtoID[FalseBB]),
+                            "init_state"
+                        );
+                        builderEntry.CreateStore(Select, SwitchVar);
+                    }
+                }
+            }
+			
+			//首部创建跳转-&gt;跳转到循环控制入口
+            builderEntry.CreateBr(LoopEntry);
+            //删除旧的跳转指令
+            if(EntryTerm) EntryTerm-&gt;eraseFromParent();
+			
+			//创建状态变量，用于控制分发器的走向
+            IRBuilder&lt;&gt; builderLoop(LoopEntry);
+            LoadInst *CurrState = builderLoop.CreateLoad(builderLoop.getInt32Ty(), SwitchVar, "curr_state");
+            builderLoop.CreateBr(SwitchBB);
+			
+			//创建switch指令
+            IRBuilder&lt;&gt; builderSwitch(SwitchBB);
+            SwitchInst *SwitchI = builderSwitch.CreateSwitch(CurrState, LoopEnd, OrigBBs.size());
+            //创建case
+            //其中的标识符是上面收集到的代码块的序号
+            for(BasicBlock *BB :OrigBBs){
+	            //所有都跳转到尾部
+                BB-&gt;moveBefore(LoopEnd);
+                SwitchI-&gt;addCase(builderSwitch.getInt32(BBtoID[BB]), BB);
+            }
+			
+			//用于兜底，跳转回循环控制头部
+            IRBuilder&lt;&gt; builderEnd(LoopEnd);
+            builderEnd.CreateBr(LoopEntry);
+			
+			//遍历每个代码块，插入修改状态变量的指令
+			//这里根据下一个跳转到的代码块来标识状态变量
+			//这里的代码跟获取初次跳转数值一模一样
+            for(BasicBlock *BB : OrigBBs){
+                Instruction *Term = BB-&gt;getTerminator();
+                IRBuilder&lt;&gt; builder(BB);
+				//由于跳转分为有条件跳转和无条件跳转
+				//这里照样要做个判断
+                if(BranchInst*BI = dyn_cast_or_null&lt;BranchInst&gt;(Term)){
+	                
+                    if(BI-&gt;isUnconditional()){
+                        BasicBlock *Target = BI-&gt;getSuccessor(0);
+                        if(BBtoID.count(Target)){
+                            builder.SetInsertPoint(Term);
+                            builder.CreateStore(builderSwitch.getInt32(BBtoID[Target]), SwitchVar);
+                            builder.CreateBr(LoopEntry);
+                            Term-&gt;eraseFromParent();
+                        }
+                    }
+                    else if(BI-&gt;isConditional()){
+                        BasicBlock *TrueBB = BI-&gt;getSuccessor(0);
+                        BasicBlock *FalseBB = BI-&gt;getSuccessor(1);
+                        if(BBtoID.count(TrueBB) &amp;&amp; BBtoID.count(FalseBB)){
+                            builder.SetInsertPoint(Term);
+                            Value *Select = builder.CreateSelect(
+                                BI-&gt;getCondition(),
+                                builder.getInt32(BBtoID[TrueBB]),
+                                builder.getInt32(BBtoID[FalseBB]),
+                                "next_state"
+                            );
+                            builder.CreateStore(Select, SwitchVar);
+                            builder.CreateBr(LoopEntry);
+                            Term-&gt;eraseFromParent();
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+</code></pre>
+<h1 id="编译和使用">编译和使用</h1>
+<p><mark><strong>这部分之前文章讲过，这里就不浪费篇幅，不懂的可以翻看</strong></mark></p>
+<h1 id="使用效果演示">使用效果演示</h1>
+<h3 id="未使用时">未使用时</h3>
+<p><img alt="控制流3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2450496/202602/2450496-20260205223717404-1628621907.png" class="lazyload"><br>
+<img alt="控制流4" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2450496/202602/2450496-20260205223722896-459325263.png" class="lazyload"></p>
+<h3 id="使用后">使用后</h3>
+<p><img alt="控制流1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2450496/202602/2450496-20260205223654729-2096773336.png" class="lazyload"><br>
+<img alt="控制流2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2450496/202602/2450496-20260205223712038-638219478.png" class="lazyload"></p>
+<p><mark><strong>至此，我们成功实现了控制流平坦化</strong></mark></p>
+<p><strong>如果❤喜欢❤本系列教程，就点个关注吧，后续不定期更新~</strong></p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/ClownLMe/" target="_blank">ClownLMe</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/ClownLMe/p/19581710" target="_blank">https://www.cnblogs.com/ClownLMe/p/19581710</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0020833333333333333" data-date-updated="2026-02-05 22:57">2026-02-05 22:54</span>&nbsp;
+<a href="https://www.cnblogs.com/ClownLMe">ClownLMe</a>&nbsp;
+阅读(<span id="post_view_count">27</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19581710);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19581710', targetLink: 'https://www.cnblogs.com/ClownLMe/p/19581710', title: 'LLVM的混淆之旅(五)-手动实现控制流平坦化混淆' })">举报</a>
+</div>
+        
