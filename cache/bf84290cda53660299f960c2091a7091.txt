@@ -1,0 +1,212 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ClownLMe/p/19612575" title="发布于 2026-02-13 16:11">
+    <span role="heading" aria-level="2">LLVM的混淆之旅(六)-字符串加密</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="简介">简介</h1>
+<p>在上一个教学中，学习了如何写一个LLVM Pass示例来进行控制流平坦化，这篇文章，来学习如何二利用LLVM实现字符串的加密。</p>
+<h1 id="案例">案例</h1>
+<h3 id="需要加密的对象">需要加密的对象</h3>
+<p>这是一个经典的c语言样例，目的是输出字符串：hello world</p>
+<pre><code class="language-c">#include &lt;stdio.h&gt;
+
+int main(){
+&nbsp; &nbsp; printf("hello world\n");
+&nbsp; &nbsp; return 0;
+}
+</code></pre>
+<h3 id="加密pass编写">加密pass编写</h3>
+<p>下面是完整的pass代码：<br>
+<mark><strong>代码的目的是：让字符串在编译的过程中进行异或加密，并且在运行的过程中动态解密。</strong></mark></p>
+<pre><code class="language-cpp">#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Constants.h"
+
+using namespace llvm;
+
+namespace{
+    struct mypass : public PassInfoMixin&lt;mypass&gt;{
+        const uint8_t KEY = 0x42;
+
+        Function *createDecryptFunc(Module *M){
+            LLVMContext &amp;Ctx = M-&gt;getContext();
+            std::vector&lt;Type*&gt; paramTypes = { PointerType::getUnqual(Ctx), Type::getInt32Ty(Ctx) };
+            FunctionType *funcType = FunctionType::get(Type::getVoidTy(Ctx),paramTypes,false);
+
+            Function *Func = Function::Create(funcType, GlobalValue::InternalLinkage, "my_decrypt_func", M);
+
+            Argument *ArgData = Func-&gt;getArg(0);
+            Argument *ArgLen  = Func-&gt;getArg(1);
+
+            BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Func);
+            BasicBlock *LoopCheckBB = BasicBlock::Create(Ctx, "loop_check", Func);
+            BasicBlock *LoopBodyBB  = BasicBlock::Create(Ctx, "loop_body", Func);
+            BasicBlock *ExitBB      = BasicBlock::Create(Ctx, "exit", Func);
+
+            IRBuilder&lt;&gt; builder(EntryBB);
+            builder.CreateBr(LoopCheckBB);
+            builder.SetInsertPoint(LoopCheckBB);
+
+            PHINode *LoopVar = builder.CreatePHI(Type::getInt32Ty(Ctx), 2, "i");
+            LoopVar-&gt;addIncoming(builder.getInt32(0), EntryBB); 
+
+            Value *Cond = builder.CreateICmpSLT(LoopVar, ArgLen, "cond");
+            builder.CreateCondBr(Cond, LoopBodyBB, ExitBB);
+
+            builder.SetInsertPoint(LoopBodyBB);
+
+            Value *Ptr = builder.CreateInBoundsGEP(builder.getInt8Ty(), ArgData, LoopVar);
+            Value *ByteVal = builder.CreateLoad(builder.getInt8Ty(), Ptr);
+            Value *XorVal = builder.CreateXor(ByteVal, builder.getInt8(KEY));
+            builder.CreateStore(XorVal, Ptr);
+
+            Value *NextVar = builder.CreateAdd(LoopVar, builder.getInt32(1));
+            LoopVar-&gt;addIncoming(NextVar, LoopBodyBB);
+
+            builder.CreateBr(LoopCheckBB);
+            builder.SetInsertPoint(ExitBB);
+            builder.CreateRetVoid();
+
+            return Func;
+        }
+        PreservedAnalyses run(Module &amp;M, ModuleAnalysisManager &amp;AM){
+            errs() &lt;&lt; "Running On-Demand String Encryption Pass...\n";
+            std::vector&lt;GlobalVariable*&gt; EncryptedGlobals;
+            for(GlobalVariable &amp;GV : M.globals()){
+                if (!GV.hasInitializer() || !GV.isConstant() || GV.getName().contains("llvm.")) continue;
+
+                Constant *Init = GV.getInitializer();
+                ConstantDataArray* DataArray = dyn_cast&lt;ConstantDataArray&gt;(Init);
+
+                if(DataArray &amp;&amp; DataArray-&gt;isString()){
+                    StringRef OriginalString = DataArray-&gt;getAsString();
+
+                    if(OriginalString.size() &lt; 2) continue;
+
+                    errs() &lt;&lt; "Encrypting string: " &lt;&lt; OriginalString &lt;&lt; "\n";
+                    std::string EncryptedStr = OriginalString.str();
+                    for(int i = 0; i &lt; EncryptedStr.size(); i++){
+                        EncryptedStr[i] ^= KEY;
+                    }
+
+                    Constant *NewInit = ConstantDataArray::getString(M.getContext(), EncryptedStr, false);
+                    GV.setInitializer(NewInit);
+                    GV.setConstant(false);
+                    
+                    EncryptedGlobals.push_back(&amp;GV);
+                }
+            }
+
+            if(EncryptedGlobals.empty()) return PreservedAnalyses::all();
+
+            Function *DecryptFunc = createDecryptFunc(&amp;M);
+
+            for(GlobalVariable *GV : EncryptedGlobals){
+                std::vector&lt;Instruction*&gt; user;
+                for(User *U: GV-&gt;users()){
+                    Instruction* ins = dyn_cast&lt;Instruction&gt;(U);
+                    if(ins-&gt;getFunction() == DecryptFunc) continue;
+                    user.push_back(ins);
+                }
+                
+                for(Instruction *ins : user){
+                    IRBuilder&lt;&gt; builder(ins);
+                    ConstantDataArray* DataArray = dyn_cast&lt;ConstantDataArray&gt;(GV-&gt;getInitializer());
+                    int len = DataArray-&gt;getNumElements();
+                    builder.CreateCall(DecryptFunc, {GV, builder.getInt32(len)});
+                }
+            }
+            return PreservedAnalyses::none();
+        }
+    };
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo(){
+    return{
+        LLVM_PLUGIN_API_VERSION,
+        "mypass",
+        "v0.1",
+        [](PassBuilder &amp;PB){
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &amp;MPM, ArrayRef&lt;PassBuilder::PipelineElement&gt;){
+                    if(Name == "mypass"){
+                        MPM.addPass(mypass());
+                        return true;
+                    }
+                    return false;
+                }
+            );
+        }
+    };
+}
+</code></pre>
+<h3 id="代码解释">代码解释</h3>
+<p>看到上面的pass代码，我们会感到头晕目眩，没关系，下面我们一步步拆解。<br>
+上面的代码分主要分为两部分：</p>
+<ol>
+<li>构建异或的解密函数（<code>createDecryptFunc</code>）</li>
+<li>加密字符串，并且将上面构建的解密函数插入代码。</li>
+</ol>
+<h3 id="cmakeliststxt">CMakeLists.txt</h3>
+<p>编译可以直接用下面的cmake配置文件，编译过程在之前文章详细讲解</p>
+<pre><code class="language-python">cmake_minimum_required(VERSION 4.1.1)
+project(mypass) 
+
+set(LLVM_DIR "D:/LLVM/llvm-project/build/lib/cmake/llvm")
+find_package(LLVM REQUIRED CONFIG)
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+include(AddLLVM)
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_library(mypass MODULE mypass.cpp)
+set_target_properties(mypass PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON) 
+target_link_libraries(mypass LLVMCore LLVMSupport)     
+target_compile_options(mypass PRIVATE /utf-8)#用中文
+</code></pre>
+<h1 id="使用效果展示">使用效果展示</h1>
+<h3 id="编译并执行">编译并执行</h3>
+<p>图片中可以看出，可以正常运行<br>
+<img alt="命令运行" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2450496/202602/2450496-20260213160118505-594712651.png" class="lazyload"></p>
+<h3 id="反编译查看区别">反编译查看区别</h3>
+<h4 id="原始testexe">原始test.exe</h4>
+<p><img alt="字符串加密" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2450496/202602/2450496-20260213160124354-268770369.png" class="lazyload"></p>
+<h4 id="加密test_optexe">加密test_opt.exe</h4>
+<p><img alt="原始" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2450496/202602/2450496-20260213160103496-2047084346.png" class="lazyload"></p>
+<p>根据上面的图片，可以看到，上面使用的pass，成功将HelloWorld加密了。</p>
+<p><mark><strong>如果❤喜欢❤本系列教程，就点个关注吧，后续不定期更新~</strong></mark></p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/ClownLMe/" target="_blank">ClownLMe</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/ClownLMe/p/19612575" target="_blank">https://www.cnblogs.com/ClownLMe/p/19612575</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-02-13 16:11">2026-02-13 16:11</span>&nbsp;
+<a href="https://www.cnblogs.com/ClownLMe">ClownLMe</a>&nbsp;
+阅读(<span id="post_view_count">40</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19612575);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19612575', targetLink: 'https://www.cnblogs.com/ClownLMe/p/19612575', title: 'LLVM的混淆之旅(六)-字符串加密' })">举报</a>
+</div>
+        
