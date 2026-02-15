@@ -1,0 +1,172 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/jaydenai/p/19614333/managed-value" title="发布于 2026-02-14 07:57">
+    <span role="heading" aria-level="2">[拆解LangChain执行引擎] ManagedValue——一种特殊的只读虚拟通道</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        我们一直在强调Pregel对象的状态是通过`Channel`维护和传递的，其实承载传递状态功能的组件除了Channel，还有  `ManagedValue`，我们可以将ManagedValue视为虚拟Channel。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>我们一直在强调Pregel对象的状态是通过<code>Channel</code>维护和传递的，其实承载传递状态功能的组件除了Channel，还有  <code>ManagedValue</code>。我们可以将ManagedValue视为虚拟Channel，Node不仅采用与读取Channel完全一样的方式读取ManagedValue，而且注册的ManagedValue也直接存放在Pregel的channels字段中。</p>
+<p>如果我们仔细查看Pregel类的定义，可以看出其<code>channels</code>字段返回一个字典，字典的值的类型联合了BaseChannel和<code>ManagedValueSpec</code>两种类型，前者是Channel的基类，后者就是<code>ManagedValue</code>类的别名。</p>
+<pre><code class="language-python">class Pregel(
+    PregelProtocol[StateT, ContextT, InputT, OutputT],
+    Generic[StateT, ContextT, InputT, OutputT]): 
+    channels : dict[str, BaseChannel | ManagedValueSpec]
+
+ManagedValueSpec = type[ManagedValue]
+</code></pre>
+<p>如果说Channel存储的是的业务状态，那么ManagedValue传递的就是Pregel这个执行引擎的运行时状态。一般来说，ManagedValue自身不负责存储状态，其提供的值可以实时计算得出，所以它不参与基于Checkpoint的持久化。从如下所示的代码片段可以看出，ManagedValue仅仅定义了一个唯一的静态抽象方法<code>get</code>返回对应的值，由于作为输入的<code>PregelScratchpad</code>对象提供的信息有限，所以ManagedValue能够发挥的空间其实很有限，在大部分情况下用不到它。</p>
+<pre><code class="language-python">class ManagedValue(ABC, Generic[V]):
+    @staticmethod
+    @abstractmethod
+    def get(scratchpad: PregelScratchpad) -&gt; V: ...
+</code></pre>
+<h2 id="1-pregelscratchpad">1. PregelScratchpad</h2>
+<p>ManagedValue提供的值是通过其get方法根据PregelScratchpad对象计算所得。当确定后续待执行的Node后，引擎会为每个Node创建一个任务，每个任务都会附加一个PregelScratchpad对象。PregelScratchpad的<code>step</code>和<code>stop</code>字段就返回当前Superstep的序号和针对迭代的限制（最大超步数），其它字段与持久化有关。</p>
+<pre><code class="language-python">@dataclasses.dataclass(**_DC_KWARGS)
+class PregelScratchpad:
+    step : int
+    stop : int
+    call_counter : Callable[[], int]
+    interrupt_counter : Callable[[], int]
+    get_null_resume	: Callable[[bool], Any]
+    resume : list[Any]
+    subgraph_counter	: Callable[[], int]	
+</code></pre>
+<p>PregelScratchpad的<code>call_counter</code>、<code>interrupt_counter</code>和<code>subgraph_counter</code>字段以闭包的形式返回一个计数器。<code>call_counter</code>计数器用于为当前Superstep内产生的所有任务分配唯一的内部序列号。</p>
+<h3 id="11-resume-value和中断计数器">1.1 Resume Value和中断计数器</h3>
+<p><code>interrupt_counter</code>、<code>get_null_resume</code>和<code>resume</code>字段与Pregel基于 “中断（Interrupt）/恢复（Resume）” 的执行方式有关。假设Pregel的对应一个需要人工介入的多级审批流程，在每次需要以人工介入的方式收集审批者决定的时候，流程进入一个中断，当前的状态被持久化。当审批决定给出后，流程以 “恢复” 的形式开始执行，中断时持久化的快照被提取出来 “恢复现场” ，审批决定以Resume Value的形式提供给引擎。为了匹配多个中断点与对应的Resume Value，后者会按照顺序被持久化，并在恢复执行的时候连同当前提供的Resume Value一并填充到PregelScratchpad的<code>resume</code>列表中。</p>
+<p>恢复执行做不到在中断点出开始执行，它总是<code>从头执行</code>Node的处理函数，所以定义 <code>幂等Node</code> 应该成为Agent编程的 “金科玉律”。由于PregelScratchpad的resume字段会按照中断的顺序存放Resume Value，所以在恢复执行的时候，每遇到一个中断，引擎可以利用<code>interrupt_counter</code>字段返回的计数器作为位置索引从resume列表中将匹配的Resume Value提取出来。如果提取的Resume Value为None，或者计数器返回的索引越界，<code>get_null_resume</code>字段提供的回调就会执行。这个回调函数具有一个bool类型的参数is_called，调用时该参数被设置为True，表示该中断确实被触发了，但没有对应的数据。这会消耗掉这个中断位，确保流程不至于永远得不到恢复。</p>
+<h3 id="12-子图调用计数器">1.2 子图调用计数器</h3>
+<p>如果说<code>interrupt_counter</code>计数器旨在解决每次中断与提供的Resume Value的匹配问题，那么<code>subgraph_counter</code>计数器解决的每次“子图调用”与对应Pregel实例的匹配问题。如果站在“图”的视角，每个Pregel对象就是由多个Node组成的图，而Pregel也可以作为一个Node出现在另一个Pregel构建的图中，两个Pregel之间就称为了“父子”关系，子Pregel构建的图就是“子图”，针对它的调用就是子图调用。</p>
+<p>虽然在同一个图中，每个Pregel会独自完成自身的持久化。在恢复执行场景中，引擎会率先加载作为“根”的Pregel对应的Checkpoint来恢复现场。当遇到“子图”形式调用另一个Pregel时，引擎会加载对应的Checkpoint来恢复子图在中断那个时间点的状态。现在问题来了：在子Pregel众多持久化的Checkpoint中，怎么知道该加载哪一个呢？</p>
+<p>这个问题本质上是如何解决作为子图执行的Pregel在执行持久化时，如何将生成的Checkpoint与当前执行上下文进行匹配的问题，这个问题是利用<code>Checkpoint命名空间</code>来解决的。Node是以任务的形式被执行的，每个任务具有唯一的ID，并且在恢复时保持不变，如果命名空间由执行链路上每个任务的<code>节点名称+任务ID</code>组成，那么子图的Checkpoint就能利用此命名空间关联起来。</p>
+<p>但是问题还是没有完全解决，如果同一个任务涉及针对<code>同一子图的多次调用</code>，如命名空间只包含基于任务的执行路径，此时两个子图会共享相同的命名空间，具体对应哪个Checkpoint依然无法解决。因此若涉及同一个Node针对同一个Pregel对象的多次调用，持久化这个Pregel的Checkpoint的命名空间还应该包含<code>调用顺序</code>。</p>
+<p>Checkpoint的命名空间的规则可以通过如下这个演示实例来证实。如代码片段所示，我们创建了一个由单一Node组成的Pregel对象（sub_graph），命名为 “baz” 的Node在执行的时候会从当前的RunnableConfig配置中提取并输出当前的Checkpoint命名空间。</p>
+<pre><code class="language-python">from langgraph.pregel import Pregel, NodeBuilder
+from langgraph.channels import LastValue
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.pregel._write import ChannelWrite, ChannelWriteTupleEntry
+from langgraph.types import RunnableConfig
+from typing import Any
+
+def handle(args:dict[str,Any], config:RunnableConfig)-&gt;None:
+    print(config["configurable"]["checkpoint_ns"])
+sub_node = (NodeBuilder()
+    .subscribe_to("start")
+    .do(handle))
+sub_graph = Pregel(
+    nodes={"baz": sub_node},
+    channels={
+        "start": LastValue(None),
+    },
+    input_channels=["start"],
+    output_channels=[])
+
+def handle1(args:dict[str,Any])-&gt;None:
+    sub_graph.invoke(input={"start": None})
+
+def handle2(args:dict[str,Any])-&gt;str:    
+    sub_graph.invoke(input={"start": None})    
+    sub_graph.invoke(input={"start": None})
+
+foo = (NodeBuilder()
+    .subscribe_to("foo")
+    .do(handle1)
+    .write_to(bar=None))
+bar = (NodeBuilder()
+    .subscribe_to("bar")
+    .do(handle2))
+
+graph = Pregel(
+    nodes={"foo": foo, "bar": bar},
+    channels={
+        "foo": LastValue(None),
+        "bar": LastValue(str),
+    },
+    input_channels=["foo"],
+    output_channels=[],
+    checkpointer= InMemorySaver())
+
+config = {"configurable": {"thread_id": "123"}}
+graph.invoke(input={"foo": None}, config=config)
+</code></pre>
+<p>在另一个Pregel中，我们为它设置了两个先后执行的Node（foo和bar），前者调用sub_graph一次，后者调用两次。针对三次调用，sub_graph为自身持久化设置的Checkpoint命名会以如下的形式输出，可以看出命名空间同时体现了调用链路和次序。</p>
+<pre><code>foo:36817c76-c3f7-643f-7924-0d29b39f469a|baz:311cc911-96a0-56b6-225b-28e4cece7cd9
+bar:97be6a71-1b71-7364-e691-a122cfef1a92|baz:789287de-869f-42b8-dd03-7518820daaa6
+bar:97be6a71-1b71-7364-e691-a122cfef1a92|1|baz:dd1ddd1b-fc62-b46a-c2ec-6a1d8344b793
+</code></pre>
+<p>基于Pregel“中断/恢复”的执行方式，让我们对<code>Pregel实例</code>会有特别的理解。我们习惯了将一个通过调用某个类构造函数创建的对象视为该类型的一个实例，但是在Node的处理函数中，即使针对<code>同一Pregel实例</code>的连续两次调用都有可能出现中断，一旦恢复执行，后一个实例就有可能使根据另一个Checkpoint的状态创建的，它自然也就不是原来的那个实例了。在不断的“中断/恢复”执行流程中，所谓<code>Pregel实例</code>有时候表示成<code>对应的Checkpoint</code>可能更准确。</p>
+<p>对于同一个节点任务来说，如果涉及针对同一个<code>子Pregel</code>的多次调用，从第二次调用开始，对方持久化生成的Checkpoint会将<code>调用次序</code>包含在命名空间中。与之相对的，在恢复执行的时候，也需要根据当前的执行上下文提供包含此序号的命名空间采用加载对应的Checkpoint，并最终恢复对应的Pregel对象，PregelScratchpad的subgraph_counter字段返回的计数器就是为了提供这个序号。</p>
+<h2 id="2-两个原生的managedvalue">2. 两个原生的ManagedValue</h2>
+<p>由于ManagedValue所能提供的值是根据PregelScratchpad计算生成，而后者可用的唯有表示当前和最大Superstep序号的<code>step</code>和<code>stop</code>字段，所以我们采用ManagedValue的应用场景其实很窄。我从只找到如下两个原生的ManagedValue类型，它们都定义在langgraph.managed.is_last_step这个包中。其中一个<code>IsLastStepManager</code>用于判断是否为最后一个Superstep，而<code>RemainingStepsManager</code>则用来确定余下的Superstep数。具体的实现非常简单，仅仅是针对PregelScratchpad的<code>step</code>和<code>stop</code>字段的简单运算而已。</p>
+<pre><code class="language-python">class IsLastStepManager(ManagedValue[bool]):
+    @staticmethod
+    def get(scratchpad: PregelScratchpad) -&gt; bool:
+        return scratchpad.step == scratchpad.stop - 1
+
+class RemainingStepsManager(ManagedValue[int]):
+    @staticmethod
+    def get(scratchpad: PregelScratchpad) -&gt; int:
+        return scratchpad.stop - scratchpad.step
+</code></pre>
+<p>由于ManagedValue属于一个<code>计算属性</code>，所以它只能作为Node的输入。它可以被视为一种虚拟的Channel，Node针对ManagedValue和常规Channel的读取方式完全一致。在创建Pregel对象时，所用到的ManagedValue需要在<code>channels</code>字段中显式声明，但是不能将其添加到输入和输出Channel列表中。</p>
+<p>如下的实例演示了RemainingStepsManager的使用方式，创建的Pregel由两个先后执行的Node构成（foo和bar），它们会将命名为<code>remaining_steps</code>的ManagedValue作为输入，并将其分别输出到<code>remaining_steps_after_foo</code>和<code>remaining_steps_after_bar</code>这两个Channel中，分别表示在这两个Node完成执行后所剩的Superstep数。</p>
+<pre><code class="language-python">from langgraph.pregel import Pregel, NodeBuilder
+from langgraph.managed.is_last_step import RemainingStepsManager
+from langgraph.channels import LastValue
+
+foo = (NodeBuilder()
+       .subscribe_to("foo")
+       .read_from("remaining_steps")
+       .do(lambda args: args["remaining_steps"])
+       .write_to(remaining_steps_after_foo= lambda args:args, bar=None))
+
+bar = (NodeBuilder()
+       .subscribe_to("bar")
+       .read_from("remaining_steps")
+       .do(lambda args: args["remaining_steps"])
+       .write_to("remaining_steps_after_bar"))
+
+app = Pregel(
+    nodes={"foo":foo, "bar":bar},
+    channels={
+        "foo": LastValue(None),
+        "bar":LastValue(None),
+        "remaining_steps_after_foo": LastValue(int),
+        "remaining_steps_after_bar":LastValue(int),
+        "remaining_steps": RemainingStepsManager, 
+    },
+    input_channels=["foo"],
+    output_channels=["remaining_steps_after_foo", "remaining_steps_after_bar"])
+
+config = {"recursion_limit": 10}
+result = app.invoke({"foo":None}, config=config)
+assert result["remaining_steps_after_foo"] == 10
+assert result["remaining_steps_after_bar"] == 9
+</code></pre>
+<p>在根据两个Node创建Pregel对象时，我们将针对命名为<code>remaining_steps</code>的ManagedValue的声明添加到channels字段中，对应的类型被设置为RemainingStepsManager。由于在调用Pregel对象时利用RunnableConfig配置将Superstep迭代限制为10，所以先后执行的两个Node后剩余步数分别为10和9。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-02-14 07:58">2026-02-14 07:57</span>&nbsp;
+<a href="https://www.cnblogs.com/jaydenai">JaydenAI</a>&nbsp;
+阅读(<span id="post_view_count">35</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19614333);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19614333', targetLink: 'https://www.cnblogs.com/jaydenai/p/19614333/managed-value', title: '[拆解LangChain执行引擎] ManagedValue——一种特殊的只读虚拟通道' })">举报</a>
+</div>
+        
