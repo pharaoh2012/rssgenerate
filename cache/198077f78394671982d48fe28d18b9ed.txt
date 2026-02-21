@@ -1,0 +1,158 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/pains/p/19555982" title="发布于 2026-01-31 22:44">
+    <span role="heading" aria-level="2">hangfire内部执行器是同步的，会导致死锁</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>再次遇到dotnet的第三方组件问题，就是hangfire的CoreBackgroundJobPerformer会导致死锁，它是作为hagnfire服务端的job执行器的，它非常的关键，是job能够运行的关键，这些库可能读是从很早的dotnetfremework时代移植过来的（我猜测的），同样的存在同步调用异步代码的问题，会导致死锁。</p>
+<p>它有问题的代码如下：</p>
+<pre><code class="language-csharp">namespace Hangfire.Server
+{
+    internal sealed class CoreBackgroundJobPerformer : IBackgroundJobPerformer
+    {
+        private object InvokeMethod(PerformContext context, object instance, object[] arguments)
+            if (context.BackgroundJob.Job == null) return null;
+
+            try
+            {
+                var methodInfo = context.BackgroundJob.Job.Method;
+                var method = new BackgroundJobMethod(methodInfo, instance, arguments);
+                var returnType = methodInfo.ReturnType;
+
+                if (returnType.IsTaskLike(out var getTaskFunc))
+                {
+                    if (_taskScheduler != null)
+                    {
+                        return InvokeOnTaskScheduler(context, method, getTaskFunc);
+                    }
+
+                    return InvokeOnTaskPump(context, method, getTaskFunc);
+                }
+
+                return InvokeSynchronously(method);
+            }
+            catch (ArgumentException ex)
+            {
+                HandleJobPerformanceException(ex, context.CancellationToken, context.BackgroundJob);
+                throw;
+            }
+            catch (AggregateException ex)
+            {
+                HandleJobPerformanceException(ex.InnerException, context.CancellationToken, context.BackgroundJob);
+                throw;
+            }
+            catch (TargetInvocationException ex)
+            {
+                HandleJobPerformanceException(ex.InnerException, context.CancellationToken, context.BackgroundJob);
+                throw;
+            }
+            catch (Exception ex) when (ex.IsCatchableExceptionType())
+            {
+                HandleJobPerformanceException(ex, context.CancellationToken, context.BackgroundJob);
+                throw;
+            }
+        }
+        private object InvokeOnTaskScheduler(PerformContext context, BackgroundJobMethod method, Func&lt;object, Task&gt; getTaskFunc)
+        {
+            var scheduledTask = Task.Factory.StartNew(
+                InvokeOnTaskSchedulerInternal,
+                method,
+                CancellationToken.None,
+                TaskCreationOptions.None,
+                _taskScheduler);
+
+            var result = scheduledTask.GetAwaiter().GetResult();//同步执行异步
+            if (result == null) return null;
+
+            return getTaskFunc(result).GetTaskLikeResult(result, method.ReturnType);
+        }
+
+        private static object InvokeOnTaskSchedulerInternal(object state)
+        {
+            // ExecutionContext is captured automatically when calling the Task.Factory.StartNew
+            // method, so we don't need to capture it manually. Please see the comment for
+            // synchronous method execution below for details.
+            return ((BackgroundJobMethod)state).Invoke();
+        }
+
+        private static object InvokeOnTaskPump(PerformContext context, BackgroundJobMethod method, Func&lt;object, Task&gt; getTaskFunc)
+        {
+            // Using SynchronizationContext here is the best default option, where workers
+            // are still running on synchronous dispatchers, and where a single job performer
+            // may be used by multiple workers. We can't create a separate TaskScheduler
+            // instance of every background job invocation, because TaskScheduler.Id may
+            // overflow relatively fast, and can't use single scheduler for multiple performers
+            // for better isolation in the default case – non-default external scheduler should
+            // be used. It's also great to preserve backward compatibility for those who are
+            // using Parallel.For(Each), since we aren't changing the TaskScheduler.Current.
+
+            var oldSyncContext = SynchronizationContext.Current;
+
+            try
+            {
+                using (var syncContext = new InlineSynchronizationContext())
+                using (var cancellationEvent = context.CancellationToken.ShutdownToken.GetCancellationEvent())
+                {
+                    SynchronizationContext.SetSynchronizationContext(syncContext);
+
+                    var result = InvokeSynchronously(method);
+                    if (result == null) return null;
+
+                    var task = getTaskFunc(result);
+                    var asyncResult = (IAsyncResult)task;
+
+                    var waitHandles = new[] { syncContext.WaitHandle, asyncResult.AsyncWaitHandle, cancellationEvent.WaitHandle };
+
+                    while (!asyncResult.IsCompleted &amp;&amp; WaitHandle.WaitAny(waitHandles) == 0)//这里也同样
+                    {
+                        var workItem = syncContext.Dequeue();
+                        workItem.Item1(workItem.Item2);
+                    }
+
+                    return task.GetTaskLikeResult(result, method.ReturnType);
+                }
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(oldSyncContext);
+            }
+        }
+</code></pre>
+<p>有问题的代码就是<br>
+var result = scheduledTask.GetAwaiter().GetResult();<br>
+以及<br>
+while (!asyncResult.IsCompleted &amp;&amp; WaitHandle.WaitAny(waitHandles) == 0)</p>
+<p>截至目前1.8.22版本还是没有解决这个问题，有人提了<a href="https://github.com/HangfireIO/Hangfire/issues/1658" title="issue" target="_blank" rel="noopener nofollow">issue</a>了，但是要到2.0.0版本才会解决。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div id="AllanboltSignature">
+<p id="PSignature" style="border-top-color: #e0e0e0; border-top-width: 1px; border-top-style: dashed; border-right-color: #e0e0e0; border-right-width: 1px; border-right-style: dashed; border-bottom-color: #e0e0e0; border-bottom-width: 1px; border-bottom-style: dashed; border-left-color: #e0e0e0; border-left-width: 1px; border-left-style: dashed; padding-top: 10px; padding-right: 10px; padding-bottom: 10px; padding-left: 80px; background-image: url(https://images.cnblogs.com/cnblogs_com/pains/109838/r_copyright.png); background-attachment: initial; background-origin: initial; background-clip: initial; font-family: 微软雅黑; font-size: 11px; background-color: #e5f1f4; background-position: 1% 50%; background-repeat: no-repeat no-repeat; ">
+作者：<a href="http://pains.cnblogs.com/" target="_blank">Rick Carter</a>
+<br>
+出处：<a href="http://pains.cnblogs.com/" target="_blank">http://pains.cnblogs.com/</a>
+<br>
+本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须保留此段声明，且在文章页面明显位置给出原文连接，否则保留追究法律责任的权利。
+</p>
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-01-31 22:45">2026-01-31 22:44</span>&nbsp;
+<a href="https://www.cnblogs.com/pains">Rick Carter</a>&nbsp;
+阅读(<span id="post_view_count">55</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19555982);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19555982', targetLink: 'https://www.cnblogs.com/pains/p/19555982', title: 'hangfire内部执行器是同步的，会导致死锁' })">举报</a>
+</div>
+        
