@@ -1,0 +1,867 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/myshare/p/19645510" title="发布于 2026-02-27 10:38">
+    <span role="heading" aria-level="2">基于 LangGraph 的AI 多Agent协作系统实战：从架构设计到并行调度</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>项目地址</strong>：<a href="https://github.com/sslovett/planMultiAgent" target="_blank" rel="noopener nofollow">https://github.com/sslovett/planMultiAgent</a></p>
+<p><strong>技术栈</strong>：FastAPI / LangGraph / LangChain / React / TypeScript / Vite</p>
+<p><strong>关键词</strong>：LangGraph、多 Agent 协作、Send API 并行 fan-out、ReAct Agent、SSE 流式输出、Supervisor 路由</p>
+</blockquote>
+<hr>
+<h2 id="一为什么需要多-agent-协作">一、为什么需要多 Agent 协作？</h2>
+<p>当我们用大模型构建一个旅行助手时，用户的问题往往是复杂的：</p>
+<blockquote>
+<p>"帮我查一下明天北京到上海的高铁，顺便看看上海天气"</p>
+</blockquote>
+<p>这一句话里同时包含了<strong>班次查询</strong>和<strong>天气查询</strong>两个独立任务。如果用单一 Agent 串行处理，要么让一个 Agent 承担所有能力（Prompt 膨胀、工具冲突），要么串行调用多个工具（延迟叠加）。</p>
+<p>更合理的做法是：让专业的 Agent 做专业的事，让它们并行执行，最后汇总结果。</p>
+<p>这正是 <strong>Supervisor + Worker Agent 并行协作模式</strong> 的核心思路。本项目基于 LangGraph 实现了这一架构，下面完整分享从设计到落地的全过程。</p>
+<hr>
+<h2 id="二系统功能一览">二、系统功能一览</h2>
+<h3 id="21-核心功能">2.1 核心功能</h3>
+<table>
+<thead>
+<tr>
+<th>功能模块</th>
+<th>Agent</th>
+<th>描述</th>
+<th>示例问句</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>班次查询</td>
+<td><code>ticket_search</code></td>
+<td>查询火车、高铁、航班班次信息</td>
+<td>"查一下明天北京到上海的高铁"</td>
+</tr>
+<tr>
+<td>天气查询</td>
+<td><code>weather_search</code></td>
+<td>查询城市实时天气</td>
+<td>"上海今天天气怎么样"</td>
+</tr>
+<tr>
+<td>政策咨询</td>
+<td><code>kb_search</code></td>
+<td>退票改签规则、票价政策等知识库 RAG</td>
+<td>"高铁改签要收手续费吗"</td>
+</tr>
+<tr>
+<td>闲聊</td>
+<td><code>chitchat</code></td>
+<td>自然语言闲聊、引导使用</td>
+<td>"你好，你能帮我做什么"</td>
+</tr>
+<tr>
+<td>多任务并行</td>
+<td>多 Agent 协作</td>
+<td>自动识别多意图，Send API 并行执行</td>
+<td>"查北京到上海的班次，顺便看看上海天气"</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-思考链可视化">2.2 思考链可视化</h3>
+<p>系统的一大特色是<strong>终端风格的思考过程实时展示</strong>。前端以类似日志终端的 UI 实时渲染每一步思考，包括 Agent 名称标签、操作类型标识、流式光标动画等。用户能清楚看到：</p>
+<pre><code>01:032  分析  规划    分析用户意图...
+02:156  完成  规划    识别到班次查询+天气查询需求
+03:201  规划  规划    并行执行 2 个任务：智慧出行, 天气
+04:350  执行  出行    智慧出行处理中...
+05:355  执行  天气    天气处理中...
+06:892  完成  出行    智慧出行完成
+07:910  完成  天气    天气完成
+08:920  执行  汇总    汇总 2 个任务结果
+</code></pre>
+<p>这种设计参考了 Claude 的 Thinking 展示方式——用户不仅看到最终结果，还能看到系统"是怎么想的"。</p>
+<p><img alt="img_1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/322142/202602/322142-20260227103436051-1086602898.png" class="lazyload"></p>
+<hr>
+<h2 id="三架构设计">三、架构设计</h2>
+<h3 id="31-整体数据流">3.1 整体数据流</h3>
+<p><img alt="img" loading="lazy" data-src="https://img2024.cnblogs.com/blog/322142/202602/322142-20260227103418041-2010662203.png" class="lazyload"></p>
+<pre><code>用户输入
+  │
+  ▼
+┌──────────────────────────────────────────────────┐
+│                FastAPI SSE 接口                    │
+│           POST /api/v1/chat/stream                │
+│           stream_mode = "custom"                  │
+└──────────────────────┬───────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────┐
+│              LangGraph StateGraph                  │
+│                                                    │
+│   ┌────────────────────────────────────────────┐ │
+│   │            Supervisor Node                   │ │
+│   │                                              │ │
+│   │   第一层：关键词快速匹配（O(n)，无 LLM）      │ │
+│   │   第二层：LLM 精确判断（仅必要时触发）        │ │
+│   │                                              │ │
+│   │   输出：next_agents = ["agent1", "agent2"]   │ │
+│   └──────┬──────────────────────────┬────────────┘ │
+│          │                          │              │
+│    len == 1                    len &gt; 1             │
+│   单任务直连               Send API 并行           │
+│          │                 ┌────┬────┐             │
+│          ▼                 ▼    ▼    ▼             │
+│    ┌──────────┐     ┌─────┐ ┌─────┐ ┌─────┐      │
+│    │  Agent   │     │Agent│ │Agent│ │Agent│       │
+│    │  (ReAct  │     │  A  │ │  B  │ │  C  │       │
+│    │  子图)   │     └──┬──┘ └──┬──┘ └──┬──┘       │
+│    └────┬─────┘        │       │       │           │
+│         │              └───────┼───────┘           │
+│         │              Reducer fan-in 聚合          │
+│         │                      │                   │
+│         ▼                      ▼                   │
+│   ┌────────────────────────────────────────────┐  │
+│   │           Synthesizer Node                   │  │
+│   │                                              │  │
+│   │   1 个结果 → 透传（流式已由 Worker 完成）     │  │
+│   │   N 个结果 → LLM 流式汇总                    │  │
+│   └──────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────┘
+                       │
+                       ▼
+              SSE 事件流 → 前端渲染
+</code></pre>
+<h3 id="32-三层节点职责">3.2 三层节点职责</h3>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th>职责</th>
+<th>输入</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Supervisor</strong></td>
+<td>意图识别、任务分解、路由决策</td>
+<td>用户消息</td>
+<td><code>next_agents</code> 列表</td>
+</tr>
+<tr>
+<td><strong>Worker Agent</strong></td>
+<td>执行具体任务（ReAct 子图）</td>
+<td>用户消息 + 工具</td>
+<td><code>agent_outputs</code> 结果</td>
+</tr>
+<tr>
+<td><strong>Synthesizer</strong></td>
+<td>结果聚合与流式输出</td>
+<td>所有 <code>agent_outputs</code></td>
+<td><code>final_response</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="33-项目目录结构">3.3 项目目录结构</h3>
+<pre><code>planMultiAgent/
+├── backend/
+│   └── app/
+│       ├── agents/
+│       │   ├── nodes/
+│       │   │   ├── supervisor.py          # Supervisor 节点：双层路由
+│       │   │   └── synthesizer.py         # Synthesizer 节点：多结果汇总
+│       │   └── tools/
+│       │       ├── registry.py            # ToolRegistry 工具注册中心
+│       │       ├── __init__.py            # 工具自动注册入口
+│       │       ├── ticket_tool.py         # 班次查询工具
+│       │       ├── weather_tool.py        # 天气查询工具
+│       │       ├── kb_tool.py             # 知识库检索工具
+│       │       └── chitchat_tool.py       # 闲聊工具
+│       ├── graph/
+│       │   ├── state.py                   # AgentState（Annotated reducer）
+│       │   ├── agents.py                  # create_react_agent 工厂
+│       │   └── langgraph_workflow.py      # 工作流编译、路由函数
+│       ├── utils/
+│       │   ├── message_helpers.py         # get_writer()、SSE 构造、3.10 兼容
+│       │   ├── llm_helper.py             # call_llm / call_llm_stream 统一接口
+│       │   └── llm_client.py             # OpenAI 兼容客户端
+│       ├── services/                      # 外部服务调用层
+│       ├── vectors/                       # 向量数据库适配层（Qdrant/ES）
+│       ├── api/
+│       │   └── routes.py                 # SSE 流式接口
+│       ├── config.py                      # pydantic-settings 配置
+│       └── main.py                        # FastAPI 入口 + lifespan
+├── frontend/
+│   └── src/
+│       ├── components/
+│       │   ├── ChatInterface.tsx          # 主界面
+│       │   ├── ThinkingChain.tsx          # 终端风格思考链组件
+│       │   ├── MessageList.tsx            # 消息列表
+│       │   ├── MessageItem.tsx            # 消息气泡
+│       │   └── InputBox.tsx               # 输入框
+│       ├── api/chat.ts                    # SSE 流解析 + 回调分发
+│       └── store/chatStore.ts             # Zustand 状态管理
+└── README.md
+</code></pre>
+<hr>
+<h2 id="四核心技术深度解析">四、核心技术深度解析</h2>
+<h3 id="41-agentstate自定义-reducer-解决并行-fan-in-难题">4.1 AgentState：自定义 Reducer 解决并行 fan-in 难题</h3>
+<p>多 Agent 并行执行时最棘手的问题是：<strong>多个节点同时写同一个 state 字段，如何避免覆盖？</strong></p>
+<p>LangGraph 的解决方案是 <code>Annotated</code> + Reducer 函数。本项目为 <code>agent_outputs</code> 字段设计了一个自定义 Reducer：</p>
+<pre><code class="language-python"># backend/app/graph/state.py
+
+def _reset_on_empty(existing: list, new: list) -&gt; list:
+    """
+    自定义列表 Reducer：空列表重置，非空追加
+
+    - Supervisor 传入 [] → 清除上一轮旧结果（每轮重置）
+    - Agent 传入 [{...}] → 追加到列表（并行 fan-in 安全）
+    """
+    if not new:
+        return []
+    return existing + new
+
+
+class AgentState(TypedDict):
+    # LangGraph 原生 reducer，自动管理多轮对话历史
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+
+    # 自定义 reducer，支持并行安全聚合 + 每轮自动重置
+    agent_outputs: Annotated[list, _reset_on_empty]
+
+    # Supervisor 输出的路由信息
+    next_agents: List[str]
+    collaboration_mode: str    # "single" | "parallel"
+
+    # 各 Agent 业务上下文（Supervisor 动态填充）
+    ticket_context: dict
+    weather_context: dict
+    consultation_context: dict
+
+    # 最终输出
+    final_response: str
+</code></pre>
+<p>Supervisor 每轮开始时返回 <code>agent_outputs: []</code>，Reducer 检测到空列表就清除旧数据；Worker Agent 各自返回 <code>[{...}]</code>，Reducer 执行 <code>existing + new</code> 追加合并。LangGraph 保证 Reducer 操作的原子性，不存在并发写冲突。</p>
+<p>这比手动加锁或用队列收集结果要优雅得多——<strong>利用框架的 Reducer 机制，把并发问题消化在状态定义层</strong>。</p>
+<h3 id="42-supervisor-双层路由关键词快速通道--llm-精确补充">4.2 Supervisor 双层路由：关键词快速通道 + LLM 精确补充</h3>
+<p>路由策略直接影响系统的<strong>响应速度</strong>和<strong>意图识别准确率</strong>。</p>
+<p>纯 LLM 路由准确但慢（每次都要调用 LLM），纯关键词路由快但死板（语义模糊时容易误判）。项目采用了"两层漏斗"设计：</p>
+<pre><code class="language-python"># backend/app/agents/nodes/supervisor.py
+
+def _analyze_task(query: str, messages: list, state: AgentState) -&gt; dict:
+    """
+    双层路由策略：
+    第一层：关键词快速匹配（O(n)，零 LLM 开销）
+    第二层：LLM 精确判断（仅在多工具冲突或无匹配时触发）
+    """
+    registry = get_tool_registry()
+    all_tools = registry.get_all()
+
+    # ====== 第一层：关键词匹配 ======
+    matched_tools = registry.match_by_keywords(query)
+
+    if matched_tools:
+        # 唯一匹配 → 直接选定
+        if len(matched_tools) == 1:
+            tool_name = matched_tools[0][0]
+            return {"mode": "single", "subtasks": [{"agent": tool_name, ...}]}
+
+        # 最高优先级明显领先（priority 数值越小越高）
+        if matched_tools[0][1] &lt; matched_tools[1][1]:
+            return {"mode": "single", "subtasks": [...]}
+
+        # 多工具同优先级 → 需要 LLM 判断是否并行
+        return _analyze_with_llm(query, messages, all_tools,
+                                 matched_tools=same_priority_tools)
+
+    # ====== 第二层：LLM 分析 ======
+    return _analyze_with_llm(query, messages, all_tools)
+</code></pre>
+<p><strong>性能对比</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>路由方式</th>
+<th>额外延迟</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"查北京到上海高铁"</td>
+<td>关键词直连</td>
+<td><strong>0ms</strong></td>
+<td>命中"高铁"关键词 → <code>ticket_search</code></td>
+</tr>
+<tr>
+<td>"上海天气"</td>
+<td>关键词直连</td>
+<td><strong>0ms</strong></td>
+<td>命中"天气"关键词 → <code>weather_search</code></td>
+</tr>
+<tr>
+<td>"查个班次顺便看天气"</td>
+<td>LLM 判断并行</td>
+<td>~500ms</td>
+<td>同优先级冲突 → LLM 决定 parallel</td>
+</tr>
+<tr>
+<td>"这个可以退吗"</td>
+<td>LLM 兜底分析</td>
+<td>~500ms</td>
+<td>无关键词命中 → LLM 分析意图</td>
+</tr>
+</tbody>
+</table>
+<p>80% 以上的日常请求都能通过第一层关键词匹配直接路由，<strong>省去了不必要的 LLM 调用</strong>。</p>
+<h3 id="43-send-api真正的并行-fan-out">4.3 Send API：真正的并行 fan-out</h3>
+<p>这是本项目的核心亮点。LangGraph 的 <code>Send API</code> 可以在条件路由中返回 <code>Send</code> 对象列表，让多个节点真正并发执行（而非串行调度）。</p>
+<pre><code class="language-python"># backend/app/graph/langgraph_workflow.py
+
+from langgraph.types import Send
+from langgraph.graph import StateGraph, END
+
+def route_after_supervisor(state: AgentState):
+    """Supervisor → Agent 的路由函数"""
+    next_agents = state.get("next_agents", [])
+
+    if not next_agents:
+        return END                    # 无任务 → 结束
+
+    if len(next_agents) == 1:
+        return next_agents[0]         # 单任务 → 直接路由
+
+    # 多任务 → Send API 并行 fan-out
+    return [Send(agent, state) for agent in next_agents]
+</code></pre>
+<p><strong>工作流编译</strong>——把所有节点和边组装起来：</p>
+<pre><code class="language-python">def create_workflow() -&gt; StateGraph:
+    agents = create_worker_agents()  # 从 ToolRegistry 动态创建所有 ReAct Agent
+    workflow = StateGraph(AgentState)
+
+    # 三类节点
+    workflow.add_node("supervisor", supervisor_node)
+    for name, compiled_agent in agents.items():
+        workflow.add_node(name, _make_agent_node(name, compiled_agent))
+    workflow.add_node("synthesizer", synthesizer_node)
+
+    # 边
+    workflow.set_entry_point("supervisor")
+    route_map = {name: name for name in agents.keys()}
+    route_map[END] = END
+    workflow.add_conditional_edges("supervisor", route_after_supervisor, route_map)
+    for name in agents.keys():
+        workflow.add_edge(name, "synthesizer")  # 所有 Agent → Synthesizer
+    workflow.add_edge("synthesizer", END)
+
+    return workflow
+
+
+def compile_workflow():
+    """编译 + MemorySaver checkpointer（会话持久化）"""
+    workflow = create_workflow()
+    checkpointer = MemorySaver()
+    return workflow.compile(checkpointer=checkpointer)
+</code></pre>
+<p>编译后的工作流图结构如下：</p>
+<pre><code>START → supervisor → [ticket_search, weather_search, kb_search, chitchat] → synthesizer → END
+            │                        ↑ Send 并行 fan-out
+            │                        ↓ Reducer fan-in 聚合
+            └── END（无任务时直接结束）
+</code></pre>
+<h3 id="44-worker-agentreact-子图--流式双模态">4.4 Worker Agent：ReAct 子图 + 流式双模态</h3>
+<p>每个 Worker Agent 都是一个 <code>create_react_agent</code> 编译出的独立子图，内置 Reason → Act → Observe 循环。Agent 包装节点根据是否为单 Agent 场景，选择不同的输出策略：</p>
+<pre><code class="language-python"># backend/app/graph/langgraph_workflow.py
+
+def _make_agent_node(agent_name: str, compiled_agent):
+    """创建 Agent 包装节点"""
+
+    async def node_fn(state: AgentState, config: RunnableConfig) -&gt; dict:
+        writer = get_writer(config)
+        is_single_agent = len(state.get("next_agents", [])) == 1
+
+        if is_single_agent:
+            # 单 Agent：astream_events 捕获子图内部 LLM token，逐个推送到前端
+            response_text = await _stream_agent(compiled_agent, state, writer, ...)
+        else:
+            # 多 Agent：ainvoke 收集完整结果，交给 Synthesizer 统一汇总
+            result = await compiled_agent.ainvoke({"messages": state["messages"]})
+            response_text = _extract_response(result)
+
+        return {
+            "messages": [AIMessage(content=response_text, name=agent_name)],
+            "agent_outputs": [{
+                "agent_name": agent_name,
+                "success": True,
+                "response": response_text,
+            }],
+        }
+
+    return node_fn
+</code></pre>
+<p><strong>为什么要区分单/多 Agent 输出策略？</strong></p>
+<ul>
+<li><strong>单 Agent</strong>：用户只等一个任务，应该尽快看到第一个 token → 用 <code>astream_events</code> 逐 token 流式推送。</li>
+<li><strong>多 Agent</strong>：多个任务并行执行，每个结果都只是片段 → 用 <code>ainvoke</code> 收集完整结果，由 Synthesizer 统一汇总后再流式输出，避免多路结果交错。</li>
+</ul>
+<p><strong>流式输出的关键实现</strong>——从 ReAct 子图中捕获 LLM 的 token 流：</p>
+<pre><code class="language-python">async def _stream_agent(compiled_agent, state, writer, agent_name, display_name):
+    """通过 astream_events 捕获 ReAct 子图内部的 LLM token"""
+    response_text = ""
+
+    async for event in compiled_agent.astream_events(
+        {"messages": state["messages"]}, version="v2"
+    ):
+        if event["event"] == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            content = chunk.content or ""
+            # 关键：过滤掉工具调用 token，只推送最终回复内容
+            if content and not getattr(chunk, "tool_call_chunks", []):
+                response_text += content
+                writer({"type": "content_stream", "block": {
+                    "delta": content,
+                    "accumulated": response_text,
+                }})
+
+    return response_text
+</code></pre>
+<blockquote>
+<p>这里有一个容易踩的坑：<code>on_chat_model_stream</code> 事件不仅包含最终回复的 token，也包含 tool call 的参数 token。如果不过滤 <code>tool_call_chunks</code>，前端会收到一堆乱码 JSON。</p>
+</blockquote>
+<h3 id="45-synthesizer智能汇总策略">4.5 Synthesizer：智能汇总策略</h3>
+<p>Synthesizer 根据结果数量采取不同策略：</p>
+<pre><code class="language-python"># backend/app/agents/nodes/synthesizer.py
+
+async def synthesizer_node(state: AgentState, config: RunnableConfig) -&gt; dict:
+    writer = get_writer(config)
+    agent_outputs = state.get("agent_outputs", [])
+
+    if not agent_outputs:
+        return {}
+
+    # 单结果 → 直接透传（Agent wrapper 已完成流式推送）
+    if len(agent_outputs) == 1:
+        return {"final_response": agent_outputs[0]["response"]}
+
+    # 多结果 → LLM 流式汇总
+    prompt = f"""汇总以下 {len(agent_outputs)} 个 Agent 的执行结果..."""
+
+    response = ""
+    async for token in call_llm_stream(prompt=prompt, ...):
+        response += token
+        writer({"type": "content_stream", "block": {
+            "delta": token,
+            "accumulated": response,
+        }})
+
+    return {
+        "messages": [AIMessage(content=response)],
+        "final_response": response,
+    }
+</code></pre>
+<p>当 Synthesizer 遇到 LLM 调用失败时，会自动降级为<strong>简单拼接</strong>模式——把各 Agent 结果按顺序拼接后一次性推送，确保用户始终能得到响应。</p>
+<h3 id="46-toolregistry插件化的工具注册中心">4.6 ToolRegistry：插件化的工具注册中心</h3>
+<p>所有工具的元数据（名称、关键词、优先级、上下文映射）统一由 <code>ToolRegistry</code> 管理。工作流代码不硬编码任何工具名称，完全通过注册中心动态发现。</p>
+<pre><code class="language-python"># backend/app/agents/tools/registry.py
+
+class ToolConfig(BaseModel):
+    name: str                           # 技术名称
+    display_name: str                   # 前端显示名称
+    description: str                    # 工具描述
+    keywords: List[str]                 # 关键词列表（第一层路由用）
+    priority: int = 3                   # 优先级（1=最高）
+    tool_class: Type[BaseTool]          # LangChain 工具类
+    required_params: List[str] = []     # 必需参数列表
+    context_field: Optional[str]        # 对应 AgentState 中的上下文字段
+    context_description: Optional[str]  # 上下文描述模板
+
+
+class ToolRegistry:
+    def register(self, name, display_name, keywords, tool_class, priority, ...): ...
+    def match_by_keywords(self, query) -&gt; List[tuple[str, int]]: ...
+    def get_tool_instance(self, name) -&gt; BaseTool: ...
+</code></pre>
+<p><strong>注册示例</strong>：</p>
+<pre><code class="language-python"># backend/app/agents/tools/__init__.py
+
+registry.register(
+    name="ticket_search",
+    display_name="智慧出行",
+    description="班次查询：查询车次、班次、出行计划",
+    keywords=["火车", "班次", "车票", "高铁", "飞机", "航班", "买票", "订票"],
+    tool_class=TicketSearchTool,
+    priority=2,
+    requires_params=True,
+    required_params=["departure", "destination"],
+    context_field="ticket_context",
+    context_description="用户查询了从 {departure} 到 {destination} 的班次"
+)
+</code></pre>
+<p><code>context_field</code> 和 <code>context_description</code> 的设计使得 Supervisor 能<strong>自动将解析出的参数填入 AgentState 对应的上下文字段</strong>，供 LLM 在后续对话中引用（例如"目的地天气"自动关联到之前查过的目的地城市）。</p>
+<h3 id="47-sse-流式协议设计">4.7 SSE 流式协议设计</h3>
+<h4 id="后端stream_modecustom-统一推送">后端：<code>stream_mode="custom"</code> 统一推送</h4>
+<p>LangGraph 提供了多种 stream_mode（<code>values</code>、<code>updates</code>、<code>messages</code>、<code>custom</code>）。本项目选择 <code>custom</code> 模式：所有事件通过 <code>get_stream_writer()</code> 手动推送，精确控制每一个 SSE 事件的时机和内容。</p>
+<pre><code class="language-python"># backend/app/api/routes.py
+
+@router.post("/chat/stream")
+async def chat_stream(request_body: ChatRequest, request: Request):
+    workflow = get_workflow()
+    session_id = request_body.session_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": session_id}}
+
+    async def stream_output():
+        yield sse_event("session_id", {"session_id": session_id})
+        yield sse_event("thinking_start")
+
+        async for payload in workflow.astream(
+            input_state, config=config, stream_mode="custom"
+        ):
+            event_type = payload.get("type", "")
+            if event_type == "thinking_stream":
+                yield sse_event("thinking_stream", payload)
+            elif event_type == "content_stream":
+                yield sse_event("content_stream", {
+                    "delta": payload["block"]["delta"],
+                    "accumulated": payload["block"]["accumulated"],
+                })
+
+        yield sse_event("thinking_end")
+        yield sse_event("response_end", {"content": accumulated_content})
+
+    return StreamingResponse(stream_output(), media_type="text/event-stream")
+</code></pre>
+<h4 id="sse-事件协议">SSE 事件协议</h4>
+<table>
+<thead>
+<tr>
+<th>事件类型</th>
+<th>触发时机</th>
+<th>关键字段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>session_id</code></td>
+<td>请求开始</td>
+<td><code>session_id</code></td>
+</tr>
+<tr>
+<td><code>thinking_start</code></td>
+<td>思考链启动</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>thinking_stream</code></td>
+<td>每个思考步骤</td>
+<td><code>content</code>, <code>agent</code>, <code>agent_display</code>, <code>is_streaming</code></td>
+</tr>
+<tr>
+<td><code>content_stream</code></td>
+<td>回复 token</td>
+<td><code>delta</code>（增量）, <code>accumulated</code>（累积）</td>
+</tr>
+<tr>
+<td><code>thinking_end</code></td>
+<td>思考链结束</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>response_end</code></td>
+<td>完整响应结束</td>
+<td><code>content</code>, <code>needs_input</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="前端sse-流解析与回调分发">前端：SSE 流解析与回调分发</h4>
+<p>前端通过 <code>fetch</code> + <code>ReadableStream</code> 解析 SSE 事件流，按事件类型分发到不同回调：</p>
+<pre><code class="language-typescript">// frontend/src/api/chat.ts
+
+export const chatApi = {
+  sendMessageStream: async (request: ChatRequest, callbacks: StreamCallbacks) =&gt; {
+    const response = await fetch(`${API_BASE_URL}/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+      body: JSON.stringify(request),
+    });
+
+    const reader = response.body?.getReader();
+    // 解析 SSE 事件 → 按 type 分发到 onThinking / onContent / onResponseEnd
+    await parseSSEReader(reader, callbacks);
+  },
+};
+</code></pre>
+<p>前端 <code>ThinkingChain</code> 组件以终端日志风格渲染思考过程，每个思考块包含：</p>
+<ul>
+<li><strong>时间戳</strong>（<code>01:032</code> 格式）</li>
+<li><strong>操作类型标签</strong>（分析 / 搜索 / 执行 / 完成）</li>
+<li><strong>Agent 标签</strong>（彩色标识不同 Agent）</li>
+<li><strong>流式光标</strong>（正在思考时闪烁）</li>
+</ul>
+<h3 id="48-python-310-contextvars-兼容方案">4.8 Python 3.10 contextvars 兼容方案</h3>
+<p>这是开发过程中耗时最长的一个技术难题。</p>
+<p><strong>问题</strong>：LangGraph 的 <code>get_stream_writer()</code> 依赖 Python 的 <code>contextvars</code> 机制。然而 Python &lt; 3.11 的 <code>asyncio</code> 在 <code>create_task()</code> 和 <code>to_thread()</code> 时<strong>不会自动传播 context</strong>，导致节点函数中调用 <code>get_stream_writer()</code> 时抛出 <code>RuntimeError</code>。</p>
+<p><strong>表现</strong>：Supervisor 的思考链推送正常，但 Worker Agent 的思考链全部丢失。</p>
+<p><strong>根因</strong>：LangGraph 内部通过 <code>var_child_runnable_config</code> 这个 <code>ContextVar</code> 传递运行时配置。Python 3.10 切换协程时不复制 context，子协程中这个变量为空。</p>
+<p><strong>解决方案</strong>——封装 <code>get_writer()</code> 工具函数，在获取 writer 前手动注入 config：</p>
+<pre><code class="language-python"># backend/app/utils/message_helpers.py
+
+def ensure_config_context(config: RunnableConfig) -&gt; None:
+    """手动将 config 注入 contextvar，兼容 Python 3.10"""
+    from langchain_core.runnables.config import var_child_runnable_config
+    if config and not var_child_runnable_config.get(None):
+        var_child_runnable_config.set(config)
+
+
+def get_writer(config: RunnableConfig = None) -&gt; Callable:
+    """获取 stream writer（兼容 Python 3.10+）"""
+    if config:
+        ensure_config_context(config)
+    try:
+        from langgraph.config import get_stream_writer
+        return get_stream_writer()
+    except RuntimeError:
+        return lambda x: None  # 降级为空操作
+</code></pre>
+<p><strong>使用规范</strong>：项目中所有需要推送 SSE 事件的节点函数，签名统一为 <code>(state: AgentState, config: RunnableConfig)</code>，函数入口第一行调用 <code>get_writer(config)</code>。</p>
+<h3 id="49-llm-统一调用层">4.9 LLM 统一调用层</h3>
+<p>项目封装了统一的 LLM 调用接口，支持同步调用和异步流式调用，统一处理日志、重试、JSON 解析等横切关注点：</p>
+<pre><code class="language-python"># backend/app/utils/llm_helper.py
+
+def call_llm(prompt, model=None, temperature=0.3,
+             parse_json=False, default_response=None) -&gt; Any:
+    """同步 LLM 调用（Supervisor 路由分析用）"""
+    client = get_llm_client()
+    response = client.chat.completions.create(model=model, messages=[...])
+    content = response.choices[0].message.content.strip()
+    if parse_json:
+        return parse_llm_json(content, default_response)
+    return content
+
+
+async def call_llm_stream(prompt, model=None, temperature=0.3) -&gt; AsyncGenerator:
+    """异步流式 LLM 调用（Synthesizer 汇总用）"""
+    client = get_async_llm_client()
+    stream = await client.chat.completions.create(model=model, messages=[...], stream=True)
+    async for chunk in stream:
+        if chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+</code></pre>
+<p>两个接口使用 OpenAI 兼容格式，可以对接任何兼容 OpenAI API 的模型服务（通义千问、DeepSeek、本地 Ollama 等）。</p>
+<h3 id="410-会话管理零代码持久化">4.10 会话管理：零代码持久化</h3>
+<p>传统做法需要手写 <code>SessionManager</code>，维护一个 <code>Dict[session_id, List[Message]]</code> 的映射。本项目直接利用 LangGraph 的 <code>MemorySaver</code> checkpointer + <code>thread_id</code> 配置：</p>
+<pre><code class="language-python"># 编译时注入 checkpointer
+checkpointer = MemorySaver()
+compiled = workflow.compile(checkpointer=checkpointer)
+
+# 运行时通过 thread_id 区分会话
+config = {"configurable": {"thread_id": session_id}}
+async for payload in workflow.astream(input_state, config=config, stream_mode="custom"):
+    ...
+</code></pre>
+<p><code>MemorySaver</code> 自动持久化 <code>AgentState</code> 中所有带 Reducer 的字段（<code>messages</code> 通过 <code>add_messages</code> 自动追加对话历史），下次同一个 <code>thread_id</code> 的请求会自动加载历史消息——<strong>零代码实现多轮对话</strong>。</p>
+<hr>
+<h2 id="五如何扩展新-agent">五、如何扩展新 Agent</h2>
+<p>添加新 Agent 只需三步，<strong>不改动任何工作流代码</strong>：</p>
+<h3 id="第一步创建-langchain-tool">第一步：创建 LangChain Tool</h3>
+<pre><code class="language-python"># backend/app/agents/tools/hotel_tool.py
+
+from langchain.tools import BaseTool
+from pydantic import BaseModel, Field
+
+class HotelSearchInput(BaseModel):
+    city: str = Field(description="城市名称")
+    checkin: str = Field(description="入住日期，格式 YYYY-MM-DD")
+
+class HotelSearchTool(BaseTool):
+    name: str = "hotel_search"
+    description: str = "酒店查询工具，查询城市酒店信息"
+    args_schema: type[BaseModel] = HotelSearchInput
+
+    def _run(self, city: str, checkin: str) -&gt; str:
+        # 调用酒店 API
+        return f"{city} 的酒店信息..."
+
+    async def _arun(self, city: str, checkin: str) -&gt; str:
+        return self._run(city, checkin)
+</code></pre>
+<h3 id="第二步注册到-toolregistry">第二步：注册到 ToolRegistry</h3>
+<pre><code class="language-python"># backend/app/agents/tools/__init__.py
+
+from .hotel_tool import HotelSearchTool
+
+registry.register(
+    name="hotel_search",
+    display_name="酒店",
+    description="酒店查询：搜索酒店、住宿信息",
+    keywords=["酒店", "住宿", "宾馆", "入住", "房间"],
+    tool_class=HotelSearchTool,
+    priority=2,
+    requires_params=True,
+    required_params=["city", "checkin"],
+)
+</code></pre>
+<h3 id="第三步添加系统提示词">第三步：添加系统提示词</h3>
+<pre><code class="language-python"># backend/app/graph/agents.py
+
+AGENT_PROMPTS["hotel_search"] = (
+    "你是酒店查询助手，帮用户搜索和推荐酒店。"
+    "请根据用户需求调用工具查询，用友好的中文回复。"
+)
+</code></pre>
+<p>重启服务，<code>create_worker_agents()</code> 自动从注册中心创建新 Agent 并加入工作流图。Supervisor 会根据"酒店"等关键词自动将相关请求路由到新 Agent。</p>
+<hr>
+<h2 id="六踩坑实录">六、踩坑实录</h2>
+<h3 id="坑-1并行-agent-的-agent_outputs-被覆盖">坑 1：并行 Agent 的 agent_outputs 被覆盖</h3>
+<p><strong>现象</strong>：两个 Agent 并行执行时，<code>agent_outputs</code> 只有后完成那个 Agent 的结果。</p>
+<p><strong>原因</strong>：state 字段默认行为是覆盖写入，不是追加。</p>
+<p><strong>解决</strong>：使用 <code>Annotated[list, _reset_on_empty]</code> 自定义 Reducer，将覆盖语义改为追加语义。LangGraph 的 Reducer 是并行安全的。</p>
+<h3 id="坑-2astream_events-输出乱码-json">坑 2：astream_events 输出乱码 JSON</h3>
+<p><strong>现象</strong>：前端 content_stream 收到类似 <code>{"departure": "北京", "destin</code> 的碎片文本。</p>
+<p><strong>原因</strong>：<code>on_chat_model_stream</code> 事件包含工具调用参数的 token（tool_call_chunks），和最终回复 token 混在一起。</p>
+<p><strong>解决</strong>：过滤 <code>tool_call_chunks</code>：</p>
+<pre><code class="language-python">if content and not getattr(chunk, "tool_call_chunks", []):
+    writer({"type": "content_stream", ...})
+</code></pre>
+<h3 id="坑-3python-310-下-get_stream_writer-失效">坑 3：Python 3.10 下 get_stream_writer() 失效</h3>
+<p><strong>现象</strong>：Supervisor 的思考链正常推送，Worker Agent 节点的思考链全部丢失。</p>
+<p><strong>原因</strong>：Python 3.10 的 asyncio 不传播 contextvars。</p>
+<p><strong>解决</strong>：封装 <code>get_writer(config)</code> 函数，手动注入 <code>var_child_runnable_config</code>（详见 4.8 节）。</p>
+<h3 id="坑-4memorysaver-导致-agent_outputs-跨轮污染">坑 4：MemorySaver 导致 agent_outputs 跨轮污染</h3>
+<p><strong>现象</strong>：第二轮对话的响应中混入了第一轮的 Agent 结果。</p>
+<p><strong>原因</strong>：<code>MemorySaver</code> 持久化整个 state，<code>agent_outputs</code> 在第二轮开始时仍保留第一轮的值。</p>
+<p><strong>解决</strong>：Supervisor 每轮返回 <code>agent_outputs: []</code>，触发 <code>_reset_on_empty</code> Reducer 清空旧数据。</p>
+<h3 id="坑-5stream_modemessages-消息重复">坑 5：stream_mode="messages" 消息重复</h3>
+<p><strong>现象</strong>：使用 <code>stream_mode="messages"</code> 时，同一条 AI 消息被推送了多次。</p>
+<p><strong>原因</strong>：<code>messages</code> 模式会输出每个节点的 state 变化，多个 Agent 节点都写入了 <code>messages</code> 字段。</p>
+<p><strong>解决</strong>：改用 <code>stream_mode="custom"</code>，所有 SSE 事件通过 <code>get_stream_writer()</code> 手动推送，精确控制输出内容。</p>
+<hr>
+<h2 id="七技术选型">七、技术选型</h2>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>版本要求</th>
+<th>角色</th>
+<th>选型理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>LangGraph</strong></td>
+<td>≥1.0.0</td>
+<td>Agent 工作流编排</td>
+<td>原生 Send API 并行、Annotated Reducer、MemorySaver、create_react_agent</td>
+</tr>
+<tr>
+<td><strong>LangChain</strong></td>
+<td>≥0.3.0</td>
+<td>工具层抽象</td>
+<td>BaseTool 体系成熟，与 LangGraph 无缝集成</td>
+</tr>
+<tr>
+<td><strong>FastAPI</strong></td>
+<td>≥0.109.0</td>
+<td>Web 框架</td>
+<td>原生异步、SSE StreamingResponse、Pydantic 校验</td>
+</tr>
+<tr>
+<td><strong>React + Vite</strong></td>
+<td>React 18+</td>
+<td>前端</td>
+<td>快速开发、TypeScript 支持</td>
+</tr>
+<tr>
+<td><strong>Pydantic v2</strong></td>
+<td>≥2.5.0</td>
+<td>配置管理</td>
+<td><code>pydantic-settings</code> 统一管理 .env 配置</td>
+</tr>
+<tr>
+<td><strong>通义千问</strong></td>
+<td>qwen-max</td>
+<td>LLM</td>
+<td>OpenAI 兼容接口、中文能力强、性价比高</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>注：LLM 层使用 OpenAI 兼容接口，可替换为 DeepSeek、GPT-4o、本地 Ollama 等任何兼容服务。</p>
+</blockquote>
+<hr>
+<h2 id="八快速上手">八、快速上手</h2>
+<h3 id="环境要求">环境要求</h3>
+<ul>
+<li>Python 3.10+</li>
+<li>Node.js 18+</li>
+</ul>
+<h3 id="克隆与配置">克隆与配置</h3>
+<pre><code class="language-bash">git clone https://github.com/sslovett/planMultiAgent
+cd planMultiAgent
+</code></pre>
+<p>在 <code>backend/</code> 目录下创建 <code>.env</code> 文件：</p>
+<pre><code class="language-bash"># LLM 配置（支持 OpenAI 兼容接口）
+LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
+LLM_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL=qwen-max
+LLM_TEMPERATURE=0.3
+
+# 服务端口
+API_PORT=8002
+
+# 外部服务（可选）
+TICKET_API_URL=http://localhost:9001
+
+# Qdrant知识库
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=travel_kb
+</code></pre>
+<h3 id="启动">启动</h3>
+<pre><code class="language-bash"># 后端
+cd backend
+pip install -r requirements.txt
+python -m uvicorn app.main:app --reload --port 8002
+
+# 前端（新终端）
+cd frontend
+npm install
+npm run dev
+</code></pre>
+<p>访问 <code>http://localhost:5173</code>，开始对话。</p>
+<p>API 文档：<code>http://localhost:8002/docs</code></p>
+<hr>
+<h2 id="九总结">九、总结</h2>
+<p>回顾整个项目的设计，核心是四个原则：</p>
+<ol>
+<li>
+<p><strong>职责单一</strong>：Supervisor 只路由，Worker 只执行，Synthesizer 只汇总。每个节点的代码量控制在 100 行以内。</p>
+</li>
+<li>
+<p><strong>并行优先</strong>：通过 LangGraph Send API 实现真正的并行 fan-out，对比串行执行，两个 Agent 并行时总延迟从 <code>T1 + T2</code> 降低到 <code>max(T1, T2)</code>。</p>
+</li>
+<li>
+<p><strong>插件化扩展</strong>：ToolRegistry 将工具元数据与工作流解耦。添加新 Agent 只需创建工具类 + 注册 + 写 Prompt，不改动任何工作流代码。</p>
+</li>
+<li>
+<p><strong>流式体验</strong>：<code>stream_mode="custom"</code> + <code>get_stream_writer()</code> 实现思考链和回复内容的实时推送，用户从发送消息到看到第一个 token 的延迟控制在 1-2 秒。</p>
+</li>
+</ol>
+<p>如果你也在探索多 Agent 协作的架构设计，希望这篇文章能提供一些有价值的参考。</p>
+<hr>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.13472222222222222" data-date-updated="2026-02-27 13:52">2026-02-27 10:38</span>&nbsp;
+<a href="https://www.cnblogs.com/myshare">夕阳醉了</a>&nbsp;
+阅读(<span id="post_view_count">67</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19645510);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19645510', targetLink: 'https://www.cnblogs.com/myshare/p/19645510', title: '基于 LangGraph 的AI 多Agent协作系统实战：从架构设计到并行调度' })">举报</a>
+</div>
+        
