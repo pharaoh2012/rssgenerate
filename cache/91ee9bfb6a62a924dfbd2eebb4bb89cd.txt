@@ -1,0 +1,129 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/wzs-study/p/19653311" title="发布于 2026-02-28 17:12">
+    <span role="heading" aria-level="2">pgvector语义检索踩坑：为什么加了 ORDER BY 反而查不到数据？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="1背景">1.背景</h1>
+<p>最近在做一个agent项目，涉及到了pgvector向量数据库的语义检索检索。<br>
+碰到了这样的一个奇怪现象：<strong>数据库里明明有数据，但是什么也查不出来，我也没有用where对检索进行限制，只是做了order by；当去除order by后才能查出东西来</strong><br>
+我执行的语句类似如下所示，这个语句很正常，就是根据传入的向量，到向量数据库中查询相似度最高的topK条记录并返回，可是查不出东西。</p>
+<pre><code>SELECT
+            c.document_id   AS documentId,
+            c.id            AS chunkId,
+            c.content       AS content,
+            d.title         AS title,
+            d.url           AS url,
+            (c.embedding &lt;=&gt; #{embedding}) AS distance
+        FROM kb_chunk c
+                 LEFT JOIN kb_document d ON c.document_id = d.id
+        WHERE c.embedding IS NOT NULL
+        ORDER BY distance
+        LIMIT #{topK}
+</code></pre>
+<p>当去除order by后，即执行下面的sql才能查出东西(但是由于没有topK逻辑了，不符合需求，只能靠java对数据结构再做topK)</p>
+<pre><code>SELECT
+            c.document_id   AS documentId,
+            c.id            AS chunkId,
+            c.content       AS content,
+            d.title         AS title,
+            d.url           AS url,
+            (c.embedding &lt;=&gt; #{embedding}) AS distance
+        FROM kb_chunk c
+                 LEFT JOIN kb_document d ON c.document_id = d.id
+        WHERE c.embedding IS NOT NULL
+        LIMIT #{topK}
+</code></pre>
+<p>更反常的事来了，<strong>输入不同query进行查询的话结果不一样：</strong><br>
+query=“重启” ✅ 能查出来<br>
+query=“你好，怎么用知识库检索？” ❌ 查不出来（返回 []）</p>
+<h1 id="2排查过程">2.排查过程</h1>
+<p>我做了几件“确认”：</p>
+<h2 id="21确认表里真的有embedding">2.1确认表里真的有embedding</h2>
+<pre><code>select count(*) from kb_chunk; -- 2
+select count(*) from kb_chunk where embedding is not null; -- 2
+</code></pre>
+<h2 id="22确认向量维度一致">2.2确认向量维度一致</h2>
+<p>维度不一致会导致距离计算出问题。</p>
+<pre><code>SELECT vector_dims(embedding) AS dims, COUNT(*)
+FROM kb_chunk
+WHERE embedding IS NOT NULL
+GROUP BY dims;
+</code></pre>
+<p>结果：dims=1024, count=2，同时在Java里打印query向量维度：也是1024。所以排除“维度不一致”。</p>
+<h2 id="23确认向量里没有-naninfinity">2.3确认向量里没有 NaN/Infinity</h2>
+<p>如果embedding里出现NaN（非数字）或Infinity（无穷大），排序会乱。<br>
+在java中加入以下代码做调试，发现也不存在NaN或Infinity</p>
+<pre><code>var list = queryEmbedding.vectorAsList();
+long badCount = list.stream().filter(v -&gt; {
+  double d = ((Number)v).doubleValue();
+  return Double.isNaN(d) || Double.isInfinite(d);
+}).count();
+log.debug("query='{}' dim={}, badCount={}", query, list.size(), badCount);
+</code></pre>
+<h1 id="发现真实原因">发现真实原因</h1>
+<p>此时其实我能隐约感觉到会不会是我的数据数量太少的原因，于是做了以下验证查索引定义：</p>
+<pre><code>SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'kb_chunk';
+</code></pre>
+<p>发现了下面这条内容：</p>
+<pre><code>CREATE INDEX idx_kb_chunk_embedding_ivfflat
+ON public.kb_chunk USING ivfflat (embedding vector_cosine_ops)
+WITH (lists='100')
+</code></pre>
+<p>原来是因为向量索引（ivfflat）的lists太大 + probes太小，导致“空桶”！</p>
+<h2 id="21-原因剖析">2.1 原因剖析</h2>
+<p>向量数据库的查询并不是简单的“=”，而是“&lt;=&gt;”。当一定情况下会使用向量索引，这是是“近似检索”，它不保证一定能找出候选数据。</p>
+<h3 id="211-ivfflat的工作方式">2.1.1 ivfflat的工作方式</h3>
+<p>ivfflat 可以把它想象成下面两步：</p>
+<p>第一步：lists（分桶）<br>
+建索引时设置了：USING ivfflat ... WITH (lists = 100)<br>
+lists 的意思可以理解为把所有向量分成100个桶（list），每条向量会落到其中一个桶里。当数据量很大时（比如10万条），分成100个桶没问题，每个桶里都能有很多数据。但实际数据量是2条(因为是demo产品)，这就会出现很夸张的情况：100个桶里，最多只有2个桶里有数据，剩下98个桶是空桶（桶里没有任何向量）。</p>
+<p>第二步：probes（探测桶）<br>
+查询时数据库不会扫完100个桶，它会先判断“最可能相近”的几个桶，然后只在这些桶里找候选。这个“查几个桶”，就是probes：<br>
+probes 越小：越快，但越容易漏。<br>
+probes 越大：越慢，但越稳。<br>
+默认 probes 往往是 1（只看 1 个桶）。</p>
+<h3 id="为什么重启能查到数据而你好查不到">为什么“重启”能查到数据，而“你好…”查不到？</h3>
+<p>这就是“空桶效应”：</p>
+<p>query=“重启” 的向量，落到的“最相近桶”刚好是一个非空桶<br>
+→ probes 即使不大，也能在桶里找到那条向量 → 有结果</p>
+<p>query=“你好，怎么用知识库检索？” 的向量，落到的“最相近桶”刚好是空桶<br>
+→ probes=10 只探测 10 个桶，但这 10 个桶恰好都空 → 候选集=0 → 返回 0 行</p>
+<p>当把probes设为100时，相当于把所有桶都探测了一遍：<br>
+即使 query 先落到空桶，最终也会探测到那两个非空桶<br>
+→ 一定能捞到候选 → 就能返回结果。</p>
+<h3 id="为什么去掉-order-by就正常">为什么“去掉 ORDER BY”就正常？</h3>
+<p>因为去掉 ORDER BY embedding &lt;=&gt; query_vector 后，数据库不需要计算距离，也就不会走 ivfflat 向量索引，查询退化成普通的 “从表里随便拿几条数据” 的行为，所以它会稳定返回 LIMIT 的结果（只要表里有数据）。</p>
+<h3 id="避免踩坑">避免踩坑</h3>
+<p>数据量很小的时候，不要把 lists 设很大（比如 N=2 还 lists=100）</p>
+<p>如果必须用 ivfflat的话，让 probes 足够大（至少不远小于 lists）</p>
+<p>或者直接把 lists 设小（例如 1~10）</p>
+<h3 id="可能的歧义">可能的歧义</h3>
+<p>有人可能会问，既然是因为算了distance，触发了向量近似索引，可是在主句中也算了distance呀：</p>
+<pre><code>select ..., (c.embedding &lt;=&gt; #{embedding}) AS distance from kb_chunk
+</code></pre>
+<p>这其实涉及到了一些数据库的优化。如果加上 ORDER BY distance LIMIT k 后，数据库需要找出‘最相似的前 k 条’，这通常会触发向量索引（ivfflat）走近似检索路径；而没有 ORDER BY 时，数据库只需要随便返回 k 条记录，不必做‘全局最相似’的计算，也就没有那么大压力，因此不会走 ivfflat。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-02-28 17:12">2026-02-28 17:12</span>&nbsp;
+<a href="https://www.cnblogs.com/wzs-study">IronBro</a>&nbsp;
+阅读(<span id="post_view_count">82</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19653311);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19653311', targetLink: 'https://www.cnblogs.com/wzs-study/p/19653311', title: 'pgvector语义检索踩坑：为什么加了 ORDER BY 反而查不到数据？' })">举报</a>
+</div>
+        
