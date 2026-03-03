@@ -1,0 +1,2108 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/t-bar/p/19652703" title="发布于 2026-03-03 15:59">
+    <span role="heading" aria-level="2">NVIDIA GPU 集合通信库 NCCL 初始化流程源码级剖析</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>本文来自博客园，作者：<a href="https://www.cnblogs.com/t-bar" target="_blank">T-BARBARIANS</a> <strong>原创</strong>，博文严禁转载，转载必究！</p>
+<p>本篇内容将从 NCCL（NVIDIA Collective Communications Library） 源码的角度尽量深入剖析 NCCL 初始化的一些关键业务流程。并且希望通过本篇文章的讲解，能够为大家揭开一些 NCCL 的神秘面纱。</p>
+<p>文章内容很长，换言之：信息量很大，一时半会真的说不清楚。</p>
+<p>如果尝试深入一些去了解 NCCL，可能需要先了解一些 NCCL 的基本概念，可以参考我写的上一篇有关 NCCL 基础介绍的文章：<a href="https://www.cnblogs.com/t-bar/p/19652224" target="_blank">NVIDIA GPU 集合通信库 NCCL 基本概念简述</a> 。</p>
+<p>对于 NCCL 源码，我自己是觉得理解起来挺费劲的。主要是会涉及到很多新知识和新概念，源码里也有很多暴力求解算法，以及触及了大量技术知识盲区，学习起来挺头痛；另外，设备太贵，实验环境比较简陋，只能跟踪到最基础的代码业务流程；再加上才疏学浅，难免有很多撰写不太顺畅，或者理解错误之处，还请各位高手指点一二，共同进步。</p>
+<h1 id="nccl-allreduce-求和操作demo">NCCL AllReduce 求和操作demo</h1>
+<p>先举例介绍 NCCL 执行一次 AllReduce Sum 操作的 demo 示例。借助 MPI，使用 NCCL 在多机、多 GPU 实验环境上实现一次 AllReduce Sum 操作，直观的展示 NCCL 完成一次 AllReduce Sum 操作的结果。</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228164727441-1895648353.png" class="lazyload">
+</div>
+<p>运行命令行：</p>
+<pre><code class="language-shell">mpirun --allow-run-as-root -np 4 --host vm1:2,vm2:2 ./examples/01_communicators/03_one_device_per_process_mpi/one_device_per_process_mpi
+</code></pre>
+<ul>
+<li>每个 GPU 都有一个  [ global_rank_id，global_rank_id + 1 ]  浮点数组</li>
+<li>通过 NCCL 实现 AllReduce 求和操作，预期是在所有 GPU 上都将得到相同的全局求和结果
+<ul>
+<li>每个 GPU 的 result_elements[0] = 6</li>
+<li>每个 GPU 的 result_elements[1] = 10</li>
+</ul>
+</li>
+</ul>
+<p>下面是 demo 的部分代码，代码框架来源于 NCCL 源码目录：docs/examples/01_communicators/03_one_device_per_process_mpi/one_device_per_process_mpi，并做了一些改动。</p>
+<pre><code class="language-c++">int main(int argc, char *argv[]) {
+    
+    // MPI 初始化与拓扑发现
+    MPI_Init(&amp;argc, &amp;argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &amp;mpi_rank);   // 为每个MPI进程分配一个全局 mpi_rank id
+    MPI_Comm_size(MPI_COMM_WORLD, &amp;mpi_size);   // 获取MPI总进程数
+    local_rank = getLocalRank(MPI_COMM_WORLD);  // 获取本节点的 local_rank id
+
+    // CUDA 设备绑定
+    cudaGetDeviceCount(&amp;num_gpus);
+    cudaSetDevice(local_rank);     // 将每个进程绑定到 local_rank 对应的 GPU
+    cudaStreamCreate(&amp;stream);
+
+    // NCCL 通信器初始化
+    if (mpi_rank == 0) 
+      ncclGetUniqueId(&amp;nccl_id);  // 生成用于唯一标识一个 NCCL 通信域的 Unique ID 
+    MPI_Bcast(&amp;nccl_id, ...);     // 向其它 MPI 进程广播该 Unique ID 
+    ncclCommInitRank(&amp;comm, mpi_size, nccl_id, mpi_rank);
+
+    // 每个 GPU sendbuff 的两个元素设为 [global_rank_id, global_rank_id + 1]
+    cudaMalloc(sendbuff/recvbuff, size * sizeof(float));
+    float elements[2] = { (float)comm_rank, (float)(comm_rank + 1) };  
+    cudaMemcpy(sendbuff, elements, ..., cudaMemcpyHostToDevice);
+
+    // 利用 GPU 对 elements[2] 个 float 执行 AllReduce Sum
+    ncclGroupStart();
+    ncclAllReduce(sendbuff, recvbuff, size, ncclFloat, ncclSum, comm, stream);
+    ncclGroupEnd();
+    cudaStreamSynchronize(stream);
+    printf("Collective operation completed on rank %d\n", mpi_rank);
+
+    // 获取 AllReduce Sum 结果
+    float result_elements[len] = {0, 0};
+    CUDACHECK(cudaMemcpy(&amp;result_elements, recvbuff, sizeof(result_elements), cudaMemcpyDeviceToHost));
+
+    // 预期 result_elements[0] = 0 + 1 + 2 + 3 = 6
+    // 预期 result_elements[1] = 1 + 2 + 3 + 4 = 10
+    for (size_t i = 0; i &lt; len; i++)
+    {
+      printf("Device %d correctly received sum: %.0f\n", comm_rank, result_elements[i]);
+    }
+ }
+</code></pre>
+<p>结果日志：</p>
+<pre><code class="language-shell"># GPU0 
+Collective operation completed on rank 0
+Device 0 correctly received sum: 6
+Device 0 correctly received sum: 10
+
+# GPU1 
+Collective operation completed on rank 1
+Device 1 correctly received sum: 6
+Device 1 correctly received sum: 10
+
+# GPU2 
+Collective operation completed on rank 2
+Device 2 correctly received sum: 6
+Device 2 correctly received sum: 10
+
+# GPU3 
+Collective operation completed on rank 3
+Device 3 correctly received sum: 6
+Device 3 correctly received sum: 10
+
+</code></pre>
+<h1 id="生成-nccl-通信域唯一通信标识符">生成 NCCL 通信域唯一通信标识符</h1>
+<p>从上面的代码中可以看到使用了函数：<strong>ncclGetUniqueId</strong>。原因是使用&nbsp;NCCL 进行多 GPU 集合通信时，所有参与通信的进程必须属于同一个 NCCL 通信域。通信域定义了一个可以互相通信逻辑组，而创建这个通信组的第一步，就是需要创建一个共享的&nbsp;Unique Id，作用类似：加群邀请码。</p>
+<p>NCCL 通过函数 <strong>ncclGetUniqueId</strong> 实现如下具体任务：</p>
+<ul>
+<li>寻找控制面通信接口</li>
+<li>生成加群唯一邀请码 Unique Id</li>
+<li>在控制面通信接口上进行连接监听</li>
+<li>等待其它 MPI 进程连接并协商，并以根 MPI 为中心进行信息传递</li>
+</ul>
+<h2 id="寻找控制面通信接口">寻找控制面通信接口</h2>
+<p>获取控制面通信接口信息（只取一个），如果指定了环境变量，则获取与环境变量匹配的接口信息。</p>
+<pre><code class="language-c++">ncclResult_t bootstrapNetInit() {
+  if (bootstrapNetInitDone == 0) {
+      ......
+      const char* env = ncclGetEnv("NCCL_COMM_ID");
+      if (env) {
+      ......
+      } else {
+        NCCLCHECK(ncclFindInterfaces(bootstrapNetIfName, &amp;bootstrapNetIfAddr, MAX_IF_NAME_SIZE, 1, &amp;nIfs));
+        ......
+      }
+      ......
+      ncclSocketToString(&amp;bootstrapNetIfAddr, line+strlen(line));
+      INFO(NCCL_BOOTSTRAP, "Bootstrap: Using%s", line);
+    }
+  }
+  return ncclSuccess;
+}
+</code></pre>
+<p>有输出日志：</p>
+<pre><code class="language-shell">findInterfaces:155 NCCL TRACE Found interface ens3:10.10.10.11&lt;0&gt;
+bootstrapNetInit:121 NCCL INFO Bootstrap: Using ens3:10.10.10.11&lt;0&gt;  #此时还没有产生端口信息，端口为0
+</code></pre>
+<h2 id="生成加群唯一邀请码-unique-id">生成加群唯一邀请码 Unique Id</h2>
+<p>生成加群唯一邀请码。唯一邀请码由随机数 magic，和上一步得到的通信接口信息拼接而成</p>
+<pre><code class="language-c++">struct ncclBootstrapHandle {
+  uint64_t magic;
+  union ncclSocketAddress addr;
+};
+
+ncclResult_t bootstrapGetUniqueId(struct ncclBootstrapHandle* handle) {
+
+  const char* env = ncclGetEnv("NCCL_COMM_ID");
+  if (env) {
+    ......
+  } else {
+    NCCLCHECK(getRandomData(&amp;handle-&gt;magic, sizeof(handle-&gt;magic)));
+    memcpy(&amp;handle-&gt;addr, &amp;bootstrapNetIfAddr, sizeof(union ncclSocketAddress));
+    NCCLCHECK(bootstrapCreateRoot(handle, false));
+  }
+
+  return ncclSuccess;
+}
+</code></pre>
+<h2 id="在控制面通信接口上进行连接监听">在控制面通信接口上进行连接监听</h2>
+<ul>
+<li>在控制面通信接口上进行监听，创建控制面协商引导线程</li>
+<li>通过 ncclSocketInit/ncclSocketListen 得到监听端口，开始在根 MPI 进程进行控制面协商连接监听</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t bootstrapCreateRoot(struct ncclBootstrapHandle* handle, bool idFromEnv) {
+
+  ......
+  NCCLCHECKGOTO(ncclSocketInit(listenSock, &amp;handle-&gt;addr, handle-&gt;magic, ncclSocketTypeBootstrap, NULL, 0), ret, fail);
+  NCCLCHECKGOTO(ncclSocketListen(listenSock), ret, fail);
+  NCCLCHECKGOTO(ncclSocketGetAddr(listenSock, &amp;handle-&gt;addr), ret, fail);
+
+  args-&gt;listenSock = listenSock;
+  args-&gt;magic = handle-&gt;magic;
+  PTHREADCHECKGOTO(pthread_create(&amp;thread, NULL, bootstrapRoot, (void*)args), "pthread_create", ret, fail);
+  ncclSetThreadName(thread, "NCCL BootstrapR");
+  ......
+}
+</code></pre>
+<pre><code class="language-shell">ncclSocketListen:421 NCCL TRACE Listening on socket 10.10.10.11&lt;36241&gt;
+</code></pre>
+<h2 id="等待其它-mpi-进程连接并协商并以根-mpi-为中心进行信息传递">等待其它 MPI 进程连接并协商，并以根 MPI 为中心进行信息传递</h2>
+<p>控制面引导线程传递各个MPI进程的连接信息，为建立控制环逻辑拓扑打基础</p>
+<pre><code class="language-c++">static void* bootstrapRoot(void* rargs) {
+  ......
+  /* Receive addresses from all ranks */
+  NCCLCHECKGOTO(ncclSocketInit(&amp;sock), res, out);
+  NCCLCHECKGOTO(ncclSocketAccept(&amp;sock, listenSock), res, out);
+  NCCLCHECKGOTO(socketRecv(&amp;sock, &amp;info, sizeof(info)), res, out);
+  NCCLCHECKGOTO(ncclSocketClose(&amp;sock), res, out);
+
+  ......
+  do {
+    ......
+    /* 如果当前节点的前驱已存在，MPI 引导线程将当前节点的连接信息发送给当前节点的前驱 */
+    int prev = (nroots &gt; 1) ? (localId - 1) : BOOTSTRAP_PID(localId - 1, nrecv);
+    if (prev &gt;= 0 &amp;&amp; prev &lt; n2send &amp;&amp; memcmp(&amp;zeroAddress, &amp;rankAddressesRoot[prev], sizeof(union ncclSocketAddress)) != 0) {
+      NCCLCHECKGOTO(rootSend(&amp;rankAddressesRoot[prev], magic, &amp;info.connectInfo), res, out);
+    } else {
+      memcpy(&amp;rankInfo[localId], &amp;info.connectInfo, sizeof(union ringConnectInfo));
+    }
+
+    /* 如果当前节点的后继已存在，MPI 引导线程将已缓存的当前节点的后继信息发送给当前的连接节点 */
+    int next = BOOTSTRAP_PID(localId + 1, nrecv);
+    if (localId &gt;= 0 &amp;&amp; localId &lt; n2send &amp;&amp; memcmp(&amp;zeroInfo, &amp;rankInfo[next], sizeof(union ringConnectInfo)) != 0) {
+      NCCLCHECKGOTO(rootSend(&amp;info.listenRootAddress, magic, &amp;rankInfo[next]), res, out);
+    } else {
+      memcpy(rankAddressesRoot + localId, &amp;info.listenRootAddress, sizeof(union ncclSocketAddress));
+    }
+    ++c;
+    TRACE(NCCL_BOOTSTRAP, "Received connect from rank %d total %d/%d", info.rank, c, nrecv);
+  } while (c &lt; nrecv);
+  ......
+}
+</code></pre>
+<p>通过 MPI 控制面引导线程的信息中继，参加通信的各个 MPI 进程都能知道自己的后继者是谁，为整个控制面的信息流转打基础。</p>
+<p>MPI 根进程将 <strong>Unique Id</strong> 通过 MPI_Bcast 传递给所有 MPI 进程，里面包含了 MPI 根进程的 magic，IP，port 信息，用作其它 MPI 进程加群的唯一票据。</p>
+<pre><code class="language-c++">  MPI_Bcast(&amp;nccl_id, NCCL_UNIQUE_ID_BYTES, MPI_CHAR, 0, MPI_COMM_WORLD);
+</code></pre>
+<p>通过 MPI_Bcast，所有 rank 上有 unique ID 接收日志：</p>
+<pre><code class="language-shell"># rank 0
+Rank 0 received NCCL unique ID
+
+# rank 1
+Rank 1 received NCCL unique ID
+
+# rank 2
+Rank 2 received NCCL unique ID
+
+# rank 3
+Rank 3 received NCCL unique ID
+</code></pre>
+<p>以上过程，可总结为如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228165013122-430248006.png" class="lazyload">
+</div>
+<h1 id="nccl初始化">NCCL初始化</h1>
+<p>这里开始陆续讲解 NCCL 初始化相关流程。</p>
+<p>NCCL 通过函数 ncclCommInitRank 实现 NCCL 相关初始化和众多计算逻辑，主要包含如下工作：</p>
+<ul>
+<li>网络插件初始化。主要涉及 InfiniBand，或者基于 TCP/IP 的 Socket 网络插件的选择。</li>
+<li>NCCL 控制环的建立。主要涉及 Unique Id 的产生和用途，以及所有 rank 组成控制面环形拓扑的相关流程。</li>
+<li>PCIe 设备发现。记录从 GPU/NIC 出发，直至归属 CPU 这条物理 PCIe 链路上有哪些 PCIe 设备，并生成从 GPU/NIC 至 CPU 链路的 PCIe XML 链路拓扑。</li>
+<li>PCIe 设备间建图。PCIe 设备之间的物理链路关系是事实存在的，但是 NCCL 需要将这些链路关系建立到自身的数据结构中，目的是后续 channel 的计算服务。</li>
+<li>PCIe 设备间最优可达路径计算。基于 PCIe 建图，NCCL 拥有 PCIe 设备间的连关系。在此基础上，NCCL 使用 BFS 算法，计算任意 PCIe 设备之间的最优可达路径，即跳数最少，带宽最大的可达路径。</li>
+<li>设备内部基于 Ring，Tree 通信算法的 channel 计算。在路径带宽允许的情况下，NCCL 会尽最大可能计算出同一种通信算法的更多通信通道，从而尽可能榨干硬件带宽资源。</li>
+<li>多机之间 Ring，Tree 通道的连接。在多机多卡之间，协商出最终可通信的逻辑算法拓扑。</li>
+</ul>
+<h2 id="网络插件选择和初始化">网络插件选择和初始化</h2>
+<p>ncclNetInit 函数通过 initPluginLibsOnceFunc 实现插件选择。如果没有指定其它插件，NCCL 默认添加两个内部网络插件，分别是：IB（InfiniBand verbs） 和 Socket（TCP/IP）。</p>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            commAlloc
+                ncclNetInit(struct ncclComm* comm)
+</code></pre>
+<pre><code class="language-c++">ncclResult_t ncclNetInit(struct ncclComm* comm) {
+  ......
+  std::call_once(initPluginLibsOnceFlag, initPluginLibsOnceFunc);
+  ......
+  for (int pluginIndex = 0; pluginIndex &lt; pluginCount; pluginIndex++) {
+ 
+    ......
+    if ((netPluginLibs[pluginIndex].ncclNetPluginState &gt;= ncclNetPluginStateInitReady)
+        &amp;&amp; (!comm-&gt;config.netName || (strcasecmp(comm-&gt;config.netName, netPluginLibs[pluginIndex].ncclNet-&gt;name) == 0))) {
+      // plugin init must be done by all comms to setup the context, therefore we use "&gt;="
+      NCCLCHECK(ncclNetPluginInit(comm, &amp;netPluginLibs[pluginIndex]));
+
+      if (netPluginLibs[pluginIndex].ncclNetPluginState == ncclNetPluginStateEnabled) {
+        bool isAssigned = false;
+        NCCLCHECK(ncclNetPluginAssignToComm(comm, pluginIndex, &amp;isAssigned));
+      }
+      ......
+    }
+  }
+  ......
+}
+</code></pre>
+<p>什么是 libibverbs？</p>
+<p>一个开源用户态库，支持多种 RDMA 硬件。这些 RDMA 硬件可以将相关能力通过 libibverbs 暴露出来，供上层的 NCCL 使用。</p>
+<p>NCCL 的 IB 插件是什么？</p>
+<p>IB 插件是 NCCL 内置的一个网络插件，可以理解为是对 libibverbs 相关 API 的再次封装。可以实现对 libibverbs 众多 API 的调用，从而最终操作底层的 InfiniBand / RoCE 硬件。NCCL 通过 IB 插件调用这些 libibverbs API，可以在不同 GPU 之间实现 RDMA 的连接建立，以及利用 RDMA 进行数据收发等操作。</p>
+<pre><code class="language-c++">static void initPluginLibsOnceFunc() {
+  ......
+  // Add 2 internal ib and socket plugins
+  netPluginLibs[pluginCounter].ncclNet = &amp;ncclNetIb;
+  netPluginLibs[pluginCounter].ncclNetPluginState = ncclNetPluginStateInitReady;
+  ++pluginCounter;
+
+  netPluginLibs[pluginCounter].ncclNet = &amp;ncclNetSocket;
+  netPluginLibs[pluginCounter++].ncclNetPluginState = ncclNetPluginStateInitReady;
+  ......
+}
+</code></pre>
+<p>ncclNetInit 函数通过 ncclNetPluginInit 实现插件初始化。通过调用：ncclNet-&gt;init 即 ncclIbInit 最终实现 IB 插件初始化。</p>
+<pre><code class="language-c++">static ncclResult_t ncclNetPluginInit(struct ncclComm* comm, netPluginLib_t* pluginLib) {
+  ......
+  if (pluginLib-&gt;ncclNetPluginState &gt;= ncclNetPluginStateInitReady &amp;&amp; pluginLib-&gt;ncclNet) {
+    ncclNetCommConfig_t commConfig = {};
+    commConfig.trafficClass = comm-&gt;config.trafficClass == NCCL_CONFIG_UNDEF_INT ? NCCL_NET_TRAFFIC_CLASS_UNDEF : comm-&gt;config.trafficClass;
+    if (pluginLib-&gt;ncclNet-&gt;init(&amp;comm-&gt;netContext, comm-&gt;commHash, &amp;commConfig, ncclDebugLog, ncclProfilerCallback) != ncclSuccess) goto fail;
+  }
+  ......
+}
+</code></pre>
+<p>其中 IB 插件有如下函数定义：</p>
+<pre><code class="language-c++">ncclNet_t ncclNetIb = {
+  "IB",
+  ncclIbInit,
+  ncclIbDevices,
+  ncclIbGetProperties,
+  ncclIbListen,
+  ncclIbConnect,
+  ncclIbAccept,
+  ncclIbRegMr,
+  ncclIbRegMrDmaBuf,
+  ncclIbDeregMr,
+  ncclIbIsend,
+  ncclIbIrecv,
+  ncclIbIflush,
+  ncclIbTest,
+  ncclIbCloseSend,
+  ncclIbCloseRecv,
+  ncclIbCloseListen,
+  NULL /* getDeviceMr */,
+  NULL /* irecvConsumed */,
+  ncclIbMakeVDevice,
+  ncclIbFinalize,
+  ncclIbSetNetAttr,
+};
+</code></pre>
+<p>通过 IB 插件定义的上述函数，NCCL 可以实现有关 RDMA 的一系列操作。</p>
+<p>设备初始化和信息获取</p>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>作用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>"IB"</code></td>
+<td>插件名称</td>
+<td>用于日志和 <code>NCCL_NET=IB</code> 匹配</td>
+</tr>
+<tr>
+<td><code>ncclIbInit</code></td>
+<td>全局初始化</td>
+<td>初始化 IB 插件一次（如加载驱动、枚举设备、创建上下文）。只在第一个 comm 初始化时调用。</td>
+</tr>
+<tr>
+<td><code>ncclIbDevices</code></td>
+<td>返回可用设备数</td>
+<td>返回本机支持的 IB/RoCE 设备数量（如 2 个 mlx5_0/1）。</td>
+</tr>
+<tr>
+<td><code>ncclIbGetProperties</code></td>
+<td>获取设备属性</td>
+<td>查询某个设备的详细信息：<br>• 带宽（speed）<br>• 端口状态<br>• 是否支持 GDR（GPUDirect RDMA）<br>• PCIe 路径（用于 NUMA 亲和性）</td>
+</tr>
+</tbody>
+</table>
+<p>连接建立</p>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>作用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ncclIbListen</code></td>
+<td>监听连接</td>
+<td>在指定设备上创建一个监听 socket（实际是创建 QP 并进入 INIT/SQD 状态），等待对端连接。用于 bootstrap 阶段 root 节点。</td>
+</tr>
+<tr>
+<td><code>ncclIbConnect</code></td>
+<td>主动连接</td>
+<td>客户端调用，向对端的 listen 地址发起连接（QP 状态迁移 + 交换 QP 信息）。</td>
+</tr>
+<tr>
+<td><code>ncclIbAccept</code></td>
+<td>接受连接</td>
+<td>服务端在收到 connect 请求后，完成连接建立（最终 QP 进入 RTS 状态）。</td>
+</tr>
+</tbody>
+</table>
+<p>内存注册和数据传输</p>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>作用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ncclIbRegMr</code></td>
+<td>注册内存区域 (Memory Registration)</td>
+<td>将一段 CPU/GPU 内存注册到 IB 网卡，使其可被 RDMA 操作（关键！RDMA 必须先注册内存）。</td>
+</tr>
+<tr>
+<td><code>ncclIbRegMrDmaBuf</code></td>
+<td>注册 DMA-BUF 内存</td>
+<td>用于 Linux DMA-BUF 框架（如 GPU 显存通过 dmabuf 导出），支持更现代的 GDR 注册方式。</td>
+</tr>
+<tr>
+<td><code>ncclIbDeregMr</code></td>
+<td>注销内存</td>
+<td>释放之前注册的内存区域。</td>
+</tr>
+<tr>
+<td><code>ncclIbIsend</code></td>
+<td>异步发送</td>
+<td>发起一个 RDMA Write 或 Send 操作（非阻塞），返回请求句柄。</td>
+</tr>
+<tr>
+<td><code>ncclIbIrecv</code></td>
+<td>异步接收</td>
+<td>发起一个 RDMA Read 或 Recv 操作（非阻塞）。</td>
+</tr>
+</tbody>
+</table>
+<p>资源清理相关</p>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>作用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ncclIbIflush</code></td>
+<td>刷新写操作（可选）</td>
+<td>确保之前的写操作对远程端可见（某些硬件需要显式 flush）。IB 通常不需要，故可能为空或空操作。</td>
+</tr>
+<tr>
+<td><code>ncclIbTest</code></td>
+<td>检查操作是否完成</td>
+<td>查询 <code>Isend</code>/<code>Irecv</code> 返回的请求是否已完成（轮询 CQ 完成队列）。</td>
+</tr>
+<tr>
+<td><code>ncclIbCloseSend</code></td>
+<td>关闭发送端</td>
+<td>释放与发送相关的资源（如 QP、CQ）。</td>
+</tr>
+<tr>
+<td><code>ncclIbCloseRecv</code></td>
+<td>关闭接收端</td>
+<td>释放接收资源。</td>
+</tr>
+<tr>
+<td><code>ncclIbCloseListen</code></td>
+<td>关闭监听端</td>
+<td>释放 listen 创建的 QP。</td>
+</tr>
+</tbody>
+</table>
+<p>NCCL 成功初始化 IB 插件后，会将 IB 绑定到当前通信域结构体：comm</p>
+<pre><code class="language-c++">static ncclResult_t ncclNetPluginAssignToComm(struct ncclComm* comm, int pluginIndex, bool* isAssigned) {
+  ......
+  if (netPluginLibs[pluginIndex].ncclNetPluginState &gt;= ncclNetPluginStateEnabled) {
+    comm-&gt;ncclNet = netPluginLibs[pluginIndex].ncclNet;
+    INFO(NCCL_INIT|NCCL_NET, "Assigned NET plugin %s to comm", netPluginLibs[pluginIndex].ncclNet-&gt;name);
+  ......
+}
+</code></pre>
+<p>上述逻辑对应如下日志：</p>
+<pre><code class="language-shell">ncclIbInitDevices:702 NCCL INFO NCCL_IB_HCA set to mlx5_0,mlx5_1
+3045.094624 ncclIbInitDevices:758 NCCL TRACE NET/IB: Device mlx5_0 does not support Data Direct DMA.
+ncclIbInitDevices:801 NCCL INFO NET/IB: [0] mlx5_0:uverbs0:1/RoCE provider=Mlx5 speed=25000 context=0x5f2592e8ef00 pciPath=/sys/devices/pci0000:00/0000:00:00.0 ar=0
+ncclIbMakeVDeviceInternal:649 NCCL INFO NET/IB : Made virtual device [0] name=mlx5_0 speed=25000 ndevs=1
+3048.209479 ncclIbInitDevices:758 NCCL TRACE NET/IB: Device mlx5_1 does not support Data Direct DMA.
+ncclIbInitDevices:801 NCCL INFO NET/IB: [1] mlx5_1:uverbs1:1/RoCE provider=Mlx5 speed=25000 context=0x5f2592ed05d0 pciPath=/sys/devices/pci0000:00/0000:00:00.0 ar=0
+ncclIbMakeVDeviceInternal:649 NCCL INFO NET/IB : Made virtual device [1] name=mlx5_1 speed=25000 ndevs=1
+ncclIbInitDevices:839 NCCL INFO NET/IB : Using [0]mlx5_0:1/RoCE [1]mlx5_1:1/RoCE [RO]; OOB ens3:10.10.10.11&lt;0&gt;
+ncclNetPluginInit:187 NCCL INFO Initialized NET plugin IB
+commAlloc:428 NCCL INFO Using network IB
+</code></pre>
+<h2 id="控制环形拓扑的建立">控制环形拓扑的建立</h2>
+<p>NCCL 使用 bootstrapInit 实现控制环形拓扑的协商和建立。</p>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            bootstrapInit(int nHandles, void* handles, struct ncclComm* comm)
+</code></pre>
+<p>在 NCCL 控制环初始化阶段：</p>
+<ul>
+<li>
+<p>每个 MPI 进程创建一个 TCP 监听 socket1，这个 socket 只允许邻居节点的连接，并交换必要的连接信息</p>
+</li>
+<li>
+<p>每个 MPI 进程创建第二个 TCP 监听 socket2，这个 socket 只允许 MPI 根进程的连接，用于传递 MPI 邻居信息</p>
+</li>
+<li>
+<p>每个 MPI 进程分别向 root MPI 进程发送自身的连接信息（root 节点通过校验 UniqueId（其实就是 UniqueId 里面的 magic），来决定是否接受连接）</p>
+</li>
+<li>
+<p>通过 MPI root 进程的 bootstrapRoot 函数逻辑，每个 MPI 进程分别从 root MPI 进程获得自己的后继节点信息（MPI root 进程通过连接每个 MPI 进程的 socket2 发送）</p>
+</li>
+<li>
+<p>每个 MPI 进程向自己的后继节点发起主动连接（指向后继节点的socket1），并接受自己前驱节点的连接。到此，每个 rank 已经和下一个 rank 建立了直接连接，形成一个控制逻辑环</p>
+</li>
+<li>
+<p>每个 MPI 进程分别再创建 3 个监听 socket，分别是：peerProxyAddresses，peerProxyAddressesUDS，和 peerP2pAddresses</p>
+<ul>
+<li>peerProxyAddresses。NCCL 使用 代理线程（proxy thread） 来处理一些异步或需要 CPU 参与的任务，例如：
+<ul>
+<li>注册/注销 GPU 内存（尤其在 IB/RDMA 场景）</li>
+<li>处理共享内存（shm）或 CUDA IPC</li>
+<li>管理连接生命周期</li>
+<li>每个 rank 启动时会创建一个 本地 proxy 服务线程，并监听一个 TCP 端口</li>
+<li>其他 rank 若需请求该 rank 的 proxy 服务（如 “请帮我注册这块 GPU 内存”），就连接到 socket：peerProxyAddresses</li>
+</ul>
+</li>
+<li>peerProxyAddressesUDS。当多个 rank 运行在 同一台机器时，可以通过：peerProxyAddressesUDS，来加速通信</li>
+<li>peerP2pAddresses。用于 rank 之间建立直接的点对点（P2P）连接，实现任意两个 rank 能直接通信。例如：ncclSend / ncclRecv（点对点通信 API）</li>
+</ul>
+</li>
+<li>
+<p>每个 MPI 进程通过 AllGather 算法，在建立的控制环形拓扑上广播交换 3 个socket：peerProxyAddresses，peerProxyAddressesUDS，和 peerP2pAddresses 的地址信息，使得每个 rank 上都知道其它任意 rank 的 3 个 socket 通信地址</p>
+</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
+  ······
+  } else {
+    // create socket for ring neightbor to contact mee
+    NCCLCHECK(createListenSocket(comm, comm-&gt;magic, &amp;STATE_LISTEN(state, socket), &amp;info.connectInfo.addr, ncclSocketTypeBootstrap));
+  }
+  // Create socket for root to contact me using the root's magic
+  NCCLCHECK(createListenSocket(comm, BOOTSTRAP_HANDLE(handles, curr_root)-&gt;magic, &amp;listenSockRoot, &amp;info.listenRootAddress, ncclSocketTypeBootstrap));
+
+  ······
+  NCCLCHECK(sendToRoot(BOOTSTRAP_HANDLE(handles, curr_root), comm, &amp;info));
+
+  // get info on my "next" rank in the bootstrap ring from root
+  NCCLCHECK(ncclSocketInit(&amp;sock));
+  NCCLCHECK(ncclSocketAccept(&amp;sock, &amp;listenSockRoot));
+  NCCLCHECK(socketRecv(&amp;sock, &amp;nextPeer, sizeof(nextPeer)));
+
+  ······
+  // accept and connect the ring network
+  NCCLCHECK(socketRingConnect(&amp;nextPeer.addr, &amp;STATE_RING(state, socket.send), &amp;STATE_LISTEN(state, socket), &amp;STATE_RING(state, socket.recv), comm-&gt;magic, state-&gt;abortFlag));
+
+  ······
+  // AllGather all listen handlers
+  // in case of failure, those resources will be free'd when calling bootstrapDestroy, so we can return immediatly
+  NCCLCHECK(ncclCalloc(&amp;state-&gt;peerProxyAddresses, nranks));
+  NCCLCHECKGOTO(createListenSocket(comm, comm-&gt;magic, proxySocket, state-&gt;peerProxyAddresses + rank, ncclSocketTypeProxy), result, fail);
+
+  NCCLCHECKGOTO(ncclCalloc(&amp;state-&gt;peerProxyAddressesUDS, nranks), result, fail);
+  NCCLCHECKGOTO(getUDS(state-&gt;peerProxyAddressesUDS + rank), result, fail);
+
+  // Create the service proxy and get the UDS
+  NCCLCHECKGOTO(ncclProxyInit(comm, proxySocket, state-&gt;peerProxyAddresses, state-&gt;peerProxyAddressesUDS), result, fail);
+
+  // create a socket for others to reach out (P2P)
+  union ncclSocketAddress peerSocketAddress;
+  NCCLCHECKGOTO(createListenSocket(comm, comm-&gt;magic, &amp;STATE_LISTEN(state, peerSocket), &amp;peerSocketAddress, ncclSocketTypeBootstrap), result, fail);
+  NCCLCHECKGOTO(ncclCalloc(&amp;state-&gt;peerP2pAddresses, nranks), result, fail);
+  memcpy(state-&gt;peerP2pAddresses + rank, &amp;peerSocketAddress, sizeof(union ncclSocketAddress));
+
+  NCCLCHECKGOTO(ringAllInfo(comm, state, state-&gt;peerP2pAddresses, state-&gt;peerProxyAddresses, state-&gt;peerProxyAddressesUDS, rasRanks), result, fail);
+  ······
+}
+</code></pre>
+<p>上述逻辑在 rank0 中对应如下日志：</p>
+<pre><code class="language-shell">bootstrapInit:656 NCCL TRACE rank 0 nranks 4
+ncclSocketListen:421 NCCL TRACE Listening on socket 10.10.10.11&lt;60473&gt;
+ncclSocketListen:421 NCCL TRACE Listening on socket 10.10.10.11&lt;53543&gt;
+
+ncclSocketConnect:718 NCCL TRACE Connecting to socket 10.10.10.11&lt;57865&gt;
+ncclSocketConnect:718 NCCL TRACE Connecting to socket 10.10.10.11&lt;59361&gt;
+
+ncclSocketListen:421 NCCL TRACE Listening on socket 10.10.10.11&lt;35707&gt;
+ncclSocketListen:421 NCCL TRACE Listening on socket 10.10.10.11&lt;55235&gt;
+ncclIpcSocketInit:51 NCCL TRACE UDS: Creating socket /tmp/nccl-socket-0-c5b60c2e5e7a9a0c
+
+bootstrapAllGather:1074 NCCL TRACE rank 0 nranks 4 size 120 - AllGather
+socketRingAllGather:1032 NCCL TRACE socketRingAllGather started: rank=0 nranks=4
+socketRingAllGather:1034 NCCL TRACE bidirectional bootstrap: totalSteps=2
+socketRingAllGather:1064 NCCL TRACE socketRingAllGather first message in 0.000115 (1.039933 MB/sec), rest in 0.000017 (21.719457 MB/sec)
+bootstrapAllGather:1085 NCCL TRACE bootstrapAllGather for 120 B done in 0.000141 sec: 3.404569 MB/sec
+bootstrapAllGather:1086 NCCL TRACE rank 0 nranks 4 size 120 - AllGather DONE
+bootstrapInit:776 NCCL TRACE rank 0 nranks 4 - DONE
+</code></pre>
+<p>以上过程，可总结为如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228165125811-895352805.png" class="lazyload">
+</div>
+<h2 id="nccl传输层初始化">NCCL传输层初始化</h2>
+<p>NCCL 使用 initTransportsRank 实现传输层初始化。</p>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            initTransportsRank(struct ncclComm* comm, struct ncclComm* parent, uint64_t timers[TIMERS_INIT_COUNT]) 
+</code></pre>
+<h3 id="控制通道交换邻居信息">控制通道交换邻居信息</h3>
+<p>交换信息有如下定义，例如 NCCL 版本，主机唯一标识：hostHash，GPU 计算能力：cudaCompCap，等等</p>
+<pre><code class="language-c++">struct ncclPeerInfo {
+  int rank;
+  int cudaDev;
+  int nvmlDev;
+  int gdrSupport;
+  uint64_t hostHash;
+  uint64_t pidHash;
+  dev_t shmDev;
+  int64_t busId;
+  struct ncclComm* comm;
+  int cudaCompCap;
+  size_t totalGlobalMem;
+
+  // MNNVL support
+  nvmlGpuFabricInfoV_t fabricInfo;
+  int cuMemSupport;
+  int version;
+};
+</code></pre>
+<p>通过算法：AllGather，在控制环广播。最终每个 rank 都将包含全局邻居信息</p>
+<pre><code class="language-c++">  NCCLCHECKGOTO(ncclCalloc(&amp;comm-&gt;peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root
+  NCCLCHECKGOTO(fillInfo(comm, comm-&gt;peerInfo+rank, comm-&gt;commHash), ret, fail);
+  NCCLCHECKGOTO(bootstrapAllGather(comm-&gt;bootstrap, comm-&gt;peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);
+</code></pre>
+<h3 id="版本一致性校验与全局属性推导">版本一致性校验与全局属性推导</h3>
+<p>做一些基础检查：</p>
+<ol>
+<li>NCCL 版本一致性检查，只有全局版本一致，才允许继续协商</li>
+<li>根据每个 rank 的 hostHash 值，推导物理机节点数</li>
+<li>GPU 绑定重复检测。同一物理机上，不能有两个 rank 绑定到同一个 GPU，只能是一个 rank 绑定一个 GPU</li>
+</ol>
+<pre><code class="language-c++">  for (int i = 0; i &lt; nranks; i++) {
+
+    if (comm-&gt;peerInfo[i].version != comm-&gt;peerInfo[rank].version) {
+      ......
+      goto fail;
+    }
+
+    if (comm-&gt;peerInfo[i].hostHash != comm-&gt;peerInfo[rank].hostHash) 
+      nNodes++;
+
+    if ((i != rank) &amp;&amp; (comm-&gt;peerInfo[i].hostHash == comm-&gt;peerInfo[rank].hostHash) &amp;&amp; (comm-&gt;peerInfo[i].busId == comm-&gt;peerInfo[rank].busId)) {
+      ......
+      goto fail;
+    }
+  }
+</code></pre>
+<h3 id="同进程rank计算">同进程rank计算</h3>
+<p>NCCL 支持多种运行模式，例如：一个进程绑定一个 GPU（One Rank Per Process（ORPP））；一个进程绑定多个 GPU（Single Process Multiple Ranks（SPMR））；一个进程通过多线程绑定多个 GPU 等模式。MPI / PyTorch DDP / DeepSpeed 等分布式深度学习框架通常使用一个进程绑定一个 GPU，即 1 process &lt;-&gt; 1 rank &lt;-&gt; 1 GPU 的模式。</p>
+<p>但是如果不是 ORPP 模式，则需要涉及如下代码逻辑，推导多个 rank 与对应进程的关系。 非 ORPP 模式的一些优势：</p>
+<ul>
+<li>共享虚拟地址空间（可直接访问彼此的 CPU 内存）</li>
+<li>同进程的 rank，集合通信使用的 ring / tree 拓扑会优先使用 Shared Memory (SHM) 或 GPU direct（P2P）进行高效通信</li>
+<li>只有跨节点时才会使用 IB / ROCE 通信</li>
+</ul>
+<pre><code class="language-c++">  do {
+    // Compute intra-process ranks
+    int intraProcRank0 = -1, intraProcRank = -1, intraProcRanks = 0;
+
+    comm-&gt;nvlsRegSupport = 1;
+    for (int i = 0; i &lt; nranks; i++) {
+
+      if ((comm-&gt;peerInfo[i].hostHash == comm-&gt;peerInfo[rank].hostHash) &amp;&amp;
+          (comm-&gt;peerInfo[i].pidHash == comm-&gt;peerInfo[rank].pidHash)) {
+        // Rank is in same process
+        if (intraProcRanks == 0)
+          intraProcRank0 = i;
+
+        if (i == rank) 
+          intraProcRank = intraProcRanks;
+
+        intraProcRanks++;
+
+        if (intraProcRank0 == rank &amp;&amp; rank != i) {
+          comm-&gt;peerInfo[i].comm-&gt;intraNext = comm-&gt;intraNext;
+          comm-&gt;intraNext = comm-&gt;peerInfo[i].comm;
+        }
+      }
+    }
+
+    comm-&gt;intraComm0 = comm0;
+    comm-&gt;intraRank = intraProcRank;    // 当前 rank 在同进程中的序号（0,1,2...）
+    comm-&gt;intraRanks = intraProcRanks;  // 同进程中的总 rank 数
+
+  } while(0);
+</code></pre>
+<h3 id="nccl推导pcie设备链路拓扑">NCCL推导PCIe设备链路拓扑</h3>
+<p>目的是先构建一个有层次关系的全局 XML 拓扑，里面记录了 NCCL 需要使用的硬件信息。</p>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            initTransportsRank
+                ncclTopoGetSystem
+                    ncclTopoFillGpu(struct ncclXml* xml, const char* busId, struct ncclXmlNode** gpuNode) 
+</code></pre>
+<p>NCCL 使用函数 ncclTopoGetSystem 构建一个描述整机关键硬件拓扑的 XML 树，拓扑将用于后续 NCCL 通信路径的构造。XML 拓扑将包含如下信息：</p>
+<ul>
+<li>所有 GPU</li>
+<li>所有 NIC</li>
+<li>CPU 归属的 NUMA 节点</li>
+<li>体现 PCIe 设备之间的层级结构</li>
+</ul>
+<p>PCIe 基础介绍</p>
+<ul>
+<li>每个 CPU 都有自己直连的 Root Complex（简称 RC），RC 会帮助 CPU 和其他组件通信，比如 CPU 和内存，CPU 和 PCIe 系统</li>
+<li>PCIe Switch 的作用是扩展 PCIe 端口，下游可以连接 PCIe 设备或者其它 PCIe Switch，上游来的请求将被 PCIe Switch 转发，PCIe 设备可以连在 RC，也可以连在 PCIe Switch</li>
+</ul>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228170203664-58296690.png" class="lazyload">
+</div>
+<p>假设有如下 PCIe 信息：</p>
+<pre><code class="language-shell">$ lspci -tv
+-+-[0000:ff]-+-00.0  Intel Corporation Device 324c
+ |           +-00.1  Intel Corporation Device 324c
+ +-[0000:f2]-+-00.0  Intel Corporation Ice Lake Memory Map/VT-d
+ |           +-00.1  Intel Corporation Ice Lake Mesh 2 PCIe
+ +-[0000:d0]-+-00.0  Intel Corporation Ice Lake Memory Map/VT-d
+ |           +-00.1  Intel Corporation Ice Lake Mesh 2 PCIe
+ |           +-00.2  Intel Corporation Ice Lake RAS
+ |           +-00.4  Intel Corporation Device 0b23
+ |           \-01.0-[d1-d9]----00.0-[d2-d9]--+-00.0-[d3]----00.0  NVIDIA Corporation AD102GL [L20]
+ |                                           +-01.0-[d4]----00.0  NVIDIA Corporation AD102GL [L20]
+ |                                           +-02.0-[d5]----00.0  NVIDIA Corporation AD102GL [L20]
+ |                                           +-03.0-[d6]----00.0  NVIDIA Corporation AD102GL [L20]
+ |                                           +-04.0-[d7]----00.0  Broadcom / LSI Virtual PCIe Placeholder Endpoint
+ |                                           +-05.0-[d8]----00.0  Broadcom / LSI Virtual PCIe Placeholder Endpoint
+ |                                           \-1f.0-[d9]----00.0  Broadcom / LSI PCIe Switch management endpoint
+ +-[0000:95]-+-00.0  Intel Corporation Ice Lake Memory Map/VT-d
+ |           +-00.1  Intel Corporation Ice Lake Mesh 2 PCIe
+ |           +-00.2  Intel Corporation Ice Lake RAS
+ |           +-00.4  Intel Corporation Device 0b23
+ |           \-01.0-[96]--+-00.0  Mellanox Technologies MT27800 Family [ConnectX-5]
+ |                        \-00.1  Mellanox Technologies MT27800 Family [ConnectX-5]
+</code></pre>
+<p>GPU 的完整链路信息如下：</p>
+<pre><code class="language-shell">0000:d3:00.0 -&gt; ../../../devices/pci0000:d0/0000:d0:01.0/0000:d1:00.0/0000:d2:00.0/0000:d3:00.0
+0000:d4:00.0 -&gt; ../../../devices/pci0000:d0/0000:d0:01.0/0000:d1:00.0/0000:d2:01.0/0000:d4:00.0
+0000:d5:00.0 -&gt; ../../../devices/pci0000:d0/0000:d0:01.0/0000:d1:00.0/0000:d2:02.0/0000:d5:00.0
+0000:d6:00.0 -&gt; ../../../devices/pci0000:d0/0000:d0:01.0/0000:d1:00.0/0000:d2:03.0/0000:d6:00.0
+</code></pre>
+<p>NIC 的完整链路信息如下：</p>
+<pre><code class="language-shell">0000:96:00.0 -&gt; ../../../devices/pci0000:95/0000:95:01.0/0000:96:00.0
+0000:96:00.1 -&gt; ../../../devices/pci0000:95/0000:95:01.0/0000:96:00.1
+</code></pre>
+<p>得到信息：</p>
+<ul>
+<li>四个 GPU 都在相同 Root Complex：pci0000:d0 下面</li>
+<li>0000:d0:01.0 为 Root Complex 的 PCIe Root Port</li>
+<li>0000:d1:00.0 / 0000:d2:01.0 为某个 PCIe Switch 的上游端口和下游端口</li>
+<li>0000:d3:00.0，0000:d4:00.0，0000:d5:00.0，0000:d6:00.0 四个 GPU 分别挂接在上游的 PCIe Switch 上</li>
+</ul>
+<p>拓扑结构可表示为：CPU → Root Complex → Root Port → PCIe Switch Upstream → PCIe Switch Downstream → GPU。</p>
+<p>NCCL 让每个 rank 分别从自身绑定的 GPU 开始，通过 PCIe 路径逐步向上逆向推导，从而获得自身 GPU 在整个 PCIe 链路上的路径信息，每个 rank 只探测自身的 PCIe 链路信息。</p>
+<pre><code class="language-c++">ncclResult_t ncclTopoFillGpu(struct ncclXml* xml, const char* busId, struct ncclXmlNode** gpuNode) {
+  ......
+  // 向 xml 中添加当前 GPU node
+  NCCLCHECK(ncclTopoGetPciNode(xml, busId, &amp;node));
+
+  ......
+  // 当前 GPU PCIe 链路信息推导
+  NCCLCHECK(ncclTopoGetXmlFromSys(node, xml));
+  ......
+}
+</code></pre>
+<p>其中，ncclTopoGetXmlFromSys 的实现可简略为：</p>
+<pre><code class="language-c++">ncclResult_t ncclTopoGetXmlFromSys(struct ncclXmlNode* pciNode, struct ncclXml* xml) {
+  ......
+  NCCLCHECKNOWARN(xmlGetAttrIndex(pciNode, "vendor", &amp;index), NCCL_GRAPH);
+  if (index == -1) {
+    if (path) NOWARN(ncclTopoSetAttrFromSys(pciNode, path, "vendor", "vendor"), NCCL_GRAPH);
+  }
+
+  ......
+  struct ncclXmlNode* parent = pciNode-&gt;parent;
+  if (parent == NULL) {
+    if (path) {
+      // Save that for later in case next step is a CPU
+      NCCLCHECK(ncclTopoGetStrFromSys(path, "numa_node", numaIdStr));
+      ......
+      // Go up one level in the PCI tree. Rewind two "/" and follow the upper PCI
+      // switch, or stop if we reach a CPU root complex.
+      for (parentOffset = strlen(path)-1; parentOffset&gt;0; parentOffset--) {
+        if (path[parentOffset] == '/') {
+          slashCount++;
+          path[parentOffset] = '\0';
+          int start = parentOffset - 1;
+          while (start&gt;0 &amp;&amp; path[start] != '/') start--;
+          // Check whether the parent path looks like "BBBB:BB:DD.F" or not.
+          if (checkBDFFormat(path+start+1) == 0) {
+            // This a CPU root complex. Create a CPU tag and stop there.
+            struct ncclXmlNode* topNode;
+            NCCLCHECK(xmlFindTag(xml, "system", &amp;topNode));
+            NCCLCHECK(xmlGetSubKv(topNode, "cpu", &amp;parent, "numaid", numaIdStr));
+            ......
+            }
+          } else if (slashCount == 2) {
+            // Continue on the upper PCI switch
+            for (int i = strlen(path)-1; i&gt;0; i--) {
+              if (path[i] == '/') {
+                NCCLCHECK(xmlFindTagKv(xml, "pci", &amp;parent, "busid", path+i+1));
+                ......
+              }
+            }
+          }
+        }
+        ......
+      }
+    } else {
+      ......
+    }
+    pciNode-&gt;parent = parent;
+
+  ......
+  if (strcmp(parent-&gt;name, "pci") == 0) {
+    NCCLCHECK(ncclTopoGetXmlFromSys(parent, xml));
+  } else if (strcmp(parent-&gt;name, "cpu") == 0) {
+    NCCLCHECK(ncclTopoGetXmlFromCpu(parent, xml));
+  }
+  ......
+}
+</code></pre>
+<p>算法思想为：逐步向上逆向推导，从而获得 GPU 在整个 PCIe 链路上的硬件信息。算法总结如下：</p>
+<ul>
+<li>先获取当前 rank 绑定的 GPU Bus ID，在 xml 中添加一个 pci 节点</li>
+<li>调用：ncclTopoGetXmlFromSys，实现向上逐级推导。获取当前 GPU 的父节点，即通过 GPU 的 PCIe Path 推导，得到 GPU：0000:d3:00.0 的父节点为 0000:d2:00.0</li>
+<li>PCIe Switch 有上游和下游端口。因此，推导至 PCIe Switch 的上游端口 Bus ID：0000:d1:00.0。判断该 Bus ID 不是 CPU root complex，此时 slashCount = 2，因此将该 ID 作为一个 pci 节点，并添加到 xml 中</li>
+<li>递归调用：ncclTopoGetXmlFromSys，从 PCIe Switch 上游端口 Bus ID：0000:d1:00.0 再次向上推导，重复上面的步骤，推导至 Bus ID：pci0000:d0，发现是一个 CPU root complex，向 xml 中添加该 CPU 节点，并填充 CPU 相关信息，例如 numaid， arch等。</li>
+<li>最后填充 当前 GPU 相关信息，例如 rank ID，sm，gdr 等信息</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t ncclTopoFillGpu(struct ncclXml* xml, const char* busId, struct ncclXmlNode** gpuNode) {
+  ......
+  // 向 xml 中添加当前 GPU 相关信息
+  NCCLCHECK(ncclTopoGetXmlFromGpu(node, nvmlDev, xml, gpuNode));
+}
+</code></pre>
+<p>NIC 推导也类似 GPU 的推导过程。但是 NIC 是系统级资源，并不绑定某个 rank，每个 rank 都会枚举自己可见的 NIC 资源。</p>
+<p>由于每个 rank 只推导自己绑定的 GPU，全局视图需要汇总。因此需要通过 NCCL 控制通道在物理设备内部通过：bootstrapIntraNodeAllGather，实现 XML 信息融合和去重。经过汇总后，前面介绍的 PCIe 链路信息，可以构造出可视化的下列 xml 视图：</p>
+<pre><code class="language-shell">&lt;system version="1"&gt;
+  &lt;cpu host_hash="0x3bd87a3604afa55d" numaid="0" arch="x86_64" vendor="GenuineIntel" familyid="6" modelid="207"&gt;
+  
+    &lt;pci busid="0000:d1:00.0" class="0x030200" link_speed="16 GT/s" link_width="16"&gt;
+
+      &lt;pci busid="0000:d3:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="0" sm="89" rank="0" gdr="1"/&gt;
+      &lt;/pci&gt;
+	  
+	  &lt;pci busid="0000:d4:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="1" sm="89" rank="1" gdr="1"/&gt;
+      &lt;/pci&gt;
+
+	  &lt;pci busid="0000:d5:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="2" sm="89" rank="2" gdr="1"/&gt;
+      &lt;/pci&gt;
+
+	  &lt;pci busid="0000:d6:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="3" sm="89" rank="3" gdr="1"/&gt;
+      &lt;/pci&gt;
+
+	&lt;/pci&gt;
+	
+    &lt;pci busid="0000:96:00.0" class="0x020000" link_speed="16 GT/s" link_width="16"&gt;
+      &lt;nic&gt;
+        &lt;net name="mlx5_0" dev="0" latency="0" speed="25000" port="1" guid="0x7f7afb0003797334" maxconn="131072" gdr="1"/&gt;
+      &lt;/nic&gt;
+    &lt;/pci&gt;
+	
+	&lt;pci busid="0000:96:00.1" class="0x020000" link_speed="16 GT/s" link_width="16"&gt;
+      &lt;nic&gt;
+        &lt;net name="mlx5_1" dev="1" latency="0" speed="25000" port="2" guid="0x7f7afb0003797334" maxconn="131072" gdr="1"/&gt;
+      &lt;/nic&gt;
+    &lt;/pci&gt;
+	
+  &lt;/cpu&gt;
+&lt;/system&gt;
+</code></pre>
+<p>在我们的虚拟机实验环境上，所有设备都挂在同一个 Root Complex 下面，且没有 PCIe Switch 参与，是最简单的拓扑。</p>
+<pre><code class="language-shell">$ lspci -tv
+-[0000:00]-+-00.0  Intel Corporation 440FX - 82441FX PMC [Natoma]
+           +-01.0  Intel Corporation 82371SB PIIX3 ISA [Natoma/Triton II]
+           +-01.1  Intel Corporation 82371SB PIIX3 IDE [Natoma/Triton II]
+           +-01.2  Intel Corporation 82371SB PIIX3 USB [Natoma/Triton II]
+           +-01.3  Intel Corporation 82371AB/EB/MB PIIX4 ACPI
+           +-02.0  Cirrus Logic GD 5446
+           +-03.0  Red Hat, Inc. Virtio network device
+           +-04.0  Red Hat, Inc. Virtio block device
+           +-05.0  Red Hat, Inc. Virtio memory balloon
+           +-06.0  Red Hat, Inc. Virtio file system
+           +-07.0-[01]--
+           +-08.0  NVIDIA Corporation AD102GL [L20]
+           +-09.0  NVIDIA Corporation AD102GL [L20]
+           +-0a.0  Mellanox Technologies MT27800 Family [ConnectX-5]
+           \-0b.0  Mellanox Technologies MT27800 Family [ConnectX-5]
+
+$ ll /sys/bus/pci/devices/
+0000:00:00.0 -&gt; ../../../devices/pci0000:00/0000:00:00.0/
+0000:00:01.0 -&gt; ../../../devices/pci0000:00/0000:00:01.0/
+0000:00:01.1 -&gt; ../../../devices/pci0000:00/0000:00:01.1/
+0000:00:01.2 -&gt; ../../../devices/pci0000:00/0000:00:01.2/
+0000:00:01.3 -&gt; ../../../devices/pci0000:00/0000:00:01.3/
+0000:00:02.0 -&gt; ../../../devices/pci0000:00/0000:00:02.0/
+0000:00:03.0 -&gt; ../../../devices/pci0000:00/0000:00:03.0/
+0000:00:04.0 -&gt; ../../../devices/pci0000:00/0000:00:04.0/
+0000:00:05.0 -&gt; ../../../devices/pci0000:00/0000:00:05.0/
+0000:00:06.0 -&gt; ../../../devices/pci0000:00/0000:00:06.0/
+0000:00:07.0 -&gt; ../../../devices/pci0000:00/0000:00:07.0/
+0000:00:08.0 -&gt; ../../../devices/pci0000:00/0000:00:08.0/
+0000:00:09.0 -&gt; ../../../devices/pci0000:00/0000:00:09.0/
+0000:00:0a.0 -&gt; ../../../devices/pci0000:00/0000:00:0a.0/
+0000:00:0b.0 -&gt; ../../../devices/pci0000:00/0000:00:0b.0/
+</code></pre>
+<p>最后得到的 xml 融合信息如下。实验环境中的网卡 mlx5_0 和 mlx5_1 被进行了合并。</p>
+<pre><code class="language-shell">&lt;system version="1"&gt;
+  &lt;cpu host_hash="0x3bd87a3604afa55d" numaid="-1" arch="x86_64" vendor="GenuineIntel" familyid="6" modelid="207"&gt;
+
+    &lt;pci busid="0000:00:08.0" class="0x030200" vendor="0x10de" device="0x26ba" subsystem_vendor="0x10de" subsystem_device="0x1957" link_speed="16.0 GT/s PCIe" link_width="0"&gt;
+      &lt;gpu dev="0" sm="89" rank="0" gdr="1"/&gt;
+    &lt;/pci&gt;
+
+    &lt;pci busid="0000:00:09.0" class="0x030200" vendor="0x10de" device="0x26ba" subsystem_vendor="0x10de" subsystem_device="0x1957" link_speed="16.0 GT/s PCIe" link_width="0"&gt;
+      &lt;gpu dev="1" sm="89" rank="1" gdr="1"/&gt;
+    &lt;/pci&gt;
+
+    &lt;pci busid="0000:00:00.0" class="0x060000" vendor="0x8086" device="0x1237" subsystem_vendor="0x1af4" subsystem_device="0x1100" link_speed="" link_width="0"&gt;
+      &lt;nic&gt;
+        &lt;net name="mlx5_0" dev="0" latency="0" speed="25000" port="1" guid="0x7f7afb0003797334" maxconn="131072" gdr="0"/&gt;
+        &lt;net name="mlx5_1" dev="1" latency="0" speed="25000" port="2" guid="0x7f7afb0003797334" maxconn="131072" gdr="0"/&gt;
+      &lt;/nic&gt;
+    &lt;/pci&gt;
+
+  &lt;/cpu&gt;
+&lt;/system&gt;
+</code></pre>
+<p>上述逻辑在 rank0 中对应如下日志：</p>
+<pre><code class="language-shell">// PCIe 链路推导
+3068.938120 ncclTopoSetAttrFromSys:472 NCCL TRACE Read from sys /sys/devices/pci0000:00/0000:00:08.0/class -&gt; class=0x030200
+3068.949021 ncclTopoSetAttrFromSys:472 NCCL TRACE Read from sys /sys/devices/pci0000:00/0000:00:08.0/vendor -&gt; vendor=0x10de
+3068.955660 ncclTopoSetAttrFromSys:472 NCCL TRACE Read from sys /sys/devices/pci0000:00/0000:00:08.0/device -&gt; device=0x26ba
+......
+
+// 网卡合并
+3069.492280 ncclTopoMakeVNics:1314 NCCL TRACE Found physical ncclNet node 0 mlx5_0
+3069.494257 ncclTopoMakeVNics:1314 NCCL TRACE Found physical ncclNet node 1 mlx5_1
+ncclIbMakeVDeviceInternal:649 NCCL INFO NET/IB : Made virtual device [2] name=mlx5_0+mlx5_1 speed=50000 ndevs=2
+ncclTopoMakeVnic:1029 NCCL INFO TOPO/NET : Made vNic 2
+3069.508220 ncclTopoGetVNicParent:1270 NCCL TRACE Re-found physical ncclNet node 0 mlx5_0
+3069.510005 ncclTopoGetVNicParent:1270 NCCL TRACE Re-found physical ncclNet node 1 mlx5_1
+3069.512078 ncclTopoGetVNicParent:1295 NCCL TRACE Selected parent pci with path 1
+ncclTopoPopulateNics:1357 NCCL INFO NET/IB : GPU Direct RDMA Disabled for HCA 2 'mlx5_0+mlx5_1'
+3069.519502 ncclTopoTrimXmlRec:982 NCCL TRACE Removing node net mlx5_0 (null)
+3069.521424 ncclTopoTrimXmlRec:982 NCCL TRACE Removing node net mlx5_1 (null)
+
+// 同主机内部 XML 信息融合
+3072.011796 bootstrapIntraNodeAllGather:1128 NCCL TRACE rank 0 nranks 2 size 2562056 - ENTER
+3072.029868 ncclSocketConnect:718 NCCL TRACE Connecting to socket 10.10.10.11&lt;46225&gt;
+3073.529592 socketRingAllGather:1032 NCCL TRACE socketRingAllGather started: rank=0 nranks=2
+3073.533829 socketRingAllGather:1034 NCCL TRACE bidirectional bootstrap: totalSteps=1
+3074.657969 socketRingAllGather:1064 NCCL TRACE socketRingAllGather first message in 0.001121 (2285.429856 MB/sec), rest in 0.000000 (50236392.156863 MB/sec)
+3074.684796 bootstrapIntraNodeAllGather:1142 NCCL TRACE rank 0 nranks 2 size 2562056 - DONE
+</code></pre>
+<h3 id="nccl对pcie节点建图">NCCL对PCIe节点建图</h3>
+<p>通过 PCIe 链路推导得到了 GPU 到 CPU ， NIC 到 CPU，以及 GPU 到 NIC 之间的基于 xml 的拓扑信息，但是还缺乏它们之间的链路连接关系。因此需要通过建图，将 PCIe 设备通过 PCIe 路径连接起来。就比如有多个孤立岛，现在按照路径规划（实际的 PCIe 路径）在它们之间建立桥梁，实现互通，从而为 NCCL 后续最优通信路径的搜索打基础。</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228142146589-1309695202.png" class="lazyload">
+</div>
+<p>NCCL 使用 ncclTopoGetSystemFromXml 在 PCIe 设备之间建图。</p>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            initTransportsRank
+                ncclTopoGetSystem
+                    ncclTopoGetSystemFromXml(struct ncclXml* xml, struct ncclTopoSystem** topoSystem, const uint64_t localHostHash)
+</code></pre>
+<p>NCCL 定义了六种设备类型，分别是：NCCL_TOPO_NODE_TYPES = [GPU，PCI，NVS，CPU，NIC，NET]，每种设备类型支持最大 NCCL_TOPO_MAX_NODES = 576 个节点，每个节点支持最多 NCCL_TOPO_MAX_LINKS = 576 个 PCIe 连接。其中，struct ncclTopoNode 里面的 struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS]，用于记录当前 PCIe 设备节点的路径信息，也就是记录从它可达其它 PCIe 设备的路径信息。</p>
+<pre><code class="language-c++">struct ncclTopoNode {
+  ......
+  // Type specific data
+  union {
+    struct {
+      int dev; // NVML dev number
+      int rank;
+      ......
+    }gpu;
+    struct {
+      int dev; // Plugin dev number
+      uint64_t pciId;
+      ......
+    }net;
+    struct {
+      int arch;
+      int vendor;
+      ......
+    }cpu;
+    struct {
+      uint64_t device;
+    }pci;
+  };
+
+  int nlinks;
+  struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS];
+
+  // Pre-computed paths to GPUs and NICs
+  struct ncclTopoLinkList* paths[NCCL_TOPO_NODE_TYPES];
+  ......
+};
+
+struct ncclTopoNodeSet {
+  int count;
+  struct ncclTopoNode nodes[NCCL_TOPO_MAX_NODES];
+};
+
+struct ncclTopoSystem {
+  int systemId;
+  uint64_t hostHashes[NCCL_TOPO_MAX_NODES];
+  int nHosts;
+  struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES];
+  float maxBw;
+  float totalBw;
+  int inter;
+};
+
+struct ncclTopoLink {
+  int type;
+  float bw;
+  struct ncclTopoNode* remNode;
+};
+
+#define NCCL_TOPO_NODE_TYPES 6
+#define NCCL_TOPO_MAX_NODES 576
+#define NCCL_TOPO_MAX_LINKS 576
+
+#define GPU 0
+#define PCI 1
+#define NVS 2
+#define CPU 3 // Actually NUMA domains
+#define NIC 4
+#define NET 5
+</code></pre>
+<p>假设有 XML 视图：</p>
+<pre><code class="language-shell">&lt;system version="1"&gt;
+  &lt;cpu host_hash="0x3bd87a3604afa55d" numaid="0" arch="x86_64" vendor="GenuineIntel" familyid="6" modelid="207"&gt;
+    &lt;pci busid="0000:d1:00.0" class="0x030200" link_speed="16 GT/s" link_width="16"&gt;
+
+      &lt;pci busid="0000:d3:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="0" sm="89" rank="0" gdr="1"/&gt;
+      &lt;/pci&gt;
+	  
+	  &lt;pci busid="0000:d4:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="1" sm="89" rank="1" gdr="1"/&gt;
+      &lt;/pci&gt;
+
+	&lt;/pci&gt;
+  &lt;/cpu&gt;
+
+
+  &lt;cpu host_hash="0x3bd87a3604afa55d" numaid="1" arch="x86_64" vendor="GenuineIntel" familyid="6" modelid="207"&gt;
+    &lt;pci busid="0000:ef:00.0" class="0x030200" link_speed="16 GT/s" link_width="16"&gt;
+
+      &lt;pci busid="0000:78:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="0" sm="89" rank="2" gdr="1"/&gt;
+      &lt;/pci&gt;
+	  
+	  &lt;pci busid="0000:79:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16"&gt;
+        &lt;gpu dev="1" sm="89" rank="3" gdr="1"/&gt;
+      &lt;/pci&gt;
+
+	&lt;/pci&gt;
+  &lt;/cpu&gt;
+&lt;/system&gt;
+</code></pre>
+<p>通过 ncclTopoAddCpu，从 XML 拓扑的 cpu 开始建图。遍历 XML 的 cpu 节点（如果是多 NUMA 环境，XML 里将是多个 CPU -&gt; PCI 的视图）。</p>
+<pre><code class="language-c++">ncclResult_t ncclTopoGetSystemFromXml(struct ncclXml* xml, struct ncclTopoSystem** topoSystem, const uint64_t localHostHash) {
+  ......
+  for (int s=0; s&lt;topNode-&gt;nSubs; s++) {
+    struct ncclXmlNode* node = topNode-&gt;subs[s];
+    if (strcmp(node-&gt;name, "cpu") == 0) NCCLCHECK(ncclTopoAddCpu(node, *topoSystem));
+  }
+
+  ......
+}
+</code></pre>
+<p>从 XML 里遍历当前 cpu 下的 pci 节点。通过 ncclTopoAddPci 去建立 CPU 和 PCIe Switch，以及 PCIe Switch 与 GPU 或者 NIC 的连接。</p>
+<pre><code class="language-c++">ncclResult_t ncclTopoAddCpu(struct ncclXmlNode* xmlCpu, struct ncclTopoSystem* system) {
+  ......
+  for (int s=0; s&lt;xmlCpu-&gt;nSubs; s++) {
+    struct ncclXmlNode* node = xmlCpu-&gt;subs[s];
+    if (strcmp(node-&gt;name, "pci") == 0) NCCLCHECK(ncclTopoAddPci(node, system, cpu, systemId, numaId));
+    if (strcmp(node-&gt;name, "nic") == 0) {
+      ......
+      NCCLCHECK(ncclTopoAddNic(node, system, nic, systemId));
+    }
+  }
+  ......
+}
+</code></pre>
+<p>在 ncclTopoAddPci 里，连接建立的算法思想可以总结如下：</p>
+<ul>
+<li>如果当前节点就是一个 PCIe 设备，那么通过 ncclTopoCreateNode 将当前节点添加到 struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES]，并调用两次 ncclTopoConnectNodes 分别去建立当前 PCIe 设备 与 parent CPU 的连接，以及建立 parent CPU 与 当前 PCIe 设备的连接</li>
+<li>如果当前节点是一个 PCIe Switch，且 Switch 下面还有其它 PCIe 设备，那么继续遍历 Switch 下面的 PCIe 设备，并递归调用 ncclTopoAddPci。当前层次的 PCIe Switch 与 上层 parent CPU 的正反连接在最后递归回溯时再执行</li>
+<li>通过 ncclTopoAddPci 递归，直至达到最底层 PCIe 设备，比如 GPU / NIC，那么将当前节点添加到 struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES]，并调用两次 ncclTopoConnectNodes 分别去建立当前 GPU / NIC 与 parent PCIe Switch 的连接，以及建立 parent PCIe Switch 与 当前 GPU / NIC 设备的连接。注意，这里的连接类型是：LINK_PCI，表示通过 PCIe 链路连接。</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t ncclTopoAddPci(struct ncclXmlNode* xmlPci, struct ncclTopoSystem* system, struct ncclTopoNode* parent, int systemId, int numaId) {
+    ......
+  } else if (type == PCI) {
+    NCCLCHECK(ncclTopoCreateNode(system, &amp;node, type, NCCL_TOPO_ID(systemId, busId)));
+    NCCLCHECK(xmlGetAttr(xmlPci, "vendor", &amp;str));
+    if (str) node-&gt;pci.device += strtol(str, NULL, 0) &lt;&lt; 48;
+    NCCLCHECK(xmlGetAttr(xmlPci, "device", &amp;str));
+    if (str) node-&gt;pci.device += strtol(str, NULL, 0) &lt;&lt; 32;
+    ......
+
+    for (int s=0; s&lt;xmlPci-&gt;nSubs; s++) {
+      struct ncclXmlNode* xmlSubPci = xmlPci-&gt;subs[s];
+      if (strcmp(xmlSubPci-&gt;name, "pcilink") != 0) { // PCI links will be added later
+        NCCLCHECK(ncclTopoAddPci(xmlSubPci, system, node, systemId, numaId));
+      }
+    }
+  }
+
+  ......
+  if (node) {
+    ......
+    NCCLCHECK(ncclTopoConnectNodes(node, parent, LINK_PCI, width*speed/80.0));
+    NCCLCHECK(ncclTopoConnectNodes(parent, node, LINK_PCI, width*speed/80.0));
+  }
+  return ncclSuccess;
+}
+</code></pre>
+<p>向 node-&gt;links 数组里添加 remNode 节点，实现两个节点的连接。调用两次就表示相互互联。</p>
+<pre><code class="language-c++">ncclResult_t ncclTopoConnectNodes(struct ncclTopoNode* node, struct ncclTopoNode* remNode, int type, float bw) {
+  
+  ......
+  struct ncclTopoLink* link;
+  for (link = node-&gt;links; link - node-&gt;links != NCCL_TOPO_MAX_LINKS &amp;&amp; link-&gt;remNode; link++) {
+    if (link-&gt;remNode == remNode &amp;&amp; link-&gt;type == type) break;
+  }
+
+  if (link-&gt;remNode == NULL) node-&gt;nlinks++;
+  link-&gt;type = type;
+  link-&gt;remNode = remNode;
+  link-&gt;bw += bw;
+
+  // Sort links in BW descending order
+  struct ncclTopoLink linkSave;
+  memcpy(&amp;linkSave, link, sizeof(struct ncclTopoLink));
+  while (link != node-&gt;links) {
+    if ((link-1)-&gt;bw &gt;= linkSave.bw) break;
+    memcpy(link, link-1, sizeof(struct ncclTopoLink));
+    link--;
+  }
+  memcpy(link, &amp;linkSave, sizeof(struct ncclTopoLink));
+  ......
+}
+</code></pre>
+<p>回到 ncclTopoGetSystemFromXml 最外层：</p>
+<ul>
+<li>通过 ncclTopoAddCpu，NCCL 实现了对当前实体节点上众多 GPU，PCI，NVS，CPU，NIC，NET 设备的建图
+<ul>
+<li>任意 PCIe 设备都记录了它自身周边通过 PCIe 链路的可达信息</li>
+<li>每个 PCIe 设备都只知道自己周边有哪些下一跳节点，但是只有一层可达信息</li>
+<li>每个 PCIe 设备的连接都是双向的，即 parent &lt;-&gt; child 模式，连接类型为：LINK_PCI</li>
+<li>每条连接都被赋值了计算出来的带宽值</li>
+<li>每个 PCIe 设备增加一个连接，就要按照连接带宽进行一次排序，将带宽最大的连接放在 links 数组的最前面</li>
+</ul>
+</li>
+<li>通过 ncclTopoAddNvLinks，构建 GPU 和 GPU 之间的 GPU0 &lt;---- NVLink ----&gt; GPU1 连接，或者基于 NVSwitch 的 GPU0 &lt;----NVLink----&gt; NVSwitch &lt;----NVLink----&gt; GPU1 连接。连接类型为：LINK_NVL</li>
+<li>通过 ncclTopoAddPciLinks，构建 PCIe 设备之间的 pcilink 连接（如果存在），连接类型为：LINK_LOC。pcilink 不是 PCIe 链路，是一种本地直连技术。<br>
+最终，通过 ncclTopoGetSystemFromXml，。</li>
+<li>通过 ncclTopoConnectCpus，构建 CPU 之间的两两连接，连接类型为：LINK_SYS</li>
+<li>最后通过 ncclTopoSortSystem，将以上所有 PCIe 设备的连接数组 links，按照 NVLink -&gt; PCI-down -&gt; PCI-up -&gt; SYS 的顺序排列。目的是在后续使用 DFS 进行路径搜索时，避免造成路径回退，确保搜索路径是在往目的 PCIe 节点前进。</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t ncclTopoGetSystemFromXml(struct ncclXml* xml, struct ncclTopoSystem** topoSystem, const uint64_t localHostHash) {
+  ......
+  for (int s=0; s&lt;topNode-&gt;nSubs; s++) {
+    struct ncclXmlNode* node = topNode-&gt;subs[s];
+    if (strcmp(node-&gt;name, "cpu") == 0) NCCLCHECK(ncclTopoAddCpu(node, *topoSystem));
+  }
+
+  ......
+  NCCLCHECK(ncclTopoAddNvLinks(topNode, *topoSystem, NULL, 0));
+  NCCLCHECK(ncclTopoAddC2c(topNode, *topoSystem, NULL, 0));
+  NCCLCHECK(ncclTopoAddPciLinks(topNode, *topoSystem, NULL, 0));
+
+  NCCLCHECK(ncclTopoFlattenBcmSwitches(*topoSystem));
+  NCCLCHECK(ncclTopoConnectCpus(*topoSystem));
+  NCCLCHECK(ncclTopoSortSystem(*topoSystem));
+}
+</code></pre>
+<p>NCCL 定义的 PCIe 设备间的连接类型</p>
+<pre><code class="language-c++">#define LINK_LOC 0
+#define LINK_NVL 1
+// Skipping 2 for PATH_NVB
+#define LINK_C2C 3
+#define LINK_PCI 4
+// Skipping 5 for PATH_PXB
+// Skipping 6 for PATH_PXN
+// Skipping 7 for PATH_P2C
+// Skipping 8 for PATH_PHB
+#define LINK_SYS 9
+#define LINK_NET 10
+</code></pre>
+<p>无 NVSwitch，只有 NVLink 直连的拓扑图：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228170414960-1171186688.png" class="lazyload">
+</div>
+<p>有 NVSwitch 硬件的拓扑图：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228170453726-1078809591.png" class="lazyload">
+</div>
+<p>但是需要注意，到目前为止，相关 PCIe 设备只有自身到周边一跳设备的连接关系。</p>
+<h3 id="nccl路径计算">NCCL路径计算</h3>
+<p>NCCL 已经建立了本节点上所有 PCIe 设备的连接图，但是还不知道该如何从某个 PCIe 设备到达另外一个 PCIe 设备。所以就需要计算 GPU, PCI, NVS, CPU, NIC, NET 它们之间的最优互通路径。例如需要计算 GPU 与 NIC 之间的最优路径，拓扑如果足够复杂，GPU 与 NIC 之间的互通路径可能有多条，NCCL 会从路径跳数，或者路径带宽去衡量，从而计算出一条最优路径。通过计算任意设备之间的最优互通路径，为后续 NCCL 进行多通道计算打基础。</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228142247761-142348837.png" class="lazyload">
+</div>
+<p>NCCL 使用 ncclTopoComputePaths 计算多个 PCIe 设备间的最优可达路径。</p>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            initTransportsRank
+                ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm* comm) 
+</code></pre>
+<p>ncclTopoComputePaths 的前半部分实现如下：</p>
+<ul>
+<li>从指定的 CPU 节点出发，计算其它任意 PCIe（GPU, PCI, NVS, NET）设备达到当前 CPU 的最优路径</li>
+<li>从指定的 GPU 节点出发，计算其它任意 PCIe（CPU, PCI, NVS, NET）设备达到当前 GPU 的最优路径</li>
+<li>从指定的 NET 节点出发，计算其它任意 PCIe（GPU, PCI, NVS, CPU）设备达到当前 NET 的最优路径</li>
+<li>从指定的 NVS 节点出发，计算其它任意 PCIe（GPU, PCI, NET, CPU）设备达到当前 NVS 的最优路径</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm* comm) {
+  // Precompute paths between GPUs/NICs.
+
+  // Remove everything in case we're re-computing
+  ncclTopoRemovePaths(system);
+
+  // Set direct paths to CPUs. We need them in many cases.
+  for (int c=0; c&lt;system-&gt;nodes[CPU].count; c++) {
+    NCCLCHECK(ncclTopoSetPaths(system-&gt;nodes[CPU].nodes+c, system));
+  }
+
+  // Set direct paths to GPUs.
+  for (int g=0; g&lt;system-&gt;nodes[GPU].count; g++) {
+    NCCLCHECK(ncclTopoSetPaths(system-&gt;nodes[GPU].nodes+g, system));
+  }
+
+  // Set direct paths to NICs.
+  for (int n=0; n&lt;system-&gt;nodes[NET].count; n++) {
+    NCCLCHECK(ncclTopoSetPaths(system-&gt;nodes[NET].nodes+n, system));
+  }
+
+  // Set direct paths to NVSwitches.
+  for (int n=0; n&lt;system-&gt;nodes[NVS].count; n++) {
+    NCCLCHECK(ncclTopoSetPaths(system-&gt;nodes[NVS].nodes+n, system));
+  }
+  ......
+}
+</code></pre>
+<p>注意，是从指定设备出发，计算其它任意 PCIe 设备达到当前指定设备的最优路径。意味着在路径探索过程中，会在其它任意中间节点添加到达当前指定的，出发节点的路径信息。</p>
+<p>比如有 PCIe 如下拓扑：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228170707053-1423341209.png" class="lazyload">
+</div>
+<ul>
+<li>从 GPU0 出发时，在 PCI_SW1，PCI_SW2，GPU1 中都会添加自身到达 GPU0 的最优路径信息</li>
+<li>从 GPU1 出发时，在 PCI_SW2，PCI_SW1，GPU0 中都会添加自身到达 GPU1 的最优路径信息</li>
+</ul>
+<p>ncclTopoSetPaths 是实现路径计算的关键函数，通过 BFS 逐层搜索其它 PCIe 设备实现。</p>
+<pre><code class="language-c++">static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclTopoSystem* system) {
+
+  ......
+  nodeList.count = 1; 
+  nodeList.list[0] = baseNode;
+
+  // 将出发节点 baseNode 初始化
+  NCCLCHECK(getPath(system, baseNode, baseNode-&gt;type, baseNode-&gt;id, &amp;basePath));
+  basePath-&gt;count = 0;
+  basePath-&gt;bw = LOC_BW;
+  basePath-&gt;type = PATH_LOC;
+
+  while (nodeList.count) {
+    nextNodeList.count = 0;
+
+    for (int n=0; n&lt;nodeList.count; n++) {
+
+      struct ncclTopoNode* node = nodeList.list[n];
+      NCCLCHECK(getPath(system, node, baseNode-&gt;type, baseNode-&gt;id, &amp;path));
+
+      for (int l=0; l&lt;node-&gt;nlinks; l++) {
+        struct ncclTopoLink* link = node-&gt;links+l;
+        struct ncclTopoNode* remNode = link-&gt;remNode;
+        ......
+
+        NCCLCHECK(getPath(system, remNode, baseNode-&gt;type, baseNode-&gt;id, &amp;remPath));
+        float bw = std::min(path-&gt;bw, link-&gt;bw);
+        ......
+
+        // 如果remPath-&gt;bw == 0，直接进入
+        // 如果remPath-&gt;bw != 0，比较跳数。当前路径跳数：path-&gt;count，小于 remPath-&gt;count 时，再比较带宽
+        // 如果最后当前路径带宽高于之前计算的 remPath-&gt;bw，尝试更新
+        if ((remPath-&gt;bw == 0 || remPath-&gt;count &gt; path-&gt;count) &amp;&amp; remPath-&gt;bw &lt; bw) {
+          // Find reverse link
+          for (int l=0; l&lt;remNode-&gt;nlinks; l++) {
+            if (remNode-&gt;links[l].remNode == node &amp;&amp; remNode-&gt;links[l].type == link-&gt;type) {
+              // 将 remPath-&gt;list[0] 的第一个连接指向当前 node
+              remPath-&gt;list[0] = remNode-&gt;links+l;
+              break;
+            }
+          }
+          ......
+
+          // 将剩余的，在前面已经得到的路径拷贝到 remPath-&gt;list
+          for (int i=0; i&lt;path-&gt;count; i++) remPath-&gt;list[i+1] = path-&gt;list[i];
+
+          // 赋值路径跳数和带宽
+          remPath-&gt;count = path-&gt;count + 1;
+          remPath-&gt;bw = bw;
+
+          ......
+          // 赋值路径类型
+          if (link-&gt;type == LINK_PCI &amp;&amp; (node-&gt;type == CPU || link-&gt;remNode-&gt;type == CPU)) type = PATH_PHB;
+
+          ......
+          remPath-&gt;type = std::max(path-&gt;type, type);
+
+          // 寻找 nextNodeList 中是否已存在 remNode
+          // 如果存在，则不会将 remNode 添加至 nextNodeList
+          // 如果不存在，则将 remNode 添加至 nextNodeList
+          for (i=0; i&lt;nextNodeList.count; i++) if (nextNodeList.list[i] == remNode) break;
+          if (i == nextNodeList.count) nextNodeList.list[nextNodeList.count++] = remNode;
+        }
+      }
+    }
+
+    // 将 nextNodeList 拷贝至 nodeList ，使用 nodeList 重新遍历
+    memcpy(&amp;nodeList, &amp;nextNodeList, sizeof(nodeList));
+  }
+  ......
+}
+</code></pre>
+<p>按照如下拓扑，算法可通过拓扑 demo 简单推导为：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228170707053-1423341209.png" class="lazyload">
+</div>
+<ol>
+<li>初始化basenode</li>
+</ol>
+<p>basenode 赋值为 GPU0，因此有：</p>
+<pre><code class="language-shell">basePath-&gt;count = 0
+basePath-&gt;bw = LOC_BW
+basePath-&gt;type = PATH_LOC
+</code></pre>
+<p>节点 GPU0 到 GPU0 的路径为 LOCAL</p>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th style="text-align: center">到 GPU0 的路径</th>
+<th style="text-align: center">路由跳数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU0</td>
+<td style="text-align: center">PATH_LOC</td>
+<td style="text-align: center">0</td>
+</tr>
+</tbody>
+</table>
+<p>用于循环的 nodeList 只有 GPU0</p>
+<pre><code class="language-shell">nodeList = { GPU0 }
+</code></pre>
+<ol start="2">
+<li>遍历 GPU0</li>
+</ol>
+<p>GPU0 有两个连接，分别是：PCI_SW1 和 GPU1</p>
+<pre><code class="language-shell">GPU0 --(PCI)--&gt; PCI_SW1
+GPU0 --(NVL)--&gt; GPU1
+</code></pre>
+<ul>
+<li>
+<p>baseNode 初始化</p>
+</li>
+<li>
+<p>用于循环的节点链表为： nodeList =</p>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th style="text-align: center">到 GPU0 的路径</th>
+<th style="text-align: center">路径跳数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU0</td>
+<td style="text-align: center">PATH_LOC</td>
+<td style="text-align: center">0</td>
+</tr>
+</tbody>
+</table>
+</li>
+<li>
+<p>GPU0 有两个连接，分别是：PCI_SW1 和 GPU1</p>
+<ul>
+<li>PCI_SW1 的 remPath-&gt;list[0] 将被赋值为 GPU0</li>
+<li>GPU1 的 remPath-&gt;list[0] 也将被赋值为 GPU0</li>
+<li>最后用于下次循环的节点链表为： nodeList =
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th style="text-align: center">到 GPU0 的路径</th>
+<th style="text-align: center">路径跳数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU0</td>
+<td style="text-align: center">PATH_LOC</td>
+<td style="text-align: center">0</td>
+</tr>
+<tr>
+<td>PCI_SW1</td>
+<td style="text-align: center">PCI_SW1 -&gt; GPU0</td>
+<td style="text-align: center">1</td>
+</tr>
+<tr>
+<td>GPU1</td>
+<td style="text-align: center">GPU1 -&gt; GPU0</td>
+<td style="text-align: center">1</td>
+</tr>
+</tbody>
+</table>
+</li>
+</ul>
+</li>
+<li>
+<p>开始下次大循环：while (nodeList = { PCI_SW1, GPU1})</p>
+<ul>
+<li>
+<p>先遍历节点 PCI_SW1，那么它的 remNode 为 PCI_SW2，因此 PCI_SW2 的 remPath-&gt;list[0] 将被赋值为 PCI_SW1, remPath-&gt;list[1] 将被赋值为 GPU0，此时 remPath-&gt;count = 2</p>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th style="text-align: center">到 GPU0 的路径</th>
+<th style="text-align: center">路径跳数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU0</td>
+<td style="text-align: center">PATH_LOC</td>
+<td style="text-align: center">0</td>
+</tr>
+<tr>
+<td>PCI_SW1</td>
+<td style="text-align: center">PCI_SW1 -&gt; GPU0</td>
+<td style="text-align: center">1</td>
+</tr>
+<tr>
+<td>GPU1</td>
+<td style="text-align: center">GPU1 -&gt; GPU0</td>
+<td style="text-align: center">1</td>
+</tr>
+<tr>
+<td>PCI_SW2</td>
+<td style="text-align: center">PCI_SW2 -&gt; PCI_SW1 -&gt; GPU0</td>
+<td style="text-align: center">2</td>
+</tr>
+</tbody>
+</table>
+</li>
+<li>
+<p>再遍历节点 GPU1，此时 GPU1 的 remNode 同样为 PCI_SW2，但是：</p>
+<ul>
+<li>remPath-&gt;bw != 0，因为遍历 PCI_SW1 时，PCI_SW2 已经被赋值</li>
+<li>此时 remPath-&gt;count = 2，path-&gt;count = 1（GPU1 的 path-&gt;count 目前还是 1），所以 (remPath-&gt;bw == 0 || remPath-&gt;count &gt; path-&gt;count) 最终为 true</li>
+<li>因此再看 remPath-&gt;bw &lt; bw 是否满足。当前 remPath-&gt;bw 也因为遍历 PCI_SW1 时被赋值，但是如果 PCI_SW2 -&gt; PCI_SW1 -&gt; GPU0 的路径带宽确实比 PCI_SW2 -&gt; GPU1 -&gt; GPU0 要小，那么，NCCL 会将 PCI_SW2 的路径信息更新为最优路径：PCI_SW2-&gt;GPU1-&gt;GPU0。因为 PCI_SW2 已经在遍历节点 PCI_SW1 时被缓存到 nodeList，所以遍历 PCI_SW2 时不再添加。因此，nodeList 只有 PCI_SW2</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th style="text-align: center">到 GPU0 的路径</th>
+<th style="text-align: center">路径跳数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU0</td>
+<td style="text-align: center">PATH_LOC</td>
+<td style="text-align: center">0</td>
+</tr>
+<tr>
+<td>PCI_SW1</td>
+<td style="text-align: center">PCI_SW1 -&gt; GPU0</td>
+<td style="text-align: center">1</td>
+</tr>
+<tr>
+<td>GPU1</td>
+<td style="text-align: center">GPU1 -&gt; GPU0</td>
+<td style="text-align: center">1</td>
+</tr>
+<tr>
+<td>PCI_SW2</td>
+<td style="text-align: center">PCI_SW2 -&gt; GPU1 -&gt; GPU0</td>
+<td style="text-align: center">2</td>
+</tr>
+</tbody>
+</table>
+</li>
+</ul>
+</li>
+<li>
+<p>开始下次大循环：while (nodeList = { PCI_SW2 })，</p>
+<ul>
+<li>PCI_SW2 有两个连接，分别是：PCI_SW1 和 GPU1</li>
+<li>遍历 PCI_SW1 和 GPU1 时，都因为  remPath-&gt;count(1) &gt; path-&gt;count(2)， 不满足（比如 PCI_SW1-&gt;count = 1，PCI_SW2-&gt;count = 2），导致 nodeList = { NULL }， 因此整个算法流程结束。</li>
+</ul>
+</li>
+</ul>
+<p>ncclTopoComputePaths 的前半部分用于 PCIe 设备之间的最优物理路径计算，获得的是：在硬件能力允许的条件下，怎么走最快的物理路径。但是物理路径可达不代表一些能力实际可用，比如物理 GPU 之间的 P2P PCIe Switch 不支持，或者未开启 PCIe P2P，或者 rank 运行在容器内，共享内存 SHM 方式可能是禁止的。因此，在 ncclTopoComputePaths 后半部分，将标记这些信息，为下一轮进行 PCIe 设备间路径重新计算做铺垫。具体实现可总结为：</p>
+<ul>
+<li>检查任意 GPU 之间是否支持 P2P 和 SHM，如果都不支持，那么这两个 GPU 之间的路径类型标记为 PATH_NET</li>
+<li>同一物理节点内部，支持通过 GPU 中继，允许比如 GPU0 通过 GPU1 访问 NIC0，但是只允许数据发送方向，即 GPU0 向外发送数据通过 GPU1 中继</li>
+<li>如果 GPU 和 NIC 之间的 GDR（GPU Direct RDMA） 模式不可用，则在它们之间添加中继 CPU 节点，强制数据从 CPU 经过</li>
+<li>提前计算与 NIC 处于同一 CPU 域的 GPU，并缓存</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm* comm) {
+  ......
+  // Update path for GPUs when we don't want to / can't use GPU Direct P2P
+  for (int g=0; g&lt;system-&gt;nodes[GPU].count; g++) {
+
+    ......
+    // Remove GPUs we can't (or don't want to) communicate with through P2P or SHM
+    struct ncclPeerInfo* dstInfo = comm-&gt;peerInfo+system-&gt;nodes[GPU].nodes[g].gpu.rank;
+    for (int p=0; p&lt;system-&gt;nodes[GPU].count; p++) {
+      ......
+      int p2p;
+      NCCLCHECK(ncclTransports[TRANSPORT_P2P]-&gt;canConnect(&amp;p2p, comm, NULL, srcInfo, dstInfo));
+      if (p2p == 0) {
+        NCCLCHECK(ncclTransports[TRANSPORT_SHM]-&gt;canConnect(&amp;shm, comm, NULL, srcInfo, dstInfo));
+        if (shm == 0) {
+          // Mark this peer as inaccessible. We'll trim it later.
+          system-&gt;nodes[GPU].nodes[p].paths[GPU][g].type = PATH_NET;
+        }
+      }
+    }
+  }
+  ......
+
+  // Update paths for NICs (no GPU Direct, PXN, ...)
+  for (int n=0; n&lt;system-&gt;nodes[NET].count; n++) {
+    struct ncclTopoNode* netNode = system-&gt;nodes[NET].nodes+n;
+
+    for (int g=0; g&lt;system-&gt;nodes[GPU].count; g++) {
+
+      // Check whether we can access the NIC through another NVLink-connected GPU (PXN)
+      struct ncclTopoNode* gpu = system-&gt;nodes[GPU].nodes+g;
+      if (ncclPxnDisable(comm) != 1) {
+        ......
+        if (localGpuIndex != g &amp;&amp; localGpuIndex != -1) {
+          // PXN = PCI + NVLink.
+            ......
+            NCCLCHECK(addInterStep(system, GPU, localGpuIndex, GPU, g, NET, n));
+        }
+      }
+
+      if (gpu-&gt;paths[NET][n].type &lt; PATH_PHB) {
+        // Update path when we dont want to / can't use GPU Direct RDMA.
+        ......
+        if (gdr == 0) {
+          // We cannot use GPU Direct RDMA, divert all traffic through the CPU local to the GPU
+          int localCpu;
+          NCCLCHECK(ncclGetLocalCpu(system, g, &amp;localCpu));
+          NCCLCHECK(addInterStep(system, CPU, localCpu, NET, n, GPU, g));
+          NCCLCHECK(addInterStep(system, CPU, localCpu, GPU, g, NET, n));
+        }
+      }
+    }
+  }
+
+  // Pre-compute NET local gpus to accelerate search
+  for (int n=0; n&lt;system-&gt;nodes[NET].count; n++) {
+    ......
+    NCCLCHECK(ncclTopoGetLocalGpu(system, net-&gt;id, &amp;net-&gt;net.localGpu));
+  }
+  ......
+}
+</code></pre>
+<p>NCCL 经过路径计算，如图中每个 PCIe 设备有如下路径信息：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228170904615-23187900.png" class="lazyload">
+</div>
+<h3 id="pcie设备裁剪和路径重新计算">PCIe设备裁剪和路径重新计算</h3>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            initTransportsRank
+                // 路径初始计算
+                ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm* comm)           
+                // 设备裁剪
+                ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* comm) 
+                // 路径再次计算
+                ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm* comm)
+</code></pre>
+<p>GPU 之间的裁剪逻辑可总结为：</p>
+<ul>
+<li>判断 GPU 之间的路径类型是否小于类型 PATH_NET，如果小于则在同一个 domain，否则在不同 domain</li>
+<li>通过 myDomain 记录本 rank 所在 domain</li>
+<li>将与当前 rank 不在同一个 domain 的 GPU 节点都删掉
+<ul>
+<li>删除该节点的所有 paths</li>
+<li>从其它节点的 links 中删除与该节点的连接 link</li>
+</ul>
+</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* comm) {
+  
+  int *domains;
+  int64_t *ids = NULL;
+  int myDomain = 0;
+  int ngpus = system-&gt;nodes[GPU].count;
+  ......
+  for (int g=0; g&lt;system-&gt;nodes[GPU].count; g++) {
+    struct ncclTopoNode* gpu = system-&gt;nodes[GPU].nodes+g;
+    domains[g] = g;
+    ids[g] = gpu-&gt;id;
+    for (int p=0; p&lt;g; p++) {
+      if (gpu-&gt;paths[GPU][p].type &lt; PATH_NET) {
+        domains[g] = std::min(domains[g], domains[p]);
+      }
+    }
+    if (gpu-&gt;gpu.rank == comm-&gt;rank) myDomain = domains[g];
+  }
+
+  for (int i=0; i&lt;ngpus; i++) {
+    if (domains[i] == myDomain) continue;
+    ......
+    for (g=0; g&lt;system-&gt;nodes[GPU].count /* This one varies over the loops */; g++) {
+      gpu = system-&gt;nodes[GPU].nodes+g;
+      if (gpu-&gt;id == ids[i]) break; else gpu=NULL;
+    }
+    ......
+    NCCLCHECKGOTO(ncclTopoRemoveNode(system, GPU, g), ret, fail);
+  }
+  ......
+}
+
+ncclResult_t ncclTopoRemoveNode(struct ncclTopoSystem* system, int type, int index) {
+  ......
+  for (int t=0; t&lt;NCCL_TOPO_NODE_TYPES; t++) {
+    free(delNode-&gt;paths[t]);
+    
+  ......
+  while (l&lt;node-&gt;nlinks &amp;&amp; node-&gt;links[l].remNode == delNode) {
+    memmove(...);
+    node-&gt;nlinks--;
+  }
+}
+</code></pre>
+<p>NCCL 基于裁剪后的拓扑，再次重新计算所有 PCIe 设备的可达路径。从而得到一个运行环境实际可用的拓扑路径，为后续通道计算做铺垫。以上逻辑对应日志如下：</p>
+<pre><code class="language-shell"># 设备列举
+ncclTopoPrint:316 NCCL INFO === System : maxBw 6.2 totalBw 24.0 ===
+ncclTopoPrintRec:289 NCCL INFO CPU/0-ffffffffffffff (1/1/4)
+ncclTopoPrintRec:289 NCCL INFO + PCI[24.0] - GPU/0-80 (0)
+ncclTopoPrintRec:289 NCCL INFO + PCI[24.0] - GPU/0-90 (1)
+ncclTopoPrintRec:289 NCCL INFO + PCI[12.0] - NIC/0-0
+ncclTopoPrintRec:308 NCCL INFO + NET[6.2] - NET/0-2 (0/7f7afb0003797334/1/6.250000)
+
+# 路径展示
+# 比如：从 GPU/0-80 经过 --PCI(24)-&gt;CPU/0-ffffffffffffff，可到达 PCI(24)-&gt;GPU/0-90
+ncclTopoPrint:319 NCCL INFO ==========================================
+printNodePaths:119 NCCL INFO Paths from GPU/0-80 :
+printNodePaths:136 NCCL INFO  (5000.000000)
+printNodePaths:136 NCCL INFO --PCI(24)-&gt;CPU/0-ffffffffffffff--PCI(24)-&gt;GPU/0-90 (24.000000)
+printNodePaths:136 NCCL INFO --PCI(24)-&gt;CPU/0-ffffffffffffff (24.000000)
+printNodePaths:136 NCCL INFO --PCI(24)-&gt;CPU/0-ffffffffffffff--PCI(12)-&gt;NIC/0-0--NET(6.25)-&gt;NET/0-2 (6.250000)
+
+printNodePaths:119 NCCL INFO Paths from GPU/0-90 :
+printNodePaths:136 NCCL INFO --PCI(24)-&gt;CPU/0-ffffffffffffff--PCI(24)-&gt;GPU/0-80 (24.000000)
+printNodePaths:136 NCCL INFO  (5000.000000)
+printNodePaths:136 NCCL INFO --PCI(24)-&gt;CPU/0-ffffffffffffff (24.000000)
+printNodePaths:136 NCCL INFO --PCI(24)-&gt;CPU/0-ffffffffffffff--PCI(12)-&gt;NIC/0-0--NET(6.25)-&gt;NET/0-2 (6.250000)
+
+printNodePaths:119 NCCL INFO Paths from NET/0-2 :
+printNodePaths:136 NCCL INFO --NET(6.25)-&gt;NIC/0-0--PCI(12)-&gt;CPU/0-ffffffffffffff--PCI(24)-&gt;GPU/0-80 (6.250000)
+printNodePaths:136 NCCL INFO --NET(6.25)-&gt;NIC/0-0--PCI(12)-&gt;CPU/0-ffffffffffffff--PCI(24)-&gt;GPU/0-90 (6.250000)
+printNodePaths:136 NCCL INFO --NET(6.25)-&gt;NIC/0-0--PCI(12)-&gt;CPU/0-ffffffffffffff (6.250000)
+printNodePaths:136 NCCL INFO  (5000.000000)
+</code></pre>
+<h3 id="nccl通信算法">NCCL通信算法</h3>
+<p>NCCL 使用 Ring，Tree 等算法在多 GPU 之间进行数据传递。不同的通信算法有对应的适用场景。</p>
+<h4 id="nccl-ring拓扑计算">NCCL Ring拓扑计算</h4>
+<p>NCCL Ring 结构顾名思义是将多个 GPU 在逻辑上组织成一个环，从而利用环形拓扑进行数据通信，环形拓扑分为两种场景：</p>
+<ul>
+<li>单物理节点上，只是将本节点内部的多个 GPU 组织为环，即形成拓扑结构：GPU a -&gt; GPU b -&gt; .. -&gt; GPU x -&gt; GPU a</li>
+<li>多机通信场景，则需要在每个节点构造一个从 NIC 到 GPU-X0，再从 GPU-Xn 到 NIC 的拓扑结构，例如：NET n -&gt; GPU a -&gt; GPU b -&gt; .. -&gt; GPU x -&gt; NET n (or m if crossNic)</li>
+</ul>
+<p>NCCL 有 channel 的概念，这里的一个 channel 对应一个 ring 环。</p>
+<p>NCCL 会尝试 ring 多通道计算，多 channel 的计算逻辑非常复杂。多 channel 的核心作用是可以使得 GPU 利用多 channel 进行数据的并行传输。好比将单车道拓宽为双车道，或者更多车道。但是通道也不是无限扩张，因为每个通道有基础带宽，在通道所经过的路径上，带宽资源也是有限的，NCCL 的目标就是通过多通道无限逼近硬件带宽资源，以求最大化利用。</p>
+<p>通道计算由函数 ncclTopoSearchRec 实现</p>
+<pre><code class="language-shell">ncclCommInitRank
+    ncclCommInitRankDev
+        ncclCommInitRankFunc
+            initTransportsRank
+                ncclTopoCompute
+                    ncclTopoSearchRec(struct ncclTopoSystem* system, struct ncclTopoGraph* graph, struct ncclTopoGraph* saveGraph, int* time)
+</code></pre>
+<p>如下归纳了 ncclTopoSearchRec 计算通道的算法逻辑（多机场景，只涉及算法主要思想）：</p>
+<pre><code class="language-txt">(1) 给定一个通道基准带宽值（通道有初始基准带宽，基准带宽刚好小于任意 GPU 到任意 NIC 路径之间的最大带宽），基于基准带宽值去搜索通道。
+(2) 按照 GPU 的顺序，找出所有 GPU 最合适的网卡，返回网卡列表
+(3) 按照得到的网卡列表，遍历网卡，准备构造 ring 路径。每一个网卡都要参与路径计算
+    1. 当前被选择的网卡 Xn，因为 graph-&gt;nChannels = 0，强制从 GPU0 开始计算，如果计算成功，得到一条 ring 路径，此时 graph-&gt;nChannels 被加 1
+        a. 如果当前所有通道的总带宽高于通道数 -1 的总带宽，则新增当前通道，保存到 saveGraph
+        b. 如果带宽相等情况下，但是当前所有通道的总跳数小于之前的通道总跳数，保存到 saveGraph
+        c. 如果带宽和跳数条件都不满足，则不会将当前 graph 保存到 saveGraph，但是 graph 内容不变
+    2. 因为 graph-&gt;nChannels 被加 1，开始选择另外一块网卡Xn+1，计算公式：(graph-&gt;nChannels+i)%netCount，开始计算新通道（graph-&gt;nChannels 会影响网卡的选择，此时是递归计算，是网卡 Xn 计算成功后的递归调用，根据通道被加 1 选择了网卡 Xn+1，而不是大循环遍历到网卡 Xn+1，此时最外层大循环还是网卡 Xn），因为 graph-&gt;nChannels != 0，从与当前被选择网卡距离最近的 localGpu（与该 NIC 共享 PCIe root complex 或 NUMA node 的 GPU）开始计算，如果计算成功，得到一条 ring 路径，此时 graph-&gt;nChannels 再被加 1，保存策略参考 (3).1.abc
+    3.按照步骤 (3).2，继续迭代，直至无法再迭代，执行回溯。在递归计算的路径上，都会在通道途经的路径上依次扣减 PCIe 设备间的给定基准带宽值，表示已经占用了一部分带宽资源。当回溯时，再按回溯路径依次恢复 PCIe 设备间的带宽。最后回溯至最外层大循环，即第一次选择网卡 Xn 的位置时，带宽恢复完毕，graph-&gt;nChannels 也恢复至0
+(3) 因为回溯至 Xn，接下来选择 localGpu 再次计算，重复过程 (3).1，只不过变为从 localGpu 开始计算，而不再是 GPU0
+(4) localGpu 计算完毕后，继续尝试所有可达 GPU 路径计算，再次重复过程 (3).1，只不过变为从 GPU 列表循环开始计算，但是会除去 localGpu，因为上一步计算过了
+(5) 回到网卡大循环，从下一块网卡，比如网卡 Xn+1 开始，再次重复上述整个过程，从步骤 (3) 开始，只是现在变为大循环网卡 Xn+1 出发，graph-&gt;nChannels = 0，之前所有 PCIe 设备间被扣减的带宽均已恢复    
+</code></pre>
+<p>当 ncclTopoSearchRec 完成当前条件设置下的通道搜索，接下来进入如下逻辑：</p>
+<ul>
+<li>当计算出的通道数 graph-&gt;nChannels 等于 NCCL 允许的最大通道数：graph-&gt;maxChannels 时，可以暂时结束搜索，跳转到指定标签 done，准备下一次搜索。暗示计算出来的所有通道在途径的链路上，带宽容量都是可以满足的</li>
+</ul>
+<pre><code class="language-c++">// Optimal solution, stop here
+if (time == -1) goto done;
+</code></pre>
+<ul>
+<li>当计算出的通道数小于允许的最大通道数，但是所消耗的总带宽 &gt;= 总带宽时（所有 GPU 中自身link链路的带宽和，取一个最大值），可以暂时结束搜索，跳转到指定标签 done，准备下一次搜索</li>
+</ul>
+<pre><code class="language-c++">// Optimal solution, stop here
+if (graph-&gt;nChannels*graph-&gt;bwInter &gt;= system-&gt;totalBw) goto done;
+</code></pre>
+<p>如果前面两个条件都未满足，进入通道搜索第一阶段：NCCL 尝试降低一些搜索条件去继续搜索 ring channel。</p>
+<ul>
+<li>例如：在基准带宽基础上逐渐减小带宽值，不断尝试是否可以计算出更多的通道。通道带宽也不能无限小，有一个最小经验值去限制。通过减小通道带宽，并尝试增加通道数的方法，去无限逼近通道路径上的带宽上限。例如：假设一个 path 有 64 GB/s 的带宽，按照 18 GB/s 的粒度只能找到 3 个 Channel，总带宽是 54 GB/s，但是按照 16 GB/s 的粒度的话，能够找到 4 个 Channel，刚好利用路径通道的所有带宽</li>
+<li>当降低搜索条件到极限：speedArray[speedIndex+1] / graph-&gt;bwInter &gt; .49 不再成立，结束第一个阶段的通道搜索</li>
+</ul>
+<pre><code class="language-c++">// Decrease bw until we find a solution
+if ((speedIndex &lt; nspeeds-1) &amp;&amp; (graph-&gt;nChannels == 0 || (speedArray[speedIndex+1]/graph-&gt;bwInter &gt; .49))) {
+  tmpGraph.bwInter = tmpGraph.bwIntra = speedArray[++speedIndex];
+  goto search;
+}
+</code></pre>
+<p>在以上逻辑完成后，可能会进入通道搜索第二阶段，比如其中有一个条件：(graph-&gt;bwIntra &amp;&amp; graph-&gt;bwInter) &gt;= 25.0，需要基准带宽足够大</p>
+<ul>
+<li>将当前计算得到的通道数翻倍（需要小于允许的 maxChannels），通道基准带宽减半</li>
+</ul>
+<pre><code class="language-c++">ncclTopoDupChannels(graph, ccMin, ngpus);
+</code></pre>
+<ul>
+<li>在带宽减半的基础上，去逐渐反向增加带宽值，不断尝试是否可以计算出带宽更高的总带宽。前提是，在所有通道所经过的路径上，带宽容量都满足。</li>
+</ul>
+<pre><code class="language-c++">if (graph-&gt;pattern == NCCL_TOPO_PATTERN_RING) {
+  // increase bw for Ring
+  tmpGraph.bwIntra = tmpGraph.bwInter = speedArray[--speedIndex];
+  goto search;
+}
+</code></pre>
+<p>NCCL 通过暴力搜索方法，不断尝试各种条件，计算出基础带宽值合适，通道数更多，总带宽更大的多通道，目标就是尽最大可能榨干硬件带宽资源。上述逻辑对应日志：</p>
+<pre><code class="language-shell">ncclTopoPrintGraph:1201 NCCL INFO Pattern 4, crossNic 0, nChannels 1, bw 6.000000/6.000000, type PHB/PHB, sameChannels 1
+
+# 当前实验环境只计算出一条channel，从 NET/0-2 出发，经过 GPU/0-80，GPU/0-90，回到 NET/0-2
+ncclTopoPrintGraph:1224 NCCL INFO  0 : NET/0-2 GPU/0-80 GPU/0-90 NET/0-2
+</code></pre>
+<p>有如下计算得到的 Ring 通道示意图：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228142325492-587698769.png" class="lazyload">
+</div>
+<h4 id="nccl-tree拓扑介绍">NCCL Tree拓扑介绍</h4>
+<p>NCCL Tree 拓扑也使用 ncclTopoCompute 计算得到，但是 Tree 只能用于 All Reduce 操作。与 ring 一样，一颗 tree 将绑定一个 channel。这里只介绍 tree 拓扑的相关算法概念。NCCL Tree 拓扑也在不断演进，从最初的 Single Binary Tree 演变为 Double Binary Tree，再在 Double Binary Tree 的基础上演变出新的 Split Tree，Balanced Tree。</p>
+<h5 id="single-binary-tree">Single Binary Tree</h5>
+<p>有如下单二叉树结构：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228143855070-533284864.png" class="lazyload">
+</div>
+<p>Single Binary Tree 上执行 All Reduce 操作，规约阶段：</p>
+<ul>
+<li>叶子节点 1, 3, 5, 7,......，31 分别向自己的父节点：2, 6, 10, 14, 18, 22, 26, 30 发送数据</li>
+<li>非叶子节点 2, 6, 10, 14, 18, 22, 26, 30 把从子节点收到的数据与本地数据进行规约，再将规约后的数据分别发送给自己的父节点</li>
+<li>依此类推，直到 root 节点 0 规约完成所有数据，时间开销 log_N</li>
+</ul>
+<p>Broadcast 阶段：</p>
+<ul>
+<li>root 节点将规约后的数据广播给自己的子节点 16</li>
+<li>子节点将收到的数据继续广播给自己的子节点 8，24</li>
+<li>依次类推，直到所有的子节点都收到 root 节点的规约数据。时间开销 log_N</li>
+</ul>
+<p>缺点：</p>
+<ul>
+<li>reduce 和 broadcast 操作在时间线上只能串行执行，需要 root 完成 reduce 后才能进行 broadcast。时间开销比较大</li>
+<li>叶子节点只有一个 parent 节点，没有 child 节点；非叶子节点虽然有两个 child 节点，但是也只有一个 parent 节点。这种结构会导致带宽浪费</li>
+</ul>
+<h5 id="double-binary-tree">Double Binary Tree</h5>
+<p>有如下双二叉树结构：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228143930030-754462260.png" class="lazyload">
+</div>
+<p>Double Binary Tree 与 Single Binary Tree 的区别：</p>
+<ul>
+<li>Double Binary Tree 基于 Single Binary Tree 的所有节点生成了第二棵单二叉树</li>
+<li>相对于 Single Binary Tree，在第二棵二叉树中，节点的角色进行了互换，叶子节点变为非叶子节点，非叶子节点转变为叶子节点</li>
+<li>如此，除了 root 点，任意节点都有了两个 parent 节点，两个 child 节点。root 节点也有了一个 child 和一个 parent</li>
+</ul>
+<p>Double Binary Tree 带来的优势：</p>
+<ul>
+<li>与 Single Binary Tree 形成互补 Tree，通信更加均衡。基本上所有节点都有两个 parent 连接，两个 child 连接</li>
+<li>增加一个通道，数据可以并行发送和接收，通信时延进一步降低</li>
+</ul>
+<p>比如执行 All Reduce 操作时，每个节点的数组分别有 2N 个元素，前 N 个元素被映射到 Double Binary Tree 1，剩下的 N 个元素被映射到 Double Binary Tree 2，数据 reduce 操作可以在两棵 Tree 上并行执行，broadcast 阶段也是如此。</p>
+<h5 id="split-tree-和-balanced-tree">Split Tree 和 Balanced Tree</h5>
+<p>Split Tree 和 Balanced Tree 本质上也都是 Double Binary Tree。但是都在 Double Binary Tree 基础上做了相应变化。</p>
+<p>这里需要澄清一个概念，在多机通信时，每个物理节点会选取其中一些节点作为与外部通信的节点；在物理节点内部，GPU 节点之间退化为链路结构。比如现在有 4 个物理节点，每个节点都有 8 个 GPU：</p>
+<pre><code class="language-shell"># node1 的 GPU 编号
+7-&gt;6-&gt;5-&gt;4-&gt;3-&gt;2-&gt;1-&gt;0
+
+# node2 的 GPU 编号
+15-&gt;14-&gt;13-&gt;12-&gt;11-&gt;10-&gt;9-&gt;8
+
+# node3 的 GPU 编号
+23-&gt;22-&gt;21-&gt;20-&gt;19-&gt;18-&gt;17-&gt;16
+
+# node4 的 GPU 编号
+31-&gt;30-&gt;29-&gt;28-&gt;27-&gt;26-&gt;25-&gt;24
+</code></pre>
+<p>那么对于普通 Double Binary Tree，有如下两棵树形结构：</p>
+<ul>
+<li>Tree1 中 GPU-8 和 GPU-24 为叶子节点，GPU-16 和 GPU-0 为非叶子节点</li>
+</ul>
+<pre><code class="language-shell">{8, 24} -&gt; 16 -&gt; 0
+</code></pre>
+<ul>
+<li>Tree2 中 GPU-0 和 GPU-16 为叶子节点，GPU-8 和 GPU-24 为非叶子节点。相对于 Tree 1，节点角色已经互换</li>
+</ul>
+<pre><code class="language-shell">{0, 16} -&gt; 8 -&gt; 24
+</code></pre>
+<p>Double Binary Tree 1 如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171211939-894963942.png" class="lazyload">
+</div>
+<p>Double Binary Trees 2 如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171240777-2019038671.png" class="lazyload">
+</div>
+<p>NCCL 对 Double Binary Tree 的定义：</p>
+<pre><code class="language-c++">#define NCCL_TOPO_PATTERN_TREE 3            // All NIC traffic going to/from the same GPU
+</code></pre>
+<p>对于 Split Tree，有如下两棵树形结构：</p>
+<ul>
+<li>Tree1 中 GPU-8 和 GPU-24 为子节点，GPU-17 为 parent 节点， GPU-16 为 GPU-1 的子节点</li>
+</ul>
+<pre><code class="language-shell">{8, 24} -&gt; {17, 16} -&gt; 0
+</code></pre>
+<ul>
+<li>Tree2 中 GPU-0 和 GPU-16 为子节点，GPU-9 为 parent 节点， GPU-8 为 GPU-25 的子节点</li>
+</ul>
+<pre><code class="language-shell">{0, 16} -&gt; {9, 8} -&gt; 24
+</code></pre>
+<p>Split Tree 1 如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171313687-743427350.png" class="lazyload">
+</div>
+<p>Split Tree 2 如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171350618-252454726.png" class="lazyload">
+</div>
+<p>NCCL 对 Split Tree 的定义：</p>
+<pre><code class="language-c++">#define NCCL_TOPO_PATTERN_SPLIT_TREE 2      // Spread NIC traffic between two GPUs (Tree parent on first GPU, tree children on the second GPU)
+</code></pre>
+<p>带来的优势：</p>
+<ul>
+<li>GPU 不再是单点热点。不再是每个节点的 first GPU 承担全部工作，其它 GPU 也会分担一些计算任务
+<ul>
+<li>例如 Tree1 中，GPU-1 承担了子节点的 reduce 计算，而不再是 GPU-0 既要承担全部 reduce，又要执行 broadcast</li>
+<li>同理，Tree1 中 GPU-17，也为 GPU-16 分担了一些计算任务</li>
+</ul>
+</li>
+<li>不再是同一个 GPU 同时处理 RX/TX 流量。NIC 的 ingress 和 egress，落在了不同的 GPU 上，避免带宽下降（虽然是全双工，但实际上 RX/TX同时发生时，容易出现Copy Engine，arbitration争抢，AI说的）
+<ul>
+<li>例如 Tree1 中，reduce 操作时，GPU-17 只接收，GPU-16 只发送</li>
+</ul>
+</li>
+</ul>
+<p>对于 Balanced Tree，有如下两棵树形结构：</p>
+<ul>
+<li>Tree1 中 GPU-8 和 GPU-24 为子节点，GPU-17 为 GPU-24 的 parent 节点， GPU-16 为 GPU-8 的 parent 节点</li>
+</ul>
+<pre><code class="language-shell">{8, 24} -&gt; {17, 16} -&gt; 0
+</code></pre>
+<ul>
+<li>Tree2 中 GPU-0 和 GPU-16 为子节点，GPU-9 为 GPU-16 的 parent 节点， GPU-8 为 GPU-0 的 parent 节点</li>
+</ul>
+<pre><code class="language-shell">{0, 16} -&gt; {9, 8} -&gt; 24
+</code></pre>
+<p>Balanced Tree 1 如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171424819-1978798644.png" class="lazyload">
+</div>
+<p>Balanced Tree 2 如下图所示：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171459507-1569997731.png" class="lazyload">
+</div>
+<p>NCCL 对 Balanced Tree 的定义：</p>
+<pre><code class="language-c++">#define NCCL_TOPO_PATTERN_BALANCED_TREE 1   // Spread NIC traffic between two GPUs (Tree parent + one child on first GPU, second child on second GPU)
+</code></pre>
+<p>带来的优势：流量更加负载均衡，NIC 流量分摊到多个 GPU（流量送到多个 GPU，比流量送到同一个 GPU 要更容易吃满 NIC 带宽，AI说的）；两个 parent 节点分别处理不同 child 节点的流量。</p>
+<h3 id="nccl通信算法的选择">NCCL通信算法的选择</h3>
+<p>NCCL 会根据通信操作类型、数据大小、GPU/节点数量、底层网络拓扑等自动选择最优算法。如下为 Ring 和 Tree 算法的一些对比差异：</p>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>Ring 算法</th>
+<th>Tree 算法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>通信步数</td>
+<td>O(N)</td>
+<td>O(log N)</td>
+</tr>
+<tr>
+<td>带宽效率</td>
+<td>高（接近最优）</td>
+<td>中等（根节点易成瓶颈）</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>较高</td>
+<td>较低</td>
+</tr>
+<tr>
+<td>适用操作</td>
+<td>AllReduce（主流）</td>
+<td>Broadcast, Reduce, AllReduce</td>
+</tr>
+<tr>
+<td>适用规模</td>
+<td>小 / 中规模（节点少）</td>
+<td>大规模（节点多）</td>
+</tr>
+</tbody>
+</table>
+<p>在链接：<a href="https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/" target="_blank" rel="noopener nofollow">https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/</a> 中，通过 All Reduce 操作，比较了 Ring 和 Tree 的时延和带宽差异，在大规模集群场景，Tree 的时延是显著低于 Ring 算法的。</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228143815215-1587192481.png" class="lazyload">
+</div>
+<h3 id="nccl-多节点之间的-channel-连接">NCCL 多节点之间的 Channel 连接</h3>
+<p>NCCL 在为每个 rank 计算完通道后，接下来就要将多机之间的 channel 进行连接，在多机之间形成逻辑上的通信路径。这里只涉及 Ring channel 的相关逻辑。</p>
+<p>首先设置当前 rank 计算得到的通道相关信息，例如通道数，机间带宽等。</p>
+<pre><code class="language-c++">  NCCLCHECKGOTO(ncclCalloc(&amp;allGather3Data, nranks), ret, fail);
+
+  for (int a=0; a&lt;NCCL_NUM_ALGORITHMS; a++) {
+    allGather3Data[rank].graphInfo[a].pattern = graphs[a]-&gt;pattern;
+    allGather3Data[rank].graphInfo[a].nChannels = graphs[a]-&gt;nChannels;
+    allGather3Data[rank].graphInfo[a].sameChannels = graphs[a]-&gt;sameChannels;
+    allGather3Data[rank].graphInfo[a].bwIntra = graphs[a]-&gt;bwIntra;
+    allGather3Data[rank].graphInfo[a].bwInter = graphs[a]-&gt;bwInter;
+    allGather3Data[rank].graphInfo[a].typeIntra = graphs[a]-&gt;typeIntra;
+    allGather3Data[rank].graphInfo[a].typeInter = graphs[a]-&gt;typeInter;
+    allGather3Data[rank].graphInfo[a].crossNic = graphs[a]-&gt;crossNic;
+  }
+</code></pre>
+<p>设置当前 rank 的具体通道信息：</p>
+<ul>
+<li>ringRecv[c] 表示：表示当前 ring channel c 的第一个接收数据的 rank id</li>
+<li>ringSend[c] 表示：表示当前 ring channel c 的最后一个 rank id</li>
+<li>ringPrev[c] 表示：当前 rank 的前驱 rank id</li>
+<li>ringNext[c] 表示：当前 rank 的后继 rank id</li>
+</ul>
+<pre><code class="language-c++">ncclResult_t ncclTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs, struct ncclTopoRanks* topoRanks) {
+  ......
+  for (int i=0; i&lt;localRanks; i++) {
+    if (ringIntra[i] == rank) {
+      topoRanks-&gt;ringRecv[c] = ringIntra[0];
+      topoRanks-&gt;ringSend[c] = ringIntra[localRanks-1];
+      topoRanks-&gt;ringPrev[c] = (i == 0) ? -1 : ringIntra[i-1];
+      topoRanks-&gt;ringNext[c] = (i == localRanks-1) ? -1 : ringIntra[i+1];
+    }
+  ......
+}
+</code></pre>
+<p>接下来通过控制通道交换所有 rank 的通道信息，目的：</p>
+<ul>
+<li>对齐通道数和通信带宽</li>
+<li>统一多机通信算法等</li>
+</ul>
+<pre><code class="language-c++">  bootstrapAllGather(comm-&gt;bootstrap, allGather3Data, sizeof(*allGather3Data))
+
+  for (int i=0; i&lt;nranks; i++) {
+    allTopoRanks[i] = &amp;allGather3Data[i].topoRanks;
+    // Make sure we align all ranks so that the tuning is consistent across ranks
+    for (int a=0; a&lt;NCCL_NUM_ALGORITHMS; a++) {
+      graphs[a]-&gt;nChannels = std::min(allGather3Data[i].graphInfo[a].nChannels, graphs[a]-&gt;nChannels);
+      graphs[a]-&gt;sameChannels = std::min(allGather3Data[i].graphInfo[a].sameChannels, graphs[a]-&gt;sameChannels);
+      graphs[a]-&gt;bwIntra = std::min(allGather3Data[i].graphInfo[a].bwIntra, graphs[a]-&gt;bwIntra);
+      graphs[a]-&gt;bwInter = std::min(allGather3Data[i].graphInfo[a].bwInter, graphs[a]-&gt;bwInter);
+      graphs[a]-&gt;typeIntra = std::max(allGather3Data[i].graphInfo[a].typeIntra, graphs[a]-&gt;typeIntra);
+      graphs[a]-&gt;typeInter = std::max(allGather3Data[i].graphInfo[a].typeInter, graphs[a]-&gt;typeInter);
+      graphs[a]-&gt;crossNic = std::max(allGather3Data[i].graphInfo[a].crossNic, graphs[a]-&gt;crossNic);
+    }
+    comm-&gt;maxTreePattern = std::max(comm-&gt;maxTreePattern, allGather3Data[i].graphInfo[NCCL_ALGO_TREE].pattern);
+  }
+</code></pre>
+<p>信息交换并对齐后，接下来就开始跨节点合并通道，实现多机间的逻辑 ring 连接。</p>
+<p>这里需要提到一个通信优化： 多机间 ring 通道通信，NCCL 将奇数 node 节点的奇数通道，偶数通道使用的网卡进行交换，避免跨轨通信。</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171701252-12329151.png" class="lazyload">
+</div>
+<p>当 NCCL_CROSS_NIC = 2（default），且节点有多块网卡，并计算出多 channel 时，NCCL 会使奇偶通道交替使用 NIC，实现流量负载均衡（NET0 和 NET1都实现收发），例如：</p>
+<pre><code class="language-shell"># channel 0
+NET 0 -&gt; GPU a -&gt; GPU b -&gt; .. -&gt; GPU x -&gt; NET 1
+
+# channel 1
+NET 1 -&gt; GPU a -&gt; GPU b -&gt; .. -&gt; GPU x -&gt; NET 0
+</code></pre>
+<p>对于 channel 0，NCCL 会在所有节点上，都使用 NET 0 收，NET 1 发，那么流量到达 node-1 时，将会由 node-1 的 NET 0 收，造成了跨轨通信。NCCL 为了避免跨轨通信，将奇数 node 的奇偶通道互换，实现同轨通信。例如 node-0 使用 NET 1 发送时，node-1 实现通过 NET 1 接收数据。</p>
+<pre><code class="language-c++">  // Alternate rings to avoid crossing rails.
+  // CrossNic values could be not the same on all nodes as it depends on the number of net devs and the NVLink bandwidth.
+  // Therefore, it's only done if the rank obtained a solution with crossNic=2.
+  for (int r = 0; r &lt; comm-&gt;nRanks; r++) {
+    if (allTopoRanks[r]-&gt;crossNicRing == 2 &amp;&amp; (nChannels % 2) == 0 &amp;&amp; (comm-&gt;rankToNode[r] % 2) == 1) {
+      // Exchange rings
+      for (int c=0; c&lt;nChannels; c+=2) {
+        exchangeValues(allTopoRanks[r]-&gt;ringRecv+c, allTopoRanks[r]-&gt;ringRecv+(c^1));
+        exchangeValues(allTopoRanks[r]-&gt;ringSend+c, allTopoRanks[r]-&gt;ringSend+(c^1));
+        exchangeValues(allTopoRanks[r]-&gt;ringPrev+c, allTopoRanks[r]-&gt;ringPrev+(c^1));
+        exchangeValues(allTopoRanks[r]-&gt;ringNext+c, allTopoRanks[r]-&gt;ringNext+(c^1));
+      }
+    }
+  }
+</code></pre>
+<p>接下来就是通过 connectRings，将多机间的 ring 连接起来，分别设置每个 rank 的前驱和后继，实现多机间 ring 的连接。</p>
+<pre><code class="language-c++">static ncclResult_t connectRings(struct ncclComm* comm, int* ringRecv, int* ringSend, int* ringPrev, int* ringNext) {
+  ......
+  for (int c=0; c&lt;nChannels; c++) {
+    int* recv = ringRecv+c*comm-&gt;nNodes;
+    int* send = ringSend+c*comm-&gt;nNodes;
+    int* prev = ringPrev+c*comm-&gt;nRanks;
+    int* next = ringNext+c*comm-&gt;nRanks;
+    for (int n=0; n&lt;nNodes; n++) {
+      int recvRank = recv[n];
+      int prevSendRank = send[(n-1+nNodes)%nNodes];
+      prev[recvRank] = prevSendRank;
+      int sendRank = send[n];
+      int nextRecvRank = recv[(n+1)%nNodes];
+      next[sendRank] = nextRecvRank;
+    }
+  }
+  ......
+}
+</code></pre>
+<p>按照当前实验环境，两个 node，每个 node 分别两块 GPU，上述 ring 连接逻辑对应日志如下：</p>
+<pre><code class="language-shell"># rank 0
+# 3为前驱，1为后继
+Ring 00 : 3 -&gt; 0 -&gt; 1
+
+# rank 1
+# 0为前驱，2为后继
+Ring 00 : 0 -&gt; 1 -&gt; 2
+
+# rank 2
+# 1为前驱，3为后继
+Ring 00 : 1 -&gt; 2 -&gt; 3
+
+# rank 3
+# 2为前驱，0为后继
+2 -&gt; 3 -&gt; 0
+</code></pre>
+<p>NCCL 初始化的目的，可以引用如下示意图来概括：</p>
+<div align="center">
+<img data-src="https://img2024.cnblogs.com/blog/1485868/202602/1485868-20260228171756494-2093687541.png" class="lazyload">
+</div>
+<h1 id="初始化总结">初始化总结</h1>
+<p>基于现有测试环境，以上内容从源码层面分析了 NCCL 的初始化关键流程。包括：</p>
+<ul>
+<li>网络插件初始化。主要涉及 InfiniBand，或者基于 TCP/IP 的 Socket 网络插件的选择。</li>
+<li>NCCL 控制环的建立。主要涉及 Unique Id 的产生和用途，以及所有 rank 组成控制面环形拓扑的相关流程。</li>
+<li>PCIe 设备发现。记录从 GPU/NIC 出发，直至归属 CPU 这条物理 PCIe 链路上有哪些 PCIe 设备，并生成从 GPU/NIC 至 CPU 链路的 PCIe XML 链路拓扑。</li>
+<li>PCIe 设备间建图。PCIe 设备之间的物理链路关系是事实存在的，但是 NCCL 需要将这些链路关系建立到自身的数据结构中，目的是后续 channel 的计算服务。</li>
+<li>PCIe 设备间最优可达路径计算。基于 PCIe 建图，NCCL 拥有 PCIe 设备间的连关系。在此基础上，NCCL 使用 BFS 算法，计算任意 PCIe 设备之间的最优可达路径，即跳数最少，带宽最大的可达路径。</li>
+<li>设备内部基于 Ring，Tree 通信算法的 channel 计算。在路径带宽允许的情况下，NCCL 会尽最大可能计算出同一种通信算法的更多通信通道，从而尽可能榨干硬件带宽资源。</li>
+<li>多机间 Ring，Tree 通道的连接。在多级多卡之间，协商出最终可通信的逻辑算法拓扑。</li>
+<li>也分析了 NCCL tree 由 Double Binary Tree 到 Split Tree，再到 Balanced Tree 的演进和优化思想</li>
+</ul>
+<p>截至本篇文章发布的时间点，可能是读者们能搜到的有关 NCCL 初始化介绍最全面和详细的文章了。</p>
+<p>以上内容是基于源码学习后，再纯手工逐字撰写，包括很多配图的原创。但是，文章也肯定存在很多错误和疏漏之处，也请大家拍砖！</p>
+<p>本文来自博客园，作者：<a href="https://www.cnblogs.com/t-bar" target="_blank">T-BARBARIANS</a> <strong>原创</strong>，博文严禁转载，转载必究！</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.010416666666666666" data-date-updated="2026-03-03 16:14">2026-03-03 15:59</span>&nbsp;
+<a href="https://www.cnblogs.com/t-bar">T-BARBARIANS</a>&nbsp;
+阅读(<span id="post_view_count">16</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19652703);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19652703', targetLink: 'https://www.cnblogs.com/t-bar/p/19652703', title: 'NVIDIA GPU 集合通信库 NCCL 初始化流程源码级剖析' })">举报</a>
+</div>
+        
