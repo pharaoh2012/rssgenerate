@@ -1,0 +1,120 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/bcodepod/p/19675908" title="发布于 2026-03-06 08:42">
+    <span role="heading" aria-level="2">SQL Server数据库服务器内存问题排查</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>最近我公众号小伙伴反馈数据库服务器爆满如何处理！接下来我详细解答一下处理方案和预防方案。<br>
+SQL Server数据库服务器内存占用高是普遍情况，不用过于紧张，因为几乎所有涉及的数据库为了加快数据库的执行效率都会缓存一部分数据到内存，<strong>如果服务器还有剩余内存，通常不用慌</strong>。如果经常内存爆满导致服务器异常那就另当别论了。</p>
+<h3 id="一-立刻处理快速释放恢复">一、 立刻处理（快速释放、恢复）</h3>
+<ol>
+<li><strong>清除缓存（谨慎使用，仅在紧急时）</strong><br>
+这会清空缓存，可能导致瞬间性能波动，业务低峰期操作。<pre><code class="language-sql">DBCC FREESYSTEMCACHE ('ALL'); 
+DBCC FREEPROCCACHE; 
+</code></pre>
+</li>
+<li><strong>杀掉阻塞/耗时查询</strong><br>
+先找出耗资源的会话，手动 Kill。<pre><code class="language-sql">-- 查看耗时且占用高的会话（为啥限制大于50是因为2005之前系统会话ID都小于等于50）
+SELECT session_id, status, command, wait_type 
+FROM sys.dm_exec_requests 
+WHERE session_id &gt; 50;
+
+-- 杀掉会话（替换 SPID）注意一定不要误杀 有些属于系统会话（比如写日志、清理）
+KILL 56; 
+</code></pre>
+</li>
+</ol>
+<h3 id="二-根源排查">二、 根源排查</h3>
+<ol>
+<li><strong>确认内存使用情况</strong><pre><code class="language-sql">  -- 查看数据库内存使用
+   SELECT 
+       (physical_memory_in_use_kb / 1024) AS SQL_Server_Used_Memory_MB,
+       (locked_page_allocations_kb / 1024) AS SQL_Server_Locked_Pages_MB,
+       (total_virtual_address_space_kb / 1024) AS Total_Virtual_Address_Space_MB,
+       process_physical_memory_low,
+       process_virtual_memory_low
+   FROM sys.dm_os_process_memory;
+   --查看服务器内存使用
+     SELECT 
+       (total_physical_memory_kb / 1024) AS Total_OS_Memory_MB,
+       (available_physical_memory_kb / 1024) AS Available_OS_Memory_MB,
+       system_memory_state_desc
+   FROM sys.dm_os_sys_memory;
+</code></pre>
+<ul>
+<li><strong>结论</strong>：如果 <code>Available_OS_Memory_MB</code> 还很大，说明这只是SQL占满了缓冲池，是正常现象；如果可用内存极少，服务器甚至Swap分区爆满，才需要紧急优化。*<br>
+<strong>顺便提一下，不要使用任务管理器来查看 SQL Server 的内存使用情况，它显示的值往往不准确。这是因为如果 SQL Server 启用了“锁定内存页”权限，大部分内存分配会通过 AWE API 进行，这部分内存不会在任务管理器的“进程私有字节”中显示，从而导致你看不到真实的内存占用。使用上述 DMV 查询才能获得准确的数据。</strong></li>
+</ul>
+</li>
+<li><strong>定位是谁在“吃内存”</strong><pre><code class="language-sql">-- 按数据库统计内存占用
+SELECT 
+    DB_NAME(database_id) AS DatabaseName,
+    COUNT(*) * 8/1024 AS CacheSize_MB
+FROM sys.dm_os_buffer_descriptors
+GROUP BY DB_NAME(database_id)
+ORDER BY CacheSize_MB DESC;
+GO
+</code></pre>
+</li>
+</ol>
+<h3 id="三-永久优化方案稳定运行">三、 永久优化方案（稳定运行）</h3>
+<ol>
+<li><strong>配置最大内存（关键！）</strong><br>
+防止SQL Server抢光系统内存导致Windows或其他服务挂掉。<pre><code class="language-sql">sp_configure 'show advanced options', 1; RECONFIGURE;
+sp_configure 'max server memory (MB)', 32768; -- 假设机器64G，留32G给系统和其他程序
+RECONFIGURE;
+</code></pre>
+</li>
+<li><strong>索引与查询优化</strong><br>
+内存高大多是因为全表查询、缺失表索引、滥用函数、查询大字段数据导致的。
+<ul>
+<li><strong>重建/重组索引</strong>：</li>
+</ul>
+<pre><code class="language-sql">-- 检查碎片
+DBCC SHOWCONTIG ('表名');
+-- 重组（碎片&lt;30%）或重建（碎片&gt;30%）
+ALTER INDEX ALL ON 表名 REBUILD;
+</code></pre>
+</li>
+</ol>
+<ul>
+<li><strong>清理执行计划缓存</strong>：解决参数嗅听问题。</li>
+</ul>
+<pre><code class="language-sql">DBCC FREEPROCCACHE;
+</code></pre>
+<h3 id="四-监控预警建议">四、 监控预警建议</h3>
+<p>建议在服务器上建个作业，每天自动检查内存，超了发邮件/短信提醒：</p>
+<pre><code class="language-sql">-- 简单的内存告警检查脚本
+DECLARE @UsedMB INT;
+SELECT @UsedMB = (physical_memory_in_use_kb/1024) FROM sys.dm_os_process_memory;
+
+IF @UsedMB &gt; 40000  -- 阈值，根据你机器配置调整
+BEGIN
+    -- 这里可以调用存储过程发送邮件通知
+    PRINT '警告：SQL Server内存占用已超过阈值！当前使用：' + CAST(@UsedMB AS VARCHAR) + ' MB';
+END;
+</code></pre>
+<p>💡 <strong>核心思路</strong>：SQL Server吃内存是为了<strong>快</strong>。只要不导致服务器卡顿、不报错，高内存利用率反而是服务器配置在物尽其用。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.03680555555555556" data-date-updated="2026-03-06 09:35">2026-03-06 08:42</span>&nbsp;
+<a href="https://www.cnblogs.com/bcodepod">马永猛</a>&nbsp;
+阅读(<span id="post_view_count">75</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19675908);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19675908', targetLink: 'https://www.cnblogs.com/bcodepod/p/19675908', title: 'SQL Server数据库服务器内存问题排查' })">举报</a>
+</div>
+        
