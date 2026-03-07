@@ -1,0 +1,215 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/manuscript/p/19683931" title="发布于 2026-03-07 19:17">
+    <span role="heading" aria-level="2">Kind 环境下 Flannel IPsec 模式跨节点通信故障排查流程</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="环境信息">环境信息</h2>
+<table>
+<thead>
+<tr>
+<th>部署方式</th>
+<th>Docker + Kind</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>K8s 版本</td>
+<td>v1.27.3</td>
+</tr>
+<tr>
+<td>CNI</td>
+<td>Flannel IPsec 模式</td>
+</tr>
+<tr>
+<td>节点网络</td>
+<td>172.18.0.0/16（Docker bridge）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="问题现象">问题现象</h2>
+<p>同节点 Pod 通信正常，跨节点 Pod 通信卡住超时：</p>
+<pre><code class="language-bash"># 同节点访问正常
+docker exec flannel-ipsec-control-plane curl -s 10.244.0.4
+PodName: Pod-1 | PodIP: eth0 10.244.0.4/24
+
+# 跨节点访问卡住
+docker exec flannel-ipsec-control-plane curl -s 10.244.1.7
+# 无响应...
+</code></pre>
+<p>检查 IPsec 状态，SA 未建立：</p>
+<pre><code class="language-bash">docker exec flannel-ipsec-control-plane ip xfrm state
+# 空
+</code></pre>
+<h2 id="排查过程">排查过程</h2>
+<h3 id="查看-flannel-日志">查看 Flannel 日志</h3>
+<p>control-plane 节点：</p>
+<pre><code class="language-bash">kubectl logs -n kube-system kube-flannel-ds-cd8rf
+
+06[CFG] loaded IKE shared key for: '172.18.0.3'
+13[CFG] loaded IKE shared key for: '172.18.0.2'
+
+07[NET] received packet: from 172.18.0.1[500] to 172.18.0.3[500] (720 bytes)
+07[IKE] no IKE config found for 172.18.0.3...172.18.0.1, sending NO_PROPOSAL_CHOSEN
+</code></pre>
+<p>worker 节点：</p>
+<pre><code class="language-bash">kubectl logs -n kube-system kube-flannel-ds-gk7pl
+
+11[NET] sending packet: from 172.18.0.2[500] to 172.18.0.3[500] (720 bytes)
+04[NET] received packet: from 172.18.0.1[500] to 172.18.0.2[500] (720 bytes)
+04[IKE] no IKE config found for 172.18.0.2...172.18.0.1, sending NO_PROPOSAL_CHOSEN
+</code></pre>
+<p><strong>发现问题</strong>：</p>
+<p>IKE 包经过 Docker bridge 时，源 IP 被 SNAT 成了网关地址。</p>
+<table>
+<thead>
+<tr>
+<th>预期源 IP</th>
+<th>实际源 IP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>172.18.0.2 (worker)</td>
+<td>172.18.0.1 (网关)</td>
+</tr>
+<tr>
+<td>172.18.0.3 (control-plane)</td>
+<td>172.18.0.1 (网关)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="检查-iptables-nat-规则">检查 iptables NAT 规则</h3>
+<pre><code class="language-bash">iptables -t nat -L POSTROUTING -n -v
+
+Chain POSTROUTING (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in  out               source          destination
+  706 42360 MASQUERADE 0    --  *   !br-822761cba2a3  172.18.0.0/16   0.0.0.0/0
+  269 19012 MASQUERADE 0    --  *   !br-64b0f4dac739  172.18.0.0/16   0.0.0.0/0
+</code></pre>
+<p>按规则字面意思，出口不是网桥 <code>!br-xxx</code> 才触发 MASQUERADE，同网桥转发不应该 NAT。</p>
+<p><strong>但问题是</strong>：K8s 部署时需要开启 <code>bridge-nf-call-iptables = 1</code>，导致网桥转发流量也会经过 iptables，触发了 MASQUERADE。</p>
+<pre><code class="language-bash">cat /proc/sys/net/bridge/bridge-nf-call-iptables
+# 1
+</code></pre>
+<p>流量示意：</p>
+<div class="mermaid">flowchart TB
+    subgraph s1 ["bridge-nf-call-iptables=0"]
+        direction LR
+        A1[容器A] --&gt; B1[网桥]
+        B1 --&gt; C1[容器B]
+        style B1 fill:#90EE90
+    end
+
+    subgraph s2 ["bridge-nf-call-iptables=1"]
+        direction LR
+        A2[容器A] --&gt; B2[网桥]
+        B2 --&gt; C2[iptables]
+        C2 --&gt;|MASQUERADE| D2[容器B]
+        style C2 fill:#FFB6C1
+    end
+</div><h2 id="问题原因">问题原因</h2>
+<p>Kind 环境下，K8s 节点本身是 Docker 容器，通过网桥互联。<code>bridge-nf-call-iptables = 1</code> 导致同网桥转发的流量也经过 iptables，触发 Docker 的 MASQUERADE 规则，源 IP 被改成网关 IP（172.18.0.1），Flannel IPsec 的 IKE 协商因此失败。</p>
+<p><strong>注</strong>：这是 Kind 环境特有的问题，kubeadm 部署的物理机/VM 环境不经过 Docker 网桥，不会遇到类似问题。</p>
+<h2 id="解决方案">解决方案</h2>
+<p>在宿主机添加 iptables 规则，让同网段流量跳过 MASQUERADE：</p>
+<pre><code class="language-bash">iptables -t nat -I POSTROUTING -s 172.18.0.0/16 -d 172.18.0.0/16 -j ACCEPT
+</code></pre>
+<p>规则说明：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-t nat</code></td>
+<td>操作 NAT 表</td>
+</tr>
+<tr>
+<td><code>-I POSTROUTING</code></td>
+<td>插入到 POSTROUTING 链最前面（优先级最高）</td>
+</tr>
+<tr>
+<td><code>-s 172.18.0.0/16</code></td>
+<td>匹配源 IP</td>
+</tr>
+<tr>
+<td><code>-d 172.18.0.0/16</code></td>
+<td>匹配目的 IP</td>
+</tr>
+<tr>
+<td><code>-j ACCEPT</code></td>
+<td>直接接受，跳过后续规则</td>
+</tr>
+</tbody>
+</table>
+<p>添加后验证：</p>
+<pre><code class="language-bash">iptables -t nat -L POSTROUTING -n -v
+
+Chain POSTROUTING (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in  out               source          destination
+   19  2648 ACCEPT     0    --  *   *                 172.18.0.0/16   172.18.0.0/16
+  706 42360 MASQUERADE 0    --  *   !br-822761cba2a3  172.18.0.0/16   0.0.0.0/0
+  269 19012 MASQUERADE 0    --  *   !br-64b0f4dac739  172.18.0.0/16   0.0.0.0/0
+</code></pre>
+<p>重启 Flannel 触发重新协商：</p>
+<pre><code class="language-bash">kubectl rollout restart daemonset -n kube-system kube-flannel-ds
+</code></pre>
+<p>验证 SA 已建立：</p>
+<pre><code class="language-bash"># docker exec flannel-ipsec-control-plane ip xfrm state
+src 172.18.0.3 dst 172.18.0.2
+        proto esp spi 0xc1115682 reqid 11 mode tunnel
+        replay-window 0 flag af-unspec
+        aead rfc4106(gcm(aes)) 0x217a8659909ac029fb600b7cab791ee5b31d3563 128
+        anti-replay context: seq 0x0, oseq 0x0, bitmap 0x00000000
+src 172.18.0.2 dst 172.18.0.3
+        proto esp spi 0xc3b69836 reqid 11 mode tunnel
+        replay-window 32 flag af-unspec
+        aead rfc4106(gcm(aes)) 0xfaa2ea9f4bfb893623ce9fc5aac9ae6646913ee7 128
+        anti-replay context: seq 0x0, oseq 0x0, bitmap 0x00000000
+src 172.18.0.3 dst 172.18.0.2
+        proto esp spi 0xc9b2e230 reqid 11 mode tunnel
+        replay-window 0 flag af-unspec
+        aead rfc4106(gcm(aes)) 0x93c09105fd818db55e1b2d730fd31ff989fd33c2 128
+        anti-replay context: seq 0x0, oseq 0x0, bitmap 0x00000000
+src 172.18.0.2 dst 172.18.0.3
+        proto esp spi 0xc709b48b reqid 11 mode tunnel
+        replay-window 32 flag af-unspec
+        aead rfc4106(gcm(aes)) 0x60697edd7c58b57220c15d3b9d41851a206d4e4e 128
+        anti-replay context: seq 0x0, oseq 0x0, bitmap 0x00000000
+</code></pre>
+<p>跨节点 Pod 通信测试：</p>
+<pre><code class="language-bash">docker exec flannel-ipsec-control-plane curl -s 10.244.1.7
+# PodName: Pod-0 | PodIP: eth0 10.244.1.7/24
+</code></pre>
+<h2 id="问题总结">问题总结</h2>
+<ol>
+<li><code>NO_PROPOSAL_CHOSEN</code> 不一定是算法协商问题，也可能是 IP 不匹配</li>
+<li>排查 IPsec 问题时，关注 <code>[NET]</code> 日志中的实际源/目的 IP</li>
+<li>Kind 环境的网络行为与物理机不同，遇到问题时优先考虑 Docker 网桥的影响</li>
+</ol>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.005555555555555556" data-date-updated="2026-03-07 19:25">2026-03-07 19:17</span>&nbsp;
+<a href="https://www.cnblogs.com/manuscript">怎么还在写代码</a>&nbsp;
+阅读(<span id="post_view_count">2</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19683931);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19683931', targetLink: 'https://www.cnblogs.com/manuscript/p/19683931', title: 'Kind 环境下 Flannel IPsec 模式跨节点通信故障排查流程' })">举报</a>
+</div>
+        
