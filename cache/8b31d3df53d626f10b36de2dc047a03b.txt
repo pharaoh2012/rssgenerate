@@ -1,0 +1,201 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/denglei1024/p/19714424" title="发布于 2026-03-13 16:24">
+    <span role="heading" aria-level="2">EF Core 并发冲突实战：乐观锁、RowVersion 与 DbUpdateConcurrencyException 怎么处理</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>并发冲突是 EF Core 里最容易被忽视、出了事又最难排查的问题之一。这篇文章聊聊它的机制、怎么配置乐观锁、冲突异常怎么处理。</p>
+<h2 id="问题背景">问题背景</h2>
+<p>真实场景：电商平台秒杀活动，同一件商品被多个请求并发扣减库存。业务日志里一切正常，但库存对不上——扣了 100 件，实际库存只减少了 60 件。</p>
+<p>排查后发现：</p>
+<ul>
+<li>多个请求几乎同时读取了库存为 200 的记录</li>
+<li>各自在内存里把数量减掉后写回</li>
+<li>数据库里最后一个写入覆盖了前面所有写入的结果</li>
+<li>EF Core 没有报任何错误，因为没有配置并发控制</li>
+</ul>
+<p>这就是典型的"丢失更新"（Lost Update）。</p>
+<h2 id="原理解析">原理解析</h2>
+<h3 id="ef-core-的并发控制模型">EF Core 的并发控制模型</h3>
+<p>EF Core 支持<strong>乐观并发</strong>，不在读取时加锁，而是在写入时检测：</p>
+<blockquote>
+<p>提交更新时，把当前数据库中读取到的"令牌值"放进 WHERE 条件，如果这行在读取之后被别人改动过，令牌不匹配，受影响行数为 0，EF Core 就会抛出 <code>DbUpdateConcurrencyException</code>。</p>
+</blockquote>
+<p>生成的 SQL 大概长这样：</p>
+<pre><code class="language-sql">UPDATE Products
+SET Stock = @newStock
+WHERE Id = @id AND RowVersion = @originalRowVersion
+</code></pre>
+<p>如果 <code>RowVersion</code> 被别人改过，WHERE 匹配不到，更新语句影响 0 行，EF Core 检测到后抛异常。</p>
+<h3 id="两种并发令牌配置方式">两种并发令牌配置方式</h3>
+<p><strong>方式一：<code>[Timestamp]</code> / <code>IsRowVersion()</code>（推荐）</strong></p>
+<p>数据库自动维护，每次行更新时自增，不需要应用层干预：</p>
+<pre><code class="language-csharp">public sealed class Product
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public int Stock { get; set; }
+
+    [Timestamp]
+    public byte[] RowVersion { get; set; } = [];
+}
+</code></pre>
+<p>或者在 <code>OnModelCreating</code> 里配置：</p>
+<pre><code class="language-csharp">modelBuilder.Entity&lt;Product&gt;()
+    .Property(p =&gt; p.RowVersion)
+    .IsRowVersion();
+</code></pre>
+<p><strong>方式二：<code>[ConcurrencyCheck]</code>（字段级令牌）</strong></p>
+<p>不需要专门的版本字段，直接把某个业务字段标为并发令牌：</p>
+<pre><code class="language-csharp">public sealed class Seat
+{
+    public int Id { get; set; }
+
+    [ConcurrencyCheck]
+    public string? OccupiedBy { get; set; }
+}
+</code></pre>
+<p>适合"只要这个字段没被改就允许写"的场景，但精度不如 <code>RowVersion</code>——其他字段改了不会触发冲突检测。</p>
+<h3 id="dbupdateconcurrencyexception-的结构">DbUpdateConcurrencyException 的结构</h3>
+<p>冲突发生时，异常里携带了足够的信息用于决策：</p>
+<pre><code class="language-csharp">catch (DbUpdateConcurrencyException ex)
+{
+    foreach (var entry in ex.Entries)
+    {
+        var proposedValues = entry.CurrentValues;   // 应用层想写入的值
+        var originalValues = entry.OriginalValues;  // 应用层读取时的快照
+        var databaseValues = await entry.GetDatabaseValuesAsync(); // 数据库现在的值
+    }
+}
+</code></pre>
+<p>三组值拿到手，才能做出合理的冲突解决策略。</p>
+<h2 id="示例代码">示例代码</h2>
+<h3 id="基础配置与迁移">基础配置与迁移</h3>
+<pre><code class="language-csharp">public sealed class AppDbContext : DbContext
+{
+    public DbSet&lt;Product&gt; Products =&gt; Set&lt;Product&gt;();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity&lt;Product&gt;()
+            .Property(p =&gt; p.RowVersion)
+            .IsRowVersion();
+    }
+}
+</code></pre>
+<p>生成迁移后，SQL Server 会把 <code>RowVersion</code> 字段类型映射为 <code>rowversion</code>，PostgreSQL 对应 <code>xmin</code> 系统列（用法略有差异）。</p>
+<h3 id="冲突重试客户端值优先">冲突重试：客户端值优先</h3>
+<p>最常见的处理策略——应用层值直接覆盖数据库值，适合"最后写入者获胜"的运营后台场景：</p>
+<pre><code class="language-csharp">public async Task UpdateStockAsync(int productId, int newStock, CancellationToken ct)
+{
+    const int maxRetries = 3;
+
+    for (var attempt = 0; attempt &lt; maxRetries; attempt++)
+    {
+        try
+        {
+            var product = await db.Products.FindAsync([productId], ct)
+                ?? throw new InvalidOperationException($"Product {productId} not found.");
+
+            product.Stock = newStock;
+            await db.SaveChangesAsync(ct);
+            return;
+        }
+        catch (DbUpdateConcurrencyException ex)
+        {
+            if (attempt == maxRetries - 1) throw;
+
+            // 刷新原始值快照，下一轮用新的 RowVersion 重试
+            foreach (var entry in ex.Entries)
+                await entry.ReloadAsync(ct);
+        }
+    }
+}
+</code></pre>
+<h3 id="冲突拒绝数据库值优先">冲突拒绝：数据库值优先</h3>
+<p>读取到冲突直接告知调用方，让用户重新决策，适合需要用户确认的场景：</p>
+<pre><code class="language-csharp">public async Task&lt;ConflictResult?&gt; TryDeductStockAsync(
+    int productId, int quantity, byte[] expectedRowVersion, CancellationToken ct)
+{
+    var product = await db.Products.FindAsync([productId], ct)
+        ?? throw new InvalidOperationException($"Product {productId} not found.");
+
+    if (!product.RowVersion.SequenceEqual(expectedRowVersion))
+        return new ConflictResult(product.Stock, product.RowVersion);
+
+    if (product.Stock &lt; quantity)
+        throw new InvalidOperationException("库存不足");
+
+    product.Stock -= quantity;
+
+    try
+    {
+        await db.SaveChangesAsync(ct);
+        return null; // 成功
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        var dbValues = await db.Products.AsNoTracking()
+            .FirstAsync(p =&gt; p.Id == productId, ct);
+        return new ConflictResult(dbValues.Stock, dbValues.RowVersion);
+    }
+}
+
+public record ConflictResult(int CurrentStock, byte[] CurrentRowVersion);
+</code></pre>
+<h3 id="冲突合并自定义字段级融合">冲突合并：自定义字段级融合</h3>
+<p>拿到三组值后，按业务规则逐字段决策：</p>
+<pre><code class="language-csharp">catch (DbUpdateConcurrencyException ex)
+{
+    foreach (var entry in ex.Entries)
+    {
+        var proposed = entry.CurrentValues;
+        var database = await entry.GetDatabaseValuesAsync();
+
+        if (database is null)
+            throw new InvalidOperationException("记录已被删除，无法合并。");
+
+        // 用数据库里最新的 Stock，保留应用层改动的 Name
+        proposed["Stock"] = database["Stock"];
+
+        // 把原始值快照更新为数据库当前值，下次提交时令牌匹配
+        entry.OriginalValues.SetValues(database);
+    }
+
+    await db.SaveChangesAsync(ct);
+}
+</code></pre>
+<h2 id="总结">总结</h2>
+<p>EF Core 的乐观并发基于"令牌比对"——写入时把读取时的快照值塞进 WHERE 条件，数据库决定这次更新是否有效。</p>
+<p>认识这个机制的关键点有三个：</p>
+<ol>
+<li><code>RowVersion</code> 是最省心的配置方式，让数据库自动维护版本</li>
+<li><code>DbUpdateConcurrencyException</code> 里有三组值，决定了你能做什么样的冲突处理</li>
+<li>冲突策略（重试、拒绝、合并）要结合业务场景选择，没有通用最优解</li>
+</ol>
+<p>并发冲突不是 EF Core 的问题，是分布式写入的本质问题。搞清楚它，才能在出事时不慌。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/denglei1024/" target="_blank">ryan-deng</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/denglei1024/p/19714424" target="_blank">https://www.cnblogs.com/denglei1024/p/19714424</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-03-13 16:25">2026-03-13 16:24</span>&nbsp;
+<a href="https://www.cnblogs.com/denglei1024">ryan-deng</a>&nbsp;
+阅读(<span id="post_view_count">101</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19714424);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19714424', targetLink: 'https://www.cnblogs.com/denglei1024/p/19714424', title: 'EF Core 并发冲突实战：乐观锁、RowVersion 与 DbUpdateConcurrencyException 怎么处理' })">举报</a>
+</div>
+        
