@@ -1,0 +1,213 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/denglei1024/p/19725123" title="发布于 2026-03-16 15:32">
+    <span role="heading" aria-level="2">EF Core 慢查询排查实战：TagWith、OpenTelemetry、执行计划，30 分钟定位性能瓶颈</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        压测没问题，上线却慢成一大坨？这篇用 TagWith + OpenTelemetry + 执行计划，带你 30 分钟定位 EF Core 慢查询真凶。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>EF Core 性能问题里，最折磨人的不是“慢”，而是“慢得没规律”，线上卡，测试又无法复现。</p>
+<p>很多小D、小W同学都经历过这种现场：</p>
+<ul>
+<li>压测数据很好看</li>
+<li>数据库 CPU 没打满</li>
+<li>业务代码看起来也没什么大问题</li>
+</ul>
+<p>你改了几个 <code>Include</code>，可能短期有效，但过两周又抖回来。根因往往不是某一行 LINQ 写错，而是整条排查链路没打通。</p>
+<p>这篇文章就做一件事：给你一套能线上落地的 EF Core 慢查询定位闭环，从应用日志一路追到数据库执行计划，不靠猜。</p>
+<h2 id="问题背景为什么本地快线上慢">问题背景：为什么本地快、线上慢</h2>
+<p>真实场景：订单列表接口平时 80ms 左右，高峰时段 P95 抬到 1s。你的第一反应是“数据库是不是扛不住了”，但监控显示：</p>
+<ul>
+<li>数据库 CPU 长期低于 50%</li>
+<li>连接池没有打满</li>
+<li>磁盘 IO 没明显异常</li>
+</ul>
+<p>排查下来，又遇到两个组合问题：</p>
+<ol>
+<li>列表查询没有打 SQL 标签，日志里几百条 SQL 根本分不出谁是谁</li>
+<li>某些筛选条件线上本地索引匹配不同，SQL 文本相同但参数分布不同，执行计划差异很大</li>
+</ol>
+<p>也就是说，问题不是“不会优化 SQL”，而是“看不见慢点在哪”。</p>
+<h2 id="原理解析慢查询定位为什么总是卡在一半">原理解析：慢查询定位为什么总是卡在一半</h2>
+<p>EF Core 的查询链路大致是：</p>
+<ol>
+<li>LINQ 表达式翻译成 SQL</li>
+<li>命令发送到数据库执行</li>
+<li>结果集回传并在应用层物化</li>
+</ol>
+<p>很多排查第一步都把 SQL 抓出来看看，忽略了第 2、3 步的上下文信息，比如：</p>
+<ul>
+<li>这条 SQL 是哪个接口触发的</li>
+<li>这次慢是数据库执行慢，还是返回数据太大导致物化慢</li>
+<li>慢的是固定 SQL，还是同模板下某些参数更慢</li>
+</ul>
+<p>要拿到这些信息，最实用的组合就是：</p>
+<ul>
+<li><code>TagWith</code>：给 SQL 打业务标签</li>
+<li><code>OpenTelemetry</code>：采集耗时、TraceId、SQL 标签并统一上报</li>
+<li>执行计划：确认索引命中、回表、扫描和 Key Lookup</li>
+</ul>
+<p>三者合起来，才能形成可服用、可验证的排查闭环。</p>
+<h2 id="示例代码从日志能看见到瓶颈可复盘">示例代码：从“日志能看见”到“瓶颈可复盘”</h2>
+<h3 id="第一步先在关键查询上打标签">第一步：先在关键查询上打标签</h3>
+<pre><code class="language-csharp">public sealed record OrderListItemDto(
+    long Id,
+    string OrderNo,
+    string CustomerName,
+    decimal TotalAmount,
+    DateTime CreatedAtUtc);
+
+public async Task&lt;IReadOnlyList&lt;OrderListItemDto&gt;&gt; QueryOrdersAsync(
+    AppDbContext db,
+    DateTime from,
+    DateTime to,
+    CancellationToken ct)
+{
+    return await db.Orders
+        .TagWith("OrderListPage:v2")
+        .AsNoTracking()
+        .Where(x =&gt; x.CreatedAtUtc &gt;= from &amp;&amp; x.CreatedAtUtc &lt; to)
+        .OrderByDescending(x =&gt; x.CreatedAtUtc)
+        .Take(100)
+        .Select(x =&gt; new OrderListItemDto(
+            x.Id,
+            x.OrderNo,
+            x.Customer.Name,
+            x.TotalAmount,
+            x.CreatedAtUtc))
+        .ToListAsync(ct);
+}
+</code></pre>
+<p><code>TagWith</code> 会把注释写进 SQL。你在数据库侧和日志侧都能直接看到 <code>OrderListPage:v2</code>，定位会快很多。</p>
+<h3 id="第二步用-opentelemetry-采集慢-sql-关键字段">第二步：用 OpenTelemetry 采集慢 SQL 关键字段</h3>
+<pre><code class="language-csharp">using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text.RegularExpressions;
+using OpenTelemetry;
+using OpenTelemetry.Trace;
+
+public sealed class EfSqlTagEnricher : BaseProcessor&lt;Activity&gt;
+{
+    private static readonly Regex EfTagLineRegex =
+        new(@"^\s*--\s*(?&lt;tag&gt;.+?)\s*$", RegexOptions.Compiled);
+
+    public override void OnEnd(Activity activity)
+    {
+        if (activity.Kind != ActivityKind.Client)
+            return;
+
+        // 只处理数据库调用 Span
+        var dbSystem = activity.GetTagItem("db.system")?.ToString();
+        if (string.IsNullOrWhiteSpace(dbSystem))
+            return;
+
+        var statement = activity.GetTagItem("db.statement")?.ToString();
+        if (string.IsNullOrWhiteSpace(statement))
+            return;
+
+        var tags = ExtractAllEfTags(statement);
+        if (tags.Count == 0)
+            return;
+
+        activity.SetTag("ef.tags", string.Join(" | ", tags));
+        activity.SetTag("ef.primary_tag", tags[0]);
+    }
+
+    private static IReadOnlyList&lt;string&gt; ExtractAllEfTags(string sql)
+    {
+        var tags = new List&lt;string&gt;();
+
+        using var reader = new StringReader(sql);
+        while (true)
+        {
+            var line = reader.ReadLine();
+            if (line is null)
+                break;
+
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0)
+                continue;
+
+            var match = EfTagLineRegex.Match(line);
+            if (match.Success)
+            {
+                var tag = match.Groups["tag"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(tag))
+                    tags.Add(tag);
+                continue;
+            }
+
+            // 遇到 SQL 正文后停止，避免把正文中的注释当成业务标签。
+            break;
+        }
+
+        return tags;
+    }
+}
+</code></pre>
+<p>这段代码落地后，你就有了最关键的三类信息：</p>
+<ul>
+<li>耗时</li>
+<li>TraceId</li>
+<li>SQL 标签（来自 TagWith）</li>
+</ul>
+<p>后面不管去日志平台还是数据库审计，排查效率都会提升一个量级。</p>
+<h3 id="第三步注册-otel-并打通上报链路">第三步：注册 OTel 并打通上报链路</h3>
+<pre><code class="language-csharp">using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+
+const string serviceName = "efcore-sql-traces";
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(r =&gt; r.AddService(serviceName))
+    .WithTracing(tracing =&gt;
+        tracing
+            .AddAspNetCoreInstrumentation()
+            .AddEntityFrameworkCoreInstrumentation()
+            .AddSource("MySqlConnector")
+            .AddProcessor&lt;EfSqlTagEnricher&gt;()
+            .AddOtlpExporter(o =&gt;
+            {
+                o.Endpoint = new Uri("http://localhost:4318/v1/traces");
+                o.Protocol = OtlpExportProtocol.HttpProtobuf;
+            })
+    );
+</code></pre>
+<h3 id="第四步把-sql-拉到数据库侧看执行计划">第四步：把 SQL 拉到数据库侧看执行计划</h3>
+<p>当你在日志里找到慢 SQL 后，下一步是确认执行计划。分析问题本质，再相应的设计和实施解决方案。</p>
+<h2 id="总结">总结</h2>
+<p>EF Core 慢查询排查，不能每次都盯着 LINQ 本身看。从工程实践角度来讲，我建议你把把链路打通：</p>
+<ol>
+<li>用 <code>TagWith</code> 把 SQL 和业务场景绑定起来</li>
+<li>用 <code>OpenTelemetry</code> 把耗时、TraceId、SQL 标签统一上报</li>
+<li>用执行计划确认瓶颈到底在扫描、回表还是排序</li>
+</ol>
+<p>如果你现在的线上排查还是“看见慢了就加索引”，那就从这三步开始，先把可定位性建起来，再谈性能优化的上限。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/denglei1024/" target="_blank">ryan-deng</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/denglei1024/p/19725123" target="_blank">https://www.cnblogs.com/denglei1024/p/19725123</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-03-16 15:32">2026-03-16 15:32</span>&nbsp;
+<a href="https://www.cnblogs.com/denglei1024">ryan-deng</a>&nbsp;
+阅读(<span id="post_view_count">60</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19725123);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19725123', targetLink: 'https://www.cnblogs.com/denglei1024/p/19725123', title: 'EF Core 慢查询排查实战：TagWith、OpenTelemetry、执行计划，30 分钟定位性能瓶颈' })">举报</a>
+</div>
+        
