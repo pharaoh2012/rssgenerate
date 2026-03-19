@@ -1,0 +1,299 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/denglei1024/p/19739116" title="发布于 2026-03-19 15:12">
+    <span role="heading" aria-level="2">EF Core 拦截器实战：SaveChangesInterceptor、CommandInterceptor 与审计落地</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>审计不是“给表补几个 CreatedBy 字段”，也不是“在业务方法里顺手记日志”。它本质上是系统级可追溯能力，设计目标是让系统在任何写路径下都能稳定回答四个问题：谁发起、改了什么、何时发生、通过哪条链路触发。</p>
+<p>真正的难点不在 API 用法，而在系统设计阶段是否把审计定义成基础设施能力。这里聚焦两层落地：<code>SaveChangesInterceptor</code> 负责实体变更审计，<code>CommandInterceptor</code> 负责 SQL 执行审计，两者一起组成可观测、可追溯、可审计的最小闭环。</p>
+<h2 id="1-问题背景为什么审计必须在系统设计期落地">1. 问题背景：为什么审计必须在系统设计期落地</h2>
+<p>如果你刚开始做系统设计，通常会先把功能跑通，再逐步补监控、日志和审计。这条路径很正常，但系统从单一写入口演进到多入口后，审计会出现一些典型断层：</p>
+<ul>
+<li>HTTP 请求有 <code>TraceId</code>，但数据库变更记录无法关联到具体调用链路。</li>
+<li>Web 接口有审计字段，批处理、后台任务、集成事件消费链路没有统一审计。</li>
+<li>SQL 慢查询能看到语句本身，但看不到对应业务场景和调用来源。</li>
+<li>合规追查时能找到结果，找不到完整过程和责任主体。</li>
+</ul>
+<p>这些现象不是某个人“写错了”，而是系统设计阶段还没有建立统一审计模型：</p>
+<ol>
+<li>还没先定义统一的审计契约（身份、时间、来源、关联链路）。</li>
+<li>写入路径没有统一审计入口，不同调用通道口径自然会分化。</li>
+<li>变更审计和 SQL 观测没有打通，排障时很难快速复原完整链路。</li>
+<li>只有开发约定，没有系统级自动机制，随着迭代推进就容易出现漏记。</li>
+</ol>
+<p>这篇文章要解决的核心问题不是“把审计代码写到哪一层”，而是“如何在系统层提供默认生效、可验证、可扩展的审计能力”，并且让这套能力能跟着系统规模一起演进。</p>
+<h2 id="2-原理解析先拆职责再落地拦截器">2. 原理解析：先拆职责，再落地拦截器</h2>
+<p>如果你是第一次从系统设计角度做审计，最稳妥的方法是先做职责拆分，再做实现落地。这里按“三步法”来理解：先统一实体变更审计，再统一 SQL 观测入口，最后明确拦截器边界。</p>
+<h3 id="21-第一步用-savechangesinterceptor-统一实体变更审计">2.1 第一步：用 SaveChangesInterceptor 统一实体变更审计</h3>
+<p><code>SaveChangesInterceptor</code> 适合处理实体状态相关规则，例如：</p>
+<ul>
+<li><code>Added</code> 时补 <code>CreatedAt/CreatedBy</code></li>
+<li><code>Modified</code> 时补 <code>UpdatedAt/UpdatedBy</code></li>
+<li>软删除时把 <code>Deleted</code> 改写成 <code>Modified + IsDeleted</code></li>
+</ul>
+<p>这类逻辑和实体状态强相关，放在拦截器里能覆盖所有调用路径，避免每个 Service 重复写一遍。</p>
+<h3 id="22-第二步用-commandinterceptor-统一-sql-观测入口">2.2 第二步：用 CommandInterceptor 统一 SQL 观测入口</h3>
+<p><code>DbCommandInterceptor</code> 适合做 SQL 级别的统一观测：</p>
+<ul>
+<li>慢 SQL 记录</li>
+<li>SQL 失败统一日志</li>
+<li>参数快照和调用耗时</li>
+</ul>
+<p>它不适合做业务决策，但非常适合做“排障入口统一化”。</p>
+<h3 id="23-第三步守住边界避免拦截器承载业务规则">2.3 第三步：守住边界，避免拦截器承载业务规则</h3>
+<p>拦截器是横切能力，不是业务规则容器。像“订单状态机是否允许跳转”这类业务校验，仍然应该放在领域或应用服务层。把业务规则塞进拦截器，后期只会让行为变得不可预测。</p>
+<h2 id="3-示例代码从分散审计到拦截器统一落地">3. 示例代码：从分散审计到拦截器统一落地</h2>
+<h3 id="31-问题写法按入口各自补审计系统层没有统一策略">3.1 问题写法：按入口各自补审计，系统层没有统一策略</h3>
+<pre><code class="language-csharp">public sealed class OrderWriteService
+{
+    private readonly AppDbContext _db;
+    private readonly ICurrentUser _currentUser;
+
+    public OrderWriteService(AppDbContext db, ICurrentUser currentUser)
+    {
+        _db = db;
+        _currentUser = currentUser;
+    }
+
+    // HTTP 入口：有用户上下文，补了部分审计字段
+    public async Task UpdateFromHttpAsync(long id, decimal amount, CancellationToken ct)
+    {
+        var order = await _db.Orders.FirstAsync(x =&gt; x.Id == id, ct);
+        order.Amount = amount;
+        order.UpdatedAt = DateTimeOffset.UtcNow;
+        order.UpdatedBy = _currentUser.UserId ?? "system";
+        await _db.SaveChangesAsync(ct);
+    }
+
+    // 后台任务入口：没有用户上下文，常见做法是直接跳过审计字段
+    public async Task UpdateFromSchedulerAsync(long id, OrderStatus status, CancellationToken ct)
+    {
+        var order = await _db.Orders.FirstAsync(x =&gt; x.Id == id, ct);
+        order.Status = status;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    // 消费者入口：补了 UpdatedBy，但漏了 UpdatedAt
+    public async Task UpdateFromEventConsumerAsync(long id, string externalStatus, CancellationToken ct)
+    {
+        var order = await _db.Orders.FirstAsync(x =&gt; x.Id == id, ct);
+        order.ExternalStatus = externalStatus;
+        order.UpdatedBy = "order-sync-consumer";
+        await _db.SaveChangesAsync(ct);
+    }
+}
+</code></pre>
+<p>这套写法的核心问题不是某个开发者“忘了写”，而是审计规则绑定在调用入口。入口一多，规则必然分裂：字段含义不一致、更新时间口径不一致、排障链路也无法统一。</p>
+<h3 id="32-优化写法一savechangesinterceptor-统一补齐审计字段">3.2 优化写法一：SaveChangesInterceptor 统一补齐审计字段</h3>
+<p>先约定实体接口：</p>
+<pre><code class="language-csharp">public interface IAuditableEntity
+{
+    DateTimeOffset CreatedAt { get; set; }
+    string CreatedBy { get; set; }
+    DateTimeOffset? UpdatedAt { get; set; }
+    string? UpdatedBy { get; set; }
+}
+</code></pre>
+<p>再实现审计拦截器：</p>
+<pre><code class="language-csharp">using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+
+public sealed class AuditSaveChangesInterceptor : SaveChangesInterceptor
+{
+    private readonly ICurrentUser _currentUser;
+    private readonly TimeProvider _timeProvider;
+
+    public AuditSaveChangesInterceptor(ICurrentUser currentUser, TimeProvider timeProvider)
+    {
+        _currentUser = currentUser;
+        _timeProvider = timeProvider;
+    }
+
+    public override InterceptionResult&lt;int&gt; SavingChanges(
+        DbContextEventData eventData,
+        InterceptionResult&lt;int&gt; result)
+    {
+        ApplyAudit(eventData.Context);
+        return base.SavingChanges(eventData, result);
+    }
+
+    public override ValueTask&lt;InterceptionResult&lt;int&gt;&gt; SavingChangesAsync(
+        DbContextEventData eventData,
+        InterceptionResult&lt;int&gt; result,
+        CancellationToken cancellationToken = default)
+    {
+        ApplyAudit(eventData.Context);
+        return base.SavingChangesAsync(eventData, result, cancellationToken);
+    }
+
+    private void ApplyAudit(DbContext? dbContext)
+    {
+        if (dbContext is null)
+        {
+            return;
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        var userId = _currentUser.UserId ?? "system";
+
+        foreach (var entry in dbContext.ChangeTracker.Entries&lt;IAuditableEntity&gt;())
+        {
+            if (entry.State == EntityState.Added)
+            {
+                entry.Entity.CreatedAt = now;
+                entry.Entity.CreatedBy = userId;
+                entry.Entity.UpdatedAt = now;
+                entry.Entity.UpdatedBy = userId;
+            }
+            else if (entry.State == EntityState.Modified)
+            {
+                entry.Entity.UpdatedAt = now;
+                entry.Entity.UpdatedBy = userId;
+            }
+        }
+    }
+}
+</code></pre>
+<h3 id="33-优化写法二commandinterceptor-统一记录慢-sql-和失败-sql">3.3 优化写法二：CommandInterceptor 统一记录慢 SQL 和失败 SQL</h3>
+<pre><code class="language-csharp">using System.Data.Common;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+
+public sealed class AuditCommandInterceptor : DbCommandInterceptor
+{
+    private readonly ILogger&lt;AuditCommandInterceptor&gt; _logger;
+    private static readonly TimeSpan SlowThreshold = TimeSpan.FromMilliseconds(300);
+
+    public AuditCommandInterceptor(ILogger&lt;AuditCommandInterceptor&gt; logger)
+    {
+        _logger = logger;
+    }
+
+    public override DbDataReader ReaderExecuted(
+        DbCommand command,
+        CommandExecutedEventData eventData,
+        DbDataReader result)
+    {
+        LogIfSlow(command, eventData);
+        return base.ReaderExecuted(command, eventData, result);
+    }
+
+    public override int NonQueryExecuted(
+        DbCommand command,
+        CommandExecutedEventData eventData,
+        int result)
+    {
+        LogIfSlow(command, eventData);
+        return base.NonQueryExecuted(command, eventData, result);
+    }
+
+    public override object? ScalarExecuted(
+        DbCommand command,
+        CommandExecutedEventData eventData,
+        object? result)
+    {
+        LogIfSlow(command, eventData);
+        return base.ScalarExecuted(command, eventData, result);
+    }
+
+    public override void CommandFailed(DbCommand command, CommandErrorEventData eventData)
+    {
+        _logger.LogError(
+            eventData.Exception,
+            "EF SQL failed. CommandText={CommandText}",
+            command.CommandText);
+
+        base.CommandFailed(command, eventData);
+    }
+
+    private void LogIfSlow(DbCommand command, CommandExecutedEventData eventData)
+    {
+        if (eventData.Duration &lt; SlowThreshold)
+        {
+            return;
+        }
+
+        _logger.LogWarning(
+            "EF slow SQL. DurationMs={DurationMs}, CommandText={CommandText}",
+            eventData.Duration.TotalMilliseconds,
+            command.CommandText);
+    }
+}
+</code></pre>
+<h3 id="34-注册方式把拦截器挂到-dbcontext-统一生效">3.4 注册方式：把拦截器挂到 DbContext 统一生效</h3>
+<pre><code class="language-csharp">builder.Services.AddScoped&lt;AuditSaveChangesInterceptor&gt;();
+builder.Services.AddScoped&lt;AuditCommandInterceptor&gt;();
+builder.Services.AddSingleton(TimeProvider.System);
+
+builder.Services.AddDbContext&lt;AppDbContext&gt;((sp, options) =&gt;
+{
+    options.UseSqlServer(builder.Configuration.GetConnectionString("Default"));
+
+    options.AddInterceptors(
+        sp.GetRequiredService&lt;AuditSaveChangesInterceptor&gt;(),
+        sp.GetRequiredService&lt;AuditCommandInterceptor&gt;());
+});
+</code></pre>
+<p>如果你希望慢 SQL 日志能快速关联到业务场景，查询时建议配合 <code>TagWith</code>：</p>
+<pre><code class="language-csharp">var order = await _db.Orders
+    .TagWith("OrderQuery:GetByOrderNo")
+    .FirstOrDefaultAsync(x =&gt; x.OrderNo == orderNo, ct);
+</code></pre>
+<h3 id="35-多-dbcontext--多租户场景统一注册与上下文透传">3.5 多 DbContext / 多租户场景：统一注册与上下文透传</h3>
+<p>单体示例里只注册一个 <code>AppDbContext</code>，但真实项目常见多个上下文（交易库、账务库、报表库）。如果每个上下文都手写一份注册代码，后续很容易出现“有的上下文挂了审计拦截器，有的没挂”。</p>
+<p>更稳妥的做法是把拦截器挂载动作抽成统一扩展方法：</p>
+<pre><code class="language-csharp">public static class DbContextOptionsBuilderExtensions
+{
+    public static DbContextOptionsBuilder AddAuditInterceptors(
+        this DbContextOptionsBuilder options,
+        IServiceProvider serviceProvider)
+    {
+        options.AddInterceptors(
+            serviceProvider.GetRequiredService&lt;AuditSaveChangesInterceptor&gt;(),
+            serviceProvider.GetRequiredService&lt;AuditCommandInterceptor&gt;());
+
+        return options;
+    }
+}
+</code></pre>
+<p>多个上下文复用同一套挂载：</p>
+<pre><code class="language-csharp">builder.Services.AddDbContext&lt;AppDbContext&gt;((sp, options) =&gt;
+{
+    options.UseSqlServer(builder.Configuration.GetConnectionString("Main"));
+    options.AddAuditInterceptors(sp);
+});
+
+builder.Services.AddDbContext&lt;BillingDbContext&gt;((sp, options) =&gt;
+{
+    options.UseSqlServer(builder.Configuration.GetConnectionString("Billing"));
+    options.AddAuditInterceptors(sp);
+});
+</code></pre>
+<p>如果是多租户系统，建议在 <code>ICurrentUser</code> 之外再引入 <code>ICurrentTenant</code>，并在 <code>SaveChangesInterceptor</code> 里统一写入 <code>TenantId</code> 或校验租户边界，避免不同入口出现租户字段口径不一致。</p>
+<h2 id="4-总结">4. 总结</h2>
+<p>EF Core 拦截器的价值，不在于“写得更高级”，而在于把重复且容易漏的规则变成基础设施能力。<code>SaveChangesInterceptor</code> 解决实体审计一致性，<code>CommandInterceptor</code> 解决 SQL 观测统一入口。先把这两层根基打牢，后续无论是做审计追踪、慢 SQL 治理，都会方便很多。</p>
+<p>实验源码：<a href="https://github.com/denglei1024/dotnet-ai-engineering/tree/master/samples/ef-core/AuditlogsDemo" target="_blank" rel="noopener nofollow">ef-core/AuditlogsDemo</a></p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/denglei1024/" target="_blank">ryan-deng</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/denglei1024/p/19739116" target="_blank">https://www.cnblogs.com/denglei1024/p/19739116</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-03-19 15:12">2026-03-19 15:12</span>&nbsp;
+<a href="https://www.cnblogs.com/denglei1024">ryan-deng</a>&nbsp;
+阅读(<span id="post_view_count">79</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19739116);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19739116', targetLink: 'https://www.cnblogs.com/denglei1024/p/19739116', title: 'EF Core 拦截器实战：SaveChangesInterceptor、CommandInterceptor 与审计落地' })">举报</a>
+</div>
+        
