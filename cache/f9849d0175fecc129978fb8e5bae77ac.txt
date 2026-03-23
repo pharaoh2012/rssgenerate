@@ -1,0 +1,181 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xy-home646/p/19759177" title="发布于 2026-03-23 17:32">
+    <span role="heading" aria-level="2">记录复现多模态大模型论文OPERA的一周工作（2）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="二-opera论文复现">二. OPERA论文复现</h2>
+<p>在做好上述的准备工作之后，我们的环境搭建、数据准备和传输已经完成。复现工作就可以正式开始了。在github下载OPERA官方代码文件，按照官方提示搭建好相关的环境。</p>
+<h3 id="1-详细情况">1. 详细情况</h3>
+<p>在README.md中官方说明有两种方式可以运行OPERA解码策略。一是将OPERA的代码集成到自己现有的代码中，也就是缝合模块的方式，二是用官方提供的脚本直接进行数据集批量推理。</p>
+<h4 id="11-部署推理出现的问题">1.1. 部署推理出现的问题</h4>
+<p>我们选择后者，直接快速验证OPERA解码策略的有效性。</p>
+<pre><code class="language-bash">OMP_NUM_THREADS=8 python chair_eval.py \
+    --model llava-1.5 \
+    --data_path /root/autodl-tmp/project/dataset/MSCOCO/val2014/ \
+    --gpu-id 0 \
+    --beam 5 \
+    --scale_factor 50 \
+    --threshold 15 \
+    --num_attn_candidates 5 \
+    --penalty_weights 1
+</code></pre>
+<p>chair_eval.py代码会随机选取500张数据集中的图片（代码中将种子固定为42，方便复现），进行图片回答的生成。当然，脚本真正跑起来的过程并不是一帆风顺，出现了一些问题如下：</p>
+<ol>
+<li>hugging face连接问题</li>
+</ol>
+<p>这个问题比较好解决，当时想用本地下载好的文件做替代，却发现怎么也不成功，于是在环境变量上做了点修改，hugging face网络连接问题就被解决了。</p>
+<pre><code class="language-bash">$ export HF_ENDPOINT="https://hf-mirror.com"
+</code></pre>
+<p>在脚本运行前设置好这个临时环境变量，只在该终端生效！！！<br>
+如果运行后问题仍然没有得到解决，可以参考下面这个博文来操作：<a href="https://zhuanlan.zhihu.com/p/689290456" target="_blank" rel="noopener nofollow">https://zhuanlan.zhihu.com/p/689290456</a><br>
+里面教你如何修改项目源代码，将下载源从https://huggingface.co 修改为镜像网站https://hf-mirror.com</p>
+<ol start="2">
+<li>维度不匹配问题</li>
+</ol>
+<p>脚本运行报错如下：</p>
+<pre><code class="language-bash">Traceback (most recent call last):
+  File "/root/autodl-tmp/project/OPERA/OPERA-main/chair_eval.py", line 173, in &lt;module&gt;
+    out = model.generate(
+  File "/root/miniconda3/envs/llava1.5/lib/python3.9/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/root/autodl-tmp/project/OPERA/OPERA-main/minigpt4/models/llava.py", line 212, in generate
+    output_ids = self.llama_model.generate(
+  File "/root/miniconda3/envs/llava1.5/lib/python3.9/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/root/autodl-tmp/project/OPERA/OPERA-main/transformers-4.29.2/src/transformers/generation/utils.py", line 1649, in generate
+    return self.opera_beam_search(
+  File "/root/autodl-tmp/project/OPERA/OPERA-main/transformers-4.29.2/src/transformers/generation/utils.py", line 3353, in opera_beam_search
+    attn_previous = torch.cat(
+RuntimeError: Sizes of tensors must match except in dimension 2. Expected size 657 but got size 694 for tensor number 1 in the list.
+</code></pre>
+<p>报错信息已经很明显，指出了最深层次的报错代码所在：<br>
+File "/root/autodl-tmp/project/OPERA/OPERA-main/transformers-4.29.2/src/transformers/generation/utils.py", line 3353</p>
+<p>所以我们需要修改项目源码来修复这个问题，这个报错在官方github库中的issue问题探讨中也被人提到过，但是没有提供解决方案。</p>
+<p>在尝试了许多方法之后，我得到了切实可行的方案：</p>
+<ul>
+<li>问题分析</li>
+</ul>
+<p>在 OPERA 的 beam search 实现中，attn_previous 试图拼接多个 beam 的注意力矩阵，但它们的序列长度不一致。这通常由以下原因导致：<br>
+根本原因： LLaVA 1.5 使用动态分辨率或不同数量的图像 token，导致不同样本的序列长度不同。当 beam search 跨样本处理时，序列长度不匹配。</p>
+<ul>
+<li>问题定位</li>
+</ul>
+<p>错误发生在这一行：</p>
+<pre><code class="language-python">attn_previous = torch.cat(
+    [attn_previous[beam_idx], outputs.attentions[-1].clone().max(1, keepdim=True).values.data], -2)
+</code></pre>
+<p>两个张量在 dim=-2（即 q 维度）上拼接，但它们的 kv 维度（dim=-1）不匹配：</p>
+<p>attn_previous[beam_idx] 的 kv 维度：657<br>
+outputs.attentions[-1] 的 kv 维度：694</p>
+<p>根本原因： LLaVA 1.5 对不同图片会产生不同数量的图像 token（因为使用了动态分辨率 AnyRes），导致 past_key_values 中 KV cache 的长度在不同 beam 间不一致，使得 attn_previous 在更新时 kv 维度对不上。</p>
+<ul>
+<li>修复方案</li>
+</ul>
+<p>在拼接之前，对 kv 维度（dim=-1）做对齐，取较大的那个，不足的用 0 填充：</p>
+<pre><code class="language-python">if not "past_key_values" in model_kwargs.keys():
+    attn_previous = outputs.attentions[-1].clone()
+else:
+    assert beam_idx is not None and attn_previous is not None
+    attn_previous = torch.cat(
+        [attn_previous, torch.zeros_like(attn_previous).sum(-1, keepdim=True)], -1
+    )
+
+    a = attn_previous[beam_idx]
+    b = outputs.attentions[-1].clone().max(1, keepdim=True).values.data
+
+    # 对齐 kv 维度（dim=-1）
+    diff = a.size(-1) - b.size(-1)
+    if diff &gt; 0:
+        b = torch.nn.functional.pad(b, (0, diff))   # b 补 0
+    elif diff &lt; 0:
+        a = torch.nn.functional.pad(a, (0, -diff))  # a 补 0
+
+    attn_previous = torch.cat([a, b], dim=-2)
+</code></pre>
+<p>修改后脚本可以正常运行。</p>
+<h4 id="12-计算chair指标">1.2 计算CHAIR指标</h4>
+<p>在OPERA官方代码仓库里明确写着使用的开源CHAIR指标计算代码库https://github.com/Maxlinn/CHAIR-metric-standalone</p>
+<p>下载后我们使用其自动计算CHAIR指标的脚本，来计算LLAVA1.5 + OPERA解码结合后生成的文本幻觉率。</p>
+<blockquote>
+<p>图像字幕（Image Captioning）任务中，专门评估物体幻觉问题的CHAIR 指标的两个子维度，分别是物体级幻觉率Cs（CHAIR-s）和样本级幻觉率Ci（CHAIR-i）<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3771773/202603/3771773-20260323173911121-1718542305.png" class="lazyload"></p>
+</blockquote>
+<blockquote>
+<ul>
+<li>物体级幻觉率 Cs<br>
+分子∣{hallucinated&nbsp;objects}∣：幻觉物体的总数量，即生成的描述里提到的、但在对应图片的真实标注中不存在的物体的个数。<br>
+分母∣{all&nbsp;mentioned&nbsp;objects}∣：生成描述里提到的所有物体的总数量，包含真实存在的物体和幻觉物体。<br>
+含义：衡量生成内容中，幻觉物体占所有提到物体的比例，是更精细的、针对物体本身的幻觉严重程度的评估，数值越高，说明生成内容里幻觉的物体占比越高。</li>
+<li>样本级幻觉率 Ci<br>
+分子∣{captions&nbsp;w/&nbsp;hallucinated&nbsp;objects}∣：包含幻觉物体的描述总条数，只要某一条生成的描述里，存在至少 1 个幻觉物体，这条描述就会被计入统计。<br>
+分母∣{all&nbsp;captions}∣：测试集中所有生成的描述的总条数。<br>
+含义：衡量整个测试集中，存在幻觉的描述占所有描述的比例，是宏观的、针对样本的幻觉覆盖度评估，数值越高，说明有越多比例的生成描述本身存在幻觉问题。</li>
+</ul>
+</blockquote>
+<p><strong>运行脚本可能存在的问题：Pattern库安装失败</strong><br>
+Pattern库维护比较差，所以在下载时比较容易出现安装失败或者是版本不对的问题。<br>
+常见报错如下：</p>
+<pre><code class="language-bash">Traceback (most recent call last):
+  File "/root/autodl-tmp/project/CHAIR-metric-standalone/chair.py", line 18, in &lt;module&gt;
+    from pattern.en import singularize
+ModuleNotFoundError: No module named 'pattern.en'
+</code></pre>
+<p>解决方案：</p>
+<ul>
+<li>卸载原版本</li>
+</ul>
+<p>用pip install pattern命令可能下载到其他一些假冒/无关的包如pattern==0.0.1a0。所以需要卸载原下载的版本。</p>
+<pre><code class="language-bash">pip uninstall pattern -y
+</code></pre>
+<ul>
+<li>安装正确版本</li>
+</ul>
+<pre><code class="language-bash"># 安装社区维护的 pattern3 分支
+pip install git+https://github.com/clips/pattern.git
+</code></pre>
+<ul>
+<li>可能出现的下一步报错</li>
+</ul>
+<pre><code class="language-bash">Exception: Can not find valid pkg-config name.
+      Specify MYSQLCLIENT_CFLAGS and MYSQLCLIENT_LDFLAGS env vars manually
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+ERROR: Failed to build 'mysqlclient' when getting requirements to build wheel
+</code></pre>
+<p>问题根源：安装官方Pattern库时，它强制尝试编译依赖项mysqlclient（用于数据库功能），但你的系统里没有安装MySQL的开发库（pkg-config找不到）。</p>
+<ul>
+<li>安装需要的依赖</li>
+</ul>
+<pre><code class="language-bash">apt update &amp;&amp; apt install -y libmariadb-dev pkg-config
+</code></pre>
+<ul>
+<li>重新运行安装命令</li>
+</ul>
+<pre><code class="language-bash"># 安装社区维护的 pattern3 分支
+pip install git+https://github.com/clips/pattern.git
+</code></pre>
+<p>如何利用这个官方库计算CHAIR指标，在其README.md中已经讲得很清楚了，不多赘述。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.004861111111111111" data-date-updated="2026-03-23 17:39">2026-03-23 17:32</span>&nbsp;
+<a href="https://www.cnblogs.com/xy-home646">旧已</a>&nbsp;
+阅读(<span id="post_view_count">16</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19759177);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19759177', targetLink: 'https://www.cnblogs.com/xy-home646/p/19759177', title: '记录复现多模态大模型论文OPERA的一周工作（2）' })">举报</a>
+</div>
+        
