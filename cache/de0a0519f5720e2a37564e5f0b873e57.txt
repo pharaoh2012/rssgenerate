@@ -1,0 +1,184 @@
+
+        <div class="postTitle">
+            <h1><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/HPC2H2/p/19768582" title="发布于 2026-03-26 10:54">
+    <span role="heading" aria-level="2">ESP32S3 USB MSC 调试全过程记录</span>
+    
+
+</a>
+</h1>
+        </div>
+        <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="需求描述">需求描述</h2>
+<p>现有一块主控为ESP32S3-WROOM-1U-MCN8的板做数据采集，需要将采集后的数据放在ESP32的Flash里，通过蓝牙切换U盘（MSC）模式后进行采集数据的读取。<br>
+可从以下三个问题进行考虑，确定具体实现：1.如何分区；2.如何写入数据进对应分区；3.如何确保使用MSC模式时，数据能够被电脑正确读取。</p>
+<h2 id="如何分区">如何分区</h2>
+<p>参考[2]Using a Custom Partition Scheme，将以下文件partitions.csv放入.ino文件同一目录下，Arduino IDE中 工具 - Partition Scheme：选择“Custom”。</p>
+<h3 id="partitionscsv">partitions.csv</h3>
+<pre><code># Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x140000,
+app1,     app,  ota_1,   0x150000,0x140000,
+ffat,     data, fat,     0x290000,0x560000,
+coredump, data, coredump,0x7F0000,0x10000,
+</code></pre>
+<p>对于问题2和3：标准FAT16 这种格式可以被电脑读取到，而FATFS实现的FAT16不行，但在ESP32端用FATFS有库很方便。于是我们使用虚拟FAT16方案，集二者之优点。</p>
+<h2 id="usb-mscu-盘模式-虚拟-fat16-方案">USB MSC（U 盘模式）— 虚拟 FAT16 方案</h2>
+<p>使用 ESP32 Core 3.x 内置 <code>USBMSC</code> 类（与 USB CDC Serial 共享 TinyUSB 栈）。</p>
+<p><strong>核心思路：</strong> FFat 分区同时被两个"文件系统"使用——ESP32 端用 FFat（FATFS）正常读写 CSV，电脑端看到的是在 RAM 中动态构建的标准 FAT16 磁盘镜像。MSC 回调读取数据时，FAT 头部（boot/FAT/root dir）从预构建缓冲区返回，文件数据通过 FFat API 实时读取。</p>
+<h2 id="usb-msc-调试全过程记录">USB MSC 调试全过程记录</h2>
+<h3 id="起始状态">起始状态</h3>
+<p>初始方案：进入 MSC 模式时卸载 FFat，将整个 ffat 分区的<strong>原始扇区</strong>直接暴露给电脑。电脑看到的是 FATFS 原始数据，无法直接用 Windows 打开 CSV。</p>
+<p><strong>问题</strong>：电脑端无法正常打开文件，因为 FFat (FATFS) 的内部布局与标准 FAT16 存在差异（LBA 对齐、元数据位置不同等）。</p>
+<h3 id="第一版动态生成-fat16失败">第一版：动态生成 FAT16（失败）</h3>
+<p><strong>方案</strong>：在 MSC read 回调中，根据请求的 LBA 扇区号<strong>动态构建</strong> FAT16 头部（boot sector / FAT table / root directory），数据区通过 FFat 的 VFS 接口读取文件内容。</p>
+<p><strong>实现</strong>：</p>
+<ul>
+<li>定义 FAT16 常量：<code>SECTORS_PER_CLUSTER = 1</code>（每簇 512 字节）</li>
+<li><code>gen_header(lba, buf)</code> 函数根据 LBA 号在 <code>g_sec_buf</code>（512 字节栈缓冲区）中生成对应扇区</li>
+<li>FAT 表条目通过 <code>fat_entry(cluster)</code> 函数计算</li>
+<li>文件列表通过 <code>scan_files()</code> 扫描 FFat 获取</li>
+</ul>
+<p><strong>问题 1：CSV 文件报错"不是有效文件"</strong></p>
+<ul>
+<li>电脑能看到磁盘和文件名，但打开 CSV 时报错</li>
+<li>排查发现 FAT16 簇分配错误</li>
+</ul>
+<p><strong>根因分析</strong>：</p>
+<ul>
+<li><code>fat_entry()</code> 中 <code>cl == 2</code> 返回 <code>0xFFFF</code>（EOF 标记），将 cluster 2 标记为结束簇</li>
+<li><code>scan_files()</code> 中 <code>next_cl = 3</code>，跳过了 cluster 2</li>
+<li>但 FAT16 规范中 cluster 0 和 1 是保留的，<strong>cluster 2 是第一个可用的数据簇</strong></li>
+<li>数据区扇区 0 映射到 cluster 2：<code>cluster = data_sec / SECTORS_PER_CLUSTER + 2</code></li>
+<li>如果文件从 cluster 3 开始，cluster 2 区域返回全零，FAT 中也是 EOF，Windows 无法正确追踪文件链</li>
+</ul>
+<p><strong>修复</strong>：</p>
+<ul>
+<li><code>fat_entry()</code> 删除 <code>if (cl == 2) return 0xFFFF;</code></li>
+<li><code>scan_files()</code> 中 <code>next_cl = 3</code> 改为 <code>next_cl = 2</code></li>
+</ul>
+<h3 id="第二版预构建缓冲区u盘为空">第二版：预构建缓冲区（U盘为空）</h3>
+<p><strong>方案改进</strong>：将动态生成改为<strong>预构建</strong>——进入 MSC 模式时一次性用 <code>malloc</code> 分配 RAM，构建完整的 FAT16 头部（boot + FAT1 + FAT2 + root dir），之后 read 回调只做 <code>memcpy</code>。</p>
+<p><strong>同步优化</strong>：</p>
+<ul>
+<li><code>SECTORS_PER_CLUSTER</code> 从 1 改为 4（2048 字节/簇），更符合 FAT16 常见配置</li>
+<li>增加蓝牙命令 <code>FMT</code>：格式化 FFat + 写入测试 CSV</li>
+</ul>
+<p><strong>问题 2：FMT 后 U 盘为空</strong></p>
+<ul>
+<li>串口日志：<code>[Format] 测试文件: /test_msc.csv (339 bytes)</code> — 文件创建成功</li>
+<li>串口日志：<code>[MSC] 扫描到 0 个文件</code> — <code>scan_files()</code> 找不到文件</li>
+</ul>
+<p><strong>排查过程</strong>：</p>
+<ol>
+<li>确认 <code>formatAndTest()</code> 中 <code>FFat.open("/test_msc.csv", "w")</code> 创建成功，<code>f.size()</code> 返回 339 字节</li>
+<li><code>setMSCMode(true)</code> 中 <code>scan_files()</code> 打开根目录成功（没有报错），但 <code>openNextFile()</code> 返回空</li>
+<li>发现中间主循环的 <code>appendRecord()</code> 打印 <code>[Flash] 无法打开: /ppg_000.csv</code>，说明 FFat 状态异常</li>
+</ol>
+<p><strong>根因分析</strong>：</p>
+<ul>
+<li><code>formatAndTest()</code> 调用 <code>FFat.end()</code> 卸载文件系统时，<code>_fs_mounted</code> 仍为 <code>true</code></li>
+<li>主循环中的 <code>appendRecord()</code> 检查 <code>_fs_mounted == true</code> 后尝试 <code>FFat.open()</code>，但文件系统正在卸载/已卸载</li>
+<li>这种并发访问导致 FFat (FATFS) 内部状态不一致</li>
+<li><code>FFat.begin(true)</code> 重新格式化挂载后，写入的文件可能只存在于缓存中，未正确刷入 flash 目录结构</li>
+<li>之后 <code>scan_files()</code> 遍历目录时看不到文件</li>
+</ul>
+<p><strong>修复</strong>：</p>
+<ol>
+<li><code>formatAndTest()</code> 中 <code>FFat.end()</code> 前先设 <code>_fs_mounted = false</code>，阻止主循环并发访问
+<ul>
+<li><code>_fs_mounted = false</code> 放在 <code>FFat.end()</code> 之前，这样 PPGTask 中的 <code>appendRecord()</code>、<code>getUsedKB()</code> 等都会在检查 <code>_fs_mounted</code> 时直接返回，不会在文件系统卸载过程中并发访问 FFat。</li>
+</ul>
+</li>
+<li><code>setMSCMode(true)</code> 在扫描文件前执行 <code>FFat.end()</code> + <code>FFat.begin(false)</code> 强制重新挂载，确保文件系统状态干净</li>
+</ol>
+<h3 id="最终方案成功">最终方案（成功）</h3>
+<p><strong>架构</strong>：</p>
+<pre><code>setMSCMode(true):
+  1. FFat.end() → delay(200) → FFat.begin(false)    // 重新挂载确保状态干净
+  2. fat_compute() → scan_files()                     // 扫描文件列表
+  3. build_fat16_headers() → malloc + 一次性构建       // 预构建FAT16头部到RAM
+  4. msc_usb.mediaPresent(true)                       // 激活磁盘
+
+ppg_msc_read_cb(lba, offset, buffer, bufsize):
+  if (lba &lt; g_data_start):
+    memcpy(buffer, g_header_buf + lba*512 + offset, bufsize)  // RAM直接拷贝
+  else:
+    查找文件 → FFat.open → seek → read → 返回数据            // FFat实时读取
+</code></pre>
+<h3 id="遇到的所有问题及修复清单">遇到的所有问题及修复清单</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>问题</th>
+<th>根因</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>电脑显示 RAW 格式</td>
+<td>直接暴露 FATFS 原始扇区</td>
+<td>改为在 MSC 回调中构建标准 FAT16</td>
+</tr>
+<tr>
+<td>2</td>
+<td>CSV 打开报错</td>
+<td>Cluster 2 被错误标记为 EOF，簇分配从 3 开始</td>
+<td>簇分配从 2 开始，删除 cl==2 的 EOF 标记</td>
+</tr>
+<tr>
+<td>3</td>
+<td>动态生成潜在不一致</td>
+<td>每次回调重新生成，存在状态竞争</td>
+<td>改为进入 MSC 时一次性预构建到 RAM</td>
+</tr>
+<tr>
+<td>4</td>
+<td>SECTORS_PER_CLUSTER=1 兼容性</td>
+<td>Windows 对 512 字节/簇的 FAT16 处理不佳</td>
+<td>改为 4 扇区/簇 (2048 字节)</td>
+</tr>
+<tr>
+<td>5</td>
+<td>FMT 后 U 盘为空</td>
+<td>FFat.end() 时 _fs_mounted 未清零，并发访问导致文件系统状态损坏</td>
+<td>end() 前设 _fs_mounted=false；MSC 进入前强制重新挂载</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Windows 缓存旧数据</td>
+<td>同一卷标序列号被缓存</td>
+<td>每次进入 MSC 生成随机 serial</td>
+</tr>
+</tbody>
+</table>
+<h3 id="关键经验">关键经验</h3>
+<ol>
+<li><strong>FAT16 簇号从 2 开始</strong>：Cluster 0/1 保留给介质描述符，cluster 2 是数据区第一个簇，<code>data_sec / SECTORS_PER_CLUSTER + 2</code> 是正确的映射公式。</li>
+<li><strong>ESP32 FFat 并发安全</strong>：<code>FFat.end()</code> 前必须阻止其他代码路径访问文件系统（设标志位），否则 FATFS 内部状态会被破坏。</li>
+<li><strong>预构建 vs 动态生成</strong>：对确定性数据（FAT头部），预构建比动态生成更可靠——避免回调中的复杂逻辑和潜在的状态竞争。</li>
+<li><strong>MSC offset 参数</strong>：TinyUSB 的 <code>read10_cb</code> 中 <code>offset</code> 是 LBA 块内的字节偏移（当 <code>CFG_TUD_MSC_EP_BUFSIZE &lt; 512</code> 时出现），不是文件偏移。</li>
+<li><strong>Windows 磁盘缓存</strong>：修改磁盘内容后如果 Windows 不识别，可能是因为卷标序列号未变化导致缓存命中。每次进入 MSC 时生成新的随机 serial 可解决</li>
+</ol>
+<h2 id="reference">Reference</h2>
+<p>[1]<a href="https://docs.espressif.com/projects/esp-idf/zh_CN/stable/esp32/api-reference/kconfig-reference.html#compiler-options" target="_blank" rel="noopener nofollow">https://docs.espressif.com/projects/esp-idf/zh_CN/stable/esp32/api-reference/kconfig-reference.html#compiler-options</a><br>
+[2]<a href="https://docs.espressif.com/projects/arduino-esp32/en/latest/tutorials/partition_table.html" target="_blank" rel="noopener nofollow">https://docs.espressif.com/projects/arduino-esp32/en/latest/tutorials/partition_table.html</a><br>
+[3]<a href="https://github.com/aoscarius/esp32usbmsc" target="_blank" rel="noopener nofollow">https://github.com/aoscarius/esp32usbmsc</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+        <div class="postDesc">posted on 
+<span id="post-date" data-last-update-days="0.002777777777777778" data-date-updated="2026-03-26 10:58">2026-03-26 10:54</span>&nbsp;
+<a href="https://www.cnblogs.com/HPC2H2">快乐的乙炔</a>&nbsp;
+阅读(<span id="post_view_count">71</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19768582);return false;">收藏</a>&nbsp;
+<a href="javascript:void(0)" onclick="reportManager.report({ currentUserId: '', targetType: 'blogPost', targetId: '19768582', targetLink: 'https://www.cnblogs.com/HPC2H2/p/19768582', title: 'ESP32S3 USB MSC 调试全过程记录' })">举报</a>
+</div>
+    
