@@ -1,0 +1,308 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/manuscript/p/19823849" title="发布于 2026-04-05 16:20">
+    <span role="heading" aria-level="2">Calico VXLAN 使用指南</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="模式介绍">模式介绍</h1>
+<blockquote>
+<p>项目文档：<a href="https://docs.tigera.io/calico/latest/networking/configuring/vxlan-ipip" target="_blank" rel="noopener nofollow">https://docs.tigera.io/calico/latest/networking/configuring/vxlan-ipip</a></p>
+</blockquote>
+<p>VXLAN（Virtual eXtensible LAN）这种网络封装协议，将 Pod 原始数据包封装在 UDP 数据包中传输，使底层网络不需要感知 Pod IP 地址。VXLAN 的优势是不依赖 BGP、支持 IPv6；对比 IPIP 模式，它的头部更大（50B vs IPIP 20B），性能略差。在 IPIP 可用的情况下（如 AWS），IPIP 通常是更好的选择。</p>
+<p>简单来讲，同一局域网里中交换机根据 MAC 地址让不同机器通信。但 VXLAN 做的是：<strong>把一个二层网络封装到 UDP 包里，通过三层网络传输</strong>。这样即使两台机器不在同一个物理交换机下，也能像在同一个局域网里一样通信。</p>
+<p>这也是 Overlay 网络的核心：利用真实的 IP 网络（三层）作为运输通道，把原本只能在同一交换机下生效的二层 MAC 机制，用隧道技术伪装成一个大的虚拟局域网。不同于传统二层依赖广播学习 MAC，Overlay 通常由<strong>控制平面主动下发映射</strong>来避免广播风暴。</p>
+<blockquote>
+<p>此处的控制平面指的是跑在每个节点上的 <code>felix</code></p>
+</blockquote>
+<pre><code class="language-bash">root@network-demo:~# kubectl get pods -n kube-system | grep 'calico-node'
+calico-node-696p5                                    1/1     Running   1 (5d5h ago)   7d3h
+calico-node-dxz57                                    1/1     Running   1 (5d5h ago)   7d3h
+
+root@network-demo:~# docker exec calico-vxlan-control-plane ss -nltup | grep -i calico
+tcp   LISTEN 0      4096       127.0.0.1:9099       0.0.0.0:*    users:(("calico-node",pid=1284,fd=9))   
+
+root@network-demo:~# docker exec calico-vxlan-control-plane ps aux | grep '-felix'
+root        1284  0.8  0.2 2117200 64012 ?       Sl   Mar31  66:17 calico-node -felix
+</code></pre>
+<h2 id="使用场景">使用场景</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>是否推荐</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Azure 环境</td>
+<td>✅</td>
+<td>Azure 封禁 IPIP 协议，VXLAN 是唯一 overlay 选项</td>
+</tr>
+<tr>
+<td>IPv6 环境</td>
+<td>✅</td>
+<td>IPIP 仅支持 IPv4，VXLAN 是 IPv6 overlay 唯一选择</td>
+</tr>
+<tr>
+<td>启用 eBPF</td>
+<td>✅</td>
+<td>eBPF 模式不支持 IPIP，必须用 VXLAN</td>
+</tr>
+<tr>
+<td>AWS 多 AZ / 跨子网</td>
+<td>✅</td>
+<td>同 AZ 直通、跨 AZ 封装 → <code>vxlanMode: CrossSubnet</code> 性能更优</td>
+</tr>
+<tr>
+<td>公有云</td>
+<td>✅</td>
+<td>无法配 BGP 或底层路由 → <code>vxlanMode: Always</code> 开箱即用</td>
+</tr>
+<tr>
+<td>快速使用</td>
+<td>✅</td>
+<td>不折腾底层网络，直接 overlay 起来，可关闭 BGP 减少组件</td>
+</tr>
+<tr>
+<td>自建机房</td>
+<td>❌</td>
+<td>有完整网络控制权 → 无封装 + BGP 是官方首选</td>
+</tr>
+<tr>
+<td>Pod IP 需集群外可达</td>
+<td>❌</td>
+<td>Overlay 下 Pod IP 不可路由到外部 → BGP 纯路由模式</td>
+</tr>
+</tbody>
+</table>
+<h1 id="部署流程">部署流程</h1>
+<h2 id="通过-kind-快速生成集群并部署-calico-vxlan-模式">通过 Kind 快速生成集群并部署 Calico VXLan 模式</h2>
+<pre><code class="language-bash">#!/bin/bash
+set -v
+
+# 1. prep NoCNI environment
+cat &lt;&lt;EOF | HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= kind create cluster --name=calico-vxlan --image=kindest/node:v1.27.3 --config=-
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+        disableDefaultCNI: true
+nodes:
+        - role: control-plane
+        - role: worker
+EOF
+
+# 2. Remove taints
+controller_node_ip=`kubectl get node -o wide --no-headers | grep -E "control-plane|bpf1" | awk -F " " '{print $6}'`
+kubectl taint nodes $(kubectl get nodes -o name | grep control-plane) node-role.kubernetes.io/control-plane:NoSchedule-
+kubectl get nodes -o wide
+
+# 3. Collect startup message
+controller_node_name=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep control-plane)
+if [ -n "$controller_node_name" ]; then
+  timeout 1 docker exec -t $controller_node_name bash -c 'cat &lt;&lt; EOF &gt; /root/monitor_startup.sh
+#!/bin/bash
+ip -ts monitor all &gt; /root/startup_monitor.txt 2&gt;&amp;1
+EOF
+chmod +x /root/monitor_startup.sh &amp;&amp; /root/monitor_startup.sh'
+else
+  echo "No such controller_node!"
+fi
+
+# 4. Install CNI[Calico v3.23.2]
+kubectl apply -f calico.yaml
+</code></pre>
+<pre><code class="language-bash">## calico.yaml
+## https://gitee.com/rowan-wcni/wcni-kind/blob/master/LabasCode/calico/03-calico-vxlan/calico.yaml
+</code></pre>
+<h2 id="创建测试-pod">创建测试 Pod</h2>
+<blockquote>
+<p>实际就是 Nginx，仅用于后续互访时抓包</p>
+</blockquote>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: wluo
+  name: wluo
+spec:
+  selector:
+    matchLabels:
+      app: wluo
+  template:
+    metadata:
+      labels:
+        app: wluo
+    spec:
+      containers:
+      - image: burlyluo/nettool:latest
+        name: nettoolbox
+        env:
+          - name: NETTOOL_NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+</code></pre>
+<h2 id="查看部署结果">查看部署结果</h2>
+<pre><code class="language-bash">root@network-demo:~# kubectl get pods -A -o wide
+NAMESPACE     NAME                                                 READY   STATUS    RESTARTS   AGE   IP              NODE
+default       wluo-nkmtp                                           1/1     Running   1          47h   10.244.177.66   calico-vxlan-worker
+default       wluo-qf5cc                                           1/1     Running   1          47h   10.244.110.74   calico-vxlan-control-plane
+kube-system   calico-kube-controllers-5b5ff6cb74-fp4r9             1/1     Running   1          47h   10.244.110.72   calico-vxlan-control-plane
+kube-system   calico-node-696p5                                    1/1     Running   1          47h   172.18.0.2      calico-vxlan-worker
+kube-system   calico-node-dxz57                                    1/1     Running   1          47h   172.18.0.3      calico-vxlan-control-plane
+kube-system   coredns-5d78c9869d-w4d2g                             1/1     Running   1          47h   10.244.110.71   calico-vxlan-control-plane
+kube-system   coredns-5d78c9869d-zl7qg                             1/1     Running   1          47h   10.244.110.70   calico-vxlan-control-plane
+kube-system   etcd-calico-vxlan-control-plane                      1/1     Running   1          47h   172.18.0.3      calico-vxlan-control-plane
+kube-system   kube-apiserver-calico-vxlan-control-plane            1/1     Running   1          47h   172.18.0.3      calico-vxlan-control-plane
+kube-system   kube-controller-manager-calico-vxlan-control-plane   1/1     Running   1          47h   172.18.0.3      calico-vxlan-control-plane
+kube-system   kube-proxy-rsf5n                                     1/1     Running   1          47h   172.18.0.2      calico-vxlan-worker
+kube-system   kube-proxy-zn8vq                                     1/1     Running   1          47h   172.18.0.3      calico-vxlan-control-plane
+kube-system   kube-scheduler-calico-vxlan-control-plane            1/1     Running   1          47h   172.18.0.3      calico-vxlan-control-plane
+</code></pre>
+<h1 id="验证效果">验证效果</h1>
+<h2 id="查询-node-节点-vxlan-设备fdbarp路由表信息">查询 Node 节点 VXLAN 设备、FDB、ARP、路由表信息</h2>
+<pre><code class="language-bash">## 节点信息
+root@network-demo:~# kubectl get node -o wide
+NAME                         STATUS   ROLES           AGE   VERSION   INTERNAL-IP
+calico-vxlan-control-plane   Ready    control-plane   47h   v1.27.3   172.18.0.3
+calico-vxlan-worker          Ready    &lt;none&gt;          47h   v1.27.3   172.18.0.2
+
+## Pod 信息
+root@network-demo:~# kubectl get pods -o wide
+NAME         READY   STATUS    RESTARTS   AGE   IP              NODE
+wluo-nkmtp   1/1     Running   1          47h   10.244.177.66   calico-vxlan-worker
+wluo-qf5cc   1/1     Running   1          47h   10.244.110.74   calico-vxlan-control-plane 
+</code></pre>
+<h3 id="1查询-vxlancalico-设备信息">1.查询 vxlan.calico 设备信息</h3>
+<blockquote>
+<p>开头提到 vxlan 模式是把一个二层网络封装到 UDP 包里，通过三层网络传输。那么 vxlan.calico 设备就是主机上的 VTEP 设备，用来做封装/解封装。</p>
+</blockquote>
+<pre><code class="language-bash">root@calico-vxlan-control-plane:/# ip -d link show vxlan.calico
+6: vxlan.calico: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 qdisc noqueue state UNKNOWN mode DEFAULT group default 
+    link/ether 66:40:d4:7a:17:07 brd ff:ff:ff:ff:ff:ff promiscuity 0 minmtu 68 maxmtu 65535 
+    vxlan id 4096 local 172.18.0.3 dev eth0 srcport 0 0 dstport 4789 nolearning ttl auto ageing 300 udpcsum noudp6zerocsumtx noudp6zerocsumrx addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 
+
+root@calico-vxlan-control-plane:/# ip address show vxlan.calico
+6: vxlan.calico: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 qdisc noqueue state UNKNOWN group default 
+    link/ether 66:40:d4:7a:17:07 brd ff:ff:ff:ff:ff:ff
+    inet 10.244.110.64/32 scope global vxlan.calico
+       valid_lft forever preferred_lft forever
+</code></pre>
+<h3 id="2查询节点路由表">2.查询节点路由表</h3>
+<blockquote>
+<p>查询路由表发现，访问对端 Pod 时通过 <strong>vxlan.calico</strong> 设备进行转发</p>
+<p>路由信息中 <code>onlink</code> 标志表示<strong>认为下一跳位于本地链路上</strong>，即使该网关不在同一网段。因为实际可达性由 VXLAN 隧道保证，而不是直接 L3 可达</p>
+</blockquote>
+<pre><code class="language-bash">root@network-demo:~# docker exec -it calico-vxlan-control-plane ip route show | grep '10.244.177.64'
+
+## 访问 10.244.177.66 走这条路由（子网掩码 /26 包含），具体看下面 ipcalc 结果
+10.244.177.64/26 via 10.244.177.64 dev vxlan.calico onlink
+
+## ipcalc 10.244.177.64/26
+## Address:   10.244.177.64        00001010.11110100.10110001.01 000000
+## Netmask:   255.255.255.192 = 26 11111111.11111111.11111111.11 000000
+## Wildcard:  0.0.0.63             00000000.00000000.00000000.00 111111
+## =&gt;
+## Network:   10.244.177.64/26     00001010.11110100.10110001.01 000000
+## HostMin:   10.244.177.65        00001010.11110100.10110001.01 000001
+## HostMax:   10.244.177.126       00001010.11110100.10110001.01 111110
+## Broadcast: 10.244.177.127       00001010.11110100.10110001.01 111111
+## Hosts/Net: 62                    Class A, Private Internet
+
+## 效果同 ip route show
+root@network-demo:~# docker exec -it calico-vxlan-control-plane route -n | grep '10.244.177.64'
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags Metric Ref    Use Iface
+10.244.177.64   10.244.177.64   255.255.255.192 UG    0      0        0 vxlan.calico
+</code></pre>
+<h3 id="3查询节点-arp-表">3.查询节点 ARP 表</h3>
+<blockquote>
+<p>跨节点 Pod 流量走 VXLAN 隧道。每条远端 Pod IP → VTEP MAC 的映射由 <strong>Felix（Calico agent）</strong> 主动写入邻居表并标记为 <code>PERMANENT</code>。</p>
+<p>既然是远端，这里的 <code>66:aa:ae:c0:d0:7a</code> MAC 肯定是对端 Pod Node VTEP MAC。</p>
+</blockquote>
+<pre><code class="language-bash">root@network-demo:~# docker exec calico-vxlan-control-plane ip neighbor show | grep '10.244.177.64'
+10.244.177.64 dev vxlan.calico lladdr 66:aa:ae:c0:d0:7a PERMANENT
+
+root@network-demo:~# docker exec calico-vxlan-control-plane arp -n | grep '10.244.177.64'
+Address                  HWtype  HWaddress           Flags Mask            Iface
+10.244.177.64            ether   66:aa:ae:c0:d0:7a   CM                    vxlan.calico
+</code></pre>
+<h3 id="4查询节点-fdb-表">4.查询节点 FDB 表</h3>
+<blockquote>
+<p><strong>vxlan.calico</strong> 是 vxlan 设备，请求经过他时，会通过 FDB 表查询</p>
+</blockquote>
+<pre><code class="language-bash">root@network-demo:~# docker exec -it calico-vxlan-control-plane bridge fdb show | grep '172.18.0.2'
+
+## 如果要发 VXLAN 帧给这个 MAC，封装后的外层目的 IP 是 172.18.0.2
+66:aa:ae:c0:d0:7a dev vxlan.calico dst 172.18.0.2 self permanent
+</code></pre>
+<h2 id="查询-pod-路由arp网络设备信息">查询 Pod 路由、ARP、网络设备信息</h2>
+<blockquote>
+<p>验证路由规则、calico 生成的网络设备开启 proxy_arp 后的效果</p>
+</blockquote>
+<h3 id="1查询-pod-网卡信息">1.查询 Pod 网卡信息</h3>
+<pre><code class="language-bash">## Pod 所处网段子网掩码为 32，即该网段只存在 Pod IP
+## /32 意味着 Pod 是"孤岛"，任何其他 IP 都不在本地网段
+root@network-demo:~# kubectl exec wluo-qf5cc -- ip address show eth0
+4: eth0@if11: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1450 qdisc noqueue state UP group default 
+    link/ether a2:7f:ae:c6:af:99 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+    inet 10.244.110.74/32 scope global eth0
+       valid_lft forever preferred_lft forever
+</code></pre>
+<h3 id="2查询-pod-路由">2.查询 Pod 路由</h3>
+<blockquote>
+<p>与 Calico IPIP 模式一样，容器默认网关的 IP 169.254.1.1 是什么其实无所谓。因为通过 <code>scope link</code> 配置后，这条路由被标记为本地链路路由，通信走的是<strong>二层转发</strong>，依赖的是 MAC 地址而非 IP 地址。</p>
+</blockquote>
+<pre><code class="language-bash">root@network-demo:~# kubectl exec wluo-qf5cc -- ip route show
+default via 169.254.1.1 dev eth0 
+169.254.1.1 dev eth0 scope link 
+
+root@network-demo:~# kubectl exec wluo-qf5cc -- route -n
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags Metric Ref    Use Iface
+0.0.0.0         169.254.1.1     0.0.0.0         UG    0      0        0 eth0
+169.254.1.1     0.0.0.0         255.255.255.255 UH    0      0        0 eth0
+</code></pre>
+<h3 id="3查询-pod-arp-信息">3.查询 Pod ARP 信息</h3>
+<pre><code class="language-bash">root@network-demo:~# kubectl exec wluo-qf5cc -- ip neighbor show
+172.18.0.3 dev eth0 lladdr ee:ee:ee:ee:ee:ee STALE
+169.254.1.1 dev eth0 lladdr ee:ee:ee:ee:ee:ee STALE
+
+root@network-demo:~# kubectl exec wluo-qf5cc -- arp -n
+Address                  HWtype  HWaddress           Flags Mask            Iface
+172.18.0.3               ether   ee:ee:ee:ee:ee:ee   C                     eth0
+169.254.1.1              ether   ee:ee:ee:ee:ee:ee   C                     eth0
+</code></pre>
+<h2 id="pod-网卡处抓包">Pod 网卡处抓包</h2>
+<pre><code class="language-bash">root@network-demo:~# kubectl exec wluo-qf5cc -- curl -s 10.244.177.66
+PodName: wluo-nkmtp | PodIP: eth0 10.244.177.66/32
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/3735354/202604/3735354-20260405162002448-727659404.png" alt="image" loading="lazy"></p>
+<p><img src="https://img2024.cnblogs.com/blog/3735354/202604/3735354-20260405162018569-413227942.png" alt="image" loading="lazy"></p>
+<h2 id="node-网卡处抓包">Node 网卡处抓包</h2>
+<p><img src="https://img2024.cnblogs.com/blog/3735354/202604/3735354-20260405162030743-159605971.png" alt="image" loading="lazy"></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-04-05 16:21">2026-04-05 16:20</span>&nbsp;
+<a href="https://www.cnblogs.com/manuscript">怎么还在写代码</a>&nbsp;
+阅读(<span id="post_view_count">44</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19823849);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmanuscript%2Fp%2F19823849&amp;targetId=19823849&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
