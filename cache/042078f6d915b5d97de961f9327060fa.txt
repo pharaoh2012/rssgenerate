@@ -1,0 +1,673 @@
+
+	<div class="postTitle">
+		<h1><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/cswuyg/p/19852392" title="发布于 2026-04-11 17:35">
+    <span role="heading" aria-level="2">vLLM 权重加载机制全解析：从挑战到理想架构</span>
+    
+
+</a>
+</h1>
+	</div>
+	<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<blockquote>
+<p class="listitem">本文已于 2026.04.11 发表于<a href="https://mp.weixin.qq.com/s/u_OJe3Y6EIJdo41CH9evIA" target="_blank" rel="noopener nofollow">公众号</a>和<a href="https://zhuanlan.zhihu.com/p/2025940088371070699" target="_blank" rel="noopener nofollow">知乎</a></p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411172856848-936951884.png" alt="head" width="789" height="440" loading="lazy"></p>
+<p>&nbsp;</p>
+<h2 class="h2" data-heading="true">1. 权重加载要解决什么问题？</h2>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411172928139-35331728.png" alt="01-infographic-three-challenges" width="757" height="508" loading="lazy"></p>
+<p>&nbsp;在阅读 vLLM 的权重加载实现之前，先理解它要解决的核心问题。</p>
+<p class="p">大模型的权重通常以 checkpoint 文件的形式存储在磁盘上。权重加载的任务就是：把这些文件中的张量，正确地填入模型(推理代码)的每一个参数中。这件事看似简单——读文件、按名字匹配、拷贝数据——但有三个问题使它变得复杂。</p>
+<h3 class="h3" data-heading="true">问题一：张量并行（Tensor Parallelism）下的权重切分与内存控制</h3>
+<p class="p">vLLM 支持将一个模型拆分到多张 GPU 上并行推理，这就是张量并行（TP）。TP 的核心思想是：把一个大矩阵按行或列切成若干份，每张 GPU 只持有其中一份，各自计算后再通过通信（AllReduce / AllGather）合并结果。</p>
+<p class="p">以一个&nbsp;<code class="codespan">[4096, 4096]</code>&nbsp;的线性层权重为例，如果 TP=2：</p>
+<ul class="ul">
+<li class="listitem">•&nbsp;<strong>列并行（Column Parallel）</strong>：权重按列切分，GPU-0 持有&nbsp;<code class="codespan">[4096, 2048]</code>，GPU-1 持有另一半。每张 GPU 用完整输入乘以自己的半个权重，得到半个输出，最后 AllGather 拼接。</li>
+<li class="listitem">•&nbsp;<strong>行并行（Row Parallel）</strong>：权重按行切分，GPU-0 持有&nbsp;<code class="codespan">[2048, 4096]</code>，GPU-1 持有另一半。输入也被切分，各自计算后 AllReduce 求和。</li>
+</ul>
+<p class="p"><strong>问题</strong>：权重加载时不能简单地把整个张量拷贝到参数中，而是需要根据当前 GPU 的 rank，从完整权重中截取出属于自己的那一片，如何实现这个"截取"？同时，由于 checkpoint 存储的是完整权重，而每个 GPU 只需要 1/TP 的切片，如何保证加载过程中不出现内存、显存 OOM？</p>
+<h3 class="h3" data-heading="true">问题二：QKV 融合与 Gate-Up 融合</h3>
+<p class="p">为了减少 kernel launch 开销和提高 GPU 利用率，vLLM 将多个逻辑上独立的权重融合（fuse）为一个物理参数：</p>
+<p class="p"><strong>QKV 融合</strong>：Transformer 的注意力层有 Q、K、V 三个投影矩阵。在 checkpoint 中它们是三个独立的权重（<code class="codespan">q_proj.weight</code>、<code class="codespan">k_proj.weight</code>、<code class="codespan">v_proj.weight</code>），但 vLLM 将它们拼接为一个&nbsp;<code class="codespan">qkv_proj.weight</code>，这样一次 GEMM 就能同时计算 Q、K、V，减少了两次 kernel launch。</p>
+<p class="p"><strong>Gate-Up 融合</strong>：FFN 层中的&nbsp;<code class="codespan">gate_proj</code>&nbsp;和&nbsp;<code class="codespan">up_proj</code>&nbsp;同理被融合为&nbsp;<code class="codespan">gate_up_proj</code>，一次 GEMM 替代两次。</p>
+<p class="p"><strong>问题</strong>：checkpoint 中没有&nbsp;<code class="codespan">qkv_proj</code>&nbsp;这个 key，只有&nbsp;<code class="codespan">q_proj</code>、<code class="codespan">k_proj</code>、<code class="codespan">v_proj</code>。加载时如何做映射？</p>
+<h3 class="h3" data-heading="true">问题三：meta 设备初始化与延迟物化（materialize，即在真实设备上分配实际内存）</h3>
+<p class="p">PyTorch 提供了一种特殊的 meta 设备（<code class="codespan">device="meta"</code>）：在 meta 设备上创建的张量只记录 shape、dtype、stride 等元信息，不分配任何实际内存。这对大模型非常有用——一个 500B 参数的模型如果直接在 GPU 上初始化空参数，仅参数本身就需要约 1000GB 显存（FP16），远超单卡容量。</p>
+<p class="p">vLLM 在在线量化和 Transformers Backend 等场景中使用 meta 设备来延迟分配内存。</p>
+<p class="p"><strong>问题</strong>：当参数位于 meta 设备时，不能直接&nbsp;<code class="codespan">copy_</code>&nbsp;数据到参数中（meta 张量没有实际存储）。权重加载如何处理这些"虚拟"参数？</p>
+<hr class="hr">
+<p class="p">带着这三个问题，我们来看 vLLM 的实际实现。</p>
+<h2 class="h2" data-heading="true">2. 权重加载体系概述</h2>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411172953285-1697239231.png" alt="02-flowchart-loading-pipeline" width="806" height="541" loading="lazy"></p>
+<p>本节系统性地介绍 vLLM 的权重加载流程。</p>
+<h3 class="h3" data-heading="true">2.1 整体流程</h3>
+<p class="p">vLLM 的权重加载分为四个阶段：模型初始化 → 权重读取 → 权重分发 → 后处理。</p>
+<pre class="hljs code__pre highlighter-hljs"><code>┌─────────────────────────────────────────────────────────────────────┐
+│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BaseModelLoader.load_model()&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;①&nbsp;initialize_model()&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;构建模型结构（空参数）&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;②&nbsp;load_weights(model,&nbsp;...)&nbsp;&nbsp;&nbsp;&nbsp;读取&nbsp;checkpoint&nbsp;并分发到参数&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;③&nbsp;process_weights_after_loading()&nbsp;&nbsp;量化后处理（repacking&nbsp;等）&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+│&nbsp;&nbsp;④&nbsp;model.eval()&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;返回推理就绪的模型&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+<h3 class="h3" data-heading="true">2.2 权重读取：从文件到迭代器</h3>
+<p class="p"><code class="codespan">DefaultModelLoader</code>&nbsp;是最常用的加载器。它将 checkpoint 文件（safetensors / PyTorch bin）转换为&nbsp;<code class="codespan">Iterable[tuple[str, torch.Tensor]]</code>&nbsp;迭代器——每个元素是一对&nbsp;<code class="codespan">(权重名, 张量)</code>：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;vllm/model_executor/model_loader/default_loader.py&nbsp;—&nbsp;DefaultModelLoader.load_weights()
+weights_to_load&nbsp;=&nbsp;{name&nbsp;for&nbsp;name,&nbsp;_&nbsp;in&nbsp;model.named_parameters()}
+loaded_weights&nbsp;=&nbsp;model.load_weights(self.get_all_weights(model_config,&nbsp;model))</code></pre>
+<p class="p"><code class="codespan">get_all_weights()</code>&nbsp;内部调用&nbsp;<code class="codespan">safetensors_weights_iterator()</code>&nbsp;等函数，逐文件、逐 key 地 yield 出&nbsp;<code class="codespan">(name, tensor)</code>&nbsp;对。这里的流式迭代器（<code class="codespan">yield</code>）避免了一次性将整个 checkpoint 读入内存——每次只读取一个张量，处理完毕后即可释放，CPU 内存峰值仅为单个最大张量的大小。此阶段 yield 出的张量位于 CPU 主存中，保持 checkpoint 原始的 key 命名和完整 shape。</p>
+<h3 class="h3" data-heading="true">2.3 权重分发：两种模式并存</h3>
+<p class="p">权重迭代器被传入&nbsp;<code class="codespan">model.load_weights()</code>，由模型层面决定如何将每个&nbsp;<code class="codespan">(name, tensor)</code>&nbsp;分发到对应参数。当前存在两种分发模式：</p>
+<h4 class="h4" data-heading="true">2.3.1 模式 A：手动遍历（传统模式，逐步被替代）</h4>
+<p class="p">顶层模型类（继承&nbsp;<code class="codespan">nn.Module</code>，如&nbsp;<code class="codespan">QWenLMHeadModel</code>）的&nbsp;<code class="codespan">load_weights</code>&nbsp;方法手动遍历迭代器，逐条处理 key 重命名、融合映射、shard_id 注入，最终调用&nbsp;<code class="codespan">param.weight_loader(param, loaded_weight, shard_id)</code>&nbsp;完成加载。以&nbsp;<code class="codespan">qwen.py</code>（<code class="codespan">vllm/model_executor/models/qwen.py</code>，Qwen-1 代模型）为例：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;典型的手动遍历模式（vllm/model_executor/models/qwen.py&nbsp;—&nbsp;QWenBaseModel.load_weights）
+def&nbsp;load_weights(self,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;stacked_params_mapping&nbsp;=&nbsp;[
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;(param_name,&nbsp;shard_name,&nbsp;shard_id)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"w2",&nbsp;0),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"w1",&nbsp;1),
+&nbsp;&nbsp;&nbsp;&nbsp;]
+&nbsp;&nbsp;&nbsp;&nbsp;params_dict&nbsp;=&nbsp;dict(self.named_parameters())
+&nbsp;&nbsp;&nbsp;&nbsp;loaded_params:&nbsp;set[str]&nbsp;=&nbsp;set()
+&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;name,&nbsp;loaded_weight&nbsp;in&nbsp;weights:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;"rotary_emb.inv_freq"&nbsp;in&nbsp;name:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;continue
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;param_name,&nbsp;weight_name,&nbsp;shard_id&nbsp;in&nbsp;stacked_params_mapping:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;weight_name&nbsp;not&nbsp;in&nbsp;name:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;continue
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;name&nbsp;=&nbsp;name.replace(weight_name,&nbsp;param_name)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;...
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param&nbsp;=&nbsp;params_dict[name]
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader&nbsp;=&nbsp;param.weight_loader
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader(param,&nbsp;loaded_weight,&nbsp;shard_id)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;break
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;else:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;...
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param&nbsp;=&nbsp;params_dict[name]
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader&nbsp;=&nbsp;getattr(param,&nbsp;"weight_loader",&nbsp;default_weight_loader)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader(param,&nbsp;loaded_weight)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;loaded_params.add(name)
+&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;loaded_params</code></pre>
+<h4 class="h4" data-heading="true">2.3.2 模式 B：自动递归（AutoWeightsLoader 模式，当前主流方向）</h4>
+<p class="p">顶层模型类（继承&nbsp;<code class="codespan">nn.Module</code>，如&nbsp;<code class="codespan">Qwen3ForCausalLM</code>）的&nbsp;<code class="codespan">load_weights</code>&nbsp;创建&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;实例，由它按模块树自动分发权重。<code class="codespan">AutoWeightsLoader</code>&nbsp;接收顶层模型实例（即整棵模块树的根节点），按&nbsp;<code class="codespan">.</code>&nbsp;分割权重名，逐级匹配子模块或参数，采用三级优先策略：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>AutoWeightsLoader._load_module(prefix,&nbsp;module,&nbsp;weights)
+&nbsp;&nbsp;├─&nbsp;①&nbsp;若&nbsp;module&nbsp;有&nbsp;load_weights&nbsp;方法&nbsp;→&nbsp;委托给它（模块级优先）
+&nbsp;&nbsp;├─&nbsp;②&nbsp;按&nbsp;prefix&nbsp;匹配子模块&nbsp;→&nbsp;递归&nbsp;_load_module（子模块递归）
+&nbsp;&nbsp;└─&nbsp;③&nbsp;按&nbsp;prefix&nbsp;匹配参数&nbsp;→&nbsp;调用&nbsp;param.weight_loader（参数级处理）</code></pre>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;典型的&nbsp;AutoWeightsLoader&nbsp;模式（vllm/model_executor/models/qwen3.py&nbsp;—&nbsp;Qwen3ForCausalLM.load_weights）
+def&nbsp;load_weights(self,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;loader&nbsp;=&nbsp;AutoWeightsLoader(
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self,
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;skip_prefixes=(["lm_head."]&nbsp;if&nbsp;self.config.tie_word_embeddings&nbsp;else&nbsp;None),
+&nbsp;&nbsp;&nbsp;&nbsp;)
+&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;loader.load_weights(weights)</code></pre>
+<p class="p"><strong><code class="codespan">AutoWeightsLoader</code>&nbsp;核心实现</strong></p>
+<p class="p">理解&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;的内部机制对后续分析缺陷至关重要。它的核心在于两个方法：<code class="codespan">load_weights</code>（入口）和&nbsp;<code class="codespan">_load_module</code>（递归引擎）。</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;vllm/model_executor/models/utils.py&nbsp;—&nbsp;AutoWeightsLoader&nbsp;核心实现（简化）
+
+class&nbsp;AutoWeightsLoader:
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;__init__(self,&nbsp;module:&nbsp;nn.Module,&nbsp;*,&nbsp;skip_prefixes=None,&nbsp;...):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.module&nbsp;=&nbsp;module&nbsp;&nbsp;#&nbsp;顶层模型实例（整棵模块树的根节点）
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;load_weights(self,&nbsp;weights,&nbsp;*,&nbsp;mapper=None)&nbsp;-&gt;&nbsp;set[str]:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"""入口方法：启动从根节点开始的递归加载"""
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;mapper&nbsp;is&nbsp;not&nbsp;None:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weights&nbsp;=&nbsp;mapper.apply(weights)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;从根模块开始递归
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;autoloaded_weights&nbsp;=&nbsp;set(self._load_module("",&nbsp;self.module,&nbsp;weights))
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;autoloaded_weights
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;_load_module(self,&nbsp;base_prefix,&nbsp;module,&nbsp;weights)&nbsp;-&gt;&nbsp;Iterable[str]:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"""递归引擎：对每个模块执行三级优先策略"""
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;①&nbsp;模块级优先：若子模块自身定义了&nbsp;load_weights，委托给它
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;&nbsp;&nbsp;&nbsp;注意：跳过根模块自身（self.module），避免无限递归
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;module&nbsp;!=&nbsp;self.module:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;module_load_weights&nbsp;=&nbsp;getattr(module,&nbsp;"load_weights",&nbsp;None)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;callable(module_load_weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;yield&nbsp;from&nbsp;module_load_weights(weights)&nbsp;&nbsp;#&nbsp;委托
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;&nbsp;#&nbsp;该模块的权重已由其自身处理完毕
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;child_modules&nbsp;=&nbsp;dict(module.named_children())
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;child_params&nbsp;=&nbsp;dict(module.named_parameters(recurse=False))
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;按权重名的第一段前缀分组，逐组处理
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;child_prefix,&nbsp;child_weights&nbsp;in&nbsp;self._groupby_prefix(weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;prefix&nbsp;=&nbsp;self._get_qualname(base_prefix,&nbsp;child_prefix)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;child_prefix&nbsp;in&nbsp;child_modules:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;②&nbsp;子模块递归：匹配到子模块，递归进入
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;yield&nbsp;from&nbsp;self._load_module(
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;prefix,&nbsp;child_modules[child_prefix],&nbsp;child_weights
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;elif&nbsp;child_prefix&nbsp;in&nbsp;child_params:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;③&nbsp;参数级处理：匹配到参数，调用&nbsp;param.weight_loader
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;yield&nbsp;from&nbsp;self._load_param(
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;prefix,&nbsp;child_params[child_prefix],&nbsp;child_weights
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;else:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;raise&nbsp;ValueError(f"No&nbsp;module&nbsp;or&nbsp;parameter&nbsp;named&nbsp;{prefix!r}")
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;_load_param(self,&nbsp;base_prefix,&nbsp;param,&nbsp;weights)&nbsp;-&gt;&nbsp;Iterable[str]:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"""参数级加载：调用参数上挂载的&nbsp;weight_loader"""
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;weight_name,&nbsp;weight_data&nbsp;in&nbsp;weights:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader&nbsp;=&nbsp;getattr(param,&nbsp;"weight_loader",&nbsp;default_weight_loader)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader(param,&nbsp;weight_data)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;yield&nbsp;self._get_qualname(base_prefix,&nbsp;weight_name)</code></pre>
+<p class="p"><strong>关键调用链：<code class="codespan">load_weights</code>&nbsp;→&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;→&nbsp;<code class="codespan">load_weights</code>（递归）</strong></p>
+<p class="p">这里存在一个容易混淆但非常重要的递归结构——顶层模型的&nbsp;<code class="codespan">load_weights</code>&nbsp;创建了&nbsp;<code class="codespan">AutoWeightsLoader</code>，而&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;在递归过程中又会调用子模块的&nbsp;<code class="codespan">load_weights</code>：</p>
+<p class="p">趋势：手动遍历中的"路由分发"部分正在被&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;替代。 对比同一系列模型的演进可以清晰看到这一趋势：早期的&nbsp;<code class="codespan">qwen.py</code>（<code class="codespan">vllm/model_executor/models/qwen.py</code>，Qwen-1）使用约 30 行手动遍历代码同时处理路由和融合，而后续的&nbsp;<code class="codespan">qwen3.py</code>（<code class="codespan">vllm/model_executor/models/qwen3.py</code>，Qwen-3）将路由职责交给&nbsp;<code class="codespan">AutoWeightsLoader</code>，顶层仅需 4 行代码。</p>
+<h4 class="h4" data-heading="true">2.3.3 字段融合映射：<code class="codespan">stacked_params_mapping</code>&nbsp;机制</h4>
+<p class="p">如第 1 章"问题二"所述，vLLM 将多个逻辑独立的权重融合为一个物理参数（如&nbsp;<code class="codespan">q_proj</code>&nbsp;+&nbsp;<code class="codespan">k_proj</code>&nbsp;+&nbsp;<code class="codespan">v_proj</code>&nbsp;→&nbsp;<code class="codespan">qkv_proj</code>）。但 checkpoint 中只有原始的分开 key，没有融合后的 key。<code class="codespan">stacked_params_mapping</code>&nbsp;就是解决这个映射问题的机制——它告诉加载器"这个 checkpoint key 应该填到融合参数的哪个位置"。</p>
+<p class="p">映射表的结构</p>
+<p class="p">每条映射是一个三元组&nbsp;<code class="codespan">(param_name, shard_name, shard_id)</code>：</p>
+<ul class="ul">
+<li class="listitem">•&nbsp;<code class="codespan">param_name</code>：融合后的参数名（模型中实际存在的参数）</li>
+<li class="listitem">•&nbsp;<code class="codespan">shard_name</code>：checkpoint 中的原始 key 片段</li>
+<li class="listitem">•&nbsp;<code class="codespan">shard_id</code>：该原始 key 在融合参数中的位置标识</li>
+</ul>
+<pre class="hljs code__pre highlighter-hljs"><code>stacked_params_mapping&nbsp;=&nbsp;[
+&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;(param_name,&nbsp;shard_name,&nbsp;shard_id)
+&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"q_proj",&nbsp;"q"),&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;q_proj&nbsp;→&nbsp;qkv_proj&nbsp;的&nbsp;Q&nbsp;区域
+&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"k_proj",&nbsp;"k"),&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;k_proj&nbsp;→&nbsp;qkv_proj&nbsp;的&nbsp;K&nbsp;区域
+&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"v_proj",&nbsp;"v"),&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;v_proj&nbsp;→&nbsp;qkv_proj&nbsp;的&nbsp;V&nbsp;区域
+&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"gate_proj",&nbsp;0),&nbsp;&nbsp;#&nbsp;gate_proj&nbsp;→&nbsp;gate_up_proj&nbsp;的第&nbsp;0&nbsp;分片
+&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"up_proj",&nbsp;1),&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;up_proj&nbsp;&nbsp;&nbsp;→&nbsp;gate_up_proj&nbsp;的第&nbsp;1&nbsp;分片
+]</code></pre>
+<p class="p">加载过程</p>
+<p class="p">当遍历到 checkpoint key&nbsp;<code class="codespan">model.layers.0.self_attn.q_proj.weight</code>&nbsp;时：</p>
+<ol class="ol">
+<li class="listitem">1. 匹配到&nbsp;<code class="codespan">shard_name="q_proj"</code>，将 key 中的&nbsp;<code class="codespan">q_proj</code>&nbsp;替换为&nbsp;<code class="codespan">qkv_proj</code>，得到&nbsp;<code class="codespan">model.layers.0.self_attn.qkv_proj.weight</code></li>
+<li class="listitem">2. 带上&nbsp;<code class="codespan">shard_id="q"</code>&nbsp;调用&nbsp;<code class="codespan">weight_loader(param, loaded_weight, shard_id="q")</code></li>
+<li class="listitem">3.&nbsp;<code class="codespan">weight_loader</code>&nbsp;内部根据&nbsp;<code class="codespan">shard_id</code>&nbsp;计算偏移量，将数据写入&nbsp;<code class="codespan">qkv_proj</code>&nbsp;参数的 Q 区域</li>
+</ol>
+<blockquote class="blockquote">
+<p class="p"><strong>融合映射在模式 A 和模式 B 中都在使用。</strong>&nbsp;无论是手动遍历（模式 A）还是&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;递归分发（模式 B），融合映射的处理逻辑都由各模型文件自行实现——在&nbsp;<code class="codespan">load_weights</code>&nbsp;方法中定义&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;并遍历匹配。具体的处理代码可参见 2.3.1 中模式 A 的完整示例。</p>
+</blockquote>
+<p class="p"><strong><code class="codespan">AutoWeightsLoader</code>&nbsp;与&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;的分层协作</strong></p>
+<ul class="ul">
+<li class="listitem">•&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;负责递归分发——按模块树自动将权重路由到对应的子模块/参数，替代的是模式 A 中手动&nbsp;<code class="codespan">for name, loaded_weight in weights</code>&nbsp;+&nbsp;<code class="codespan">params_dict[name]</code>&nbsp;的路由逻辑；</li>
+<li class="listitem">•&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;负责字段融合映射——将 checkpoint 中分开的&nbsp;<code class="codespan">q_proj</code>/<code class="codespan">k_proj</code>/<code class="codespan">v_proj</code>&nbsp;映射到融合后的&nbsp;<code class="codespan">qkv_proj</code>，并注入&nbsp;<code class="codespan">shard_id</code>。</li>
+</ul>
+<p class="p">部分较新的模型同时使用两者，形成分层协作：顶层模型类用&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;做递归分发，<code class="codespan">AutoWeightsLoader</code>&nbsp;递归到某个子模块时发现它有&nbsp;<code class="codespan">load_weights</code>&nbsp;方法便委托给它，子模块内部再用&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;处理融合映射。</p>
+<p class="p">以&nbsp;<code class="codespan">qwen3_next.py</code>（<code class="codespan">vllm/model_executor/models/qwen3_next.py</code>）为例，顶层&nbsp;<code class="codespan">Qwen3NextForCausalLM</code>&nbsp;使用&nbsp;<code class="codespan">AutoWeightsLoader</code>，而中间层&nbsp;<code class="codespan">Qwen3NextModel</code>&nbsp;使用&nbsp;<code class="codespan">stacked_params_mapping</code>：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;顶层：Qwen3NextForCausalLM.load_weights&nbsp;—&nbsp;使用&nbsp;AutoWeightsLoader&nbsp;递归分发
+class&nbsp;Qwen3NextForCausalLM(...):
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;load_weights(self,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;loader&nbsp;=&nbsp;AutoWeightsLoader(self,&nbsp;skip_prefixes=["mtp."])
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;loader.load_weights(weights)
+
+#&nbsp;中间层：Qwen3NextModel.load_weights&nbsp;—&nbsp;使用&nbsp;stacked_params_mapping&nbsp;处理融合映射
+class&nbsp;Qwen3NextModel(nn.Module):
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;load_weights(self,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;stacked_params_mapping&nbsp;=&nbsp;[
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"q_proj",&nbsp;"q"),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"k_proj",&nbsp;"k"),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"v_proj",&nbsp;"v"),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"gate_proj",&nbsp;0),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"up_proj",&nbsp;1),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;]
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;params_dict&nbsp;=&nbsp;dict(self.named_parameters())
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;loaded_params:&nbsp;set[str]&nbsp;=&nbsp;set()
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;name,&nbsp;loaded_weight&nbsp;in&nbsp;weights:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;param_name,&nbsp;weight_name,&nbsp;shard_id&nbsp;in&nbsp;stacked_params_mapping:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;weight_name&nbsp;not&nbsp;in&nbsp;name:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;continue
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;name&nbsp;=&nbsp;name.replace(weight_name,&nbsp;param_name)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param&nbsp;=&nbsp;params_dict[name]
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader&nbsp;=&nbsp;param.weight_loader
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader(param,&nbsp;loaded_weight,&nbsp;shard_id)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;break
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;else:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param&nbsp;=&nbsp;params_dict[name]
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader&nbsp;=&nbsp;getattr(param,&nbsp;"weight_loader",&nbsp;default_weight_loader)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weight_loader(param,&nbsp;loaded_weight)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;loaded_params.add(name)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;loaded_params</code></pre>
+<p class="p">调用链如下：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>Qwen3NextForCausalLM.load_weights()
+&nbsp;&nbsp;└─&nbsp;AutoWeightsLoader.load_weights(weights)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;_load_module("",&nbsp;Qwen3NextForCausalLM,&nbsp;weights)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;_load_module("model",&nbsp;Qwen3NextModel,&nbsp;grouped_weights)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;Qwen3NextModel.load_weights(grouped_weights)&nbsp;&nbsp;←&nbsp;委托（优先级&nbsp;①）
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;遍历&nbsp;stacked_params_mapping，处理融合映射
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;param.weight_loader(param,&nbsp;loaded_weight,&nbsp;shard_id)</code></pre>
+<h3 class="h3" data-heading="true">2.4 参数级加载：<code class="codespan">weight_loader</code>&nbsp;的职责</h3>
+<p class="p">无论哪种分发模式，最终都会调用参数上的&nbsp;<code class="codespan">weight_loader</code>&nbsp;来完成实际的数据拷贝。<code class="codespan">weight_loader</code>&nbsp;负责处理 TP 分片（从完整权重中 narrow 出当前 rank 的切片）和 融合偏移（将多个子权重拼接到同一个参数的不同区域）。</p>
+<p class="p">在深入两代参数体系之前，先理解&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;本身。<code class="codespan">nn.Parameter</code>&nbsp;本质上就是&nbsp;<code class="codespan">torch.Tensor</code>——它直接继承自&nbsp;<code class="codespan">Tensor</code>，只额外做了两件事：</p>
+<ol class="ol">
+<li class="listitem">1. 默认&nbsp;<code class="codespan">requires_grad=True</code>：普通 Tensor 默认不参与梯度计算，而 Parameter 默认参与。这是它作为"可学习参数"的语义标识。</li>
+<li class="listitem">2. 自动注册到&nbsp;<code class="codespan">nn.Module</code>：当一个 Parameter 被赋值为 Module 的属性时（如&nbsp;<code class="codespan">self.weight = nn.Parameter(...)</code>），Module 的&nbsp;<code class="codespan">__setattr__</code>&nbsp;会自动将其注册到&nbsp;<code class="codespan">_parameters</code>&nbsp;字典中，使其能被&nbsp;<code class="codespan">named_parameters()</code>&nbsp;遍历到、被优化器发现、被&nbsp;<code class="codespan">state_dict()</code>&nbsp;序列化。</li>
+</ol>
+<p class="p">除此之外，<code class="codespan">nn.Parameter</code>&nbsp;没有任何额外的数据存储或方法</p>
+<p class="p">vLLM 中存在两代参数体系，分别以不同方式在这个"纯粹的 Tensor 子类"上附加权重加载能力：</p>
+<table class="preview-table">
+<thead>
+<tr><th class="th">&nbsp;</th><th class="th">v1（<code class="codespan">nn.Parameter</code>&nbsp;+ 动态属性）</th><th class="th">v2（<code class="codespan">BasevLLMParameter</code>&nbsp;子类）</th></tr>
+</thead>
+<tbody>
+<tr class="tr">
+<td class="td">类型</td>
+<td class="td">PyTorch 原生&nbsp;<code class="codespan">nn.Parameter</code></td>
+<td class="td"><code class="codespan">BasevLLMParameter</code>&nbsp;及其子类</td>
+</tr>
+<tr class="tr">
+<td class="td"><code class="codespan">weight_loader</code>&nbsp;来源</td>
+<td class="td">由&nbsp;<code class="codespan">set_weight_attrs</code>&nbsp;或直接赋值动态挂载</td>
+<td class="td">构造函数传入，作为正式类属性</td>
+</tr>
+<tr class="tr">
+<td class="td">TP 分片逻辑</td>
+<td class="td">在&nbsp;<code class="codespan">weight_loader</code>&nbsp;函数内手动&nbsp;<code class="codespan">narrow</code>&nbsp;+&nbsp;<code class="codespan">copy_</code></td>
+<td class="td">由参数子类的&nbsp;<code class="codespan">load_column_parallel_weight()</code>&nbsp;等方法封装</td>
+</tr>
+<tr class="tr">
+<td class="td">代表</td>
+<td class="td"><code class="codespan">ColumnParallelLinear.weight_loader</code>（v1）</td>
+<td class="td"><code class="codespan">ModelWeightParameter.load_column_parallel_weight()</code>（v2）</td>
+</tr>
+</tbody>
+</table>
+<h4 class="h4" data-heading="true">2.4.1 v1：<code class="codespan">nn.Parameter</code>&nbsp;+ 动态属性</h4>
+<p class="p">v1 的做法利用了 Python 的动态属性机制，绕过了类型系统的约束。如上所述，<code class="codespan">nn.Parameter</code>&nbsp;本质上只是一个 Tensor，本身不具备&nbsp;<code class="codespan">weight_loader</code>&nbsp;属性。v1 通过&nbsp;<code class="codespan">setattr</code>或直接赋值，将&nbsp;<code class="codespan">weight_loader</code>&nbsp;强行注入到&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;实例上：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;方式一：通过&nbsp;set_weight_attrs&nbsp;间接注入（vllm/model_executor/utils.py）
+def&nbsp;set_weight_attrs(weight:&nbsp;torch.Tensor,&nbsp;weight_attrs:&nbsp;dict[str,&nbsp;Any]&nbsp;|&nbsp;None):
+&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;weight_attrs&nbsp;is&nbsp;None:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return
+&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;key,&nbsp;value&nbsp;in&nbsp;weight_attrs.items():
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;assert&nbsp;not&nbsp;hasattr(weight,&nbsp;key),&nbsp;f"Overwriting&nbsp;existing&nbsp;tensor&nbsp;attribute:&nbsp;{key}"
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;setattr(weight,&nbsp;key,&nbsp;value)&nbsp;&nbsp;#&nbsp;本质是&nbsp;setattr，动态挂载任意属性
+
+#&nbsp;使用示例（vllm/model_executor/layers/linear.py&nbsp;—&nbsp;ColumnParallelLinear.__init__）
+#&nbsp;bias&nbsp;是原生&nbsp;nn.Parameter，通过&nbsp;set_weight_attrs&nbsp;挂载&nbsp;weight_loader&nbsp;和&nbsp;output_dim
+self.bias&nbsp;=&nbsp;Parameter(torch.empty(self.output_size_per_partition,&nbsp;dtype=params_dtype))
+set_weight_attrs(self.bias,&nbsp;{"output_dim":&nbsp;0,&nbsp;"weight_loader":&nbsp;self.weight_loader})
+
+#&nbsp;方式二：直接赋值（vllm/model_executor/layers/mamba/linear_attn.py&nbsp;—&nbsp;MiniMaxText01RMSNormTP）
+self.weight&nbsp;=&nbsp;nn.Parameter(torch.ones(int(hidden_size&nbsp;/&nbsp;self.tp_world)))
+self.weight.weight_loader&nbsp;=&nbsp;self.weight_loader&nbsp;&nbsp;#&nbsp;直接在&nbsp;nn.Parameter&nbsp;上挂载动态属性</code></pre>
+<p class="p">这种做法的问题在于：<code class="codespan">nn.Parameter</code>&nbsp;的类型定义中没有&nbsp;<code class="codespan">weight_loader</code>&nbsp;属性，类型检查器无法校验、不同模块挂载的&nbsp;<code class="codespan">weight_loader</code>&nbsp;签名也各不相同（详见 4.3.1 节）。</p>
+<h4 class="h4" data-heading="true">2.4.2 v2：<code class="codespan">BasevLLMParameter</code>&nbsp;子类体系</h4>
+<p class="p">v2 的&nbsp;<code class="codespan">BasevLLMParameter</code>&nbsp;是更好的设计。它继承&nbsp;<code class="codespan">nn.Parameter</code>，将&nbsp;<code class="codespan">weight_loader</code>&nbsp;作为构造函数的正式参数，通过&nbsp;<code class="codespan">@property</code>&nbsp;暴露为类属性，具备完整的类型约束：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;vllm/model_executor/parameter.py&nbsp;—&nbsp;BasevLLMParameter
+class&nbsp;BasevLLMParameter(Parameter):
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;__init__(self,&nbsp;data:&nbsp;torch.Tensor,&nbsp;weight_loader:&nbsp;Callable):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;weight_loader&nbsp;是构造函数的正式参数，而非动态挂载
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self._weight_loader&nbsp;=&nbsp;weight_loader
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.tp_rank&nbsp;=&nbsp;get_tensor_model_parallel_rank()
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.tp_size&nbsp;=&nbsp;get_tensor_model_parallel_world_size()
+
+&nbsp;&nbsp;&nbsp;&nbsp;@property
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;weight_loader(self)&nbsp;-&gt;&nbsp;Callable:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;self._weight_loader
+
+#&nbsp;使用示例（vllm/model_executor/layers/quantization/fp8.py&nbsp;—&nbsp;Fp8LinearMethod.create_weights）
+weight&nbsp;=&nbsp;ModelWeightParameter(&nbsp;&nbsp;#&nbsp;ModelWeightParameter&nbsp;继承自&nbsp;BasevLLMParameter
+&nbsp;&nbsp;&nbsp;&nbsp;data=torch.empty(output_size_per_partition,&nbsp;input_size_per_partition,&nbsp;dtype=weight_dtype),
+&nbsp;&nbsp;&nbsp;&nbsp;input_dim=1,
+&nbsp;&nbsp;&nbsp;&nbsp;output_dim=0,
+&nbsp;&nbsp;&nbsp;&nbsp;weight_loader=weight_loader,&nbsp;&nbsp;#&nbsp;通过构造函数传入，类型明确
+)
+layer.register_parameter("weight",&nbsp;weight)</code></pre>
+<p class="p">此外，v2 还将 TP 分片逻辑封装为参数自身的方法（如&nbsp;<code class="codespan">load_column_parallel_weight()</code>、<code class="codespan">load_merged_column_weight()</code>），而非散落在外部的&nbsp;<code class="codespan">weight_loader</code>&nbsp;函数中，内聚性更好。</p>
+<h3 class="h3" data-heading="true">2.5 后处理：<code class="codespan">process_weights_after_loading</code></h3>
+<p class="p"><code class="codespan">process_weights_after_loading</code>&nbsp;负责将权重从存储格式转为运行时 kernel 所需的格式，完成量化权重的 repacking、scale 计算、格式转换等操作。它的调用时机取决于加载场景：</p>
+<p class="p"><strong>默认场景（非在线量化）</strong>：在整个模型的所有权重加载完成后统一调用。从&nbsp;<code class="codespan">BaseModelLoader.load_model</code>&nbsp;的流程可以清楚看到这一顺序：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;vllm/model_executor/model_loader/base_loader.py&nbsp;—&nbsp;BaseModelLoader.load_model
+self.load_weights(model,&nbsp;model_config)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;←&nbsp;先加载完所有权重
+process_weights_after_loading(model,&nbsp;model_config,&nbsp;target_device)&nbsp;&nbsp;&nbsp;#&nbsp;←&nbsp;再统一后处理</code></pre>
+<p class="p"><code class="codespan">process_weights_after_loading</code>&nbsp;接收整个&nbsp;<code class="codespan">model</code>（根&nbsp;<code class="codespan">nn.Module</code>），内部通过&nbsp;<code class="codespan">model.named_modules()</code>&nbsp;遍历所有子模块，逐个检查是否有&nbsp;<code class="codespan">quant_method</code>&nbsp;并调用后处理：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;vllm/model_executor/model_loader/utils.py
+def&nbsp;process_weights_after_loading(model,&nbsp;model_config,&nbsp;target_device):
+&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;_,&nbsp;module&nbsp;in&nbsp;model.named_modules():
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;quant_method&nbsp;=&nbsp;getattr(module,&nbsp;"quant_method",&nbsp;None)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;isinstance(quant_method,&nbsp;QuantizeMethodBase):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;with&nbsp;device_loading_context(module,&nbsp;target_device):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;quant_method.process_weights_after_loading(module)</code></pre>
+<p class="p"><strong>在线量化场景（layerwise reload）</strong>：后处理是逐层进行的——每层权重加载完毕后立即执行该层的&nbsp;<code class="codespan">process_weights_after_loading</code>，将全精度权重转为低精度格式后释放，再处理下一层。这样 GPU 上同一时刻只需持有一层的全精度权重，峰值显存大幅降低。</p>
+<h3 class="h3" data-heading="true">2.6 关键参与者总结</h3>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411173220000-847742554.png" alt="权重加载关键参与者" width="1005" height="168" loading="lazy"></p>
+<p>&nbsp;在整个流程中，有两个最核心的参与者需要重点理解：模块级的&nbsp;<code class="codespan">load_weights</code>&nbsp;方法和参数级的&nbsp;<code class="codespan">weight_loader</code>&nbsp;属性。它们分别承担了权重加载的"调度"和"执行"职责。</p>
+<h4 class="h4" data-heading="true">2.6.1 模块级：<code class="codespan">Module.load_weights</code></h4>
+<p class="p"><code class="codespan">load_weights</code>&nbsp;是 vLLM 各模型类自行定义的约定方法，框架通过&nbsp;<code class="codespan">hasattr(module, "load_weights")</code>&nbsp;检测模块是否实现了该方法，如果有则调用。它负责权重的路由与调度——决定每个 checkpoint 权重应该交给哪个参数来处理。它出现在两个层次：</p>
+<ul class="ul">
+<li class="listitem">• 顶层模型类（如&nbsp;<code class="codespan">Qwen3ForCausalLM</code>）：作为整个权重加载的入口，由&nbsp;<code class="codespan">BaseModelLoader</code>&nbsp;调用。顶层&nbsp;<code class="codespan">load_weights</code>&nbsp;要么手动遍历迭代器（模式 A），要么创建&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;委托递归分发（模式 B）。</li>
+<li class="listitem">• 中间层子模块（如&nbsp;<code class="codespan">Qwen3NextModel</code>）：当&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;递归到某个子模块时，如果该子模块有&nbsp;<code class="codespan">load_weights</code>&nbsp;方法，就优先委托给它。子模块的&nbsp;<code class="codespan">load_weights</code>&nbsp;通常负责处理融合映射（<code class="codespan">stacked_params_mapping</code>）等该层特有的逻辑。</li>
+</ul>
+<p class="p"><code class="codespan">load_weights</code>&nbsp;的核心职责包括：</p>
+<ol class="ol">
+<li class="listitem">1. key 重命名：将 checkpoint key 映射为模型参数名</li>
+<li class="listitem">2. 融合映射：通过&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;将分开的 checkpoint key（<code class="codespan">q_proj</code>、<code class="codespan">k_proj</code>、<code class="codespan">v_proj</code>）映射到融合参数（<code class="codespan">qkv_proj</code>），并注入&nbsp;<code class="codespan">shard_id</code></li>
+<li class="listitem">3. 路由分发：将处理后的&nbsp;<code class="codespan">(name, tensor)</code>&nbsp;交给对应参数的&nbsp;<code class="codespan">weight_loader</code>&nbsp;完成实际加载</li>
+</ol>
+<h4 class="h4" data-heading="true">2.6.2 参数级：<code class="codespan">param.weight_loader</code></h4>
+<p class="p"><code class="codespan">weight_loader</code>&nbsp;是挂载在&nbsp;<code class="codespan">nn.Parameter</code>（或其子类&nbsp;<code class="codespan">BasevLLMParameter</code>）上的可调用属性，负责权重的实际写入——将一个 checkpoint 张量正确地填入参数的数据存储中。它是权重加载链条的最后一环，处理两件关键事情：</p>
+<ul class="ul">
+<li class="listitem">• TP 分片：根据当前 rank 从完整权重中&nbsp;<code class="codespan">narrow</code>&nbsp;出属于自己的 1/TP 切片</li>
+<li class="listitem">• 融合偏移：根据&nbsp;<code class="codespan">shard_id</code>&nbsp;计算偏移量，将数据写入融合参数的正确区域</li>
+</ul>
+<p class="p"><code class="codespan">weight_loader</code>&nbsp;的典型调用方式：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;非融合权重：2&nbsp;参数调用
+weight_loader(param,&nbsp;loaded_weight)
+
+#&nbsp;融合权重：3&nbsp;参数调用，带&nbsp;shard_id
+weight_loader(param,&nbsp;loaded_weight,&nbsp;shard_id)</code></pre>
+<p class="p"><code class="codespan">weight_loader</code>&nbsp;是一种通用的参数级加载协议，并不局限于线性层。任何需要自定义权重写入逻辑的层都可以为其参数提供&nbsp;<code class="codespan">weight_loader</code>。常见的来源包括：</p>
+<ul class="ul">
+<li class="listitem">• 线性层：<code class="codespan">ColumnParallelLinear.weight_loader</code>、<code class="codespan">MergedColumnParallelLinear.weight_loader</code>、<code class="codespan">QKVParallelLinear.weight_loader</code>&nbsp;等，处理 TP 分片和融合偏移</li>
+<li class="listitem">• Embedding 层：<code class="codespan">VocabParallelEmbedding.weight_loader</code>，处理词表分片</li>
+<li class="listitem">• Mamba 层：<code class="codespan">mamba_v2_sharded_weight_loader</code>，处理 SSM 投影的交错分片</li>
+<li class="listitem">• MoE 层：<code class="codespan">FusedMoE</code>&nbsp;中的 weight_loader，处理专家权重的分发</li>
+<li class="listitem">• v2 参数子类：<code class="codespan">BasevLLMParameter</code>&nbsp;及其子类自身就携带&nbsp;<code class="codespan">weight_loader</code>&nbsp;属性，将加载逻辑内聚到参数类型中</li>
+</ul>
+<p class="p">这些&nbsp;<code class="codespan">weight_loader</code>&nbsp;被"挂载"到参数上，由外部框架通过参数间接调用。这种设计使得外部框架无需知道参数属于哪种层，只需调用&nbsp;<code class="codespan">param.weight_loader</code>&nbsp;即可。</p>
+<h4 class="h4" data-heading="true">2.6.3 两者的协作关系</h4>
+<pre class="hljs code__pre highlighter-hljs"><code>Module.load_weights（调度层）
+&nbsp;&nbsp;│&nbsp;&nbsp;"这个&nbsp;checkpoint&nbsp;key&nbsp;应该交给哪个参数？shard_id&nbsp;是什么？"
+&nbsp;&nbsp;│
+&nbsp;&nbsp;▼
+param.weight_loader（执行层）
+&nbsp;&nbsp;│&nbsp;&nbsp;"我拿到了数据和&nbsp;shard_id，按&nbsp;TP&nbsp;分片规则写入正确位置"
+&nbsp;&nbsp;│
+&nbsp;&nbsp;▼
+参数数据更新完成</code></pre>
+<p class="p">简言之：<code class="codespan">load_weights</code>&nbsp;解决"谁来加载"的问题，<code class="codespan">weight_loader</code>&nbsp;解决"怎么加载"的问题。前者是调度逻辑，后者是执行逻辑。</p>
+<p class="p">以上是 vLLM 权重加载体系的全貌。</p>
+<hr class="hr">
+<h2 class="h2" data-heading="true">3. 问题解答</h2>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411173239972-661765772.png" alt="03-framework-tp-sharding-flow" width="717" height="481" loading="lazy"></p>
+<p>&nbsp;本节回到第 1 章提出的三个问题，结合第 2 章介绍的体系，逐一给出 vLLM 的解决方案。</p>
+<h3 class="h3" data-heading="true">解答一：TP 下的权重切分与内存控制</h3>
+<p class="p"><strong>切分机制</strong>：权重加载时，通过&nbsp;<code class="codespan">narrow</code>（截取）操作从完整权重中取出属于当前 rank 的切片，再&nbsp;<code class="codespan">copy_</code>&nbsp;到参数中。这个"截取"操作就是&nbsp;<code class="codespan">weight_loader</code>&nbsp;的核心职责之一。</p>
+<p class="p">具体来说，<code class="codespan">ColumnParallelLinear.weight_loader</code>（<code class="codespan">vllm/model_executor/layers/linear.py</code>）会根据&nbsp;<code class="codespan">tp_rank</code>&nbsp;和&nbsp;<code class="codespan">tp_size</code>&nbsp;计算当前 rank 的起始位置和分片大小，然后在 CPU 张量上执行&nbsp;<code class="codespan">narrow</code>：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>param_data&nbsp;=&nbsp;param.data
+shard_size&nbsp;=&nbsp;param_data.shape[output_dim]
+start_idx&nbsp;=&nbsp;self.tp_rank&nbsp;*&nbsp;shard_size
+loaded_weight&nbsp;=&nbsp;loaded_weight.narrow(output_dim,&nbsp;start_idx,&nbsp;shard_size)
+param_data.copy_(loaded_weight)</code></pre>
+<p class="p"><code class="codespan">RowParallelLinear</code>&nbsp;的逻辑类似，只是切分维度不同。</p>
+<p class="p"><strong>显存侧</strong>：参数只分配 1/TP 的空间</p>
+<p class="p">模型初始化时，vLLM 在 GPU 设备上下文中创建模型（<code class="codespan">vllm/model_executor/model_loader/base_loader.py</code>）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>with&nbsp;target_device:&nbsp;&nbsp;#&nbsp;GPU
+&nbsp;&nbsp;&nbsp;&nbsp;model&nbsp;=&nbsp;initialize_model(vllm_config=vllm_config,&nbsp;...)</code></pre>
+<p class="p">此时&nbsp;<code class="codespan">ColumnParallelLinear</code>、<code class="codespan">RowParallelLinear</code>&nbsp;等并行层会根据&nbsp;<code class="codespan">tp_size</code>&nbsp;计算分片后的尺寸，只在 GPU 上分配&nbsp;<code class="codespan">[4096, 4096/TP]</code>&nbsp;大小的参数，而非完整的&nbsp;<code class="codespan">[4096, 4096]</code>。因此，GPU 显存从一开始就只占 1/TP。</p>
+<p class="p"><strong>内存侧</strong>：逐张量读取 + CPU 上 narrow</p>
+<p class="p">checkpoint 权重的读取采用流式迭代模式（<code class="codespan">vllm/model_executor/model_loader/weight_utils.py</code>）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;safetensors&nbsp;的默认加载方式：逐张量按需读取到&nbsp;CPU
+with&nbsp;safe_open(st_file,&nbsp;framework="pt")&nbsp;as&nbsp;f:
+&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;name&nbsp;in&nbsp;f.keys():
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param&nbsp;=&nbsp;f.get_tensor(name)&nbsp;&nbsp;#&nbsp;读取单个张量到&nbsp;CPU
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;yield&nbsp;name,&nbsp;param</code></pre>
+<p class="p"><code class="codespan">safetensors</code>&nbsp;的&nbsp;<code class="codespan">safe_open</code>&nbsp;使用 mmap 机制，<code class="codespan">get_tensor()</code>&nbsp;只将当前请求的单个张量从磁盘读入 CPU 内存，而非一次性加载整个文件。随后在&nbsp;<code class="codespan">weight_loader</code>&nbsp;中，<code class="codespan">narrow</code>&nbsp;操作在 CPU 张量上执行，截取出当前 rank 需要的 1/TP 切片，再通过&nbsp;<code class="codespan">param_data.copy_(loaded_weight)</code>&nbsp;跨设备拷贝到 GPU：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;ColumnParallelLinear.weight_loader&nbsp;—&nbsp;narrow&nbsp;在&nbsp;CPU&nbsp;上执行
+loaded_weight&nbsp;=&nbsp;loaded_weight.narrow(output_dim,&nbsp;start_idx,&nbsp;shard_size)&nbsp;&nbsp;#&nbsp;CPU&nbsp;上截取
+param_data.copy_(loaded_weight)&nbsp;&nbsp;#&nbsp;CPU&nbsp;→&nbsp;GPU&nbsp;拷贝，只传输&nbsp;1/TP&nbsp;的数据</code></pre>
+<p class="p">这样，CPU 内存峰值 ≈ 单个最大张量的完整大小（通常几百 MB），而非整个模型的大小；GPU 显存始终只持有 1/TP 的参数。</p>
+<p class="p"><strong>注意：每个 rank 都独立读取完整的 checkpoint 文件</strong>。虽然每个 rank 最终只需要 1/TP 的数据，但它们都会遍历所有 checkpoint 文件、读取每个完整张量、然后各自 narrow 出自己的切片。这意味着磁盘 I/O 是 TP 倍冗余的——这是当前设计的一个 trade-off，用 I/O 冗余换取实现简单性（无需 rank 间协调分工读取）。<code class="codespan">fastsafetensors</code>&nbsp;和&nbsp;<code class="codespan">instanttensor</code>&nbsp;等加载器尝试通过分布式 I/O 来优化这一点。</p>
+<h3 class="h3" data-heading="true">解答二：QKV 融合与 Gate-Up 融合的加载</h3>
+<p class="p">这就是&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;和&nbsp;<code class="codespan">shard_id</code>&nbsp;机制存在的原因——它们告诉加载器"这个 checkpoint key 应该填到融合参数的哪个位置"。详细的映射表结构、加载过程和示例代码参见 2.3.3 节。</p>
+<p class="p">简要来说，加载时需要：</p>
+<ol class="ol">
+<li class="listitem">1. 识别出&nbsp;<code class="codespan">q_proj</code>&nbsp;应该映射到&nbsp;<code class="codespan">qkv_proj</code>&nbsp;的第 0 个分片（shard_id="q"）；</li>
+<li class="listitem">2. 将&nbsp;<code class="codespan">q_proj</code>&nbsp;的数据写入&nbsp;<code class="codespan">qkv_proj</code>&nbsp;参数的对应区域；</li>
+<li class="listitem">3. 对&nbsp;<code class="codespan">k_proj</code>、<code class="codespan">v_proj</code>&nbsp;重复上述过程，分别写入各自的区域。</li>
+</ol>
+<h3 class="h3" data-heading="true">解答三：meta 设备初始化与延迟物化</h3>
+<p class="p">vLLM 在两个场景中使用 meta 设备，并通过不同的物化策略来处理，下面以&nbsp;<strong>Online Quantization（在线量化）</strong>为例：</p>
+<p class="p">当用户指定在线量化（如 FP8 per-tensor）时，模型加载的目标是：读取全精度 checkpoint → 在线量化为低精度 → 存储量化后的权重。如果先在 GPU 上分配全精度参数，再量化为 FP8，那么在量化完成前，GPU 上需要同时持有全精度权重和量化后权重，峰值内存翻倍。</p>
+<p class="p">为了解决这个问题，在线量化方法（如&nbsp;<code class="codespan">Fp8OnlineLinearMethod</code>，<code class="codespan">vllm/model_executor/layers/quantization/fp8.py</code>）将权重创建在 meta 设备上：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>weight&nbsp;=&nbsp;ModelWeightParameter(
+&nbsp;&nbsp;&nbsp;&nbsp;data=torch.empty(output_size_per_partition,&nbsp;input_size_per_partition,
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;device="meta",&nbsp;&nbsp;#&nbsp;不分配实际内存
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;dtype=params_dtype),
+&nbsp;&nbsp;&nbsp;&nbsp;...
+)</code></pre>
+<p class="p">然后通过 逐层物化（layerwise reload） 机制（<code class="codespan">vllm/model_executor/model_loader/reload/layerwise.py</code>）处理：</p>
+<ol class="ol">
+<li class="listitem">1. 权重加载时，先将 checkpoint 数据缓冲在 CPU 内存中，不立即写入参数（此时参数位于 meta 设备，无法写入）。具体来说，<code class="codespan">online_process_loader</code>&nbsp;拦截&nbsp;<code class="codespan">weight_loader</code>&nbsp;调用，将调用参数（包含来自 checkpoint 迭代器的 CPU 张量引用）缓存到&nbsp;<code class="codespan">LayerReloadingInfo.loaded_weights</code>&nbsp;列表中；</li>
+<li class="listitem">2. 当一层的所有权重都缓冲完毕后，才物化（materialize）该层——在 GPU 上分配真实内存；</li>
+<li class="listitem">3. 将缓冲的权重加载到物化后的参数中；</li>
+<li class="listitem">4. 立即执行量化处理（<code class="codespan">process_weights_after_loading</code>），将全精度权重转为 FP8；</li>
+<li class="listitem">5. 释放全精度权重，只保留量化后的结果。</li>
+</ol>
+<p class="p">这样，GPU 上同一时刻只需要持有一层的全精度权重，量化完成后立即释放，峰值显存大幅降低。</p>
+<hr class="hr">
+<h2 class="h2" data-heading="true">4. 设计缺陷分析</h2>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411173301993-2031654520.png" alt="04-infographic-design-flaws" width="805" height="540" loading="lazy"></p>
+<p>&nbsp;本节逐一分析 vLLM 权重加载体系中不合理的设计。尽管我称它们为“设计缺陷”，但它们对 vLLM 系统的稳定、性能没有任何影响，大多数时候仅影响到了人类程序员，阅读的时候要多绕几个弯，开发的时候需要额外关注更多细节。</p>
+<h3 class="h3" data-heading="true">4.1 【非必要的分离设计带来开发负担】<code class="codespan">AutoWeightsLoader</code>&nbsp;的防递归与双向依赖</h3>
+<p class="p"><code class="codespan">AutoWeightsLoader</code>&nbsp;是独立于模型的工具类，由模型的&nbsp;<code class="codespan">load_weights</code>&nbsp;创建，但它又会反过来调用子模块的&nbsp;<code class="codespan">load_weights</code>，形成双向依赖。</p>
+<p class="p"><strong>案例 A：防递归的防御代码</strong></p>
+<p class="p"><code class="codespan">vllm/model_executor/models/utils.py</code>&nbsp;—&nbsp;<code class="codespan">AutoWeightsLoader._load_module()</code>：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;Avoid&nbsp;infinite&nbsp;recursion&nbsp;since&nbsp;this&nbsp;function&nbsp;is&nbsp;typically
+#&nbsp;called&nbsp;inside&nbsp;load_weights&nbsp;of&nbsp;the&nbsp;module&nbsp;itself
+if&nbsp;module&nbsp;!=&nbsp;self.module:
+&nbsp;&nbsp;&nbsp;&nbsp;module_load_weights&nbsp;=&nbsp;getattr(module,&nbsp;"load_weights",&nbsp;None)
+&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;callable(module_load_weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;loaded_params&nbsp;=&nbsp;module_load_weights(weights)</code></pre>
+<p class="p"><code class="codespan">module != self.module</code>&nbsp;这行检查的存在，说明框架意识到了递归风险——如果顶层模块的&nbsp;<code class="codespan">load_weights</code>&nbsp;创建了&nbsp;<code class="codespan">AutoWeightsLoader</code>，而&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;又调用了同一个模块的&nbsp;<code class="codespan">load_weights</code>，就会无限递归。这是设计缺陷的症状，好的设计不应该有这种初看莫名其妙的防御。</p>
+<p class="p"><strong>案例 B：双向依赖的调用链</strong></p>
+<pre class="hljs code__pre highlighter-hljs"><code>Model.load_weights()
+&nbsp;&nbsp;└─&nbsp;创建&nbsp;AutoWeightsLoader(self)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;AutoWeightsLoader._load_module()
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;调用&nbsp;child_module.load_weights()&nbsp;&nbsp;&nbsp;←&nbsp;反向调用</code></pre>
+<p class="p"><code class="codespan">AutoWeightsLoader</code>&nbsp;在多个模型文件中被创建，每个模型的&nbsp;<code class="codespan">load_weights</code>&nbsp;都是&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;的创建者，同时又是它的潜在调用目标。这种双向依赖增加了理解和维护的负担。</p>
+<h3 class="h3" data-heading="true">4.2 【不内聚】融合 key 映射散落在模型层，而非内聚于融合算子</h3>
+<p class="p">融合层（如&nbsp;<code class="codespan">MergedColumnParallelLinear</code>、<code class="codespan">QKVParallelLinear</code>）将多个 checkpoint key 合并到一个参数中，但映射关系由每个模型文件自行定义，而非由融合算子自身声明， 导致多个模型文件均有类似的&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;定义。</p>
+<p class="p"><strong>案例：多个模型文件重复定义几乎相同的映射表</strong></p>
+<pre class="hljs code__pre highlighter-hljs"><code>stacked_params_mapping&nbsp;=&nbsp;[
+&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;(param_name,&nbsp;shard_name,&nbsp;shard_id)
+&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"q_proj",&nbsp;"q"),
+&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"k_proj",&nbsp;"k"),
+&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"v_proj",&nbsp;"v"),
+&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"gate_proj",&nbsp;0),
+&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"up_proj",&nbsp;1),
+]</code></pre>
+<p class="p"><strong>问题本质</strong>：融合算子（如&nbsp;<code class="codespan">MergedColumnParallelLinear</code>）知道自己由哪些子权重组成，但它不声明这个信息，而是让每个使用它的模型文件去重复声明。这违反了"信息应由拥有者管理"的内聚原则。</p>
+<h3 class="h3" data-heading="true">4.3 【核心缺陷】<code class="codespan">nn.Parameter</code>&nbsp;承载了不属于自己的职责，导致参数对象不纯粹</h3>
+<p class="p">如 2.4 节所述，<code class="codespan">nn.Parameter</code>&nbsp;本质上只是一个带&nbsp;<code class="codespan">requires_grad</code>&nbsp;标志的&nbsp;<code class="codespan">torch.Tensor</code>，是纯粹的数据容器。但 vLLM 通过动态属性将权重加载的调度逻辑（<code class="codespan">weight_loader</code>）等挂载到&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上，使其承载了不属于自己的职责。这个根因导致了三个层面的问题：动态挂载绕过类型系统（4.3.1）、<code class="codespan">weight_loader</code>&nbsp;两版本共存的版本分裂（4.3.2）、以及 meta 设备物化被迫使用&nbsp;<code class="codespan">__class__</code>&nbsp;hack（4.3.3）。</p>
+<h4 class="h4" data-heading="true">4.3.1 表现一：在原生&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上动态挂载&nbsp;<code class="codespan">weight_loader</code>（绕过类型系统）</h4>
+<p class="p"><code class="codespan">nn.Parameter</code>&nbsp;是 PyTorch 原生类型，不具备&nbsp;<code class="codespan">weight_loader</code>&nbsp;属性。vLLM 利用 Python 动态语言特性，通过两种方式强行注入该属性。</p>
+<p class="p"><strong>案例 A：直接赋值</strong></p>
+<pre class="hljs code__pre highlighter-hljs"><code>self.weight.weight_loader&nbsp;=&nbsp;self._weight_loader&nbsp;&nbsp;#&nbsp;动态挂载</code></pre>
+<p class="p"><strong>案例 B：通过&nbsp;<code class="codespan">set_weight_attrs</code>&nbsp;间接注入</strong></p>
+<pre class="hljs code__pre highlighter-hljs"><code>def&nbsp;set_weight_attrs(weight:&nbsp;torch.Tensor,&nbsp;weight_attrs:&nbsp;dict[str,&nbsp;Any]&nbsp;|&nbsp;None):
+&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;key,&nbsp;value&nbsp;in&nbsp;weight_attrs.items():
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;setattr(weight,&nbsp;key,&nbsp;value)&nbsp;&nbsp;#&nbsp;本质仍是&nbsp;setattr</code></pre>
+<blockquote class="blockquote">
+<p class="p"><strong>注</strong>：<code class="codespan">BasevLLMParameter</code>（继承自&nbsp;<code class="codespan">nn.Parameter</code>）已将&nbsp;<code class="codespan">weight_loader</code>&nbsp;改为正式的类属性，是对这一问题的改进。</p>
+</blockquote>
+<h4 class="h4" data-heading="true">4.3.2 表现二：<code class="codespan">weight_loader</code>&nbsp;v1/v2 两版本共存（版本分裂）</h4>
+<p class="p"><code class="codespan">vllm/model_executor/layers/linear.py</code>&nbsp;中维护了白名单&nbsp;<code class="codespan">WEIGHT_LOADER_V2_SUPPORTED</code>，量化方法在白名单中则使用 v2（<code class="codespan">BasevLLMParameter</code>&nbsp;子类的&nbsp;<code class="codespan">load_column_parallel_weight()</code>&nbsp;等方法），否则使用 v1（外部函数手动&nbsp;<code class="codespan">narrow</code>&nbsp;+&nbsp;<code class="codespan">copy_</code>）。两个版本并存意味着：新增量化方法时需要决定支持哪个版本并手动加入白名单，已有代码中两种风格混杂。</p>
+<p class="p">根因：v1/v2 两版本共存只是表面现象，根源在于权重加载的调度逻辑被挂在了参数上——v1 和 v2 本质上都是在参数级别做调度，只是实现风格不同。如果将调度职责提升到模块级（由&nbsp;<code class="codespan">nn.Module</code>&nbsp;的&nbsp;<code class="codespan">load_weights</code>&nbsp;方法负责），参数不再承载&nbsp;<code class="codespan">weight_loader</code>，只保留自服务的分片能力，白名单机制和版本分裂也就自然消失了（详见第 5 章理想态设计）。</p>
+<h4 class="h4" data-heading="true">4.3.3 表现三：meta 设备物化依赖&nbsp;<code class="codespan">__class__</code>&nbsp;hack（连锁反应）</h4>
+<p class="p">参数对象不纯粹的另一个连锁反应体现在 meta 设备物化上。当参数位于 meta 设备时，需要在真实设备上创建一个等价的参数对象。由于&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上通过&nbsp;<code class="codespan">setattr</code>&nbsp;挂载了&nbsp;<code class="codespan">weight_loader</code>、<code class="codespan">output_dim</code>&nbsp;等动态属性，这些属性存储在实例的&nbsp;<code class="codespan">__dict__</code>&nbsp;中，无法通过标准的&nbsp;<code class="codespan">nn.Parameter(data, requires_grad)</code>&nbsp;构造器重建。因此，<code class="codespan">materialize_meta_tensor()</code>&nbsp;只能绕过正常的对象构造流程，使用&nbsp;<code class="codespan">__class__</code>&nbsp;+&nbsp;<code class="codespan">__dict__</code>&nbsp;拷贝的 hack：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>def&nbsp;materialize_meta_tensor(meta_tensor:&nbsp;torch.Tensor)&nbsp;-&gt;&nbsp;torch.Tensor:
+&nbsp;&nbsp;&nbsp;&nbsp;tensor&nbsp;=&nbsp;torch.empty_strided(
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;size=tuple(meta_tensor.size()),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;stride=tuple(meta_tensor.stride()),
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;dtype=meta_tensor.dtype,
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;requires_grad=False,
+&nbsp;&nbsp;&nbsp;&nbsp;)
+&nbsp;&nbsp;&nbsp;&nbsp;tensor.__class__&nbsp;=&nbsp;meta_tensor.__class__&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;←&nbsp;__class__&nbsp;hack：强制改变类型
+&nbsp;&nbsp;&nbsp;&nbsp;tensor.__dict__&nbsp;=&nbsp;meta_tensor.__dict__.copy()&nbsp;&nbsp;#&nbsp;←&nbsp;拷贝动态属性（weight_loader&nbsp;等）
+&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;tensor</code></pre>
+<p class="p">如果原生&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上没有这些动态属性（<code class="codespan">__dict__</code>&nbsp;为空），直接走标准构造器&nbsp;<code class="codespan">nn.Parameter(real_data)</code>&nbsp;即可，<code class="codespan">__class__</code>&nbsp;hack 和&nbsp;<code class="codespan">__dict__</code>&nbsp;拷贝都不再需要。对于&nbsp;<code class="codespan">BasevLLMParameter</code>&nbsp;子类，其&nbsp;<code class="codespan">__dict__</code>&nbsp;中的分片元数据（<code class="codespan">_output_dim</code>、<code class="codespan">tp_rank</code>&nbsp;等）是参数自身的固有属性，可以通过给基类添加&nbsp;<code class="codespan">materialize_on</code>&nbsp;方法来正规处理（走&nbsp;<code class="codespan">__new__</code>&nbsp;而非&nbsp;<code class="codespan">__init__</code>，避免构造器副作用，同时继承分片元数据），同样不需要&nbsp;<code class="codespan">__class__</code>&nbsp;hack。</p>
+<hr class="hr">
+<h2 class="h2" data-heading="true">5. 理想态设计</h2>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411173331995-842081042.png" alt="05-framework-ideal-architecture" width="568" height="381" loading="lazy"></p>
+<p>&nbsp;基于第 4 章的缺陷分析，本节贴着缺陷逐一展开理想态设计方向。核心思想是：引入&nbsp;<code class="codespan">nn.Module</code>&nbsp;基类承担递归加载职责（消除&nbsp;<code class="codespan">AutoWeightsLoader</code>），融合映射内聚到融合算子，<code class="codespan">nn.Parameter</code>&nbsp;去掉&nbsp;<code class="codespan">weight_loader</code>&nbsp;等动态属性，所有定制加载逻辑由参数的拥有者（<code class="codespan">nn.Module</code>&nbsp;派生类）通过实现&nbsp;<code class="codespan">load_weights</code>&nbsp;来完成。</p>
+<h3 class="h3" data-heading="true">5.1 消除&nbsp;<code class="codespan">AutoWeightsLoader</code>：引入&nbsp;<code class="codespan">nn.Module</code>&nbsp;基类（对应缺陷 4.1）</h3>
+<h4 class="h4" data-heading="true">5.1.1 问题回顾</h4>
+<p class="p">如 4.1 节所述，<code class="codespan">AutoWeightsLoader</code>&nbsp;是一个独立于模型的工具类，由模型的&nbsp;<code class="codespan">load_weights</code>&nbsp;创建，但它又会反过来调用子模块的&nbsp;<code class="codespan">load_weights</code>，形成双向依赖。<code class="codespan">module != self.module</code>&nbsp;这种防递归检查的存在，本身就说明了设计上的不自然。</p>
+<p class="p">根本原因在于：递归遍历模块树并分发权重这件事，本应是模块体系自身的能力，而不应由一个外部工具类来承担。</p>
+<h4 class="h4" data-heading="true">5.1.2 理想设计：<code class="codespan">vLLMModule</code>&nbsp;基类</h4>
+<p class="p">引入一个继承自&nbsp;<code class="codespan">nn.Module</code>&nbsp;的基类&nbsp;<code class="codespan">vLLMModule</code>，将&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;的递归分发逻辑内化为基类的默认&nbsp;<code class="codespan">load_weights</code>&nbsp;实现：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>class&nbsp;vLLMModule(nn.Module):
+&nbsp;&nbsp;&nbsp;&nbsp;"""vLLM&nbsp;模块基类，提供递归权重加载的默认实现。"""
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;load_weights(self,&nbsp;weights:&nbsp;Iterable[tuple[str,&nbsp;torch.Tensor]])&nbsp;-&gt;&nbsp;set[str]:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self._maybe_materialize()&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;★&nbsp;加载前：物化&nbsp;meta&nbsp;参数
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;weights&nbsp;=&nbsp;self._apply_fused_routing(weights)&nbsp;&nbsp;#&nbsp;★&nbsp;融合路由
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;child_prefix,&nbsp;child_weights&nbsp;in&nbsp;self._groupby_prefix(weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;child_prefix&nbsp;in&nbsp;child_modules:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;child_module.load_weights(child_weights)&nbsp;&nbsp;&nbsp;#&nbsp;委托给子模块
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;elif&nbsp;child_prefix&nbsp;in&nbsp;child_params:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self._load_single_param(param,&nbsp;child_weights)&nbsp;&nbsp;#&nbsp;叶子参数
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self._maybe_post_process()&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;★&nbsp;加载后：量化后处理
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;_load_single_param(self,&nbsp;param,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"""默认使用&nbsp;copy_&nbsp;加载单个参数。"""
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param.data.copy_(weight_data)
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;_maybe_materialize(self):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"""如果直接参数在&nbsp;meta&nbsp;device&nbsp;上，物化到真实设备。
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;非&nbsp;Layerwise&nbsp;Reload&nbsp;场景下&nbsp;any()&nbsp;检查立即返回&nbsp;False，近乎零开销。"""
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;遍历&nbsp;named_parameters(recurse=False)，对&nbsp;meta&nbsp;参数执行&nbsp;materialize
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;_maybe_post_process(self):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"""Layerwise&nbsp;reload&nbsp;模式下执行量化后处理。"""
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;检查&nbsp;_layerwise_reload&nbsp;标志和&nbsp;quant_method
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;_groupby_prefix(self,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"""按权重名的第一段前缀分组，驱动递归分发。"""</code></pre>
+<h4 class="h4" data-heading="true">5.1.3 改造后的效果</h4>
+<p class="p"><strong>之前</strong>（双向依赖，防递归 hack）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>Qwen3ForCausalLM.load_weights()
+&nbsp;&nbsp;└─&nbsp;创建&nbsp;AutoWeightsLoader(self)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;←&nbsp;外部工具类
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─&nbsp;if&nbsp;module&nbsp;!=&nbsp;self.module:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;←&nbsp;防递归&nbsp;hack</code></pre>
+<p class="p"><strong>之后</strong>（单向继承，自然递归）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>Qwen3ForCausalLM(vLLMModule).load_weights()&nbsp;&nbsp;&nbsp;←&nbsp;继承基类，无需&nbsp;override
+&nbsp;&nbsp;└─&nbsp;基类递归分发&nbsp;→&nbsp;child_module.load_weights()&nbsp;→&nbsp;自然多态</code></pre>
+<p class="p">关键改变：</p>
+<ol class="ol">
+<li class="listitem">1. 消除了&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;外部工具类——递归分发是模块体系自身的能力</li>
+<li class="listitem">2. 消除了防递归 hack——基类的&nbsp;<code class="codespan">load_weights</code>&nbsp;只递归调用子模块，不会调用自身</li>
+<li class="listitem">3. 顶层模型类变得极简——大多数不需要 override&nbsp;<code class="codespan">load_weights</code>，直接继承基类即可；只有融合线性层、MoE 层等才 override</li>
+</ol>
+<h4 class="h4" data-heading="true">5.1.4 个性化定制能力</h4>
+<p class="p">由于每个模块自己实现&nbsp;<code class="codespan">load_weights</code>，过滤等个性化逻辑自然有了归属：通用的 checkpoint key 过滤（如跳过&nbsp;<code class="codespan">rotary_emb.inv_freq</code>）可以在基类中统一处理，模型特有的过滤（如&nbsp;<code class="codespan">skip_prefixes</code>）由具体模块在自己的&nbsp;<code class="codespan">load_weights</code>&nbsp;中处理。当前&nbsp;<code class="codespan">AutoWeightsLoader</code>&nbsp;承担的&nbsp;<code class="codespan">skip_prefixes</code>、<code class="codespan">skip_substrs</code>&nbsp;等职责都可以按此方式自然分解。</p>
+<h3 class="h3" data-heading="true">5.2 融合映射内聚到融合算子（对应缺陷 4.2）</h3>
+<h4 class="h4" data-heading="true">5.2.1 问题回顾</h4>
+<p class="p">如 4.2 节所述，融合层（<code class="codespan">MergedColumnParallelLinear</code>、<code class="codespan">QKVParallelLinear</code>）将多个 checkpoint key 合并到一个参数中，但映射关系由每个模型文件通过&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;自行定义，导致多个模型文件重复声明几乎相同的映射表。</p>
+<h4 class="h4" data-heading="true">5.2.2 理想设计：融合层自己声明映射关系</h4>
+<p class="p">融合算子知道自己由哪些子权重组成，应该由它自己声明这个信息。融合层通过 override&nbsp;<code class="codespan">load_weights</code>&nbsp;方法，在内部完成 checkpoint key 到 shard_id 的映射：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>class&nbsp;MergedColumnParallelLinear(ColumnParallelLinear):
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;__init__(self,&nbsp;...,&nbsp;shard_names:&nbsp;list[str]):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.shard_names&nbsp;=&nbsp;shard_names&nbsp;&nbsp;#&nbsp;e.g.&nbsp;["gate_proj",&nbsp;"up_proj"]
+
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;load_weights(self,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;name,&nbsp;loaded_weight&nbsp;in&nbsp;weights:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;从权重名推断&nbsp;shard_id
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;e.g.&nbsp;"gate_proj.weight"&nbsp;→&nbsp;shard_id=0,&nbsp;param_suffix="weight"
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;shard_id&nbsp;=&nbsp;self._infer_shard_id(name)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;shard_id&nbsp;is&nbsp;not&nbsp;None:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param.load_merged_column_weight(loaded_weight,&nbsp;shard_id=shard_id)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;else:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param.load_column_parallel_weight(loaded_weight)</code></pre>
+<h4 class="h4" data-heading="true">5.2.3 路由前的融合映射：递归调度层的融合路由</h4>
+<p class="p">5.2.2 节中融合层接收的权重 key 仍是 checkpoint 原始名称（如&nbsp;<code class="codespan">gate_proj.weight</code>），但基类按 prefix 匹配子模块时只有&nbsp;<code class="codespan">gate_up_proj</code>，没有&nbsp;<code class="codespan">gate_proj</code>，路由会失败。</p>
+<p class="p">解决方案：基类的递归调度逻辑在路由前，自动扫描子模块的&nbsp;<code class="codespan">shard_names</code>&nbsp;属性，构建融合路由表——当 checkpoint key 的前缀（如&nbsp;<code class="codespan">gate_proj</code>）命中路由表时，直接将该权重路由到对应的融合子模块（如&nbsp;<code class="codespan">gate_up_proj</code>）。调度归调度，处理归处理——路由逻辑留在递归调度层，融合层只负责接收权重并处理 shard_id。</p>
+<p class="p">路由流程（以 MLP 为例）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>MLP.load_weights(weights)
+&nbsp;&nbsp;│&nbsp;&nbsp;_build_fused_routing()&nbsp;→&nbsp;{"gate_proj":&nbsp;"gate_up_proj",&nbsp;"up_proj":&nbsp;"gate_up_proj"}
+&nbsp;&nbsp;│
+&nbsp;&nbsp;│&nbsp;&nbsp;路由阶段（按融合路由表分发）：
+&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;"gate_proj.weight"&nbsp;→&nbsp;命中路由表&nbsp;→&nbsp;路由到&nbsp;gate_up_proj
+&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;"up_proj.weight"&nbsp;&nbsp;&nbsp;→&nbsp;命中路由表&nbsp;→&nbsp;路由到&nbsp;gate_up_proj
+&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;"down_proj.weight"&nbsp;→&nbsp;未命中&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→&nbsp;正常&nbsp;prefix&nbsp;匹配
+&nbsp;&nbsp;│
+&nbsp;&nbsp;└─&nbsp;gate_up_proj&nbsp;→&nbsp;MergedColumnParallelLinear.load_weights&nbsp;→&nbsp;推断&nbsp;shard_id
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;down_proj&nbsp;&nbsp;&nbsp;&nbsp;→&nbsp;RowParallelLinear.load_weights</code></pre>
+<p class="p">融合路由表由基类自动从子模块的&nbsp;<code class="codespan">shard_names</code>&nbsp;构建，零硬编码；没有融合子模块的普通模块则零开销跳过。</p>
+<h4 class="h4" data-heading="true">5.2.4 改造后的效果</h4>
+<p class="p"><strong>之前</strong>（映射散落在模型层）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;每个模型文件都要重复定义
+stacked_params_mapping&nbsp;=&nbsp;[
+&nbsp;&nbsp;&nbsp;&nbsp;("qkv_proj",&nbsp;"q_proj",&nbsp;"q"),&nbsp;("qkv_proj",&nbsp;"k_proj",&nbsp;"k"),&nbsp;...
+&nbsp;&nbsp;&nbsp;&nbsp;("gate_up_proj",&nbsp;"gate_proj",&nbsp;0),&nbsp;("gate_up_proj",&nbsp;"up_proj",&nbsp;1),
+]
+#&nbsp;模型层手动遍历、替换&nbsp;key、注入&nbsp;shard_id
+for&nbsp;param_name,&nbsp;weight_name,&nbsp;shard_id&nbsp;in&nbsp;stacked_params_mapping:
+&nbsp;&nbsp;&nbsp;&nbsp;name&nbsp;=&nbsp;name.replace(weight_name,&nbsp;param_name)
+&nbsp;&nbsp;&nbsp;&nbsp;param.weight_loader(param,&nbsp;loaded_weight,&nbsp;shard_id)</code></pre>
+<p class="p"><strong>之后</strong>（映射内聚于融合算子，路由由基类递归调度层自动完成）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>#&nbsp;模型层不再需要&nbsp;stacked_params_mapping
+#&nbsp;基类递归调度层自动扫描子模块的&nbsp;shard_names，构建融合路由表
+#&nbsp;checkpoint&nbsp;key&nbsp;通过融合路由表路由到融合层
+#&nbsp;融合层自己根据&nbsp;shard_names&nbsp;推断&nbsp;shard_id
+#&nbsp;Attention/MLP&nbsp;等上层模块无需&nbsp;override&nbsp;load_weights</code></pre>
+<p class="p">关键改变：</p>
+<ol class="ol">
+<li class="listitem">1. 消除了模型文件中的&nbsp;<code class="codespan">stacked_params_mapping</code>&nbsp;重复定义——映射关系由融合层自己声明</li>
+<li class="listitem">2. shard_id 不再是外部注入的——融合层根据权重名称自行推断</li>
+<li class="listitem">3. 路由问题由基类递归调度层自动解决——基类扫描子模块的&nbsp;<code class="codespan">shard_names</code>&nbsp;构建融合路由表，自动将 checkpoint key 路由到正确的融合子模块，上层模块无需任何额外代码</li>
+</ol>
+<h3 class="h3" data-heading="true">5.3 消除&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上的&nbsp;<code class="codespan">weight_loader</code>（对应缺陷 4.3）</h3>
+<h4 class="h4" data-heading="true">5.3.1 问题回顾</h4>
+<p class="p">如 4.3 节所述，<code class="codespan">nn.Parameter</code>&nbsp;本质上是纯粹的数据容器，但 vLLM 通过&nbsp;<code class="codespan">setattr</code>&nbsp;将&nbsp;<code class="codespan">weight_loader</code>&nbsp;等动态属性挂载到原生&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上，绕过了类型系统。这导致了三个层面的问题：类型不安全（4.3.1）、v1/v2 版本分裂（4.3.2）、meta 物化依赖&nbsp;<code class="codespan">__class__</code>&nbsp;hack（4.3.3）。</p>
+<h4 class="h4" data-heading="true">5.3.2 理想设计：定制逻辑由参数的拥有者实现</h4>
+<p class="p">核心原则：<code class="codespan">nn.Parameter</code>&nbsp;不应有绕过类型系统的动态属性。如果某个参数需要定制的加载逻辑，由它的拥有者（持有该参数的&nbsp;<code class="codespan">nn.Module</code>&nbsp;派生类）通过实现&nbsp;<code class="codespan">load_weights</code>&nbsp;来完成。</p>
+<p class="p">这与 5.1 节引入的&nbsp;<code class="codespan">vLLMModule</code>&nbsp;基类自然配合——基类提供默认的递归分发和简单&nbsp;<code class="codespan">copy_</code>&nbsp;加载，子类通过 override&nbsp;<code class="codespan">load_weights</code>&nbsp;来实现定制逻辑：</p>
+<p class="p">线性层的&nbsp;<code class="codespan">load_weights</code>（示意）：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>class&nbsp;ColumnParallelLinear(vLLMModule):
+&nbsp;&nbsp;&nbsp;&nbsp;def&nbsp;load_weights(self,&nbsp;weights):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;name,&nbsp;loaded_weight&nbsp;in&nbsp;weights:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param&nbsp;=&nbsp;params[name]
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;isinstance(param,&nbsp;BasevLLMParameter):
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;param.load_column_parallel_weight(loaded_weight)&nbsp;&nbsp;#&nbsp;参数自服务分片
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;else:
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;#&nbsp;原生&nbsp;nn.Parameter，由模块处理&nbsp;TP&nbsp;分片（narrow&nbsp;+&nbsp;copy_）</code></pre>
+<p class="p">其他需要定制加载的模块也同理，它们各自 override&nbsp;<code class="codespan">load_weights</code>，在其中实现自己的加载逻辑，而不是把&nbsp;<code class="codespan">weight_loader</code>&nbsp;挂到参数上。</p>
+<h4 class="h4" data-heading="true">5.3.3 消除动态属性的全景</h4>
+<p class="p">消除动态属性后，原生&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上通过&nbsp;<code class="codespan">setattr</code>&nbsp;挂载的&nbsp;<code class="codespan">weight_loader</code>&nbsp;等属性全部移除，这些职责转移到拥有者模块的&nbsp;<code class="codespan">load_weights</code>&nbsp;中。原生&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;回归纯粹的数据容器（<code class="codespan">__dict__</code>&nbsp;为空）。<code class="codespan">BasevLLMParameter</code>&nbsp;子类的&nbsp;<code class="codespan">_output_dim</code>、<code class="codespan">_input_dim</code>、<code class="codespan">tp_rank</code>&nbsp;等分片元数据保留——这些是参数自身的固有属性，通过正式的构造函数和&nbsp;<code class="codespan">@property</code>&nbsp;定义，与被消除的&nbsp;<code class="codespan">weight_loader</code>（外部调度逻辑被"挂载"到参数上）性质不同。</p>
+<h4 class="h4" data-heading="true">5.3.4 连锁收益：v1/v2 版本分裂自然消失</h4>
+<p class="p">当所有模块都通过&nbsp;<code class="codespan">load_weights</code>&nbsp;来调度权重加载后，v1（外部函数手动&nbsp;<code class="codespan">narrow</code>&nbsp;+&nbsp;<code class="codespan">copy_</code>）和 v2（<code class="codespan">BasevLLMParameter</code>&nbsp;子类方法被挂载到参数上）都不再需要——模块的&nbsp;<code class="codespan">load_weights</code>&nbsp;直接调用&nbsp;<code class="codespan">param.load_column_parallel_weight()</code>&nbsp;等自服务方法，<code class="codespan">WEIGHT_LOADER_V2_SUPPORTED</code>&nbsp;白名单自然消失。</p>
+<h4 class="h4" data-heading="true">5.3.5 连锁收益：meta 物化简化</h4>
+<p class="p">原生&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;上的动态属性被消除后，<code class="codespan">__class__</code>&nbsp;赋值和&nbsp;<code class="codespan">__dict__</code>&nbsp;拷贝两个 hack 都不再需要。原生&nbsp;<code class="codespan">nn.Parameter</code>&nbsp;的&nbsp;<code class="codespan">__dict__</code>&nbsp;为空，直接走&nbsp;<code class="codespan">nn.Parameter(real_data)</code>&nbsp;构造器即可；<code class="codespan">BasevLLMParameter</code>&nbsp;子类通过新增的&nbsp;<code class="codespan">materialize_on</code>&nbsp;方法（在真实设备上走&nbsp;<code class="codespan">__new__</code>&nbsp;创建实例，跳过&nbsp;<code class="codespan">__init__</code>&nbsp;的副作用）正规地构造并继承分片元数据。物化逻辑从 hack 变为正规的构造器调用。</p>
+<h4 class="h4" data-heading="true">5.3.6 连锁收益：物化逻辑内置于递归流程，统一所有加载场景</h4>
+<p class="p">如 5.1.2 节基类骨架代码所示，<code class="codespan">load_weights</code>&nbsp;在递归分发之前调用&nbsp;<code class="codespan">_maybe_materialize()</code>，在分发完成后调用&nbsp;<code class="codespan">_maybe_post_process()</code>。每个模块在自己的&nbsp;<code class="codespan">load_weights</code>&nbsp;开头物化自己的直接参数（检查是否在 meta device 上），子模块的物化由子模块自己负责，递归天然保证了"先物化、再加载"的顺序。这使得正常加载、Layerwise Reload、Transformers Backend 三个场景走同一个入口和递归流程，内部根据参数状态自动分支——不需要外部编排器，不需要&nbsp;<code class="codespan">weight_loader</code>&nbsp;拦截机制，非 Layerwise 场景下&nbsp;<code class="codespan">_maybe_materialize()</code>&nbsp;的&nbsp;<code class="codespan">any()</code>&nbsp;检查立即返回&nbsp;<code class="codespan">False</code>，近乎零开销。</p>
+<h3 class="h3" data-heading="true">5.4 改造路径总结</h3>
+<p class="p">整个理想态改造贴着三个缺陷逐一展开，形成一个有机整体：</p>
+<pre class="hljs code__pre highlighter-hljs"><code>缺陷&nbsp;4.1：AutoWeightsLoader&nbsp;的防递归与双向依赖
+&nbsp;&nbsp;└──&nbsp;改造&nbsp;5.1：引入&nbsp;vLLMModule&nbsp;基类，递归分发内化为模块体系自身的能力
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└──&nbsp;消除&nbsp;AutoWeightsLoader&nbsp;外部工具类
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└──&nbsp;消除防递归&nbsp;hack
+
+缺陷&nbsp;4.2：融合&nbsp;key&nbsp;映射散落在模型层
+&nbsp;&nbsp;└──&nbsp;改造&nbsp;5.2：融合层&nbsp;override&nbsp;load_weights，自行声明映射关系
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└──&nbsp;消除模型文件中的&nbsp;stacked_params_mapping&nbsp;重复定义
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└──&nbsp;shard_id&nbsp;由融合层自行推断
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└──&nbsp;融合路由由基类递归调度层自动完成（扫描&nbsp;shard_names&nbsp;构建路由表）
+
+缺陷&nbsp;4.3：nn.Parameter&nbsp;承载了不属于自己的职责
+&nbsp;&nbsp;└──&nbsp;改造&nbsp;5.3：定制逻辑由参数的拥有者（nn.Module&nbsp;派生类）实现&nbsp;load_weights，代替&nbsp;weight_loader
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├──&nbsp;消除原生&nbsp;nn.Parameter&nbsp;上的动态属性（weight_loader、output_dim&nbsp;等）
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├──&nbsp;连锁：v1/v2&nbsp;版本分裂自然消失
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├──&nbsp;连锁：meta&nbsp;物化简化，消除&nbsp;__class__&nbsp;hack
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└──&nbsp;连锁：物化逻辑内置于递归流程，统一正常加载与&nbsp;Layerwise&nbsp;Reload</code></pre>
+<p class="p">核心原则：权重加载的所有逻辑都由&nbsp;<code class="codespan">nn.Module</code>&nbsp;派生类承担——基类提供递归分发的默认实现，子类通过 override&nbsp;<code class="codespan">load_weights</code>&nbsp;实现定制逻辑（TP 分片、融合映射等）。<code class="codespan">nn.Parameter</code>&nbsp;回归纯粹的数据容器，不承载任何加载调度逻辑。<code class="codespan">BasevLLMParameter</code>&nbsp;体系作为类型安全的参数子类，其自服务的分片能力（<code class="codespan">load_column_parallel_weight</code>&nbsp;等）是合理的设计，不在消除之列。物化逻辑作为递归流程的有机组成部分，使正常加载、Layerwise Reload、Transformers Backend 三个场景走同一个代码路径，消除了对&nbsp;<code class="codespan">weight_loader</code>&nbsp;拦截机制的依赖。</p>
+<hr class="hr">
+<h2 class="h2" data-heading="true">6. 附录：SGLang 权重加载体系对比分析</h2>
+<p><img src="https://img2024.cnblogs.com/blog/104985/202604/104985-20260411173353519-237772675.png" alt="06-comparison-vllm-vs-sglang" width="736" height="494" loading="lazy"></p>
+<p>&nbsp;SGLang 的权重加载体系直接源自 vLLM，两者在架构设计上高度一致：四阶段加载流程相同，<code class="codespan">nn.Parameter</code>&nbsp;动态挂载&nbsp;<code class="codespan">weight_loader</code>、<code class="codespan">stacked_params_mapping</code>&nbsp;散落在模型层、v1/v2 版本分裂等核心缺陷均存在。因此，前述理想态改造方案对 SGLang 同样有价值——且由于 SGLang 几乎不使用&nbsp;<code class="codespan">AutoWeightsLoader</code>（仅&nbsp;<code class="codespan">transformers.py</code>&nbsp;1 个文件使用），43+ 个模型文件全部采用手动遍历权重，引入基类&nbsp;<code class="codespan">load_weights</code>（改造 5.1）是收益最大的一项改造，这些模型文件中的&nbsp;<code class="codespan">load_weights</code>&nbsp;方法高度相似（每个 30~130 行），可大量减少重复代码。</p>
+<p class="p">与 vLLM 的一个显著差异在于 meta 设备的使用：SGLang 的主流路径（<code class="codespan">DefaultModelLoader</code>）直接在 GPU 设备上创建模型，不涉及 meta 设备；meta 设备仅出现在两个非主流路径中。因此 SGLang 不存在 vLLM 的&nbsp;<code class="codespan">__class__</code>&nbsp;hack 问题。<code class="codespan">LayeredModelLoader</code>&nbsp;使用 PyTorch 原生的&nbsp;<code class="codespan">to_empty()</code>&nbsp;逐模块物化，并将权重填充委托给模型自身的&nbsp;<code class="codespan">load_weights_to_module</code>&nbsp;方法，但目前仅&nbsp;<code class="codespan">torch_native_llama.py</code>&nbsp;一个模型实现了该接口，且其逻辑与&nbsp;<code class="codespan">load_weights</code>&nbsp;有重复。如果采用理想态的基类方案，可以统一正常加载和逐层加载的代码路径，消除这一额外接口负担。</p>
+<p class="p">&nbsp;</p>
+<p class="p">本文所在：<a class="ng-star-inserted" href="https://www.cnblogs.com/cswuyg/p/19852392" rel="noopener" target="_blank">https://www.cnblogs.com/cswuyg/p/19852392</a></p>
+
+</div>
+<div class="clear"></div>
+
+	<div class="postDesc">posted on 
+<span id="post-date" data-last-update-days="0.001388888888888889" data-date-updated="2026-04-11 17:37">2026-04-11 17:35</span>&nbsp;
+<a href="https://www.cnblogs.com/cswuyg">-银光-</a>&nbsp;
+阅读(<span id="post_view_count">30</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19852392);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fcswuyg%2Fp%2F19852392&amp;targetId=19852392&amp;targetType=0" target="_blank">举报</a>
+</div>
