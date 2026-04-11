@@ -1,0 +1,200 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/denglei1024/p/19759009" title="发布于 2026-03-23 17:06">
+    <span role="heading" aria-level="2">EF Core 原生 SQL 实战：FromSql、SqlQuery 与对象映射边界</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>做 EF Core 一段时间后，很多人都会遇到同一个节点：常规 LINQ 能覆盖大多数查询，但一到复杂报表、视图或者历史 SQL 复用场景，就会开始考虑原生 SQL。问题不在于“能不能写 SQL”，而在于怎么写得可维护、可观测、还能和 EF Core 的映射体系配合好。这篇文章讲解 <code>FromSql</code>、<code>SqlQuery</code> 的使用边界和对象映射的一些坑。</p>
+<h2 id="1-问题背景为什么原生-sql-常常能跑但难以长期维护">1. 问题背景：为什么原生 SQL 常常能跑但难以长期维护</h2>
+<p>在系统演进到中后期后，下面这些场景非常常见：</p>
+<ul>
+<li>报表查询需要 <code>GROUP BY</code>、聚合，LINQ 写出来可读性很差。</li>
+<li>历史系统已经有稳定 SQL，需要在新服务里复用。</li>
+<li>部分查询要精确控制执行计划，团队希望直接落 SQL。</li>
+</ul>
+<p>这时候“能跑”的版本通常很快就能写出来，但过一段时间就会暴露问题：</p>
+<ol>
+<li>SQL 拼接字符串，参数化做得不一致，埋下注入和计划污染风险。</li>
+<li>映射类型定义不清晰，字段一改名就出现运行时映射异常。</li>
+<li>查询读模型和实体模型混用，导致跟踪行为和更新语义变得混乱。</li>
+<li>慢 SQL 能看到语句，但定位不到具体业务查询意图。</li>
+</ol>
+<p>所以这篇不是教你“怎么在 EF Core 里执行 SQL”，而是讲“如何把原生 SQL 纳入 EF Core 的工程边界”。</p>
+<h2 id="2-原理解析先分清-fromsql-和-sqlquery-的职责">2. 原理解析：先分清 FromSql 和 SqlQuery 的职责</h2>
+<p><code>FromSql</code> 和 <code>SqlQuery</code> 都能执行原生 SQL，但它们解决的是不同问题。</p>
+<h3 id="21-fromsql面向-dbset-的查询入口">2.1 FromSql：面向 DbSet 的查询入口</h3>
+<p><code>FromSql</code> 适合挂在 <code>DbSet</code> 或 <code>Set&lt;T&gt;()</code> 上执行原生 SQL，典型用途有两类：</p>
+<ul>
+<li>查询实体类型（可跟踪，也可 <code>AsNoTracking</code>）</li>
+<li>查询 Keyless 读模型（只读投影）</li>
+</ul>
+<p>关键点：</p>
+<ul>
+<li>优先用参数化写法（如 <code>FromSqlInterpolated</code>），不要拼接原始字符串。</li>
+<li>SQL 返回列要和映射类型属性一致，否则会在运行时出错。</li>
+<li>若用于纯读场景，建议显式 <code>AsNoTracking()</code> 降低跟踪开销。</li>
+</ul>
+<h3 id="22-sqlquery面向轻量读模型和标量结果">2.2 SqlQuery：面向轻量读模型和标量结果</h3>
+<p><code>Database.SqlQuery&lt;T&gt;</code> 更适合“读多写少”的轻量查询：</p>
+<ul>
+<li>直接映射到 DTO</li>
+<li>执行标量统计（如 count/sum）</li>
+</ul>
+<p>它的定位就是查询，不承担实体生命周期管理。对报表、后台统计、运营看板这类读路径很实用。</p>
+<h3 id="23-对象映射边界的核心原则">2.3 对象映射边界的核心原则</h3>
+<p>无论用哪种方式，建议固定三条原则：</p>
+<ol>
+<li>命令边界：原生 SQL 负责读模型查询，不直接承载复杂写入事务语义。</li>
+<li>模型边界：实体模型和报表 DTO 分离，避免查询模型反向污染领域模型。</li>
+<li>可观测边界：关键查询用 <code>TagWith</code> 标注业务意图，便于慢 SQL 排障。</li>
+</ol>
+<h2 id="3-示例代码从危险写法到可维护落地">3. 示例代码：从危险写法到可维护落地</h2>
+<h3 id="31-问题写法字符串拼-sql--实体读模型混用">3.1 问题写法：字符串拼 SQL + 实体/读模型混用</h3>
+<pre><code class="language-csharp">public async Task&lt;List&lt;Order&gt;&gt; SearchOrdersAsync(string keyword, CancellationToken ct)
+{
+    var sql = $"""
+        SELECT *
+        FROM Orders
+        WHERE CustomerName LIKE '%{keyword}%'
+    """;
+
+    return await _db.Orders
+        .FromSqlRaw(sql)
+        .ToListAsync(ct);
+}
+</code></pre>
+<p>这段代码的风险很集中：</p>
+<ul>
+<li>直接拼接字符串，参数化缺失。</li>
+<li><code>SELECT *</code> 对列变化非常敏感。</li>
+<li>查询语义是“搜索结果”，却直接映射实体，后续容易和更新流程耦合。</li>
+</ul>
+<h3 id="32-优化写法一fromsql--keyless-读模型承接报表查询">3.2 优化写法一：FromSql + Keyless 读模型承接报表查询</h3>
+<p>先定义读模型：</p>
+<pre><code class="language-csharp">public sealed class MonthlyTopCustomerRow
+{
+    public string CustomerNo { get; set; } = string.Empty;
+    public decimal TotalAmount { get; set; }
+    public int OrderCount { get; set; }
+}
+</code></pre>
+<p>在 <code>OnModelCreating</code> 中声明 Keyless：</p>
+<pre><code class="language-csharp">modelBuilder.Entity&lt;MonthlyTopCustomerRow&gt;().HasNoKey();
+</code></pre>
+<p>查询代码：</p>
+<pre><code class="language-csharp">public async Task&lt;List&lt;MonthlyTopCustomerRow&gt;&gt; GetTopCustomersAsync(
+    DateTime monthStart,
+    DateTime monthEnd,
+    CancellationToken ct)
+{
+    return await _db.Set&lt;MonthlyTopCustomerRow&gt;()
+        .FromSqlInterpolated($"""
+            SELECT
+                o.CustomerNo,
+                SUM(o.TotalAmount) AS TotalAmount,
+                COUNT(1) AS OrderCount
+            FROM Orders o
+            WHERE o.CreatedAt &gt;= {monthStart} AND o.CreatedAt &lt; {monthEnd}
+            GROUP BY o.CustomerNo
+        """)
+        .TagWith("Report:MonthlyTopCustomers")
+        .AsNoTracking()
+        .OrderByDescending(x =&gt; x.TotalAmount)
+        .Take(20)
+        .ToListAsync(ct);
+}
+</code></pre>
+<p>这套写法把“报表查询”明确限定在读模型上，不和实体跟踪语义混在一起。</p>
+<h3 id="33-优化写法二sqlquery-映射-dto-与标量统计">3.3 优化写法二：SqlQuery 映射 DTO 与标量统计</h3>
+<p>定义 DTO：</p>
+<pre><code class="language-csharp">public sealed class OrderRevenueDto
+{
+    public long OrderId { get; set; }
+    public string OrderNo { get; set; } = string.Empty;
+    public decimal Revenue { get; set; }
+}
+</code></pre>
+<p>查询 DTO：</p>
+<pre><code class="language-csharp">public async Task&lt;List&lt;OrderRevenueDto&gt;&gt; GetPaidOrderRevenueAsync(CancellationToken ct)
+{
+    var paid = 2;
+
+    return await _db.Database
+        .SqlQuery&lt;OrderRevenueDto&gt;($"""
+            SELECT
+                o.Id AS OrderId,
+                o.OrderNo,
+                SUM(i.LineAmount) AS Revenue
+            FROM Orders o
+            INNER JOIN OrderItems i ON i.OrderId = o.Id
+            WHERE o.Status = {paid}
+            GROUP BY o.Id, o.OrderNo
+        """)
+        .ToListAsync(ct);
+}
+</code></pre>
+<p>查询标量：</p>
+<pre><code class="language-csharp">public async Task&lt;int&gt; GetPendingOrderCountAsync(CancellationToken ct)
+{
+    var pending = 1;
+
+    return await _db.Database
+        .SqlQuery&lt;int&gt;($"""
+            SELECT COUNT(1)
+            FROM Orders
+            WHERE Status = {pending}
+        """)
+        .SingleAsync(ct);
+}
+</code></pre>
+<h3 id="34-最容易踩的映射坑">3.4 最容易踩的映射坑</h3>
+<ol>
+<li>列名不一致：DTO 属性和 SQL 别名不一致会导致映射失败或值错位。</li>
+<li>可空性不匹配：数据库可空列映射到不可空属性，运行时容易报错。</li>
+<li>类型边界不清：例如数据库 <code>bigint</code> 映射到 <code>int</code>，高位数据会溢出。</li>
+<li>把读模型当实体：查询 DTO 后又尝试走 <code>SaveChanges</code>，语义会混乱。</li>
+</ol>
+<h2 id="4-总结">4. 总结</h2>
+<p>在 EF Core 里使用原生 SQL 的关键，不是“写不写 SQL”，而是“把 SQL 放在正确边界”。<code>FromSql</code> 更适合承接 <code>DbSet</code> 维度查询，<code>SqlQuery</code> 更适合轻量 DTO 和标量统计。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <hr>
+
+<p>
+<strong>本文作者：<a href="https://www.cnblogs.com/denglei1024/" target="_blank">邓磊Lei</a></strong><br>
+<strong>原文链接：</strong>
+<a href="https://www.cnblogs.com/denglei1024/p/19759009" target="_blank">https://www.cnblogs.com/denglei1024/p/19759009</a>
+</p>
+
+<p>
+⚠️ 本文采用 CC BY-NC-SA 4.0 协议，转载请注明出处
+</p>
+
+<p>
+📢 <strong>本文首发于公众号</strong>，更多高质量技术文章，欢迎关注：<br>
+<img src="https://img2024.cnblogs.com/blog/1033627/202604/1033627-20260405184333155-127086238.jpg" width="200">
+</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-03-23 17:07">2026-03-23 17:06</span>&nbsp;
+<a href="https://www.cnblogs.com/denglei1024">邓磊Lei</a>&nbsp;
+阅读(<span id="post_view_count">384</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19759009);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdenglei1024%2Fp%2F19759009&amp;targetId=19759009&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
