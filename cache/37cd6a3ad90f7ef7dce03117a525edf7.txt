@@ -1,0 +1,280 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/youdiscovered1t/p/19872209" title="发布于 2026-04-15 15:47">
+    <span role="heading" aria-level="2">第九届强网杯 · SecretVault WP：HTTP Connection 头绕过 JWT 反代身份校验</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        SecretVault 是第九届"强网杯"中的一道 Web 题。题目采用 Go + Flask 双层架构：Go 实现的 JWT 鉴权反向代理监听 5555 端口，负责解析 JWT、清洗请求头并向 Flask 后端（5000 端口）注入 X-User 身份标识。反代看似严密——会强制删除用户携带的 X-User、Authorization、Cookie 等敏感头，再根据 JWT 校验结果重新写入。然而漏洞藏于 Flask 的回退逻辑：当 X-User 头缺席时，后端默认将其视为 0，而非 anonymous，恰好满足绕过登录跳转至 /dashboard 的条件。利用 HTTP Connection 头的逐跳（hop-by-hop）语义，将 X-User 列入其中，即可令代理在转发时主动丢弃该字段，触发后端回退，无需伪造任何 JWT，即可以合法身份访问受保护页面，最终获取 flag。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>题目描述：小明最近注册了很多网络平台账号，为了让账号使用不同的强密码，小明自己动手实现了一套非常“安全”的密码存储系统 -- SecretVault，但是健忘的小明没记住主密码，你能帮他找找吗？</p>
+</blockquote>
+<h2 id="一yml-文件分析">一、yml 文件分析</h2>
+<p>题目给了源码，并且给了 <code>docker-compose.yml</code> 文件，我们可以直接在本地起环境。</p>
+<p>在运行容器之前，先看看 <code>.yml</code> 文件中的内容：</p>
+<pre><code>services:
+  secretvault:
+    build:
+      context: .
+    container_name: secretvault
+    environment:
+      ICQ_FLAG: flag{test}
+    ports:
+      - "5555:5555"
+</code></pre>
+<p>得到的信息：</p>
+<ul>
+<li>本地 flag 为：flag</li>
+<li>容器内部的 5555 端口映射到宿主机的 5555端口</li>
+</ul>
+<h2 id="二登入界面分析">二、登入界面分析</h2>
+<h3 id="1简单浏览">1、简单浏览</h3>
+<p>把容器跑起来：</p>
+<pre><code class="language-bash"># 在 docker-compose.yml 文件所在目录运行
+docker compose up
+</code></pre>
+<p>由于端口仅映射了 5555 端口，那么直接浏览器访问：</p>
+<pre><code>http://127.0.0.1:5555
+</code></pre>
+<p>看到的是一个登入界面，并且含注册功能：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154521797-731103165.png" alt="file-20260414144858318" loading="lazy"></p>
+<p><code>CTRL + U</code> 查看页面源码没有发现“注释信息泄露关键信息”的情况。</p>
+<p>弱密码尝试登入 admin 账户无果，打算尝试注册一个 admin，发现：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154528831-918456938.png" alt="file-20260415144105006" loading="lazy"></p>
+<p>用户已经存在，说明 admin 就很有可能是管理员账户，并且是我们最终的目标。</p>
+<p>正常情况下，这里可以尝试做 SQL Fuzz 的操作，但是这题给了网站的源码，可以直接进行白盒审计。</p>
+<h3 id="2反代">2、反代</h3>
+<p>根据 5555 端口这个线索，我们可以定位到这段代码（<code>main.go</code>）：</p>
+<pre><code class="language-go">log.Println("Authorizer middleware service is running at :5555")
+	if err := http.ListenAndServe(":5555", authorizer); err != nil {
+		log.Fatal(err)
+	}
+</code></pre>
+<p><code>http.ListenAndServe</code> 是 Go 标准库 <code>net/http</code> 里的一个函数，用来启动一个 HTTP 服务器，它有两个参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>addr</code></td>
+<td><code>string</code></td>
+<td>指定监听的地址和端口</td>
+</tr>
+<tr>
+<td><code>handler</code></td>
+<td><code>http.Handler</code></td>
+<td>指定收到请求后由谁处理</td>
+</tr>
+</tbody>
+</table>
+<p>因此，我们可以分析得到：服务器监听任意网卡的 5555 端口，并且由 <code>authorizer</code> 这个对象处理请求。</p>
+<p>据此线索，去找 <code>authorizer</code>（还是在 <code>main.go</code> 文件中）：</p>
+<pre><code class="language-go">authorizer := &amp;httputil.ReverseProxy{Director: func(req *http.Request) {
+		req.URL.Scheme = "http"
+		req.URL.Host = "127.0.0.1:5000"
+
+		uid := GetUIDFromRequest(req)
+		log.Printf("Request UID: %s, URL: %s", uid, req.URL.String())
+		req.Header.Del("Authorization")
+		req.Header.Del("X-User")
+		req.Header.Del("X-Forwarded-For")
+		req.Header.Del("Cookie")
+
+		if uid == "" {
+			req.Header.Set("X-User", "anonymous")
+		} else {
+			req.Header.Set("X-User", uid)
+		}
+	}}
+</code></pre>
+<p><code>httputil.ReverseProxy</code> 是 Go 中专门用来实现反向代理的结构体，用于处理：反代服务器和后端服务器之间的请求交互。</p>
+<p><code>authorizer</code> 实例化了这个结构体，并作为指向该实例地址的指针存在。</p>
+<pre><code class="language-go">req.URL.Scheme = "http"
+req.URL.Host = "127.0.0.1:5000"
+</code></pre>
+<p>这代表真正的后端服务是开在 <code>127.0.0.1:5000</code> 上的。</p>
+<blockquote>
+<p>指定了 <code>127.0.0.1</code>，说明不允许非本地网络访问。</p>
+</blockquote>
+<p>接着看：</p>
+<pre><code class="language-go">uid := GetUIDFromRequest(req)
+</code></pre>
+<p>调用了 <code>GetUIDFromRequest()</code> 函数：</p>
+<pre><code class="language-go">func GetUIDFromRequest(r *http.Request) string {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		cookie, err := r.Cookie("token")
+		if err == nil {
+			authHeader = "Bearer " + cookie.Value
+		} else {
+			return ""
+		}
+	}
+	if len(authHeader) &lt;= 7 || !strings.HasPrefix(authHeader, "Bearer ") {
+		return ""
+	}
+	tokenString := strings.TrimSpace(authHeader[7:])
+	if tokenString == "" {
+		return ""
+	}
+	token, err := jwt.ParseWithClaims(tokenString, &amp;AuthClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(SecretKey), nil
+	})
+	if err != nil {
+		log.Printf("failed to parse token: %v", err)
+		return ""
+	}
+	claims, ok := token.Claims.(*AuthClaims)
+	if !ok || !token.Valid {
+		log.Printf("invalid token claims")
+		return ""
+	}
+	return claims.UID
+}
+</code></pre>
+<p>该函数首先会查看 Http Header 中是否有 Authorization 字段，如果没有，则继续查看 Cookie 字段中的 token，如果有值则写入 authHeader 变量中，无值则直接函数返回空字符。</p>
+<p>后续一连串的 <code>if</code> 都是用于判断这个 Token 是否是一个合法的 JWT Token（格式、长度等是否正确），并且判断签名是否正确。若合法且签名正确，则会接收 <code>jwt.ParseWithClaims</code> 函数的返回值。</p>
+<p>这个函数可以在 Go 的官方文档（<code>https://pkg.go.dev/github.com/golang-jwt/jwt/v5#section-readme</code>）中看到：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154549962-1400863986.png" alt="file-20260415142242349" loading="lazy"></p>
+<p>其返回值：</p>
+<pre><code>*Token, error
+</code></pre>
+<p>同意文档中可以找到：</p>
+<pre><code class="language-go">type Token struct {
+	Raw       string         // Raw contains the raw token.  Populated when you [Parse] a token
+	Method    SigningMethod  // Method is the signing method used or to be used
+	Header    map[string]any // Header is the first segment of the token in decoded form
+	Claims    Claims         // Claims is the second segment of the token in decoded form
+	Signature []byte         // Signature is the third segment of the token in decoded form.  Populated when you [Parse] or sign a token
+	Valid     bool           // Valid specifies if the token is valid.  Populated when you [Parse] a token
+}
+</code></pre>
+<p>简单来说，<code>token</code> 会获得 JWT 的一些关键元素。</p>
+<p>最后：</p>
+<pre><code class="language-go">claims, ok := token.Claims.(*AuthClaims)
+……
+return claims.UID
+</code></pre>
+<p>这回返回 payload 中的 UID 字段。</p>
+<p>回到之前看到的：</p>
+<pre><code class="language-go">uid := GetUIDFromRequest(req)
+</code></pre>
+<p>现在我们知道，这一步会检查 jwt 的合法性和签名情况，如果正常，则返回 jwt payload 中的 uid 字段值并赋值给 <code>uid</code> 变量。</p>
+<p>继续看：</p>
+<pre><code class="language-go">req.Header.Del("Authorization")
+req.Header.Del("X-User")
+req.Header.Del("X-Forwarded-For")
+req.Header.Del("Cookie")
+</code></pre>
+<p>这说明反代传给后端服务器的 http 请求并非与用户原始请求相同，而是删减了一些 http 请求头：</p>
+<ul>
+<li><code>Authorization</code></li>
+<li><code>X-User</code></li>
+<li><code>X-Forwarded-For</code></li>
+<li><code>Cookie</code></li>
+</ul>
+<p>最后是一个 <code>if-else</code> 判断：</p>
+<pre><code class="language-go">if uid == "" {
+			req.Header.Set("X-User", "anonymous")
+		} else {
+			req.Header.Set("X-User", uid)
+		}
+</code></pre>
+<p>如果 uid 没有值，则在请求头中加上：</p>
+<pre><code>X-User: anonymous
+</code></pre>
+<p>如果 uid 有值，则在请求头中加上：</p>
+<pre><code>X-User: &lt;uid_value&gt;
+</code></pre>
+<h3 id="3真正的后端">3、真正的后端</h3>
+<p>既然知道了 5555 是反代，当然要去找到真正的后端服务，也就是我们上面分析出来的 5000 端口，在 <code>app.py</code> 中就能看到监听信息：</p>
+<pre><code class="language-python">if __name__ == '__main__':
+    flask_app = create_app()
+    flask_app.run(host='127.0.0.1', port=5000, debug=False)
+</code></pre>
+<p>通过之前页面的简单浏览，我们知道，访问 <code>127.0.0.1:5555</code> 就会重定向到 <code>127.0.0.1:5555/sign</code>：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154602652-1816124259.png" alt="file-20260415143719997" loading="lazy"></p>
+<p>对应的代码逻辑：</p>
+<pre><code class="language-python">@app.route('/')
+def index():
+	uid = request.headers.get('X-User', '0')
+	if not uid or uid == 'anonymous':
+		return redirect(url_for('login'))
+	
+	return redirect(url_for('dashboard'))
+</code></pre>
+<p>这里有个小发现，如果请求头中的 <code>X-User</code> 字段有值且不为“anonymous”，则可以绕过登入，直接到 <code>/dashboard</code> 界面。</p>
+<p>正常的请求包中是没有该字段的：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154613564-1156605577.png" alt="file-20260415144350223" loading="lazy"></p>
+<p>我们若手动添加该字段，则会被反代给删除（上面我们分析过的）：</p>
+<pre><code class="language-go">req.Header.Del("X-User")
+</code></pre>
+<p>删除后，又会根据 uid 的值添加上了 <code>X-User</code> 字段并赋予新值：</p>
+<pre><code class="language-go">if uid == "" {
+	req.Header.Set("X-User", "anonymous")
+} else {
+	req.Header.Set("X-User", uid)
+}
+</code></pre>
+<p>而 uid 的值来自 jwt，若不知道签名密钥，则无法伪造正常 jwt。</p>
+<p>换言之，我们无法在请求中伪造 <code>X-User</code> 字段来绕过登入判断。</p>
+<p>但是这有个非常重要的细节，聚焦：</p>
+<pre><code class="language-python">request.headers.get('X-User', '0')
+</code></pre>
+<p>当请求头中没有 <code>X-User</code> 字段的时候，则会添加上：</p>
+<pre><code>X-User: 0
+</code></pre>
+<p>而 0 刚好是能绕过登入判断的。</p>
+<p>那么，我们就得想，如何让反代不传该请求头呢？</p>
+<p>想到 http 请求头中的字段 <code>Connection</code>：<code>Connection</code> 里列出的字段名，表示这些头只对当前连接有效，代理在转发时应把它们去掉。</p>
+<p>也就是说，当我们请求 <code>127.0.0.1:5555</code> 的时候，带上请求头：</p>
+<pre><code>……
+……
+Connection: X-User
+</code></pre>
+<p>反代看到该字段，则在转发给后端服务器的时候会将该字段从请求头中去除。</p>
+<p>5000 API 接到请求后，发现并没有检测到 <code>X-User</code> 请求头字段，则默认将其设置为：</p>
+<pre><code>X-User: 0
+</code></pre>
+<p>绕过登入成功。</p>
+<h2 id="三获取-flag">三、获取 Flag</h2>
+<p>尝试上述分析到的结果，改包：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154630055-1906756977.png" alt="file-20260415152946047" loading="lazy"></p>
+<p>从响应中可以看出直接重定向到 <code>/dashboard</code> 去了而不是 <code>/sign</code>，说明成功了。</p>
+<p>开启 burp 的跟随重定向功能：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154637197-1169532218.png" alt="file-20260415153126761" loading="lazy"></p>
+<p>发送请求，得到结果：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3622178/202604/3622178-20260415154644283-646531271.png" alt="file-20260415153203363" loading="lazy"></p>
+<p>成功得到 flag！</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-04-15 15:48">2026-04-15 15:47</span>&nbsp;
+<a href="https://www.cnblogs.com/youdiscovered1t">YouDiscovered1t</a>&nbsp;
+阅读(<span id="post_view_count">70</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19872209);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyoudiscovered1t%2Fp%2F19872209&amp;targetId=19872209&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
