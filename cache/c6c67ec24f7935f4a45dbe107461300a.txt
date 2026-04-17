@@ -1,0 +1,553 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/twoshuai/p/19882061" title="发布于 2026-04-17 11:13">
+    <span role="heading" aria-level="2">【002】HTTPS 粗解：证书、TLS 握手与对后端配置的影响</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文介绍 HTTPS（HTTP over TLS）的机密性、完整性与证书身份，理清证书链、SAN 与缺中间证书，勾勒握手并归纳过期、域名不符、`PKIX`/`SSLHandshakeException` 等典型报错。含 Spring Boot `server.ssl`、Nginx 与 `X-Forwarded-Proto`/`Host`、Java 信任库、自签、mTLS、小程序合法域名及 `openssl s_client`、`curl -v`；便于与运维对齐并联调，非密码学教材。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>上一篇【001】把 HTTP 这一条「明文应用层」捋了一遍。一旦站点改成 <strong>HTTPS</strong>，同样还是 HTTP 语义（方法、状态码、Header、JSON），但 <strong>TCP 连接建立之后、HTTP 报文发送之前</strong>，多了一层 <strong>TLS（前身常叫 SSL）</strong> 协商：协商出对称密钥、校验服务器身份、（可选）校验客户端。联调时常见的「证书过期」「域名和证书不一致」「小程序要求合法 HTTPS」「Java 调合作伙伴接口 PKIX 报错」大半都落在这层上。</p>
+<p>这篇用「能排障、能跟运维对齐、能配 Spring Boot / 反代 / 本地证书」为度做一次<strong>加量粗解</strong>，仍然不替密码学教材。下面我按「HTTPS 解决啥 → 证书与链 → TLS 版本与握手直觉 → Spring Boot 实操 → 反代与转发头 → Java 当客户端 → 命令行排障 → 自签与 SAN → 双向认证与小场景 → 小程序合法域名」往下聊；每个大节里都尽量塞<strong>可复制的配置与命令</strong>。</p>
+<hr>
+<h2 id="1-https-在解决什么问题-">1. HTTPS 在解决什么问题 ✉</h2>
+<p>在 <strong>HTTP</strong> 上，链路中的设备若能看到你的流量，就能读到 URL（含敏感 query）、Header、Body（含 token——敏感凭证更应放 Header 而非 query）。<strong>HTTPS = HTTP over TLS</strong>，TLS 主要负责三件事（和「机密性 / 完整性 / 身份」对应）：</p>
+<ul>
+<li><strong>机密性</strong>：应用数据用协商出的对称密钥加密，窃听者拿到的是密文。</li>
+<li><strong>完整性</strong>：现代套件多用 <strong>AEAD</strong>，篡改更容易被对端拒收或校验失败。</li>
+<li><strong>身份（对服务端而言最显眼）</strong>：服务端用 <strong>X.509 证书</strong>绑定域名（及公钥），客户端验证链与主机名后，才相信「当前连接对端是该域名背后的服务」。</li>
+</ul>
+<p>还要知道两个「周边」问题：</p>
+<p><strong>混合内容（Mixed Content）</strong><br>
+页面是 HTTPS，但页面里的脚本、接口、图片还用 <code>http://</code> 去拉，浏览器可能<strong>拦截</strong>或降级处理，表现为「线上环境只有部分资源失败」。前后端联调时，<strong>统一入口协议</strong>很关键。</p>
+<p><strong>HSTS（HTTP Strict Transport Security）</strong><br>
+服务端通过响应头要求浏览器<strong>只走 HTTPS</strong> 访问该域一段时间，可减少「首次仍打到 HTTP」被劫持的风险。配在云/WAF/Nginx/Spring 上都有可能；开发本地一般碰不到，上线要听安全/运维规范。</p>
+<p><strong>和 Java 后端的关系</strong>：你在内嵌 Tomcat 上开 <code>server.ssl.*</code>，或前面用 Nginx/Ingress <strong>终结 TLS</strong> 再回源 HTTP，都要理解证书与域名；Java 作为 <strong>HTTPS 客户端</strong>（<code>RestTemplate</code>、<code>RestClient</code>、Feign、SDK）时还会单独碰到 <strong>truststore</strong> 与<strong>协议/套件</strong>不匹配问题。</p>
+<hr>
+<h2 id="2-证书与证书链里有什么-">2. 证书与证书链里有什么 📜</h2>
+<p>网站给你的材料一般是 <strong>X.509</strong>。常见<strong>存放形态</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>PEM</strong></td>
+<td>Base64 + <code>-----BEGIN CERTIFICATE-----</code> 头尾，可读文本，可链式拼接多个证书。</td>
+</tr>
+<tr>
+<td><strong>DER</strong></td>
+<td>二进制，扩展名不一定是 <code>.der</code>，有时 <code>.crt</code> 既是 PEM 又是 DER，需用 <code>openssl x509 -in file -text -noout</code> 试读。</td>
+</tr>
+<tr>
+<td><strong>PKCS#12（.p12 / .pfx）</strong></td>
+<td>一个文件里常含<strong>私钥 + 证书链</strong>（+ 密码保护），Java <code>keytool</code>、Spring <code>key-store-type: PKCS12</code> 都爱用它。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="21-字段里你最该盯的">2.1 字段里你最该盯的</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>你需要知道的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SAN（Subject Alternative Name）</strong></td>
+<td>现代浏览器校验<strong>主名</strong>看 SAN；<strong>仅 CN（Common Name）</strong> 不含 SAN 的老证书在部分环境会踩坑。你的访问域名/泛域名应出现在 SAN 列表里。</td>
+</tr>
+<tr>
+<td><strong>Issuer</strong></td>
+<td>颁发者：公共 CA、企业私有 CA、或自签名（Issuer = Subject）。</td>
+</tr>
+<tr>
+<td><strong>有效期</strong></td>
+<td><code>notBefore</code> ~ <code>notAfter</code>。过期必挂；建议设<strong>到期告警</strong>（提前 30 天很常见）。</td>
+</tr>
+<tr>
+<td><strong>公钥与用途</strong></td>
+<td>与服务器<strong>私钥</strong>成对；私钥<strong>绝不能</strong>进代码仓库。</td>
+</tr>
+<tr>
+<td><strong>证书链顺序</strong></td>
+<td>典型：<code>站点证书</code> → <code>中间证书</code>（可多层）→ 根证常已在客户端信任库。服务端配置时要避免「只发了站点证、没发中间证」。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-dv--ov--ev面试与采购常听">2.2 DV / OV / EV（面试与采购常听）</h3>
+<ul>
+<li><strong>DV</strong>：验证域名控制权，签发快，浏览器地址栏一般只显示锁。</li>
+<li><strong>OV / EV</strong>：多组织信息与更严审核，<strong>不能</strong>当作「绝对安全」，业务安全仍靠你自己（鉴权、防重放、日志等）。</li>
+</ul>
+<h3 id="23-公网-vs-内网">2.3 公网 vs 内网</h3>
+<ul>
+<li><strong>公网</strong>：Let’s Encrypt、DigiCert 等签的链，手机/浏览器/小程序默认可信。</li>
+<li><strong>内网/自签</strong>：客户端不信任 → <code>PKIX path building failed</code>。正规做法是<strong>把企业根 CA 导入</strong>各环境的 truststore，或统一用<strong>私有 ACME/PKI</strong>；开发机临时导入要有限度。</li>
+</ul>
+<p><strong>吊销（CRL / OCSP）</strong><br>
+浏览器与部分客户端会检查证书是否被吊销；排障时若遇「极少数客户端不行」，除链以外也可让运维侧看一眼吊销可达性（企业环境才多见）。</p>
+<hr>
+<h2 id="3-tls-版本套件与握手直觉-">3. TLS 版本、套件与握手直觉 🔐</h2>
+<h3 id="31-tls-12-和-13-的差异工程师版">3.1 TLS 1.2 和 1.3 的差异（工程师版）</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>TLS 1.2</th>
+<th>TLS 1.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>典型往返（RTT）</td>
+<td>完整握手常见 <strong>2-RTT</strong>（外加 TCP）</td>
+<td><strong>1-RTT</strong> 完整握手更常见</td>
+</tr>
+<tr>
+<td>套件</td>
+<td>历史上套件繁杂，配置错误易出现弱套件</td>
+<td>废弃大量旧套件，缺省更安全</td>
+</tr>
+<tr>
+<td>中间人可见度</td>
+<td>设计年代早，需更注意禁用旧协议</td>
+<td>行业整体在推 1.3</td>
+</tr>
+</tbody>
+</table>
+<p><strong>实践</strong>：生产侧听运维/WAF 统一策略；Java 侧若指定过「只允许 TLSv1.2」之类 JVM 参数，升级时要和网关策略对齐，避免 <code>protocol_version</code> / <code>handshake_failure</code>。</p>
+<h3 id="32-握手剧情仍是这几步与-12-对齐理解">3.2 握手「剧情」仍是这几步（与 1.2 对齐理解）</h3>
+<ol>
+<li><strong>ClientHello</strong>：协议版本上限、随机数、支持的套件、<strong>SNI</strong>（你访问的域名）、扩展（ALPN 里可协商 <code>h2</code>/<code>http/1.1</code> 等）。</li>
+<li><strong>ServerHello + Certificate</strong>：服务端选定参数，下发<strong>证书链</strong>。</li>
+<li><strong>客户端验链、验主机名</strong>（证书是否覆盖 SNI 里的名字）。</li>
+<li><strong>密钥交换</strong>（ECDHE 等）→ 双方得到<strong>会话密钥</strong>。</li>
+<li><strong>Finished</strong> 后，应用数据（即 <strong>HTTP</strong>）才加密传输——【001】里的报文在这之后才出现。</li>
+</ol>
+<p><strong>你要记的结论</strong>：业务 HTTP 报错与 TLS 报错<strong>层级不同</strong>；<code>curl</code>/浏览器若在握手阶段失败，<strong>根本不会</strong>到你的 <code>@GetMapping</code>。</p>
+<h3 id="33-sniserver-name-indication为何重要">3.3 SNI（Server Name Indication）为何重要</h3>
+<p>同一台机、同一个公网 IP 上可能挂成千上万个 HTTPS 虚拟主机，靠的就是 <strong>TLS 握手 ClientHello 里带的 SNI</strong>。<strong>老旧的 Java 8 早期</strong>或未正确配置 SNI 的客户端，访问多域名 HTTPS 时可能莫名其妙失败；你现在主力 <strong>JDK 17</strong> 一般问题不大，但排障时心里要有这根弦。</p>
+<h3 id="34-会话恢复了解即可">3.4 会话恢复（了解即可）</h3>
+<p><strong>Session ID / Session Ticket</strong> 让同客户端重复建连时少算密钥，<strong>体感</strong>主要是「复访更快」。深度排障很少从零扣这个，但若 CDN 文档让你开/关 ticket，知道它和「会话复用」有关即可。</p>
+<hr>
+<h2 id="4-spring-boot-3x-里开-https内嵌容器">4. Spring Boot 3.x 里开 HTTPS（内嵌容器）☕</h2>
+<p>很多团队 <strong>不在 JVM 上终结 TLS</strong>，但若你需要「单机直出 HTTPS」或本地对齐生产，可以用下面几类配置。</p>
+<h3 id="41-pkcs12p12--pfx最常见">4.1 PKCS#12（.p12 / .pfx）——最常见</h3>
+<pre><code class="language-yaml">server:
+  port: 8443
+  ssl:
+    enabled: true
+    bundle: classpath:keystore.p12
+    key-store-password: ${SSL_KEYSTORE_PASSWORD}
+    key-store-type: PKCS12
+    key-alias: myalias
+</code></pre>
+<p>不同 Boot 小版本里 <strong><code>key-store</code></strong> 与 <strong><code>bundle</code></strong> 的键名请以你当前 <strong>3.3.x 官方文档</strong>为准（有的示例仍写 <code>server.ssl.key-store</code>）。要点不变：</p>
+<ul>
+<li><strong>key-store-password</strong>：库口令；<strong>key-password</strong> 若与库口令不同需单独指定。</li>
+<li><strong>key-alias</strong>：一个 p12 里多个别名时必填对。</li>
+<li>生产口令走<strong>环境变量 / Secret</strong>，勿提交 Git。</li>
+</ul>
+<p><strong>HTTP 与 HTTPS 同时开</strong>：可以用 <strong>两套端口</strong>（例如 8080 HTTP + 8443 HTTPS），或只做反代层双协议；若只要「强制跳 HTTPS」，多在 <strong>网关/Nginx</strong> 做 301，比在业务里写过滤器更常见。</p>
+<h3 id="42-pem证书文件--私钥文件">4.2 PEM（证书文件 + 私钥文件）</h3>
+<pre><code class="language-yaml">server:
+  port: 8443
+  ssl:
+    certificate: classpath:cert.pem
+    certificate-private-key: classpath:key.pem
+</code></pre>
+<p>注意：<strong>私钥文件权限</strong>在 Linux 上应收紧（仅运行用户可读）。链若分多段，按文档要求拼成服务端认可的 <strong>fullchain</strong> 形态。</p>
+<h3 id="43-协议与套件进阶兜底">4.3 协议与套件（进阶兜底）</h3>
+<p>若安全基线要求「仅 TLSv1.2+」或指定套件，常见是通过 <strong>内嵌容器定制</strong> 或 <strong>反向代理统一策略</strong>。Boot 层若暴露 <code>server.ssl.enabled-protocols</code> / <code>ciphers</code>（以文档为准），改前务必和运维对齐，避免老式客户端全挂。</p>
+<h3 id="44-actuator-与健康检查">4.4 Actuator 与健康检查</h3>
+<p>Kubernetes <strong>探针</strong>常打 HTTP。若你整站只开在 HTTPS，要么：</p>
+<ul>
+<li>探针走 <strong>独立 management 端口</strong>（仅内网），仍 HTTP；要么</li>
+<li>探针路径在<strong>明文侧</strong>单独暴露（由平台规范约束）。</li>
+</ul>
+<p>不要想当然把「业务 URL 必须 https」让探针也跟着复杂化，除非平台明确要求。</p>
+<h3 id="45-信任反代传来的-httpsforwarded-头">4.5 信任「反代传来的 https」——Forwarded 头</h3>
+<p>见下一节与 <strong>5.3</strong> 联动：<code>X-Forwarded-Proto: https</code>、<code>X-Forwarded-Host</code> 等会影响 <strong>Spring MVC 的绝对 URL 生成</strong>、<strong>Cookie 的 Secure</strong>、<strong>重定向 Location</strong>。Boot 3 常用：</p>
+<pre><code class="language-yaml">server:
+  forward-headers-strategy: framework
+</code></pre>
+<p>或 <code>native</code>——具体取值请对照 <strong>当前 minor</strong> 文档与你们网关实际发的头。<strong>没配时</strong>，常见 bug 是：登录后重定向成 <code>http://</code> 导致无限跳或 Cookie 丢失。</p>
+<hr>
+<h2 id="5-反向代理终结-tls更常见的生产形态">5. 反向代理终结 TLS（更常见的生产形态）📎</h2>
+<h3 id="51-典型拓扑">5.1 典型拓扑</h3>
+<pre><code class="language-text">浏览器 --HTTPS--&gt; 云 LB / Nginx / Ingress --HTTP--&gt; Spring Boot :8080
+                                  \--HTTPS mTLS--&gt; （少数场景）
+</code></pre>
+<p>TLS 在「边缘」终结，<strong>内网回源</strong>可走明文 HTTP（配合安全组/专线策略）。你的 <strong>Java 日志里 RemoteAddr</strong> 往往是反代 IP，真实客户端在 <strong><code>X-Forwarded-For</code></strong> 里（注意伪造链，信任边界以<strong>网关抹写</strong>为准）。</p>
+<h3 id="52-nginx-配置加深一版">5.2 Nginx 配置加深一版</h3>
+<pre><code class="language-nginx">upstream spring_app {
+    server 127.0.0.1:8080;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name api.example.com;
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    # 按公司基线补 ssl_protocols / ssl_ciphers 等
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_pass http://spring_app;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}
+</code></pre>
+<p><strong><code>fullchain.pem</code></strong>：站点 + 中间证书；别只拷「叶子证」。</p>
+<p><strong>WebSocket</strong>：若路径走 WS，要额外 <code>Upgrade</code>、<code>Connection</code> 相关头，或使用 Nginx/网关的 <strong>websocket 专用示例</strong>。</p>
+<h3 id="53-spring-侧为何要认-forwarded">5.3 Spring 侧为何要认 Forwarded</h3>
+<p>场景：用户访问的是 <code>https://api.example.com</code>，网关回源 <code>http://127.0.0.1:8080</code>。Spring 若不知道「外面是 https」，生成的 <strong>redirect</strong> 可能写成 <code>http://</code>，<strong>OAuth2 回调</strong>、<strong>表单 action</strong>、<strong>HATEOAS</strong> 等都会歪。配好 <code>forward-headers-strategy</code> 并<strong>只信任你家网关 IP</strong> 写的头（防 Spoof），是生产必备意识。</p>
+<h3 id="54-云厂商四层七层-lb">5.4 云厂商四层/七层 LB</h3>
+<p>七层 LB 往往在控制台上传证书，回源可指定 HTTP；注意 <strong>健康检查路径</strong>、<strong>会话保持</strong>与 <strong>TLS 只在入口</strong> 的组合。细节跟阿里云/腾讯云/AWS 控制台走，此处只强调：<strong>证书续期在 LB/CDN 控制台也可能发生</strong>，别忘了不仅 Nginx。</p>
+<hr>
+<h2 id="6-java-作为客户端访问-https-上游-">6. Java 作为客户端访问 HTTPS 上游 🎯</h2>
+<h3 id="61-默认信任从哪来">6.1 默认信任从哪来</h3>
+<p>JRE/JDK 带着 <strong><code>lib/security/cacerts</code></strong>（密码默认 <code>changeit</code>），里面是公共 CA 根。<strong>公网 HTTPS</strong> 一般够用。</p>
+<h3 id="62-keytool看库导入根证示例">6.2 <code>keytool</code>：看库、导入根证（示例）</h3>
+<pre><code class="language-bash"># 列出 cacerts 里别名（路径随 JDK 安装变）
+
+keytool -list -keystore "%JAVA_HOME%\lib\security\cacerts" -storepass changeit
+</code></pre>
+<p>企业根证书导入（示例，别名自定）：</p>
+<pre><code class="language-bash">keytool -importcert -noprompt -alias corp-root -file corp-root.pem -keystore "%JAVA_HOME%\lib\security\cacerts" -storepass changeit
+</code></pre>
+<p><strong>注意</strong>：改系统 <code>cacerts</code> 影响整台机所有 Java 进程，很多公司改为 <strong>启动时挂自定义 truststore</strong>，或容器镜像层统一管理。</p>
+<p>自定义 truststore 启动：</p>
+<pre><code class="language-text">-Djavax.net.ssl.trustStore=E:/dev/corp-truststore.p12
+-Djavax.net.ssl.trustStorePassword=yourSecret
+-Djavax.net.ssl.trustStoreType=PKCS12
+</code></pre>
+<h3 id="63-典型异常与含义">6.3 典型异常与含义</h3>
+<table>
+<thead>
+<tr>
+<th>异常 / 日志关键字</th>
+<th>更可能原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PKIX path building failed</code></td>
+<td>不信任颁发链、缺根/中间、或连错环境（测网证书打生产域名）</td>
+</tr>
+<tr>
+<td><code>CertificateExpiredException</code></td>
+<td>证书过期</td>
+</tr>
+<tr>
+<td><code>CertificateNotYetValidException</code></td>
+<td>本机时间不对或证书未生效</td>
+</tr>
+<tr>
+<td><code>No subject alternative DNS name matching</code></td>
+<td>访问的 Host 不在证书 SAN</td>
+</tr>
+<tr>
+<td><code>javax.net.ssl.SSLHandshakeException</code></td>
+<td>协议/套件/证书错误的大箩筐，需打开 <strong><code>-Djavax.net.debug=ssl:handshake</code></strong>（仅排障短暂开）</td>
+</tr>
+<tr>
+<td><code>SunCertPathBuilderException</code></td>
+<td>常与 PKIX 同类，链构造失败</td>
+</tr>
+</tbody>
+</table>
+<h3 id="64-框架层resttemplate--restclient--feign">6.4 框架层：RestTemplate / RestClient / Feign</h3>
+<ul>
+<li>公网 CA：一般零配置。</li>
+<li>私有 CA：<strong>运维发根证</strong> → 进 truststore（推荐）→ 再谈代码。</li>
+<li>「开发环境跳过校验」类 <code>TrustManager</code>：<strong>不要</strong>复制进生产；代码评审应拦。</li>
+</ul>
+<p>Feign / HttpClient 若单独配了 SSL 上下文，要确认<strong>没有</strong>覆盖默认的 SNI 行为（少数老配置会踩坑）。</p>
+<hr>
+<h2 id="7-联调与排障命令流程与表-">7. 联调与排障：命令、流程与表 ✅</h2>
+<h3 id="71-curl">7.1 curl</h3>
+<p><strong>看握手与证书</strong>（Windows 可把管道后换成 <code>findstr</code>）：</p>
+<pre><code class="language-bash">curl -v "https://api.example.com/actuator/health" 2&gt;&amp;1 | findstr /i "subject issuer expire SSL certificate"
+</code></pre>
+<p><strong>指定解析</strong>（排除 DNS 捣乱）：</p>
+<pre><code class="language-bash">curl -v --resolve api.example.com:443:203.0.113.10 "https://api.example.com/"
+</code></pre>
+<h3 id="72-openssl-s_client有-openssl-的环境">7.2 openssl s_client（有 OpenSSL 的环境）</h3>
+<pre><code class="language-bash">openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts &lt;/dev/null
+</code></pre>
+<p>关注：<strong>证书链有几张</strong>、<code>Verify return code</code> 是否 0、<code>subject=CN</code> / SAN、<code>OCSP</code> 相关输出（视版本）。</p>
+<h3 id="73-浏览器">7.3 浏览器</h3>
+<p>Chrome：<strong>锁图标 → 连接是安全的 → 证书有效</strong>，看颁发者、有效期、使用者可选名称。<br>
+Safari / Firefox 路径略不同，<strong>原则一样</strong>：链、日期、域名。</p>
+<h3 id="74-排障流程可当-check-list">7.4 排障流程（可当 check list）</h3>
+<ol>
+<li><strong>先分清</strong>：是<strong>握手失败</strong>还是 <strong>HTTP 4xx/5xx</strong>（握手失败时很多监控探不到业务指标）。</li>
+<li><strong><code>curl -v</code> / <code>openssl s_client</code></strong> 在<strong>出问题的同一网络环境</strong>跑（公司出口、用户家宽、机房内网）。</li>
+<li>核对 <strong>访问的 Host</strong> 与证书 <strong>SAN</strong>；核对 <strong>系统时间</strong>。</li>
+<li>服务器/Nginx 侧：<code>fullchain</code> 是否真 full；<strong>是否改过中间证</strong>未重启。</li>
+<li>Java 客户端：<strong>truststore</strong> 是否包含企业根；JVM <strong>TLS 版本</strong>是否过严或过旧。</li>
+<li>仅<strong>部分移动网络</strong>失败：想到 <strong>IPv6</strong>、<strong>SNI</strong>、过时安卓 WebView、中间设备劫持等（需要抓包与运营侧信息）。</li>
+</ol>
+<h3 id="75-浏览器错误与可能原因扩表">7.5 浏览器错误与可能原因（扩表）</h3>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>可能原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NET::ERR_CERT_DATE_INVALID</code></td>
+<td>过期/未生效/本机时间错误</td>
+</tr>
+<tr>
+<td><code>NET::ERR_CERT_COMMON_NAME_INVALID</code></td>
+<td>域名与 SAN 不匹配</td>
+</tr>
+<tr>
+<td><code>ERR_CERT_AUTHORITY_INVALID</code></td>
+<td>自签或私有 CA 未被信任</td>
+</tr>
+<tr>
+<td><code>NET::ERR_SSL_VERSION_OR_CIPHER_MISMATCH</code></td>
+<td>协议/套件过新或过旧</td>
+</tr>
+<tr>
+<td>小程序合法域名失败</td>
+<td>非 443 默认、TLS 不合规、证书链问题、域名未登记、业务未备案（政策以平台文档为准）</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="8-综合示例本地证书与-spring-boot-">8. 综合示例：本地证书与 Spring Boot 💻</h2>
+<h3 id="81-最简自签仅本机带-san-更好">8.1 最简自签（仅本机，带 SAN 更好）</h3>
+<p><code>/etc/hosts</code> 或 Windows <code>hosts</code> 把 <code>local.test</code> 指到 <code>127.0.0.1</code>，用 SAN 覆盖该名字（OpenSSL 命令各版本用 <code>req v3_req</code> + <code>subjectAltName</code> 配置块；此处给思路，命令以你本机 OpenSSL 手册为准）：</p>
+<ul>
+<li>生成 <strong>私钥</strong> + <strong>CSR</strong> + <strong>自签</strong>，SAN 含 <code>DNS:local.test</code>、<code>DNS:localhost</code>。</li>
+<li>Spring：<code>server.ssl.certificate</code> / <code>certificate-private-key</code> 指向生成文件，<code>server.port=8443</code>。</li>
+<li>浏览器首次仍会<strong>红屏</strong>——导入自签为<strong>受信任根</strong>或每次点高级继续，<strong>团队规范</strong>通常禁止把这种证书用于联调小程序。</li>
+</ul>
+<h3 id="82-开发利器-mkcert可选">8.2 开发利器 mkcert（可选）</h3>
+<p><code>mkcert</code> 在开发机上生成本地受信 CA，浏览器少红屏；<strong>仍非公网方案</strong>，上线与小程序无关。</p>
+<h3 id="83-与生产一致的路径">8.3 「与生产一致」的路径</h3>
+<p>尽量用<strong>测试环境</strong>已申请的正式域+正式证书（或 staging），连接到<strong>类生产网关</strong>，减少「本地自签一切正常、上云全挂」的落差。</p>
+<hr>
+<h2 id="9-双向-tlsmtls知道边界即可-">9. 双向 TLS（mTLS）——知道边界即可 🔗</h2>
+<p>部分 <strong>开放银行 / 企业 B2B</strong> 要求 <strong>客户端也交证书</strong>，服务端校验「你是谁」。此时除服务端 <code>server.ssl.*</code>（trust-store 配合作方根或伙伴客户端认证配置）外，<strong>客户端</strong>要配 <strong>keyStore</strong>（自己的证书+私钥）。细节强烈依赖对方接口文档与你们网关是否 offload，这里只提醒：<strong>遇到「要交客户端证书」的需求，别在业务代码里硬编码私钥路径密码</strong>，交给配置中心与密钥托管。</p>
+<hr>
+<h2 id="10-小程序--开放平台的合法域名和-https-的关系-">10. 小程序 / 开放平台的「合法域名」——和 HTTPS 的关系 📱</h2>
+<p>不同平台细则会变，开发时可按下面<strong>自查</strong>（以微信等官方文档为准，这里列工程常识）：</p>
+<ol>
+<li>接口域名必须是 <strong>HTTPS</strong>（小程序里 <code>request</code> 合法域名列表）。</li>
+<li>证书链完整、<strong>TLS 版本与套件</strong>满足平台最低要求（旧版文档常写不支持 SSLv3 等，需读当期说明）。</li>
+<li><strong>域名</strong>已加到控制台「合法域名」，且与证书 SAN <strong>一致</strong>。</li>
+<li>部分能力要求 <strong>ICP 备案</strong>、<strong>业务域名</strong>校验文件等——与纯 TLS 不同，但排障时一起查。</li>
+</ol>
+<p>「后端同事说接口OK，小程序不通」——先<strong>手机浏览器</strong>打开同一 URL 看证书；再用<strong>开发者工具 Network</strong>；最后核对<strong>控制后台域名配置</strong>。</p>
+<hr>
+<h2 id="11-openssl带-san-的自签与-csr-思路可复制骨架">11. OpenSSL：带 SAN 的自签与 CSR 思路（可复制骨架）🧰</h2>
+<p>下面是一段「<strong>思路骨架</strong>」：用独立配置文件把 <strong>SAN</strong> 写清楚，避免证书只有 <code>CN=localhost</code>、没有 SAN，被 Chrome 等直接标红。具体命令以你机器上 <strong>OpenSSL 3.x / 1.1.1</strong> 文档为准，路径自行替换。</p>
+<p><strong>第一步：写 <code>openssl-san.cnf</code>（示例）</strong></p>
+<pre><code class="language-ini">[ req ]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+distinguished_name = dn
+req_extensions     = v3_req
+
+[ dn ]
+CN = local.test
+
+[ v3_req ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = local.test
+DNS.2 = localhost
+IP.1  = 127.0.0.1
+</code></pre>
+<p><strong>第二步：生成私钥 + CSR + 自签证书（示例命令序列）</strong></p>
+<pre><code class="language-bash">openssl req -new -x509 -nodes -days 365 -keyout local.test.key -out local.test.crt -config openssl-san.cnf -extensions v3_req
+</code></pre>
+<p>生成的 <code>local.test.crt</code> + <code>local.test.key</code> 可交给 Spring Boot <code>server.ssl.certificate</code> / <code>certificate-private-key</code>（或先拼成 p12 再用 <code>key-store</code>）。<strong>记得</strong>在 <code>hosts</code> 里把 <code>local.test</code> 指到本机，否则浏览器用别的名字访问仍会报域名不匹配。</p>
+<p><strong>验证书内容</strong>（看 SAN 是否在）：</p>
+<pre><code class="language-bash">openssl x509 -in local.test.crt -noout -text | findstr /i "Subject Alternative Name DNS"
+</code></pre>
+<p>Linux / macOS 把 <code>findstr</code> 换成 <code>grep -A1 'Subject Alternative Name'</code> 即可。</p>
+<hr>
+<h2 id="12-lets-encrypt--自动化续期工程侧常识">12. Let’s Encrypt / 自动化续期（工程侧常识）📅</h2>
+<p>公网免费证书里 <strong>ACME</strong>（如 Let’s Encrypt）最普及。工程上你要记住：</p>
+<ol>
+<li><strong>有效期短</strong>（常见 90 天），必须 <strong>自动续期</strong>（certbot、caddy、云厂商托管证书等），不能靠人肉日历。</li>
+<li>验证域名所有权常见 <strong>HTTP-01</strong>（临时文件或路由）、<strong>DNS-01</strong>（改 TXT 记录）。<strong>在 K8s/多副本</strong> 上要用平台认可的 controller，避免验证打到错误 Pod。</li>
+<li>证书更新后，<strong>Nginx 要 reload</strong>、部分 Java 进程要 <strong>热加载或滚动发布</strong>——别把「续期成功」当成「应用已用上新证」。</li>
+<li><strong>完整链</strong>：ACME 客户端一般会给你 <code>fullchain.pem</code>，部署时用它，而不是只拿单张 <code>cert.pem</code>。</li>
+</ol>
+<p>你只写 Java 时，续期多在运维；但<strong>事故复盘</strong>里「昨晚续期、今早握手失败」要能参与对话。</p>
+<hr>
+<h2 id="13-nginx-上再多了几招安全-баз线--mtls-提示">13. Nginx 上再多了几招（安全 баз线 + mTLS 提示）🛡</h2>
+<h3 id="131-安全基线示意具体以你们等保基线为准">13.1 安全基线（示意，具体以你们等保/基线为准）</h3>
+<pre><code class="language-nginx">ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+# 若仍要 TLSv1.2，可配 ssl_ciphers ... 由安全组给清单；TLSv1.3 下多由 OpenSSL 默认择优
+</code></pre>
+<p><strong>OCSP Stapling</strong>（减少客户端延迟、隐私略好）在 Nginx 有 <code>ssl_stapling on;</code> 等指令，但要链与解析都正确，配不好不如关——交给运维评估。</p>
+<p><strong>HSTS</strong>（示意）：</p>
+<pre><code class="language-nginx">add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+</code></pre>
+<p>首次上线要确认<strong>没有</strong>依赖明文 HTTP 的用户书签，否则最长一年内难撤回影响；<strong>includeSubDomains</strong> 影响子域，慎开。</p>
+<h3 id="132-mtls-在-nginx-边缘做校验概念">13.2 mTLS 在 Nginx 边缘做校验（概念）</h3>
+<pre><code class="language-nginx">ssl_client_certificate /etc/nginx/certs/ca-chain.pem;
+ssl_verify_client optional;  # 或 require，视业务
+</code></pre>
+<p>通过后再把必要信息 <strong><code>proxy_set_header</code></strong> 带给后端（如证书序列号需在网关文档化，别直接传整 PEM 进 HTTP 头）。Spring 若不做 mTLS，就信任<strong>已鉴权</strong>的内网回源。</p>
+<hr>
+<h2 id="14-spring-boot-serverssl-与转发属性速查33-语境">14. Spring Boot <code>server.ssl</code> 与转发：属性速查（3.3 语境）☕</h2>
+<p>下表是「<strong>认得名字、会搜文档</strong>」用，<strong>精确键名以官方文档为准</strong>（Minor 升级会补属性）。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>常见配置方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PKCS12 路径</td>
+<td><code>server.ssl.key-store</code>（或文档中的 bundle 写法）</td>
+</tr>
+<tr>
+<td>密钥库密码</td>
+<td><code>server.ssl.key-store-password</code>（环境变量注入）</td>
+</tr>
+<tr>
+<td>密钥口令不同</td>
+<td><code>server.ssl.key-password</code></td>
+</tr>
+<tr>
+<td>PEM 证书</td>
+<td><code>server.ssl.certificate</code>（或 <code>certificate-chain</code>）</td>
+</tr>
+<tr>
+<td>PEM 私钥</td>
+<td><code>server.ssl.certificate-private-key</code></td>
+</tr>
+<tr>
+<td>禁用旧协议</td>
+<td><code>server.ssl.enabled-protocols</code></td>
+</tr>
+<tr>
+<td>限制套件</td>
+<td><code>server.ssl.ciphers</code></td>
+</tr>
+<tr>
+<td>只信任客户端证</td>
+<td><code>server.ssl.client-auth</code>（如需 mTLS）</td>
+</tr>
+<tr>
+<td>识别反代 HTTPS</td>
+<td><code>server.forward-headers-strategy=framework</code> 等</td>
+</tr>
+</tbody>
+</table>
+<p><strong>双端口</strong>：有人喜欢 <code>8080</code> 仅内网、对外只暴露 <code>8443</code> —— 安全组与防火墙要和架构一致，别只留下 8080 给公网。</p>
+<hr>
+<h2 id="15-jvm-与-java-出站的调试开关仅排障短暂开">15. JVM 与 Java 出站的调试开关（仅排障短暂开）🔧</h2>
+<p><strong>握手调试</strong>（日志极多，仅本机或灰度短时间）：</p>
+<pre><code class="language-text">-Djavax.net.debug=ssl:handshake:verbose
+</code></pre>
+<p>你会看到 <strong>ClientHello</strong>、选中套件、证书链加载等；抓完记得关，避免磁盘爆掉。</p>
+<p><strong>信任库 / 密钥库</strong>：</p>
+<pre><code class="language-text">-Djavax.net.ssl.trustStore=C:\dev\corp-truststore.p12
+-Djavax.net.ssl.trustStorePassword=secret
+-Djavax.net.ssl.trustStoreType=PKCS12
+</code></pre>
+<p><strong>误区别踩</strong>：</p>
+<ul>
+<li>把 <strong><code>trustStore</code></strong> 和 <strong><code>keyStore</code></strong>（客户端证书）混在一个文件里管理，权限难审计。</li>
+<li>生产关闭证书校验（<code>TrustAll</code>）方便「联调」，结果忘了关上线。</li>
+<li>只改 Nginx 证书却未 <strong>reload</strong>，导致新旧证并存、节点不一致。</li>
+</ul>
+<hr>
+<h2 id="16-和001叠在一起分层心智图-">16. 和【001】叠在一起：分层心智图 📌</h2>
+<p>以后排障可以在心里按层掰：</p>
+<pre><code class="language-text">[ 浏览器 / 小程序 / Postman ]
+        │  DNS（【003】会讲）
+        ▼
+[ TCP 连接 ]
+        │  TLS 握手（本篇）
+        ▼
+[ HTTP/1.1 或 HTTP/2 上的请求/响应 ]  ← 【001】
+        ▼
+[ 反代 / 网关 / Spring MVC / 业务 ]
+</code></pre>
+<p><strong>现象归类</strong>：锁形报错、握手失败 → 先停在本篇；已经 200/401/502 → 回到【001】与业务日志。</p>
+<hr>
+<h2 id="17-常见误区十条口试--复盘可向团队念">17. 常见误区十条（口试 / 复盘可向团队念）📋</h2>
+<ol>
+<li>「HTTPS 就绝对安全」—— <strong>TLS 只保传输</strong>，鉴权弱、SQL 注入、账号泄露仍会发生。</li>
+<li>「自签证书和 CA 证书只是心理安慰」——差在 <strong>公共信任根</strong>，小程序/公网用户不认自签。</li>
+<li>「证书在 Nginx 更新了，Java 不用动」——若 Java <strong>直连</strong> 旧入口或缓存了 OCSP/会话，要分路径讨论。</li>
+<li>「PEM 好几个文件随便拼」——顺序错了链就断。</li>
+<li>「禁 TLSv1.0 会掉所有用户」—— 2020 年代基本该禁，但要留 <strong>监控</strong> 看旧客户端占比。</li>
+<li>「502 一定是 Java 挂了」—— SSL 在网关花式配置也会导致 <strong>握手失败或协议错误</strong>。</li>
+<li>「开发关校验、生产复制同一镜像」—— <strong>不要把 dev 的 trust 策略</strong>带进交付物。</li>
+<li>「Cookie 不设 Secure 也能混 HTTPS」——<strong>现代浏览器</strong>对混用越来越严，按规范设。</li>
+<li>「443 以外也能叫 HTTPS」——可以，但<strong>小程序/CDN 默认策略</strong>常卡 443，先读平台文档。</li>
+<li>「证书没过期就没事」——还有 <strong>算法迁移、根证淘汰</strong>（历史上有）之类「日历外」事件，跟运维订阅公告。</li>
+</ol>
+<hr>
+<h2 id="小结-">小结 💡</h2>
+<ul>
+<li><strong>HTTPS</strong> 仍是【001】的 HTTP，只是先过 <strong>TLS</strong>：握手失败则业务层无感、日志可能只有 SSL 异常。</li>
+<li><strong>证书</strong>看 SAN、有效期、<strong>链完整</strong>；<strong>fullchain</strong> 是运维口头禅也是有技术缘由的。</li>
+<li><strong>TLS 1.3</strong> 更快更严；<strong>SNI</strong> 决定「同一 IP 上找对虚拟主机证书」。</li>
+<li><strong>Spring Boot</strong> 可用 PKCS12/PEM 直开 TLS，但更多生产是 <strong>边缘终结 + Forwarded 头 + Boot 认反代</strong>。</li>
+<li><strong>Java 客户端</strong>牢记 <strong><code>cacerts</code> / 自定义 truststore</strong> 与 <strong><code>PKIX</code></strong> 系列错误。</li>
+<li>排障：<code>curl -v</code>、<code>openssl s_client</code>、浏览器证书详情三连，再分「握手 vs HTTP」。</li>
+</ul>
+<p><strong>下一篇（003）预告</strong> 🌐：TCP/IP 分层、超时与「后端接口为什么慢 / 为什么断」——和网关、Feign、数据库、线程池超时怎么对照着看。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-04-17 11:14">2026-04-17 11:13</span>&nbsp;
+<a href="https://www.cnblogs.com/twoshuai">杨凯凡</a>&nbsp;
+阅读(<span id="post_view_count">88</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19882061);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Ftwoshuai%2Fp%2F19882061&amp;targetId=19882061&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
