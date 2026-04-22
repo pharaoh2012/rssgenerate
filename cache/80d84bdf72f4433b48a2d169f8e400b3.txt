@@ -1,0 +1,788 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/charlee44/p/19905614" title="发布于 2026-04-22 09:29">
+    <span role="heading" aria-level="2">最小二乘问题详解21：稀疏GCP约束下的自由网平差与弱约束融合</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文深入解析稀疏GCP约束下的自由网平差难题，提出“Sim3引导的联合优化”三步走策略，通过Umeyama算法初值与非线性BA融合，以最低数据成本实现了从相对结构到绝对坐标的厘米级高精度对齐。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="一引言">一、引言</h1>
+<p>在本系列的前两篇文章中，我们分别探讨了增量式 SfM 的两个场景：<strong>带完全位姿先验的稳健重建</strong>（《<a href="https://charlee44.com/post.html?id=40b61c69ae7d421c8af05d1f162b515f" target="_blank" rel="noopener nofollow">最小二乘问题详解19：带先验约束的增量式SFM优化与实现</a>》）与<strong>无先验约束的纯视觉自由网平差</strong>（《<a href="https://charlee44.com/post.html?id=8b61bfecc835426a86b43f84183f903e" target="_blank" rel="noopener nofollow">最小二乘问题详解20：无先验约束下的增量式SFM自由网平差</a>》）。这两者代表了数据驱动与模型驱动的两种截然不同的技术路线，各自有着鲜明的优势与局限。</p>
+<p>在《<a href="https://charlee44.com/post.html?id=40b61c69ae7d421c8af05d1f162b515f" target="_blank" rel="noopener nofollow">最小二乘问题详解19：带先验约束的增量式SFM优化与实现</a>》中，我们利用 INS/GNSS 提供的高精度位姿先验，极大地简化了 SfM 的求解难度。由于拥有可靠的绝对位置初值，系统可以直接跳过脆弱的初始化环节，基于已知位姿进行特征匹配与三角化。这种方案虽然实现了极高的稳健性，但其前提是必须配备昂贵的组合导航设备，数据采集成本极高。而在《<a href="https://charlee44.com/post.html?id=8b61bfecc835426a86b43f84183f903e" target="_blank" rel="noopener nofollow">最小二乘问题详解20：无先验约束下的增量式SFM自由网平差</a>》中，我们回归视觉本源，仅利用 2D-2D 的特征对应关系，通过复杂的对极几何（本质矩阵 <span class="math inline">\(E\)</span>）求解来完成初始化。虽然这种方法极大地降低了硬件门槛，实现了“从无到有”的重建，但其代价是重建结果仅为相对度量（Similarity Transformation），缺乏绝对的地理尺度与位置信息。</p>
+<p>然而，在实际的工业应用与科研场景中，我们往往面临一个尴尬的中间地带：我们既无法承担每张影像都配有高精度 POS 数据的高昂成本，又希望能视觉重建出基于真实世界的绝对坐标系的结果。这就是本文将要深入探讨的核心主题——<strong>稀疏 GCP 约束下的自由网平差与弱约束融合</strong>。</p>
+<p>稀疏 GCP（地面控制点）代表了一种典型的<strong>弱先验约束（Weak Prior Constraint）</strong>。与第19篇中“强约束”的密集位姿先验不同，稀疏 GCP 仅在极少数的特征点上提供了 3D 物理坐标信息。这种约束无法像 INS/GNSS 那样直接引导每一步的 PnP 求解，也不能简化初始化流程；相反，它要求我们在保持纯视觉自由网平差（第20篇流程）复杂性的基础上，额外引入全局优化策略，将这些零星的绝对坐标信息“渗透”到整个重建网络中。</p>
+<p>因此，本文的实现流程将是目前最麻烦但也最实用的：它保留了<a href="https://charlee44.com/post.html?id=8b61bfecc835426a86b43f84183f903e" target="_blank" rel="noopener nofollow">第20篇</a>中复杂的本质矩阵初始化与增量扩展逻辑，同时引入了<a href="https://charlee44.com/post.html?id=40b61c69ae7d421c8af05d1f162b515f" target="_blank" rel="noopener nofollow">第19篇</a>中的多源信息融合思想，将稀疏的 GCP 作为软约束嵌入到光束法平差（BA）中。通过这种融合，我们旨在以最低的数据采集成本（仅需少量人工测量的 GCP），获得接近<a href="https://charlee44.com/post.html?id=40b61c69ae7d421c8af05d1f162b515f" target="_blank" rel="noopener nofollow">第19篇</a>的绝对地理定位精度。</p>
+<h1 id="二思路">二、思路</h1>
+<p>在确立了“稀疏 GCP 约束”这一核心目标后，我们需要解决的关键问题是：<strong>如何将少量的 GCP 观测值有效地融合进增量式 SfM 的优化流程中？</strong></p>
+<p>通常来说，处理这类多源信息融合问题主要有两种常规思路。一种是在优化过程中实时引入约束，另一种则是先构建相对模型再进行整体对齐。</p>
+<h2 id="1-增量式联合优化">1. 增量式联合优化</h2>
+<p>第一种思路是<strong>边重建，边约束</strong>。即在增量式 SfM 的每一步迭代中（无论是 PnP 位姿估计还是局部/全局 BA），都将 GCP 作为一个特殊的 3D 点加入优化目标函数。</p>
+<ul>
+<li><strong>实现逻辑</strong>：在构建 BA 问题时，为 GCP 对应的 3D 点添加一个额外的残差项（GCP 坐标先验误差）。随着新图像的注册和新点的三角化，GCP 的约束力会实时地“拉扯”整个模型，试图将其固定在绝对坐标系中。</li>
+<li><strong>面临的挑战</strong>：这种方案在理论上很完美，但在<strong>稀疏 GCP</strong> 场景下实现难度极大。
+<ol>
+<li><strong>权重难以平衡</strong>：GCP 数量极少（可能只有几个），而视觉重投影残差数量巨大（成千上万）。在优化初期，模型漂移严重，GCP 的微弱约束力很容易被海量的视觉残差“淹没”，导致无法生效；若强行增加 GCP 权重，又可能导致模型为了迎合 GCP 而发生局部扭曲。</li>
+<li><strong>冷启动困难</strong>：在重建的初始阶段，自由网尚未形成稳定的几何结构，此时引入强约束容易导致优化器陷入局部极小值，甚至直接导致初始化失败。</li>
+</ol>
+</li>
+</ul>
+<h2 id="2-两步法绝对定向">2. 两步法绝对定向</h2>
+<p>第二种思路是<strong>先重建，后对齐</strong>。即先完全忽略 GCP，按照第 20 篇的方法完成纯视觉的自由网平差，待模型内部结构稳定后，再利用 GCP 计算一个全局变换矩阵，将整个模型“搬”到绝对坐标系中。</p>
+<ul>
+<li><strong>实现逻辑</strong>：利用<a href="https://charlee44.com/post.html?id=8b61bfecc835426a86b43f84183f903e" target="_blank" rel="noopener nofollow">第 20 篇</a>生成的自由网模型，提取 GCP 对应的 3D 点坐标，与 GCP 的真实坐标进行匹配，求解一个 <strong>Sim3（相似变换）</strong> 矩阵。</li>
+<li><strong>面临的挑战</strong>：这种方案实现简单，且能保证内部结构的完整性。但它存在一个理论上的缺陷——<strong>刚性假设</strong>。Sim3 变换假设自由网与真实世界之间仅存在线性的相似变换关系（旋转、平移、统一尺度）。然而，实际的重建误差往往是非线性的（例如镜头畸变校正残差、累积漂移导致的弯曲等）。简单的 Sim3 变换无法消除这些非线性变形，只能做到“整体对齐”，而无法做到“局部贴合”。</li>
+</ul>
+<h2 id="3-sim3引导的联合优化">3. Sim3引导的联合优化</h2>
+<p>为了兼顾<strong>实现的鲁棒性</strong>与<strong>结果的绝对精度</strong>，本文最终采用了一种结合上述两者之长的<strong>三步走策略</strong>。</p>
+<p>该方案利用方案二的 Sim3 结果为方案一提供完美的初值，从而规避了方案一“冷启动”和“权重平衡”的难题。具体流程如下：</p>
+<ol>
+<li><strong>第一步：纯视觉自由网平差</strong><br>
+完全沿用<a href="https://charlee44.com/post.html?id=8b61bfecc835426a86b43f84183f903e" target="_blank" rel="noopener nofollow">第 20 篇</a>的流程，不引入任何 GCP 信息，独立完成增量式 SfM。此时我们获得了一个<strong>内部几何结构高度一致</strong>（重投影误差极低），但坐标系任意的 3D 模型。</li>
+<li><strong>第二步：Sim3 绝对定向</strong><br>
+在自由网平差完成后，利用已知的 GCP 坐标与模型中对应的 3D 点，计算 Sim3 变换矩阵，将所有相机位姿和 3D 点一次性变换到绝对坐标系下。这一步解决了尺度、旋转和平移的 7 自由度不确定性问题。</li>
+<li><strong>第三步：带 GCP 约束的全局 BA</strong><br>
+将 Sim3 对齐后的结果作为<strong>初值</strong>，再次运行全局光束法平差。此时，我们在优化函数中加入 GCP 的坐标先验残差项。
+<ul>
+<li><strong>关键点</strong>：由于初值已经非常接近真实值（得益于 Sim3 对齐），优化器不再需要处理巨大的漂移，GCP 的约束项可以平滑地修正模型中的非线性误差（如微小的弯曲），实现视觉结构与地理坐标的完美统一。</li>
+</ul>
+</li>
+</ol>
+<p>这种策略既保留了纯视觉 SfM 的灵活性，又利用 Sim3 解决了绝对定向的初值问题，最后通过联合 BA 榨干了 GCP 的精度潜力，是目前工程实践中处理稀疏 GCP 最稳健的方案。</p>
+<h1 id="三sim3问题">三、Sim3问题</h1>
+<p>在完成了纯视觉自由网平差后，我们获得了一个内部几何结构完美但处于任意坐标系下的 3D 模型。为了将其“锚定”到真实世界坐标系中，我们需要求解一个三维空间的<strong>相似变换（Similarity Transformation, Sim3）</strong>。</p>
+<p>在摄影测量学中，这一过程被称为<strong>绝对定向（Absolute Orientation）</strong>。其本质是寻找一个 7 自由度的变换（3 个旋转、3 个平移、1 个统一尺度），使得自由网中的点集 <span class="math inline">\(\mathbf{X}_{sfm}\)</span> 与真实世界中的控制点集 <span class="math inline">\(\mathbf{X}_{gcp}\)</span> 之间的误差最小化。</p>
+<h2 id="1-数学模型">1. 数学模型</h2>
+<p>Sim3 变换的数学模型可以表示为：</p>
+<p></p><div class="math display">\[\mathbf{X}_{world} = s \cdot \mathbf{R} \cdot \mathbf{X}_{sfm} + \mathbf{t}
+\]</div><p></p><p>其中：</p>
+<ul>
+<li><span class="math inline">\(\mathbf{X}_{sfm}\)</span>：自由网中的 3D 点坐标（观测值）。</li>
+<li><span class="math inline">\(\mathbf{X}_{world}\)</span>：GCP 的真实世界坐标（真值）。</li>
+<li><span class="math inline">\(s\)</span>：尺度因子（Scale），用于纠正单目视觉的尺度不确定性。</li>
+<li><span class="math inline">\(\mathbf{R}\)</span>：<span class="math inline">\(3 \times 3\)</span> 的旋转矩阵（Rotation），属于 <span class="math inline">\(SO(3)\)</span> 群。</li>
+<li><span class="math inline">\(\mathbf{t}\)</span>：<span class="math inline">\(3 \times 1\)</span> 的平移向量（Translation）。</li>
+</ul>
+<p>我们的目标是求解最优的 <span class="math inline">\(s, \mathbf{R}, \mathbf{t}\)</span>，使得所有对应点对的重投影误差（欧氏距离）平方和最小：</p>
+<p></p><div class="math display">\[\min_{s, \mathbf{R}, \mathbf{t}} \sum_{i=1}^{N} \| \mathbf{X}_{world}^i - (s \mathbf{R} \mathbf{X}_{sfm}^i + \mathbf{t}) \|^2
+\]</div><p></p><p>这是一个典型的非线性最小二乘问题。在工程实践中，通常采用<strong>线性初值 + 非线性优化</strong>的两步策略来求解，以保证精度和鲁棒性。</p>
+<h2 id="2-umeyama线性解">2. Umeyama线性解</h2>
+<p>为了获得非线性优化的良好初值，我们首先使用 <strong>Umeyama 算法</strong>（基于 SVD 分解）来求解 Sim3 的闭式解（Closed-form Solution）。这是一种代数解法，计算速度快且稳定。</p>
+<p>该算法的核心思想是通过<strong>去中心化</strong>操作，将平移参数 <span class="math inline">\(\mathbf{t}\)</span> 与旋转 <span class="math inline">\(\mathbf{R}\)</span>、尺度 <span class="math inline">\(s\)</span> 解耦，从而将复杂的非线性问题转化为线性的 SVD 问题。推导过程如下：</p>
+<p><strong>1. 计算质心与去中心化</strong><br>
+首先，我们需要计算源点集（自由网点 <span class="math inline">\(\mathbf{X}_{sfm}\)</span>）和目标点集（GCP点 <span class="math inline">\(\mathbf{X}_{world}\)</span>）的几何中心（质心）。</p>
+<p></p><div class="math display">\[\mu_{sfm} = \frac{1}{N} \sum_{i=1}^{N} \mathbf{X}_{sfm}^i, \quad \mu_{world} = \frac{1}{N} \sum_{i=1}^{N} \mathbf{X}_{world}^i
+\]</div><p></p><p>接着，计算每个点相对于其质心的偏移向量（去中心化坐标），记为 <span class="math inline">\(\mathbf{x}_i\)</span> 和 <span class="math inline">\(\mathbf{y}_i\)</span>：</p>
+<p></p><div class="math display">\[\mathbf{x}_i = \mathbf{X}_{sfm}^i - \mu_{sfm}, \quad \mathbf{y}_i = \mathbf{X}_{world}^i - \mu_{world}
+\]</div><p></p><p>此时，原始的最小二乘目标函数 <span class="math inline">\(\sum \| \mathbf{y}_i + \mu_{world} - (s \mathbf{R} (\mathbf{x}_i + \mu_{sfm}) + \mathbf{t}) \|^2\)</span> 可以简化。由于质心是最小二乘问题的最优平移估计点，我们可以直接得出平移量 <span class="math inline">\(\mathbf{t}\)</span> 与 <span class="math inline">\(\mathbf{R}, s\)</span> 的关系：</p>
+<p></p><div class="math display">\[\mathbf{t} = \mu_{world} - s \mathbf{R} \mu_{sfm}
+\]</div><p></p><p>这意味着，只要我们要解出了 <span class="math inline">\(\mathbf{R}\)</span> 和 <span class="math inline">\(s\)</span>，<span class="math inline">\(\mathbf{t}\)</span> 就迎刃而解。因此，问题转化为最小化去中心化后的残差：</p>
+<p></p><div class="math display">\[\min_{s, \mathbf{R}} \sum_{i=1}^{N} \| \mathbf{y}_i - s \mathbf{R} \mathbf{x}_i \|^2
+\]</div><p></p><p><strong>2. 构建协方差矩阵并进行 SVD 分解</strong><br>
+展开上述目标函数并忽略与变量无关的项，最大化 <span class="math inline">\(s \sum \mathbf{y}_i^T \mathbf{R} \mathbf{x}_i\)</span> 等价于最小化原目标函数。利用迹（Trace）的性质 <span class="math inline">\(\text{tr}(\mathbf{A}\mathbf{B}) = \text{tr}(\mathbf{B}\mathbf{A})\)</span>，我们可以构建源点集与目标点集的协方差矩阵 <span class="math inline">\(\mathbf{\Sigma}\)</span>：</p>
+<p></p><div class="math display">\[\mathbf{\Sigma} = \frac{1}{N} \sum_{i=1}^{N} \mathbf{x}_i \mathbf{y}_i^T
+\]</div><p></p><p>对协方差矩阵 <span class="math inline">\(\mathbf{\Sigma}\)</span> 进行奇异值分解（SVD）：</p>
+<p></p><div class="math display">\[\mathbf{\Sigma} = \mathbf{U} \mathbf{D} \mathbf{V}^T
+\]</div><p></p><p>其中 <span class="math inline">\(\mathbf{U}, \mathbf{V}\)</span> 是正交矩阵，<span class="math inline">\(\mathbf{D}\)</span> 是包含奇异值的对角矩阵。</p>
+<p><strong>3. 求解旋转矩阵 <span class="math inline">\(\mathbf{R}\)</span></strong><br>
+根据正交普鲁克问题（Orthogonal Procrustes Problem）的解法，最优旋转矩阵 <span class="math inline">\(\mathbf{R}\)</span> 可以通过 <span class="math inline">\(\mathbf{U}\)</span> 和 <span class="math inline">\(\mathbf{V}\)</span> 计算得出。为了保证解出的是纯旋转矩阵（行列式为 1）而不是反射矩阵（行列式为 -1），我们需要引入一个修正矩阵 <span class="math inline">\(\mathbf{S}\)</span>：</p>
+<p></p><div class="math display">\[\mathbf{R} = \mathbf{V} \mathbf{S} \mathbf{U}^T
+\]</div><p></p><p>其中 <span class="math inline">\(\mathbf{S} = \text{diag}(1, 1, \det(\mathbf{V}\mathbf{U}^T))\)</span>。如果 <span class="math inline">\(\det(\mathbf{V}\mathbf{U}^T) = -1\)</span>，则 <span class="math inline">\(\mathbf{S}\)</span> 的最后一个元素为 -1，用于修正反射分量。</p>
+<p><strong>4. 求解尺度因子 <span class="math inline">\(s\)</span></strong><br>
+在求得最优旋转 <span class="math inline">\(\mathbf{R}\)</span> 后，我们可以通过对目标函数关于 <span class="math inline">\(s\)</span> 求导并令其为 0，得到最优尺度因子的闭式解。它等于变换后的协方差迹与源点集方差的比值：</p>
+<p></p><div class="math display">\[s = \frac{\text{trace}(\mathbf{S} \mathbf{D})}{\sigma_{sfm}^2} = \frac{\sum_{k=1}^{3} s_k}{\sum_{i=1}^{N} \| \mathbf{x}_i \|^2}
+\]</div><p></p><p>其中 <span class="math inline">\(s_k\)</span> 是 <span class="math inline">\(\mathbf{\Sigma}\)</span> 的奇异值，分母是源点集去中心化后的方差和（即 <code>X.squaredNorm()</code>）。</p>
+<p><strong>5. 求解平移向量 <span class="math inline">\(\mathbf{t}\)</span></strong><br>
+最后，将求得的 <span class="math inline">\(s\)</span> 和 <span class="math inline">\(\mathbf{R}\)</span> 代入第一步推导的公式中，即可恢复平移向量：</p>
+<p></p><div class="math display">\[\mathbf{t} = \mu_{world} - s \mathbf{R} \mu_{sfm}
+\]</div><p></p><p>Umeyama 算法为我们提供了一个非常接近全局最优的线性解，但这仅仅是代数意义上的最优。为了获得统计意义上的最优解（考虑噪声分布），我们需要在此基础上进行非线性优化。</p>
+<h2 id="3-非线性优化">3. 非线性优化</h2>
+<p>虽然 Umeyama 算法给出了闭式解，但它假设噪声是高斯分布的，且无法方便地引入鲁棒核函数（Robust Kernel）来剔除 GCP 中的粗差。因此，我们以 Umeyama 的结果为初值，构建非线性优化问题。我们定义残差函数如下：</p>
+<p></p><div class="math display">\[\mathbf{r}_i(s, \mathbf{q}, \mathbf{t}) = \mathbf{X}_{world}^i - (e^{\log s} \cdot \mathbf{R}(\mathbf{q}) \cdot \mathbf{X}_{sfm}^i + \mathbf{t})
+\]</div><p></p><p>在代码实现中，有几个关键的工程技巧：</p>
+<ol>
+<li>
+<p><strong>参数化旋转</strong>：使用四元数 <span class="math inline">\(\mathbf{q} = [w, x, y, z]\)</span> 表示旋转，避免欧拉角的万向节死锁，并利用 Ceres 的 <code>QuaternionManifold</code> 保持流形约束。</p>
+</li>
+<li>
+<p><strong>参数化尺度</strong>：优化变量不是直接优化 <span class="math inline">\(s\)</span>，而是优化 <span class="math inline">\(\log s\)</span>。在计算时通过 <span class="math inline">\(s = \exp(\log s)\)</span> 还原。这样做的好处是<strong>强制尺度 <span class="math inline">\(s\)</span> 始终为正值</strong>，防止优化过程中尺度变为负数导致模型翻转。</p>
+</li>
+<li>
+<p><strong>鲁棒核函数</strong>：在 <code>AddResidualBlock</code> 时加入了 <code>HuberLoss</code>。</p>
+<pre><code class="language-cpp">problem.AddResidualBlock(cost, new ceres::HuberLoss(0.5), q, t, log_s);
+</code></pre>
+<p>这使得优化器对 GCP 坐标中的粗差（Outliers）不敏感，提高了系统的鲁棒性。</p>
+</li>
+</ol>
+<h2 id="4-实现代码">4. 实现代码</h2>
+<p>通过这种“线性初值 + 非线性优化”的组合操作，我们既能保证求解的稳定性，又能获得亚像素级的绝对定位精度，完美解决了自由网到真实世界的映射问题。具体实现代码如下：</p>
+<pre><code class="language-cpp">#include "Sim3Problem.h"
+
+#include &lt;ceres/ceres.h&gt;
+#include &lt;ceres/rotation.h&gt;
+
+#include &lt;iostream&gt;
+
+namespace {
+
+// 残差结构体
+struct Sim3Residual {
+  Sim3Residual(const Eigen::Vector3d&amp; sfm, const Eigen::Vector3d&amp; world)
+      : sfm_(sfm), world_(world) {}
+
+  template &lt;typename T&gt;
+  bool operator()(const T* const q,      // Quaternion (w, x, y, z)
+                  const T* const t,      // Translation
+                  const T* const log_s,  // Log-Scale (为了强制 s &gt; 0)
+                  T* residuals) const {
+    // 1. 旋转
+    T p[3];
+    T sfm[3] = {T(sfm_(0)), T(sfm_(1)), T(sfm_(2))};
+    ceres::QuaternionRotatePoint(q, sfm, p);
+
+    // 2. 尺度 (通过 exp 保证正数)
+    T s = ceres::exp(log_s[0]);
+
+    // 3. 变换: p = s * R * x + t
+    p[0] = s * p[0] + t[0];
+    p[1] = s * p[1] + t[1];
+    p[2] = s * p[2] + t[2];
+
+    // 4. 残差: 预测值 - 观测值
+    residuals[0] = p[0] - T(world_(0));
+    residuals[1] = p[1] - T(world_(1));
+    residuals[2] = p[2] - T(world_(2));
+
+    return true;
+  }
+
+  Eigen::Vector3d sfm_, world_;
+};
+
+}  // namespace
+
+Sim3Problem::Sim3Problem(const std::vector&lt;Eigen::Vector3d&gt;&amp; src_pts,
+                         const std::vector&lt;Eigen::Vector3d&gt;&amp; dst_pts)
+    : src_pts_(src_pts), dst_pts_(dst_pts) {}
+
+bool Sim3Problem::Solve(Sim3&amp; sim3) {
+  // 1. 线性初值 (Umeyama)
+  sim3 = Umeyama(src_pts_, dst_pts_);
+
+  // 2. 设置优化变量初值
+  Eigen::Quaterniond qTemp(sim3.R);
+  qTemp.normalize();  // 防止初值有微小误差
+  double q[4] = {qTemp.w(), qTemp.x(), qTemp.y(), qTemp.z()};
+  double t[3] = {sim3.t.x(), sim3.t.y(), sim3.t.z()};
+  double log_s[1] = {std::log(sim3.scale)};  // 关键：使用 log(s)
+
+  ceres::Problem problem;
+
+  // 3. 构建残差
+  for (int i = 0; i &lt; src_pts_.size(); ++i) {
+    auto* cost = new ceres::AutoDiffCostFunction&lt;Sim3Residual, 3, 4, 3, 1&gt;(
+        new Sim3Residual(src_pts_[i], dst_pts_[i]));
+
+    // 关键：加上 Huber Loss 增加鲁棒性，阈值设为 0.5 (根据单位调整)
+    // 如果你的坐标单位是米，0.5 意味着允许 0.5米的误差而不被惩罚
+    problem.AddResidualBlock(cost, new ceres::HuberLoss(0.5), q, t, log_s);
+  }
+
+  //
+  problem.AddParameterBlock(q, 4, new ceres::QuaternionManifold());
+  problem.AddParameterBlock(t, 3);
+  problem.AddParameterBlock(log_s, 1);
+
+  ceres::Solver::Options options;
+  options.linear_solver_type = ceres::DENSE_QR;
+  options.max_num_iterations = 100;  // 稍微增加迭代次数
+  options.minimizer_progress_to_stdout = true;
+
+  ceres::Solver::Summary summary;
+  ceres::Solve(options, &amp;problem, &amp;summary);
+
+  std::cout &lt;&lt; summary.BriefReport() &lt;&lt; std::endl;
+
+  ComputeRMSE(log_s, q, t);
+
+  // 5. 提取结果
+  if (summary.IsSolutionUsable()) {  // 比 != CONVERGENCE 更宽松一点的判断
+    sim3.R = Eigen::Quaterniond(q[0], q[1], q[2], q[3]).toRotationMatrix();
+    sim3.t.x() = t[0];
+    sim3.t.y() = t[1];
+    sim3.t.z() = t[2];
+    sim3.scale = std::exp(log_s[0]);  // 关键：还原尺度
+    return true;
+  }
+
+  return false;
+}
+
+void Sim3Problem::ComputeRMSE(double* log_s, double* q, double* t) {
+  // 1. 获取优化后的参数
+  double final_scale = std::exp(log_s[0]);
+  Eigen::Quaterniond final_q(q[0], q[1], q[2], q[3]);
+  Eigen::Vector3d final_t(t[0], t[1], t[2]);
+
+  // 2. 计算 RMSE
+  double sum_squared_error = 0.0;
+  for (const auto&amp; src_pt : src_pts_) {
+    // 变换源点: p' = s * R * p + t
+    Eigen::Vector3d p_transformed = final_scale * (final_q * src_pt) + final_t;
+
+    // 这里我们需要找到 src_pt 对应的 dst_pt
+    // 注意：因为 src_pts_ 和 dst_pts_ 是按顺序对应的，我们可以用索引，
+    // 但为了代码安全，建议在这里重新建立映射或者假设顺序一致。
+    // 假设顺序一致（因为你的循环是按索引来的）：
+    int idx = &amp;src_pt - &amp;src_pts_[0];
+    const auto&amp; dst_pt = dst_pts_[idx];
+
+    double error = (p_transformed - dst_pt).norm();
+    sum_squared_error += error * error;
+  }
+
+  double rmse = std::sqrt(sum_squared_error / src_pts_.size());
+
+  std::cout &lt;&lt; "----------------------------------------" &lt;&lt; std::endl;
+  std::cout &lt;&lt; "Sim3 Optimization Result:" &lt;&lt; std::endl;
+  std::cout &lt;&lt; "  Scale (s): " &lt;&lt; final_scale &lt;&lt; std::endl;
+  std::cout &lt;&lt; "  Final RMSE: " &lt;&lt; rmse &lt;&lt; " meters" &lt;&lt; std::endl;
+  std::cout &lt;&lt; "  Translation: " &lt;&lt; final_t.transpose() &lt;&lt; std::endl;
+  std::cout &lt;&lt; "----------------------------------------" &lt;&lt; std::endl;
+}
+
+Sim3Problem::Sim3 Sim3Problem::Umeyama(
+    const std::vector&lt;Eigen::Vector3d&gt;&amp; pts_sfm,
+    const std::vector&lt;Eigen::Vector3d&gt;&amp; pts_world) {
+  int N = pts_sfm.size();
+
+  // 1. 计算均值
+  Eigen::Vector3d mu_sfm = Eigen::Vector3d::Zero();
+  Eigen::Vector3d mu_world = Eigen::Vector3d::Zero();
+  for (int i = 0; i &lt; N; ++i) {
+    mu_sfm += pts_sfm[i];
+    mu_world += pts_world[i];
+  }
+  mu_sfm /= N;
+  mu_world /= N;
+
+  // 2. 去中心
+  Eigen::MatrixXd X(3, N), Y(3, N);
+  for (int i = 0; i &lt; N; ++i) {
+    X.col(i) = pts_sfm[i] - mu_sfm;
+    Y.col(i) = pts_world[i] - mu_world;
+  }
+
+  // 3. 协方差
+  Eigen::Matrix3d S = X * Y.transpose();  // 不需要除以 N，不影响 SVD
+
+  // 4. SVD
+  Eigen::JacobiSVD&lt;Eigen::Matrix3d&gt; svd(
+      S, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Eigen::Matrix3d U = svd.matrixU();
+  Eigen::Matrix3d V = svd.matrixV();
+
+  // 5. 旋转 (处理反射)
+  Eigen::Matrix3d D = Eigen::Matrix3d::Identity();
+  if ((V * U.transpose()).determinant() &lt; 0) {
+    D(2, 2) = -1;
+  }
+  Eigen::Matrix3d R = V * D * U.transpose();
+
+  // 6. 尺度 (更稳健的公式)
+  // scale = trace(D * S) / ||X||^2
+  double scale = (svd.singularValues().dot(D.diagonal())) / X.squaredNorm();
+
+  // 7. 平移
+  Eigen::Vector3d t = mu_world - scale * R * mu_sfm;
+
+  return {scale, R, t};
+}
+</code></pre>
+<h1 id="四流程改进">四、流程改进</h1>
+<p>在<a href="https://charlee44.com/post.html?id=8b61bfecc835426a86b43f84183f903e" target="_blank" rel="noopener nofollow">第 20 篇</a>的实现基础上， 仿照<a href="https://charlee44.com/post.html?id=40b61c69ae7d421c8af05d1f162b515f" target="_blank" rel="noopener nofollow">第 19 篇</a>的实现给 BA 问题增加一个带 GCP 约束的求解实现 <code>BAProblem::SolveWithGcp</code>：</p>
+<pre><code class="language-cpp">#include "SolveBA.h"
+
+#include &lt;ceres/ceres.h&gt;
+#include &lt;ceres/rotation.h&gt;
+
+#include &lt;Eigen/Core&gt;
+#include &lt;Eigen/Geometry&gt;
+#include &lt;iostream&gt;
+#include &lt;random&gt;
+#include &lt;vector&gt;
+
+using namespace std;
+
+namespace {
+
+struct ReprojectionError {
+  ReprojectionError(double x, double y, double fx, double fy, double cx,
+                    double cy)
+      : x_(x), y_(y), fx_(fx), fy_(fy), cx_(cx), cy_(cy) {}
+
+  template &lt;typename T&gt;
+  bool operator()(const T* const q, const T* const t, const T* const point,
+                  T* residuals) const {
+    T p[3];
+
+    ceres::QuaternionRotatePoint(q, point, p);
+
+    p[0] += t[0];
+    p[1] += t[1];
+    p[2] += t[2];
+
+    T xp = p[0] / p[2];
+    T yp = p[1] / p[2];
+
+    T u = T(fx_) * xp + T(cx_);
+    T v = T(fy_) * yp + T(cy_);
+
+    residuals[0] = u - T(x_);
+    residuals[1] = v - T(y_);
+
+    return true;
+  }
+
+  static ceres::CostFunction* Create(double x, double y, double fx, double fy,
+                                     double cx, double cy) {
+    return new ceres::AutoDiffCostFunction&lt;ReprojectionError, 2, 4, 3, 3&gt;(
+        new ReprojectionError(x, y, fx, fy, cx, cy));
+  }
+
+  double x_, y_;
+  double fx_, fy_, cx_, cy_;
+};
+
+struct GCPPriorError {
+  GCPPriorError(const Eigen::Vector3d&amp; xyz_prior, const Eigen::Vector3d&amp; sigma)
+      : xyz_prior_(xyz_prior),
+        weight_(1.0 / sigma.x(), 1.0 / sigma.y(), 1.0 / sigma.z()) {}
+
+  template &lt;typename T&gt;
+  bool operator()(const T* const point, T* residuals) const {
+    residuals[0] = T(weight_.x()) * (point[0] - T(xyz_prior_.x()));
+    residuals[1] = T(weight_.y()) * (point[1] - T(xyz_prior_.y()));
+    residuals[2] = T(weight_.z()) * (point[2] - T(xyz_prior_.z()));
+    return true;
+  }
+
+  static ceres::CostFunction* Create(const Eigen::Vector3d&amp; xyz_prior,
+                                     const Eigen::Vector3d&amp; sigma) {
+    return new ceres::AutoDiffCostFunction&lt;GCPPriorError, 3, 3&gt;(
+        new GCPPriorError(xyz_prior, sigma));
+  }
+
+  Eigen::Vector3d xyz_prior_;
+  Eigen::Vector3d weight_;  // 1 / sigma
+};
+
+}  // namespace
+
+BAProblem::BAProblem(const Eigen::Matrix3d&amp; K, const vector&lt;Observation&gt;&amp; obs,
+                     vector&lt;CameraExtrinsics&gt;&amp; est_cams,
+                     vector&lt;ObjectPoint&gt;&amp; est_pts)
+    : fx(K(0, 0)),
+      fy(K(1, 1)),
+      cx(K(0, 2)),
+      cy(K(1, 2)),
+      obs(obs),
+      est_cams(est_cams),
+      est_pts(est_pts) {}
+
+bool BAProblem::Solve() {
+  ceres::Problem problem;
+  ceres::Manifold* q_manifold = new ceres::QuaternionManifold();
+
+  for (int i = 0; i &lt; est_cams.size(); i++) {
+    problem.AddParameterBlock(est_cams[i].q, 4, q_manifold);
+
+    problem.AddParameterBlock(est_cams[i].t, 3);
+  }
+
+  for (auto&amp; o : obs) {
+    ceres::CostFunction* cost =
+        ReprojectionError::Create(o.x, o.y, fx, fy, cx, cy);
+
+    problem.AddResidualBlock(cost, nullptr, est_cams[o.cam_id].q,
+                             est_cams[o.cam_id].t, est_pts[o.pt_id].xyz);
+  }
+
+  // Fix first camera
+  problem.SetParameterBlockConstant(est_cams[0].q);
+  problem.SetParameterBlockConstant(est_cams[0].t);
+
+  ceres::Solver::Options options;
+
+  options.linear_solver_type = ceres::SPARSE_SCHUR;
+  options.minimizer_progress_to_stdout = true;
+  options.max_num_iterations = 50;
+  ceres::Solver::Summary summary;
+  ceres::Solve(options, &amp;problem, &amp;summary);
+
+  cout &lt;&lt; summary.BriefReport() &lt;&lt; endl;
+
+  cout &lt;&lt; "Final RMSE: " &lt;&lt; ComputeRMSE() &lt;&lt; endl;
+
+  // === 3. 核心判断：仅根据终止类型决定成败 ===
+  if (summary.termination_type != ceres::CONVERGENCE) {
+    return false;
+  }
+  return true;
+}
+
+bool BAProblem::SolveWithGcp(
+    const std::map&lt;int, Eigen::Vector3d&gt;&amp; gcp_3d_priors) {
+  ceres::Problem problem;
+  ceres::Manifold* q_manifold = new ceres::QuaternionManifold();
+
+  for (int i = 0; i &lt; est_cams.size(); i++) {
+    problem.AddParameterBlock(est_cams[i].q, 4, q_manifold);
+
+    problem.AddParameterBlock(est_cams[i].t, 3);
+  }
+
+  for (auto&amp; o : obs) {
+    ceres::CostFunction* cost =
+        ReprojectionError::Create(o.x, o.y, fx, fy, cx, cy);
+
+    if (o.is_gcp) {
+      // GCP 人工刺点精度高，典型值: 0.2 ~ 0.5 像素
+      double gcp_pixel_sigma = 0.3;
+      // 在最小二乘中，应最小化 (residual / sigma)^2
+      // ScaledLoss(nullptr, s) 产生 cost = (s * residual)^2
+      // 因此 s = 1.0 / sigma
+      const double scale = 1.0 / gcp_pixel_sigma;
+      ceres::LossFunction* loss =
+          new ceres::ScaledLoss(nullptr, scale, ceres::TAKE_OWNERSHIP);
+      problem.AddResidualBlock(cost, loss, est_cams[o.cam_id].q,
+                               est_cams[o.cam_id].t, est_pts[o.pt_id].xyz);
+    } else {
+      // 普通特征点，σ ≈ 1.0 px
+      problem.AddResidualBlock(cost, nullptr, est_cams[o.cam_id].q,
+                               est_cams[o.cam_id].t, est_pts[o.pt_id].xyz);
+    }
+  }
+
+  // 3. GCP 先验残差
+  Eigen::Vector3d gcp_sigma(0.01, 0.01, 0.01);  // 假设 GCP 精度为 1cm
+  for (const auto&amp; kv : gcp_3d_priors) {
+    int pt_id = kv.first;
+    const Eigen::Vector3d&amp; xyz_true = kv.second;
+
+    // 确保 pt_id 有效
+    if (pt_id &lt; 0 || pt_id &gt;= est_pts.size()) {
+      cerr &lt;&lt; "Warning: Invalid GCP pt_id=" &lt;&lt; pt_id &lt;&lt; endl;
+      continue;
+    }
+
+    ceres::CostFunction* gcp_cost = GCPPriorError::Create(xyz_true, gcp_sigma);
+    problem.AddResidualBlock(gcp_cost, nullptr, est_pts[pt_id].xyz);
+  }
+
+  ceres::Solver::Options options;
+
+  options.linear_solver_type = ceres::SPARSE_SCHUR;
+  options.minimizer_progress_to_stdout = true;
+  options.max_num_iterations = 50;
+  ceres::Solver::Summary summary;
+  ceres::Solve(options, &amp;problem, &amp;summary);
+
+  cout &lt;&lt; summary.BriefReport() &lt;&lt; endl;
+
+  cout &lt;&lt; "Final RMSE: " &lt;&lt; ComputeRMSE() &lt;&lt; endl;
+
+  // === 3. 核心判断：仅根据终止类型决定成败 ===
+  if (summary.termination_type != ceres::CONVERGENCE) {
+    return false;
+  }
+  return true;
+}
+
+double BAProblem::ComputeRMSE() {
+  double err = 0;
+  int n = 0;
+
+  for (auto&amp; o : obs) {
+    const CameraExtrinsics&amp; c = est_cams[o.cam_id];
+    const ObjectPoint&amp; p = est_pts[o.pt_id];
+
+    Eigen::Quaterniond q(c.q[0], c.q[1], c.q[2], c.q[3]);
+
+    Eigen::Vector3d t(c.t[0], c.t[1], c.t[2]);
+
+    Eigen::Vector3d P(p.xyz[0], p.xyz[1], p.xyz[2]);
+
+    Eigen::Vector3d Pc = q * P + t;
+
+    double u = fx * Pc.x() / Pc.z() + cx;
+    double v = fy * Pc.y() / Pc.z() + cy;
+
+    double du = u - o.x;
+    double dv = v - o.y;
+
+    err += du * du + dv * dv;
+    n += 2;
+  }
+
+  return sqrt(err / n);
+}
+</code></pre>
+<p>调整 SFM 优化的流程，在最后加上绝对定向 <code>AbsoluteOrientation</code> 和联合稀少 GCP 约束的估计 <code>GlobalBundleAdjustmentWithGcp</code> ：</p>
+<pre><code class="language-cpp">int main() {
+  std::string cameraIntrinsicsPath =
+      "D:/Work/SFMWork/SFM/CameraIntrinsics.json";
+  std::string bundlePath = "D:/Work/SFMWork/SFM/Bundle.json";
+  std::string outputDir = "D:/Work/SFMWork/SFM";
+
+  auto [K, cameraExtrinsics, bundle, objectPoints, gcp_3d_priors] =
+      ReadData(cameraIntrinsicsPath, bundlePath);
+
+  IncrementalSFM(K, cameraExtrinsics, bundle, objectPoints);
+
+  AbsoluteOrientation(cameraExtrinsics, bundle, objectPoints);
+
+  // GlobalBundleAdjustment(K, bundle, cameraExtrinsics, objectPoints);
+  GlobalBundleAdjustmentWithGcp(K, bundle, cameraExtrinsics, objectPoints,
+                                gcp_3d_priors);
+
+  Output(K, cameraExtrinsics, bundle, objectPoints, outputDir);
+}
+</code></pre>
+<p>在绝对定向 <code>AbsoluteOrientation</code> 中，会获取自由网物方点和 GCP 点，然后调用 <code>Sim3Problem</code> 进行优化求解，最后更新位姿参数：</p>
+<pre><code class="language-cpp">void AbsoluteOrientation(vector&lt;cl::CameraExtrinsics&gt;&amp; cameraExtrinsics,
+                         const sfm::Bundle&amp; bundle,
+                         vector&lt;cl::ObjectPoint&gt;&amp; objectPoints) {
+  std::vector&lt;Eigen::Vector3d&gt; src_pts;
+  std::vector&lt;Eigen::Vector3d&gt; dst_pts;
+
+  // 1. 收集匹配点对
+  for (const auto&amp; track : bundle.tracks) {
+    // 确保点是三角化过的，且是 GCP (isPrior)
+    if (track.isPrior &amp;&amp; objectPoints[track.pointId].triangulated) {
+      src_pts.push_back(objectPoints[track.pointId].pos);
+      dst_pts.push_back(bundle.points[track.pointId]);
+      cout &lt;&lt; objectPoints[track.pointId].pos.transpose() &lt;&lt; " &lt;-&gt; "
+           &lt;&lt; bundle.points[track.pointId].transpose() &lt;&lt; endl;
+    }
+  }
+
+  if (src_pts.size() &lt; 3) {
+    cout &lt;&lt; "警告: GCP 匹配点少于 3 个，无法进行绝对定向" &lt;&lt; endl;
+    return;
+  }
+
+  // 2. 求解 Sim3
+  Sim3Problem sim3Problem(src_pts, dst_pts);
+  Sim3Problem::Sim3 sim3;
+  if (!sim3Problem.Solve(sim3)) {
+    cout &lt;&lt; "Sim3 求解失败" &lt;&lt; endl;
+    return;
+  }
+
+  cout &lt;&lt; "=== 应用 Sim3 变换 ===" &lt;&lt; endl;
+  cout &lt;&lt; "Scale: " &lt;&lt; sim3.scale &lt;&lt; endl;
+
+  // 3. 变换 3D 点
+  for (auto&amp; point : objectPoints) {
+    // 公式: X_world = s * R * X_sfm + t
+    point.pos = sim3.scale * sim3.R * point.pos + sim3.t;
+  }
+
+  // 4. 变换相机
+  for (auto&amp; cam : cameraExtrinsics) {
+    if (!cam.registered) continue;  // 跳过未注册的相机
+
+    // --- 修正点：旋转矩阵的更新 ---
+    // 解释: 如果世界坐标系旋转了 R_sim3，相机姿态需要反向旋转来补偿
+    // 公式: R_new = R_old * R_sim3.transpose()
+    Eigen::Matrix3d R_world = cam.R * sim3.R.transpose();
+
+    // --- 平移向量的更新  ---
+    // 计算相机中心 C_sfm (在世界坐标系下)
+    Eigen::Vector3d C_sfm = -cam.R.transpose() * cam.t;
+    // 变换相机中心: C_world = s * R_sim3 * C_sfm + t_sim3
+    Eigen::Vector3d C_world = sim3.scale * sim3.R * C_sfm + sim3.t;
+
+    // 重新计算 t_world: t = -R * C
+    Eigen::Vector3d t_world = -R_world * C_world;
+
+    // 更新相机参数
+    cam.R = R_world;
+    cam.t = t_world;
+  }
+}
+</code></pre>
+<p><code>GlobalBundleAdjustmentWithGcp</code> 则进行最后的带约束的 BA 优化估计：</p>
+<pre><code class="language-cpp">bool GlobalBundleAdjustmentWithGcp(
+    const Eigen::Matrix3d&amp; K, const sfm::Bundle&amp; bundle,
+    vector&lt;cl::CameraExtrinsics&gt;&amp; cameras,
+    vector&lt;cl::ObjectPoint&gt;&amp; objectPoints,
+    const std::map&lt;int, Eigen::Vector3d&gt;&amp; golbal_gcp_3d_priors) {
+  map&lt;int, int&gt; cameraIdMap;
+  vector&lt;BAProblem::CameraExtrinsics&gt; est_cams;
+  for (size_t ci = 0; ci &lt; cameras.size(); ++ci) {
+    if (cameras[ci].registered) {
+      BAProblem::CameraExtrinsics cameraExtrinsics;
+      Eigen::Quaterniond quaternion(cameras[ci].R);
+      cameraExtrinsics.q[0] = quaternion.w();
+      cameraExtrinsics.q[1] = quaternion.x();
+      cameraExtrinsics.q[2] = quaternion.y();
+      cameraExtrinsics.q[3] = quaternion.z();
+      cameraExtrinsics.t[0] = cameras[ci].t.x();
+      cameraExtrinsics.t[1] = cameras[ci].t.y();
+      cameraExtrinsics.t[2] = cameras[ci].t.z();
+      cameraIdMap[ci] = est_cams.size();
+      est_cams.push_back(std::move(cameraExtrinsics));
+    }
+  }
+
+  vector&lt;BAProblem::ObjectPoint&gt; est_pts;
+  vector&lt;BAProblem::Observation&gt; obs;
+  map&lt;int, int&gt; pointIdMap;
+  std::map&lt;int, Eigen::Vector3d&gt; local_gcp_3d_priors;
+
+  for (const auto&amp; track : bundle.tracks) {
+    if (objectPoints[track.pointId].triangulated) {
+      BAProblem::ObjectPoint objectPoint;
+      objectPoint.xyz[0] = objectPoints[track.pointId].pos.x();
+      objectPoint.xyz[1] = objectPoints[track.pointId].pos.y();
+      objectPoint.xyz[2] = objectPoints[track.pointId].pos.z();
+
+      for (auto ob : track.obs) {
+        auto iter = cameraIdMap.find(ob.imgId);
+        if (iter != cameraIdMap.end()) {
+          BAProblem::Observation observation;
+          observation.cam_id = iter-&gt;second;
+          observation.pt_id = est_pts.size();
+          observation.x = bundle.views[ob.imgId][ob.kpId].x();
+          observation.y = bundle.views[ob.imgId][ob.kpId].y();
+          observation.is_gcp = track.isPrior;
+          obs.push_back(std::move(observation));
+        }
+      }
+
+      int current3DIdx = est_pts.size();
+      pointIdMap.emplace(track.pointId, current3DIdx);
+
+      auto iter = golbal_gcp_3d_priors.find(track.pointId);
+      if (golbal_gcp_3d_priors.end() != iter) {
+        local_gcp_3d_priors.emplace(current3DIdx, iter-&gt;second);
+      }
+
+      est_pts.push_back(objectPoint);
+    }
+  }
+
+  BAProblem problem(K, obs, est_cams, est_pts);
+  if (!problem.SolveWithGcp(local_gcp_3d_priors)) {
+    return false;
+  }
+
+  for (const auto&amp; [oldId, id] : cameraIdMap) {
+    Eigen::Quaternion q(est_cams[id].q[0], est_cams[id].q[1], est_cams[id].q[2],
+                        est_cams[id].q[3]);
+    cameras[oldId].R = q.toRotationMatrix();
+    cameras[oldId].t.x() = est_cams[id].t[0];
+    cameras[oldId].t.y() = est_cams[id].t[1];
+    cameras[oldId].t.z() = est_cams[id].t[2];
+  }
+
+  for (auto track : bundle.tracks) {
+    if (objectPoints[track.pointId].triangulated) {
+      auto iter = pointIdMap.find(track.pointId);
+      if (iter != pointIdMap.end()) {
+        objectPoints[track.pointId].pos.x() = est_pts[iter-&gt;second].xyz[0];
+        objectPoints[track.pointId].pos.y() = est_pts[iter-&gt;second].xyz[1];
+        objectPoints[track.pointId].pos.z() = est_pts[iter-&gt;second].xyz[2];
+      }
+    }
+  }
+
+  return true;
+}
+</code></pre>
+<p>最终得到精度报告与之前的精度报告差不多：</p>
+<pre><code class="language-text">=== SfM 重建精度报告 ===
+
+=== 总体重投影误差评估 ===
+总有效观测点数量: 213825
+均方根重投影误差 (RMSE): 0.925549 像素
+平均重投影距离: 1.308924 像素
+最大重投影误差: 4.737442 像素
+
+评估结果: 优秀 (RMSE &lt; 1.0 px)
+
+=== 各相机重投影误差统计 ===
+相机ID	观测点数	平均误差(px)	最大误差(px)
+------	--------	----------	----------
+0	669		1.138498		3.506387
+1	800		1.143440		3.333284
+2	963		1.120040		3.558708
+3	1236		1.134163		3.825562
+4	1384		1.160838		4.003462
+5	1273		1.186830		3.400867
+6	1419		1.183719		3.495600
+7	1307		1.175630		3.276562
+8	1283		1.154504		4.027606
+9	1125		1.173727		3.303618
+10	1300		1.176120		3.562757
+# ...
+107	1365		1.084929		3.216329
+</code></pre>
+<p>不过这次我们还比较了真实误差，即真实位姿和估计位姿的差异：</p>
+<pre><code class="language-text">=== 逐相机误差报告 ===
+ID      Trans Error (m) Rot Error (deg)
+--------------------------------------
+0       0.091888                0.020811
+1       0.020144                0.002362
+2       0.035423                0.007638
+3       0.017054                0.003444
+4       0.017345                0.004937
+5       0.025189                0.007842
+6       0.021996                0.005809
+7       0.006136                0.001724
+8       0.037700                0.010153
+9       0.016937                0.004562
+10      0.011840                0.003652
+# ...
+107     0.039919                0.008512
+
+=== 整体精度统计 ===
+-------------------
+平移误差 (Translation Error):
+  平均 (Mean): 0.020618 m
+  均方根 (RMSE): 0.023966 m
+  最大 (Max): 0.091888 m (Camera 0)
+旋转误差 (Rotation Error):
+  平均 (Mean): 0.006283 deg
+  均方根 (RMSE): 0.007199 deg
+  最大 (Max): 0.020811 deg (Camera 0)
+===================
+</code></pre>
+<p>这充分说明，通过本文提出的“Sim3 引导的联合优化”策略，我们已经成功将自由网模型从任意坐标系精确对齐到了真实世界坐标系中。从误差统计来看，平移误差的均方根（RMSE）仅为 2.4 厘米，旋转误差低至 0.007 度。这一结果验证了从线性初值计算到非线性全局优化这一整套数学推导与代码实现的正确性。至此，我们不仅解决了单目视觉重建的尺度不确定性问题，更在稀疏控制点的约束下，实现了从“相对结构”到“绝对位姿”的完整闭环。</p>
+<p><a href="https://charlee44.com/post.html?id=8b61bfecc835426a86b43f84183f903e" target="_blank" rel="noopener nofollow">上一篇</a> | <a href="https://charlee44.com/post.html?id=223ff86904534035a42619e4c7684db6" target="_blank" rel="noopener nofollow">目录</a> | <a href="" rel="noopener nofollow">下一篇</a><br>
+<a href="https://download.csdn.net/download/charlee44/92822643" target="_blank" rel="noopener nofollow">代码存档</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-04-22 09:30">2026-04-22 09:29</span>&nbsp;
+<a href="https://www.cnblogs.com/charlee44">charlee44</a>&nbsp;
+阅读(<span id="post_view_count">40</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19905614);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fcharlee44%2Fp%2F19905614&amp;targetId=19905614&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
