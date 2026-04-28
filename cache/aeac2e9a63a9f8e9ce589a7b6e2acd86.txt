@@ -1,0 +1,561 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/NickYao/p/19944656" title="发布于 2026-04-28 14:57">
+    <span role="heading" aria-level="2">深入 Open Agent SDK（四）：多 Agent 协作——子代理、团队与任务编排</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>本文是「深入 Open Agent SDK (Swift)」系列第四篇。</p>
+</blockquote>
+<p>单个 Agent 再强，也只是一个执行者。真实的开发任务往往是多步骤、多角色的：先有人探索代码库，有人设计方案，再有人写代码、跑测试。一个 Agent 单干，上下文容易膨胀，效率也上不去。</p>
+<p>Open Agent SDK 从三个层面解决这个问题：</p>
+<ol>
+<li><strong>子 Agent</strong> -- 主 Agent 在运行过程中动态生成子 Agent，把专门的任务委派出去</li>
+<li><strong>Task 系统</strong> -- 用任务追踪多步骤工作的进度和结果</li>
+<li><strong>Team + 消息传递</strong> -- 多个 Agent 组成团队，通过邮箱系统互相通信</li>
+</ol>
+<p>这篇文章逐一分析这三个层面的实现，最后看它们怎么组合起来做任务编排。</p>
+<h2 id="一子-agentsubagentspawner-协议与-agenttool">一、子 Agent：SubAgentSpawner 协议与 AgentTool</h2>
+<h3 id="subagentspawner-协议">SubAgentSpawner 协议</h3>
+<p>子 Agent 的生成不是 AgentTool 直接 new 一个 Agent 出来——中间隔了一层协议。<code>SubAgentSpawner</code> 定义在 <code>Types/AgentTypes.swift</code> 里：</p>
+<pre><code class="language-swift">public protocol SubAgentSpawner: Sendable {
+    func spawn(
+        prompt: String,
+        model: String?,
+        systemPrompt: String?,
+        allowedTools: [String]?,
+        maxTurns: Int?
+    ) async -&gt; SubAgentResult
+
+    func spawn(
+        prompt: String,
+        model: String?,
+        systemPrompt: String?,
+        allowedTools: [String]?,
+        maxTurns: Int?,
+        disallowedTools: [String]?,
+        mcpServers: [AgentMcpServerSpec]?,
+        skills: [String]?,
+        runInBackground: Bool?,
+        isolation: String?,
+        name: String?,
+        teamName: String?,
+        mode: PermissionMode?,
+        resume: String?
+    ) async -&gt; SubAgentResult
+}
+</code></pre>
+<p>两个方法，一个基础版（5 个参数），一个增强版（13 个参数）。协议还提供了默认实现，增强版直接调用基础版，这样已有的实现类不用改代码就能兼容。</p>
+<p>为什么要把 spawner 放在 <code>Types/</code> 而不是 <code>Core/</code>？因为 <code>Tools/Advanced/AgentTool.swift</code> 需要用它，但 <code>Tools/</code> 不应该导入 <code>Core/</code>。把协议定义在 <code>Types/</code>，具体实现放在 <code>Core/</code>，通过 <code>ToolContext.agentSpawner</code> 注入——这是 SDK 里常见的依赖倒置。</p>
+<h3 id="defaultsubagentspawner-实现">DefaultSubAgentSpawner 实现</h3>
+<p><code>DefaultSubAgentSpawner</code> 在 <code>Core/DefaultSubAgentSpawner.swift</code> 里，做了这几件事：</p>
+<pre><code class="language-swift">final class DefaultSubAgentSpawner: SubAgentSpawner, @unchecked Sendable {
+    private let apiKey: String
+    private let baseURL: String?
+    private let parentModel: String
+    private let parentTools: [ToolProtocol]
+    private let provider: LLMProvider
+    private let client: (any LLMClient)?
+
+    func spawn(...) async -&gt; SubAgentResult {
+        // 1. 过滤掉 AgentTool，防止无限递归
+        var subTools = parentTools.filter { $0.name != "Agent" }
+
+        // 2. 如果指定了 allowedTools，进一步过滤
+        if let allowed = allowedTools, !allowed.isEmpty {
+            let allowedSet = Set(allowed)
+            subTools = subTools.filter { allowedSet.contains($0.name) }
+        }
+
+        // 3. disallowedTools 再过一遍（优先级高于 allowedTools）
+        if let disallowed = disallowedTools, !disallowed.isEmpty {
+            let disallowedSet = Set(disallowed)
+            subTools = subTools.filter { !disallowedSet.contains($0.name) }
+        }
+
+        // 4. 创建子 Agent 并执行
+        let options = AgentOptions(
+            apiKey: apiKey,
+            model: model ?? parentModel,
+            systemPrompt: systemPrompt,
+            maxTurns: maxTurns ?? 10,
+            tools: subTools
+        )
+        let agent = Agent(options: options)
+        let result = await agent.prompt(prompt)
+
+        return SubAgentResult(
+            text: result.text.isEmpty
+                ? "(Subagent completed with no text output)"
+                : result.text,
+            toolCalls: [],
+            isError: result.status != .success
+        )
+    }
+}
+</code></pre>
+<p>几个关键点：</p>
+<ul>
+<li><strong>防递归</strong>：子 Agent 不会再拿到 AgentTool，所以不会出现 Agent 套 Agent 套 Agent 的情况</li>
+<li><strong>工具继承</strong>：子 Agent 默认继承父 Agent 的所有工具（除了 AgentTool），但可以通过 <code>allowedTools</code> / <code>disallowedTools</code> 限制</li>
+<li><strong>阻塞式执行</strong>：父 Agent 调用 <code>spawn()</code> 后会 await，等子 Agent 跑完才继续</li>
+</ul>
+<h3 id="agenttoolllm-眼里的子-agent-工具">AgentTool：LLM 眼里的子 Agent 工具</h3>
+<p><code>AgentTool</code> 是暴露给 LLM 的工具。LLM 调用 <code>Agent</code> 工具时传入 prompt 和参数，AgentTool 负责调用 spawner 生成子 Agent。</p>
+<p>它内置了两种预定义的子 Agent 类型：</p>
+<pre><code class="language-swift">private let BUILTIN_AGENTS: [String: AgentDefinition] = [
+    "Explore": AgentDefinition(
+        name: "Explore",
+        description: "Fast agent specialized for exploring codebases...",
+        systemPrompt: "You are a codebase exploration agent. Search through files and code to answer questions...",
+        tools: ["Read", "Glob", "Grep", "Bash"],
+        maxTurns: 10
+    ),
+    "Plan": AgentDefinition(
+        name: "Plan",
+        description: "Software architect agent for designing implementation plans...",
+        systemPrompt: "You are a software architect. Design implementation plans...",
+        tools: ["Read", "Glob", "Grep", "Bash"],
+        maxTurns: 10
+    ),
+]
+</code></pre>
+<ul>
+<li><strong>Explore</strong>：代码库探索，用 Glob 找文件、Grep 搜内容、Read 读文件</li>
+<li><strong>Plan</strong>：软件架构师，理解代码库后输出实施方案</li>
+</ul>
+<p>LLM 调用 AgentTool 时，通过 <code>subagent_type</code> 字段指定用哪种：</p>
+<pre><code class="language-json">{
+  "prompt": "Explore the project structure and find all Swift source files",
+  "description": "Explore codebase",
+  "subagent_type": "Explore"
+}
+</code></pre>
+<p>AgentTool 还支持一堆可选参数：<code>model</code>（指定模型）、<code>maxTurns</code>（覆盖轮次上限）、<code>run_in_background</code>（后台运行）、<code>isolation</code>（隔离模式，比如 worktree）、<code>team_name</code>（关联团队）、<code>mode</code>（权限模式）。这些参数直接透传给 spawner。</p>
+<h3 id="一个完整的示例">一个完整的示例</h3>
+<p>SDK 自带了一个 SubagentExample，演示了主 Agent 作为协调者，通过 AgentTool 委派 Explore 子 Agent 的完整流程：</p>
+<pre><code class="language-swift">// 主 Agent 的系统提示
+let systemPrompt = """
+You are a coordinator agent. When given a task, you should delegate it to a sub-agent \
+using the Agent tool. The Agent tool will spawn a specialized agent (e.g., "Explore" type) \
+that can use Read, Glob, Grep, and Bash tools to investigate the codebase. \
+After the sub-agent returns its findings, summarize the results for the user.
+"""
+
+// 注册工具：核心工具 + AgentTool
+let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: defaultModel,
+    systemPrompt: systemPrompt,
+    maxTurns: 10,
+    tools: getAllBaseTools(tier: .core) + [createAgentTool()]
+))
+
+// 发任务——主 Agent 会调用 AgentTool 委派给 Explore 子 Agent
+for await message in agent.stream("""
+    Explore the current project directory. Find all Swift source files, \
+    examine the project structure, and provide a summary. \
+    Use the Agent tool to delegate this task to an Explore sub-agent.
+""") {
+    switch message {
+    case .toolUse(let data):
+        if data.toolName == "Agent" {
+            print("[Sub-agent Delegation: \(data.toolName)]")
+        }
+    case .toolResult(let data):
+        print("[Result: \(data.content.prefix(200))]")
+    case .result(let data):
+        print("Turns: \(data.numTurns), Cost: $\(data.totalCostUsd)")
+    default:
+        break
+    }
+}
+</code></pre>
+<p>执行流程：用户发 prompt -&gt; 主 Agent 判断需要探索代码库 -&gt; 调用 AgentTool -&gt; AgentTool 通过 spawner 生成 Explore 子 Agent -&gt; 子 Agent 用 Glob/Grep/Read 执行探索 -&gt; 结果返回给主 Agent -&gt; 主 Agent 汇总后回复用户。</p>
+<h2 id="二task-系统任务追踪与状态机">二、Task 系统：任务追踪与状态机</h2>
+<p>子 Agent 解决了"谁干活"的问题，Task 系统解决的是"活干了多少、谁在干、结果是什么"的问题。</p>
+<h3 id="taskstore线程安全的-actor">TaskStore：线程安全的 Actor</h3>
+<p><code>TaskStore</code> 是一个 Swift Actor，保证并发安全：</p>
+<pre><code class="language-swift">public actor TaskStore {
+    private var tasks: [String: Task] = [:]
+    private var taskCounter: Int = 0
+
+    public func create(
+        subject: String,
+        description: String? = nil,
+        owner: String? = nil,
+        status: TaskStatus = .pending
+    ) -&gt; Task {
+        taskCounter += 1
+        let id = "task_\(taskCounter)"
+        let now = dateFormatter.string(from: Date())
+        let task = Task(
+            id: id, subject: subject, description: description,
+            status: status, owner: owner,
+            createdAt: now, updatedAt: now
+        )
+        tasks[id] = task
+        return task
+    }
+}
+</code></pre>
+<p>用 Actor 而不是普通类，意味着所有方法都是隐式串行化的——不需要自己加锁。多个 Agent 同时创建任务不会出现竞态条件。</p>
+<h3 id="task-的状态机">Task 的状态机</h3>
+<p>Task 有 5 种状态，流转规则很明确：</p>
+<pre><code class="language-swift">public enum TaskStatus: String, Sendable, Equatable, Codable {
+    case pending      // 等待开始
+    case inProgress   // 进行中
+    case completed    // 已完成
+    case failed       // 失败
+    case cancelled    // 已取消
+}
+</code></pre>
+<p>状态转换有约束：<code>pending</code> 和 <code>inProgress</code> 可以转到任何状态，但 <code>completed</code>、<code>failed</code>、<code>cancelled</code> 是终态，不可再变：</p>
+<pre><code class="language-swift">private func isValidTransition(from: TaskStatus, to: TaskStatus) -&gt; Bool {
+    switch from {
+    case .pending, .inProgress:
+        return true
+    case .completed, .failed, .cancelled:
+        return false  // 终态，不能再转
+    }
+}
+</code></pre>
+<p>画成状态图：</p>
+<pre><code>pending ──→ inProgress ──→ completed
+   │            │
+   │            ├──→ failed
+   │            │
+   └──→ cancelled ←──┘
+</code></pre>
+<p><code>TaskStatus</code> 还有个贴心的 <code>parse()</code> 方法，同时支持 camelCase（<code>inProgress</code>）和 snake_case（<code>in_progress</code>），因为 LLM 返回的 JSON 格式不一定统一：</p>
+<pre><code class="language-swift">public static func parse(_ string: String) -&gt; TaskStatus? {
+    if let direct = TaskStatus(rawValue: string) { return direct }
+    // snake_case → camelCase
+    let camel = string
+        .split(separator: "_")
+        .enumerated()
+        .map { $0.offset == 0 ? String($0.element) : String($0.element).capitalized }
+        .joined()
+    return TaskStatus(rawValue: camel)
+}
+</code></pre>
+<h3 id="task-结构体">Task 结构体</h3>
+<p>一个 Task 实例除了基本的状态追踪，还预留了依赖关系和元数据：</p>
+<pre><code class="language-swift">public struct Task: Sendable, Equatable, Codable {
+    public let id: String
+    public var subject: String
+    public var description: String?
+    public var status: TaskStatus
+    public var owner: String?        // 谁在干
+    public let createdAt: String
+    public var updatedAt: String
+    public var output: String?       // 结果
+    public var blockedBy: [String]?  // 被哪些任务阻塞
+    public var blocks: [String]?     // 阻塞了哪些任务
+    public var metadata: [String: String]?
+}
+</code></pre>
+<p><code>blockedBy</code> 和 <code>blocks</code> 字段说明 Task 系统预留了任务依赖的能力——任务 A 可以声明"我需要等任务 B 和 C 完成才能开始"。</p>
+<h3 id="三个-task-工具">三个 Task 工具</h3>
+<p>SDK 提供了三个工具让 LLM 操作 Task 系统：</p>
+<p><strong>TaskCreate</strong> -- 创建任务：</p>
+<pre><code class="language-swift">public func createTaskCreateTool() -&gt; ToolProtocol {
+    return defineTool(
+        name: "TaskCreate",
+        description: "Create a new task for tracking work progress.",
+        inputSchema: taskCreateSchema,
+        isReadOnly: false
+    ) { (input: TaskCreateInput, context: ToolContext) in
+        guard let taskStore = context.taskStore else {
+            return ToolExecuteResult(content: "Error: TaskStore not available.", isError: true)
+        }
+        let initialStatus: TaskStatus = input.status.flatMap { TaskStatus.parse($0) } ?? .pending
+        let task = await taskStore.create(
+            subject: input.subject,
+            description: input.description,
+            owner: input.owner,
+            status: initialStatus
+        )
+        return ToolExecuteResult(
+            content: "Task created: \(task.id) - \"\(task.subject)\" (\(task.status.rawValue))",
+            isError: false
+        )
+    }
+}
+</code></pre>
+<p><strong>TaskList</strong> -- 列出任务（支持按 status 和 owner 过滤）：</p>
+<pre><code class="language-swift">// LLM 可以查 "列出所有 pending 状态的任务" 或 "列出分配给 agent-1 的任务"
+let tasks = await taskStore.list(status: status, owner: input.owner)
+</code></pre>
+<p><strong>TaskUpdate</strong> -- 更新任务（状态、描述、负责人、输出）：</p>
+<pre><code class="language-swift">do {
+    let task = try await taskStore.update(
+        id: input.id,
+        status: status,
+        description: input.description,
+        owner: input.owner,
+        output: input.output
+    )
+    return ToolExecuteResult(
+        content: "Task updated: \(task.id) - \(task.status.rawValue) - \"\(task.subject)\"",
+        isError: false
+    )
+} catch let error as TaskStoreError {
+    return ToolExecuteResult(content: "Error: \(error.localizedDescription)", isError: true)
+}
+</code></pre>
+<p>注意 TaskUpdate 会抛出 <code>invalidStatusTransition</code> 错误——比如试图把一个 <code>completed</code> 的任务改成 <code>inProgress</code>，LLM 会收到错误提示，可以据此调整策略。</p>
+<h2 id="三team-系统团队组建与管理">三、Team 系统：团队组建与管理</h2>
+<p>Task 系统追踪"做什么"，Team 系统解决"谁跟谁一组"。</p>
+<h3 id="teamstore">TeamStore</h3>
+<p>和 TaskStore 一样，TeamStore 也是 Actor：</p>
+<pre><code class="language-swift">public actor TeamStore {
+    private var teams: [String: Team] = [:]
+    private var teamCounter: Int = 0
+
+    public func create(
+        name: String,
+        members: [TeamMember] = [],
+        leaderId: String = "self"
+    ) -&gt; Team {
+        teamCounter += 1
+        let id = "team_\(teamCounter)"
+        let team = Team(
+            id: id, name: name, members: members,
+            leaderId: leaderId,
+            createdAt: dateFormatter.string(from: Date()),
+            status: .active
+        )
+        teams[id] = team
+        return team
+    }
+}
+</code></pre>
+<p>Team 有两种状态：<code>active</code> 和 <code>disbanded</code>。删除 Team 不是真删，而是把状态改成 <code>disbanded</code>——标记为 disbanded 的 Team 不允许添加/移除成员。</p>
+<h3 id="teammember-和角色">TeamMember 和角色</h3>
+<pre><code class="language-swift">public enum TeamRole: String, Sendable, Equatable, Codable {
+    case leader   // 团队领导
+    case member   // 普通成员
+}
+
+public struct TeamMember: Sendable, Equatable, Codable {
+    public let name: String
+    public let role: TeamRole
+}
+</code></pre>
+<p><code>TeamCreateTool</code> 创建 Team 时，所有传入的成员默认都是 <code>member</code> 角色，<code>leaderId</code> 默认是 <code>"self"</code>（即创建者自己）：</p>
+<pre><code class="language-swift">let members: [TeamMember] = input.members?.map { TeamMember(name: $0) } ?? []
+let team = await teamStore.create(
+    name: input.name,
+    members: members,
+    leaderId: "self"
+)
+</code></pre>
+<p><code>TeamStore</code> 还提供了动态管理成员的能力：</p>
+<pre><code class="language-swift">// 添加成员
+try teamStore.addMember(teamId: "team_1", member: TeamMember(name: "agent-coder"))
+
+// 移除成员
+try teamStore.removeMember(teamId: "team_1", agentName: "agent-coder")
+
+// 查找某个 Agent 属于哪个团队
+let team = await teamStore.getTeamForAgent(agentName: "agent-coder")
+</code></pre>
+<p><code>getTeamForAgent</code> 对消息传递很重要——发消息时需要知道发件人属于哪个 Team，才能验证收件人是不是队友。</p>
+<h3 id="agentregistryagent-注册表">AgentRegistry：Agent 注册表</h3>
+<p>除了 TeamStore，还有一个 <code>AgentRegistry</code> 负责追踪所有活跃的 Agent：</p>
+<pre><code class="language-swift">public actor AgentRegistry {
+    private var agents: [String: AgentRegistryEntry] = [:]
+    private var nameIndex: [String: String] = [:]  // name -&gt; agentId
+
+    public func register(agentId: String, name: String, agentType: String) throws -&gt; AgentRegistryEntry {
+        if nameIndex[name] != nil {
+            throw AgentRegistryError.duplicateAgentName(name: name)
+        }
+        let entry = AgentRegistryEntry(...)
+        agents[agentId] = entry
+        nameIndex[name] = agentId
+        return entry
+    }
+
+    public func getByName(name: String) -&gt; AgentRegistryEntry? {
+        guard let agentId = nameIndex[name] else { return nil }
+        return agents[agentId]
+    }
+}
+</code></pre>
+<p>名字唯一性约束——同一个 AgentRegistry 里不能注册两个同名的 Agent。<code>nameIndex</code> 是一个反查索引，支持 O(1) 的名字查找。</p>
+<h2 id="四消息传递mailboxstore-与-sendmessage">四、消息传递：MailboxStore 与 SendMessage</h2>
+<p>有了 Team，Agent 之间需要能通信。SDK 用的是邮箱模式（Mailbox）——发消息不直接推给对方，而是放进对方的邮箱，对方自己来取。</p>
+<h3 id="mailboxstore">MailboxStore</h3>
+<pre><code class="language-swift">public actor MailboxStore {
+    private var mailboxes: [String: [AgentMessage]] = [:]
+
+    // 点对点发送
+    public func send(from: String, to: String, content: String, type: AgentMessageType = .text) {
+        let message = AgentMessage(from: from, to: to, content: content,
+                                   timestamp: dateFormatter.string(from: Date()), type: type)
+        if mailboxes[to] == nil { mailboxes[to] = [] }
+        mailboxes[to]?.append(message)
+    }
+
+    // 广播——发给所有有邮箱的 Agent
+    public func broadcast(from: String, content: String, type: AgentMessageType = .text) {
+        let timestamp = dateFormatter.string(from: Date())
+        for (agentName, _) in mailboxes {
+            let message = AgentMessage(from: from, to: agentName, content: content,
+                                       timestamp: timestamp, type: type)
+            mailboxes[agentName]?.append(message)
+        }
+    }
+
+    // 读取并清空邮箱
+    public func read(agentName: String) -&gt; [AgentMessage] {
+        guard let messages = mailboxes[agentName] else { return [] }
+        mailboxes[agentName] = []  // 读完清空
+        return messages
+    }
+}
+</code></pre>
+<p>三个核心操作：<code>send</code>（点对点）、<code>broadcast</code>（广播）、<code>read</code>（读取）。<code>read</code> 是破坏性读取——读一次邮箱就清空了。<code>broadcast</code> 只发给已经有邮箱的 Agent，不会凭空创建邮箱。</p>
+<p>消息类型除了普通文本（<code>.text</code>），还有 <code>.shutdownRequest</code>、<code>.shutdownResponse</code>、<code>.planApprovalResponse</code>——这些特殊类型用于团队管理的协调操作。</p>
+<h3 id="sendmessage-工具">SendMessage 工具</h3>
+<p><code>SendMessageTool</code> 做了三层校验：</p>
+<pre><code class="language-swift">// 1. 必须有 MailboxStore
+guard let mailboxStore = context.mailboxStore else { ... }
+// 2. 必须有 TeamStore
+guard let teamStore = context.teamStore else { ... }
+// 3. 必须知道发送者是谁
+guard let senderName = context.senderName else { ... }
+
+// 4. 发送者必须在某个 Team 里
+guard let team = await teamStore.getTeamForAgent(agentName: senderName) else { ... }
+
+// 5. 收件人必须是同 Team 的成员
+let isMember = team.members.contains { $0.name == input.to }
+guard isMember else { ... }
+</code></pre>
+<p>广播用 <code>"*"</code> 作为收件人：</p>
+<pre><code class="language-json">{ "to": "*", "message": "Phase 1 complete, starting Phase 2." }
+</code></pre>
+<p>点对点用具体名字：</p>
+<pre><code class="language-json">{ "to": "agent-coder", "message": "Here's the spec for module A." }
+</code></pre>
+<p>校验不通过时返回错误信息，LLM 能看到哪些成员可用，可以调整发送目标。</p>
+<h2 id="五编排模式怎么组合这些能力">五、编排模式：怎么组合这些能力</h2>
+<p>单个 Agent、Task、Team、Mailbox 各自能做什么清楚了。实际场景中怎么组合？看一个典型的工作流。</p>
+<h3 id="模式一主-agent--并行子-agent">模式一：主 Agent + 并行子 Agent</h3>
+<p>最简单的模式。主 Agent 收到复杂任务后，同时启动多个子 Agent 各自处理一部分：</p>
+<pre><code class="language-swift">let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    systemPrompt: """
+    You are a coordinator. Break complex tasks into subtasks, \
+    delegate each to an Explore sub-agent, then synthesize results.
+    """,
+    maxTurns: 20,
+    tools: getAllBaseTools(tier: .core) + [
+        createAgentTool(),
+        createTaskCreateTool(),
+        createTaskUpdateTool(),
+        createTaskListTool()
+    ],
+    taskStore: TaskStore()
+))
+</code></pre>
+<p>LLM 可能这样编排：</p>
+<ol>
+<li><code>TaskCreate("Analyze module A")</code> -- 创建任务</li>
+<li><code>Agent(prompt: "Analyze module A", subagent_type: "Explore")</code> -- 委派子 Agent</li>
+<li><code>TaskUpdate(id: "task_1", status: "completed", output: result)</code> -- 标记完成</li>
+<li>重复步骤 1-3 处理其他模块</li>
+<li>汇总所有结果</li>
+</ol>
+<h3 id="模式二团队协作--消息传递">模式二：团队协作 + 消息传递</h3>
+<p>需要多个 Agent 长期协作时，用 Team + Mailbox：</p>
+<pre><code class="language-swift">let mailboxStore = MailboxStore()
+let teamStore = TeamStore()
+
+let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    agentName: "coordinator",
+    mailboxStore: mailboxStore,
+    teamStore: teamStore,
+    tools: getAllBaseTools(tier: .core) + [
+        createAgentTool(),
+        createTeamCreateTool(),
+        createTeamDeleteTool(),
+        createSendMessageTool(),
+        createTaskCreateTool(),
+        createTaskListTool(),
+        createTaskUpdateTool()
+    ]
+))
+</code></pre>
+<p>LLM 的编排可能像这样：</p>
+<ol>
+<li><code>TeamCreate(name: "refactor-team", members: ["explorer", "planner", "coder"])</code> -- 建团队</li>
+<li><code>TaskCreate("Explore codebase", owner: "explorer")</code> -- 创建任务</li>
+<li><code>Agent(prompt: "...", name: "explorer", subagent_type: "Explore")</code> -- 启动探索 Agent</li>
+<li><code>SendMessage(to: "planner", message: "Exploration done, here's the summary...")</code> -- 通知规划 Agent</li>
+<li><code>TaskCreate("Write implementation plan", owner: "planner")</code> -- 下一个任务</li>
+<li>持续推进...</li>
+</ol>
+<h3 id="模式三工作队列">模式三：工作队列</h3>
+<p>用 Task 系统做工作队列，主 Agent 创建一批任务，子 Agent 逐个领取执行：</p>
+<pre><code>主 Agent:
+  TaskCreate("Fix bug #1")     → task_1 (pending)
+  TaskCreate("Fix bug #2")     → task_2 (pending)
+  TaskCreate("Add feature X")  → task_3 (pending)
+
+子 Agent A:
+  TaskList(status: "pending")       → [task_1, task_2, task_3]
+  TaskUpdate(task_1, status: "in_progress", owner: "agent-a")
+  ... 干活 ...
+  TaskUpdate(task_1, status: "completed", output: "Fixed by ...")
+
+子 Agent B:
+  TaskList(status: "pending")       → [task_2, task_3]
+  TaskUpdate(task_2, status: "in_progress", owner: "agent-b")
+  ... 干活 ...
+</code></pre>
+<p>TaskStore 是 Actor，多个 Agent 并发更新同一条任务不会出问题（先到先得），但不会自动分配——需要 LLM 自己协调谁认领哪个任务。</p>
+<h2 id="设计思路的取舍">设计思路的取舍</h2>
+<p>这套多 Agent 协作机制有几个设计选择：</p>
+<p><strong>为什么子 Agent 不能再生子 Agent？</strong> <code>DefaultSubAgentSpawner</code> 在创建子 Agent 时过滤掉了 AgentTool。这是有意的限制——如果不限制，一个 Agent 生成一个 Agent 再生成一个 Agent，递归深度不可控，token 消耗也会指数级增长。</p>
+<p><strong>为什么消息是拉取（Pull）不是推送（Push）？</strong> <code>MailboxStore.read()</code> 是破坏性读取，Agent 需要主动调用才能收到消息。这比推送模式简单得多——不需要维护回调、不需要处理 Agent 离线的情况。代价是实时性差，但在 Agent Loop 的工具调用频率下（每个 turn 都可以调工具），拉取的延迟可以接受。</p>
+<p><strong>为什么 Task 的状态机没有自动流转？</strong> <code>blockedBy</code> 字段只是声明了依赖关系，但 <code>TaskStore.update()</code> 不会自动检查前置任务是否完成。这意味着"等任务 A 做完再做任务 B"这个逻辑需要 LLM 自己实现——调 TaskList 看状态，再决定下一步。这是一个务实的取舍：自动依赖解析可以加，但对 LLM 来说，显式检查反而更可控。</p>
+<h2 id="小结">小结</h2>
+<p>Open Agent SDK 的多 Agent 协作由三层构成：</p>
+<ul>
+<li><strong>子 Agent</strong>：通过 <code>SubAgentSpawner</code> 协议和 <code>AgentTool</code> 实现，主 Agent 在运行时动态生成子 Agent 委派任务，内置 Explore 和 Plan 两种类型</li>
+<li><strong>Task 系统</strong>：基于 <code>TaskStore</code> Actor 的任务追踪，有明确的状态机（pending -&gt; inProgress -&gt; completed/failed/cancelled），终态不可逆转</li>
+<li><strong>Team + Mailbox</strong>：<code>TeamStore</code> 管理团队和成员，<code>MailboxStore</code> 实现邮箱式消息传递，支持点对点和广播</li>
+</ul>
+<p>三层可以独立使用，也可以组合——用 Task 追踪进度，用 Team 组织成员，用 Mailbox 协调通信，用子 Agent 执行具体工作。</p>
+<p>下一篇会看 SDK 的 <strong>会话持久化</strong>：Agent 对话历史怎么存、怎么恢复、怎么在重启后继续之前的工作。</p>
+<hr>
+<p><strong>GitHub</strong>：<a href="https://github.com/terryso/open-agent-sdk-swift" target="_blank" rel="noopener nofollow">terryso/open-agent-sdk-swift</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-04-28 14:57">2026-04-28 14:57</span>&nbsp;
+<a href="https://www.cnblogs.com/NickYao">四眼蒙面侠</a>&nbsp;
+阅读(<span id="post_view_count">22</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19944656);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FNickYao%2Fp%2F19944656&amp;targetId=19944656&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
