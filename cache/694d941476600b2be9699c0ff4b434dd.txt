@@ -1,0 +1,633 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/NickYao/p/19950702" title="发布于 2026-04-29 11:42">
+    <span role="heading" aria-level="2">深入 Open Agent SDK（五）：会话持久化与安全防线</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>本文是「深入 Open Agent SDK (Swift)」系列第五篇。</p>
+</blockquote>
+<p>Agent 不只是一次性问答工具。真正有用的 Agent 要做到三件事：记住上下文（上次聊到哪了）、控制权限（哪些操作能做）、审计行为（谁在什么时候干了什么）。Open Agent SDK 用四个子系统来覆盖这些需求——SessionStore、PermissionPolicy、SandboxSettings、HookRegistry。</p>
+<p>这篇文章分析这四个子系统的实现细节，看它们各自怎么工作，以及怎么组合起来构建一个安全的 Agent。</p>
+<h2 id="一会话持久化sessionstore">一、会话持久化：SessionStore</h2>
+<p>Agent Loop 每次运行会产生一组 messages 数组。如果不保存，进程退出就没了。SessionStore 负责把这些对话历史持久化到磁盘，下次启动时恢复。</p>
+<h3 id="sessionstore-是什么">SessionStore 是什么</h3>
+<p><code>SessionStore</code> 是一个 <code>actor</code>，所有方法都需要 <code>await</code> 调用。默认把会话存在 <code>~/.open-agent-sdk/sessions/</code> 目录下，每个 session 一个子目录，里面放一个 <code>transcript.json</code>。</p>
+<pre><code class="language-swift">let sessionStore = SessionStore()  // 默认路径
+let sessionStore = SessionStore(sessionsDir: "/custom/path")  // 自定义路径
+</code></pre>
+<h3 id="五个核心操作">五个核心操作</h3>
+<p>SessionStore 提供五个核心方法，覆盖会话的完整生命周期。</p>
+<p><strong>save</strong> — 保存会话。把 messages 数组和元数据序列化成 JSON 写入磁盘：</p>
+<pre><code class="language-swift">try await sessionStore.save(
+    sessionId: "my-session",
+    messages: messages,
+    metadata: PartialSessionMetadata(
+        cwd: "/project",
+        model: "claude-sonnet-4-6",
+        summary: "代码分析会话",
+        tag: "analysis",
+        firstPrompt: "分析项目结构"
+    )
+)
+</code></pre>
+<p>存储结构长这样：</p>
+<pre><code>~/.open-agent-sdk/sessions/
+  my-session/
+    transcript.json    // { "metadata": {...}, "messages": [...] }
+</code></pre>
+<p>文件权限是 <code>0600</code>，目录权限是 <code>0700</code>——只有当前用户能读写。每次 save 会保留第一次创建时的 <code>createdAt</code> 时间戳，只更新 <code>updatedAt</code>。</p>
+<p><strong>load</strong> — 加载会话。从磁盘读取 transcript.json，反序列化为 <code>SessionData</code>：</p>
+<pre><code class="language-swift">if let data = try await sessionStore.load(sessionId: "my-session") {
+    print("Messages: \(data.metadata.messageCount)")
+    print("Model: \(data.metadata.model)")
+    // data.messages 是 [[String: Any]] 数组
+}
+</code></pre>
+<p>load 支持分页参数 <code>limit</code> 和 <code>offset</code>，不需要加载全部消息时可以只取尾部：</p>
+<pre><code class="language-swift">// 只加载最近 50 条消息
+let recent = try await sessionStore.load(sessionId: "my-session", limit: 50, offset: nil)
+</code></pre>
+<p><strong>list</strong> — 列出所有会话，按 <code>updatedAt</code> 降序排列（最近的在前）：</p>
+<pre><code class="language-swift">let sessions = try await sessionStore.list(limit: 10)
+for session in sessions {
+    print("\(session.id) — \(session.summary ?? "(无标题)") [\(session.messageCount) 条消息]")
+}
+</code></pre>
+<p><code>SessionMetadata</code> 包含 id、cwd、model、createdAt、updatedAt、messageCount，以及可选的 summary、tag、firstPrompt、gitBranch、fileSize。</p>
+<p><strong>fork</strong> — 分叉会话。从已有会话复制消息到新 session，可以指定截断点：</p>
+<pre><code class="language-swift">// 完整复制
+let newId = try await sessionStore.fork(sourceSessionId: "my-session")
+
+// 只复制前 10 条消息
+let truncatedId = try await sessionStore.fork(
+    sourceSessionId: "my-session",
+    upToMessageIndex: 10
+)
+
+// 指定新 session ID
+let customId = try await sessionStore.fork(
+    sourceSessionId: "my-session",
+    newSessionId: "forked-session"
+)
+</code></pre>
+<p><strong>delete</strong> — 删除整个会话目录：</p>
+<pre><code class="language-swift">let deleted = try await sessionStore.delete(sessionId: "my-session")
+</code></pre>
+<p>此外还有 <code>rename</code>（改标题）和 <code>tag</code>（打标签）两个辅助方法。</p>
+<h3 id="会话恢复的三种模式">会话恢复的三种模式</h3>
+<p>把 SessionStore 注入 Agent 后，SDK 提供三种恢复策略：</p>
+<p><strong>1. 指定 sessionId 恢复</strong></p>
+<p>最直接的方式：给定一个 session ID，Agent 启动时从 SessionStore 加载历史消息，追加到 messages 数组前面：</p>
+<pre><code class="language-swift">let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    sessionStore: sessionStore,
+    sessionId: "my-session"      // 指定恢复哪个 session
+))
+</code></pre>
+<p><strong>2. continueRecentSession — 自动接续最近的会话</strong></p>
+<p>不知道 session ID 时，让 SDK 自动找最近的一个：</p>
+<pre><code class="language-swift">let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    sessionStore: sessionStore,
+    continueRecentSession: true   // 自动加载最近的 session
+))
+</code></pre>
+<p>内部实现是调 <code>sessionStore.list()</code> 取第一个（已按 updatedAt 降序排列），把它的 ID 作为恢复目标。</p>
+<p><strong>3. forkSession + resumeSessionAt — 分叉并截断</strong></p>
+<p>在已有会话的基础上分叉一个新分支，还可以截断到指定消息：</p>
+<pre><code class="language-swift">let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    sessionStore: sessionStore,
+    sessionId: "my-session",
+    forkSession: true,                     // 复制到新 session
+    resumeSessionAt: "msg-uuid-123"        // 截断到这条消息
+))
+</code></pre>
+<p>SDK 内部的解析顺序是：先 <code>continueRecentSession</code> 确定 session ID，再 <code>forkSession</code> 创建分叉，再 <code>resumeSessionAt</code> 截断历史。这三个选项可以独立使用也可以组合。</p>
+<h3 id="sessionstore-的安全细节">SessionStore 的安全细节</h3>
+<p>SessionStore 在 session ID 校验上做了路径遍历防护：</p>
+<pre><code class="language-swift">private func validateSessionId(_ sessionId: String) throws {
+    guard !sessionId.isEmpty else {
+        throw SDKError.sessionError(message: "Session ID must not be empty")
+    }
+    let forbidden = ["/", "\\", ".."]
+    for component in forbidden {
+        if sessionId.contains(component) {
+            throw SDKError.sessionError(message: "Session ID contains invalid character: '\(component)'")
+        }
+    }
+}
+</code></pre>
+<p>session ID 里不能包含 <code>/</code>、<code>\</code>、<code>..</code>——防止攻击者通过构造 ID 来读写预期之外的路径。</p>
+<h2 id="二权限控制permissionpolicy">二、权限控制：PermissionPolicy</h2>
+<p>会话持久化解决了"记住"的问题，权限控制解决的是"能做什么"的问题。</p>
+<h3 id="六种-permissionmode">六种 PermissionMode</h3>
+<p>SDK 定义了 6 种权限模式：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>default</code></td>
+<td>每次工具执行前询问用户</td>
+</tr>
+<tr>
+<td><code>plan</code></td>
+<td>只读工具直接执行，写操作需要确认</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td>自动执行所有工具，危险操作除外</td>
+</tr>
+<tr>
+<td><code>acceptEdits</code></td>
+<td>文件编辑自动执行，其他操作需要确认</td>
+</tr>
+<tr>
+<td><code>dontAsk</code></td>
+<td>不询问用户，根据上下文自动判断</td>
+</tr>
+<tr>
+<td><code>bypassPermissions</code></td>
+<td>跳过所有权限检查</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-swift">let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    permissionMode: .plan  // 只读工具直接跑，写操作要确认
+))
+</code></pre>
+<h3 id="canusetool-回调比-permissionmode-更细粒度">canUseTool 回调：比 PermissionMode 更细粒度</h3>
+<p><code>permissionMode</code> 是全局开关，粒度比较粗。如果你需要按工具名称或工具属性做精细控制，用 <code>canUseTool</code> 回调：</p>
+<pre><code class="language-swift">let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    permissionMode: .bypassPermissions,
+    canUseTool: { tool, input, context in
+        if tool.name == "Bash" {
+            return CanUseToolResult.deny("Bash is not allowed")
+        }
+        return nil  // nil 表示"我没意见，交给 permissionMode 决定"
+    }
+))
+</code></pre>
+<p><code>canUseTool</code> 返回 <code>CanUseToolResult?</code>。返回 <code>nil</code> 表示该回调没有意见，交给下一个检查环节；返回非 nil 结果时，SDK 用回调的决定，不再看 <code>permissionMode</code>。</p>
+<p><code>CanUseToolResult</code> 有三个工厂方法：</p>
+<pre><code class="language-swift">CanUseToolResult.allow()                              // 允许
+CanUseToolResult.deny("原因")                          // 拒绝
+CanUseToolResult.allowWithInput(modifiedInput)         // 允许但修改输入参数
+</code></pre>
+<p><code>allowWithInput</code> 比较少见但很实用——你可以在权限检查时修改工具的输入参数。比如把文件写入路径重定向到安全目录。</p>
+<h3 id="策略模式可组合的权限规则">策略模式：可组合的权限规则</h3>
+<p>直接写闭包虽然灵活，但不方便复用。SDK 提供了 <code>PermissionPolicy</code> 协议，把权限判断封装成可组合的策略：</p>
+<pre><code class="language-swift">public protocol PermissionPolicy: Sendable {
+    func evaluate(
+        tool: ToolProtocol,
+        input: Any,
+        context: ToolContext
+    ) async -&gt; CanUseToolResult?
+}
+</code></pre>
+<p>SDK 内置了四个策略：</p>
+<p><strong>ToolNameAllowlistPolicy</strong> — 白名单，只允许指定的工具：</p>
+<pre><code class="language-swift">let policy = ToolNameAllowlistPolicy(allowedToolNames: ["Read", "Glob", "Grep"])
+// Write、Edit、Bash 等工具全部被拒绝
+</code></pre>
+<p><strong>ToolNameDenylistPolicy</strong> — 黑名单，拒绝指定的工具：</p>
+<pre><code class="language-swift">let policy = ToolNameDenylistPolicy(deniedToolNames: ["Bash", "Write"])
+// 其他工具正常执行
+</code></pre>
+<p><strong>ReadOnlyPolicy</strong> — 只允许只读工具（<code>isReadOnly == true</code>）：</p>
+<pre><code class="language-swift">let policy = ReadOnlyPolicy()
+// Read、Glob、Grep、WebSearch 等只读工具允许
+// Write、Edit、Bash 等变更工具被拒绝
+</code></pre>
+<p><strong>CompositePolicy</strong> — 组合多个策略，按顺序评估：</p>
+<pre><code class="language-swift">let policy = CompositePolicy(policies: [
+    ToolNameDenylistPolicy(deniedToolNames: ["Bash"]),
+    ReadOnlyPolicy()
+])
+// 先检查黑名单（Bash 被拒绝），再检查只读策略
+</code></pre>
+<p>CompositePolicy 的评估规则：</p>
+<ul>
+<li>任何子策略返回 deny，整体 deny（短路）</li>
+<li>子策略返回 nil（没意见），跳过</li>
+<li>所有子策略都 allow 或没意见，整体 allow</li>
+</ul>
+<p>用 <code>canUseTool(policy:)</code> 桥接函数把策略转成回调：</p>
+<pre><code class="language-swift">let policy = CompositePolicy(policies: [
+    ToolNameDenylistPolicy(deniedToolNames: ["Bash"]),
+    ReadOnlyPolicy()
+])
+
+let agent = createAgent(options: AgentOptions(
+    apiKey: apiKey,
+    model: "claude-sonnet-4-6",
+    permissionMode: .bypassPermissions,
+    canUseTool: canUseTool(policy: policy)
+))
+</code></pre>
+<h2 id="三沙盒机制sandboxsettings--sandboxchecker">三、沙盒机制：SandboxSettings + SandboxChecker</h2>
+<p>权限控制管的是"这个工具能不能执行"，沙盒管的是"这个操作在不在允许范围内"。比如 Bash 工具通过了权限检查，但你还得确保它不会 <code>rm -rf /</code>。</p>
+<h3 id="sandboxsettings-的配置项">SandboxSettings 的配置项</h3>
+<pre><code class="language-swift">let sandbox = SandboxSettings(
+    // 路径控制
+    allowedReadPaths: ["/project/"],
+    allowedWritePaths: ["/project/build/"],
+    deniedPaths: ["/etc/", "/var/"],
+
+    // 命令控制
+    deniedCommands: ["rm", "sudo"],           // 黑名单
+    // allowedCommands: ["git", "swift"],     // 白名单（和黑名单二选一）
+
+    // 行为控制
+    allowNestedSandbox: false,
+    autoAllowBashIfSandboxed: false,          // 沙箱激活时自动批准 Bash
+    allowUnsandboxedCommands: false,
+    enableWeakerNestedSandbox: false,
+
+    // 网络控制
+    network: SandboxNetworkConfig(
+        allowedDomains: ["api.example.com"],
+        allowLocalBinding: false
+    )
+)
+</code></pre>
+<p>路径和命令各有两种模式：</p>
+<ul>
+<li><strong>路径</strong>：<code>allowedReadPaths</code> / <code>allowedWritePaths</code> 是白名单（空数组=全部允许），<code>deniedPaths</code> 是黑名单（优先级更高）</li>
+<li><strong>命令</strong>：<code>allowedCommands</code> 是白名单（设为非 nil 就只允许列出的命令），<code>deniedCommands</code> 是黑名单。<code>allowedCommands</code> 优先级高于 <code>deniedCommands</code></li>
+</ul>
+<h3 id="sandboxchecker-的执行逻辑">SandboxChecker 的执行逻辑</h3>
+<p><code>SandboxChecker</code> 是一个无状态的枚举类，提供 <code>isPathAllowed</code>、<code>checkPath</code>、<code>isCommandAllowed</code>、<code>checkCommand</code> 四个静态方法。<code>isXxx</code> 返回 Bool，<code>checkXxx</code> 不通过时抛出 <code>SDKError.permissionDenied</code>。</p>
+<p><strong>路径检查</strong>用前缀匹配加段边界保证：</p>
+<pre><code class="language-swift">// /project/ 匹配 /project/src/file.swift
+// /project/ 不匹配 /project-backup/file.swift
+SandboxChecker.isPathAllowed("/project/src/main.swift", for: .read, settings: sandbox)
+// -&gt; true
+
+SandboxChecker.isPathAllowed("/project-backup/old.swift", for: .read, settings: sandbox)
+// -&gt; false（段边界不匹配）
+</code></pre>
+<p>实现关键在于 <code>SandboxPathNormalizer</code>——先把路径规范化（解析 <code>..</code>、<code>.</code>、symlink），再做前缀比较时保证尾部有 <code>/</code> 来强制段边界。</p>
+<pre><code class="language-swift">// 路径遍历攻击会被 normalize 掉
+let normalized = SandboxPathNormalizer.normalize("/project/src/../../etc/passwd")
+// -&gt; "/etc/passwd"，然后被 deniedPaths 拦截
+</code></pre>
+<p><strong>命令检查</strong>分三个阶段：</p>
+<ol>
+<li>Shell 元字符检测——识别 <code>bash -c "cmd"</code>、<code>$(cmd)</code>、<code>`cmd`</code> 等绕过模式</li>
+<li>Basename 提取——从 <code>/usr/bin/rm -rf /tmp</code> 提取出 <code>rm</code></li>
+<li>白名单/黑名单匹配</li>
+</ol>
+<pre><code class="language-swift">// 黑名单里有 "rm"
+SandboxChecker.isCommandAllowed("rm -rf /tmp", settings: blocklist)
+// -&gt; false
+
+// 路径形式的命令也能识别
+SandboxChecker.isCommandAllowed("/usr/bin/rm -rf /tmp", settings: blocklist)
+// -&gt; false（提取 basename 得到 "rm"）
+
+// 反斜杠绕过
+SandboxChecker.isCommandAllowed("\\rm -rf /tmp", settings: blocklist)
+// -&gt; false（去掉前导 \ 后得到 "rm"）
+
+// 引号绕过
+SandboxChecker.isCommandAllowed("\"rm\" -rf /tmp", settings: blocklist)
+// -&gt; false（去掉引号后得到 "rm"）
+
+// 子 shell 绕过
+SandboxChecker.isCommandAllowed("bash -c \"rm -rf /tmp\"", settings: blocklist)
+// -&gt; false（递归检查内部命令）
+</code></pre>
+<p>对于无法可靠解析的命令（比如多层嵌套的 <code>bash -c "bash -c 'rm ...'"</code>），默认拒绝。</p>
+<p>命令参数中的文件路径也会被提取并检查——如果命令里出现了 <code>deniedPaths</code> 中的路径，命令也会被拒绝。</p>
+<h3 id="autoallowbashifsandboxed">autoAllowBashIfSandboxed</h3>
+<p>这个选项是沙盒和权限系统的桥梁。当 <code>autoAllowBashIfSandboxed = true</code> 时，Bash 工具会跳过 <code>canUseTool</code> 权限回调检查，但仍然经过 <code>SandboxChecker.checkCommand()</code> 的命令过滤。</p>
+<p>设计思路是：如果你已经配了完善的沙盒规则，Bash 命令能做什么已经被限制住了，不需要再弹一次权限确认。</p>
+<h2 id="四hook-系统20-生命周期事件">四、Hook 系统：20+ 生命周期事件</h2>
+<p>前三个系统解决的是"能不能做"的问题，Hook 系统解决的是"做了之后要知道"和"做之前要干预"的问题。</p>
+<h3 id="20-个-hookevent">20+ 个 HookEvent</h3>
+<p>SDK 定义了 24 个生命周期事件：</p>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th>触发时机</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>preToolUse</code></td>
+<td>工具执行前</td>
+</tr>
+<tr>
+<td><code>postToolUse</code></td>
+<td>工具执行成功后</td>
+</tr>
+<tr>
+<td><code>postToolUseFailure</code></td>
+<td>工具执行失败后</td>
+</tr>
+<tr>
+<td><code>sessionStart</code></td>
+<td>Agent 会话开始</td>
+</tr>
+<tr>
+<td><code>sessionEnd</code></td>
+<td>Agent 会话结束</td>
+</tr>
+<tr>
+<td><code>stop</code></td>
+<td>Agent Loop 停止</td>
+</tr>
+<tr>
+<td><code>subagentStart</code></td>
+<td>子 Agent 启动</td>
+</tr>
+<tr>
+<td><code>subagentStop</code></td>
+<td>子 Agent 完成</td>
+</tr>
+<tr>
+<td><code>userPromptSubmit</code></td>
+<td>用户提交 prompt</td>
+</tr>
+<tr>
+<td><code>permissionRequest</code></td>
+<td>权限检查发生</td>
+</tr>
+<tr>
+<td><code>permissionDenied</code></td>
+<td>权限被拒绝</td>
+</tr>
+<tr>
+<td><code>taskCreated</code></td>
+<td>任务创建</td>
+</tr>
+<tr>
+<td><code>taskCompleted</code></td>
+<td>任务完成</td>
+</tr>
+<tr>
+<td><code>configChange</code></td>
+<td>配置变更</td>
+</tr>
+<tr>
+<td><code>cwdChanged</code></td>
+<td>工作目录变更</td>
+</tr>
+<tr>
+<td><code>fileChanged</code></td>
+<td>文件变更</td>
+</tr>
+<tr>
+<td><code>notification</code></td>
+<td>通知事件</td>
+</tr>
+<tr>
+<td><code>preCompact</code></td>
+<td>对话压缩前</td>
+</tr>
+<tr>
+<td><code>postCompact</code></td>
+<td>对话压缩后</td>
+</tr>
+<tr>
+<td><code>teammateIdle</code></td>
+<td>团队成员空闲</td>
+</tr>
+<tr>
+<td><code>setup</code></td>
+<td>Agent 初始化</td>
+</tr>
+<tr>
+<td><code>worktreeCreate</code></td>
+<td>工作树创建</td>
+</tr>
+<tr>
+<td><code>worktreeRemove</code></td>
+<td>工作树移除</td>
+</tr>
+</tbody>
+</table>
+<h3 id="函数-hook-vs-shell-hook">函数 Hook vs Shell Hook</h3>
+<p>Hook 有两种实现方式：函数回调和 Shell 命令。</p>
+<p><strong>函数 Hook</strong> — Swift 闭包，适合进程内逻辑：</p>
+<pre><code class="language-swift">await registry.register(.preToolUse, definition: HookDefinition(
+    handler: { input in
+        // input 是 HookInput，包含 event、toolName、toolInput、sessionId 等
+        return HookOutput(message: "拦截成功", block: true)
+    }
+))
+</code></pre>
+<p><strong>Shell Hook</strong> — 外部命令，适合集成非 Swift 脚本：</p>
+<pre><code class="language-swift">await registry.register(.preToolUse, definition: HookDefinition(
+    command: "python3 /path/to/check.py"  // HookInput 通过 stdin JSON 传入
+))
+</code></pre>
+<p>Shell Hook 通过 <code>ShellHookExecutor</code> 执行：用 <code>/bin/bash -c</code> 启动进程，把 <code>HookInput</code> 序列化为 JSON 写入 stdin，从 stdout 读取 <code>HookOutput</code> JSON。Shell 命令的标准输出如果不是合法 JSON，会被包装成 <code>HookOutput(message: stdout)</code>。</p>
+<p>Shell Hook 的环境变量里会注入 <code>HOOK_EVENT</code>、<code>HOOK_TOOL_NAME</code>、<code>HOOK_SESSION_ID</code>、<code>HOOK_CWD</code>，方便脚本直接用环境变量判断上下文。</p>
+<h3 id="hookregistry-的注册与执行">HookRegistry 的注册与执行</h3>
+<p><code>HookRegistry</code> 是一个 <code>actor</code>，内部维护 <code>[HookEvent: [HookDefinition]]</code> 映射：</p>
+<pre><code class="language-swift">let registry = HookRegistry()
+
+// 注册函数 Hook
+await registry.register(.preToolUse, definition: HookDefinition(
+    handler: { input in
+        return HookOutput(message: "Bash blocked", block: true)
+    },
+    matcher: "Bash"  // 只匹配 Bash 工具
+))
+
+// 注册 Shell Hook
+await registry.register(.postToolUse, definition: HookDefinition(
+    command: "/usr/bin/logger 'Tool executed'",
+    timeout: 5000  // 5 秒超时
+))
+
+// 执行所有注册在某事件上的 Hook
+let results = await registry.execute(.preToolUse, input: hookInput)
+// results: [HookOutput]，包含所有匹配的 Hook 的返回值
+</code></pre>
+<p><strong>matcher 过滤</strong>：每个 HookDefinition 可以设一个 <code>matcher</code>（正则表达式）。执行时先检查 <code>input.toolName</code> 是否匹配 matcher，不匹配就跳过这个 Hook。<code>matcher</code> 为 nil 时匹配所有工具。</p>
+<p><strong>超时处理</strong>：函数 Hook 用 <code>withThrowingTaskGroup</code> 实现超时——把实际执行和 <code>Task.sleep</code> 放在同一个 TaskGroup 里，谁先完成用谁。超时的 Hook 不影响其他 Hook 执行。Shell Hook 通过 <code>DispatchQueue.asyncAfter</code> 设置超时，到时间就 terminate 进程。</p>
+<p><strong>执行顺序</strong>：同一事件上的 Hook 按注册顺序串行执行。</p>
+<h3 id="hookoutput-的能力">HookOutput 的能力</h3>
+<p><code>HookOutput</code> 可以做这些事：</p>
+<pre><code class="language-swift">HookOutput(
+    message: "日志消息",                          // 附加信息
+    block: true,                                  // 拦截操作
+    notification: HookNotification(               // 发送通知
+        title: "警告",
+        body: "检测到危险操作",
+        level: .warning
+    ),
+    permissionUpdate: PermissionUpdate(           // 动态修改权限
+        tool: "Bash",
+        behavior: .deny
+    ),
+    systemMessage: "请在沙箱内操作",               // 注入系统消息
+    reason: "安全策略",                            // 拦截原因
+    updatedInput: ["command": "echo safe"],       // 修改工具输入
+    decision: .block                              // 显式 approve/block
+)
+</code></pre>
+<p>其中 <code>block: true</code> 会阻止工具执行，返回一个错误结果给 LLM。<code>permissionUpdate</code> 可以在 Hook 运行时动态修改工具权限。<code>updatedInput</code> 可以替换工具的输入参数。</p>
+<h2 id="五实战组合构建一个安全的-agent">五、实战组合：构建一个安全的 Agent</h2>
+<p>四个子系统各有分工：</p>
+<ul>
+<li><strong>SessionStore</strong> — 记住对话历史</li>
+<li><strong>PermissionPolicy</strong> — 控制工具能不能执行</li>
+<li><strong>SandboxSettings</strong> — 限制操作范围</li>
+<li><strong>HookRegistry</strong> — 审计和拦截</li>
+</ul>
+<p>下面用一个完整的例子展示怎么把它们组合起来：</p>
+<pre><code class="language-swift">import Foundation
+import OpenAgentSDK
+
+// 1. 创建 SessionStore
+let sessionStore = SessionStore()
+
+// 2. 创建 HookRegistry，注册审计和安全拦截
+let hookRegistry = HookRegistry()
+
+// 记录所有工具执行
+await hookRegistry.register(.postToolUse, definition: HookDefinition(
+    handler: { input in
+        if let toolName = input.toolName {
+            print("[审计] 工具 \(toolName) 执行完成")
+        }
+        return nil
+    }
+))
+
+// 拦截 Bash 中的危险命令
+await hookRegistry.register(.preToolUse, definition: HookDefinition(
+    handler: { input in
+        return HookOutput(
+            message: "Bash 被安全策略拦截",
+            block: true,
+            decision: .block
+        )
+    },
+    matcher: "Bash"
+))
+
+// 记录权限拒绝事件
+await hookRegistry.register(.permissionDenied, definition: HookDefinition(
+    handler: { input in
+        print("[安全告警] 权限被拒绝: \(input.error ?? "unknown")")
+        return nil
+    }
+))
+
+// 会话生命周期追踪
+await hookRegistry.register(.sessionStart, definition: HookDefinition(
+    handler: { _ in print("[会话] 开始"); return nil }
+))
+await hookRegistry.register(.sessionEnd, definition: HookDefinition(
+    handler: { _ in print("[会话] 结束"); return nil }
+))
+
+// 3. 配置沙盒：限制路径和命令
+let sandbox = SandboxSettings(
+    allowedReadPaths: ["/project/"],
+    allowedWritePaths: ["/project/src/", "/project/tests/"],
+    deniedPaths: ["/etc/", "/var/", "/tmp/"],
+    deniedCommands: ["rm", "sudo", "chmod", "chown"],
+    autoAllowBashIfSandboxed: false,
+    allowNestedSandbox: false
+)
+
+// 4. 配置权限策略：只读 + 排除 Bash
+let policy = CompositePolicy(policies: [
+    ToolNameDenylistPolicy(deniedToolNames: ["Bash"]),
+    ReadOnlyPolicy()
+])
+
+// 5. 创建 Agent，注入所有组件
+let agent = createAgent(options: AgentOptions(
+    apiKey: "sk-...",
+    model: "claude-sonnet-4-6",
+    systemPrompt: "你是一个代码分析助手。只能读取文件，不能修改。",
+    maxTurns: 10,
+    permissionMode: .bypassPermissions,
+    canUseTool: canUseTool(policy: policy),
+    sessionStore: sessionStore,
+    sessionId: "analysis-session",
+    hookRegistry: hookRegistry,
+    sandbox: sandbox
+))
+
+// 6. 执行查询
+let result = await agent.prompt("分析项目中的 Swift 源文件结构")
+print(result.text)
+
+// 7. 后续恢复会话
+let resumedAgent = createAgent(options: AgentOptions(
+    apiKey: "sk-...",
+    model: "claude-sonnet-4-6",
+    permissionMode: .bypassPermissions,
+    canUseTool: canUseTool(policy: policy),
+    sessionStore: sessionStore,
+    sessionId: "analysis-session",  // 同一个 session ID，自动恢复历史
+    hookRegistry: hookRegistry,
+    sandbox: sandbox
+))
+
+let continued = await resumedAgent.prompt("继续分析测试文件")
+print(continued.text)
+</code></pre>
+<p>这个 Agent 的安全特性：</p>
+<ul>
+<li><strong>权限层</strong>：CompositePolicy 确保只有只读工具能执行，Bash 被黑名单排除</li>
+<li><strong>沙盒层</strong>：即使工具通过了权限检查，也受路径限制——只能读 <code>/project/</code> 下的文件，不能碰 <code>/etc/</code>、<code>/var/</code></li>
+<li><strong>Hook 层</strong>：所有工具执行被记录（审计），Bash 调用被 preToolUse Hook 二次拦截</li>
+<li><strong>会话层</strong>：对话自动保存和恢复，重启后能继续之前的工作</li>
+</ul>
+<p>多层防御的好处是：即使某一层的配置有疏漏，其他层还能兜底。比如你误把 Bash 加进了白名单，Hook 的 matcher 还能拦截；即使 Hook 没拦住，沙盒的命令过滤还能挡。</p>
+<h2 id="小结">小结</h2>
+<p>SessionStore、PermissionPolicy、SandboxSettings、HookRegistry 四个系统各管一件事，但组合起来就是一套完整的安全框架：</p>
+<ul>
+<li>SessionStore 的 actor 隔离和 session ID 校验保证了存储安全</li>
+<li>PermissionPolicy 的策略组合提供了灵活的权限管理</li>
+<li>SandboxChecker 的路径规范化和段边界匹配防止目录穿越</li>
+<li>HookRegistry 的 matcher 过滤和超时机制确保了 Hook 系统的可靠性</li>
+</ul>
+<p>下一篇看 SDK 的 <strong>多 LLM 提供商</strong>：怎么同时支持 Anthropic、OpenAI 和其他 LLM，Provider 协议的设计，以及运行时切换模型的机制。</p>
+<hr>
+<p><strong>GitHub</strong>：<a href="https://github.com/terryso/open-agent-sdk-swift" target="_blank" rel="noopener nofollow">terryso/open-agent-sdk-swift</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-04-29 11:43">2026-04-29 11:42</span>&nbsp;
+<a href="https://www.cnblogs.com/NickYao">四眼蒙面侠</a>&nbsp;
+阅读(<span id="post_view_count">123</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19950702);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FNickYao%2Fp%2F19950702&amp;targetId=19950702&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
