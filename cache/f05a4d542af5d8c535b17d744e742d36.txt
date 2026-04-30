@@ -1,0 +1,348 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Marktowin/p/19956970" title="发布于 2026-04-30 11:45">
+    <span role="heading" aria-level="2">记录一个支付回调处理失败问题的场景</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p id="支付宝异步回调-body-丢失问题分析" class="atx">&nbsp;影响范围：<code>application/x-www-form-urlencoded</code> 类型的回调接口</p>
+<p>关联代码：支付回调、切面处理流程<code><br></code></p>
+<hr>
+<h2 id="一、问题现象" class="atx">一、问题现象</h2>
+<p>线上多个支付平台的异步通知到达后，控制器拿不到任何参数，直接返回 <code>failure</code>，依靠回调支付状态无法落库，流程最后依赖主动验单落库。</p>
+<p><strong>初次故障日志</strong>：</p>
+<pre><code class="fenced-code-block">INFO  aspect.RequestLogAspect : param: arg0=RequestFacade@7567055
+WARN  c.d.PaymentWebhook : pay notify: empty params, contentType=application/x-www-form-urlencoded; charset=UTF-8, charEncoding=UTF-8, queryString=null
+WARN  c.d.PaymentWebhook : pay notify: raw body=[unreadable body: IllegalStateException]</code></pre>
+<p><strong>加了诊断日志后的日志</strong>（关键信息更完整）：</p>
+<pre><code class="fenced-code-block">INFO  aspect.RequestLogAspect  : param: arg0=RequestFacade@7659b067
+WARN  c.d.PaymentWebhook : pay notify: 请求体已被消费 (IllegalStateException)，无法再次读取: getInputStream() has already been called for this request
+WARN  </code><code class="fenced-code-block">c.d.PaymentWebhook </code><code class="fenced-code-block">: pay notify: empty params, contentType=application/x-www-form-urlencoded; charset=UTF-8, charEncoding=UTF-8, contentLength=1198, queryString=null, bodyLen=-1 WARN c.d.i.c.w.PointsPaymentWebhookController : Alipay notify: raw body=null</code></pre>
+<p>关键信号：</p>
+<table>
+<thead>
+<tr><th>字段</th><th>值</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><code>contentLength</code></td>
+<td>1156</td>
+<td>支付宝<strong>确实</strong>发了 1156 字节的 body</td>
+</tr>
+<tr>
+<td><code>queryString</code></td>
+<td>null</td>
+<td>没有走 query string</td>
+</tr>
+<tr>
+<td><code>bodyLen</code></td>
+<td>-1</td>
+<td>控制器读 body 时 <code>getReader()</code> 抛了 <code>IllegalStateException</code></td>
+</tr>
+<tr>
+<td>异常信息</td>
+<td><code>getInputStream() has already been called for this request</code></td>
+<td><strong>在控制器执行之前</strong>，请求体已经被人读光</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论</strong>：body 在到达控制器之前就被消费掉了。</p>
+<hr>
+<h2 id="二、根因分析" class="atx">二、根因分析</h2>
+<h3 id="21-谁在控制器之前读了-body？" class="atx">2.1 谁在控制器之前读了 body？</h3>
+<p>可疑链路：</p>
+<pre><code class="fenced-code-block">[Tomcat] → [CorsFilter] → [Interceptor] → [RequestLogAspect] → [Controller]</code></pre>
+<p>逐个排查：</p>
+<ul>
+<li><strong>CorsFilter</strong>：只看 origin/method 这类 header，不读 body；</li>
+<li><strong>JwtTokenUserInterceptor</strong>：回调接口已经在 <code>WebMvcConfiguration</code> 中通过 <code>excludePathPatterns</code> 排除掉，不会执行；</li>
+<li><strong>RequestLogAspect</strong>：注释 <code>@Around("execution(public * com.hello.marktowin.controller..*.*(..))")</code> 表明它会拦截所有 controller 方法，<strong>会先于业务代码执行</strong>。</li>
+</ul>
+<p>切入点找到了 → <code>RequestLogAspect</code>。</p>
+<h3 id="22-切面到底做了什么" class="atx">2.2 切面到底做了什么</h3>
+<p>切面逻辑核心两段：</p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)"> 1</span> <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 1) 从 ProceedingJoinPoint 拿到 controller 入参</span>
+<span style="color: rgba(0, 128, 128, 1)"> 2</span> Object[] args =<span style="color: rgba(0, 0, 0, 1)"> joinPoint.getArgs();
+</span><span style="color: rgba(0, 128, 128, 1)"> 3</span> Map&lt;String, Object&gt; paramMap =<span style="color: rgba(0, 0, 0, 1)"> buildParameterMap(paramNames, args);
+</span><span style="color: rgba(0, 128, 128, 1)"> 4</span> 
+<span style="color: rgba(0, 128, 128, 1)"> 5</span> <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 2) buildParameterMap 中过滤"servlet 对象"</span>
+<span style="color: rgba(0, 128, 128, 1)"> 6</span> <span style="color: rgba(0, 0, 255, 1)">private</span> Map&lt;String, Object&gt;<span style="color: rgba(0, 0, 0, 1)"> buildParameterMap(String[] paramNames, Object[] args) {
+</span><span style="color: rgba(0, 128, 128, 1)"> 7</span>     Map&lt;String, Object&gt; paramMap = <span style="color: rgba(0, 0, 255, 1)">new</span> HashMap&lt;&gt;<span style="color: rgba(0, 0, 0, 1)">();
+</span><span style="color: rgba(0, 128, 128, 1)"> 8</span>     <span style="color: rgba(0, 0, 255, 1)">for</span> (<span style="color: rgba(0, 0, 255, 1)">int</span> i = 0; i &lt; paramNames.length &amp;&amp; i &lt; args.length; i++<span style="color: rgba(0, 0, 0, 1)">) {
+</span><span style="color: rgba(0, 128, 128, 1)"> 9</span>         Object arg =<span style="color: rgba(0, 0, 0, 1)"> args[i];
+</span><span style="color: rgba(0, 128, 128, 1)">10</span>         <span style="color: rgba(0, 0, 255, 1)">if</span> (arg != <span style="color: rgba(0, 0, 255, 1)">null</span> &amp;&amp; !<span style="color: rgba(0, 0, 0, 1)">isServletObject(arg)) {
+</span><span style="color: rgba(0, 128, 128, 1)">11</span> <span style="color: rgba(0, 0, 0, 1)">            paramMap.put(paramNames[i], processParameterData(arg));
+</span><span style="color: rgba(0, 128, 128, 1)">12</span> <span style="color: rgba(0, 0, 0, 1)">        }
+</span><span style="color: rgba(0, 128, 128, 1)">13</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)">14</span>     <span style="color: rgba(0, 0, 255, 1)">return</span><span style="color: rgba(0, 0, 0, 1)"> paramMap;
+</span><span style="color: rgba(0, 128, 128, 1)">15</span> <span style="color: rgba(0, 0, 0, 1)">}
+</span><span style="color: rgba(0, 128, 128, 1)">16</span> 
+<span style="color: rgba(0, 128, 128, 1)">17</span> <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 3) processParameterData 用 Jackson 把对象转成 JSON 字符串后写入日志</span>
+<span style="color: rgba(0, 128, 128, 1)">18</span> <span style="color: rgba(0, 0, 255, 1)">private</span><span style="color: rgba(0, 0, 0, 1)"> Object processParameterData(Object obj) {
+</span><span style="color: rgba(0, 128, 128, 1)">19</span>     <span style="color: rgba(0, 0, 255, 1)">try</span><span style="color: rgba(0, 0, 0, 1)"> {
+</span><span style="color: rgba(0, 128, 128, 1)">20</span>         ObjectMapper objectMapper = <span style="color: rgba(0, 0, 255, 1)">new</span><span style="color: rgba(0, 0, 0, 1)"> ObjectMapper();
+</span><span style="color: rgba(0, 128, 128, 1)">21</span>         String jsonStr =<span style="color: rgba(0, 0, 0, 1)"> objectMapper.writeValueAsString(obj);
+</span><span style="color: rgba(0, 128, 128, 1)">22</span>         <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> ...</span>
+<span style="color: rgba(0, 128, 128, 1)">23</span>         <span style="color: rgba(0, 0, 255, 1)">return</span><span style="color: rgba(0, 0, 0, 1)"> jsonStr;
+</span><span style="color: rgba(0, 128, 128, 1)">24</span>     } <span style="color: rgba(0, 0, 255, 1)">catch</span><span style="color: rgba(0, 0, 0, 1)"> (Exception e) {
+</span><span style="color: rgba(0, 128, 128, 1)">25</span>         <span style="color: rgba(0, 0, 255, 1)">return</span> obj.getClass().getSimpleName() + "@" +<span style="color: rgba(0, 0, 0, 1)"> Integer.toHexString(obj.hashCode());
+</span><span style="color: rgba(0, 128, 128, 1)">26</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)">27</span> }</pre>
+</div>
+<p>只要 <code>isServletObject</code> 漏判，<code>HttpServletRequest</code> 就会被丢给 Jackson 序列化。Jackson 序列化方式是<strong>反射调用所有 <code>getXxx()</code> 方法</strong>，其中包括：</p>
+<ul>
+<li><code>getInputStream()</code></li>
+<li><code>getReader()</code></li>
+<li><code>getParameterMap()</code></li>
+<li>...</li>
+</ul>
+<p>第一个被反射调用的"流型 getter"会<strong>消费 InputStream</strong>，body 就此丢失。</p>
+<h3 id="23-致命的-isservletobject" class="atx">2.3&nbsp;&nbsp;<code>isServletObject的原因</code></h3>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)">1</span> <span style="color: rgba(0, 0, 255, 1)">private</span> <span style="color: rgba(0, 0, 255, 1)">boolean</span><span style="color: rgba(0, 0, 0, 1)"> isServletObject(Object obj) {
+</span><span style="color: rgba(0, 128, 128, 1)">2</span>     String className =<span style="color: rgba(0, 0, 0, 1)"> obj.getClass().getName();
+</span><span style="color: rgba(0, 128, 128, 1)">3</span>     <span style="color: rgba(0, 0, 255, 1)">return</span> className.contains("javax.servlet") || 
+<span style="color: rgba(0, 128, 128, 1)">4</span>            className.contains("jakarta.servlet") ||
+<span style="color: rgba(0, 128, 128, 1)">5</span>            className.contains("org.springframework.web") ||
+<span style="color: rgba(0, 128, 128, 1)">6</span>            className.contains("org.springframework.ui"<span style="color: rgba(0, 0, 0, 1)">);
+</span><span style="color: rgba(0, 128, 128, 1)">7</span> }</pre>
+</div>
+<p>这段判断<strong>漏掉了关键的实现类包名</strong>：</p>
+<table>
+<thead>
+<tr><th>容器</th><th><code>HttpServletRequest</code> 实现类</th><th>实现类包名</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>Tomcat（本项目）</td>
+<td><code>RequestFacade</code></td>
+<td><code>org.apache.catalina.connector</code></td>
+</tr>
+<tr>
+<td>Jetty</td>
+<td><code>Request</code></td>
+<td><code>org.eclipse.jetty.server</code></td>
+</tr>
+<tr>
+<td>Undertow</td>
+<td><code>HttpServletRequestImpl</code></td>
+<td><code>io.undertow.servlet.spec</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>HttpServletRequest</code> 这个<strong>接口</strong>确实在 <code>jakarta.servlet.http</code> 包下，但容器里跑的是它的<strong>实现类</strong>，包名跟 servlet 完全无关。<code>contains("jakarta.servlet")</code> 一个都命中不了。</p>
+<p>→ <code>isServletObject(RequestFacade)</code> 错误地返回 <code>false</code><br>→ <code>RequestFacade</code> 被丢给 Jackson<br>→ Jackson 反射 <code>getInputStream()</code> 把 body 读光<br>→ Jackson 中途抛 <code>IOException</code> 被 catch，fallback 到 <code>RequestFacade@7659b067</code>（这就是日志里那一行的来源）<br>→ 控制器再调 <code>getReader()</code> → <code>IllegalStateException</code><br>→ 控制器再调 <code>getParameterMap()</code> → Tomcat 检测到 <code>usingInputStream=true</code>，跳过 form 解析，返回空表</p>
+<h3 id="24-控制器侧的次要问题" class="atx">2.4 控制器侧的次要问题</h3>
+<p>切面 bug 是主因，但控制器自己也不够健壮：</p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)"> 1</span> @PostMapping(value = "/webhook", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE, produces =<span style="color: rgba(0, 0, 0, 1)"> MediaType.TEXT_PLAIN_VALUE)
+</span><span style="color: rgba(0, 128, 128, 1)"> 2</span> <span style="color: rgba(0, 0, 255, 1)">public</span><span style="color: rgba(0, 0, 0, 1)"> String webhook(HttpServletRequest request) {
+</span><span style="color: rgba(0, 128, 128, 1)"> 3</span>     Map&lt;String, String&gt; params =<span style="color: rgba(0, 0, 0, 1)"> flattenParams(request.getParameterMap());
+</span><span style="color: rgba(0, 128, 128, 1)"> 4</span>     <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> ...</span>
+<span style="color: rgba(0, 128, 128, 1)"> 5</span>     <span style="color: rgba(0, 0, 255, 1)">if</span><span style="color: rgba(0, 0, 0, 1)"> (params.isEmpty()) {
+</span><span style="color: rgba(0, 128, 128, 1)"> 6</span>         <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 这里再去 getReader() 必抛 IllegalStateException</span>
+<span style="color: rgba(0, 128, 128, 1)"> 7</span>         log.warn("Alipay notify: raw body={}"<span style="color: rgba(0, 0, 0, 1)">, readRequestBodySafe(request));
+</span><span style="color: rgba(0, 128, 128, 1)"> 8</span>         <span style="color: rgba(0, 0, 255, 1)">return</span> "failure"<span style="color: rgba(0, 0, 0, 1)">;
+</span><span style="color: rgba(0, 128, 128, 1)"> 9</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)">10</span> }</pre>
+</div>
+<p>两个隐患：</p>
+<ol>
+<li><strong>强依赖容器隐式 form 解析</strong>：调用 <code>request.getParameterMap()</code> 之后就再也无法 <code>getReader()</code>，一旦 Tomcat 没解析出参数（任何原因），排查信息全部丢失；</li>
+<li><strong>诊断兜底无法工作</strong>：本意是"参数空时打印原始 body 帮助排查"，实际上只能打印 <code>[unreadable body: IllegalStateException]</code>。</li>
+</ol><hr>
+<h2 id="三、修复方案对比" class="atx">三、修复方案对比</h2>
+<h3 id="方式-1：仿照-payment-service--在控制器加一个andquot哑形参andquot提前触发-form-解析" class="atx">方式 1： 在控制器加一个"哑形参"提前触发 form 解析</h3>
+<p>只动控制器一行：</p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)">1</span> @PostMapping(value = "/webhook", produces =<span style="color: rgba(0, 0, 0, 1)"> MediaType.TEXT_PLAIN_VALUE)
+</span><span style="color: rgba(0, 128, 128, 1)">2</span> <span style="color: rgba(0, 0, 255, 1)">public</span> String webhook(HttpServletRequest request, @RequestBody(required = <span style="color: rgba(0, 0, 255, 1)">false</span><span style="color: rgba(0, 0, 0, 1)">) String body) {
+</span><span style="color: rgba(0, 128, 128, 1)">3</span>     <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> body 实际不用，但它的存在让 Spring 提前调 getParameterMap()</span>
+<span style="color: rgba(0, 128, 128, 1)">4</span>     Map&lt;String, String&gt; params =<span style="color: rgba(0, 0, 0, 1)"> flattenParams(request.getParameterMap());
+</span><span style="color: rgba(0, 128, 128, 1)">5</span>     <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> ... 后续逻辑保持不变</span>
+<span style="color: rgba(0, 128, 128, 1)">6</span> }</pre>
+</div>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>改动极小，不需要动切面；</li>
+</ul>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li><strong>本质是利用 Spring 的副作用</strong>，在代码里看不出来 <code>body</code> 形参为啥要存在，有可能被 review 时会觉得没用顺手删掉；</li>
+<li><strong>切面的根因 bug 没修</strong>，所有不带 <code>@RequestBody</code> 形参的控制器（webhook 之外的接口）依然有"body 被切面读光"的隐患；</li>
+</ul>
+<p><strong>原理：</strong></p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)">1</span> @PostMapping("/webhook"<span style="color: rgba(0, 0, 0, 1)">)
+</span><span style="color: rgba(0, 128, 128, 1)">2</span> <span style="color: rgba(0, 0, 255, 1)">public</span> ResponseEntity&lt;String&gt;<span style="color: rgba(0, 0, 0, 1)"> webhook(@PathVariable String payChannel,
+</span><span style="color: rgba(0, 128, 128, 1)">3</span> <span style="color: rgba(0, 0, 0, 1)">                                     HttpServletRequest request,
+</span><span style="color: rgba(0, 128, 128, 1)">4</span>                                      @RequestBody(required = <span style="color: rgba(0, 0, 255, 1)">false</span>) String body) {</pre>
+</div>
+<p>这里多一个 @RequestBody(required = false) String body 形参。可以触发 Spring 的一段救命代码：</p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)">1</span> <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> org.springframework.http.server.ServletServerHttpRequest#getBody</span>
+<span style="color: rgba(0, 128, 128, 1)">2</span> <span style="color: rgba(0, 0, 0, 1)">@Override
+</span><span style="color: rgba(0, 128, 128, 1)">3</span> <span style="color: rgba(0, 0, 255, 1)">public</span> InputStream getBody() <span style="color: rgba(0, 0, 255, 1)">throws</span><span style="color: rgba(0, 0, 0, 1)"> IOException {
+</span><span style="color: rgba(0, 128, 128, 1)">4</span>     <span style="color: rgba(0, 0, 255, 1)">if</span> (isFormPost(<span style="color: rgba(0, 0, 255, 1)">this</span><span style="color: rgba(0, 0, 0, 1)">.servletRequest)) {
+</span><span style="color: rgba(0, 128, 128, 1)">5</span>         <span style="color: rgba(0, 0, 255, 1)">return</span> getBodyFromServletRequestParameters(<span style="color: rgba(0, 0, 255, 1)">this</span><span style="color: rgba(0, 0, 0, 1)">.servletRequest);
+</span><span style="color: rgba(0, 128, 128, 1)">6</span>     } <span style="color: rgba(0, 0, 255, 1)">else</span><span style="color: rgba(0, 0, 0, 1)"> {
+</span><span style="color: rgba(0, 128, 128, 1)">7</span>         <span style="color: rgba(0, 0, 255, 1)">return</span> <span style="color: rgba(0, 0, 255, 1)">this</span><span style="color: rgba(0, 0, 0, 1)">.servletRequest.getInputStream();
+</span><span style="color: rgba(0, 128, 128, 1)">8</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)">9</span> }</pre>
+</div>
+<p>当 Content-Type=application/x-www-form-urlencoded + method=POST 时，isFormPost() 返回 true，进入 getBodyFromServletRequestParameters 分支，它会先调用一次 request.getParameterMap() 让 Tomcat 把 body 解析进参数表并缓存，再把参数表反向拼成一段 InputStream 喂给 @RequestBody String body。</p>
+<p><strong>执行顺序：</strong></p>
+<div class="cnblogs_Highlighter">
+<pre class="brush:java;gutter:false;">1. Spring 解析 @RequestBody String body
+　　 isFormPost == true
+　　 request.getParameterMap() ← 关键：参数被 Tomcat 缓存
+　　 反向拼一个 InputStream 给 body 用
+2. RequestLogAspect 跑起来
+　　 Jackson 反射 RequestFacade.getInputStream() ← 这次抛异常被吞掉，但参数表已缓存
+3. controller.notify() 跑起来
+　　 request.getParameterMap() ← 直接命中第 1 步的缓存，正常拿到所有参数
+　　 controller 的 @RequestBody String body 在不经意间提前触发了 Tomcat 的 form 解析，把切面的 bug 给挡住了。 但哪天有人觉得 body 没被使用把它删了，回调立刻出现问题。</pre>
+</div>
+<p>适用于：<strong>只想用最小代价让某个接口立刻恢复，不打算做系统性修复</strong>。</p>
+<h3 id="方式-2：本次采用的修复--切面治根--控制器治标" class="atx">方式 2：切面治根 + 控制器治标</h3>
+<h4 id="21-切面治根" class="atx">2.1 切面治根</h4>
+<p>修改文件：</p>
+<ul>
+<li><code>aspect/RequestLogAspect.java</code></li>
+</ul>
+<p>把基于"包名子串"的判断改成基于"接口 instanceof"的判断：</p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)"> 1</span> <span style="color: rgba(0, 0, 255, 1)">private</span> <span style="color: rgba(0, 0, 255, 1)">boolean</span><span style="color: rgba(0, 0, 0, 1)"> isServletObject(Object obj) {
+</span><span style="color: rgba(0, 128, 128, 1)"> 2</span>     <span style="color: rgba(0, 0, 255, 1)">if</span> (obj <span style="color: rgba(0, 0, 255, 1)">instanceof</span><span style="color: rgba(0, 0, 0, 1)"> ServletRequest
+</span><span style="color: rgba(0, 128, 128, 1)"> 3</span>             || obj <span style="color: rgba(0, 0, 255, 1)">instanceof</span><span style="color: rgba(0, 0, 0, 1)"> ServletResponse
+</span><span style="color: rgba(0, 128, 128, 1)"> 4</span>             || obj <span style="color: rgba(0, 0, 255, 1)">instanceof</span><span style="color: rgba(0, 0, 0, 1)"> HttpSession
+</span><span style="color: rgba(0, 128, 128, 1)"> 5</span>             || obj <span style="color: rgba(0, 0, 255, 1)">instanceof</span><span style="color: rgba(0, 0, 0, 1)"> MultipartFile
+</span><span style="color: rgba(0, 128, 128, 1)"> 6</span>             || obj <span style="color: rgba(0, 0, 255, 1)">instanceof</span><span style="color: rgba(0, 0, 0, 1)"> Model) {
+</span><span style="color: rgba(0, 128, 128, 1)"> 7</span>         <span style="color: rgba(0, 0, 255, 1)">return</span> <span style="color: rgba(0, 0, 255, 1)">true</span><span style="color: rgba(0, 0, 0, 1)">;
+</span><span style="color: rgba(0, 128, 128, 1)"> 8</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)"> 9</span>     String className =<span style="color: rgba(0, 0, 0, 1)"> obj.getClass().getName();
+</span><span style="color: rgba(0, 128, 128, 1)">10</span>     <span style="color: rgba(0, 0, 255, 1)">return</span> className.startsWith("jakarta.servlet"<span style="color: rgba(0, 0, 0, 1)">)
+</span><span style="color: rgba(0, 128, 128, 1)">11</span>             || className.startsWith("javax.servlet"<span style="color: rgba(0, 0, 0, 1)">)
+</span><span style="color: rgba(0, 128, 128, 1)">12</span>             || className.startsWith("org.apache.catalina"<span style="color: rgba(0, 0, 0, 1)">)
+</span><span style="color: rgba(0, 128, 128, 1)">13</span>             || className.startsWith("org.springframework.web"<span style="color: rgba(0, 0, 0, 1)">)
+</span><span style="color: rgba(0, 128, 128, 1)">14</span>             || className.startsWith("org.springframework.ui"<span style="color: rgba(0, 0, 0, 1)">);
+</span><span style="color: rgba(0, 128, 128, 1)">15</span> }</pre>
+</div>
+<p>修复点：</p>
+<table>
+<thead>
+<tr><th>修复项</th><th>原来</th><th>现在</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>容器实现类识别</td>
+<td>不认识 <code>RequestFacade</code></td>
+<td><code>instanceof ServletRequest</code> 直接命中</td>
+</tr>
+<tr>
+<td>误判风险</td>
+<td><code>contains</code> 子串可能误伤业务包</td>
+<td><code>startsWith</code> 包前缀精准匹配</td>
+</tr>
+<tr>
+<td>覆盖范围</td>
+<td>漏掉 <code>HttpSession</code>、<code>MultipartFile</code>、<code>Model</code></td>
+<td>全部覆盖</td>
+</tr>
+<tr>
+<td>容器无关性</td>
+<td>强依赖 Tomcat/Spring 包名</td>
+<td>任意容器实现都被接口判断兜住</td>
+</tr>
+</tbody>
+</table>
+<h4 id="22-控制器治标" class="atx">2.2 控制器治标</h4>
+<p>修改文件：<code>PaymentWebhook.java</code></p>
+<div class="cnblogs_code">
+<pre><span style="color: rgba(0, 128, 128, 1)"> 1</span> @PostMapping(value = "/webhook", produces =<span style="color: rgba(0, 0, 0, 1)"> MediaType.TEXT_PLAIN_VALUE)
+</span><span style="color: rgba(0, 128, 128, 1)"> 2</span> <span style="color: rgba(0, 0, 255, 1)">public</span><span style="color: rgba(0, 0, 0, 1)"> String webhook(HttpServletRequest request) {
+</span><span style="color: rgba(0, 128, 128, 1)"> 3</span>     String contentType =<span style="color: rgba(0, 0, 0, 1)"> request.getContentType();
+</span><span style="color: rgba(0, 128, 128, 1)"> 4</span>     String charEncoding =<span style="color: rgba(0, 0, 0, 1)"> request.getCharacterEncoding();
+</span><span style="color: rgba(0, 128, 128, 1)"> 5</span>     String queryString =<span style="color: rgba(0, 0, 0, 1)"> request.getQueryString();
+</span><span style="color: rgba(0, 128, 128, 1)"> 6</span>     <span style="color: rgba(0, 0, 255, 1)">int</span> contentLength =<span style="color: rgba(0, 0, 0, 1)"> request.getContentLength();
+</span><span style="color: rgba(0, 128, 128, 1)"> 7</span> 
+<span style="color: rgba(0, 128, 128, 1)"> 8</span>     <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 第一步：先读原始 body 字符串，留作排查日志用</span>
+<span style="color: rgba(0, 128, 128, 1)"> 9</span>     String rawBody =<span style="color: rgba(0, 0, 0, 1)"> readRawBody(request);
+</span><span style="color: rgba(0, 128, 128, 1)">10</span> 
+<span style="color: rgba(0, 128, 128, 1)">11</span>     <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 第二步：手动 URL-decode 解析 form，不依赖容器隐式 form 解析</span>
+<span style="color: rgba(0, 128, 128, 1)">12</span>     Map&lt;String, String&gt; params = <span style="color: rgba(0, 0, 255, 1)">new</span> HashMap&lt;&gt;<span style="color: rgba(0, 0, 0, 1)">();
+</span><span style="color: rgba(0, 128, 128, 1)">13</span>     <span style="color: rgba(0, 0, 255, 1)">if</span> (queryString != <span style="color: rgba(0, 0, 255, 1)">null</span> &amp;&amp; !<span style="color: rgba(0, 0, 0, 1)">queryString.isEmpty()) {
+</span><span style="color: rgba(0, 128, 128, 1)">14</span>         params.putAll(parseUrlEncoded(queryString, "UTF-8"<span style="color: rgba(0, 0, 0, 1)">));
+</span><span style="color: rgba(0, 128, 128, 1)">15</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)">16</span>     <span style="color: rgba(0, 0, 255, 1)">if</span> (rawBody != <span style="color: rgba(0, 0, 255, 1)">null</span> &amp;&amp; !<span style="color: rgba(0, 0, 0, 1)">rawBody.isEmpty()) {
+</span><span style="color: rgba(0, 128, 128, 1)">17</span> <span style="color: rgba(0, 0, 0, 1)">        params.putAll(parseUrlEncoded(rawBody,
+</span><span style="color: rgba(0, 128, 128, 1)">18</span>                 charEncoding != <span style="color: rgba(0, 0, 255, 1)">null</span> &amp;&amp; !charEncoding.isBlank() ? charEncoding : "UTF-8"<span style="color: rgba(0, 0, 0, 1)">));
+</span><span style="color: rgba(0, 128, 128, 1)">19</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)">20</span> 
+<span style="color: rgba(0, 128, 128, 1)">21</span>     <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 第三步：诊断信息更完整</span>
+<span style="color: rgba(0, 128, 128, 1)">22</span>     <span style="color: rgba(0, 0, 255, 1)">if</span><span style="color: rgba(0, 0, 0, 1)"> (params.isEmpty()) {
+</span><span style="color: rgba(0, 128, 128, 1)">23</span>         log.warn("Alipay notify: empty params, contentType={}, charEncoding={}, contentLength={}, queryString={}, bodyLen={}"<span style="color: rgba(0, 0, 0, 1)">,
+</span><span style="color: rgba(0, 128, 128, 1)">24</span> <span style="color: rgba(0, 0, 0, 1)">                contentType, charEncoding, contentLength, queryString,
+</span><span style="color: rgba(0, 128, 128, 1)">25</span>                 rawBody != <span style="color: rgba(0, 0, 255, 1)">null</span> ? rawBody.length() : -1<span style="color: rgba(0, 0, 0, 1)">);
+</span><span style="color: rgba(0, 128, 128, 1)">26</span>         log.warn("Alipay notify: raw body={}", abbreviate(rawBody, 4000<span style="color: rgba(0, 0, 0, 1)">));
+</span><span style="color: rgba(0, 128, 128, 1)">27</span>         <span style="color: rgba(0, 0, 255, 1)">return</span> "failure"<span style="color: rgba(0, 0, 0, 1)">;
+</span><span style="color: rgba(0, 128, 128, 1)">28</span> <span style="color: rgba(0, 0, 0, 1)">    }
+</span><span style="color: rgba(0, 128, 128, 1)">29</span>     <span style="color: rgba(0, 128, 0, 1)">//</span><span style="color: rgba(0, 128, 0, 1)"> 后续验签 / 入账逻辑不变...</span>
+<span style="color: rgba(0, 128, 128, 1)">30</span> }</pre>
+</div>
+<p>修复点：</p>
+<ul>
+<li>第一步先 <code>getReader()</code> 读取，杜绝"被切面或其它过滤器消费后再也读不到"的问题；</li>
+<li>第二步手工 <code>URLDecoder.decode</code> 解析，不再依赖容器对 form-encoded 的隐式解析；</li>
+<li>第三步即使解析失败，<strong>永远能在日志里看到原始 body</strong>，方便排查上游问题（nginx 配置、IP 探测、Content-Type 异常等）。</li>
+</ul>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>切面 bug 治根，所有 webhook / 文件上传接口同时受益；</li>
+<li>控制器侧再加一道保险，即使将来切面被新引入的同类问题污染，回调依然能正常工作；</li>
+<li>任何代理 / 容器 / <code>Content-Type</code> 组合都能拿到原始 body 用于诊断；</li>
+</ul>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li>改动量比方式 1 大；</li>
+</ul>
+<br><hr>
+<h2 id="四、经验沉淀" class="atx">四、总结</h2>
+<h3 id="41-写日志切面的几条铁律" class="atx">4.1 写日志切面几个避免的坑：</h3>
+<ol>
+<li><strong>不要把 <code>HttpServletRequest</code> / <code>HttpServletResponse</code> / <code>HttpSession</code> / <code>MultipartFile</code> 丢给 Jackson 等通用序列化器</strong>。它们的 <code>getXxx()</code> 方法很多有副作用（读流、加锁、触发懒加载）。</li>
+<li><strong>判断 servlet 对象用 <code>instanceof</code> 接口</strong>，不要用包名字符串匹配。容器实现类的包名跟 servlet 接口包名无关。</li>
+<li><strong>如果要打印请求体</strong>，使用 Spring 的 <code>ContentCachingRequestWrapper</code> 或自定义可重复读取的 <code>HttpServletRequestWrapper</code>，而不是直接 <code>getReader()</code>。</li>
+<li><strong>切面尽量晚于业务参数解析</strong>，或干脆只打印 <code>joinPoint.getSignature()</code>、URL、headers，避免反射触碰参数对象。</li>
+
+
+</ol>
+<h3 id="42-写-webhook-接口的几条铁律" class="atx">4.2 写 webhook 接口的几条铁律</h3>
+<ol>
+<li><strong>不要依赖 <code>request.getParameterMap()</code></strong>。容器对 form 解析的处理在不同代理 / Content-Type / Transfer-Encoding 下行为不一致。</li>
+<li><strong>第一步就读 body 留底</strong>。出问题时能看到原文是排查的关键。</li>
+<li><strong>手动解析 + 验签</strong> 比 "容器解析 + 验签" 更可控。</li>
+<li><strong>诊断日志必须包含 contentType / Content-Length / queryString / bodyLen</strong>，这四个字段能区分"上游没发"、"代理截断"、"容器没解析"、"代码 bug" 这几类问题。</li>
+
+</ol>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.08263888888888889" data-date-updated="2026-04-30 13:44">2026-04-30 11:45</span>&nbsp;
+<a href="https://www.cnblogs.com/Marktowin">Marktowin</a>&nbsp;
+阅读(<span id="post_view_count">73</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19956970);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FMarktowin%2Fp%2F19956970&amp;targetId=19956970&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
