@@ -1,0 +1,195 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/deali/p/20001495" title="发布于 2026-05-09 13:40">
+    <span role="heading" aria-level="2">ROCm on Windows 性能排查：RX 6650 XT 跑 PyTorch，为什么加速不明显？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>事情是这样的：我手上有一张 RX 6650 XT (gfx1032)，想在 Windows 上跑 PyTorch 做深度学习。AMD 官方的 HIP SDK for Windows 并不正式支持 gfx1032，但我还是通过自编译 ROCm 7.11.0a + PyTorch 2.9.1 把环境搭起来了。</p>
+<p><code>torch.cuda.is_available()</code> 返回 <code>True</code>，<code>rocm-sdk test</code> 也过了，Qwen3-0.6B 能加载到 GPU 上生成文本，看起来一切正常。</p>
+<p>但跑 benchmark 的时候发现，GPU 加速只有 1.7-2.0 倍，任务管理器里 GPU 利用率也不高。这到底是怎么回事？</p>
+<h2 id="测试环境">测试环境</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>配置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>AMD Radeon RX 6650 XT (gfx1032)</td>
+</tr>
+<tr>
+<td>ROCm</td>
+<td>7.11.0a / 自编译</td>
+</tr>
+<tr>
+<td>PyTorch</td>
+<td>2.9.1+rocm7.11.0a</td>
+</tr>
+<tr>
+<td>模型</td>
+<td>Qwen/Qwen3-0.6B</td>
+</tr>
+<tr>
+<td>精度</td>
+<td>float16</td>
+</tr>
+<tr>
+<td>系统</td>
+<td>Windows 10 Pro</td>
+</tr>
+</tbody>
+</table>
+<h2 id="benchmark-结果">Benchmark 结果</h2>
+<p>用 5 类 prompt 各跑 3 次，<code>max_new_tokens=256</code>：</p>
+<pre><code>                    CPU vs GPU Comparison
+╔════════════════════╤══════════════╤══════════════╤════════════╗
+║ Prompt             │    CPU tok/s │    GPU tok/s │    Speedup ║
+╟────────────────────┼──────────────┼──────────────┼────────────╢
+║ Short Factual      │         16.8 │         30.0 │       1.8x ║
+║ Summarization      │         14.8 │         30.3 │       2.0x ║
+║ Reasoning          │         18.0 │         30.2 │       1.7x ║
+║ Code Generation    │         18.4 │         30.4 │       1.7x ║
+║ Long-form          │         18.0 │         30.6 │       1.7x ║
+╚════════════════════╧══════════════╧══════════════╧════════════╝
+</code></pre>
+<p>几个直观的观察：</p>
+<ul>
+<li>GPU 路径确实有效，加速约 1.7-2.0x。</li>
+<li>但这个加速比对一张独显来说，实在算不上好。</li>
+<li>GPU 端吞吐稳定在 ~30 tok/s，不管 prompt 类型怎么变都差不多——说明瓶颈不在 prompt 内容上。</li>
+</ul>
+<h2 id="先看-amd-怎么说的">先看 AMD 怎么说的</h2>
+<p>AMD HIP SDK for Windows 的官方支持矩阵里，RDNA2 各档的支持情况是这样的：</p>
+<table>
+<thead>
+<tr>
+<th>GPU</th>
+<th>架构</th>
+<th>Runtime</th>
+<th>HIP SDK</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RX 6950/6900/6800 系列</td>
+<td>gfx1030</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RX 6750/6700 系列</td>
+<td>gfx1031</td>
+<td>✅</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>RX 6650/6600 系列</td>
+<td>gfx1032</td>
+<td>✅</td>
+<td>❌</td>
+</tr>
+</tbody>
+</table>
+<p>Runtime 支持意味着 HIP/OpenCL runtime 能跑起来；HIP SDK 不支持意味着官方预编译的 HIP SDK 库不覆盖这块硬件，运行时可能出各种问题。</p>
+<p>这是最关键的一点：<strong>gfx1032 在 Windows 上根本不在官方 HIP SDK 支持范围内</strong>。所以即使自编译能跑，也应该对兼容性和性能有心理准备。</p>
+<h2 id="冒烟测试到底哪些操作能跑在-gpu-上">冒烟测试：到底哪些操作能跑在 GPU 上？</h2>
+<p>为了搞清楚 PyTorch 操作在当前环境下的实际表现，我写了一个冒烟测试脚本（<code>tests/test_operators.py</code>）。思路很简单：创建 CUDA/HIP tensor，执行操作，检查输出是不是还在 GPU 上。</p>
+<p>结果：</p>
+<pre><code>Summary: 54/55 returned CUDA/HIP tensors | 1 errors | 1 warnings
+</code></pre>
+<p>55 个检查项里，54 个成功返回了 CUDA/HIP tensor。失败的两个：</p>
+<p><strong>batch_norm 报错</strong>——MIOpen 在运行时编译 kernel 的时候，HIPRTC 找不到 <code>&lt;type_traits&gt;</code> 这个 C++ 标准库头文件。这是编译环境的问题，不是 GPU 不支持。后续装上 VS Build Tools 的 C++ 工具链应该能修。但要注意，这并不意味着修好之后 BatchNorm 就一定有高性能 GPU kernel——还得复测。</p>
+<p><strong>sdpa 有警告</strong>——PyTorch 编译时没启用 memory efficient attention，<code>scaled_dot_product_attention</code> 走的是数学 fallback。功能没问题，但长序列和大 batch 场景下性能差距会比较明显。</p>
+<p>需要强调的是，这个测试结果<strong>不能</strong>直接解读成"54/55 个算子有 GPU kernel，覆盖率 98%"。</p>
+<p>因为检查输出 device 只能证明 PyTorch 的设备语义成立（CUDA tensor 的结果还在 CUDA 上），不能证明底层调用了什么 backend、用了什么 kernel、有没有隐式同步。</p>
+<h2 id="低加速比到底是什么原因">低加速比到底是什么原因？</h2>
+<p>说实话，我没有一个确定的答案。目前比较合理的判断是多个因素叠加：</p>
+<p><strong>自回归 decode 天生吃不满 GPU。</strong> 每次只生成一个 token，batch=1 的时候 kernel 粒度很小，launch latency 和调度开销占比就上去了。这是 LLM 推理的通病，不独属于 ROCm。</p>
+<p><strong>Qwen3-0.6B 太小了。</strong> 600M 参数，fp16 权重才 1.2GB。小模型在 batch=1 的 decode 阶段，瓶颈往往在内存访问和框架开销上，而不是 GPU 算力。</p>
+<p><strong>SDPA 没走高性能路径。</strong> 编译 warning 已经提示了，memory efficient attention 没启用。对 Transformer 模型来说这是个不小的性能因素。</p>
+<p><strong>Windows + gfx1032 本身就不是官方支持场景。</strong> 自编译能让操作跑起来，但 kernel 选择、库集成、性能调优这些方面，很难指望和官方支持的硬件一样。</p>
+<p><strong>CPU 使用率高 ≠ forward 在 CPU 上算。</strong> 任务管理器里 CPU 20% 左右的使用率，其实大部分是 Python 解释器、Transformers generation loop、tokenizer 处理、kernel launch、同步这些工作，不能直接推导出"大部分计算回退到了 CPU"。</p>
+<h2 id="下一步怎么查">下一步怎么查</h2>
+<p>为了进一步研究，可能还需要做这些事：</p>
+<ol>
+<li>用 <code>torch.profiler</code> 看 CPU 和 CUDA/HIP activity 的时间分布。</li>
+<li>把 prefill 和 decode 分开计时，看瓶颈到底在哪。</li>
+<li>用真实 LLM 的 tensor shape 单独测 <code>linear</code>、RMSNorm、RoPE、SDPA、KV cache 这些关键路径。</li>
+<li>开 MIOpen/rocBLAS 日志，确认关键操作到底走了哪个库。</li>
+<li>试不同 batch size，看 tok/s 曲线怎么变。</li>
+<li>如果条件允许，和 Linux ROCm 或者官方支持的 RDNA3 GPU 做对比。</li>
+</ol>
+<h2 id="结论">结论</h2>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>回答</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PyTorch 能在 RX 6650 XT 上跑吗？</td>
+<td>自编译后可以跑基础 workload，但不在官方 HIP SDK 支持范围内</td>
+</tr>
+<tr>
+<td>算子覆盖率是多少？</td>
+<td>冒烟测试只能说 54/55 个检查项返回了 CUDA/HIP tensor，不是严格的算子覆盖率</td>
+</tr>
+<tr>
+<td>有没有 CPU fallback 的证据？</td>
+<td>目前没有。<code>batch_norm</code> 是编译报错，不是 fallback</td>
+</tr>
+<tr>
+<td>为什么 GPU 加速低？</td>
+<td>大概率是 batch=1 自回归、小模型、attention fallback、非官方支持、框架开销这些因素叠加</td>
+</tr>
+<tr>
+<td>大模型或大 batch 会好吗？</td>
+<td>很可能，但得实测，不能从冒烟测试推断</td>
+</tr>
+<tr>
+<td>升级新版 ROCm 有用吗？</td>
+<td>可能修一些 bug，但官方支持矩阵是硬约束，gfx1032 短期内大概率不会被正式支持</td>
+</tr>
+</tbody>
+</table>
+<h2 id="小结">小结</h2>
+<p>给同样想在 RDNA2 + Windows 上跑深度学习的朋友：</p>
+<ol>
+<li>把自编译 ROCm/PyTorch 当实验环境，别当生产环境。</li>
+<li>先跑冒烟测试确认常见操作不会直接报错。</li>
+<li>性能问题要用 profiler 和 backend 日志定位，光看输出 device 说明不了什么。</li>
+<li>LLM 推理要单独分析 prefill/decode、batch size 和 attention backend。</li>
+<li>如果要稳定跑、追求可预期的性能，优先考虑 Linux ROCm，或者换一张 Windows 上官方支持的 GPU。</li>
+</ol>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    微信公众号：「程序设计实验室」
+专注于互联网热门新技术探索与团队敏捷开发实践，包括架构设计、机器学习与数据分析算法、移动端开发、Linux、Web前后端开发等，欢迎一起探讨技术，分享学习实践经验。
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-05-09 13:41">2026-05-09 13:40</span>&nbsp;
+<a href="https://www.cnblogs.com/deali">曦远Code</a>&nbsp;
+阅读(<span id="post_view_count">108</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20001495);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdeali%2Fp%2F20001495&amp;targetId=20001495&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
