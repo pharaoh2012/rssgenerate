@@ -1,0 +1,989 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/diamondhusky/p/20008918" title="发布于 2026-05-10 21:40">
+    <span role="heading" aria-level="2">【.NET并发编程 - 07】异步异常处理：AggregateException 的拆解与最佳实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="07-异步异常处理aggregateexception-的拆解与最佳实践">07. 异步异常处理：AggregateException 的拆解与最佳实践</h1>
+<blockquote>
+<p><strong>本章 GitHub 仓库</strong>：<a href="https://github.com/Naughtyhusky/csharp-concurrency-cookbook/tree/dev" target="_blank" rel="noopener nofollow">csharp-concurrency-cookbook</a> ⭐</p>
+<p>欢迎 Star 和 Fork！所有代码示例都可以在仓库中找到并运行。</p>
+</blockquote>
+<hr>
+<h2 id="-本章导读">🎯 本章导读</h2>
+<blockquote>
+<p>📌 <strong>本文目标</strong>：掌握异步异常处理的正确姿势，理解 AggregateException 的设计思想，学会在复杂并发场景下优雅处理异常。</p>
+</blockquote>
+<p>你是否遇到过这样的场景：</p>
+<ul>
+<li>为什么 <code>await</code> 抛出的是单个异常，而 <code>.Result</code> 抛出的是 <code>AggregateException</code>？</li>
+<li>同时调用 10 个 API，其中 3 个失败了，如何获取所有失败信息？</li>
+<li><code>Task.WhenAll</code> 抛异常时，为什么只能捕获第一个？</li>
+<li>后台任务（Fire-and-forget）的异常去哪儿了？</li>
+<li>如何实现一个"容错"的并发任务执行器？</li>
+</ul>
+<p>今天，我们就来彻底搞懂 <strong>.NET 异步编程中的异常处理机制</strong>，从 <code>AggregateException</code> 的设计理念到实战技巧，一网打尽。</p>
+<blockquote>
+<p>⚠️ <strong>重要提示</strong>：本文涉及异步编程的核心概念，建议先掌握前面章节的 Task、async/await 和 CancellationToken 基础。</p>
+</blockquote>
+<hr>
+<h2 id="0️⃣-一个真实的故事消失的异常">0️⃣ 一个真实的故事：消失的异常</h2>
+<h3 id="01-场景重现批量调用-api">0.1 场景重现：批量调用 API</h3>
+<p>假设你正在写一个数据同步工具，需要同时调用 10 个微服务的 API，获取数据并汇总。</p>
+<p>你写出了第一版代码：</p>
+<pre><code class="language-csharp">public async Task&lt;List&lt;UserData&gt;&gt; GetAllUsersAsync()
+{
+    var tasks = new List&lt;Task&lt;UserData&gt;&gt;();
+
+    // 并发调用 10 个 API
+    for (int i = 1; i &lt;= 10; i++)
+    {
+        tasks.Add(GetUserDataAsync(i));
+    }
+
+    // 等待所有任务完成
+    var results = await Task.WhenAll(tasks);
+
+    return results.ToList();
+}
+
+private async Task&lt;UserData&gt; GetUserDataAsync(int userId)
+{
+    using var client = new HttpClient();
+    var response = await client.GetStringAsync($"https://api.example.com/users/{userId}");
+    return JsonSerializer.Deserialize&lt;UserData&gt;(response);
+}
+</code></pre>
+<p><strong>测试一下</strong>：前面几次运行都正常，但突然有一天：</p>
+<pre><code>未处理的异常: System.Net.Http.HttpRequestException: Response status code does not indicate success: 404 (Not Found).
+</code></pre>
+<p><strong>问题来了</strong>：</p>
+<ol>
+<li>只看到了<strong>一个异常</strong>，但实际上可能有多个 API 都失败了</li>
+<li>其他成功的 API 数据<strong>丢失了</strong></li>
+<li>如何记录<strong>所有失败的 API</strong>，方便排查问题？</li>
+</ol>
+<p>这就是我们今天要解决的核心问题。</p>
+<hr>
+<h3 id="02-新手的常见尝试">0.2 新手的常见尝试</h3>
+<h4 id="-尝试-1直接-try-catch丢失了多个异常">❌ 尝试 1：直接 try-catch（丢失了多个异常）</h4>
+<pre><code class="language-csharp">try
+{
+    var results = await Task.WhenAll(tasks);
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"出错了: {ex.Message}");
+    // ❌ 只能捕获第一个异常！其他失败的任务信息丢失
+}
+</code></pre>
+<p><strong>结果</strong>：只捕获到了第一个异常，其他失败的任务信息全部丢失。</p>
+<h4 id="-尝试-2改用-result引入了-aggregateexception">❌ 尝试 2：改用 .Result（引入了 AggregateException）</h4>
+<pre><code class="language-csharp">try
+{
+    var whenAllTask = Task.WhenAll(tasks);
+    whenAllTask.Wait(); // 或者 .Result
+}
+catch (AggregateException aggEx)
+{
+    foreach (var ex in aggEx.InnerExceptions)
+    {
+        Console.WriteLine($"出错了: {ex.Message}");
+    }
+    // ✅ 可以获取所有异常，但 Wait() 会阻塞线程！
+}
+</code></pre>
+<p><strong>结果</strong>：能获取所有异常了，但 <code>.Wait()</code> 会阻塞线程，而且可能导致死锁（回顾第 05 章）。</p>
+<h4 id="-正确的做法await--手动检查-taskexception">✅ 正确的做法：await + 手动检查 Task.Exception</h4>
+<pre><code class="language-csharp">var whenAllTask = Task.WhenAll(tasks);
+
+try
+{
+    await whenAllTask;
+}
+catch (Exception firstEx)
+{
+    // 捕获第一个异常
+    Console.WriteLine($"第一个异常: {firstEx.Message}");
+
+    // 如果需要所有异常，从 Task.Exception 中获取
+    if (whenAllTask.Exception != null)
+    {
+        Console.WriteLine("\n所有异常:");
+        foreach (var ex in whenAllTask.Exception.InnerExceptions)
+        {
+            Console.WriteLine($"- {ex.Message}");
+        }
+    }
+}
+</code></pre>
+<p><strong>疑问</strong>：为什么 <code>await</code> 只抛出第一个异常，而 <code>.Wait()</code> 抛出 <code>AggregateException</code>？这就要从 <strong>AggregateException 的设计思想</strong>说起。</p>
+<hr>
+<h2 id="1️⃣-aggregateexception为什么需要它">1️⃣ AggregateException：为什么需要它？</h2>
+<h3 id="11-单个异常-vs-多个异常">1.1 单个异常 vs 多个异常</h3>
+<p>在传统的同步编程中，一个方法只会抛出<strong>一个异常</strong>：</p>
+<pre><code class="language-csharp">public void ProcessData()
+{
+    ValidateInput();    // 可能抛出 ArgumentException
+    ConnectDatabase();  // 可能抛出 SqlException
+    SaveData();         // 可能抛出 IOException
+    // ❌ 一旦抛出异常，后面的代码不会执行
+}
+</code></pre>
+<p>但在<strong>并发编程</strong>中，情况完全不同：</p>
+<pre><code class="language-csharp">var task1 = Task.Run(() =&gt; throw new InvalidOperationException("Task 1 failed"));
+var task2 = Task.Run(() =&gt; throw new ArgumentException("Task 2 failed"));
+var task3 = Task.Run(() =&gt; throw new IOException("Task 3 failed"));
+
+await Task.WhenAll(task1, task2, task3);
+// ❓ 三个任务都失败了，应该抛出哪个异常？
+</code></pre>
+<p><strong>问题</strong>：</p>
+<ul>
+<li>三个任务<strong>同时执行</strong>，都失败了</li>
+<li>传统的异常机制只能抛出<strong>一个异常</strong></li>
+<li>如果只抛出第一个，<strong>其他两个异常信息就丢失了</strong></li>
+</ul>
+<p><strong>解决方案</strong>：<code>AggregateException</code>——一个可以包含<strong>多个异常</strong>的容器。</p>
+<hr>
+<h3 id="12-aggregateexception-的设计结构">1.2 AggregateException 的设计结构</h3>
+<pre><code class="language-csharp">public class AggregateException : Exception
+{
+    // 存储所有内部异常
+    public ReadOnlyCollection&lt;Exception&gt; InnerExceptions { get; }
+
+    // 扁平化嵌套的 AggregateException
+    public AggregateException Flatten();
+
+    // 按条件处理异常
+    public void Handle(Func&lt;Exception, bool&gt; predicate);
+}
+</code></pre>
+<p><strong>核心特性</strong>：</p>
+<ol>
+<li><strong>InnerExceptions</strong>：存储所有子任务的异常</li>
+<li><strong>Flatten()</strong>：处理嵌套的 <code>AggregateException</code></li>
+<li><strong>Handle()</strong>：选择性处理某些异常，未处理的会重新抛出</li>
+</ol>
+<p><strong>示例</strong>：</p>
+<pre><code class="language-csharp">try
+{
+    var task1 = Task.Run(() =&gt; throw new InvalidOperationException("Task 1 failed"));
+    var task2 = Task.Run(() =&gt; throw new ArgumentException("Task 2 failed"));
+    var task3 = Task.Run(() =&gt; throw new IOException("Task 3 failed"));
+
+    Task.WaitAll(task1, task2, task3); // ❌ 同步等待，会抛出 AggregateException
+}
+catch (AggregateException aggEx)
+{
+    Console.WriteLine($"捕获了 {aggEx.InnerExceptions.Count} 个异常:");
+
+    foreach (var ex in aggEx.InnerExceptions)
+    {
+        Console.WriteLine($"- {ex.GetType().Name}: {ex.Message}");
+    }
+}
+</code></pre>
+<p><strong>输出</strong>：</p>
+<pre><code>捕获了 3 个异常:
+- InvalidOperationException: Task 1 failed
+- ArgumentException: Task 2 failed
+- IOException: Task 3 failed
+</code></pre>
+<hr>
+<h3 id="13-await-vs-waitresult-的异常行为差异">1.3 await vs Wait/Result 的异常行为差异</h3>
+<p>这是一个<strong>非常重要</strong>的知识点，很多开发者在这里踩坑。</p>
+<h4 id="场景单个任务失败">场景：单个任务失败</h4>
+<pre><code class="language-csharp">var task = Task.Run(() =&gt; throw new InvalidOperationException("Something went wrong"));
+</code></pre>
+<p><strong>方式 1：使用 await（推荐）</strong></p>
+<pre><code class="language-csharp">try
+{
+    await task;
+}
+catch (InvalidOperationException ex)
+{
+    Console.WriteLine($"捕获异常: {ex.Message}");
+    // ✅ 直接抛出原始异常，简化异常处理
+}
+</code></pre>
+<p><strong>方式 2：使用 Wait() 或 .Result</strong></p>
+<pre><code class="language-csharp">try
+{
+    task.Wait(); // 或者 var result = task.Result;
+}
+catch (AggregateException aggEx)
+{
+    // ❌ 包装在 AggregateException 中，需要额外解包
+    var innerEx = aggEx.InnerException;
+    Console.WriteLine($"捕获异常: {innerEx.Message}");
+}
+</code></pre>
+<p><strong>对比表格</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th><code>await</code></th>
+<th><code>.Wait()</code> / <code>.Result</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>抛出的异常类型</strong></td>
+<td>原始异常（第一个）</td>
+<td><code>AggregateException</code></td>
+</tr>
+<tr>
+<td><strong>获取原始异常</strong></td>
+<td>直接捕获</td>
+<td><code>aggEx.InnerException</code></td>
+</tr>
+<tr>
+<td><strong>多个异常</strong></td>
+<td>只抛出第一个</td>
+<td><code>InnerExceptions</code> 包含所有</td>
+</tr>
+<tr>
+<td><strong>线程阻塞</strong></td>
+<td>❌ 不阻塞</td>
+<td>✅ 阻塞当前线程</td>
+</tr>
+<tr>
+<td><strong>死锁风险</strong></td>
+<td>✅ 安全</td>
+<td>❌ 可能死锁（UI 线程）</td>
+</tr>
+<tr>
+<td><strong>推荐使用</strong></td>
+<td>✅ <strong>强烈推荐</strong></td>
+<td>❌ 尽量避免</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论</strong>：</p>
+<ul>
+<li><strong>优先使用 <code>await</code></strong>：代码更简洁，异常处理更直观</li>
+<li><strong>需要所有异常</strong>：通过 <code>Task.Exception</code> 属性获取 <code>AggregateException</code></li>
+<li><strong>避免使用 <code>.Wait()</code> 和 <code>.Result</code></strong>：会阻塞线程，可能导致死锁</li>
+</ul>
+<hr>
+<h2 id="2️⃣-taskwhenall-的异常陷阱与解决方案">2️⃣ Task.WhenAll 的异常陷阱与解决方案</h2>
+<h3 id="21-问题whenall-只抛出第一个异常">2.1 问题：WhenAll 只抛出第一个异常</h3>
+<p>这是 <code>Task.WhenAll</code> 最容易踩坑的地方。</p>
+<p><strong>示例</strong>：</p>
+<pre><code class="language-csharp">public async Task CallMultipleApisAsync()
+{
+    var tasks = new[]
+    {
+        CallApiAsync(1), // ✅ 成功
+        CallApiAsync(2), // ❌ 失败：404 Not Found
+        CallApiAsync(3), // ✅ 成功
+        CallApiAsync(4), // ❌ 失败：500 Internal Server Error
+        CallApiAsync(5), // ❌ 失败：Timeout
+    };
+
+    try
+    {
+        await Task.WhenAll(tasks);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"捕获异常: {ex.Message}");
+        // ❌ 只能看到第一个失败的异常（404 Not Found）
+        // ❌ 其他两个失败（500 和 Timeout）的信息丢失
+    }
+}
+</code></pre>
+<p><strong>输出</strong>：</p>
+<pre><code>捕获异常: Response status code does not indicate success: 404 (Not Found).
+</code></pre>
+<p><strong>问题</strong>：只看到了第一个异常，其他失败信息丢失了！</p>
+<hr>
+<h3 id="22-解决方案-1手动检查-taskexception">2.2 解决方案 1：手动检查 Task.Exception</h3>
+<pre><code class="language-csharp">public async Task CallMultipleApisAsync()
+{
+    var tasks = new[]
+    {
+        CallApiAsync(1),
+        CallApiAsync(2),
+        CallApiAsync(3),
+        CallApiAsync(4),
+        CallApiAsync(5),
+    };
+
+    var whenAllTask = Task.WhenAll(tasks);
+
+    try
+    {
+        await whenAllTask;
+    }
+    catch (Exception firstEx)
+    {
+        Console.WriteLine($"第一个异常: {firstEx.Message}");
+
+        // ✅ 从 Task.Exception 获取所有异常
+        if (whenAllTask.Exception != null)
+        {
+            Console.WriteLine($"\n总共 {whenAllTask.Exception.InnerExceptions.Count} 个任务失败:");
+
+            foreach (var ex in whenAllTask.Exception.InnerExceptions)
+            {
+                Console.WriteLine($"- {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
+}
+</code></pre>
+<p><strong>输出</strong>：</p>
+<pre><code>第一个异常: Response status code does not indicate success: 404 (Not Found).
+
+总共 3 个任务失败:
+- HttpRequestException: Response status code does not indicate success: 404 (Not Found).
+- HttpRequestException: Response status code does not indicate success: 500 (Internal Server Error).
+- TaskCanceledException: The request was canceled due to the configured HttpClient.Timeout of 30 seconds elapsing.
+</code></pre>
+<p><strong>优点</strong>：✅ 可以获取所有异常信息</p>
+<p><strong>缺点</strong>：❌ 代码略显冗长</p>
+<hr>
+<h3 id="23-解决方案-2逐个-await更简洁">2.3 解决方案 2：逐个 await（更简洁）</h3>
+<pre><code class="language-csharp">public async Task CallMultipleApisAsync()
+{
+    var tasks = new[]
+    {
+        CallApiAsync(1),
+        CallApiAsync(2),
+        CallApiAsync(3),
+        CallApiAsync(4),
+        CallApiAsync(5),
+    };
+
+    // 先启动所有任务（并发执行）
+    var whenAllTask = Task.WhenAll(tasks);
+
+    // 逐个 await，捕获每个任务的异常
+    foreach (var task in tasks)
+    {
+        try
+        {
+            await task;
+            Console.WriteLine("✅ 任务成功");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ 任务失败: {ex.Message}");
+        }
+    }
+}
+</code></pre>
+<p><strong>输出</strong>：</p>
+<pre><code>✅ 任务成功
+❌ 任务失败: Response status code does not indicate success: 404 (Not Found).
+✅ 任务成功
+❌ 任务失败: Response status code does not indicate success: 500 (Internal Server Error).
+❌ 任务失败: The request was canceled due to the configured HttpClient.Timeout of 30 seconds elapsing.
+</code></pre>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>✅ 可以单独处理每个任务的异常</li>
+<li>✅ 代码清晰，逻辑直观</li>
+</ul>
+<p><strong>注意</strong>：</p>
+<ul>
+<li><code>Task.WhenAll</code> 仍然需要调用，确保所有任务并发执行</li>
+<li>逐个 <code>await</code> 时，已完成的任务会立即返回，不会重新执行</li>
+</ul>
+<hr>
+<h3 id="24-解决方案-3实现-safewhenall-扩展方法最优雅">2.4 解决方案 3：实现 SafeWhenAll 扩展方法（最优雅）</h3>
+<p><strong>目标</strong>：封装异常处理逻辑，返回成功和失败的结果。</p>
+<pre><code class="language-csharp">public static async Task&lt;(List&lt;T&gt; Successes, List&lt;Exception&gt; Failures)&gt; SafeWhenAll&lt;T&gt;(
+    this IEnumerable&lt;Task&lt;T&gt;&gt; tasks)
+{
+    var taskList = tasks.ToList();
+    var successes = new List&lt;T&gt;();
+    var failures = new List&lt;Exception&gt;();
+
+    foreach (var task in taskList)
+    {
+        try
+        {
+            var result = await task;
+            successes.Add(result);
+        }
+        catch (Exception ex)
+        {
+            failures.Add(ex);
+        }
+    }
+
+    return (successes, failures);
+}
+</code></pre>
+<p><strong>使用示例</strong>：</p>
+<pre><code class="language-csharp">public async Task CallMultipleApisAsync()
+{
+    var tasks = new[]
+    {
+        CallApiAsync(1),
+        CallApiAsync(2),
+        CallApiAsync(3),
+        CallApiAsync(4),
+        CallApiAsync(5),
+    };
+
+    var (successes, failures) = await tasks.SafeWhenAll();
+
+    Console.WriteLine($"✅ 成功: {successes.Count} 个");
+    Console.WriteLine($"❌ 失败: {failures.Count} 个");
+
+    if (failures.Any())
+    {
+        Console.WriteLine("\n失败详情:");
+        foreach (var ex in failures)
+        {
+            Console.WriteLine($"- {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+}
+</code></pre>
+<p><strong>输出</strong>：</p>
+<pre><code>✅ 成功: 2 个
+❌ 失败: 3 个
+
+失败详情:
+- HttpRequestException: Response status code does not indicate success: 404 (Not Found).
+- HttpRequestException: Response status code does not indicate success: 500 (Internal Server Error).
+- TaskCanceledException: The request was canceled due to the configured HttpClient.Timeout of 30 seconds elapsing.
+</code></pre>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>✅ 封装良好，可复用</li>
+<li>✅ 同时获取成功和失败的结果</li>
+<li>✅ 不丢失任何异常信息</li>
+</ul>
+<hr>
+<h3 id="25-实战场景并发调用-api--容错处理">2.5 实战场景：并发调用 API + 容错处理</h3>
+<p><strong>需求</strong>：</p>
+<ul>
+<li>同时调用 10 个 API</li>
+<li>允许部分失败，只要有 5 个成功就算整体成功</li>
+<li>记录所有失败的 API，方便排查</li>
+</ul>
+<p><strong>实现</strong>：</p>
+<pre><code class="language-csharp">public class ApiAggregator
+{
+    private readonly HttpClient _httpClient;
+    private readonly ILogger&lt;ApiAggregator&gt; _logger;
+
+    public ApiAggregator(HttpClient httpClient, ILogger&lt;ApiAggregator&gt; logger)
+    {
+        _httpClient = httpClient;
+        _logger = logger;
+    }
+
+    public async Task&lt;AggregatedResult&gt; GetAggregatedDataAsync(
+        IEnumerable&lt;string&gt; apiUrls,
+        int minSuccessCount = 5,
+        CancellationToken cancellationToken = default)
+    {
+        var tasks = apiUrls.Select(url =&gt; CallApiWithLoggingAsync(url, cancellationToken)).ToList();
+
+        var (successes, failures) = await tasks.SafeWhenAll();
+
+        // 记录失败信息
+        foreach (var ex in failures)
+        {
+            _logger.LogError(ex, "API 调用失败");
+        }
+
+        // 检查是否满足最低成功数量
+        if (successes.Count &lt; minSuccessCount)
+        {
+            throw new InvalidOperationException(
+                $"API 调用失败过多：期望至少 {minSuccessCount} 个成功，实际只有 {successes.Count} 个成功");
+        }
+
+        return new AggregatedResult
+        {
+            Successes = successes,
+            FailureCount = failures.Count,
+            Errors = failures.Select(ex =&gt; ex.Message).ToList()
+        };
+    }
+
+    private async Task&lt;ApiResponse&gt; CallApiWithLoggingAsync(string url, CancellationToken cancellationToken)
+    {
+        try
+        {
+            _logger.LogInformation("开始调用 API: {Url}", url);
+
+            var response = await _httpClient.GetStringAsync(url, cancellationToken);
+            var data = JsonSerializer.Deserialize&lt;ApiResponse&gt;(response);
+
+            _logger.LogInformation("API 调用成功: {Url}", url);
+
+            return data;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "API 调用失败: {Url}", url);
+            throw; // 重新抛出，由 SafeWhenAll 捕获
+        }
+    }
+}
+
+public class AggregatedResult
+{
+    public List&lt;ApiResponse&gt; Successes { get; set; }
+    public int FailureCount { get; set; }
+    public List&lt;string&gt; Errors { get; set; }
+}
+</code></pre>
+<p><strong>使用示例</strong>：</p>
+<pre><code class="language-csharp">var apiUrls = new[]
+{
+    "https://api1.example.com/data",
+    "https://api2.example.com/data",
+    "https://api3.example.com/data",
+    // ... 更多 API
+};
+
+try
+{
+    var result = await aggregator.GetAggregatedDataAsync(apiUrls, minSuccessCount: 5);
+
+    Console.WriteLine($"✅ 成功获取 {result.Successes.Count} 个数据");
+    Console.WriteLine($"❌ 失败 {result.FailureCount} 个请求");
+}
+catch (InvalidOperationException ex)
+{
+    Console.WriteLine($"❌ {ex.Message}");
+}
+</code></pre>
+<hr>
+<h2 id="3️⃣-后台任务fire-and-forget的异常处理">3️⃣ 后台任务（Fire-and-Forget）的异常处理</h2>
+<h3 id="31-问题后台任务的异常会被吞掉">3.1 问题：后台任务的异常会被吞掉</h3>
+<p><strong>场景</strong>：启动一个后台任务，不等待它完成。</p>
+<pre><code class="language-csharp">// ❌ 错误示例：异常会被吞掉
+public void StartBackgroundTask()
+{
+    _ = DoWorkAsync(); // Fire-and-forget
+}
+
+private async Task DoWorkAsync()
+{
+    await Task.Delay(1000);
+    throw new InvalidOperationException("后台任务失败了！");
+    // ❌ 这个异常不会被捕获，程序不会崩溃，但异常信息丢失
+}
+</code></pre>
+<p><strong>问题</strong>：</p>
+<ul>
+<li>异常被吞掉，无法排查问题</li>
+<li>可能导致未处理的异常（UnobservedTaskException）</li>
+<li>资源可能没有正确释放</li>
+</ul>
+<hr>
+<h3 id="32-解决方案-1使用-taskschedulerunobservedtaskexception">3.2 解决方案 1：使用 TaskScheduler.UnobservedTaskException</h3>
+<pre><code class="language-csharp">// 在程序启动时注册全局异常处理器
+TaskScheduler.UnobservedTaskException += (sender, e) =&gt;
+{
+    Console.WriteLine($"❌ 未观察到的异常: {e.Exception.Message}");
+
+    // 标记为已观察，防止程序崩溃
+    e.SetObserved();
+};
+</code></pre>
+<p><strong>缺点</strong>：</p>
+<ul>
+<li>只在垃圾回收时触发，可能延迟很久</li>
+<li>.NET Core 默认不会导致程序崩溃，容易忽略异常</li>
+</ul>
+<hr>
+<h3 id="32-解决方案-2safefireandforget-扩展方法推荐">3.2 解决方案 2：SafeFireAndForget 扩展方法（推荐）</h3>
+<pre><code class="language-csharp">public static async void SafeFireAndForget(
+    this Task task,
+    Action&lt;Exception&gt; onException = null)
+{
+    try
+    {
+        await task;
+    }
+    catch (Exception ex)
+    {
+        // 调用自定义异常处理器
+        onException?.Invoke(ex);
+
+        // 或者记录日志
+        Console.WriteLine($"❌ 后台任务异常: {ex.Message}");
+    }
+}
+</code></pre>
+<p><strong>使用示例</strong>：</p>
+<pre><code class="language-csharp">public void StartBackgroundTask()
+{
+    DoWorkAsync().SafeFireAndForget(ex =&gt;
+    {
+        _logger.LogError(ex, "后台任务失败");
+        // 可以发送告警、记录到数据库等
+    });
+}
+
+private async Task DoWorkAsync()
+{
+    await Task.Delay(1000);
+    throw new InvalidOperationException("后台任务失败了！");
+}
+</code></pre>
+<p><strong>优点</strong>：</p>
+<ul>
+<li>✅ 异常不会被吞掉</li>
+<li>✅ 可以自定义异常处理逻辑</li>
+<li>✅ 代码清晰，意图明确</li>
+</ul>
+<hr>
+<h3 id="33-解决方案-3使用-backgroundservicenet-core">3.3 解决方案 3：使用 BackgroundService（.NET Core）</h3>
+<p>如果是长期运行的后台任务，推荐使用 <code>IHostedService</code> 或 <code>BackgroundService</code>。</p>
+<pre><code class="language-csharp">public class MyBackgroundService : BackgroundService
+{
+    private readonly ILogger&lt;MyBackgroundService&gt; _logger;
+
+    public MyBackgroundService(ILogger&lt;MyBackgroundService&gt; logger)
+    {
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await DoWorkAsync(stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                // ✅ 异常会被记录，服务继续运行
+                _logger.LogError(ex, "后台任务执行失败");
+
+                // 等待一段时间后重试
+                await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+            }
+        }
+    }
+
+    private async Task DoWorkAsync(CancellationToken cancellationToken)
+    {
+        // 业务逻辑
+        await Task.Delay(5000, cancellationToken);
+    }
+}
+</code></pre>
+<hr>
+<h2 id="4️⃣-aggregateexception-的高级用法">4️⃣ AggregateException 的高级用法</h2>
+<h3 id="41-flatten扁平化嵌套异常">4.1 Flatten()：扁平化嵌套异常</h3>
+<p><strong>问题</strong>：嵌套的 <code>Task.WhenAll</code> 会产生嵌套的 <code>AggregateException</code>。</p>
+<pre><code class="language-csharp">var task1 = Task.Run(() =&gt; throw new InvalidOperationException("Task 1"));
+var task2 = Task.Run(() =&gt; throw new ArgumentException("Task 2"));
+
+var outerTask = Task.Run(() =&gt;
+{
+    Task.WaitAll(task1, task2); // 内层 AggregateException
+});
+
+try
+{
+    outerTask.Wait(); // 外层 AggregateException
+}
+catch (AggregateException aggEx)
+{
+    // aggEx.InnerExceptions[0] 是另一个 AggregateException
+    // 需要递归处理
+
+    // ✅ 使用 Flatten() 扁平化
+    var flattenedEx = aggEx.Flatten();
+
+    foreach (var ex in flattenedEx.InnerExceptions)
+    {
+        Console.WriteLine($"- {ex.GetType().Name}: {ex.Message}");
+    }
+}
+</code></pre>
+<p><strong>输出</strong>：</p>
+<pre><code>- InvalidOperationException: Task 1
+- ArgumentException: Task 2
+</code></pre>
+<hr>
+<h3 id="42-handle选择性处理异常">4.2 Handle()：选择性处理异常</h3>
+<p><strong>场景</strong>：某些异常可以忽略，某些异常需要重新抛出。</p>
+<pre><code class="language-csharp">try
+{
+    Task.WaitAll(tasks);
+}
+catch (AggregateException aggEx)
+{
+    aggEx.Handle(ex =&gt;
+    {
+        // 如果是 TaskCanceledException，忽略它
+        if (ex is TaskCanceledException)
+        {
+            Console.WriteLine("任务被取消，忽略");
+            return true; // 标记为已处理
+        }
+
+        // 其他异常不处理，会重新抛出
+        return false;
+    });
+}
+</code></pre>
+<p><strong>行为</strong>：</p>
+<ul>
+<li><code>Handle()</code> 返回 <code>true</code>：异常被处理，不会重新抛出</li>
+<li><code>Handle()</code> 返回 <code>false</code>：异常未处理，会重新抛出</li>
+</ul>
+<hr>
+<h2 id="5️⃣-异常处理的最佳实践">5️⃣ 异常处理的最佳实践</h2>
+<h3 id="51-优先使用-await--try-catch">5.1 优先使用 await + try-catch</h3>
+<pre><code class="language-csharp">// ✅ 推荐：简洁清晰
+try
+{
+    var result = await SomeOperationAsync();
+}
+catch (HttpRequestException ex)
+{
+    // 处理网络异常
+}
+catch (JsonException ex)
+{
+    // 处理 JSON 解析异常
+}
+</code></pre>
+<pre><code class="language-csharp">// ❌ 不推荐：引入 AggregateException，增加复杂度
+try
+{
+    var result = SomeOperationAsync().Result;
+}
+catch (AggregateException aggEx)
+{
+    foreach (var ex in aggEx.InnerExceptions)
+    {
+        // ...
+    }
+}
+</code></pre>
+<hr>
+<h3 id="52-taskwhenall-需要所有异常时">5.2 Task.WhenAll 需要所有异常时</h3>
+<pre><code class="language-csharp">var whenAllTask = Task.WhenAll(tasks);
+
+try
+{
+    await whenAllTask;
+}
+catch
+{
+    // 从 Task.Exception 获取所有异常
+    if (whenAllTask.Exception != null)
+    {
+        foreach (var ex in whenAllTask.Exception.InnerExceptions)
+        {
+            _logger.LogError(ex, "任务失败");
+        }
+    }
+}
+</code></pre>
+<hr>
+<h3 id="53-后台任务必须有异常处理">5.3 后台任务必须有异常处理</h3>
+<pre><code class="language-csharp">// ❌ 错误：异常会被吞掉
+_ = DoWorkAsync();
+
+// ✅ 正确：使用 SafeFireAndForget
+DoWorkAsync().SafeFireAndForget(ex =&gt;
+{
+    _logger.LogError(ex, "后台任务失败");
+});
+</code></pre>
+<hr>
+<h3 id="54-库代码不要吞掉异常">5.4 库代码不要吞掉异常</h3>
+<pre><code class="language-csharp">// ❌ 错误：吞掉异常，调用者无法感知
+public async Task&lt;Result&gt; TryGetDataAsync()
+{
+    try
+    {
+        return await GetDataAsync();
+    }
+    catch
+    {
+        return null; // 吞掉异常
+    }
+}
+
+// ✅ 正确：让异常传播，或返回明确的错误状态
+public async Task&lt;Result&lt;T, Error&gt;&gt; TryGetDataAsync()
+{
+    try
+    {
+        var data = await GetDataAsync();
+        return Result.Success(data);
+    }
+    catch (Exception ex)
+    {
+        return Result.Failure(ex.Message);
+    }
+}
+</code></pre>
+<hr>
+<h3 id="55-异常信息要足够详细">5.5 异常信息要足够详细</h3>
+<pre><code class="language-csharp">// ❌ 错误：异常信息不明确
+throw new Exception("出错了");
+
+// ✅ 正确：提供上下文信息
+throw new InvalidOperationException(
+    $"API 调用失败: URL={url}, StatusCode={statusCode}, ErrorMessage={errorMessage}");
+</code></pre>
+<hr>
+<h2 id="6️⃣-实战总结异常处理清单">6️⃣ 实战总结：异常处理清单</h2>
+<h3 id="-dos应该做的">✅ Do's（应该做的）</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>单个任务</strong></td>
+<td>使用 <code>await</code> + <code>try-catch</code></td>
+</tr>
+<tr>
+<td><strong>多个任务（需要所有异常）</strong></td>
+<td><code>await Task.WhenAll</code> + 检查 <code>Task.Exception</code></td>
+</tr>
+<tr>
+<td><strong>多个任务（容错）</strong></td>
+<td>使用 <code>SafeWhenAll</code> 扩展方法</td>
+</tr>
+<tr>
+<td><strong>后台任务</strong></td>
+<td>使用 <code>SafeFireAndForget</code> 或 <code>BackgroundService</code></td>
+</tr>
+<tr>
+<td><strong>嵌套异常</strong></td>
+<td>使用 <code>Flatten()</code> 扁平化</td>
+</tr>
+<tr>
+<td><strong>选择性处理</strong></td>
+<td>使用 <code>Handle()</code> 方法</td>
+</tr>
+<tr>
+<td><strong>记录日志</strong></td>
+<td>在 <code>catch</code> 块中使用 <code>ILogger</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="-donts不应该做的">❌ Don'ts（不应该做的）</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>使用 <code>.Wait()</code> 或 <code>.Result</code></strong></td>
+<td>阻塞线程，可能死锁</td>
+</tr>
+<tr>
+<td><strong>吞掉异常（空 catch）</strong></td>
+<td>隐藏问题，难以排查</td>
+</tr>
+<tr>
+<td><strong>忽略后台任务异常</strong></td>
+<td>资源泄漏，问题难以发现</td>
+</tr>
+<tr>
+<td><strong>只捕获第一个异常</strong></td>
+<td>丢失其他失败信息</td>
+</tr>
+<tr>
+<td><strong>异常信息不足</strong></td>
+<td>难以定位问题</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7️⃣-本章小结">7️⃣ 本章小结</h2>
+<h3 id="核心知识点">核心知识点</h3>
+<ol>
+<li>
+<p><strong>AggregateException 的设计思想</strong>：</p>
+<ul>
+<li>为并发任务设计的异常容器</li>
+<li>可以包含多个子异常</li>
+<li>提供 <code>Flatten()</code> 和 <code>Handle()</code> 高级功能</li>
+</ul>
+</li>
+<li>
+<p><strong>await vs Wait/Result 的异常行为</strong>：</p>
+<ul>
+<li><code>await</code>：抛出第一个原始异常，简化处理</li>
+<li><code>.Wait()</code> / <code>.Result</code>：抛出 <code>AggregateException</code>，阻塞线程</li>
+<li><strong>优先使用 await</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>Task.WhenAll 的异常处理</strong>：</p>
+<ul>
+<li><code>await</code> 只抛出第一个异常</li>
+<li>通过 <code>Task.Exception</code> 获取所有异常</li>
+<li>使用 <code>SafeWhenAll</code> 封装处理逻辑</li>
+</ul>
+</li>
+<li>
+<p><strong>后台任务的异常处理</strong>：</p>
+<ul>
+<li>异常容易被吞掉</li>
+<li>使用 <code>SafeFireAndForget</code> 或 <code>BackgroundService</code></li>
+<li>注册全局的 <code>UnobservedTaskException</code> 处理器</li>
+</ul>
+</li>
+</ol>
+<h3 id="进阶思考">进阶思考</h3>
+<p>之前去面试，碰见了一道面试题，至今记忆犹新。现在拿出来，供大家思考一下：</p>
+<blockquote>
+<p>有一组API，数量记为N，50&lt;=N&lt;=500。现在要设计一个功能，要求在最短的时间内找出这组API里成功响应时间最短的API，每次最大并发请求数量限制为10。</p>
+</blockquote>
+<hr>
+<h2 id="-下一章预告">🎯 下一章预告</h2>
+<p>在下一章中，我们将深入探讨<strong>异步编程的最佳实践和反模式</strong>：</p>
+<ul>
+<li><code>async void</code> 的危害与正确使用场景</li>
+<li>异步同步混用的陷阱</li>
+<li><code>Task.Run</code> 的滥用问题</li>
+<li><code>using</code> 语句中的异步操作</li>
+<li>异步命名规范与代码审查清单</li>
+</ul>
+<p>敬请期待！</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-05-10 21:41">2026-05-10 21:40</span>&nbsp;
+<a href="https://www.cnblogs.com/diamondhusky">呆萌哈士奇</a>&nbsp;
+阅读(<span id="post_view_count">56</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20008918);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdiamondhusky%2Fp%2F20008918&amp;targetId=20008918&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
