@@ -1,0 +1,3009 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/diamondhusky/p/19976212" title="发布于 2026-05-05 23:51">
+    <span role="heading" aria-level="2">【.NET并发编程 - 06】CancellationToken：优雅地取消异步操作</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="06-cancellationtoken优雅地取消异步操作">06. CancellationToken：优雅地取消异步操作</h1>
+<blockquote>
+<p><strong>本章 GitHub 仓库</strong>：<a href="https://github.com/Naughtyhusky/csharp-concurrency-cookbook/tree/dev" target="_blank" rel="noopener nofollow">csharp-concurrency-cookbook</a> ⭐</p>
+<p>欢迎 Star 和 Fork！所有代码示例都可以在仓库中找到并运行。</p>
+</blockquote>
+<hr>
+<h2 id="-本章导读">🎯 本章导读</h2>
+<blockquote>
+<p>📌 <strong>本文目标</strong>：掌握 CancellationToken 的正确使用姿势，实现优雅的异步操作取消和超时控制，避免常见陷阱。</p>
+</blockquote>
+<p>你是否遇到过这样的场景：</p>
+<ul>
+<li>用户点击"取消"按钮，但后台的文件下载还在继续？</li>
+<li>一个 API 请求超过 30 秒了，如何自动停止？</li>
+<li>多个异步任务，如何统一取消？</li>
+<li>取消操作后，如何正确释放资源？</li>
+</ul>
+<p>今天，我们就来彻底搞懂 <strong>CancellationToken</strong>——.NET 异步编程中最优雅的取消机制。</p>
+<blockquote>
+<p>⚠️ <strong>重要提示</strong>：本文涉及异步编程的核心概念，建议先掌握前面章节的 Task 和 async/await 基础。</p>
+</blockquote>
+<hr>
+<h2 id="0️⃣-一个真实的故事用户的取消按钮为什么不好使">0️⃣ 一个真实的故事：用户的"取消"按钮为什么不好使？</h2>
+<h3 id="01-场景重现文件下载器">0.1 场景重现：文件下载器</h3>
+<p>假设你正在写一个文件下载器，需求很明确：</p>
+<ol>
+<li>点击"下载"按钮，开始下载大文件</li>
+<li>点击"取消"按钮，立即停止下载</li>
+<li>如果超过 10 秒还没下载完，自动超时</li>
+</ol>
+<p>你写出了第一版代码：</p>
+<pre><code class="language-csharp">// ❌ 错误的实现：无法取消
+public partial class MainForm : Form
+{
+    private bool _shouldCancel = false; // 用 bool 标志位控制
+
+    private async void btnDownload_Click(object sender, EventArgs e)
+    {
+        _shouldCancel = false;
+        btnDownload.Enabled = false;
+        btnCancel.Enabled = true;
+
+        try
+        {
+            lblStatus.Text = "下载中...";
+            await DownloadFileAsync("https://example.com/large-file.zip");
+            lblStatus.Text = "下载完成！";
+        }
+        catch (Exception ex)
+        {
+            lblStatus.Text = $"错误: {ex.Message}";
+        }
+        finally
+        {
+            btnDownload.Enabled = true;
+            btnCancel.Enabled = false;
+        }
+    }
+
+    private void btnCancel_Click(object sender, EventArgs e)
+    {
+        _shouldCancel = true; // 设置标志位
+        lblStatus.Text = "取消中...";
+    }
+
+    private async Task DownloadFileAsync(string url)
+    {
+        using var client = new HttpClient();
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+        using var stream = await response.Content.ReadAsStreamAsync();
+        using var fileStream = File.Create("downloaded-file.zip");
+
+        byte[] buffer = new byte[8192];
+        int bytesRead;
+
+        while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length)) &gt; 0)
+        {
+            // 检查取消标志
+            if (_shouldCancel)
+            {
+                lblStatus.Text = "已取消";
+                return; // ❌ 问题1：资源泄漏（文件句柄未正确关闭）
+            }
+
+            await fileStream.WriteAsync(buffer, 0, bytesRead);
+
+            // 更新进度
+            progressBar.Value = (int)(fileStream.Position * 100 / response.Content.Headers.ContentLength);
+        }
+    }
+}
+</code></pre>
+<h3 id="02-这个实现的问题">0.2 这个实现的问题</h3>
+<p>运行后你发现了一堆问题：</p>
+<ol>
+<li><strong>❌ 响应延迟</strong>：点击"取消"后，要等到下一次循环才检查 <code>_shouldCancel</code>，可能等好几秒</li>
+<li><strong>❌ 线程安全问题</strong>：多个线程同时读写 <code>_shouldCancel</code>，可能出现竞态条件</li>
+<li><strong>❌ 无法实现超时</strong>：如何在 10 秒后自动取消？再加一个定时器？</li>
+<li><strong>❌ 资源泄漏风险</strong>：取消时直接 <code>return</code>，文件流可能没有正确关闭</li>
+<li><strong>❌ 无法统一管理</strong>：如果有多个异步操作，如何一次性取消？</li>
+</ol>
+<p>你开始头疼：<strong>取消一个异步操作，怎么这么复杂</strong>？</p>
+<h3 id="03-cancellationtoken-的登场">0.3 CancellationToken 的登场</h3>
+<p>.NET 提供了一套完整的取消机制：<strong>CancellationToken</strong>。</p>
+<p>使用 CancellationToken 重写后：</p>
+<pre><code class="language-csharp">// ✅ 正确的实现：使用 CancellationToken
+public partial class MainForm : Form
+{
+    private CancellationTokenSource _cts; // 取消令牌源
+
+    private async void btnDownload_Click(object sender, EventArgs e)
+    {
+        // 创建取消令牌源
+        _cts = new CancellationTokenSource();
+        _cts.CancelAfter(TimeSpan.FromSeconds(10)); // 10秒自动超时
+
+        btnDownload.Enabled = false;
+        btnCancel.Enabled = true;
+
+        try
+        {
+            lblStatus.Text = "下载中...";
+            await DownloadFileAsync("https://example.com/large-file.zip", _cts.Token);
+            lblStatus.Text = "下载完成！";
+        }
+        catch (OperationCanceledException)
+        {
+            lblStatus.Text = "已取消";
+        }
+        catch (Exception ex)
+        {
+            lblStatus.Text = $"错误: {ex.Message}";
+        }
+        finally
+        {
+            _cts?.Dispose(); // 释放资源
+            btnDownload.Enabled = true;
+            btnCancel.Enabled = false;
+        }
+    }
+
+    private void btnCancel_Click(object sender, EventArgs e)
+    {
+        _cts?.Cancel(); // 触发取消
+    }
+
+    private async Task DownloadFileAsync(string url, CancellationToken cancellationToken)
+    {
+        using var client = new HttpClient();
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var fileStream = File.Create("downloaded-file.zip");
+
+        byte[] buffer = new byte[8192];
+        int bytesRead;
+
+        while ((bytesRead = await stream.ReadAsync(buffer, cancellationToken)) &gt; 0)
+        {
+            // 不需要手动检查，ReadAsync 内部会检查 CancellationToken
+            await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
+
+            // 更新进度
+            progressBar.Value = (int)(fileStream.Position * 100 / response.Content.Headers.ContentLength);
+        }
+    }
+}
+</code></pre>
+<p><strong>神奇的效果</strong>：</p>
+<ul>
+<li>✅ 点击"取消"，<strong>立即响应</strong>（不用等循环）</li>
+<li>✅ <strong>线程安全</strong>（CancellationToken 内部保证）</li>
+<li>✅ <strong>自动超时</strong>（<code>CancelAfter</code> 一行搞定）</li>
+<li>✅ <strong>资源自动释放</strong>（using 块保证）</li>
+<li>✅ <strong>统一的异常处理</strong>（<code>OperationCanceledException</code>）</li>
+</ul>
+<p>看到这里，你是不是有点心动了？别急，我们先从原理讲起。</p>
+<hr>
+<h2 id="1️⃣-cancellationtoken-的核心理念协作式取消">1️⃣ CancellationToken 的核心理念：协作式取消</h2>
+<h3 id="11-为什么不能强制终止线程">1.1 为什么不能强制终止线程？</h3>
+<p>你可能会问：为什么不直接 <code>Thread.Abort()</code> 强制停止线程？</p>
+<p>在 .NET Framework 时代，确实有 <code>Thread.Abort()</code> 方法，但它有<strong>致命缺陷</strong>：</p>
+<pre><code class="language-csharp">// ❌ .NET Framework 的黑历史（.NET Core 已移除）
+Thread workerThread = new Thread(() =&gt;
+{
+    try
+    {
+        using var fileStream = File.Create("important.dat");
+        fileStream.Write(data, 0, data.Length);
+        // 如果此时被 Abort，文件句柄泄漏！
+    }
+    finally
+    {
+        // finally 块可能不会执行！
+    }
+});
+
+workerThread.Start();
+Thread.Sleep(100);
+workerThread.Abort(); // 💣 强制终止，可能造成：
+                       // 1. 文件句柄泄漏
+                       // 2. 数据库连接未释放
+                       // 3. finally 块不执行
+                       // 4. 数据损坏
+</code></pre>
+<p><strong>强制终止的问题</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>🔥 <strong>资源泄漏</strong></td>
+<td>线程被强制终止，<code>using</code> 和 <code>finally</code> 可能不执行</td>
+</tr>
+<tr>
+<td>🔥 <strong>数据损坏</strong></td>
+<td>写入一半的数据被中断，文件/数据库处于不一致状态</td>
+</tr>
+<tr>
+<td>🔥 <strong>死锁</strong></td>
+<td>线程持有锁时被终止,其他线程永远等待</td>
+</tr>
+<tr>
+<td>🔥 <strong>无法预测</strong></td>
+<td>不知道线程会在哪里被终止</td>
+</tr>
+</tbody>
+</table>
+<p>这就是为什么 <strong>.NET Core 完全移除了 <code>Thread.Abort()</code></strong>。</p>
+<h3 id="12-协作式取消温柔的力量">1.2 协作式取消：温柔的力量</h3>
+<p>CancellationToken 采用<strong>协作式取消（Cooperative Cancellation）</strong>模型：</p>
+<pre><code>┌─────────────────────────────────────────────────────────────┐
+│                   协作式取消模型                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  调用方                     执行方                          │
+│  ┌────────┐                ┌────────┐                       │
+│  │ 发出   │                │ 检查   │                       │
+│  │ 取消   │───────────────&gt;│ 取消   │                       │
+│  │ 请求   │                │ 信号   │                       │
+│  └────────┘                └────────┘                       │
+│      │                          │                           │
+│      │                          ├──&gt; 主动停止工作           │
+│      │                          ├──&gt; 清理资源               │
+│      │                          └──&gt; 抛出异常               │
+│                                                             │
+│  核心思想：我请求你停止,你决定何时停止                       │
+└─────────────────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>类比</strong>：</p>
+<ul>
+<li><strong>强制终止</strong> = 断电关机（可能丢失数据）</li>
+<li><strong>协作式取消</strong> = 点击"关机"，等待程序保存数据后关闭</li>
+</ul>
+<h3 id="13-cancellationtoken-的两个核心类">1.3 CancellationToken 的两个核心类</h3>
+<pre><code class="language-csharp">// 发信号的人：CancellationTokenSource
+CancellationTokenSource cts = new CancellationTokenSource();
+
+// 接收信号的人：CancellationToken
+CancellationToken token = cts.Token;
+
+// 发送取消信号
+cts.Cancel();
+
+// 检查取消信号
+if (token.IsCancellationRequested)
+{
+    // 停止工作
+}
+</code></pre>
+<p><strong>角色分工</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>类</th>
+<th>角色</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CancellationTokenSource</code></td>
+<td><strong>信号源</strong>（调用方持有）</td>
+<td>发送取消信号：<code>Cancel()</code>、<code>CancelAfter()</code></td>
+</tr>
+<tr>
+<td><code>CancellationToken</code></td>
+<td><strong>信号接收器</strong>（执行方持有）</td>
+<td>检查信号：<code>IsCancellationRequested</code>、<code>ThrowIfCancellationRequested()</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>设计思想</strong>：</p>
+<ul>
+<li><strong>分离关注点</strong>：发送方和接收方分离，避免误操作</li>
+<li><strong>单向传递</strong>：只能从 Source 到 Token，不能反向</li>
+<li><strong>轻量级</strong>：Token 是 struct，传递无性能损耗</li>
+</ul>
+<hr>
+<h2 id="1️⃣-补充深入理解-cancellationtoken-的设计理念">1️⃣-补充：深入理解 CancellationToken 的设计理念</h2>
+<h3 id="14-为什么需要手动控制取消">1.4 为什么需要"手动"控制取消？</h3>
+<p>你可能会疑惑：<strong>既然 CancellationToken 这么强大，为什么不设计成自动的</strong>？为什么需要开发者手动写 <code>if (cancellationToken.IsCancellationRequested)</code> 或 <code>cancellationToken.ThrowIfCancellationRequested()</code>？</p>
+<p>让我们通过一个例子来理解：</p>
+<pre><code class="language-csharp">// 场景：处理订单数据
+public async Task ProcessOrdersAsync(List&lt;Order&gt; orders, CancellationToken cancellationToken)
+{
+    foreach (var order in orders)
+    {
+        // ❓ 问题：如果这里自动取消，会发生什么？
+
+        // 步骤1：开始数据库事务
+        await _db.BeginTransactionAsync();
+
+        // 步骤2：更新订单状态
+        order.Status = OrderStatus.Processing;
+        await _db.SaveChangesAsync();
+
+        // 步骤3：调用支付接口（可能需要几秒）
+        var paymentResult = await _paymentService.ProcessAsync(order.Amount);
+
+        // 步骤4：提交事务
+        await _db.CommitTransactionAsync();
+
+        // 步骤5：发送通知邮件
+        await _emailService.SendAsync(order.Email, "订单已处理");
+    }
+}
+</code></pre>
+<p><strong>如果框架自动取消会怎样？</strong></p>
+<p>假设用户在步骤3（调用支付接口）时点击了取消：</p>
+<table>
+<thead>
+<tr>
+<th>自动取消的后果</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>💥 <strong>数据不一致</strong></td>
+<td>订单状态更新了，但支付未完成，事务未提交</td>
+</tr>
+<tr>
+<td>💥 <strong>资源泄漏</strong></td>
+<td>数据库事务未回滚，数据库连接可能被锁定</td>
+</tr>
+<tr>
+<td>💥 <strong>业务逻辑错误</strong></td>
+<td>支付接口已扣款，但本地数据未保存</td>
+</tr>
+<tr>
+<td>💥 <strong>用户体验差</strong></td>
+<td>邮件没发送，用户不知道订单状态</td>
+</tr>
+</tbody>
+</table>
+<p><strong>手动控制的价值</strong>：</p>
+<pre><code class="language-csharp">// ✅ 正确实现：开发者决定何时可以安全取消
+public async Task ProcessOrdersAsync(List&lt;Order&gt; orders, CancellationToken cancellationToken)
+{
+    foreach (var order in orders)
+    {
+        // 👉 在循环开始时检查（粗粒度检查点）
+        cancellationToken.ThrowIfCancellationRequested();
+
+        try
+        {
+            // 原子操作：不检查取消（保证业务完整性）
+            await _db.BeginTransactionAsync();
+            order.Status = OrderStatus.Processing;
+            await _db.SaveChangesAsync();
+
+            // 💡 关键点：支付是长时间操作，传递 token
+            var paymentResult = await _paymentService.ProcessAsync(
+                order.Amount, 
+                cancellationToken  // 支付服务内部会检查
+            );
+
+            await _db.CommitTransactionAsync();
+        }
+        catch (OperationCanceledException)
+        {
+            // 如果在支付过程中取消，回滚事务
+            await _db.RollbackTransactionAsync();
+            throw; // 重新抛出，让调用方知道已取消
+        }
+
+        // 👉 事务完成后再检查，决定是否发送邮件
+        if (!cancellationToken.IsCancellationRequested)
+        {
+            await _emailService.SendAsync(order.Email, "订单已处理");
+        }
+    }
+}
+</code></pre>
+<p><strong>手动控制的三大好处</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>好处</th>
+<th>说明</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>🎯 <strong>保证业务完整性</strong></td>
+<td>开发者决定哪些操作必须完成</td>
+<td>数据库事务必须原子执行</td>
+</tr>
+<tr>
+<td>🎯 <strong>灵活的检查点</strong></td>
+<td>在合适的位置检查取消</td>
+<td>循环开始时检查，而不是每次迭代</td>
+</tr>
+<tr>
+<td>🎯 <strong>优雅的清理</strong></td>
+<td>取消时执行必要的清理逻辑</td>
+<td>回滚事务、删除临时文件</td>
+</tr>
+</tbody>
+</table>
+<h3 id="15-底层实现原理概览">1.5 底层实现原理概览</h3>
+<blockquote>
+<p>💡 <strong>提示</strong>：这里只做简单介绍，详细内容请参考第 7 章《高级话题》。</p>
+</blockquote>
+<p>CancellationToken 的核心设计非常巧妙：</p>
+<p><strong>关键设计点</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>设计</th>
+<th>实现</th>
+<th>好处</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Token 是 struct</strong></td>
+<td>值类型（栈上分配）</td>
+<td>无 GC 压力，传递零开销（8 字节）</td>
+</tr>
+<tr>
+<td><strong>Source 是 class</strong></td>
+<td>引用类型（堆上分配）</td>
+<td>管理可变状态和回调链表</td>
+</tr>
+<tr>
+<td><strong>使用 volatile</strong></td>
+<td>内存屏障</td>
+<td>保证多线程可见性</td>
+</tr>
+<tr>
+<td><strong>使用 Interlocked</strong></td>
+<td>原子操作</td>
+<td>保证只取消一次</td>
+</tr>
+<tr>
+<td><strong>无锁回调链表</strong></td>
+<td>SparselyPopulatedArray</td>
+<td>高并发性能</td>
+</tr>
+</tbody>
+</table>
+<p><strong>简化的结构</strong>：</p>
+<pre><code class="language-csharp">// Token 只是一个轻量级的"遥控器"
+public struct CancellationToken
+{
+    private readonly CancellationTokenSource _source;  // 只存一个引用（8字节）
+}
+
+// Source 是真正的"控制中心"
+public class CancellationTokenSource
+{
+    private volatile int _state;  // 0=未取消, 1=已取消
+    private volatile SparselyPopulatedArray&lt;CancellationCallbackInfo&gt; _callbacks;
+
+    public void Cancel()
+    {
+        // 原子操作，保证只取消一次
+        if (Interlocked.CompareExchange(ref _state, 1, 0) == 0)
+        {
+            ExecuteCallbacks();  // 执行所有注册的回调
+        }
+    }
+}
+</code></pre>
+<p><strong>类比</strong>：</p>
+<pre><code>Source = 电视台的发射塔（只有一个，管理状态）
+Token = 每个人的遥控器（人手一个，但都指向同一个发射塔）
+</code></pre>
+<p>传递 Token 就像复制遥控器，非常轻量；所有遥控器都指向同一个发射塔。</p>
+<p><strong>性能特点</strong>：</p>
+<ul>
+<li>创建 Token：O(1)，8 字节</li>
+<li>检查取消：O(1)，约 2-3 纳秒</li>
+<li>调用 Cancel()：O(n)，n = 回调数量</li>
+</ul>
+<blockquote>
+<p>📖 <strong>想了解更多</strong>？请跳转到第 7 章《高级话题》查看详细的内部实现和性能分析。</p>
+</blockquote>
+<hr>
+<h2 id="2️⃣-cancellationtoken-的基本用法">2️⃣ CancellationToken 的基本用法</h2>
+<h3 id="21-创建-cancellationtokensource">2.1 创建 CancellationTokenSource</h3>
+<pre><code class="language-csharp">// 方式1：手动取消
+CancellationTokenSource cts = new CancellationTokenSource();
+
+// 方式2：自动超时
+CancellationTokenSource cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+// 方式3：延迟设置超时
+CancellationTokenSource cts = new CancellationTokenSource();
+cts.CancelAfter(TimeSpan.FromSeconds(5)); // 5秒后自动取消
+
+// 方式4：链接多个 Token（任意一个取消，都会触发）
+CancellationTokenSource cts1 = new CancellationTokenSource();
+CancellationTokenSource cts2 = new CancellationTokenSource();
+CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts1.Token, cts2.Token);
+</code></pre>
+<h3 id="22-两种检查取消的方式">2.2 两种检查取消的方式</h3>
+<h4 id="方式1主动检查适用于循环">方式1：主动检查（适用于循环）</h4>
+<pre><code class="language-csharp">public async Task ProcessDataAsync(List&lt;int&gt; data, CancellationToken cancellationToken)
+{
+    foreach (var item in data)
+    {
+        // 检查是否取消
+        if (cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine("操作已取消");
+            return; // 优雅退出
+        }
+
+        // 处理数据
+        await ProcessItemAsync(item);
+    }
+}
+</code></pre>
+<h4 id="方式2抛出异常推荐">方式2：抛出异常（推荐）</h4>
+<pre><code class="language-csharp">public async Task ProcessDataAsync(List&lt;int&gt; data, CancellationToken cancellationToken)
+{
+    foreach (var item in data)
+    {
+        // 如果取消，抛出 OperationCanceledException
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // 处理数据
+        await ProcessItemAsync(item);
+    }
+}
+
+// 调用方统一捕获异常
+try
+{
+    await ProcessDataAsync(data, cts.Token);
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("操作已取消");
+}
+</code></pre>
+<p><strong>推荐方式2的原因</strong>：</p>
+<ol>
+<li><strong>统一异常处理</strong>：调用方可以统一捕获 <code>OperationCanceledException</code></li>
+<li><strong>清晰的语义</strong>：抛出异常明确表示"操作被取消"</li>
+<li><strong>符合 .NET 规范</strong>：框架内所有异步 API 都这么做</li>
+</ol>
+<h3 id="23-在异步方法中传递-cancellationtoken">2.3 在异步方法中传递 CancellationToken</h3>
+<pre><code class="language-csharp">// ✅ 标准模式：CancellationToken 作为最后一个参数
+public async Task&lt;string&gt; DownloadAsync(string url, CancellationToken cancellationToken = default)
+{
+    using var client = new HttpClient();
+
+    // 传递给框架 API
+    var response = await client.GetAsync(url, cancellationToken);
+    return await response.Content.ReadAsStringAsync();
+}
+
+// 调用
+await DownloadAsync("https://api.example.com/data", cts.Token);
+</code></pre>
+<p><strong>最佳实践</strong>：</p>
+<ol>
+<li><strong>参数位置</strong>：CancellationToken 总是最后一个参数</li>
+<li><strong>默认值</strong>：使用 <code>= default</code>，调用方可以不传</li>
+<li><strong>一路传递</strong>：从顶层一直传到底层</li>
+</ol>
+<h3 id="24--传递性的重要性不传递会出大问题">2.4 ⭐ 传递性的重要性：不传递会出大问题！</h3>
+<blockquote>
+<p><strong>⚠️ 重要警告</strong>：CancellationToken 的传递性是其设计的核心，不传递可能导致严重问题！</p>
+</blockquote>
+<h4 id="问题场景忘记传递-token">问题场景：忘记传递 Token</h4>
+<pre><code class="language-csharp">// ❌ 错误示例：不传递 CancellationToken
+public class BadOrderService
+{
+    public async Task ProcessOrderAsync(Order order, CancellationToken cancellationToken)
+    {
+        // 第一层：检查了 Token ✅
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // 第二层：调用支付服务，但没有传递 Token ❌
+        await _paymentService.ChargeAsync(order.Amount);  // 缺少 cancellationToken
+
+        // 第三层：调用库存服务，也没传递 ❌
+        await _inventoryService.ReserveAsync(order.ProductId);  // 缺少 cancellationToken
+
+        // 第四层：发送邮件，还是没传递 ❌
+        await _emailService.SendAsync(order.Email, "订单已处理");  // 缺少 cancellationToken
+    }
+}
+</code></pre>
+<p><strong>后果分析</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>用户操作</th>
+<th>实际效果</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第1层</td>
+<td>用户取消</td>
+<td>ProcessOrderAsync 退出</td>
+<td>✅ 正常</td>
+</tr>
+<tr>
+<td>第2层</td>
+<td>支付服务</td>
+<td><strong>继续运行</strong></td>
+<td>💥 扣款已发生</td>
+</tr>
+<tr>
+<td>第3层</td>
+<td>库存服务</td>
+<td><strong>继续运行</strong></td>
+<td>💥 库存已锁定</td>
+</tr>
+<tr>
+<td>第4层</td>
+<td>邮件服务</td>
+<td><strong>继续运行</strong></td>
+<td>💥 邮件已发送</td>
+</tr>
+</tbody>
+</table>
+<p><strong>真实场景的灾难</strong>：</p>
+<ol>
+<li>用户点击取消</li>
+<li>界面显示"已取消"</li>
+<li>但后台：
+<ul>
+<li>✅ 第1层退出了</li>
+<li>💥 第2层：钱被扣了（支付接口已调用）</li>
+<li>💥 第3层：库存被锁定了</li>
+<li>💥 第4层：用户收到了"订单成功"的邮件</li>
+</ul>
+</li>
+</ol>
+<p>用户：<strong>"什么鬼？我明明取消了，为什么还扣钱？"</strong> 😱</p>
+<h4 id="-正确实现一路传递">✅ 正确实现：一路传递</h4>
+<pre><code class="language-csharp">// ✅ 正确示例：CancellationToken 必须一路传递
+public class GoodOrderService
+{
+    public async Task ProcessOrderAsync(Order order, CancellationToken cancellationToken)
+    {
+        // 第一层：检查 Token
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // 第二层：传递给支付服务 ✅
+        await _paymentService.ChargeAsync(order.Amount, cancellationToken);
+
+        // 第三层：传递给库存服务 ✅
+        await _inventoryService.ReserveAsync(order.ProductId, cancellationToken);
+
+        // 第四层：传递给邮件服务 ✅
+        await _emailService.SendAsync(order.Email, "订单已处理", cancellationToken);
+    }
+}
+
+// 支付服务内部也传递
+public class PaymentService
+{
+    public async Task ChargeAsync(decimal amount, CancellationToken cancellationToken)
+    {
+        // 传递给 HTTP 客户端 ✅
+        var response = await _httpClient.PostAsync(
+            "/api/charge", 
+            content, 
+            cancellationToken);  // 继续传递
+
+        // ...
+    }
+}
+</code></pre>
+<p><strong>传递链路可视化</strong>：</p>
+<pre><code>用户界面 (取消按钮)
+    │
+    └─&gt; OrderService.ProcessOrderAsync(token)
+            │
+            ├─&gt; PaymentService.ChargeAsync(token)
+            │       │
+            │       └─&gt; HttpClient.PostAsync(token)  ← 真正的网络请求
+            │
+            ├─&gt; InventoryService.ReserveAsync(token)
+            │       │
+            │       └─&gt; DbContext.SaveChangesAsync(token)  ← 真正的数据库操作
+            │
+            └─&gt; EmailService.SendAsync(token)
+                    │
+                    └─&gt; SmtpClient.SendMailAsync(token)  ← 真正的邮件发送
+
+如果任意一个环节不传递，后面的操作都无法取消！
+</code></pre>
+<h4 id="传递规则总结">传递规则总结</h4>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>是否传递</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>✅ 调用异步方法</td>
+<td><strong>必须传递</strong></td>
+<td>让底层有机会响应取消</td>
+</tr>
+<tr>
+<td>✅ HTTP 请求</td>
+<td><strong>必须传递</strong></td>
+<td>网络请求可能很慢</td>
+</tr>
+<tr>
+<td>✅ 数据库操作</td>
+<td><strong>必须传递</strong></td>
+<td>查询可能超时</td>
+</tr>
+<tr>
+<td>✅ 文件 I/O</td>
+<td><strong>必须传递</strong></td>
+<td>大文件读写需要时间</td>
+</tr>
+<tr>
+<td>✅ Task.Delay</td>
+<td><strong>必须传递</strong></td>
+<td>否则无法提前结束等待</td>
+</tr>
+<tr>
+<td>⚠️ 短时间同步操作</td>
+<td>可以不传递</td>
+<td>如：简单计算、内存操作</td>
+</tr>
+</tbody>
+</table>
+<h4 id="如何检查代码中的传递问题">如何检查代码中的传递问题？</h4>
+<p><strong>使用 Roslyn 分析器</strong>：</p>
+<p>安装 <code>Microsoft.VisualStudio.Threading.Analyzers</code> NuGet 包，它会自动检测：</p>
+<pre><code class="language-csharp">// 编译器警告：VSTHRD103
+public async Task ProcessAsync(CancellationToken cancellationToken)
+{
+    // ⚠️ Warning: Method 'DoWorkAsync' should be called with cancellation token
+    await DoWorkAsync();  // 缺少 cancellationToken 参数
+}
+</code></pre>
+<p><strong>手动检查清单</strong>：</p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 所有 <code>async</code> 方法都接受 <code>CancellationToken</code> 参数</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 所有异步调用都传递了 <code>cancellationToken</code></label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> HTTP 请求、数据库操作、文件 I/O 都传递了 token</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>Task.Run</code>、<code>Task.Delay</code> 都传递了 token</label></li>
+</ul>
+<h3 id="25-异步编程模式下的最佳实践">2.5 异步编程模式下的最佳实践</h3>
+<blockquote>
+<p><strong>.NET Core 时代，异步编程是主流</strong>。正确使用 CancellationToken 是异步代码的必修课。</p>
+</blockquote>
+<h4 id="模式1aspnet-core-控制器中的使用">模式1：ASP.NET Core 控制器中的使用</h4>
+<pre><code class="language-csharp">// ✅ 最佳实践：使用 ASP.NET Core 的内置支持
+[ApiController]
+[Route("api/[controller]")]
+public class OrdersController : ControllerBase
+{
+    private readonly IOrderService _orderService;
+
+    public OrdersController(IOrderService orderService)
+    {
+        _orderService = orderService;
+    }
+
+    // 🔥 重点：使用 [FromHeader] 或直接注入，无需手动创建
+    [HttpPost]
+    public async Task&lt;IActionResult&gt; CreateOrder(
+        [FromBody] CreateOrderRequest request,
+        CancellationToken cancellationToken)  // ASP.NET Core 自动注入！
+    {
+        try
+        {
+            // 直接传递，ASP.NET Core 会在请求中断时自动取消
+            var order = await _orderService.CreateAsync(request, cancellationToken);
+            return Ok(order);
+        }
+        catch (OperationCanceledException)
+        {
+            // 客户端断开连接（如：用户关闭浏览器）
+            _logger.LogInformation("请求已取消");
+            return StatusCode(499, "Client Closed Request");
+        }
+    }
+}
+</code></pre>
+<p><strong>ASP.NET Core 的自动取消场景</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>何时触发</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端断开</td>
+<td>用户关闭浏览器</td>
+<td>下载大文件时关闭页面</td>
+</tr>
+<tr>
+<td>请求超时</td>
+<td>超过 Kestrel 超时设置</td>
+<td>默认 30 秒</td>
+</tr>
+<tr>
+<td>应用关闭</td>
+<td>IHostApplicationLifetime.ApplicationStopping</td>
+<td>优雅停机</td>
+</tr>
+</tbody>
+</table>
+<h4 id="模式2后台服务backgroundservice">模式2：后台服务（BackgroundService）</h4>
+<pre><code class="language-csharp">// ✅ 最佳实践：后台任务必须响应应用关闭
+public class OrderProcessingService : BackgroundService
+{
+    private readonly IOrderRepository _orderRepository;
+    private readonly ILogger&lt;OrderProcessingService&gt; _logger;
+
+    public OrderProcessingService(
+        IOrderRepository orderRepository,
+        ILogger&lt;OrderProcessingService&gt; logger)
+    {
+        _orderRepository = orderRepository;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("订单处理服务已启动");
+
+        // 🔥 重点：使用 stoppingToken，应用关闭时会自动取消
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                // 处理待处理的订单
+                var pendingOrders = await _orderRepository.GetPendingOrdersAsync(stoppingToken);
+
+                foreach (var order in pendingOrders)
+                {
+                    // 每个订单处理前检查
+                    stoppingToken.ThrowIfCancellationRequested();
+
+                    await ProcessOrderAsync(order, stoppingToken);
+                }
+
+                // 等待 5 秒后继续（可取消的等待）
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("订单处理服务正在停止...");
+                break;  // 退出循环
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理订单时发生错误");
+                // 继续循环，处理下一批
+            }
+        }
+
+        _logger.LogInformation("订单处理服务已停止");
+    }
+
+    private async Task ProcessOrderAsync(Order order, CancellationToken cancellationToken)
+    {
+        // 实际处理逻辑（也传递 cancellationToken）
+        await _orderRepository.UpdateStatusAsync(order.Id, OrderStatus.Processing, cancellationToken);
+        // ...
+    }
+}
+</code></pre>
+<p><strong>优雅停机流程</strong>：</p>
+<pre><code>1. 用户按 Ctrl+C
+    │
+2. IHostApplicationLifetime.ApplicationStopping 触发
+    │
+3. stoppingToken 被取消
+    │
+4. BackgroundService.ExecuteAsync 中的循环检测到取消
+    │
+5. 当前订单处理完成后退出
+    │
+6. 应用优雅关闭
+</code></pre>
+<h4 id="模式3并发任务中的使用">模式3：并发任务中的使用</h4>
+<pre><code class="language-csharp">// ✅ 最佳实践：并发任务共享同一个 Token
+public async Task ProcessMultipleUrlsAsync(
+    List&lt;string&gt; urls, 
+    CancellationToken cancellationToken)
+{
+    // 创建多个任务，都传递同一个 token
+    var tasks = urls.Select(url =&gt; 
+        DownloadAsync(url, cancellationToken)
+    ).ToList();
+
+    try
+    {
+        // 一旦 cancellationToken 被取消，所有任务都会收到信号
+        await Task.WhenAll(tasks);
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("所有下载已取消");
+    }
+}
+
+private async Task DownloadAsync(string url, CancellationToken cancellationToken)
+{
+    using var client = new HttpClient();
+    var response = await client.GetAsync(url, cancellationToken);
+    // ...
+}
+</code></pre>
+<h4 id="模式4组合多个取消源">模式4：组合多个取消源</h4>
+<pre><code class="language-csharp">// ✅ 最佳实践：组合用户取消 + 超时 + 应用关闭
+public async Task ProcessWithTimeoutAsync(
+    Order order,
+    CancellationToken userToken,        // 用户手动取消
+    CancellationToken applicationToken) // 应用关闭
+{
+    // 创建超时 Token
+    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+    // 组合三个 Token：任意一个取消都会停止
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+        userToken,           // 用户点击取消
+        timeoutCts.Token,    // 30秒超时
+        applicationToken);   // 应用关闭
+
+    try
+    {
+        await _orderService.ProcessAsync(order, linkedCts.Token);
+    }
+    catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
+    {
+        throw new TimeoutException("订单处理超时");
+    }
+    catch (OperationCanceledException) when (userToken.IsCancellationRequested)
+    {
+        _logger.LogInformation("用户取消了订单处理");
+        throw;
+    }
+    catch (OperationCanceledException) when (applicationToken.IsCancellationRequested)
+    {
+        _logger.LogInformation("应用关闭，订单处理中断");
+        throw;
+    }
+}
+</code></pre>
+<h4 id="模式5避免常见错误">模式5：避免常见错误</h4>
+<pre><code class="language-csharp">// ❌ 错误1：在 catch 中吞掉 OperationCanceledException
+try
+{
+    await ProcessAsync(cancellationToken);
+}
+catch (Exception ex)  // ❌ 不要捕获所有异常
+{
+    _logger.LogError(ex, "处理失败");
+    // OperationCanceledException 被吞掉了！
+}
+
+// ✅ 正确：单独处理取消异常
+try
+{
+    await ProcessAsync(cancellationToken);
+}
+catch (OperationCanceledException)
+{
+    // 取消是正常流程，不是错误
+    _logger.LogInformation("操作已取消");
+    throw;  // 重新抛出
+}
+catch (Exception ex)
+{
+    _logger.LogError(ex, "处理失败");
+    throw;
+}
+
+// ❌ 错误2：使用 ConfigureAwait(false) 后忘记传递 Token
+await Task.Delay(1000).ConfigureAwait(false);  // ❌ 无法取消
+
+// ✅ 正确
+await Task.Delay(1000, cancellationToken).ConfigureAwait(false);  // ✅
+
+// ❌ 错误3：在同步方法中阻塞异步方法
+public void Process(CancellationToken cancellationToken)
+{
+    ProcessAsync(cancellationToken).Wait();  // ❌ 可能死锁
+}
+
+// ✅ 正确：要么全异步，要么提供同步版本
+public async Task ProcessAsync(CancellationToken cancellationToken)
+{
+    // 异步实现
+}
+</code></pre>
+<h3 id="26-注册取消回调">2.6 注册取消回调</h3>
+<p>有时候，你需要在取消时执行一些清理工作：</p>
+<pre><code class="language-csharp">public async Task DownloadWithCleanupAsync(string url, CancellationToken cancellationToken)
+{
+    string tempFile = Path.GetTempFileName();
+
+    // 注册取消回调：删除临时文件
+    using var registration = cancellationToken.Register(() =&gt;
+    {
+        Console.WriteLine("取消时删除临时文件");
+        if (File.Exists(tempFile))
+        {
+            File.Delete(tempFile);
+        }
+    });
+
+    try
+    {
+        // 下载文件
+        using var client = new HttpClient();
+        var data = await client.GetByteArrayAsync(url, cancellationToken);
+        await File.WriteAllBytesAsync(tempFile, data, cancellationToken);
+
+        Console.WriteLine("下载完成");
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("下载已取消");
+        throw;
+    }
+}
+</code></pre>
+<p><strong>输出</strong>（取消时）：</p>
+<pre><code>取消时删除临时文件
+下载已取消
+</code></pre>
+<hr>
+<h2 id="3️⃣-实战场景超时控制">3️⃣ 实战场景：超时控制</h2>
+<h3 id="31-场景1http-请求超时">3.1 场景1：HTTP 请求超时</h3>
+<pre><code class="language-csharp">public async Task&lt;string&gt; GetDataWithTimeoutAsync(string url)
+{
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); // 5秒超时
+
+    try
+    {
+        using var client = new HttpClient();
+        var response = await client.GetAsync(url, cts.Token);
+        return await response.Content.ReadAsStringAsync();
+    }
+    catch (OperationCanceledException)
+    {
+        throw new TimeoutException($"请求超时: {url}");
+    }
+}
+</code></pre>
+<h3 id="32-场景2用户取消--超时">3.2 场景2：用户取消 + 超时</h3>
+<pre><code class="language-csharp">public async Task&lt;string&gt; DownloadWithUserCancelAndTimeoutAsync(
+    string url,
+    CancellationToken userCancellationToken)
+{
+    // 创建超时 Token
+    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+    // 链接用户取消 Token 和超时 Token
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+        userCancellationToken,
+        timeoutCts.Token);
+
+    try
+    {
+        using var client = new HttpClient();
+        var response = await client.GetAsync(url, linkedCts.Token);
+        return await response.Content.ReadAsStringAsync();
+    }
+    catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
+    {
+        throw new TimeoutException("下载超时");
+    }
+    catch (OperationCanceledException)
+    {
+        throw new OperationCanceledException("用户取消");
+    }
+}
+</code></pre>
+<h3 id="33-场景3taskwhenany-实现超时">3.3 场景3：Task.WhenAny 实现超时</h3>
+<pre><code class="language-csharp">public async Task&lt;string&gt; DownloadWithTimeoutAsync(string url, TimeSpan timeout)
+{
+    using var client = new HttpClient();
+    var downloadTask = client.GetStringAsync(url);
+    var timeoutTask = Task.Delay(timeout);
+
+    // 哪个先完成执行哪个
+    var completedTask = await Task.WhenAny(downloadTask, timeoutTask);
+
+    if (completedTask == downloadTask)
+    {
+        return await downloadTask; // 下载完成
+    }
+    else
+    {
+        throw new TimeoutException("下载超时");
+        // ⚠️ 注意：downloadTask 还在后台运行，无法真正取消
+    }
+}
+</code></pre>
+<p><strong>问题</strong>：这种方式<strong>无法真正取消</strong> <code>downloadTask</code>，它会在后台继续运行。</p>
+<p><strong>改进版</strong>（真正取消）：</p>
+<pre><code class="language-csharp">public async Task&lt;string&gt; DownloadWithTimeoutAsync(string url, TimeSpan timeout)
+{
+    using var cts = new CancellationTokenSource();
+    using var client = new HttpClient();
+
+    var downloadTask = client.GetStringAsync(url, cts.Token);
+    var timeoutTask = Task.Delay(timeout, cts.Token);
+
+    var completedTask = await Task.WhenAny(downloadTask, timeoutTask);
+
+    if (completedTask == downloadTask)
+    {
+        cts.Cancel(); // 取消超时任务
+        return await downloadTask;
+    }
+    else
+    {
+        cts.Cancel(); // 取消下载任务
+        throw new TimeoutException("下载超时");
+    }
+}
+</code></pre>
+<hr>
+<h2 id="3️⃣-补充aspnet-core-web-api-实战演示-">3️⃣-补充：ASP.NET Core Web API 实战演示 🔥</h2>
+<blockquote>
+<p><strong>💡 实战项目</strong>：完整的 Web API 项目在 <code>CancellationToken.WebApi.Demo</code> 文件夹中。<br>
+本节只介绍核心场景和关键代码，完整代码请查看 GitHub 仓库。</p>
+</blockquote>
+<h3 id="34-为什么需要-web-api-演示">3.4 为什么需要 Web API 演示？</h3>
+<p>前面的示例都是控制台程序，但在实际工作中，我们大多数时候都在开发 Web API。<strong>Web API 中的 CancellationToken 使用有其特殊性</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>控制台程序</th>
+<th>Web API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>手动创建 CancellationTokenSource</td>
+<td>ASP.NET Core <strong>自动注入</strong> CancellationToken</td>
+</tr>
+<tr>
+<td>用户按 Ctrl+C 取消</td>
+<td>客户端断开、请求超时、应用关闭</td>
+</tr>
+<tr>
+<td>适合演示基础概念</td>
+<td><strong>更贴近实际业务场景</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="35-aspnet-core-的自动取消机制">3.5 ASP.NET Core 的自动取消机制</h3>
+<p>ASP.NET Core 会在以下情况自动取消 CancellationToken：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>触发条件</th>
+<th>常见示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>客户端断开</strong></td>
+<td>用户关闭浏览器/标签页</td>
+<td>下载大文件时关闭页面</td>
+</tr>
+<tr>
+<td><strong>请求超时</strong></td>
+<td>超过 Kestrel 配置的超时时间</td>
+<td>默认无限制，需手动配置</td>
+</tr>
+<tr>
+<td><strong>应用关闭</strong></td>
+<td>Ctrl+C 或 docker stop</td>
+<td>优雅停机</td>
+</tr>
+</tbody>
+</table>
+<h3 id="36-场景1商品查询客户端取消">3.6 场景1：商品查询（客户端取消）⭐</h3>
+<p><strong>真实业务场景</strong>：</p>
+<ul>
+<li>用户在商品列表页进行复杂筛选（类别、价格区间、关键词等）</li>
+<li>查询可能需要几秒钟（数据库多表连接、全文搜索）</li>
+<li><strong>用户点击"取消"按钮，或关闭浏览器标签页</strong></li>
+<li>系统应该立即停止查询，释放数据库连接</li>
+</ul>
+<h4 id="控制器代码核心部分">控制器代码（核心部分）</h4>
+<pre><code class="language-csharp">[ApiController]
+[Route("api/[controller]")]
+public class ProductsController : ControllerBase
+{
+    private readonly IProductService _productService;
+
+    [HttpGet]
+    public async Task&lt;IActionResult&gt; Query(
+        [FromQuery] ProductQueryRequest request,
+        CancellationToken cancellationToken) // 🔥 ASP.NET Core 自动注入
+    {
+        try
+        {
+            // 🔥 关键点：将 cancellationToken 传递给服务层
+            var result = await _productService.QueryProductsAsync(request, cancellationToken);
+            return Ok(result);
+        }
+        catch (OperationCanceledException)
+        {
+            // 🔥 关键点：捕获取消异常，返回特定状态码
+            _logger.LogInformation("商品查询被取消（客户端断开或手动取消）");
+
+            // 返回 499 状态码（Client Closed Request）
+            return StatusCode(499, "查询已取消");
+        }
+    }
+}
+</code></pre>
+<h4 id="服务层代码核心部分">服务层代码（核心部分）</h4>
+<pre><code class="language-csharp">public class ProductService : IProductService
+{
+    public async Task&lt;PagedResponse&lt;Product&gt;&gt; QueryProductsAsync(
+        ProductQueryRequest request, 
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // 🔥 关键点1：在开始长时间操作前检查取消
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // 模拟复杂的数据库查询（多表连接、全文搜索等）
+            _logger.LogInformation("模拟复杂查询，延迟 {Delay}ms...", request.SimulatedDelayMs);
+
+            // 🔥 关键点2：长时间操作必须传递 CancellationToken
+            await Task.Delay(request.SimulatedDelayMs, cancellationToken);
+
+            // 🔥 关键点3：在处理数据前再次检查取消
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // 执行实际查询（这里省略了数据库操作代码）
+            // 真实场景：await _dbContext.Products.Where(...).ToListAsync(cancellationToken);
+
+            return new PagedResponse&lt;Product&gt; { /* 返回数据 */ };
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("商品查询已取消");
+            throw; // 重新抛出，让控制器处理
+        }
+    }
+}
+</code></pre>
+<h4 id="测试方法">测试方法</h4>
+<pre><code class="language-bash"># 启动查询（10秒延迟）
+curl "http://localhost:5000/api/products?simulatedDelayMs=10000"
+
+# 在 10 秒内按 Ctrl+C 取消
+</code></pre>
+<p><strong>预期结果</strong>：</p>
+<ul>
+<li>服务端日志显示："商品查询已取消"</li>
+<li>curl 返回错误（连接中断）</li>
+</ul>
+<h3 id="37-场景2订单创建超时控制">3.7 场景2：订单创建（超时控制）⭐⭐</h3>
+<p><strong>真实业务场景</strong>：</p>
+<ul>
+<li>用户提交订单，需要：验证 → 扣库存 → <strong>调用支付接口</strong> → 更新状态</li>
+<li>支付接口可能需要 5-30 秒（第三方服务，如微信支付、支付宝）</li>
+<li><strong>系统设置 30 秒超时，超时后自动取消</strong></li>
+<li>用户可以手动取消订单</li>
+<li><strong>取消时需要回滚已执行的操作</strong>（恢复库存等）</li>
+</ul>
+<h4 id="控制器代码核心部分-1">控制器代码（核心部分）</h4>
+<pre><code class="language-csharp">[ApiController]
+[Route("api/[controller]")]
+public class OrdersController : ControllerBase
+{
+    [HttpPost]
+    public async Task&lt;IActionResult&gt; Create(
+        [FromBody] CreateOrderRequest request,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // 🔥 关键点1：创建超时 Token（30秒）
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+            // 🔥 关键点2：组合用户取消 + 超时
+            // 任意一个取消都会触发
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,      // 用户取消（客户端断开）
+                timeoutCts.Token);      // 超时
+
+            // 🔥 关键点3：传递组合后的 Token
+            var result = await _orderService.CreateOrderAsync(request, linkedCts.Token);
+
+            return Ok(result);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // 🔥 关键点4：使用 when 子句区分取消原因
+            _logger.LogWarning("订单创建被用户取消");
+            return StatusCode(499, "订单已取消");
+        }
+        catch (OperationCanceledException)
+        {
+            // 超时取消
+            _logger.LogWarning("订单创建超时（30秒）");
+            return StatusCode(408, "订单处理超时，请稍后重试");
+        }
+    }
+}
+</code></pre>
+<h4 id="服务层代码核心部分-1">服务层代码（核心部分）</h4>
+<pre><code class="language-csharp">public class OrderService : IOrderService
+{
+    public async Task&lt;OrderResponse&gt; CreateOrderAsync(
+        CreateOrderRequest request, 
+        CancellationToken cancellationToken)
+    {
+        var order = new Order { /* 初始化订单 */ };
+
+        try
+        {
+            // 步骤1：验证订单
+            _logger.LogInformation("步骤1：验证订单...");
+            await Task.Delay(500, cancellationToken);
+
+            // 🔥 关键点：关键步骤前检查取消
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // 步骤2：扣减库存
+            _logger.LogInformation("步骤2：扣减库存...");
+            await Task.Delay(800, cancellationToken);
+
+            // 🔥 关键点：长时间操作前检查
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // 步骤3：调用支付接口（长时间操作）
+            _logger.LogInformation("步骤3：调用支付接口...");
+            await ProcessPaymentAsync(order, cancellationToken);
+
+            // 步骤4：更新订单状态
+            order.Status = OrderStatus.Completed;
+
+            return new OrderResponse { Success = true, Order = order };
+        }
+        catch (OperationCanceledException)
+        {
+            // 🔥 关键点：取消时执行清理逻辑
+            _logger.LogWarning("订单创建已取消，正在回滚...");
+            await RollbackOrderAsync(order);  // 恢复库存、取消支付
+
+            order.Status = OrderStatus.Cancelled;
+            return new OrderResponse { Success = false, Message = "订单已取消" };
+        }
+    }
+
+    private async Task RollbackOrderAsync(Order order)
+    {
+        // 执行回滚：恢复库存、取消支付等
+        _logger.LogInformation("回滚操作：恢复库存、取消支付...");
+        await Task.Delay(200);
+    }
+}
+</code></pre>
+<h4 id="测试方法-1">测试方法</h4>
+<p><strong>测试1：正常完成（3秒）</strong></p>
+<pre><code class="language-bash">curl -X POST http://localhost:5000/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [{"productId": 1, "quantity": 2, "price": 99.99}],
+    "simulatedPaymentDelayMs": 3000
+  }'
+</code></pre>
+<p><strong>预期结果</strong>：3秒后返回成功</p>
+<p><strong>测试2：超时取消（35秒，超过30秒限制）</strong></p>
+<pre><code class="language-bash">curl -X POST http://localhost:5000/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [{"productId": 1, "quantity": 2, "price": 99.99}],
+    "simulatedPaymentDelayMs": 35000
+  }'
+</code></pre>
+<p><strong>预期结果</strong>：30秒后自动取消，返回 HTTP 408，日志显示"订单创建超时"</p>
+<h3 id="38-场景3报表生成cpu-密集型任务">3.8 场景3：报表生成（CPU 密集型任务）⭐</h3>
+<p><strong>真实业务场景</strong>：</p>
+<ul>
+<li>用户请求生成销售报表（需要分析大量数据）</li>
+<li>报表生成是 CPU 密集型任务，可能需要几十秒</li>
+<li>用户可以随时取消报表生成</li>
+<li>系统应该定期检查取消信号，并显示进度</li>
+</ul>
+<h4 id="控制器代码核心部分-2">控制器代码（核心部分）</h4>
+<pre><code class="language-csharp">[ApiController]
+[Route("api/[controller]")]
+public class ReportsController : ControllerBase
+{
+    [HttpPost("generate")]
+    public async Task&lt;IActionResult&gt; Generate(
+        [FromBody] ReportRequest request,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // 🔥 关键点：传递 CancellationToken 给 CPU 密集型任务
+            var report = await _reportService.GenerateReportAsync(request, cancellationToken);
+            return Ok(report);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("报表生成被取消");
+            return StatusCode(499, "报表生成已取消");
+        }
+    }
+}
+</code></pre>
+<h4 id="服务层代码核心部分-2">服务层代码（核心部分）</h4>
+<pre><code class="language-csharp">public class ReportService : IReportService
+{
+    public async Task&lt;ReportData&gt; GenerateReportAsync(
+        ReportRequest request, 
+        CancellationToken cancellationToken)
+    {
+        var report = new ReportData();
+
+        // 🔥 关键点：使用 Task.Run 处理 CPU 密集型任务
+        report.ProcessedRecords = await Task.Run(async () =&gt;
+        {
+            return await ProcessDataAsync(request, cancellationToken);
+        }, cancellationToken);
+
+        return report;
+    }
+
+    private async Task&lt;int&gt; ProcessDataAsync(
+        ReportRequest request, 
+        CancellationToken cancellationToken)
+    {
+        const int totalRecords = 10000;
+        int processedCount = 0;
+        int batchSize = 1000;  // 每批处理 1000 条
+        int batchCount = totalRecords / batchSize;
+
+        for (int batch = 0; batch &lt; batchCount; batch++)
+        {
+            // 🔥 关键点：每批数据处理前检查取消
+            // 不要每次循环都检查（性能影响）
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // 模拟处理一批数据
+            await Task.Delay(1000, cancellationToken);
+
+            processedCount += batchSize;
+
+            // 输出进度
+            _logger.LogInformation(
+                "报表生成中... {Processed}/{Total} ({Percentage}%)", 
+                processedCount, 
+                totalRecords, 
+                (processedCount * 100 / totalRecords));
+        }
+
+        return processedCount;
+    }
+}
+</code></pre>
+<h3 id="39-场景4后台服务优雅停机">3.9 场景4：后台服务（优雅停机）⭐</h3>
+<p><strong>真实业务场景</strong>：</p>
+<ul>
+<li>后台服务持续运行，定期处理待处理的订单</li>
+<li>用户按 Ctrl+C 停止应用</li>
+<li><strong>后台服务应该：完成当前订单 → 记录日志 → 优雅退出</strong></li>
+</ul>
+<h4 id="后台服务代码核心部分">后台服务代码（核心部分）</h4>
+<pre><code class="language-csharp">public class OrderBackgroundService : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("订单后台处理服务已启动");
+
+        try
+        {
+            // 🔥 关键点1：使用 while 循环持续运行
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    _logger.LogInformation("开始处理待处理订单...");
+
+                    // 🔥 关键点2：传递 stoppingToken 给业务逻辑
+                    await ProcessPendingOrdersAsync(stoppingToken);
+
+                    // 🔥 关键点3：等待时也传递 stoppingToken
+                    // 这样应用关闭时不需要等待完整的 5 秒
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // 内层循环的取消异常，继续外层循环检查
+                    _logger.LogInformation("当前批次处理已取消");
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 🔥 关键点4：外层捕获取消异常，记录日志
+            _logger.LogInformation("收到停止信号，正在退出...");
+        }
+        finally
+        {
+            _logger.LogInformation("订单后台处理服务已停止");
+        }
+    }
+
+    private async Task ProcessPendingOrdersAsync(CancellationToken stoppingToken)
+    {
+        var pendingOrders = GetPendingOrders();
+
+        foreach (var orderId in pendingOrders)
+        {
+            // 🔥 关键点：每个订单处理前检查取消
+            stoppingToken.ThrowIfCancellationRequested();
+
+            _logger.LogInformation("  处理订单 {OrderId}...", orderId);
+            await Task.Delay(2000, stoppingToken);
+            _logger.LogInformation("  订单 {OrderId} 处理完成", orderId);
+        }
+    }
+}
+</code></pre>
+<h4 id="测试方法-2">测试方法</h4>
+<ol>
+<li>启动应用：<code>dotnet run</code></li>
+<li>观察日志：应该看到后台服务每 5 秒处理一批订单</li>
+<li>按 Ctrl+C 停止应用</li>
+<li>观察日志：应该看到"收到停止信号，正在退出..."</li>
+</ol>
+<p><strong>预期日志</strong>：</p>
+<pre><code>info: 订单后台处理服务已启动
+info: 开始处理待处理订单...
+info: 发现 3 个待处理订单
+info:   处理订单 1001...
+info:   订单 1001 处理完成
+info:   处理订单 1002...
+
+（此时按 Ctrl+C）
+
+info: Application is shutting down...
+info: 收到停止信号，正在退出...
+info: 订单后台处理服务已停止
+</code></pre>
+<p><strong>关键点</strong>：</p>
+<ul>
+<li>当前正在处理的订单（1002）会完成</li>
+<li>未开始的订单（1003）不会处理</li>
+<li>服务记录日志后退出</li>
+</ul>
+<h3 id="310-web-api-实战总结">3.10 Web API 实战总结</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>技术要点</th>
+<th>状态码</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>商品查询</strong></td>
+<td>ASP.NET Core 自动注入，客户端断开自动取消</td>
+<td>499</td>
+</tr>
+<tr>
+<td><strong>订单创建</strong></td>
+<td>LinkedTokenSource 组合超时，when 子句区分原因</td>
+<td>499/408</td>
+</tr>
+<tr>
+<td><strong>报表生成</strong></td>
+<td>Task.Run + 定期检查，提供进度报告</td>
+<td>499</td>
+</tr>
+<tr>
+<td><strong>后台服务</strong></td>
+<td>BackgroundService + stoppingToken，优雅停机</td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<p><strong>完整代码</strong>：请查看 <code>CancellationToken.WebApi.Demo</code> 项目，或访问 <a href="https://github.com/Naughtyhusky/csharp-concurrency-cookbook" target="_blank" rel="noopener nofollow">GitHub 仓库</a>。</p>
+<hr>
+<h3 id="311-深入底层客户端取消是如何工作的-">3.11 深入底层：客户端取消是如何工作的？ 🔍</h3>
+<blockquote>
+<p><strong>🤔 你是否好奇</strong>：</p>
+<p>通过上面的 4 个实战场景，我们看到当用户在页面点击"取消"按钮、关闭浏览器标签页，或在 curl 中按 Ctrl+C 时，服务端都能正确地收到取消信号。</p>
+<p><strong>但你有没有想过</strong>：</p>
+<ul>
+<li>用户的这个"取消"操作，服务端是如何知道的？</li>
+<li>这个过程中，网络层发生了什么？</li>
+<li>.NET Core 框架在背后做了什么魔法？</li>
+<li>为什么在 Controller 方法中只需要接收一个参数，就能自动取消？</li>
+</ul>
+<p>本节将揭开这层神秘的面纱，带你深入理解<strong>客户端取消的底层原理</strong>。</p>
+</blockquote>
+<h4 id="完整的取消流程时序图">完整的取消流程（时序图）</h4>
+<div class="mermaid">sequenceDiagram
+    actor User as 用户
+    participant Client as 客户端&lt;br/&gt;(浏览器/curl)
+    participant TCP as TCP 层
+    participant Kestrel as Kestrel&lt;br/&gt;Web服务器
+    participant HttpContext as HttpContext
+    participant MVC as ASP.NET Core&lt;br/&gt;MVC 框架
+    participant Controller as Controller
+    participant Service as Service 层
+    participant DbContext as DbContext
+    participant Database as 数据库
+
+    Note over User,Client: 🔥 Step 1: 用户发起取消
+    User-&gt;&gt;Client: 点击取消 / 按 Ctrl+C / 关闭标签页
+    Client-&gt;&gt;TCP: 断开 TCP 连接
+    Note right of TCP: 发送 RST (重置) 或&lt;br/&gt;FIN (结束) 包
+
+    Note over TCP,Kestrel: 🔥 Step 2: Kestrel 检测连接断开
+    TCP-&gt;&gt;Kestrel: 连接断开信号&lt;br/&gt;(ConnectionReset/Aborted)
+    Kestrel-&gt;&gt;HttpContext: 触发 OnConnectionAborted()
+    HttpContext-&gt;&gt;HttpContext: _requestAbortedSource.Cancel()
+    Note right of HttpContext: RequestAborted&lt;br/&gt;被取消
+
+    Note over HttpContext,MVC: 🔥 Step 3: 框架自动注入 Token
+    MVC-&gt;&gt;HttpContext: 获取 HttpContext.RequestAborted
+    HttpContext--&gt;&gt;MVC: 返回已取消的 Token
+    MVC-&gt;&gt;Controller: 注入 CancellationToken 参数
+    Note right of Controller: cancellationToken&lt;br/&gt;已经处于取消状态
+
+    Note over Controller,Database: 🔥 Step 4: Token 传递链
+    Controller-&gt;&gt;Service: QueryAsync(request, token)
+    Service-&gt;&gt;Service: 检查 token.IsCancellationRequested
+    alt Token 未取消
+        Service-&gt;&gt;DbContext: ToListAsync(token)
+        DbContext-&gt;&gt;Database: ExecuteReaderAsync(token)
+        Note right of Database: 如果 Token 在此时取消&lt;br/&gt;发送 ATTENTION 包&lt;br/&gt;中止数据库查询
+        Database--&gt;&gt;DbContext: 返回数据
+        DbContext--&gt;&gt;Service: 返回结果
+        Service--&gt;&gt;Controller: 返回结果
+        Controller--&gt;&gt;Client: HTTP 200 OK
+    else Token 已取消
+        Service-&gt;&gt;Service: ThrowIfCancellationRequested()
+        Service--&gt;&gt;Controller: OperationCanceledException
+        Controller-&gt;&gt;Controller: catch (OperationCanceledException)
+        Controller--&gt;&gt;Client: HTTP 499 Client Closed Request
+        Note right of Client: 此时客户端已断开&lt;br/&gt;实际上收不到响应
+    end
+
+    Note over User,Database: ✅ 完整的取消链路建立
+</div><p><strong>流程说明</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>参与者</th>
+<th>关键操作</th>
+<th>时间</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Step 1</strong></td>
+<td>用户 → 客户端 → TCP</td>
+<td>客户端断开连接，发送 RST/FIN 包</td>
+<td>~0ms</td>
+</tr>
+<tr>
+<td><strong>Step 2</strong></td>
+<td>TCP → Kestrel → HttpContext</td>
+<td>Kestrel 检测断开，触发 RequestAborted 取消</td>
+<td>~1-5ms</td>
+</tr>
+<tr>
+<td><strong>Step 3</strong></td>
+<td>HttpContext → MVC → Controller</td>
+<td>框架注入已取消的 Token</td>
+<td>~0.1ms</td>
+</tr>
+<tr>
+<td><strong>Step 4</strong></td>
+<td>Controller → Service → DbContext → Database</td>
+<td>Token 沿调用链传递，中止操作</td>
+<td>取决于业务逻辑</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键时间节点</strong>：</p>
+<pre><code>T=0ms     用户按 Ctrl+C
+T=1ms     TCP 连接断开
+T=2ms     Kestrel 检测到断开
+T=3ms     HttpContext.RequestAborted 被取消
+T=3ms     Controller 接收到已取消的 Token
+T=5ms     Service 检查到取消，抛出异常
+T=6ms     Controller 返回 HTTP 499（但客户端已断开）
+</code></pre>
+<h4 id="关键技术细节">关键技术细节</h4>
+<p><strong>1. TCP 层的连接断开</strong></p>
+<table>
+<thead>
+<tr>
+<th>断开方式</th>
+<th>TCP 包类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>正常关闭</strong></td>
+<td>FIN (Finish)</td>
+<td>四次挥手，等待确认</td>
+</tr>
+<tr>
+<td><strong>异常关闭</strong></td>
+<td>RST (Reset)</td>
+<td>立即断开，不等待确认</td>
+</tr>
+<tr>
+<td><strong>curl Ctrl+C</strong></td>
+<td>RST</td>
+<td>立即重置连接</td>
+</tr>
+<tr>
+<td><strong>浏览器关闭标签页</strong></td>
+<td>FIN 或 RST</td>
+<td>取决于浏览器实现</td>
+</tr>
+</tbody>
+</table>
+<p><strong>2. Kestrel 的连接监听</strong></p>
+<p>Kestrel 使用底层 Socket API 监听连接状态，当检测到 <code>SocketError.ConnectionReset</code> 或 <code>ConnectionAborted</code> 时，立即取消 <code>HttpContext.RequestAborted</code>。</p>
+<p><strong>3. ASP.NET Core 的自动绑定</strong></p>
+<p>框架在编译时分析 Action 方法参数，如果检测到 <code>CancellationToken</code> 类型，自动绑定 <code>HttpContext.RequestAborted</code>。</p>
+<h4 id="控制台-vs-web-api-的取消流程对比">控制台 vs Web API 的取消流程对比</h4>
+<div class="mermaid">graph LR
+    subgraph 控制台程序
+        A1[用户按 Ctrl+C] --&gt; B1[Console.CancelKeyPress 事件]
+        B1 --&gt; C1[你的代码监听事件]
+        C1 --&gt; D1[手动调用 cts.Cancel]
+        D1 --&gt; E1[CancellationToken 被取消]
+    end
+
+    subgraph Web API
+        A2[用户按 Ctrl+C&lt;br/&gt;在 curl 窗口] --&gt; B2[TCP RST 包]
+        B2 --&gt; C2[Kestrel 检测断开]
+        C2 --&gt; D2[自动取消 RequestAborted]
+        D2 --&gt; E2[框架自动注入到 Action]
+    end
+
+    style A1 fill:#e74c3c,stroke:#c0392b,stroke-width:2px,color:#fff
+    style A2 fill:#e74c3c,stroke:#c0392b,stroke-width:2px,color:#fff
+    style D1 fill:#e67e22,stroke:#d35400,stroke-width:2px,color:#fff
+    style D2 fill:#3498db,stroke:#2980b9,stroke-width:2px,color:#fff
+</div><p><strong>关键区别</strong>：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>控制台程序</th>
+<th>Web API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>触发方式</strong></td>
+<td>用户按 Ctrl+C</td>
+<td>客户端断开连接（TCP 层）</td>
+</tr>
+<tr>
+<td><strong>检测机制</strong></td>
+<td><code>Console.CancelKeyPress</code> 事件</td>
+<td>Kestrel 监听 Socket 事件</td>
+</tr>
+<tr>
+<td><strong>取消方式</strong></td>
+<td>❌ 手动监听，手动取消</td>
+<td>✅ 框架自动检测，自动取消</td>
+</tr>
+<tr>
+<td><strong>代码复杂度</strong></td>
+<td>需要自己写事件处理</td>
+<td>只需要接收参数</td>
+</tr>
+<tr>
+<td><strong>典型延迟</strong></td>
+<td>~10-50ms</td>
+<td>~1-5ms（更快）</td>
+</tr>
+</tbody>
+</table>
+<h4 id="实验验证可选阅读">实验验证（可选阅读）</h4>
+<p>你可以通过日志验证取消流程：</p>
+<pre><code class="language-csharp">[HttpGet]
+public async Task&lt;IActionResult&gt; Query(
+    [FromQuery] ProductQueryRequest request,
+    CancellationToken cancellationToken)
+{
+    // 🔥 实验1：检查进入方法时的状态
+    _logger.LogInformation("进入方法，Token.IsCancellationRequested = {IsCancelled}", 
+        cancellationToken.IsCancellationRequested);
+
+    try
+    {
+        await Task.Delay(10000, cancellationToken);
+    }
+    catch (OperationCanceledException)
+    {
+        // 🔥 实验2：捕获到取消异常
+        _logger.LogInformation("捕获到取消异常");
+        _logger.LogInformation("HttpContext.RequestAborted = {IsCancelled}", 
+            HttpContext.RequestAborted.IsCancellationRequested);
+    }
+
+    return Ok();
+}
+</code></pre>
+<p><strong>测试结果</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>日志输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>正常请求</strong></td>
+<td><code>进入方法，Token = False</code> → 10秒后 → <code>返回成功</code></td>
+</tr>
+<tr>
+<td><strong>5秒后取消</strong></td>
+<td><code>进入方法，Token = False</code> → 5秒 → <code>捕获到取消异常，Token = True</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="常见问题">常见问题</h4>
+<p><strong>Q1: 如果不传递 CancellationToken，会怎样？</strong></p>
+<pre><code class="language-csharp">// ❌ 错误：不传递 Token
+await Task.Delay(10000); // 无法取消！即使客户端断开，还是等 10 秒
+await _dbContext.Products.ToListAsync(); // 数据库查询无法取消
+</code></pre>
+<p><strong>结果</strong>：资源持续占用，数据库连接不释放，性能下降。</p>
+<p><strong>Q2: 数据库查询如何被取消？</strong></p>
+<p>数据库驱动（如 SqlClient）会监听 CancellationToken，取消时发送 <strong>TDS ATTENTION</strong> 包给数据库服务器，中止当前查询。</p>
+<pre><code class="language-csharp">// Entity Framework Core
+await _dbContext.Products.ToListAsync(cancellationToken);
+  ↓
+// SqlClient 内部
+SqlCommand.ExecuteReaderAsync(cancellationToken)
+  ↓ (Token 被取消)
+// 发送 ATTENTION 包给 SQL Server
+SQL Server 中止查询，释放锁
+</code></pre>
+<p><strong>Q3: 为什么使用 499 状态码？</strong></p>
+<table>
+<thead>
+<tr>
+<th>状态码</th>
+<th>含义</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>408</td>
+<td>Request Timeout</td>
+<td><strong>服务端</strong>超时</td>
+</tr>
+<tr>
+<td>499</td>
+<td>Client Closed Request</td>
+<td><strong>客户端</strong>主动断开（Nginx 定义）</td>
+</tr>
+<tr>
+<td>500</td>
+<td>Internal Server Error</td>
+<td>服务端错误</td>
+</tr>
+</tbody>
+</table>
+<p>使用 499 可以区分："是客户端取消的，不是服务端出错"。</p>
+<h4 id="总结完整的取消链路">总结：完整的取消链路</h4>
+<div class="mermaid">graph TD
+    A[用户操作：Ctrl+C] --&gt; B[TCP 连接断开：RST/FIN 包]
+    B --&gt; C[Kestrel 检测到断开]
+    C --&gt; D[HttpContext.RequestAborted 被取消]
+    D --&gt; E[框架注入 CancellationToken]
+    E --&gt; F[Controller 接收已取消的 Token]
+    F --&gt; G[传递给 Service]
+    G --&gt; H[传递给 DbContext]
+    H --&gt; I[传递给 Database Driver]
+    I --&gt; J[所有异步操作被取消]
+
+    style A fill:#e74c3c,stroke:#c0392b,stroke-width:2px,color:#fff
+    style D fill:#e67e22,stroke:#d35400,stroke-width:2px,color:#fff
+    style F fill:#3498db,stroke:#2980b9,stroke-width:2px,color:#fff
+    style J fill:#27ae60,stroke:#229954,stroke-width:2px,color:#fff
+</div><p><strong>关键要点</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>✅ <strong>TCP 层断开</strong></td>
+<td>物理断开是起点，触发整个取消链路</td>
+</tr>
+<tr>
+<td>✅ <strong>Kestrel 自动检测</strong></td>
+<td>~1-5ms 内检测到并触发取消</td>
+</tr>
+<tr>
+<td>✅ <strong>框架自动注入</strong></td>
+<td>无需手动创建 <code>CancellationTokenSource</code></td>
+</tr>
+<tr>
+<td>✅ <strong>传递性保证</strong></td>
+<td>整个调用链（Controller → Service → DbContext → Database）都能取消</td>
+</tr>
+<tr>
+<td>✅ <strong>数据库支持</strong></td>
+<td>SqlClient、Npgsql 等驱动支持取消网络查询</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="4️⃣-在-cpu-密集型任务中使用-cancellationtoken">4️⃣ 在 CPU 密集型任务中使用 CancellationToken</h2>
+<h3 id="41-问题cpu-密集型任务如何取消">4.1 问题：CPU 密集型任务如何取消？</h3>
+<p>前面的例子都是 I/O 密集型任务（网络请求、文件读写），这些任务内部会自动检查 CancellationToken。</p>
+<p>但如果是 CPU 密集型任务（大量计算），就需要<strong>手动检查</strong>：</p>
+<pre><code class="language-csharp">// ❌ 无法取消的 CPU 密集型任务
+public async Task&lt;int&gt; CalculatePrimesAsync(int max)
+{
+    return await Task.Run(() =&gt;
+    {
+        int count = 0;
+        for (int i = 2; i &lt; max; i++)
+        {
+            if (IsPrime(i))
+            {
+                count++;
+            }
+        }
+        return count;
+    });
+}
+
+// 问题：计算过程中无法取消，只能等它跑完
+</code></pre>
+<h3 id="42-解决方案定期检查-cancellationtoken">4.2 解决方案：定期检查 CancellationToken</h3>
+<pre><code class="language-csharp">// ✅ 可取消的 CPU 密集型任务
+public async Task&lt;int&gt; CalculatePrimesAsync(int max, CancellationToken cancellationToken)
+{
+    return await Task.Run(() =&gt;
+    {
+        int count = 0;
+        for (int i = 2; i &lt; max; i++)
+        {
+            // 每隔一段时间检查一次（避免频繁检查影响性能）
+            if (i % 1000 == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            if (IsPrime(i))
+            {
+                count++;
+            }
+        }
+        return count;
+    }, cancellationToken); // 注意：这里也要传递 Token
+}
+
+private bool IsPrime(int number)
+{
+    if (number &lt; 2) return false;
+    for (int i = 2; i &lt;= Math.Sqrt(number); i++)
+    {
+        if (number % i == 0) return false;
+    }
+    return true;
+}
+</code></pre>
+<p><strong>性能权衡</strong>：</p>
+<ul>
+<li><strong>检查频率</strong>：每 1000 次循环检查一次（根据实际情况调整）</li>
+<li><strong>太频繁</strong>：影响性能</li>
+<li><strong>太稀疏</strong>：响应延迟</li>
+</ul>
+<h3 id="43-使用-parallelfor-的取消">4.3 使用 Parallel.For 的取消</h3>
+<pre><code class="language-csharp">public void ProcessLargeDataSet(int[] data, CancellationToken cancellationToken)
+{
+    var options = new ParallelOptions
+    {
+        CancellationToken = cancellationToken,
+        MaxDegreeOfParallelism = Environment.ProcessorCount
+    };
+
+    try
+    {
+        Parallel.For(0, data.Length, options, i =&gt;
+        {
+            // Parallel.For 会自动检查 CancellationToken
+            ProcessItem(data[i]);
+        });
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("并行处理已取消");
+    }
+}
+</code></pre>
+<hr>
+<h2 id="5️⃣-常见陷阱与最佳实践">5️⃣ 常见陷阱与最佳实践</h2>
+<h3 id="51--陷阱1不传递-cancellationtoken">5.1 ❌ 陷阱1：不传递 CancellationToken</h3>
+<pre><code class="language-csharp">// ❌ 错误：接收了 Token 但不传递
+public async Task DownloadAsync(string url, CancellationToken cancellationToken)
+{
+    using var client = new HttpClient();
+
+    // 没有传递 cancellationToken，无法取消！
+    var response = await client.GetAsync(url);
+    return await response.Content.ReadAsStringAsync();
+}
+
+// ✅ 正确：一路传递
+public async Task DownloadAsync(string url, CancellationToken cancellationToken)
+{
+    using var client = new HttpClient();
+
+    // 传递给所有支持的 API
+    var response = await client.GetAsync(url, cancellationToken);
+    return await response.Content.ReadAsStringAsync(cancellationToken);
+}
+</code></pre>
+<h3 id="52--陷阱2忘记-dispose">5.2 ❌ 陷阱2：忘记 Dispose</h3>
+<pre><code class="language-csharp">// ❌ 错误：忘记释放 CancellationTokenSource
+public async Task ProcessAsync()
+{
+    var cts = new CancellationTokenSource();
+    await DoWorkAsync(cts.Token);
+    // 忘记 Dispose，可能导致内存泄漏
+}
+
+// ✅ 正确：使用 using 自动释放
+public async Task ProcessAsync()
+{
+    using var cts = new CancellationTokenSource();
+    await DoWorkAsync(cts.Token);
+} // 自动释放
+</code></pre>
+<p><strong>为什么要 Dispose</strong>？</p>
+<ul>
+<li><code>CancellationTokenSource</code> 内部有 <code>Timer</code>（如果使用了 <code>CancelAfter</code>）</li>
+<li>不释放会导致 Timer 一直运行，浪费资源</li>
+</ul>
+<h3 id="53--陷阱3在-cpu-密集循环中频繁检查">5.3 ❌ 陷阱3：在 CPU 密集循环中频繁检查</h3>
+<pre><code class="language-csharp">// ❌ 错误：每次循环都检查，性能差
+public int Calculate(int max, CancellationToken cancellationToken)
+{
+    int sum = 0;
+    for (int i = 0; i &lt; max; i++)
+    {
+        cancellationToken.ThrowIfCancellationRequested(); // 太频繁！
+        sum += i;
+    }
+    return sum;
+}
+
+// ✅ 正确：每隔一段时间检查一次
+public int Calculate(int max, CancellationToken cancellationToken)
+{
+    int sum = 0;
+    for (int i = 0; i &lt; max; i++)
+    {
+        if (i % 10000 == 0) // 每 10000 次检查一次
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        sum += i;
+    }
+    return sum;
+}
+</code></pre>
+<h3 id="54--陷阱4吞掉-operationcanceledexception">5.4 ❌ 陷阱4：吞掉 OperationCanceledException</h3>
+<pre><code class="language-csharp">// ❌ 错误：吞掉取消异常
+public async Task ProcessAsync(CancellationToken cancellationToken)
+{
+    try
+    {
+        await DoWorkAsync(cancellationToken);
+    }
+    catch (Exception ex) // 吞掉了所有异常，包括 OperationCanceledException
+    {
+        Console.WriteLine($"错误: {ex.Message}");
+    }
+}
+
+// ✅ 正确：区分取消异常和其他异常
+public async Task ProcessAsync(CancellationToken cancellationToken)
+{
+    try
+    {
+        await DoWorkAsync(cancellationToken);
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine("操作已取消");
+        throw; // 重新抛出，让调用方知道
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"错误: {ex.Message}");
+    }
+}
+</code></pre>
+<h3 id="55--最佳实践总结">5.5 ✅ 最佳实践总结</h3>
+<table>
+<thead>
+<tr>
+<th>实践</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>✅ <strong>参数位置</strong></td>
+<td>CancellationToken 总是最后一个参数</td>
+</tr>
+<tr>
+<td>✅ <strong>默认值</strong></td>
+<td>使用 <code>= default</code>，调用方可以不传</td>
+</tr>
+<tr>
+<td>✅ <strong>一路传递</strong></td>
+<td>传递给所有支持的 API</td>
+</tr>
+<tr>
+<td>✅ <strong>使用 using</strong></td>
+<td>自动释放 CancellationTokenSource</td>
+</tr>
+<tr>
+<td>✅ <strong>抛出异常</strong></td>
+<td>使用 <code>ThrowIfCancellationRequested()</code></td>
+</tr>
+<tr>
+<td>✅ <strong>区分异常</strong></td>
+<td>单独捕获 <code>OperationCanceledException</code></td>
+</tr>
+<tr>
+<td>✅ <strong>适度检查</strong></td>
+<td>CPU 密集型任务每隔一段时间检查一次</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="6️⃣-实战综合案例文件批量处理器">6️⃣ 实战综合案例：文件批量处理器</h2>
+<h3 id="61-需求">6.1 需求</h3>
+<p>实现一个文件批量处理器，支持：</p>
+<ol>
+<li>批量处理多个文件</li>
+<li>用户可以随时取消</li>
+<li>单个文件处理超过 10 秒自动跳过</li>
+<li>整体超时 5 分钟</li>
+<li>显示实时进度</li>
+</ol>
+<h3 id="62-实现">6.2 实现</h3>
+<pre><code class="language-csharp">public class FileBatchProcessor
+{
+    public async Task ProcessFilesAsync(
+        List&lt;string&gt; filePaths,
+        IProgress&lt;string&gt; progress,
+        CancellationToken cancellationToken)
+    {
+        // 整体超时 5 分钟
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            timeoutCts.Token);
+
+        int processed = 0;
+        int failed = 0;
+
+        foreach (var filePath in filePaths)
+        {
+            try
+            {
+                // 单个文件超时 10 秒
+                using var fileTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                using var fileCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    linkedCts.Token,
+                    fileTimeoutCts.Token);
+
+                progress?.Report($"处理中: {Path.GetFileName(filePath)}");
+
+                await ProcessSingleFileAsync(filePath, fileCts.Token);
+
+                processed++;
+                progress?.Report($"✅ 完成: {Path.GetFileName(filePath)} ({processed}/{filePaths.Count})");
+            }
+            catch (OperationCanceledException) when (fileTimeoutCts.Token.IsCancellationRequested)
+            {
+                failed++;
+                progress?.Report($"⏱️ 超时: {Path.GetFileName(filePath)} ({processed}/{filePaths.Count})");
+            }
+            catch (OperationCanceledException)
+            {
+                progress?.Report($"❌ 用户取消 ({processed}/{filePaths.Count})");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                progress?.Report($"❌ 错误: {Path.GetFileName(filePath)} - {ex.Message}");
+            }
+        }
+
+        progress?.Report($"处理完成！成功: {processed}, 失败: {failed}");
+    }
+
+    private async Task ProcessSingleFileAsync(string filePath, CancellationToken cancellationToken)
+    {
+        // 模拟文件处理
+        var lines = await File.ReadAllLinesAsync(filePath, cancellationToken);
+
+        foreach (var line in lines)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // 模拟处理
+            await Task.Delay(10, cancellationToken);
+        }
+
+        // 保存结果
+        var outputPath = filePath + ".processed";
+        await File.WriteAllLinesAsync(outputPath, lines, cancellationToken);
+    }
+}
+</code></pre>
+<h3 id="63-使用">6.3 使用</h3>
+<pre><code class="language-csharp">// 在 WinForms 或控制台中使用
+var processor = new FileBatchProcessor();
+var files = Directory.GetFiles(@"C:\Data", "*.txt").ToList();
+
+using var cts = new CancellationTokenSource();
+
+var progress = new Progress&lt;string&gt;(msg =&gt;
+{
+    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}");
+});
+
+try
+{
+    // 可以在另一个线程调用 cts.Cancel() 取消
+    await processor.ProcessFilesAsync(files, progress, cts.Token);
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("批量处理已取消");
+}
+</code></pre>
+<p><strong>输出示例</strong>：</p>
+<pre><code>[14:23:15] 处理中: file1.txt
+[14:23:16] ✅ 完成: file1.txt (1/10)
+[14:23:16] 处理中: file2.txt
+[14:23:17] ✅ 完成: file2.txt (2/10)
+[14:23:17] 处理中: file3.txt
+[14:23:27] ⏱️ 超时: file3.txt (2/10)
+[14:23:27] 处理中: file4.txt
+[14:23:28] ❌ 用户取消 (2/10)
+批量处理已取消
+</code></pre>
+<hr>
+<h2 id="7️⃣-高级话题cancellationtoken-的内部实现">7️⃣ 高级话题：CancellationToken 的内部实现</h2>
+<h3 id="71-为什么-cancellationtoken-是-struct">7.1 为什么 CancellationToken 是 struct？</h3>
+<h4 id="设计原因">设计原因</h4>
+<pre><code class="language-csharp">// CancellationToken 定义
+public struct CancellationToken
+{
+    private readonly CancellationTokenSource _source;
+
+    public bool IsCancellationRequested =&gt; _source?.IsCancellationRequested ?? false;
+
+    public void ThrowIfCancellationRequested()
+    {
+        if (IsCancellationRequested)
+        {
+            throw new OperationCanceledException(this);
+        }
+    }
+}
+</code></pre>
+<p><strong>三大好处</strong>：</p>
+<ol>
+<li><strong>性能优化</strong>：值类型，栈上分配，无 GC 压力</li>
+<li><strong>轻量传递</strong>：传递时复制，但只复制引用字段（8 字节）</li>
+<li><strong>天然不可变</strong>：struct 的不可变性保证线程安全</li>
+</ol>
+<h4 id="性能对比">性能对比</h4>
+<p>假设一个方法链：</p>
+<pre><code class="language-csharp">await Method1(token);
+  └─&gt; await Method2(token);
+        └─&gt; await Method3(token);
+              └─&gt; await Method4(token);
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>实现方式</th>
+<th>堆分配</th>
+<th>GC 压力</th>
+<th>性能影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>class</strong></td>
+<td>4 次堆分配</td>
+<td>4 次 GC 扫描</td>
+<td>❌ 有开销</td>
+</tr>
+<tr>
+<td><strong>struct</strong></td>
+<td>0 次堆分配</td>
+<td>0 次 GC 扫描</td>
+<td>✅ 零开销</td>
+</tr>
+</tbody>
+</table>
+<h4 id="验证代码">验证代码</h4>
+<pre><code class="language-csharp">var cts = new CancellationTokenSource();
+var token1 = cts.Token;
+var token2 = cts.Token;
+
+// 两个 token 是不同的实例（值类型复制）
+Console.WriteLine(object.ReferenceEquals(token1, token2)); // False（装箱后比较）
+
+// 但它们指向同一个 Source
+Console.WriteLine(token1.Equals(token2)); // True
+</code></pre>
+<hr>
+<h3 id="72-cancellationtokensource-的线程安全">7.2 CancellationTokenSource 的线程安全</h3>
+<h4 id="内部实现简化版">内部实现（简化版）</h4>
+<pre><code class="language-csharp">public class CancellationTokenSource : IDisposable
+{
+    private volatile int _state; // 0 = 未取消, 1 = 已取消, 2 = 已释放
+    private volatile ManualResetEventSlim _kernelEvent;
+    private volatile SparselyPopulatedArray&lt;CancellationCallbackInfo&gt; _callbacks;
+
+    public void Cancel()
+    {
+        // 使用 Interlocked 保证原子性
+        if (Interlocked.CompareExchange(ref _state, 1, 0) == 0)
+        {
+            // 只有一个线程能进入这里
+            NotifyCallbacks();
+            _kernelEvent?.Set();
+        }
+    }
+}
+</code></pre>
+<h4 id="线程安全保证">线程安全保证</h4>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>作用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>volatile 字段</strong></td>
+<td>保证可见性</td>
+<td>内存屏障，确保所有线程看到最新值</td>
+</tr>
+<tr>
+<td><strong>Interlocked.CompareExchange</strong></td>
+<td>保证原子性</td>
+<td>只有一个线程能成功取消</td>
+</tr>
+<tr>
+<td><strong>SparselyPopulatedArray</strong></td>
+<td>无锁数据结构</td>
+<td>高并发回调注册</td>
+</tr>
+</tbody>
+</table>
+<h4 id="多线程场景验证">多线程场景验证</h4>
+<pre><code class="language-csharp">var cts = new CancellationTokenSource();
+
+// 10 个线程同时调用 Cancel
+Parallel.For(0, 10, i =&gt;
+{
+    cts.Cancel(); // 安全！只有第一个会成功
+    Console.WriteLine($"线程 {i} 尝试取消");
+});
+
+// 输出：只有一个线程成功，其他线程调用被忽略
+</code></pre>
+<hr>
+<h3 id="73-回调注册的性能优化">7.3 回调注册的性能优化</h3>
+<h4 id="内部数据结构">内部数据结构</h4>
+<pre><code class="language-csharp">// 使用 SparselyPopulatedArray（稀疏数组）
+// 优点：无锁、高并发、内存效率高
+private volatile SparselyPopulatedArray&lt;CancellationCallbackInfo&gt; _callbacks;
+</code></pre>
+<h4 id="注册时机优化">注册时机优化</h4>
+<pre><code class="language-csharp">public CancellationTokenRegistration Register(Action callback)
+{
+    // 优化1：如果已经取消，立即执行
+    if (IsCancellationRequested)
+    {
+        callback(); // 不添加到链表
+        return default; // 返回空注册
+    }
+
+    // 优化2：如果 Token 是 default，不注册
+    if (_source == null)
+    {
+        return default;
+    }
+
+    // 添加到回调链表
+    var node = new CallbackNode(callback);
+    _callbacks.Add(node);
+
+    return new CancellationTokenRegistration(node);
+}
+</code></pre>
+<h4 id="性能对比表">性能对比表</h4>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>普通实现</th>
+<th>优化实现</th>
+<th>性能提升</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已取消时注册</td>
+<td>添加到链表 → 立即触发</td>
+<td><strong>立即执行</strong></td>
+<td>避免分配</td>
+</tr>
+<tr>
+<td>default Token</td>
+<td>添加到链表（浪费）</td>
+<td><strong>直接返回</strong></td>
+<td>零开销</td>
+</tr>
+<tr>
+<td>未取消时注册</td>
+<td>添加到链表</td>
+<td>添加到链表</td>
+<td>无差异</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h3 id="74-cancellationtokennone-vs-default">7.4 CancellationToken.None vs default</h3>
+<h4 id="两者的等价性">两者的等价性</h4>
+<pre><code class="language-csharp">// CancellationToken.None 的定义
+public static CancellationToken None =&gt; default;
+</code></pre>
+<p><strong>结论</strong>：<code>CancellationToken.None</code> 和 <code>default</code> <strong>完全等价</strong>！</p>
+<h4 id="使用场景">使用场景</h4>
+<pre><code class="language-csharp">// ✅ 场景1：参数默认值 - 使用 default
+public async Task DoWorkAsync(CancellationToken cancellationToken = default)
+{
+    // ...
+}
+
+// ✅ 场景2：显式传递 - 使用 CancellationToken.None（语义更清晰）
+await DoWorkAsync(CancellationToken.None);
+
+// ✅ 场景3：变量初始化 - 使用 default（简洁）
+CancellationToken token = default;
+</code></pre>
+<p><strong>推荐</strong>：参数默认值用 <code>default</code>，显式传递用 <code>CancellationToken.None</code>。</p>
+<hr>
+<h3 id="75-取消传播链分析">7.5 取消传播链分析</h3>
+<h4 id="场景多层方法调用">场景：多层方法调用</h4>
+<p>在复杂的应用中，取消信号可能需要跨越多层方法调用：</p>
+<pre><code class="language-csharp">public async Task Level1Async(CancellationToken cancellationToken)
+{
+    try
+    {
+        await Level2Async(cancellationToken);
+    }
+    catch (OperationCanceledException ex)
+    {
+        // 问题：如何判断是哪一层取消的？
+        Console.WriteLine($"Level1 捕获取消: {ex.Message}");
+        throw; // 继续传播
+    }
+}
+
+public async Task Level2Async(CancellationToken cancellationToken)
+{
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); // 内部超时
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+        cancellationToken, cts.Token);
+
+    try
+    {
+        await Level3Async(linkedCts.Token);
+    }
+    catch (OperationCanceledException ex)
+    {
+        // 判断是哪个 Token 取消的
+        if (cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine("外部取消");
+            throw; // 传播到上层
+        }
+        else if (cts.Token.IsCancellationRequested)
+        {
+            Console.WriteLine("内部超时");
+            throw new TimeoutException("Level2 超时");
+        }
+    }
+}
+
+public async Task Level3Async(CancellationToken cancellationToken)
+{
+    // 实际工作
+    await Task.Delay(5000, cancellationToken);
+}
+</code></pre>
+<h4 id="最佳实践使用-when-子句">最佳实践：使用 when 子句</h4>
+<p>更优雅的写法：</p>
+<pre><code class="language-csharp">try
+{
+    await DoWorkAsync(linkedCts.Token);
+}
+catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
+{
+    throw new TimeoutException("操作超时");
+}
+catch (OperationCanceledException) when (userCts.Token.IsCancellationRequested)
+{
+    Console.WriteLine("用户取消");
+    throw;
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("其他原因取消");
+    throw;
+}
+</code></pre>
+<hr>
+<h3 id="76-cancellationtokensource-的复用问题">7.6 CancellationTokenSource 的复用问题</h3>
+<h4 id="-错误复用已取消的-cancellationtokensource">❌ 错误：复用已取消的 CancellationTokenSource</h4>
+<pre><code class="language-csharp">public class BadService
+{
+    private CancellationTokenSource _cts = new CancellationTokenSource();
+
+    public async Task DoWorkAsync()
+    {
+        try
+        {
+            await Task.Delay(1000, _cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("第一次取消");
+        }
+
+        // ❌ 错误：_cts 已经取消，无法再用
+        await Task.Delay(1000, _cts.Token); // 会立即抛出异常！
+    }
+
+    public void Cancel()
+    {
+        _cts.Cancel();
+    }
+}
+</code></pre>
+<p><strong>问题</strong>：已取消的 <code>CancellationTokenSource</code> 无法重置，再次使用会立即抛出异常。</p>
+<h4 id="-解决方案1每次创建新实例">✅ 解决方案1：每次创建新实例</h4>
+<pre><code class="language-csharp">public class GoodService
+{
+    private CancellationTokenSource _cts;
+
+    public async Task DoWorkAsync()
+    {
+        // 每次创建新的
+        _cts?.Dispose();
+        _cts = new CancellationTokenSource();
+
+        try
+        {
+            await Task.Delay(1000, _cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("操作已取消");
+        }
+    }
+
+    public void Cancel()
+    {
+        _cts?.Cancel();
+    }
+}
+</code></pre>
+<h4 id="-解决方案2使用-tryresetnet-6">✅ 解决方案2：使用 TryReset（.NET 6+）</h4>
+<pre><code class="language-csharp">public class ModernService
+{
+    private CancellationTokenSource _cts = new CancellationTokenSource();
+
+    public async Task DoWorkAsync()
+    {
+        // .NET 6+ 支持重置
+        if (!_cts.TryReset())
+        {
+            // 重置失败（已释放），创建新实例
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+        }
+
+        try
+        {
+            await Task.Delay(1000, _cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("操作已取消");
+        }
+    }
+
+    public void Cancel()
+    {
+        _cts?.Cancel();
+    }
+}
+</code></pre>
+<hr>
+<h3 id="77-内存泄漏风险">7.7 内存泄漏风险</h3>
+<h4 id="问题忘记-dispose">问题：忘记 Dispose</h4>
+<pre><code class="language-csharp">// ❌ 内存泄漏示例
+public async Task BadMethodAsync()
+{
+    var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+    await DoWorkAsync(cts.Token);
+    // 忘记 Dispose，Timer 一直运行！
+}
+</code></pre>
+<p><strong>后果</strong>：</p>
+<ol>
+<li><strong>Timer 泄漏</strong>：<code>CancelAfter</code> 创建的内部 Timer 一直运行</li>
+<li><strong>回调链表泄漏</strong>：注册的回调未释放</li>
+<li><strong>内存累积</strong>：长时间运行的服务会越来越慢</li>
+</ol>
+<h4 id="解决方案">解决方案</h4>
+<pre><code class="language-csharp">// ✅ 方式1：使用 using（推荐）
+public async Task GoodMethod1Async()
+{
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+    await DoWorkAsync(cts.Token);
+} // 自动 Dispose
+
+// ✅ 方式2：手动 Dispose
+public async Task GoodMethod2Async()
+{
+    var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+    try
+    {
+        await DoWorkAsync(cts.Token);
+    }
+    finally
+    {
+        cts.Dispose();
+    }
+}
+</code></pre>
+<hr>
+<h3 id="78-parallelfor-和-plinq-的取消">7.8 Parallel.For 和 PLINQ 的取消</h3>
+<h4 id="parallelfor-的取消">Parallel.For 的取消</h4>
+<pre><code class="language-csharp">var cts = new CancellationTokenSource();
+
+try
+{
+    Parallel.For(0, 1000, new ParallelOptions
+    {
+        CancellationToken = cts.Token, // 传递取消令牌
+        MaxDegreeOfParallelism = Environment.ProcessorCount
+    }, i =&gt;
+    {
+        // Parallel.For 会自动检查 Token
+        Console.WriteLine($"处理: {i}");
+        Thread.Sleep(100);
+    });
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("并行处理已取消");
+}
+
+// 在另一个线程取消
+Task.Run(async () =&gt;
+{
+    await Task.Delay(2000);
+    cts.Cancel();
+});
+</code></pre>
+<h4 id="plinq-的取消">PLINQ 的取消</h4>
+<pre><code class="language-csharp">var cts = new CancellationTokenSource();
+
+try
+{
+    var result = Enumerable.Range(0, 1000)
+        .AsParallel()
+        .WithCancellation(cts.Token) // 关键！
+        .Select(i =&gt;
+        {
+            Thread.Sleep(100);
+            return i * i;
+        })
+        .ToList();
+
+    Console.WriteLine($"计算完成，结果数量: {result.Count}");
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("PLINQ 查询已取消");
+}
+</code></pre>
+<hr>
+<h3 id="79-性能基准测试">7.9 性能基准测试</h3>
+<h4 id="测试检查频率对性能的影响">测试：检查频率对性能的影响</h4>
+<pre><code class="language-csharp">using BenchmarkDotNet.Attributes;
+
+[MemoryDiagnoser]
+public class CancellationBenchmark
+{
+    private CancellationToken _token = new CancellationTokenSource().Token;
+
+    [Benchmark(Baseline = true)]
+    public int NoCheck()
+    {
+        int sum = 0;
+        for (int i = 0; i &lt; 10_000_000; i++)
+        {
+            sum += i;
+        }
+        return sum;
+    }
+
+    [Benchmark]
+    public int CheckEveryIteration()
+    {
+        int sum = 0;
+        for (int i = 0; i &lt; 10_000_000; i++)
+        {
+            _token.ThrowIfCancellationRequested(); // 每次都检查
+            sum += i;
+        }
+        return sum;
+    }
+
+    [Benchmark]
+    public int CheckEvery10000()
+    {
+        int sum = 0;
+        for (int i = 0; i &lt; 10_000_000; i++)
+        {
+            if (i % 10000 == 0)
+            {
+                _token.ThrowIfCancellationRequested(); // 每 10000 次检查
+            }
+            sum += i;
+        }
+        return sum;
+    }
+}
+</code></pre>
+<h4 id="测试结果参考值">测试结果（参考值）</h4>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>平均时间</th>
+<th>相对性能</th>
+<th>内存分配</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NoCheck</td>
+<td>10 ms</td>
+<td>1.00x (基准)</td>
+<td>0 B</td>
+</tr>
+<tr>
+<td>CheckEvery10000</td>
+<td>10 ms</td>
+<td>1.00x</td>
+<td>0 B</td>
+</tr>
+<tr>
+<td>CheckEveryIteration</td>
+<td>25 ms</td>
+<td>2.50x (慢 150%)</td>
+<td>0 B</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论</strong>：</p>
+<ul>
+<li>✅ 每 10000 次检查：几乎无性能影响</li>
+<li>❌ 每次检查：性能降低 150%</li>
+</ul>
+<h4 id="检查频率建议">检查频率建议</h4>
+<table>
+<thead>
+<tr>
+<th>循环次数</th>
+<th>推荐检查频率</th>
+<th>响应时间</th>
+<th>性能影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt; 1,000</td>
+<td>每次</td>
+<td>&lt; 1 ms</td>
+<td>可忽略</td>
+</tr>
+<tr>
+<td>1,000 - 10,000</td>
+<td>每 100 次</td>
+<td>~10 ms</td>
+<td>&lt; 1%</td>
+</tr>
+<tr>
+<td>10,000 - 100,000</td>
+<td>每 1,000 次</td>
+<td>~100 ms</td>
+<td>&lt; 1%</td>
+</tr>
+<tr>
+<td>&gt; 100,000</td>
+<td>每 10,000 次</td>
+<td>~1 s</td>
+<td>&lt; 1%</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="8️⃣-总结">8️⃣ 总结</h2>
+<h3 id="81-核心概念">8.1 核心概念</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>🎯 <strong>协作式取消</strong></td>
+<td>调用方请求取消，执行方决定何时停止</td>
+</tr>
+<tr>
+<td>📡 <strong>CancellationTokenSource</strong></td>
+<td>取消信号源，调用方持有</td>
+</tr>
+<tr>
+<td>📻 <strong>CancellationToken</strong></td>
+<td>取消信号接收器，执行方持有</td>
+</tr>
+<tr>
+<td>💥 <strong>OperationCanceledException</strong></td>
+<td>取消操作的标准异常</td>
+</tr>
+</tbody>
+</table>
+<h3 id="82-最佳实践">8.2 最佳实践</h3>
+<ol>
+<li>✅ <strong>任何超过 50ms 的异步操作都应支持取消</strong></li>
+<li>✅ <strong>CancellationToken 作为最后一个参数，默认值 <code>= default</code></strong></li>
+<li>✅ <strong>使用 <code>ThrowIfCancellationRequested()</code> 抛出异常</strong></li>
+<li>✅ <strong>使用 <code>using</code> 自动释放 CancellationTokenSource</strong></li>
+<li>✅ <strong>区分取消异常和其他异常</strong></li>
+<li>✅ <strong>CPU 密集型任务定期检查，不要太频繁</strong></li>
+</ol>
+<h3 id="83-常见陷阱">8.3 常见陷阱</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>后果</th>
+<th>解决方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>❌ 不传递 Token</td>
+<td>无法取消</td>
+<td>一路传递</td>
+</tr>
+<tr>
+<td>❌ 忘记 Dispose</td>
+<td>内存泄漏</td>
+<td>使用 using</td>
+</tr>
+<tr>
+<td>❌ 频繁检查</td>
+<td>性能差</td>
+<td>适度检查</td>
+</tr>
+<tr>
+<td>❌ 吞掉异常</td>
+<td>逻辑混乱</td>
+<td>区分异常类型</td>
+</tr>
+</tbody>
+</table>
+<h3 id="84-何时使用-cancellationtoken">8.4 何时使用 CancellationToken？</h3>
+<ul>
+<li>✅ <strong>网络请求</strong>：HTTP、WebSocket、gRPC</li>
+<li>✅ <strong>文件操作</strong>：读写大文件、批量处理</li>
+<li>✅ <strong>数据库查询</strong>：长时间查询</li>
+<li>✅ <strong>后台任务</strong>：定时任务、批处理</li>
+<li>✅ <strong>用户交互</strong>：可取消的操作（下载、导出）</li>
+<li>✅ <strong>CPU 密集型</strong>：大量计算、图像处理</li>
+</ul>
+<h2 id="-参考资源">📚 参考资源</h2>
+<ul>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/standard/threading/cancellation-in-managed-threads" target="_blank" rel="noopener nofollow">官方文档：Cancellation in Managed Threads</a></li>
+<li><a href="https://devblogs.microsoft.com/dotnet/task-cancellation/" target="_blank" rel="noopener nofollow">Stephen Toub：Task Cancellation</a></li>
+</ul>
+<hr>
+<p>五一假期就这么眨眼间没了，明天又要开始牛马的日子，不开心~</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-05-05 23:51">2026-05-05 23:51</span>&nbsp;
+<a href="https://www.cnblogs.com/diamondhusky">呆萌哈士奇</a>&nbsp;
+阅读(<span id="post_view_count">149</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(19976212);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdiamondhusky%2Fp%2F19976212&amp;targetId=19976212&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
