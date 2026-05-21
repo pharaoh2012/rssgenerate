@@ -1,0 +1,152 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/deali/p/20103524" title="发布于 2026-05-21 10:09">
+    <span role="heading" aria-level="2">你的显卡能跑多少算子？用 55 个检查项，给 PyTorch GPU 环境做一次冒烟测试</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="背景">背景</h2>
+<p>之前的文章: <a href="https://blog.deali.cn/p/rocm-windows-perf-rx6650xt-pytorch-slow" target="_blank" rel="noopener nofollow">ROCm on Windows 性能排查：RX 6650 XT 跑 PyTorch，为什么加速不明显？</a></p>
+<p>在 Windows 上用 RX 6650 XT 跑自编译 ROCm + PyTorch 的时候，我遇到一个问题：LLM 推理确实跑在 GPU 上了，但加速比只有 1.7-2.0x，任务管理器里 GPU 利用率也很低。</p>
+<p>第一反应是——是不是很多操作没有 GPU 路径，PyTorch 悄悄把计算挪回了 CPU？</p>
+<p>为了搞清楚这件事，我写了一个简单的 Python 脚本。它做的事情用一句话就能说清楚：<strong>对一堆常见的 PyTorch 操作，检查输入是 CUDA/HIP tensor 的时候，输出是不是还在 CUDA/HIP 上。</strong></p>
+<p>如果某个操作直接报错，或者输出跑到了 CPU，那就值得深挖一下。</p>
+<h2 id="脚本在做什么">脚本在做什么</h2>
+<p>核心逻辑非常朴素：</p>
+<pre><code class="language-python">x = torch.randn(128, 512, device="cuda")
+out = some_operation(x)
+print(out.device)  # 还在 cuda:0 上吗？
+</code></pre>
+<p>再配合 warmup + 计时（前后都 <code>torch.cuda.synchronize()</code>），以及 Python warning 捕获和错误分类，就是一个完整的冒烟测试了。</p>
+<p>但这里有个容易误解的地方：<strong>输出 tensor 仍在 GPU 上，不等于底层一定调用了高性能 GPU kernel。</strong> PyTorch 的设备语义本身就倾向于让 CUDA tensor 的结果留在同一设备上；缺少对应 accelerator 实现时，常见行为是直接报错，而不是悄悄生成 CPU tensor。所以"输出还在 cuda 上"这个结论的含金量，其实比"证明该算子有高性能 GPU kernel"低得多。</p>
+<h2 id="覆盖了哪些操作">覆盖了哪些操作</h2>
+<p>脚本测了 9 类常见操作，大概 55 个检查项：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>典型操作</th>
+<th>可能涉及的 backend</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>线性代数</td>
+<td>matmul, linear, bmm, einsum</td>
+<td>rocBLAS / ATen</td>
+</tr>
+<tr>
+<td>卷积</td>
+<td>conv2d, depthwise, transpose, pooling</td>
+<td>MIOpen / ATen</td>
+</tr>
+<tr>
+<td>归一化</td>
+<td>batch_norm, layer_norm, group_norm, rms_norm</td>
+<td>MIOpen / ATen</td>
+</tr>
+<tr>
+<td>激活函数</td>
+<td>relu, gelu, silu, sigmoid, softmax, mish</td>
+<td>ATen</td>
+</tr>
+<tr>
+<td>注意力</td>
+<td>手动 attention, SDPA</td>
+<td>CK / ATen / math fallback</td>
+</tr>
+<tr>
+<td>Reduction</td>
+<td>sum, mean, max, argmax, topk</td>
+<td>ATen</td>
+</tr>
+<tr>
+<td>逐元素</td>
+<td>add, mul, exp, log, clamp, where</td>
+<td>ATen</td>
+</tr>
+<tr>
+<td>形状/索引</td>
+<td>reshape, cat, gather, embedding</td>
+<td>ATen</td>
+</tr>
+<tr>
+<td>损失函数</td>
+<td>cross_entropy, mse_loss, BCE</td>
+<td>ATen</td>
+</tr>
+</tbody>
+</table>
+<p>选这些操作的原因很简单：它们基本覆盖了主流深度学习模型（包括 Transformer）里最常见的计算模式。够用，但不代表完整 workload 的性能质量。</p>
+<h2 id="计时怎么做">计时怎么做</h2>
+<p>GPU 操作是异步提交的，所以计时前后必须同步：</p>
+<pre><code class="language-python">for _ in range(3):       # warmup
+    out = fn()
+
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+for _ in range(20):
+    out = fn()
+torch.cuda.synchronize()
+elapsed = (time.perf_counter() - t0) / 20 * 1000
+</code></pre>
+<p>这些时间只能粗略参考。部分检查项会在 lambda 里创建随机输入，计时会混入 tensor 分配和随机数生成的成本。要做严肃性能分析，应该单独固定输入、用更长的 repeat、配合 profiler。</p>
+<h2 id="实际跑出来什么样">实际跑出来什么样</h2>
+<p>在 RX 6650 XT (gfx1032) + 自编译 ROCm/PyTorch 环境下，结果类似：</p>
+<pre><code>Summary: 54/55 returned CUDA/HIP tensors | 1 errors | 1 warnings
+</code></pre>
+<p>怎么理解这个结果：</p>
+<ul>
+<li>54 个检查项成功返回了 CUDA/HIP tensor。这是好消息——说明这些操作在当前环境下不会直接崩掉。</li>
+<li><code>batch_norm</code> 报错了。MIOpen 跑 HIPRTC 编译的时候找不到 <code>&lt;type_traits&gt;</code>，这是 C++ 头文件缺失的问题，装上 VS Build Tools 的 C++ 工具链大概率能修。</li>
+<li><code>sdpa</code> 能跑，但 PyTorch 没启用 memory efficient attention，走的是数学 fallback。功能没问题，性能不是最优。</li>
+</ul>
+<p><strong>但这个结果不能写成"算子覆盖率 98%"</strong>——这 54 个只是"输出还在 GPU 上"，不是"证明有高性能 GPU kernel"。如果你看到有人拿类似的数字说"ROCm 在 Windows 上已经完美支持了"，那个结论是过头的。</p>
+<h2 id="错误诊断">错误诊断</h2>
+<p>脚本会对报错做自动分类，直接在终端里给出建议。目前能识别的几类：</p>
+<p><strong>BatchNorm MIOpen/HIPRTC error</strong> — 最常见的问题。MIOpen 用 HIPRTC 运行时编译 kernel，但 HIPRTC 在 Windows 上经常找不到 C++ 标准库头文件。stderr 里会看到 <code>fatal error: 'type_traits' file not found</code>。修复方法是装 VS Build Tools 并确认 HIPRTC 的 include path 配置正确。注意：这不是 CPU fallback，是编译直接失败。</p>
+<p><strong>SDPA: no flash attn</strong> — PyTorch 编译时没开启 memory efficient attention / FlashAttention。SDPA 会走数学 fallback，仍在 GPU tensor 上运行，但对长序列、大 batch 的 LLM workload 来说性能差距明显。</p>
+<p><strong>GPU OOM</strong> — 显存不够，减小输入尺寸或关掉其他 GPU 进程。</p>
+<p><strong>MIOpen runtime error</strong> — 其他 MIOpen 错误。可以试试清 kernel 缓存（<code>rmdir /s /q %LOCALAPPDATA%\miopen</code>），或者开 <code>MIOpen_ENABLE_LOGGING=2</code> 看详细日志。</p>
+<h2 id="这个脚本适合干什么">这个脚本适合干什么</h2>
+<ul>
+<li>新搭好 ROCm/PyTorch 环境后，快速确认常见操作不会直接报错。</li>
+<li>ROCm 或 PyTorch 升级后，做回归检查。</li>
+<li>作为 profiler 定位的第一层筛查——先知道哪些操作有问题，再深入分析。</li>
+</ul>
+<p>不适合拿来做"算子覆盖率统计"或者"性能瓶颈最终结论"。</p>
+<h2 id="如果真的想定位性能问题">如果真的想定位性能问题</h2>
+<p>光看输出 device 是不够的。要搞清楚 LLM 推理为什么慢，建议继续做这些：</p>
+<ol>
+<li>用 <code>torch.profiler</code> 记录 CPU 和 CUDA/HIP activity 的时间分布。</li>
+<li>把 prefill 和 decode 分开计时——自回归 decode 的瓶颈和 prefill 完全不同。</li>
+<li>用真实 LLM 的 tensor shape 单独测 <code>linear</code>、RMSNorm、RoPE、SDPA、KV cache 路径。</li>
+<li>开 MIOpen/rocBLAS 日志，确认关键操作到底走了哪个库。</li>
+<li>试不同 batch size、prompt length、<code>max_new_tokens</code>，看性能曲线怎么变。</li>
+</ol>
+<p>这样得到的结论，比"看输出还在不在 GPU 上"要靠谱得多。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    微信公众号：「程序设计实验室」
+专注于互联网热门新技术探索与团队敏捷开发实践，包括架构设计、机器学习与数据分析算法、移动端开发、Linux、Web前后端开发等，欢迎一起探讨技术，分享学习实践经验。
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-05-21 10:09">2026-05-21 10:09</span>&nbsp;
+<a href="https://www.cnblogs.com/deali">曦远Code</a>&nbsp;
+阅读(<span id="post_view_count">105</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20103524);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdeali%2Fp%2F20103524&amp;targetId=20103524&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
