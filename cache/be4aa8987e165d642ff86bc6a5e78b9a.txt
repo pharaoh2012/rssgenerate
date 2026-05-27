@@ -1,0 +1,179 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ACaiGarden/p/20176693" title="发布于 2026-05-26 22:03">
+    <span role="heading" aria-level="2">PolyMarket Ghost Fills（幽灵订单）探究</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="1-背景">1. 背景</h1>
+<p>2026 年 2 月 19 日，推特用户 <code>@itslirrato</code> 披露 Polymarket 存在一个已知的漏洞，攻击者可以利用 CTF Exchange 合约上的 <code>incrementNonce()</code> 函数，将已经在链下订单簿上撮合的订单取消，导致被撮合的对手挂单在链上合约因撮合失败而被消耗。攻击者可以在清空了挂单后的订单簿中作为唯一的做市商进行挂单定价，从而完成获利。这种攻击手法也被称为&nbsp;<strong>Ghost Fills（幽灵订单）</strong>。</p>
+<p>一笔订单的完整生命周期如下图所示：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1483609/202605/1483609-20260526215146299-327415523.png" alt="image" loading="lazy"></p>
+<ol>
+<li>用户将订单信息发送到 CLOB 中</li>
+<li>CLOB 根据用户提交的订单类型是否为市价单（Marketable）进行操作：
+<ol>
+<li>市价单：直接将其与订单簿中的挂单进行配对，并提交到链上执行</li>
+<li>非市价单：添加到订单簿上进行挂单。</li>
+</ol>
+</li>
+</ol>
+<p>在官方文档中，用户提交的订单在提交到 CLOB 进行匹配之后就无法取消了。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1483609/202605/1483609-20260526215353663-353425585.png" alt="image" loading="lazy"></p>
+<blockquote>
+<p>骗你的，CLOB 匹配了以后也能够取消。正是利用了这个漏洞，攻击者能够完成 Ghost Fills 操作。</p>
+</blockquote>
+<h1 id="2-攻击流程">2. 攻击流程</h1>
+<p>攻击流程涉及 CLOB 订单簿和链上合约两部分</p>
+<pre><code>初始状态：
+  Maker A 在 CLOB 上挂着 1000 股 YES @ 0.55 的卖单（用 nonce_A 签名）
+  这个订单在前端盘口显示，所有人都能吃
+
+T+0   攻击者发送一个市价买单 1000 股 YES @ market
+T+0.1 CLOB 撮合引擎：撮合到 Maker A 的卖单
+      → 把 Maker A 的卖单从盘口移除（标记为 filled）
+      → 通知 Maker A 的客户端："你的单成交了"
+      → 通知攻击者："你的单成交了"
+      
+T+0.5 Operator 准备 matchOrders(攻击者订单, [Maker A 订单]) 上链
+
+T+0.8 ⚡ 攻击者调用 incrementNonce()
+      → 攻击者自己的 nonce++
+
+T+1.0 Operator 的 matchOrders() 上链
+      → 校验攻击者订单的 nonce → 失败
+      → 整笔撮合 revert
+      → Maker A 的卖单也跟着没被结算
+      
+T+1.0 之后：
+      Maker A 的订单签名【技术上仍然有效】（他的 nonce 没变）
+      但他的订单已经【从 CLOB 盘口被移除】
+      Maker A 的客户端以为成交了，可能已经更新内部状态、对冲、移仓
+      盘口上那 1000 股 YES @ 0.55 的卖单【消失了】
+</code></pre>
+<h1 id="3-详细攻击流程">3. 详细攻击流程</h1>
+<p>首先通过 CLOB Client 的 create_market_order() 创建市价单，随后订单簿撮合器会根据 amount 的数量撮合对应数量的挂单。</p>
+<pre><code class="language-python">from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY
+
+HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137
+PRIVATE_KEY = "&lt;your-private-key&gt;"
+FUNDER = "&lt;your-funder-address&gt;"
+
+client = ClobClient(
+    HOST,  # The CLOB API endpoint
+    key=PRIVATE_KEY,  # Your wallet's private key
+    chain_id=CHAIN_ID,  # Polygon chain ID (137)
+    signature_type=1,  # 1 for email/Magic wallet signatures
+    funder=FUNDER  # Address that holds your funds
+)
+client.set_api_creds(client.create_or_derive_api_creds())
+
+mo = MarketOrderArgs(token_id="&lt;token-id&gt;", amount=25.0, side=BUY, order_type=OrderType.FOK)  # Get a token ID: https://docs.polymarket.com/developers/gamma-markets-api/get-markets
+signed = client.create_market_order(mo)
+resp = client.post_order(signed, OrderType.FOK)
+print(resp)
+</code></pre>
+<p>随后，经过撮合的订单列表会被 Operator 打包发送到 <code>CTFExchange.matchOrders()</code> 函数进行链上交易。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1483609/202605/1483609-20260526215512906-391470117.png" alt="image" loading="lazy"></p>
+<p>经过下面的调用链条，最终进行 <code>nonce</code> 检查。</p>
+<blockquote>
+<p>matchOrders --&gt; _matchOrders --&gt; _fillMakerOrders --&gt; _fillMakerOrder --&gt; _performOrderChecks --&gt; _validateOrder --&gt; isValidNonce</p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/1483609/202605/1483609-20260526215536544-139548784.png" alt="image" loading="lazy"></p>
+<p>而攻击者正是在 CLOB 撮合订单后，Operator 执行 <code>matchOrders()</code> 函数前的这个时间段内，调用 <code>incrementNonce()</code> 函数使得自己的 nonces 值增加 1 。在合约调用 <code>isValidNonce()</code> 函数检查时，由于 nonces 已经更新无法成功执行，交易回滚。攻击者就是通过这种方式来无效化自己的市价单，导致“幽灵订单”的情况出现。</p>
+<h1 id="4-漏洞修复过程">4. 漏洞修复过程</h1>
+<p>在 2026 年 4 月 28 日 Polymarket 升级了 V2 版本，其中存在一些更新项用以缓解 Ghost Fills 带来的影响。</p>
+<h2 id="41-v2-更新内容">4.1 V2 更新内容</h2>
+<p>下面是和 Ghost Fills 相关的更新内容：</p>
+<ol>
+<li>订单结构简化：移除 <code>nonce</code> 、 <code>feeRateBps</code> 和 <code>taker</code> ；添加 <code>timestamp</code> 、 <code>metadata</code> 和 <code>builder</code> 。</li>
+<li>链上取消操作已替换为操作员控制的 <code>pauseUser</code> / <code>unpauseUser</code> 。</li>
+<li>移除 <code>incrementNonce()</code> 和 <code>cancelOrder()</code> 两个可以<strong>批量无效化订单</strong>的函数。</li>
+</ol>
+<p>在更新完以后移除了 <code>nonce</code> 机制以及 <code>cancelOrder()</code> 函数，用户无法通过 CTFExchange 合约<strong>批量取消</strong>已经被 CLOB 配对的订单。如果用户需要取消订单，只能通过调用 CLOB 的接口从 CLOB 中取消（<a href="https://github.com/Polymarket/py-clob-client-v2/blob/main/examples/orders/cancel_orders.py" target="_blank" rel="noopener nofollow">https://github.com/Polymarket/py-clob-client-v2/blob/main/examples/orders/cancel_orders.py</a> ）也就是说已经通过 CLOB 配对提交到链上的订单，无法在合约层面进行取消。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1483609/202605/1483609-20260526215739843-599726271.png" alt="image" loading="lazy"></p>
+<h2 id="42-v2-遗留风险">4.2 V2 遗留风险</h2>
+<p>Ghost Fills 产生的前提条件主要有三个：</p>
+<ol>
+<li>CLOB 撮合与链上订单交易是串行的，且两者之间存在时间差。</li>
+<li>只要 CLOB 完成撮合后，就默认交易已经完成，移除已经撮合的挂单。</li>
+<li>链上订单交易可以被用户的其他链上行为进行阻拦，表现为链上订单交易 revert。</li>
+</ol>
+<p>V2 版本的更新都是围绕着第三点进行的，通过取消 nonce 机制以及 cancelOrder() 函数来禁止用户抢在CLOB 撮合与链上订单交易执行的时间差内取消订单。但是第三点也提到了，阻拦链上订单交易最终呈现出来的效果是让链上订单交易 revert。即使官方在 Polymarket 合约层面进行了限制，用户依然可以通过其他手法来阻止订单交易的执行：</p>
+<ol>
+<li>余额转移：把地址持有的 pUSD/CTF 转走，使得订单在成交时因余额不足而 revert</li>
+<li>授权取消：将对 CTFExchangeV2 的 pUSD/CTF 授权取消，在转移代币时因授权不足而 revert</li>
+</ol>
+<p>此次 V2 的更新只是局部地解决了链上订单取消的问题。从攻击平面看，ghost fills 仍然有完整的可利用通道。</p>
+<h2 id="43-deposit-wallets-更新">4.3 Deposit Wallets 更新</h2>
+<p>紧接着在 2026 年 5 月 4 日，Polymarket 紧急上线 Deposit Wallet 功能，本次更新"专门用于解决 ghost fills 问题"。</p>
+<ul>
+<li>Deposit Wallets Address：<a href="https://polygonscan.com/address/0x00000000000Fb5C9ADea0298D729A0CB3823Cc07#code" target="_blank" rel="noopener nofollow">https://polygonscan.com/address/0x00000000000Fb5C9ADea0298D729A0CB3823Cc07#code</a></li>
+</ul>
+<p>本次更新在 V2 的基础上引入了一个“Deposit Wallets”的概念，背后是一套<strong>链下中继器 + 链上代理合约 + ERC-1271 签名包装</strong>的混合系统。</p>
+<p>Deposit Wallet 是一个每个用户独立部署的 ERC-1967 代理合约。它替代了 V1/V2 里 maker 直接用 EOA 钱包持有 pUSD 和 CTF token 的模式。用户需要创建一个唯一的 Deposit Wallet 来存储在 Polymarket 中使用的资金。</p>
+<p>引入 Deposit Wallet 后用户的操作分为 CLOB 下单与钱包操作两种类型，分别对应不同的签名与执行方式：</p>
+<ol>
+<li>CLOB 下单：signatureType = 3 (POLY_1271)</li>
+</ol>
+<pre><code>Step 1: 用 Owner 或 Session Signer 私钥准备签名
+Step 2: 构造 V2 订单（maker = signer = Deposit Wallet，signatureType = 3）
+Step 3: 用 ERC-7739 包装签订单（内层签 CTFExchangeV2 域的订单哈希，外层嵌套 Deposit Wallet 的 EIP-712 domain）
+Step 4: 提交到 CLOB（POST /order）
+Step 5: CTFExchangeV2 撮合后直接调 Deposit Wallet.isValidSignature 结算
+</code></pre>
+<ol start="2">
+<li>钱包操作：EIP-712 签名 Wallet Batch</li>
+</ol>
+<pre><code>Step 1: 用 Owner EOA 准备签名
+Step 2: 构造 Batch（wallet、nonce、deadline、calls）
+Step 3: 用标准 EIP-712 签 Batch
+Step 4: 提交到 Polymarket Relayer（POST /submit）
+Step 5: Operator 调 Factory.proxy 转发
+Step 6: Factory 调 DepositWallet.execute 执行
+Step 7: 必要时同步 CLOB 缓存（/balance-allowance/update）
+</code></pre>
+<p>通过钱包操作的流程可以看出，由于资金不再存放在用户的 EOA 中，而是在 Deposit Wallet  中。这使得用户在进行代币的 transfer 或 approve 操作时，需要经过“签 Batch → Polymarket Relayer → Operator → Factory → Wallet”这个流程。</p>
+<p>此时所有钱包操作都需要经过由官方控制的 Relayer 和 Operator 的检查，使得项目方可以在多个环节对 ghost fills 等各个操作进行检测与拦截（但是具体是如何实现的官方并没有给出具体的说明，如果是为了避免攻击者根据检测规则更新攻击手法也可以理解）。</p>
+<h1 id="5-总结">5. 总结</h1>
+<p>经过了 V2 + Deposit Wallet 两次大更新后，Ghost Fills 的问题被彻底解决了吗？</p>
+<blockquote>
+<p>很遗憾并没有。</p>
+</blockquote>
+<ol>
+<li>尽管新用户采用的是 V2 版本，但是现存的 V1 版本老用户依然暴露在 Ghost Fills 的风险之中。</li>
+<li>Operator 层的拦截取决于 Polymarket 风控代码的具体实现，不能确认能够 100% 地拦截掉所有的 Ghost Fills 操作。</li>
+<li>时间差问题依旧存在，目前 CLOB 撮合与链上行为存在时间差且为非原子性的，攻击者理论上还是可以通过这个特征来干扰正常的交易操作。</li>
+</ol>
+<p>可以遇见地在未来 Polymarket 和 Ghost Fills 等其他问题还会不断地纠缠下去，可谓魔高一尺道高一丈。但是在预测市场这个新兴领域需要这种纠缠，才能不断地发展成一个成熟的安全的领域。</p>
+<h1 id="6-参考文档">6. 参考文档</h1>
+<ol>
+<li>Polymarket 升级了 V2 版本：<a href="https://docs.polymarket.com/v2-migration" target="_blank" rel="noopener nofollow">https://docs.polymarket.com/v2-migration</a></li>
+<li>Deposit Wallet 更新预告：<a href="https://x.com/0xdanzu/status/2051063408234025437" target="_blank" rel="noopener nofollow">https://x.com/0xdanzu/status/2051063408234025437</a></li>
+<li>Polymarket 升级了 Deposit Wallet：<a href="https://docs.polymarket.com/trading/deposit-wallets" target="_blank" rel="noopener nofollow">https://docs.polymarket.com/trading/deposit-wallets</a></li>
+<li>Ghost Fills 检测工具：<a href="https://github.com/TheOneWhoBurns/polymarket-nonce-guard" target="_blank" rel="noopener nofollow">https://github.com/TheOneWhoBurns/polymarket-nonce-guard</a></li>
+</ol>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.013888888888888888" data-date-updated="2026-05-26 22:23">2026-05-26 22:03</span>&nbsp;
+<a href="https://www.cnblogs.com/ACaiGarden">ACai_sec</a>&nbsp;
+阅读(<span id="post_view_count">137</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20176693);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FACaiGarden%2Fp%2F20176693&amp;targetId=20176693&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
