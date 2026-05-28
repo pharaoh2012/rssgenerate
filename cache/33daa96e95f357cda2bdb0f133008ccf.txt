@@ -1,0 +1,308 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xiaogongzi/p/20197322" title="发布于 2026-05-28 10:50">
+    <span role="heading" aria-level="2">云原生 CI/CD 平台架构设计</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>一套运行在公有云上的 GitOps 交付平台，覆盖 500 个线上项目。从网络拓扑、集群规划到自动化链路，完整复盘架构设计思路。</p>
+</blockquote>
+<hr>
+<h2 id="一整体架构概览">一、整体架构概览</h2>
+<p>先看全局。整套平台部署在公有云 VPC 内，承载 500 个线上项目的构建和部署，核心组件分布在三条逻辑链路上：</p>
+<div class="mermaid">graph TB
+    subgraph 代码与制品侧
+        A[GitLab&lt;br/&gt;代码仓库 + CI Runner]
+        B[Harbor&lt;br/&gt;镜像仓库 + OCI Chart 制品库]
+    end
+
+    subgraph 配置侧
+        D[GitOps 配置仓库&lt;br/&gt;应用定义 + 环境 Values]
+    end
+
+    subgraph 集群侧
+        E[ArgoCD&lt;br/&gt;集群内同步 Agent]
+        F[Argo Rollouts&lt;br/&gt;渐进式交付]
+        G[Kubernetes 集群&lt;br/&gt;3 节点池 / 4 命名空间]
+    end
+
+    subgraph 外部
+        H[DNS / CDN]
+        I[飞书通知]
+    end
+
+    A --&gt;|推送镜像 + Chart| B
+    A --&gt;|更新环境配置| D
+    E --&gt;|轮询 + 同步| D
+    E --&gt;|部署 + 健康检查| F
+    F --&gt;|管控| G
+    G --&gt;|对外暴露| H
+    A --&gt;|部署事件| I
+    E --&gt;|同步状态| I
+</div><p><strong>设计核心：CI 系统不接触集群。</strong> 这条约束是整个架构的安全基石。CI 只管产出制品（镜像和 Chart）、更新 GitOps 配置仓库，不持有任何集群凭据。集群内的 ArgoCD 自主拉取配置并同步。安全边界清晰——即使 CI 系统被攻破，攻击者也拿不到集群控制权。</p>
+<hr>
+<h2 id="二网络拓扑四条隔离边界">二、网络拓扑：四条隔离边界</h2>
+<p>网络设计是云上安全的第一道防线，事后改的成本极高。我们划了四条隔离边界：</p>
+<div class="mermaid">graph LR
+    subgraph 公网
+        USER[用户流量]
+        DEV[开发者]
+    end
+
+    subgraph VPC
+        subgraph 公网接入层
+            SLB[SLB 负载均衡]
+            NAT[NAT 网关]
+        end
+
+        subgraph K8s 节点池
+            direction TB
+            W_PROD[生产节点池]
+            W_FAT[测试节点池]
+        end
+
+        subgraph 基础服务
+            REGISTRY[Harbor]
+            GIT[GitLab]
+        end
+    end
+
+    USER --&gt; SLB
+    SLB --&gt; W_PROD
+    DEV --&gt; GIT
+    DEV --&gt; REGISTRY
+    W_PROD -.-&gt;|内网拉镜像| REGISTRY
+    W_FAT -.-&gt;|内网拉镜像| REGISTRY
+    W_PROD -.-&gt;|出公网| NAT
+    W_FAT -.-&gt;|出公网| NAT
+</div><p><strong>边界一：Worker 节点不绑公网 IP。</strong> 出网走 NAT 统一出口，入网只走 SLB。节点对公网完全不可见。</p>
+<p><strong>边界二：镜像仓库和 GitLab 在同一 VPC。</strong> Runner 也在 VPC 内。构建、推送、拉取全链路走内网，不产生公网流量费用。</p>
+<p><strong>边界三：SLB 是唯一的公网入口。</strong> SSL 终结在 SLB 层，SLB 做七层转发到 Ingress。不把证书分散到各个应用上管理。</p>
+<p><strong>边界四：凭据不出集群。</strong> 这是个容易被忽略但极其重要的设计点。Harbor 密码、GitOps 仓库 Token、飞书 Webhook Secret，全部通过 GitLab CI 变量注入，CI 运行时以环境变量形式存在于 Runner Pod 内，不写入配置文件、不进入 Git 历史。ArgoCD 侧的集群凭据由 Kubernetes Secret 管理，通过 Sealed Secrets 加密后存入 GitOps 仓库——Git 里的密文是可版本化的，但只有集群内的 controller 能解密。镜像仓库的拉取凭据同理，通过 <code>imagePullSecrets</code> 注入，应用开发者不需要知道 Harbor 密码。</p>
+<p>不展开讲工具细节，核心原则一句话：<strong>凭据的明文只存在于运行时内存和集群内部 Secret 中，任何持久化存储（Git、日志、制品）里只允许出现密文或引用。</strong></p>
+<hr>
+<h2 id="三交付链路为什么拆成两条流水线">三、交付链路：为什么拆成两条流水线</h2>
+<p>这是全文最重要的架构决策，值得单独一节。</p>
+<div class="mermaid">sequenceDiagram
+    participant Dev as 开发者
+    participant CI as GitLab CI
+    participant Registry as Harbor
+    participant GitOps as GitOps 配置仓库
+    participant Argo as ArgoCD
+    participant K8s as K8s 集群
+
+    Dev-&gt;&gt;CI: git push
+    CI-&gt;&gt;CI: 编译 + 测试 + 镜像构建
+    CI-&gt;&gt;Registry: 推送镜像 + Helm Chart
+    CI-&gt;&gt;CI: 渲染环境 Values
+    CI-&gt;&gt;GitOps: git commit + push
+    CI--&gt;&gt;Dev: 通知：构建完成
+
+    Note over Argo,GitOps: ArgoCD 每 3 分钟轮询
+
+    Argo-&gt;&gt;GitOps: git pull
+    Argo-&gt;&gt;Argo: diff 期望状态 vs 实际状态
+    Argo-&gt;&gt;K8s: 同步差异
+    Argo--&gt;&gt;Dev: 通知：部署完成
+</div><p>如果把镜像推送和集群部署写在同一个 pipeline 里（构建完直接 <code>kubectl apply</code>），等于把集群写权限捆绑在 CI 系统上。一旦 CI 被攻破——Runner 镜像有漏洞、开发者脚本注入了恶意命令、某个 CI 变量泄露——攻击者就能直接操控集群。</p>
+<p>拆成两条线之后：</p>
+<p><strong>构建线</strong>（左侧）：CI 只做编译、镜像打包、Values 渲染、Git push。这条线不需要任何集群凭据，甚至不知道集群地址。</p>
+<p><strong>同步线</strong>（右侧）：ArgoCD 在集群内部，持续对比 Git 仓库和实际状态，有集群写权限，但完全不暴露给外部系统。</p>
+<p><strong>额外收益：部署和构建解耦后，回滚变得极其简单。</strong> 回滚就是 <code>git revert</code> 推送到 GitOps 仓库，ArgoCD 自动同步回集群。运维不需要 kubectl 权限，在 GitLab 界面点一下 rollback pipeline 按钮就完成。从"半夜爬起来敲命令"变成了"手机上点个按钮"。</p>
+<p><strong>代价：3 分钟的轮询延迟。</strong> ArgoCD 默认每 3 分钟拉一次 Git，这意味着从 CI 推送配置到集群实际变更，最多有 3 分钟的空白期。对于绝大多数业务场景这个延迟可以接受。如果对延迟敏感，可以缩短轮询间隔，或者用 webhook 触发——两者都支持，我们保守地用轮询，先稳再快。</p>
+<hr>
+<h2 id="四平台自举argocd-自己怎么部署">四、平台自举：ArgoCD 自己怎么部署</h2>
+<p>GitOps 架构中有一个经典问题：ArgoCD 管理所有业务应用，那 ArgoCD 自己怎么管理？</p>
+<p>我们的做法分两层：</p>
+<p><strong>集群基础组件</strong>（ArgoCD、Traefik、Prometheus、Sealed Secrets Controller 等）不走 GitOps 自举循环——它们由 Helm 手动安装到 <code>kube-system</code> 和专用命名空间，配置通过 <code>values.yaml</code> 保存在 Git 仓库中，但安装动作是手动的。这不是技术做不到，而是刻意为之：基础组件是平台的"底座"，底座不应该依赖平台自己。如果用 ArgoCD 管理 ArgoCD，那就成了一个死结——ArgoCD 挂了，谁去执行 GitOps 同步来恢复它？答案是没人，你得手动介入。那还不如一开始就老老实实手动装，别假装能自动恢复。</p>
+<p><strong>业务应用和 Addon</strong> 由 ArgoCD 通过 ApplicationSet 管理。新增一个项目时，只需要在 GitOps 仓库中新增一个 Application 定义文件，ArgoCD 自动同步。这部分完全 GitOps 化。</p>
+<p>这个"分层自举"的设计不是一个优雅的方案，但它是一个诚实的方案。很多文章会声称"一切皆 GitOps"，但底座组件的手动安装是工程现实。我们宁可在架构文档里承认这一点，而不是假装 pipeline 里一个 <code>terraform apply</code> 就能解决一切。</p>
+<hr>
+<h2 id="五分支即环境单集群多命名空间的路由设计">五、分支即环境：单集群多命名空间的路由设计</h2>
+<p>不做"一个环境一个集群"的奢侈方案。500 个项目跑在集群上，通过命名空间做逻辑隔离：</p>
+<div class="mermaid">graph TB
+    subgraph Git 仓库
+        B1[develop]
+        B2[hotfix-uat]
+        B3[master]
+        B4[feature/xxx]
+    end
+
+    subgraph K8s 集群
+        subgraph fat-ns[fat]
+            F1[项目 A] --- F2[项目 B] --- F3[项目 C]
+        end
+        subgraph uat-ns[uat]
+            U1[项目 A] --- U2[项目 B]
+        end
+        subgraph prod-ns[prod]
+            P1[项目 A] --- P2[项目 B]
+        end
+        subgraph preview-ns[preview]
+            V1[feature-x-项目A]
+            V2[feature-y-项目B]
+        end
+    end
+
+    B1 --&gt;|自动| fat-ns
+    B2 --&gt;|手动| uat-ns
+    B3 --&gt;|手动| prod-ns
+    B4 --&gt;|自动创建| preview-ns
+</div><p><strong>为什么还是单集群？</strong> 500 个项目的体量下，这个选择看起来有些反直觉，很多人第一反应是"肯定得拆"。我们的理由不是单集群有多好，而是多集群在这个场景下带来的额外复杂度——多套监控、多套日志、多个 Ingress 入口、跨集群服务发现、多版本的 API 兼容——在当前阶段大于单集群的风险。命名空间级别的隔离加上 RBAC 和资源配额，已经做到了"一个环境的故障不波及其他环境，一个团队的 Pod 不抢占另一个团队的资源"。</p>
+<p><strong>什么时候拆？</strong> 当出现以下信号之一：某个业务方要求生产环境物理隔离（合规要求而非技术需求）、集群规模接近单集群的节点上限、或者控制面压力（大量 ArgoCD Application 导致 API Server 负载过高）开始影响调度性能。当前架构的一个重要设计是：环境配置和集群目标是解耦的——同一个 GitOps 仓库、同一套 Chart 模板，拆集群时只需要将 prod 命名空间的 ArgoCD Application 指向新集群即可，不需要重新生成任何制品。</p>
+<p><strong>生产部署必须手动触发。</strong> fat 可以自动，但 uat 和 prod 在 pipeline 里需要人点按钮。这不是技术限制，是流程设计——通往生产的每一步都要有人对它负责。</p>
+<p><strong>Feature 预览环境的生命周期管理。</strong> feature 分支在合入或删除后，对应的命名空间、Ingress 域名、ArgoCD Application 一并自动回收。不留僵尸资源是云成本控制的底线。</p>
+<hr>
+<h2 id="六集群内流量拓扑南北向和东西向分开看">六、集群内流量拓扑：南北向和东西向分开看</h2>
+<div class="mermaid">graph TB
+    subgraph 集群外部
+        DNS[DNS]
+        CDN[CDN]
+    end
+
+    subgraph 集群内
+        SLB_L7[SLB&lt;br/&gt;七层转发 / TLS 终结]
+        INGRESS[Traefik Ingress&lt;br/&gt;限流 / 域名路由]
+        SVC_A[Service A]
+        SVC_B[Service B]
+        POD_A1[Pod A-1]
+        POD_A2[Pod A-2]
+        POD_B1[Pod B-1]
+    end
+
+    DNS --&gt; CDN
+    CDN --&gt; SLB_L7
+    SLB_L7 --&gt; INGRESS
+    INGRESS --&gt;|域名路由| SVC_A
+    INGRESS --&gt;|域名路由| SVC_B
+    SVC_A --&gt;|iptables| POD_A1
+    SVC_A --&gt;|iptables| POD_A2
+    SVC_B --&gt;|iptables| POD_B1
+    POD_A1 -.-&gt;|东西向直连| POD_B1
+</div><p><strong>南北向</strong>：CDN → SLB（七层转发 + TLS 终结）→ Ingress → Service → Pod。SSL 终结在 SLB 层，证书统一管理。Ingress 层专注于域名路由和限流策略，各司其职。</p>
+<p><strong>东西向</strong>：集群内服务间直连，不绕 Ingress。减少一跳延迟，也避免内部流量被限流策略误伤。</p>
+<p><strong>为什么选 Traefik 而不是 K8s 原生 Ingress Controller？</strong> Traefik 的中间件机制（限流、重定向、路径替换、IP 白名单）可以按 IngressRoute 粒度绑定，不需要在每个应用的 Chart 里重复实现这些横切逻辑。代价是它的 CRD 和原生 Ingress 资源不通用，团队需要额外学习。如果你已经在用原生 Ingress 且没有中间件需求，没必要换。</p>
+<p><strong>多租户的网络隔离：</strong> 500 个项目跑在一个集群里，不同命名空间之间的 Pod 默认可以互访（K8s 的默认行为）。当前没有上全量 NetworkPolicy——不是不需要，而是 500 个项目的 NetworkPolicy 规则维护成本太高，且大部分项目之间没有调用关系，默认策略就是全通。对于有明确隔离需求的业务（比如涉及支付或用户数据的服务），单独配白名单策略，而不是一刀切。如果后续监管要求升级，模板层可以自动为每个项目生成默认拒绝 + 显式放行的 NetworkPolicy。这个决策是权衡过的——不被还没发生的合规需求拖着走，但也留好了升级路径。</p>
+<hr>
+<h2 id="七渐进式交付灰度的真正价值是反悔权">七、渐进式交付：灰度的真正价值是"反悔权"</h2>
+<p>标准发布停旧启新，中间有短暂不可用。K8s 滚动更新能解决这个问题（先启新 Pod，健康检查通过再停旧 Pod），但如果新版本有 bug，滚动更新会把 bug 逐步扩散到所有 Pod，等你发现已经全量了。</p>
+<p>灰度的真正价值不是"平滑切换"，而是在错误扩散之前拦住它。</p>
+<div class="mermaid">graph LR
+    subgraph 标准发布
+        S1[Rollout 更新] --&gt; S2[新 Pod 启动]
+        S2 --&gt; S3[健康检查通过]
+        S3 --&gt; S4[旧 Pod 终止]
+    end
+
+    subgraph 金丝雀发布
+        C1[创建 Canary Pod] --&gt; C2[切 10% 流量]
+        C2 --&gt; C3{自动分析&lt;br/&gt;Prometheus 指标}
+        C3 --&gt;|通过| C4[逐步提升至 100%]
+        C3 --&gt;|失败| C5[自动回滚]
+    end
+
+    subgraph 蓝绿发布
+        G1[创建完整绿色环境] --&gt; G2[切换 Ingress 权重]
+        G2 --&gt; G3{观察窗口}
+        G3 --&gt;|确认| G4[回收蓝色环境]
+        G3 --&gt;|异常| G5[切回蓝色]
+    end
+</div><p>三个组件配合支撑这套能力：</p>
+<ul>
+<li><strong>Argo Rollouts</strong> 替代原生 Deployment，接管 Pod 生命周期和流量切换。</li>
+<li><strong>Traefik IngressRoute</strong> 的加权路由，实现按比例切流量。</li>
+<li><strong>Prometheus + AnalysisTemplate</strong> 在灰度期间持续查询错误率、延迟、重启次数，任意一项破线自动中止回滚。</li>
+</ul>
+<p>发布策略按业务重要度分级：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>适用场景</th>
+<th>发布时长</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>标准发布</td>
+<td>内部工具、管理后台</td>
+<td>1-2 分钟</td>
+</tr>
+<tr>
+<td>金丝雀 + 自动分析</td>
+<td>核心 API、用户面服务</td>
+<td>5-10 分钟</td>
+</tr>
+<tr>
+<td>蓝绿</td>
+<td>大版本升级、数据库迁移</td>
+<td>10-30 分钟</td>
+</tr>
+</tbody>
+</table>
+<p><strong>一个踩过的坑：分析窗口要区分预热期和稳态期。</strong> 新 Pod 启动时 CPU 和延迟天然偏高，如果在这个阶段就开始分析，大概率误判回滚。我们的做法是分析模板先设一段静默期（只检查 Pod 是否 Ready，不做性能判断），过了静默期再进入正式的指标分析。这个值我们调了好几次才找到一个比较稳的默认值——不是代码问题，是参数问题。</p>
+<hr>
+<h2 id="八可观测性三层覆盖逐级缩小排查范围">八、可观测性：三层覆盖，逐级缩小排查范围</h2>
+<p>云上应用出问题时的排查链路比应用本身长得多——请求经过了 CDN、SLB、Ingress、Service、Pod 五层，任何一层出问题用户看到的都是 502。</p>
+<div class="mermaid">graph TB
+    subgraph 第一层-基础设施
+        NODE[节点指标&lt;br/&gt;CPU/内存/磁盘/网络]
+        KSM[kube-state-metrics&lt;br/&gt;Pod 状态 / 副本数]
+    end
+
+    subgraph 第二层-应用链路
+        APM[应用指标&lt;br/&gt;QPS / 延迟 / 错误率]
+        TRACE[分布式追踪&lt;br/&gt;OpenTelemetry]
+    end
+
+    subgraph 第三层-事件
+        DEPLOY[部署事件&lt;br/&gt;谁 / 什么时间 / 发到哪]
+        ALERT[告警事件&lt;br/&gt;Prometheus AlertManager]
+        NOTIFY[通知服务&lt;br/&gt;聚合推送飞书]
+    end
+
+    NODE --&gt; PROM[Prometheus]
+    KSM --&gt; PROM
+    APM --&gt; PROM
+    TRACE --&gt; TEMPO[Tempo]
+    PROM --&gt; GRAFANA[Grafana 统一面板]
+    PROM --&gt; ALERTMANAGER[AlertManager]
+    ALERTMANAGER --&gt; NOTIFY
+    DEPLOY --&gt; NOTIFY
+    NOTIFY --&gt; FEISHU[飞书群]
+</div><p>分层不为分而分，而是为了一个非常实际的目的：<strong>出了问题沿层级逐级缩小排查范围。</strong></p>
+<p>我们的固定排查路径：先看事件层有没有最近的部署记录（"是不是刚发版了"——这个问题能解释 50% 的线上异常），再看应用层哪个服务的指标先出现异常（缩小到具体服务），最后看基础设施层有没有资源瓶颈（缩小到具体节点或 Pod）。没有这个分层，排查就是对数百万条日志大海捞针。</p>
+<p>通知服务的架构要点只有一句话：<strong>通知是旁路，不能阻塞主流程。</strong> 通知发失败了不应该影响部署结果。所以通知服务是独立部署的 Webhook 中转——CI 发一个 JSON 过来，通知服务负责格式化并推送到飞书，CI 不关心推送结果。部署日志里看不到通知报错，那是通知服务的事。</p>
+<hr>
+<h2 id="九架构设计的五个取舍">九、架构设计的五个取舍</h2>
+<p>这是全文最重要的一章。架构本质上是取舍，而不是"最佳实践"的堆砌。下面五个决策是做过的最难的。</p>
+<p><strong>1. 单集群 vs 多集群。</strong> 500 个项目仍然选了单集群。这个决定不轻松——好处是运维成本受控，一套监控、一套日志、一套 Ingress 扛住所有业务。代价是风险集中，集群故障会同时影响所有环境。拆集群的触发条件不是项目数量，而是合规要求物理隔离、节点数逼近单集群上限、或 API Server 压力影响调度性能。真到那一天，环境配置和集群目标是解耦的——同一个 GitOps 仓库，改一下 Application 的指向就能迁走。</p>
+<p><strong>2. Push vs Pull。</strong> 选了 Pull。运维倾向于主动下发（Push），但 Pull 把安全边界缩到了集群内部——不需要向外部暴露任何写入接口。ArgoCD 每 3 分钟轮询的延迟是代价，但业务上可接受。保守选型：先稳再快。</p>
+<p><strong>3. 模板化 vs 灵活性。</strong> 统一模板让 90% 的项目接入极快，新项目几分钟上线。代价是剩下 10% 的复杂需求需要改模板，而改模板影响所有使用者。没有完美解法——我们在模板里预留了"自定义注入"的扩展点，让少数特殊需求有出口。</p>
+<p><strong>4. 自研 vs 组合。</strong> 没有自研任何核心组件，全用 CNCF 生态——GitLab CI、Harbor、Helm、ArgoCD、Argo Rollouts、Traefik、Prometheus、OpenTelemetry。表面看是在"搭积木"，但选型、组合、调参本身就是架构工作。知道哪些组件拼在一起能形成完整闭环、边界画在哪里不容易出问题——这些判断需要踩过坑才能做出来的。</p>
+<p><strong>5. 底座手动 vs 完全 GitOps。</strong> 坦率地说，没有做到"一切皆 GitOps"。ArgoCD 自己、Traefik、Prometheus 这些底座组件是 Helm 手动安装的，配置存 Git 但安装动作需要人工。这不是能力问题——技术上可以让 ArgoCD 管理 ArgoCD（自举循环），但这是个危险的循环依赖：如果 ArgoCD 挂了由 ArgoCD 来恢复自己？底座应该是平台的锚，锚不能自己拉着自己。一个不优雅但诚实的答案。</p>
+<hr>
+<p>平台的价值不在于图纸画得多漂亮，而在于开发推代码之后不需要关心中间发生了什么。哪天它不在的时候你才会感觉到它存在——那个周一的早上，没人记得上次谁改了什么配置的时候。</p>
+<p>各位大佬感兴趣可以关注我的公众号：探索者卡尔</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-05-28 10:51">2026-05-28 10:50</span>&nbsp;
+<a href="https://www.cnblogs.com/xiaogongzi">zz小公子</a>&nbsp;
+阅读(<span id="post_view_count">47</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20197322);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxiaogongzi%2Fp%2F20197322&amp;targetId=20197322&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

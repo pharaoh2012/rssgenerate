@@ -1,0 +1,177 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xyh0703/p/20198014" title="发布于 2026-05-28 11:27">
+    <span role="heading" aria-level="2">DeepSeek V4 + Claude Code thinking mode 400 错误修复方案</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="deepseek-v4--claude-code-thinking-mode-400-错误修复方案">DeepSeek V4 + Claude Code thinking mode 400 错误修复方案</h1>
+<h2 id="问题描述">问题描述</h2>
+<p>使用 DeepSeek V4 Pro / V4 Flash 的 thinking mode + tool calls 时，第一轮工具调用后的每次请求都返回 <strong>400 错误</strong>：</p>
+<pre><code>API Error: 400 The `content[].thinking` in the thinking mode must be passed back to the API.
+</code></pre>
+<h2 id="根因">根因</h2>
+<pre><code>Claude Code  →  DeepSeek API（返回 reasoning_content / thinking 块）
+                ↓
+Claude Code 保存对话历史时丢弃非标准的 thinking 字段
+                ↓
+下一轮请求 → DeepSeek API：检测到 assistant 消息缺少 thinking 块 → 400
+</code></pre>
+<p>DeepSeek V4 要求 multi-turn 对话中，每个 <code>role: assistant</code> 的消息必须保留 thinking 块。Claude Code / cc-switch 在序列化历史时把它丢弃了。</p>
+<h2 id="解决方案">解决方案</h2>
+<p>在 Claude Code 和 DeepSeek API 之间插入一个本地 Node.js 代理，自动补全被丢弃的 thinking 字段。</p>
+<h3 id="拓扑">拓扑</h3>
+<pre><code>Claude Code → cc-switch → 本地代理 (127.0.0.1:15722) → api.deepseek.com
+                               ↑
+                        注入 thinking 块
+</code></pre>
+<h2 id="步骤">步骤</h2>
+<h3 id="1-创建代理脚本-ds-proxyjs">1. 创建代理脚本 <code>ds-proxy.js</code></h3>
+<pre><code class="language-js">const http = require('http');
+const { Readable } = require('stream');
+
+const DEEPSEEK_BASE = 'https://api.deepseek.com';
+const PORT = 15722;
+
+function fixMessages(data) {
+    if (!data.messages &amp;&amp; !Array.isArray(data.messages)) return;
+    for (const msg of data.messages) {
+        if (msg.role !== 'assistant') continue;
+        if (Array.isArray(msg.content)) {
+            const hasThinking = msg.content.some(b =&gt; b.type === 'thinking');
+            if (!hasThinking) {
+                msg.content.unshift({ type: 'thinking', thinking: '' });
+            }
+        } else {
+            msg.reasoning_content = msg.reasoning_content || '';
+        }
+    }
+}
+
+const server = http.createServer(async (req, res) =&gt; {
+    console.log(`${req.method} ${req.url}`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+
+    if (req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ id: 'root', object: 'list' }));
+        return;
+    }
+
+    if (req.method !== 'POST') {
+        res.writeHead(404);
+        res.end('Not Found');
+        return;
+    }
+
+    let body = '';
+    req.on('data', chunk =&gt; body += chunk);
+    req.on('end', async () =&gt; {
+        try {
+            const data = JSON.parse(body);
+            fixMessages(data);
+
+            const target = DEEPSEEK_BASE + req.url;
+            console.log('-&gt;', target);
+
+            const apiRes = await fetch(target, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': req.headers.authorization,
+                    'anthropic-version': req.headers['anthropic-version'] || ''
+                },
+                body: JSON.stringify(data)
+            });
+
+            console.log('&lt;-', apiRes.status);
+            const headers = {};
+            apiRes.headers.forEach((v, k) =&gt; { headers[k] = v; });
+            res.writeHead(apiRes.status, headers);
+
+            if (apiRes.body) {
+                Readable.fromWeb(apiRes.body).pipe(res);
+            } else {
+                res.end();
+            }
+        } catch (err) {
+            console.error('Proxy error:', err.message);
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: 'Proxy Error: ' + err.message }));
+        }
+    });
+});
+
+server.listen(PORT, () =&gt; {
+    console.log('DS4 Proxy on http://127.0.0.1:' + PORT);
+});
+</code></pre>
+<h3 id="2-启动代理">2. 启动代理</h3>
+<pre><code class="language-powershell">node ds-proxy.js
+</code></pre>
+<p>保持在后台运行。</p>
+<h3 id="3-配置-cc-switch">3. 配置 cc-switch</h3>
+<p>DeepSeek provider 的 Base URL 设为：</p>
+<pre><code>http://127.0.0.1:15722/anthropic
+</code></pre>
+<p>或跳过 cc-switch，直连代理：</p>
+<pre><code class="language-powershell">$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:15722/anthropic"
+$env:ANTHROPIC_API_KEY = "你的DeepSeek API Key"
+claude
+</code></pre>
+<h3 id="4-重启-claude-code">4. 重启 Claude Code</h3>
+<h2 id="代理处理逻辑">代理处理逻辑</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>操作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anthropic 格式（content 为数组）</td>
+<td>在 content 最前面插入 <code>{type:"thinking",thinking:""}</code></td>
+</tr>
+<tr>
+<td>OpenAI 格式</td>
+<td>注入 <code>reasoning_content: ""</code></td>
+</tr>
+<tr>
+<td>连通性检测（GET）</td>
+<td>返回 <code>{"id":"root","object":"list"}</code> 模拟 API</td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考">参考</h2>
+<ul>
+<li><a href="https://github.com/musistudio/claude-code-router/issues/1378" target="_blank" rel="noopener nofollow">claude-code-router Issue #1378</a></li>
+<li><a href="https://github.com/farion1231/cc-switch/issues/2331" target="_blank" rel="noopener nofollow">cc-switch Issue #2331</a></li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-05-28 11:27">2026-05-28 11:27</span>&nbsp;
+<a href="https://www.cnblogs.com/xyh0703">xyh0703</a>&nbsp;
+阅读(<span id="post_view_count">27</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20198014);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxyh0703%2Fp%2F20198014&amp;targetId=20198014&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
