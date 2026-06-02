@@ -1,0 +1,922 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/diamondhusky/p/20241817" title="发布于 2026-05-31 20:39">
+    <span role="heading" aria-level="2">【.NET并发编程 - 13】ThreadLocal 与 AsyncLocal：线程本地存储</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="13-threadlocal-与-asynclocal线程本地存储">13. ThreadLocal 与 AsyncLocal：线程本地存储</h1>
+<blockquote>
+<p><strong>本章 GitHub 仓库</strong>：<a href="https://github.com/Naughtyhusky/csharp-concurrency-cookbook/tree/dev" target="_blank" rel="noopener nofollow">csharp-concurrency-cookbook</a> ⭐</p>
+<p>欢迎 Star 和 Fork！所有代码示例都可以在仓库中找到并运行。</p>
+</blockquote>
+<hr>
+<h2 id="-本章导读">🎯 本章导读</h2>
+<blockquote>
+<p>📌 <strong>本文目标</strong>：搞清楚 <code>ThreadLocal&lt;T&gt;</code> 和 <code>AsyncLocal&lt;T&gt;</code> 各自解决什么问题；深入 <code>AsyncLocal&lt;T&gt;</code> 的 <code>ExecutionContext</code> 原理与源码机制，彻底理解"向下继承、向上隔离、写时复制"三条核心规则；以及如何在 ASP.NET Core 中用 <code>AsyncLocal</code> 实现生产级 TraceId 追踪和优雅的 <code>CurrentUser</code> 全局上下文，彻底告别 <code>IHttpContextAccessor</code> 注入的样板代码。</p>
+</blockquote>
+<p>上一篇《并发集合与线程安全类型》里，我们聊的是"多线程共享同一份数据"的问题。今天翻个方向，聊聊<strong>每个线程（或每条异步调用链）独占自己一份数据</strong>的问题——这就是"线程本地存储（Thread-Local Storage，TLS）"。</p>
+<p>先来个灵魂拷问：你有没有遇到过这种需求？</p>
+<blockquote>
+<p>"我有一个 <code>Random</code> 实例，我想多线程并发用它生成随机数，但 <code>Random</code> 不是线程安全的，加锁又太慢——怎么办？"</p>
+</blockquote>
+<p>或者：</p>
+<blockquote>
+<p>"我在处理 HTTP 请求，我想让 TraceId（请求追踪 ID）在整个调用链里都能取到，但我又不想把它一层一层地当参数传下去——怎么搞？"</p>
+</blockquote>
+<p>这两个问题，分别是 <code>ThreadLocal&lt;T&gt;</code> 和 <code>AsyncLocal&lt;T&gt;</code> 的经典使用场景。学完这篇，这两个问题你都能给出漂亮的解答。</p>
+<hr>
+<h2 id="-从最古老的方式说起threadstatic">🧵 从最古老的方式说起：[ThreadStatic]</h2>
+<p>在 <code>ThreadLocal&lt;T&gt;</code> 出现之前（.NET 4.0 以前），我们用 <code>[ThreadStatic]</code> 特性来实现线程本地存储。</p>
+<pre><code class="language-csharp">[ThreadStatic]
+private static int _counter = 10;
+</code></pre>
+<p><code>[ThreadStatic]</code> 的作用很简单：<strong>让每个线程都拥有这个静态字段的独立副本</strong>。线程A改了它，不影响线程B。</p>
+<p>听起来很美好，但有一个<strong>经典陷阱</strong>——</p>
+<h3 id="️-threadstatic-的初始化陷阱">⚠️ [ThreadStatic] 的初始化陷阱</h3>
+<pre><code class="language-csharp">[ThreadStatic]
+private static int _counter = 10;  // ❌ 危险！
+
+var t = new Thread(() =&gt;
+{
+	Console.WriteLine(_counter); // 输出 0，不是 10！
+});
+t.Start();
+t.Join();
+</code></pre>
+<p>为什么子线程拿到的是 <code>0</code> 而不是 <code>10</code>？</p>
+<p>因为 <code>= 10</code> 这个静态字段初始化，<strong>只在类型被加载时执行一次</strong>，而类型加载发生在主线程。子线程拿到的是该字段的 <strong>默认值</strong>（<code>int</code> 是 <code>0</code>，引用类型是 <code>null</code>）。</p>
+<p><strong>正确做法</strong>：声明时不赋初值，在每个线程开始时手动初始化：</p>
+<pre><code class="language-csharp">[ThreadStatic]
+private static int _counter;  // ✅ 不赋初值
+
+// 在线程入口处手动初始化
+_counter = 10;
+</code></pre>
+<p><code>[ThreadStatic]</code> 还有另一个限制：<strong>只能用在静态字段上</strong>，不能用于属性、局部变量、实例字段。</p>
+<hr>
+<h2 id="-threadlocaltthreadstatic-的进化版">📦 ThreadLocal&lt;T&gt;：[ThreadStatic] 的进化版</h2>
+<p>.NET 4.0 带来了 <code>ThreadLocal&lt;T&gt;</code>，把上面那个"初始化陷阱"彻底解决了，同时增加了更多实用特性。</p>
+<h3 id="基本用法工厂函数初始化">基本用法：工厂函数初始化</h3>
+<pre><code class="language-csharp">// ✅ 通过工厂函数初始化，每个线程第一次访问 .Value 时执行一次
+private static readonly ThreadLocal&lt;StringBuilder&gt; _sb =
+	new(() =&gt; new StringBuilder());
+</code></pre>
+<p>工厂函数是懒加载的——<strong>第一次访问 <code>.Value</code> 才执行</strong>，并且每个线程的工厂函数调用是相互独立的。</p>
+<pre><code class="language-csharp">var threads = Enumerable.Range(1, 3).Select(i =&gt; new Thread(() =&gt;
+{
+	// 每个线程都有自己独立的 StringBuilder 实例
+	_sb.Value!.Append($"来自线程{Thread.CurrentThread.ManagedThreadId}的消息");
+	Console.WriteLine(_sb.Value);
+})).ToList();
+
+threads.ForEach(t =&gt; t.Start());
+threads.ForEach(t =&gt; t.Join());
+
+// 记得释放！
+_sb.Dispose();
+</code></pre>
+<h3 id="threadlocalt-对比-threadstatic">ThreadLocal&lt;T&gt; 对比 [ThreadStatic]</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th><code>[ThreadStatic]</code></th>
+<th><code>ThreadLocal&lt;T&gt;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>初始化方式</td>
+<td>只有主线程执行静态初始化</td>
+<td>✅ 每线程独立的工厂函数</td>
+</tr>
+<tr>
+<td>适用范围</td>
+<td>只能用于静态字段</td>
+<td>可以是任意成员</td>
+</tr>
+<tr>
+<td>追踪所有线程的值</td>
+<td>❌ 不支持</td>
+<td>✅ <code>trackAllValues: true</code></td>
+</tr>
+<tr>
+<td>实现 IDisposable</td>
+<td>❌</td>
+<td>✅ 需要手动 Dispose</td>
+</tr>
+<tr>
+<td>延迟初始化</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="trackallvalues追踪所有线程的值">trackAllValues：追踪所有线程的值</h3>
+<p>这是一个低调但好用的特性，适合"无锁多线程统计"的场景：</p>
+<pre><code class="language-csharp">// trackAllValues: true —— 可以通过 .Values 拿到所有线程的值快照
+using var perThreadCount = new ThreadLocal&lt;int&gt;(
+	valueFactory: () =&gt; 0,
+	trackAllValues: true);
+
+var threads = Enumerable.Range(1, 5).Select(i =&gt; new Thread(() =&gt;
+{
+	perThreadCount.Value = i * 10;  // 每个线程自己计数
+})).ToList();
+
+threads.ForEach(t =&gt; t.Start());
+threads.ForEach(t =&gt; t.Join());
+
+// 汇总所有线程的计数，无需任何锁！
+var total = perThreadCount.Values.Sum();
+Console.WriteLine($"总计：{total}");
+</code></pre>
+<p>这比用 <code>lock</code> 保护的全局计数器效率高很多，因为各线程写入时完全无竞争，只有最后汇总时才需要一次聚合。</p>
+<hr>
+<h2 id="️-threadlocal-在线程池中的复用陷阱">⚠️ ThreadLocal 在线程池中的"复用陷阱"</h2>
+<p>这是一个很多人踩过的坑，务必记清楚。</p>
+<p>线程池里的线程是<strong>复用</strong>的——任务完成后线程不会销毁，而是回到池子里等下一个任务。如果你在 <code>Task.Run</code> 里设置了 <code>ThreadLocal</code> 却忘记清理，下一个跑在同一个线程上的任务就会<strong>读到脏数据</strong>：</p>
+<pre><code class="language-csharp">private static readonly ThreadLocal&lt;string?&gt; _requestContext = new(() =&gt; null);
+
+// ❌ 危险写法
+var task1 = Task.Run(() =&gt;
+{
+	_requestContext.Value = "RequestId=AAA";
+	// ... 处理完，但忘了清理
+});
+await task1;
+
+// 如果 task2 分到同一个线程，会读到 "RequestId=AAA"！
+var task2 = Task.Run(() =&gt;
+{
+	Console.WriteLine(_requestContext.Value);  // 可能是 "RequestId=AAA"，数据污染！
+});
+await task2;
+</code></pre>
+<p><strong>正确做法</strong>：<code>try/finally</code> 保证清理：</p>
+<pre><code class="language-csharp">// ✅ 正确写法
+var task = Task.Run(() =&gt;
+{
+	try
+	{
+		_requestContext.Value = "RequestId=BBB";
+		// 处理业务逻辑
+	}
+	finally
+	{
+		_requestContext.Value = null;  // ✅ 无论异常与否，都清理
+	}
+});
+</code></pre>
+<blockquote>
+<p>💬 说真的，这个坑让很多人调试了好几个小时才找到原因——线程池里的线程数量有限，一旦触发复用，问题就很难复现。<strong>只要在 Task.Run 里用了 ThreadLocal，就要养成写 try/finally 的习惯。</strong></p>
+</blockquote>
+<hr>
+<h2 id="-threadlocal-实战线程安全的-random">🎯 ThreadLocal 实战：线程安全的 Random</h2>
+<p>这是 <code>ThreadLocal&lt;T&gt;</code> 最经典的使用场景之一。<code>System.Random</code> 不是线程安全的，在老版本 .NET 中多线程共享一个 <code>Random</code> 会导致它内部状态损坏，所有后续调用只返回 <code>0</code>（经典 bug）。</p>
+<pre><code class="language-csharp">// ✅ 每线程一个 Random 实例，完全无竞争
+private static readonly ThreadLocal&lt;Random&gt; _random =
+	new(() =&gt; new Random(Thread.CurrentThread.ManagedThreadId * 31 + Environment.TickCount));
+
+// 在任意线程中安全使用
+var value = _random.Value!.Next(1, 100);
+</code></pre>
+<blockquote>
+<p>📝 <strong>.NET 6+ 注意</strong>：<code>Random.Shared</code> 已经是官方线程安全实现，新项目直接用 <code>Random.Shared</code> 就行，不需要 <code>ThreadLocal&lt;Random&gt;</code> 了。但理解这个模式对于维护老代码非常重要。</p>
+</blockquote>
+<hr>
+<h2 id="-asynclocalt异步世界里的上下文传播">🌊 AsyncLocal&lt;T&gt;：异步世界里的"上下文传播"</h2>
+<p>好，现在我们进入今天的重头戏——<code>AsyncLocal&lt;T&gt;</code>。</p>
+<p>如果说 <code>ThreadLocal&lt;T&gt;</code> 是"跟踪线程"，那么 <code>AsyncLocal&lt;T&gt;</code> 是<strong>跟踪逻辑执行流（异步调用链）</strong>。</p>
+<p>先看一个问题：在 <code>async</code> 方法里设置了 <code>ThreadLocal</code> 值，<code>await</code> 之后还在吗？</p>
+<pre><code class="language-csharp">private static readonly ThreadLocal&lt;string?&gt; _tl = new(() =&gt; null);
+
+async Task TestAsync()
+{
+	_tl.Value = "hello";
+	Console.WriteLine(_tl.Value);  // "hello"  ✅
+
+	await Task.Delay(100);  // await 可能切换到另一个线程！
+
+	Console.WriteLine(_tl.Value);  // 可能是 null  ❌
+}
+</code></pre>
+<p><code>await</code> 之后，运行时可能把你调度到<strong>另一个线程</strong>上继续执行，而那个线程的 <code>ThreadLocal</code> 副本是空的——值就"找不到"了。</p>
+<p><code>AsyncLocal&lt;T&gt;</code> 就是来解决这个问题的：</p>
+<pre><code class="language-csharp">private static readonly AsyncLocal&lt;string?&gt; _al = new();
+
+async Task TestAsync()
+{
+	_al.Value = "hello";
+
+	await Task.Delay(100);  // 无论切没切线程
+
+	Console.WriteLine(_al.Value);  // ✅ 依然是 "hello"
+}
+</code></pre>
+<hr>
+<h2 id="-深入原理executioncontext-是如何工作的">🔬 深入原理：ExecutionContext 是如何工作的？</h2>
+<p>要真正理解 <code>AsyncLocal&lt;T&gt;</code>，必须先搞清楚 <strong><code>ExecutionContext</code></strong> ——这才是幕后的真正主角。</p>
+<h3 id="executioncontext-是什么">ExecutionContext 是什么？</h3>
+<p><code>ExecutionContext</code> 是 .NET 运行时用来<strong>传递"执行环境"的容器</strong>，你可以把它想象成一个随着异步调用链自动流动的"背包"：线程切换了、<code>await</code> 了、<code>Task.Run</code> 了，这个背包都会跟着走。</p>
+<p><code>AsyncLocal&lt;T&gt;</code> 的值，就存在这个背包里。</p>
+<h3 id="源码结构速览net-10">源码结构速览（.NET 10）</h3>
+<p>我们来看看 .NET 运行时的实际源码（<a href="https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Threading/ExecutionContext.cs" target="_blank" rel="noopener nofollow">coreclr/ExecutionContext.cs</a>）：</p>
+<pre><code class="language-csharp">// ExecutionContext 的核心字段（精简版）
+public sealed class ExecutionContext
+{
+	// AsyncLocal 的值就存在这个不可变映射里
+	// （是一个经过优化的不可变 AsyncLocal 键值对映射）
+	internal IAsyncLocalValueMap? m_localValues;
+
+	// 快照复制（这是"写时复制"的关键）
+	internal static ExecutionContext ShallowClone(ExecutionContext? ec)
+	{
+		return new ExecutionContext
+		{
+			m_localValues = ec?.m_localValues  // 直接共享同一个 map 引用（浅拷贝！）
+		};
+	}
+}
+</code></pre>
+<p>再看 <code>AsyncLocal&lt;T&gt;.Value</code> 的 set 实现：</p>
+<pre><code class="language-csharp">// AsyncLocal&lt;T&gt;.Value 的 setter（精简版）
+public T? Value
+{
+	set
+	{
+		// 1. 获取当前线程的 ExecutionContext
+		var current = Thread.CurrentThread._executionContext;
+
+		// 2. 用新值创建一个新的 IAsyncLocalValueMap（不可变结构，写入 = 生成新副本）
+		var newValues = AsyncLocalValueMap.Create(this, value, current?.m_localValues);
+
+		// 3. 把新的 map 包装成一个新的 ExecutionContext，赋给当前线程
+		//    ⚠️ 注意：这是一个全新的 ExecutionContext 对象，不是修改原来那个！
+		Thread.CurrentThread._executionContext = new ExecutionContext { m_localValues = newValues };
+
+		// 4. 如果注册了值变更回调（ValueChanged），通知它
+		if (_valueChangedHandler != null)
+			_valueChangedHandler(new AsyncLocalValueChangedArgs&lt;T&gt;(...));
+	}
+}
+</code></pre>
+<p>这几行代码揭示了最核心的机制：<strong>每次给 <code>AsyncLocal&lt;T&gt;.Value</code> 赋值，都会生成一个全新的 <code>ExecutionContext</code> 对象</strong>，老的那个完全不受影响。这就是"写时复制"的本质。</p>
+<h3 id="await-时发生了什么">await 时发生了什么？</h3>
+<p>每次 <code>await</code> 一个 Task，编译器生成的状态机会这样处理（简化版）：</p>
+<pre><code class="language-csharp">// 编译器生成的状态机（概念代码）
+void MoveNext()
+{
+	// ... 进入 await 点 ...
+
+	// 捕获当前 ExecutionContext 的快照
+	var capturedContext = ExecutionContext.Capture();
+
+	// 把"恢复执行"这个动作（continuation）包装好，连同 ExecutionContext 一起投递给线程池
+	ThreadPool.QueueUserWorkItem(state =&gt;
+	{
+		// 线程池线程上：用捕获的 ExecutionContext 恢复执行
+		ExecutionContext.Run(capturedContext, s =&gt; continuation(s), state);
+	}, null);
+}
+</code></pre>
+<p><code>ExecutionContext.Capture()</code> 拿到的是当前上下文的<strong>快照</strong>（浅拷贝），<code>ExecutionContext.Run()</code> 则在指定上下文下执行 continuation。<strong>整个过程 AsyncLocal 的值都随着这个快照流转，不依赖具体是哪个线程。</strong></p>
+<hr>
+<h2 id="-核心规则图解向下继承--向上隔离--写时复制">🎯 核心规则图解：向下继承 · 向上隔离 · 写时复制</h2>
+<p>这三条规则是 <code>AsyncLocal&lt;T&gt;</code> 的灵魂，搞清楚了就彻底掌握了它。</p>
+<h3 id="规则一向下继承downward-propagation">规则一：向下继承（Downward Propagation）</h3>
+<blockquote>
+<p>父级设置的值，子级（子方法、子 Task）默认可以读到。</p>
+</blockquote>
+<div class="mermaid">flowchart TD
+	Root["Root&lt;br/&gt;TraceId = 'REQ-001'"]
+	ChildA["ChildA 进入&lt;br/&gt;读到 TraceId = 'REQ-001' ✅"]
+	ChildB["ChildB 进入&lt;br/&gt;读到 TraceId = 'REQ-001' ✅"]
+
+	Root --&gt;|"await / Task.Run&lt;br/&gt;EC 快照传递（浅拷贝）"| ChildA
+	Root --&gt;|"await / Task.Run&lt;br/&gt;EC 快照传递（浅拷贝）"| ChildB
+
+	style Root fill:#bbdefb,color:#1565c0,stroke:#1976d2,stroke-width:2px
+	style ChildA fill:#c8e6c9,color:#2e7d32,stroke:#388e3c,stroke-width:2px
+	style ChildB fill:#c8e6c9,color:#2e7d32,stroke:#388e3c,stroke-width:2px
+</div><p>原理：<code>await ChildAsync()</code> / <code>Task.Run(...)</code> 时，运行时将当前 <code>ExecutionContext</code> <strong>快照</strong>传递给子执行流。子流一开始和父流指向同一个 <code>m_localValues</code>（浅拷贝，高效）。</p>
+<h3 id="规则二向上隔离upward-isolation">规则二：向上隔离（Upward Isolation）</h3>
+<blockquote>
+<p>子级对 AsyncLocal 的修改，不会影响父级。</p>
+</blockquote>
+<div class="mermaid">flowchart TD
+	Root["Root&lt;br/&gt;TraceId = 'REQ-001'"]
+	ChildA["ChildA&lt;br/&gt;将 TraceId 改为 'CHILD-A'&lt;br/&gt;（创建新 ExecutionContext）"]
+	RootAfter["Root await 返回后&lt;br/&gt;TraceId 仍然是 'REQ-001' ✅"]
+
+	Root --&gt;|"await ChildA()&lt;br/&gt;EC 快照传递"| ChildA
+	ChildA --&gt;|"return（子 EC 消亡）&lt;br/&gt;父 EC 从未被修改"| RootAfter
+
+	style Root fill:#bbdefb,color:#1565c0,stroke:#1976d2,stroke-width:2px
+	style ChildA fill:#ffccbc,color:#d84315,stroke:#e64a19,stroke-width:2px
+	style RootAfter fill:#c8e6c9,color:#2e7d32,stroke:#388e3c,stroke-width:2px
+</div><p>原理：子流修改 <code>AsyncLocal.Value</code> 时，会生成一个<strong>全新的 <code>ExecutionContext</code></strong> 赋给当前线程。父流的那个 <code>ExecutionContext</code> 实例始终没有被碰过。</p>
+<h3 id="规则三写时复制copy-on-write">规则三：写时复制（Copy-on-Write）</h3>
+<blockquote>
+<p>修改触发"副本创建"，父子之间共享直到其中一方写入。</p>
+</blockquote>
+<p><strong>初始状态</strong>——子流继承父流快照，双方共享同一个 <code>m_localValues</code> 引用（零拷贝开销）：</p>
+<div class="mermaid">flowchart LR
+	Root(["Root 流"])
+	ChildA1(["ChildA 流"])
+
+	subgraph EC0["EC — 父子共享"]
+		mv0["m_localValues&lt;br/&gt;TraceId = 'REQ-001'"]
+	end
+
+	Root --&gt; mv0
+	ChildA1 --&gt; mv0
+
+	style Root fill:#bbdefb,color:#1565c0,stroke:#1976d2,stroke-width:2px
+	style ChildA1 fill:#bbdefb,color:#1565c0,stroke:#1976d2,stroke-width:2px
+	style mv0 fill:#fff9c4,color:#f57f17,stroke:#f9a825,stroke-width:2px
+	style EC0 fill:#e1bee7,color:#6a1b9a,stroke:#7b1fa2,stroke-width:2px
+</div><p><strong>ChildA 执行 <code>_traceId.Value = "CHILD-A"</code></strong>——写时复制，创建全新 EC，父流 EC 完全不受影响：</p>
+<div class="mermaid">flowchart LR
+	RootFlow(["Root 流"])
+	ChildFlow(["ChildA 流"])
+
+	subgraph ECRoot["EC-Root — 未修改"]
+		mvRoot["m_localValues&lt;br/&gt;TraceId = 'REQ-001'"]
+	end
+
+	subgraph ECChild["EC-ChildA — 新创建"]
+		mvChild["m_localValues&lt;br/&gt;TraceId = 'CHILD-A'"]
+	end
+
+	RootFlow --&gt; mvRoot
+	ChildFlow --&gt; mvChild
+
+	style RootFlow fill:#bbdefb,color:#1565c0,stroke:#1976d2,stroke-width:2px
+	style ChildFlow fill:#ffccbc,color:#d84315,stroke:#e64a19,stroke-width:2px
+	style mvRoot fill:#c8e6c9,color:#2e7d32,stroke:#388e3c,stroke-width:2px
+	style mvChild fill:#ffccbc,color:#d84315,stroke:#e64a19,stroke-width:2px
+	style ECRoot fill:#bbdefb,color:#1565c0,stroke:#1976d2,stroke-width:2px
+	style ECChild fill:#ffccbc,color:#d84315,stroke:#e64a19,stroke-width:2px
+</div><p><code>IAsyncLocalValueMap</code> 是一个<strong>不可变（immutable）的键值映射</strong>，每次写入都会生成新的映射实例，旧的映射不变。这就是为什么父流永远看不到子流的修改。</p>
+<h3 id="完整时序图">完整时序图</h3>
+<div class="mermaid">sequenceDiagram
+	participant Root as 🔵 Root
+	participant ChildA as 🟠 ChildA
+	participant ChildB as 🟢 ChildB
+
+	Root-&gt;&gt;Root: _ctx.Value = "REQ"&lt;br/&gt;（EC: TraceId="REQ"）
+	Root-&gt;&gt;ChildA: await ChildA()&lt;br/&gt;传递 EC 快照（TraceId="REQ"）
+
+	ChildA-&gt;&gt;ChildA: 读 TraceId = "REQ" ✅（向下继承）
+	ChildA-&gt;&gt;ChildA: _ctx.Value = "CHILD"&lt;br/&gt;（创建新 EC，TraceId="CHILD"）
+	ChildA-&gt;&gt;ChildB: await ChildB()&lt;br/&gt;传递 EC 快照（TraceId="CHILD"）
+
+	ChildB-&gt;&gt;ChildB: 读 TraceId = "CHILD" ✅（继承自 ChildA）
+	Note over ChildB: await Task.Delay → 可能切换线程
+	ChildB-&gt;&gt;ChildB: 切换后读 TraceId = "CHILD" ✅&lt;br/&gt;（EC 随 continuation 流转，与线程无关）
+	ChildB--&gt;&gt;ChildA: return
+
+	ChildA--&gt;&gt;Root: return（ChildA 的新 EC 随栈帧消亡）
+
+	Root-&gt;&gt;Root: 读 TraceId = "REQ" ✅（向上隔离）&lt;br/&gt;Root 的 EC 从未被修改
+</div><hr>
+<h2 id="-用代码验证三条规则">📝 用代码验证三条规则</h2>
+<pre><code class="language-csharp">private static readonly AsyncLocal&lt;string?&gt; _ctx = new();
+
+async Task VerifyRulesAsync()
+{
+	// ── 规则1：向下继承 ──────────────────────────────────
+	_ctx.Value = "Root";
+
+	await Task.Run(async () =&gt;
+	{
+		Console.WriteLine(_ctx.Value); // "Root" ✅ 子任务继承了父级的值
+		await Task.Delay(1);
+		Console.WriteLine(_ctx.Value); // "Root" ✅ await 后依然保持
+	});
+
+	// ── 规则2：向上隔离 ──────────────────────────────────
+	await ModifyInChildAsync();
+	Console.WriteLine(_ctx.Value); // "Root" ✅ 子方法修改不影响父级
+
+	// ── 规则3：写时复制（两个并发分支互不干扰）──────────
+	var t1 = ProcessAsync("Branch1", "B1");
+	var t2 = ProcessAsync("Branch2", "B2");
+	await Task.WhenAll(t1, t2);
+	Console.WriteLine(_ctx.Value); // "Root" ✅ 并发分支的修改都不影响主流
+}
+
+async Task ModifyInChildAsync()
+{
+	Console.WriteLine(_ctx.Value); // "Root" ✅ 可以读到父级的值
+	_ctx.Value = "Child";          // 写时复制，创建新 EC
+	Console.WriteLine(_ctx.Value); // "Child" ✅
+	await Task.Delay(1);
+	Console.WriteLine(_ctx.Value); // "Child" ✅ await 后自己的副本还在
+}   // 方法返回后，这个新 EC 随着栈帧消亡，父级的 EC 完全不受影响
+
+async Task ProcessAsync(string name, string value)
+{
+	_ctx.Value = value;            // 每个分支都有自己独立的 EC 副本
+	await Task.Delay(10);
+	Console.WriteLine($"[{name}] {_ctx.Value}"); // 各自正确，互不干扰
+}
+</code></pre>
+<hr>
+<h2 id="-历史-bugnet-6-之前值类型的陷阱">🐛 历史 Bug：.NET 6 之前值类型的陷阱</h2>
+<p>这是一个鲜少被提及但很真实的历史问题，如果你维护老项目，务必了解。</p>
+<p>在 <strong>.NET 6 之前</strong>，<code>AsyncLocal&lt;T&gt;</code> 在存储<strong>值类型（struct）</strong> 时存在一个隐蔽的问题：由于 <code>IAsyncLocalValueMap</code> 的实现方式，值类型会被装箱（Boxing）存储。这本身不是 bug，但有一个棘手的副作用：</p>
+<p><strong>问题复现（.NET Framework / .NET 5 及以下）</strong>：</p>
+<pre><code class="language-csharp">// 假设 T 是值类型 int
+var al = new AsyncLocal&lt;int&gt;();
+al.Value = 42;
+
+await Task.Run(() =&gt;
+{
+	// 在某些旧版本运行时中，如果没有赋值（只是读），
+	// 对 ExecutionContext 的其他修改（比如设置了另一个 AsyncLocal）
+	// 可能触发 EC 重建，导致值类型副本的引用断开，
+	// 下次读取时拿到的是默认值 0 而不是 42
+	// （具体触发条件依赖运行时版本和 EC 的内部实现细节）
+	Console.WriteLine(al.Value); // 在受影响版本上：0（而不是 42）
+});
+</code></pre>
+<p><strong>根本原因</strong>：旧版 <code>IAsyncLocalValueMap</code> 在某些 slot 优化路径上，对值类型的处理与引用类型不一致，导致在 EC 快照复制时，值类型的 box 实例没有被正确传递。</p>
+<p><strong>解决方案（.NET 6 之前的防御性写法）</strong>：</p>
+<pre><code class="language-csharp">// ✅ 把值类型包装成引用类型（class），彻底避免问题
+private static readonly AsyncLocal&lt;IntWrapper?&gt; _count = new();
+
+class IntWrapper { public int Value { get; set; } }
+
+// 最保险：用 string 传数字，完全避开结构体装箱问题
+private static readonly AsyncLocal&lt;string?&gt; _countStr = new();
+</code></pre>
+<p><strong>.NET 6 的修复</strong>：.NET 6 对 <code>ExecutionContext</code> 和 <code>IAsyncLocalValueMap</code> 的内部实现做了彻底重构，引入了新的 <code>AsyncLocalValueMap</code> 实现，正确处理了值类型的存储和传递。<strong>从 .NET 6 起，<code>AsyncLocal&lt;int&gt;</code>、<code>AsyncLocal&lt;bool&gt;</code> 等值类型用法是完全安全的。</strong></p>
+<blockquote>
+<p>💡 项目用的是 .NET 10，这个 bug 不存在。但如果你接手 .NET 5 或更早的老项目，看到有人把 <code>AsyncLocal&lt;int&gt;</code> 包装成 <code>AsyncLocal&lt;MyClass&gt;</code> 时，现在你知道原因了。</p>
+</blockquote>
+<hr>
+<h2 id="-实战一用-asynclocal-实现生产级-traceid-追踪">🏢 实战一：用 AsyncLocal 实现生产级 TraceId 追踪</h2>
+<p>下面是完整的生产级实现（代码见 <code>AsyncLocalDemo</code> 项目）。</p>
+<h3 id="架构设计">架构设计</h3>
+<div class="mermaid">flowchart TD
+    Request(["HTTP 请求&lt;br/&gt;（可携带 X-Trace-Id 请求头）"])
+
+    subgraph MW["ASP.NET Core 中间件管道"]
+        direction TB
+        TM["TraceMiddleware&lt;br/&gt;① 读取 / 生成 TraceId&lt;br/&gt;② TraceContext.Initialize → 写入 AsyncLocal&lt;br/&gt;③ 响应头写回 X-Trace-Id"]
+        Auth["UseAuthentication&lt;br/&gt;JWT 验证 → 填充 HttpContext.User"]
+        CUM["CurrentUserMiddleware&lt;br/&gt;从 Claims 解析用户信息&lt;br/&gt;CurrentUser.Set → 写入 AsyncLocal"]
+        AuthZ["UseAuthorization"]
+    end
+
+    subgraph BIZ["业务层（任意层直接读取 AsyncLocal，无需注入）"]
+        direction TB
+        Ctrl["Controller&lt;br/&gt;TraceContext.TraceId / CurrentUser.UserId"]
+        Svc["Service&lt;br/&gt;TraceContext.TraceId / CurrentUser.UserId"]
+        Repo["Repository&lt;br/&gt;TraceContext.TraceId"]
+    end
+
+    Finally["TraceMiddleware finally 块&lt;br/&gt;记录请求总耗时日志"]
+
+    Request --&gt; TM
+    TM --&gt; Auth
+    Auth --&gt; CUM
+    CUM --&gt; AuthZ
+    AuthZ --&gt; Ctrl
+    Ctrl --&gt; Svc
+    Svc --&gt; Repo
+    Repo --&gt; Finally
+
+    style Request fill:#bbdefb,color:#1565c0,stroke:#1976d2,stroke-width:2px
+    style TM fill:#e1bee7,color:#6a1b9a,stroke:#7b1fa2,stroke-width:2px
+    style Auth fill:#fff9c4,color:#f57f17,stroke:#f9a825,stroke-width:2px
+    style CUM fill:#fff9c4,color:#f57f17,stroke:#f9a825,stroke-width:2px
+    style AuthZ fill:#fff9c4,color:#f57f17,stroke:#f9a825,stroke-width:2px
+    style Ctrl fill:#c8e6c9,color:#2e7d32,stroke:#388e3c,stroke-width:2px
+    style Svc fill:#c8e6c9,color:#2e7d32,stroke:#388e3c,stroke-width:2px
+    style Repo fill:#c8e6c9,color:#2e7d32,stroke:#388e3c,stroke-width:2px
+    style Finally fill:#ffccbc,color:#d84315,stroke:#e64a19,stroke-width:2px
+    style MW fill:#f3e5f5,color:#6a1b9a,stroke:#7b1fa2,stroke-width:1px
+    style BIZ fill:#e8f5e9,color:#2e7d32,stroke:#388e3c,stroke-width:1px
+</div><h3 id="tracecontext-静态类">TraceContext 静态类</h3>
+<pre><code class="language-csharp">public static class TraceContext
+{
+	// 使用 AsyncLocal&lt;string?&gt; 存储 TraceId
+	private static readonly AsyncLocal&lt;string?&gt; _traceId = new();
+	private static readonly AsyncLocal&lt;DateTime&gt; _requestStartTime = new();
+
+	public static string TraceId =&gt; _traceId.Value ?? "N/A";
+	public static DateTime RequestStartTime =&gt; _requestStartTime.Value;
+	public static double ElapsedMs =&gt; (DateTime.UtcNow - _requestStartTime.Value).TotalMilliseconds;
+
+	// internal：只允许 TraceMiddleware 写入，业务代码只读
+	internal static void Initialize(string? traceId = null)
+	{
+		_traceId.Value = traceId ?? Guid.NewGuid().ToString("N")[..16].ToUpper();
+		_requestStartTime.Value = DateTime.UtcNow;
+	}
+}
+</code></pre>
+<h3 id="tracemiddleware">TraceMiddleware</h3>
+<pre><code class="language-csharp">public sealed class TraceMiddleware(RequestDelegate next, ILogger&lt;TraceMiddleware&gt; logger)
+{
+	private const string TraceIdHeader = "X-Trace-Id";
+
+	public async Task InvokeAsync(HttpContext context)
+	{
+		// 1. 从请求头读取（支持链路追踪透传），否则自动生成
+		var incomingTraceId = context.Request.Headers[TraceIdHeader].FirstOrDefault();
+		TraceContext.Initialize(incomingTraceId);
+
+		// 2. 响应头写回 TraceId
+		context.Response.OnStarting(() =&gt;
+		{
+			context.Response.Headers[TraceIdHeader] = TraceContext.TraceId;
+			return Task.CompletedTask;
+		});
+
+		// 3. ILogger Scope 让整个请求的所有日志自动携带 TraceId
+		using (logger.BeginScope(new Dictionary&lt;string, object&gt; { ["TraceId"] = TraceContext.TraceId }))
+		{
+			logger.LogInformation("请求开始 [{Method}] {Path}", context.Request.Method, context.Request.Path);
+			try
+			{
+				await next(context);
+			}
+			finally
+			{
+				logger.LogInformation(
+					"请求结束 StatusCode={StatusCode} Elapsed={Elapsed:F1}ms",
+					context.Response.StatusCode, TraceContext.ElapsedMs);
+			}
+		}
+	}
+}
+</code></pre>
+<h3 id="service-层零注入读取上下文">Service 层：零注入读取上下文</h3>
+<pre><code class="language-csharp">public sealed class OrderService(ILogger&lt;OrderService&gt; logger) : IOrderService
+{
+	public async Task&lt;IReadOnlyList&lt;OrderDto&gt;&gt; GetMyOrdersAsync(CancellationToken ct = default)
+	{
+		// ✅ 直接读取 AsyncLocal 上下文，无需 IHttpContextAccessor 注入
+		var userId = CurrentUser.UserId;
+		var traceId = TraceContext.TraceId;
+
+		logger.LogInformation("[{TraceId}] GetMyOrders: 查询用户 {UserId}", traceId, userId);
+
+		await Task.Delay(10, ct);  // 模拟数据库 I/O
+
+		// ✅ await 之后，TraceId 和 UserId 依然有效（ExecutionContext 流转保证）
+		logger.LogInformation("[{TraceId}] GetMyOrders 完成", TraceContext.TraceId);
+
+		return _db.Where(o =&gt; o.UserId == userId).ToList();
+	}
+}
+</code></pre>
+<h3 id="programcs-中间件注册顺序">Program.cs 中间件注册顺序</h3>
+<pre><code class="language-csharp">// ✅ 第一步：TraceMiddleware 放在最前端
+app.UseTracing();
+
+app.UseAuthentication();  // JWT 认证，填充 HttpContext.User
+
+// ✅ 第二步：CurrentUserMiddleware 必须在 UseAuthentication 之后
+app.UseCurrentUser();
+
+app.UseAuthorization();
+app.MapControllers();
+</code></pre>
+<hr>
+<h2 id="-实战二用-asynclocal-实现-currentuser彻底告别-ihttpcontextaccessor">🧑‍💼 实战二：用 AsyncLocal 实现 CurrentUser，彻底告别 IHttpContextAccessor</h2>
+<p>这是我觉得 <code>AsyncLocal&lt;T&gt;</code> 最能体现价值的实战场景，解决的是一个让无数团队头疼的工程痛点。</p>
+<h3 id="原来的做法有什么问题">原来的做法有什么问题？</h3>
+<pre><code class="language-csharp">// ❌ 传统写法：每个 Service 都注入 IHttpContextAccessor
+
+// ServiceBase 基类
+public abstract class ServiceBase
+{
+	protected readonly IHttpContextAccessor _httpContextAccessor;
+	protected ServiceBase(IHttpContextAccessor httpContextAccessor)
+		=&gt; _httpContextAccessor = httpContextAccessor;
+
+	protected string? CurrentUserId =&gt;
+		_httpContextAccessor.HttpContext?.User?.FindFirstValue(ClaimTypes.NameIdentifier);
+}
+
+// 每个具体 Service 都得写这个构造函数
+public class OrderService : ServiceBase
+{
+	public OrderService(IHttpContextAccessor httpContextAccessor,
+						IRepository&lt;Order&gt; repo,
+						ILogger&lt;OrderService&gt; logger)
+		: base(httpContextAccessor) { ... }
+}
+
+public class ProductService : ServiceBase
+{
+	public ProductService(IHttpContextAccessor httpContextAccessor,
+						  IRepository&lt;Product&gt; repo)
+		: base(httpContextAccessor) { ... }
+}
+
+// ... 几十个 Service，每个都要这样写
+</code></pre>
+<p>这有几个问题：</p>
+<ol>
+<li><strong>每个 Service 都要多一个无聊的构造函数参数</strong>，纯粹是样板代码</li>
+<li><strong>Service 层被迫依赖 HTTP 基础设施</strong>（<code>IHttpContextAccessor</code> 本质是对 <code>HttpContext</code> 的封装），破坏了分层架构的纯净性</li>
+<li><strong>单元测试麻烦</strong>：测试时需要 Mock <code>IHttpContextAccessor</code>，配置繁琐</li>
+</ol>
+<h3 id="用-asynclocal-的新方案">用 AsyncLocal 的新方案</h3>
+<pre><code class="language-csharp">// ✅ 新方案：CurrentUser 全局静态上下文
+public static class CurrentUser
+{
+	private static readonly AsyncLocal&lt;UserInfo?&gt; _userInfo = new();
+
+	public static UserInfo? Info    =&gt; _userInfo.Value;
+	public static string?  UserId  =&gt; _userInfo.Value?.UserId;
+	public static string   UserName =&gt; _userInfo.Value?.UserName ?? "Anonymous";
+	public static bool     IsAuthenticated =&gt; _userInfo.Value?.IsAuthenticated == true;
+	public static bool     IsInRole(string role) =&gt; _userInfo.Value?.IsInRole(role) == true;
+
+	// 仅供 CurrentUserMiddleware 调用
+	internal static void Set(ClaimsPrincipal? principal) { ... }
+
+	// 仅供单元测试使用
+	public static void SetForTesting(UserInfo? userInfo) =&gt; _userInfo.Value = userInfo;
+}
+</code></pre>
+<pre><code class="language-csharp">// CurrentUserMiddleware：认证完成后，从 Claims 填充 CurrentUser
+public sealed class CurrentUserMiddleware(RequestDelegate next)
+{
+	public async Task InvokeAsync(HttpContext context)
+	{
+		// UseAuthentication 已经运行完毕，HttpContext.User 已填充
+		CurrentUser.Set(context.User);
+		await next(context);
+	}
+}
+</code></pre>
+<pre><code class="language-csharp">// ✅ 新的 Service：构造函数干净了！
+public class OrderService(ILogger&lt;OrderService&gt; logger) : IOrderService
+{
+	public async Task&lt;OrderDto&gt; CreateOrderAsync(string productName, decimal amount)
+	{
+		// 直接读取，零注入
+		var userId = CurrentUser.UserId ?? throw new UnauthorizedAccessException();
+		var userName = CurrentUser.UserName;
+		// ...
+	}
+}
+
+public class ProductService(IRepository&lt;Product&gt; repo) : IProductService
+{
+	// 同样干净，不需要注入 IHttpContextAccessor
+}
+</code></pre>
+<h3 id="为什么这样是线程安全的">为什么这样是线程安全的？</h3>
+<p>有人可能会担心：<code>CurrentUser</code> 是静态类，多个并发请求会不会互相串号？</p>
+<p><strong>不会。</strong><code>AsyncLocal&lt;T&gt;</code> 的写时复制语义保证了每个请求有独立的 <code>ExecutionContext</code>：</p>
+<div class="mermaid">sequenceDiagram
+	participant MW1 as 🔵 Middleware（请求1·Alice）
+	participant MW2 as 🟠 Middleware（请求2·Bob）
+	participant Svc1 as 🔵 OrderService（请求1）
+	participant Svc2 as 🟠 OrderService（请求2）
+
+	Note over MW1,MW2: 两个请求并发进入，各自拥有独立的 ExecutionContext
+
+	MW1-&gt;&gt;MW1: CurrentUser.Set(Alice)&lt;br/&gt;写入 AsyncLocal → 创建新 EC1&lt;br/&gt;（仅影响请求1的执行流）
+	MW2-&gt;&gt;MW2: CurrentUser.Set(Bob)&lt;br/&gt;写入 AsyncLocal → 创建新 EC2&lt;br/&gt;（仅影响请求2的执行流）
+
+	MW1-&gt;&gt;Svc1: await（EC1 流转）
+	MW2-&gt;&gt;Svc2: await（EC2 流转）
+
+	Svc1-&gt;&gt;Svc1: CurrentUser.UserId = "alice-001" ✅
+	Svc2-&gt;&gt;Svc2: CurrentUser.UserId = "bob-002" ✅
+
+	Note over Svc1,Svc2: 两个请求完全隔离，不存在"Alice 读到 Bob 的 UserId"的情况
+</div><h3 id="单元测试怎么办">单元测试怎么办？</h3>
+<p>这也是新方案的一个优点：测试时直接调用 <code>SetForTesting</code>，不需要繁琐地 Mock <code>IHttpContextAccessor</code>：</p>
+<pre><code class="language-csharp">[Fact]
+public async Task CreateOrder_ShouldReturnOrder_WhenUserAuthenticated()
+{
+	// Arrange
+	CurrentUser.SetForTesting(new UserInfo
+	{
+		UserId = "test-user-001",
+		UserName = "TestUser",
+		Email = "test@example.com",
+		Roles = ["User"]
+	});
+
+	var service = new OrderService(Mock.Of&lt;ILogger&lt;OrderService&gt;&gt;());
+
+	// Act
+	var order = await service.CreateOrderAsync("MacBook Pro", 12999m);
+
+	// Assert
+	Assert.Equal("test-user-001", order.UserId);
+}
+</code></pre>
+<hr>
+<h2 id="️-使用-asynclocal-的注意事项">⚠️ 使用 AsyncLocal 的注意事项</h2>
+<h3 id="1-引用类型的浅拷贝陷阱">1. 引用类型的"浅拷贝"陷阱</h3>
+<p><code>AsyncLocal&lt;T&gt;</code> 的写时复制是<strong>对 <code>Value</code> 引用本身的复制</strong>，而不是对象的深拷贝！</p>
+<pre><code class="language-csharp">// ❌ 陷阱：T 是 List&lt;string&gt;（引用类型）
+var myList = new AsyncLocal&lt;List&lt;string&gt;&gt;();
+myList.Value = new List&lt;string&gt; { "初始值" };
+
+await Task.Run(() =&gt;
+{
+	// 子任务没有给 myList.Value 重新赋值——
+	// 子任务的 EC 和父任务的 EC 指向同一个 List 实例！
+	myList.Value!.Add("子任务的数据");  // ⚠️ 这修改的是父任务看到的那个 List！
+});
+
+Console.WriteLine(myList.Value!.Count);  // 2，父任务的 List 被改了！
+</code></pre>
+<p><strong>正确做法</strong>：子任务写入时重新赋值新实例（触发写时复制）：</p>
+<pre><code class="language-csharp">await Task.Run(() =&gt;
+{
+	// ✅ 重新赋值 → 触发写时复制 → 创建新 EC → 父任务的 EC 不受影响
+	myList.Value = new List&lt;string&gt;(myList.Value!) { "子任务的数据" };
+});
+</code></pre>
+<h3 id="2-valuechanged-回调">2. ValueChanged 回调</h3>
+<p><code>AsyncLocal&lt;T&gt;</code> 构造函数可以传入一个回调，在值被修改（包括 EC 流转时）时触发：</p>
+<pre><code class="language-csharp">var al = new AsyncLocal&lt;string?&gt;(change =&gt;
+{
+	Console.WriteLine($"值从 '{change.PreviousValue}' 变为 '{change.CurrentValue}'，" +
+					  $"是否因线程切换：{change.ThreadContextChanged}");
+});
+</code></pre>
+<p>这在调试 <code>AsyncLocal</code> 值的流转问题时非常有用。</p>
+<h3 id="3-抑制-executioncontext-流转">3. 抑制 ExecutionContext 流转</h3>
+<p>极少数情况下，你想创建一个"断开继承"的子任务（不继承任何 AsyncLocal 值）：</p>
+<pre><code class="language-csharp">using (ExecutionContext.SuppressFlow())
+{
+	// 这个 Task.Run 里读不到任何 AsyncLocal 的值
+	_ = Task.Run(() =&gt;
+	{
+		Console.WriteLine(TraceContext.TraceId);  // "N/A"，因为流被切断了
+	});
+}
+</code></pre>
+<p>99% 的业务代码不需要这个。主要用于后台任务，不希望它"意外继承"请求上下文而导致对象被意外保活（防止内存泄漏）。</p>
+<h3 id="4-性能开销要了解">4. 性能开销要了解</h3>
+<ul>
+<li><strong>读取</strong>（<code>.Value</code> get）：遍历 <code>IAsyncLocalValueMap</code>，O(1) 到 O(n)，n 是 AsyncLocal 实例数量。通常几个实例时可忽略不计。</li>
+<li><strong>写入</strong>（<code>.Value</code> set）：创建新 <code>ExecutionContext</code> 和新 <code>IAsyncLocalValueMap</code>，有分配开销。在热路径上（比如每毫秒数千次调用）需要注意，一般业务代码无需担心。</li>
+<li><strong>await</strong>：每次 <code>await</code> 触发 <code>ExecutionContext.Capture()</code>，有轻微开销。ASP.NET Core 内部有大量针对性优化。</li>
+</ul>
+<p><strong>最佳实践</strong>：<code>AsyncLocal</code> 实例数量保持在个位数；存储轻量数据（ID、枚举、标志位）而非大对象。</p>
+<hr>
+<h2 id="-内存泄漏threadlocal-未释放的代价">🔴 内存泄漏：ThreadLocal 未释放的代价</h2>
+<p><code>ThreadLocal&lt;T&gt;</code> 实现了 <code>IDisposable</code>，如果你忘记调用 <code>Dispose()</code>，会有内存泄漏风险。</p>
+<p>原因：<code>ThreadLocal&lt;T&gt;</code> 在内部维护了一张全局的 <code>WeakReference</code> 表，用来追踪所有活跃的 <code>ThreadLocal</code> 实例。如果不 <code>Dispose</code>，这个条目永远不会被清理，而每个线程为它分配的本地数据也就无法被 GC 回收。</p>
+<pre><code class="language-csharp">// ❌ 泄漏：static ThreadLocal 永远不 Dispose 是常见错误
+// （虽然对 static 字段来说进程退出时会清理，但在长寿进程里仍有问题）
+
+// ✅ 短生命周期的 ThreadLocal 要用 using
+using var tl = new ThreadLocal&lt;byte[]&gt;(() =&gt; new byte[1024]);
+// ... 用完自动 Dispose
+</code></pre>
+<p>对于 <code>static readonly ThreadLocal</code>，由于其生命周期跟随应用，通常问题不大；但如果你在某个方法/类内部创建了 <code>ThreadLocal</code> 实例，务必配合 <code>IDisposable</code> 模式释放。</p>
+<hr>
+<h2 id="-threadlocal-vs-asynclocal选哪个">📊 ThreadLocal vs AsyncLocal：选哪个？</h2>
+<p>这张表你可以收藏，以后拿出来对照选型：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th><code>ThreadLocal&lt;T&gt;</code></th>
+<th><code>AsyncLocal&lt;T&gt;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>绑定对象</strong></td>
+<td>线程（Thread）</td>
+<td>执行上下文（ExecutionContext）</td>
+</tr>
+<tr>
+<td><strong>await 后值保持</strong></td>
+<td>❌ 可能丢失（切线程了）</td>
+<td>✅ 始终保持</td>
+</tr>
+<tr>
+<td><strong>子任务可见</strong></td>
+<td>❌ 不可见</td>
+<td>✅ 可继承</td>
+</tr>
+<tr>
+<td><strong>子任务修改隔离</strong></td>
+<td>N/A</td>
+<td>✅ 写时复制，完全隔离</td>
+</tr>
+<tr>
+<td><strong>线程池复用问题</strong></td>
+<td>⚠️ 需手动清理</td>
+<td>✅ 自动隔离</td>
+</tr>
+<tr>
+<td><strong>适用场景</strong></td>
+<td>CPU 密集型多线程</td>
+<td>异步调用链上下文</td>
+</tr>
+<tr>
+<td><strong>典型用例</strong></td>
+<td>Random/StringBuilder 缓存、无锁计数器</td>
+<td>TraceId/UserId/TenantId</td>
+</tr>
+<tr>
+<td><strong>需要 Dispose</strong></td>
+<td>✅ 需要手动释放</td>
+<td>❌ 无需</td>
+</tr>
+<tr>
+<td><strong>性能</strong></td>
+<td>极高（直接内存寻址）</td>
+<td>略低（ExecutionContext 查找）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>一句话记住</strong>：</p>
+<blockquote>
+<ul>
+<li><strong>CPU 密集型、纯多线程、需要每线程独享实例</strong> → <code>ThreadLocal&lt;T&gt;</code></li>
+<li><strong>有 await 的异步代码、需要跨 await 传递上下文</strong> → <code>AsyncLocal&lt;T&gt;</code></li>
+</ul>
+</blockquote>
+<hr>
+<h2 id="-本章小结">🎓 本章小结</h2>
+<p>今天我们从古老的 <code>[ThreadStatic]</code> 出发，走过了 <code>ThreadLocal&lt;T&gt;</code> 的工厂初始化、<code>trackAllValues</code> 追踪、线程池复用陷阱，然后重点深入了 <code>AsyncLocal&lt;T&gt;</code> 的：</p>
+<ul>
+<li><strong>ExecutionContext 原理</strong>：每次 <code>await</code> 都会携带 EC 快照流转，值不依赖具体线程</li>
+<li><strong>源码级理解</strong>：<code>Value</code> set 每次创建新 <code>ExecutionContext</code>，<code>IAsyncLocalValueMap</code> 是不可变结构</li>
+<li><strong>三条核心规则</strong>：向下继承（浅拷贝快照传递）、向上隔离（父 EC 永不被子修改）、写时复制（改变时创建新副本）</li>
+<li><strong>历史 Bug</strong>：.NET 6 之前值类型存储问题，及防御性写法</li>
+<li><strong>生产实战一</strong>：TraceMiddleware + <code>TraceContext</code> 全链路请求追踪</li>
+<li><strong>生产实战二</strong>：<code>CurrentUser</code> 静态上下文，彻底告别 <code>IHttpContextAccessor</code> 注入模式</li>
+</ul>
+<p>几个关键结论：</p>
+<ol>
+<li><strong><code>[ThreadStatic]</code> 永远不要在声明时赋初值</strong>，子线程拿到的是默认值。</li>
+<li><strong><code>ThreadLocal&lt;T&gt;</code> 在 <code>Task.Run</code> 里用，必须 <code>try/finally</code> 清理</strong>，否则线程复用会带来脏数据。</li>
+<li><strong><code>AsyncLocal&lt;T&gt;</code> 的值存在 <code>ExecutionContext</code> 里</strong>，随异步调用链流转，与线程无关。</li>
+<li><strong>三条规则熟记</strong>：向下继承、向上隔离、写时复制——这三条决定了你用它时所有的行为。</li>
+<li><strong><code>.NET 6</code> 之前避免存值类型</strong>，.NET 6+ 完全没问题。</li>
+<li><strong><code>CurrentUser</code> 模式</strong>比 <code>IHttpContextAccessor</code> 注入更优雅，写时复制保证了并发请求的完全隔离。</li>
+</ol>
+<p>下一篇我们将进入《无锁编程与内存模型》，探索 <code>Interlocked</code>、<code>volatile</code>、CAS 这些不用锁就能实现线程安全的底层武器——期待与你继续！</p>
+<hr>
+<h2 id="-速查卡片">⚡ 速查卡片</h2>
+<pre><code>ThreadLocal&lt;T&gt;
+├── 访问：.Value
+├── 初始化：构造时传入工厂函数 () =&gt; new T()
+├── 追踪所有线程值：trackAllValues: true → .Values
+├── 必须 Dispose：using var tl = new ThreadLocal&lt;T&gt;(...);
+└── 线程池用法：try { ... } finally { tl.Value = null; }
+
+AsyncLocal&lt;T&gt;
+├── 访问：.Value（get/set）
+├── 传播方向：父 → 子（可见），子 → 父（隔离）
+├── 底层机制：ExecutionContext 流转（每次 await 自动复制快照）
+├── 引用类型陷阱：修改对象属性仍然共享，需要重新赋值新实例
+└── 不需要 Dispose
+
+选型口诀：
+  有 await → AsyncLocal
+  无 await，纯多线程 → ThreadLocal
+</code></pre>
+<hr>
+<h2 id="-参考资料">📚 参考资料</h2>
+<ul>
+<li><a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.threadlocal-1" target="_blank" rel="noopener nofollow">ThreadLocal&lt;T&gt; Class - Microsoft Docs</a></li>
+<li><a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.asynclocal-1" target="_blank" rel="noopener nofollow">AsyncLocal&lt;T&gt; Class - Microsoft Docs</a></li>
+<li><a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.executioncontext" target="_blank" rel="noopener nofollow">ExecutionContext - Microsoft Docs</a></li>
+<li><a href="https://devblogs.microsoft.com/pfxteam/executioncontext-vs-synchronizationcontext/" target="_blank" rel="noopener nofollow">ExecutionContext vs SynchronizationContext</a></li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-05-31 20:39">2026-05-31 20:39</span>&nbsp;
+<a href="https://www.cnblogs.com/diamondhusky">呆萌哈士奇</a>&nbsp;
+阅读(<span id="post_view_count">35</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20241817);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdiamondhusky%2Fp%2F20241817&amp;targetId=20241817&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
