@@ -1,0 +1,406 @@
+
+<table cellspacing="0" cellpadding="0"><tbody><tr><td class="t_f" id="postmessage_55373716">
+# Deadlock 游戏辅助源码分析与二次开发全记录<br>
+<br>
+## 一、前言<br>
+- 仅用于学习交流，勿用于非法用途<br>
+- Deadlock 是 Valve 基于 Source 2 引擎开发的 MOBA+射击游戏（Steam AppID: 1422450）。本文记录了对开源项目 Andromeda-DeadLock 的逆向分析、跨版本适配、源码修改与定制化开发的全过程，涵盖字节模式扫描、Schema 系统分析、ImGui 菜单汉化、自瞄骨骼数据生成、以及离线许可系统的设计与实现。<br>
+<br>
+## 二、项目架构分析<br>
+<br>
+### 2.1 整体结构<br>
+<br>
+```<br>
+Andromeda-DeadLock-Base/ (VS DLL项目)<br>
+├── DllMain.cpp&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;# DLL入口<br>
+├── DeadLock/<br>
+│&nbsp; &nbsp;├── Hook/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp; # 12个MinHook引擎钩子<br>
+│&nbsp; &nbsp;├── SDK/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;# 逆向的Source2 SDK封装<br>
+│&nbsp; &nbsp;│&nbsp; &nbsp;├── CFunctionList.hpp&nbsp; &nbsp;&nbsp; &nbsp;# 19个字节模式函数查找<br>
+│&nbsp; &nbsp;│&nbsp; &nbsp;├── CSchemaOffset.cpp&nbsp; &nbsp;&nbsp; &nbsp;# 运行时Schema字段偏移解析<br>
+│&nbsp; &nbsp;│&nbsp; &nbsp;└── Interface/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp; # 引擎接口封装<br>
+│&nbsp; &nbsp;└── Protobuf/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;# 94个预编译protobuf文件<br>
+├── AndromedaClient/<br>
+│&nbsp; &nbsp;├── Features/<br>
+│&nbsp; &nbsp;│&nbsp; &nbsp;├── CAimbot/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;# 自瞄 (轨迹预测/惯性/AntiFrog)<br>
+│&nbsp; &nbsp;│&nbsp; &nbsp;├── CVisual/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;# ESP (方框/骨骼/Chams/观战)<br>
+│&nbsp; &nbsp;│&nbsp; &nbsp;├── CMisc/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;# 自动格挡/换弹<br>
+│&nbsp; &nbsp;│&nbsp; &nbsp;└── CHeroes/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;# 英雄专属功能<br>
+│&nbsp; &nbsp;└── GUI/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;# ImGui渲染菜单<br>
+└── GameClient/&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;# 实体缓存/控制器封装<br>
+```<br>
+<br>
+### 2.2 Hook 链分析<br>
+<br>
+项目通过 MinHook 挂载了 12 个关键函数：<br>
+<br>
+| Hook 点 | 所在 DLL | 用途 |<br>
+|---|---|---|<br>
+| CreateMove | client.dll | 自瞄角度写入 |<br>
+| FireEventClientSide | client.dll | 游戏事件拦截 |<br>
+| OnAddEntity / OnRemoveEntity | client.dll | 实体缓存更新 |<br>
+| ParseMessage | engine2.dll | 网络消息解析（伤害事件） |<br>
+| OnClientOutput | engine2.dll | 客户端渲染回调 |<br>
+| GetMatricesForView | client.dll | 视图矩阵获取 |<br>
+| DrawModel | scenesystem.dll | Chams 模型上色 |<br>
+| Present / ResizeBuffers | GameOverlayRenderer64.dll | D3D11 渲染层注入 |<br>
+<br>
+### 2.3 Schema 系统<br>
+<br>
+这是项目最精巧的设计。Source 2 引擎提供了 `schemasystem.dll`，其中包含所有实体类的字段名→偏移映射。`CSchemaOffset.cpp` 在运行时遍历所有 TypeScope，动态读取 `CSchemaClassBinding` 结构的成员偏移，存入 `unordered_map&lt;string, unordered_map&lt;string, uint32_t&gt;&gt;`。<br>
+<br>
+这意味着游戏更新导致实体字段偏移变化时，**无需重新逆向**，运行时自动解析。<br>
+<br>
+### 2.4 字节模式系统<br>
+<br>
+对于非 Schema 暴露的函数（如 `CalcWorldSpaceBones`、`ScreenTransform`），项目通过 `CBasePattern` 在 DLL 加载时执行 AOB（Array of Bytes）扫描定位：<br>
+<br>
+```cpp<br>
+// 示例：通过函数头字节码定位<br>
+CBasePattern ScreenTransform = {<br>
+&nbsp; &nbsp; "ScreenTransform",<br>
+&nbsp; &nbsp; "33 C0 48 39 05 ? ? ? ? 0F 84", // 字节模式，?? 为通配符<br>
+&nbsp; &nbsp; CLIENT_DLL,<br>
+&nbsp; &nbsp; 0,<br>
+&nbsp; &nbsp; SEARCH_TYPE_NONE<br>
+};<br>
+```<br>
+<br>
+支持三种扫描类型：直接匹配、CALL指令追踪（`SEARCH_TYPE_CALL`）、LEA RIP相对寻址（`SEARCH_TYPE_PTR2`）。<br>
+<br>
+## 三、跨版本适配<br>
+<br>
+### 3.1 模式扫描器<br>
+拿到源码之后我想着能不能自己扫描进行适配，发现还真可以，使用AI进行批量文件扫描进行版本适配几乎可以无脑适配，但是适配之后骨骼和aimbot失效后续我也解决了！嘿嘿<br>
+<br>
+编写了 Python 脚本 `pattern_scan.py`，通过 Boyer-Moore 风格的通配符匹配算法，一次性扫描所有目标 DLL：<br>
+<br>
+```python<br>
+# 核心扫描逻辑<br>
+def scan(data, pat_bytes, mask):<br>
+&nbsp; &nbsp; n = len(pat_bytes)<br>
+&nbsp; &nbsp; first_byte = pat_bytes[first_lit]&nbsp;&nbsp;# 首个固定字节<br>
+&nbsp; &nbsp; pos = data.find(first_byte)&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;# 快速定位候选<br>
+&nbsp; &nbsp; ...<br>
+```<br>
+<br>
+对 8 个 DLL 的 35 个模式进行批量扫描，输出命中/缺失/歧义三类结果。<br>
+<br>
+### 3.2 结果<br>
+<br>
+针对新版 Deadlock（ClientVersion 6536），扫描结果 **30/32 OK，0 MISS**，仅 CameraManager 和 CreateMaterial 存在歧义（2 处命中指向同一地址），确认无需修改即可运行。<br>
+<br>
+## 四、源码修改<br>
+<br>
+### 4.1 中文本地化<br>
+本人英文不好所以手动给他添加了所有的翻译工程，然后重新编译即可<br>
+<img id="aimg_Bkxm2" onclick="zoom(this, this.src, 0, 0, 0)" class="zoom" file="https://bbs.kanxue.com/upload/attach/202606/994967_QMRUACJN7MV63YH.webp" onmouseover="img_onmouseoverfunc(this)" lazyloadthumb="1" border="0" alt="" src="https://bbs.kanxue.com/upload/attach/202606/994967_QMRUACJN7MV63YH.webp"><br>
+<br>
+新增 `LangHelper.hpp` 翻译宏：<br>
+<br>
+```cpp<br>
+#define L(en, cn) (GetMisc()-&gt;Language == 1 ? cn : en)<br>
+```<br>
+<br>
+遍历 17 个菜单文件的数百处 `XorStr("English")` 替换为 `L("English", "中文")`。<br>
+<br>
+同时为 ImGui 字体系统添加 CJK Merge Font（`msyh.ttc`），解决中文字符显示为方框的问题。<br>
+<br>
+添加 `/utf-8` MSVC 编译标志，确保 UTF-8 字符串在 GBK 环境下正确编译。<br>
+<br>
+### 4.2 DLL重命名<br>
+<br>
+- 原始DLL编译出来的需要原始自带的注入器，但是我看了就是远程线程注入，而VITTLOCK的注入器是能够规避V社 DeadLock的检测，游戏我并没有去逆向，没那个实力，但是在测试过程中我尝试打开IDAPro 游戏并没有响应的措施进行阻拦，例如WeGame的黑客弹窗 闪退游戏这些措施；大牛可以自己逆向一下<br>
+- 由于没有使用原来的注入器，而是使用的VITTLOCK的注入器，所以将编译的Dll 更名为VITTLOCK.dll 即可，VITTLOCK是扫描同级目录VITTLOCK.dll 进行注入的；不过我怀疑他们用的也是同一套源码 因为注入之后界面几乎一样，他也只是加了一个静默自瞄（范围子弹命中，相关技术可浏览UC帖子 有大牛传授技术）<br>
+- `CHEAT_NAME` 宏 → "L I V E L O C K"，即可修改标题名称<br>
+- Wrapper 控制台 ASCII Art → LIVELOCK 大字<br>
+- ImGui 窗口标题 → LIVE LOCK<br>
+<br>
+### 4.3 配置持久化<br>
+<br>
+- 因为我将dll和注入器exe进行了打包，方便部署本地；我想着避免dll和exe落地能使用着方便，大牛能直接断点api dump下完整文件<br>
+- 被我这么一搞他检测不到dll了文件貌似没创建成功，所以我重新修改了源码进行本地存储配置，方便下次加载直接加载配置文件，就不用每次都手动改配置了<br>
+<br>
+原始代码通过 `GetDllDir()` 获取 DLL 所在目录作为配置路径。由于 DLL 被注入器提取到 `%TEMP%\随机目录`，注入完成后被全零覆盖删除，导致配置不保存。<br>
+<br>
+修改 `CSettingsJson.cpp`，新增 `GetConfigDir()`：<br>
+<br>
+```cpp<br>
+static std::string GetConfigDir() {<br>
+&nbsp; &nbsp; char path[MAX_PATH];<br>
+&nbsp; &nbsp; SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path);<br>
+&nbsp; &nbsp; std::string dir = std::string(path) + "\\LiveLock\\";<br>
+&nbsp; &nbsp; CreateDirectoryA(dir.c_str(), nullptr);<br>
+&nbsp; &nbsp; return dir;<br>
+}<br>
+```<br>
+<br>
+配置保存到 `%APPDATA%\LiveLock\`，永久保留。<br>
+<img id="aimg_RerB1" onclick="zoom(this, this.src, 0, 0, 0)" class="zoom" width="982" height="773" file="https://bbs.kanxue.com/upload/attach/202606/994967_9FZ9C9C7TAY7CKC.webp" border="0" alt="" src="https://bbs.kanxue.com/upload/attach/202606/994967_9FZ9C9C7TAY7CKC.webp"><br>
+<br>
+### 4.4 自瞄骨骼 Fallback<br>
+<br>
+原始项目依赖 `HeroSkeletonPairs.hpp` 中的预先提取的骨骼映射表。由于 BoneExtractor 源码缺失，初版使用空存根导致自瞄无法锁定目标。<br>
+<br>
+- 添加了基于 `m_vecAbsOrigin() + Z偏移` 的无骨骼 Fallback；由于作者并没有发布骨骼数据这部分数据，所以只能自己做去找骨骼数据了，神通广大的UC果然有大神发布骨骼数据，我就直接拿来现成的直接提取出来就OK了，另外做了一个Fallback<br>
+<br>
+```cpp<br>
+// 无骨骼数据时，使用实体原点+垂直偏移估算各部位位置<br>
+Vector3 aimPos = pNode-&gt;m_vecAbsOrigin();<br>
+float zOff = (bone.slot == HitboxSlot::Head) ? 72.f :<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp; (bone.slot == HitboxSlot::Neck) ? 64.f : 48.f;<br>
+aimPos.m_z += zOff;<br>
+//-------------------------------------------------------------------<br>
+const auto* boneList = GetCL_Bones()-&gt;GetHitboxBones(pPawn, bone.slot);<br>
+if (boneList &amp;&amp; !boneList-&gt;empty()) {<br>
+&nbsp; &nbsp; // 原版路径：精确骨骼坐标<br>
+&nbsp; &nbsp; for (const int16_t bid : *boneList) {<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;pNode-&gt;GetBonePosition(bid, bonePos);&nbsp;&nbsp;// ← 读骨骼矩阵<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;Trace_IsVisibleEx(..., bonePos);&nbsp; &nbsp;&nbsp; &nbsp; // ← 射线检测<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;WorldToScreen(bonePos, screen);&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;// ← 投影到屏幕<br>
+&nbsp; &nbsp; }<br>
+}<br>
+else {<br>
+&nbsp; &nbsp; // Fallback：用实体原点 + Z轴偏移估算<br>
+&nbsp; &nbsp; Vector3 aimPos = pNode-&gt;m_vecAbsOrigin();&nbsp;&nbsp;// ← 实体脚下坐标 (X, Y, Z↓)<br>
+&nbsp; &nbsp; aimPos.m_z += 72.f;&nbsp;&nbsp;// 头部：脚下 + 72 单位<br>
+&nbsp; &nbsp; // Neck: +64, Torso: +48, Arms: +38, Legs: +12<br>
+<br>
+&nbsp; &nbsp; // 跳过 Trace_IsVisible（不需要射线检测，避免 Trace 系统兼容问题）<br>
+&nbsp; &nbsp; WorldToScreen(aimPos, screen);&nbsp;&nbsp;// 直接投影<br>
+}<br>
+```<br>
+<br>
+### 4.5 自瞄默认开关<br>
+<br>
+`CAimbot.hpp` 中 `bool Active = false;` 改为 `true;`，避免用户找不到开关。<br>
+<br>
+## 五、BoneExtractor 骨骼数据生成、VPK 逆向：从游戏文件中提取骨骼数据<br>
+<br>
+从 UC 获取 Deadlock-BoneExtractor 源码，其对游戏 VPK 文件（Valve Pak）执行解析：<br>
+### 5.1 问题背景<br>
+<br>
+Andromeda 的自瞄和骨骼 ESP 都依赖 `HeroSkeletonPairs.hpp` 中预先提取的骨骼数据：<br>
+<br>
+```cpp<br>
+// 每个英雄模型对应一份<br>
+struct ModelBoneData {<br>
+&nbsp; &nbsp; vector&lt;BonePair&gt; pairs;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;// 父子骨骼连接 (用于骨架线绘制)<br>
+&nbsp; &nbsp; unordered_map&lt;string, int&gt; ids;&nbsp;&nbsp;// 骨骼名 → 运行时 ID<br>
+&nbsp; &nbsp; vector&lt;int16_t&gt; slotBones[5];&nbsp; &nbsp;// Head/Neck/Torso/Arms/Legs 部位骨骼列表<br>
+};<br>
+```<br>
+VPK读取 → 遍历 4966 个 .vmdl_c 条目<br>
+&nbsp; &nbsp;&nbsp; &nbsp; → 过滤英雄模型路径<br>
+&nbsp; &nbsp;&nbsp; &nbsp; → 解析 ValveResourceFormat 提取骨骼名称/ID<br>
+&nbsp; &nbsp;&nbsp; &nbsp; → 构建 slotBones 部位分类 (Head/Neck/Torso/Arms/Legs)<br>
+&nbsp; &nbsp;&nbsp; &nbsp; → 生成 C++ 头文件<br>
+<br>
+源码仓库中的 `HeroSkeletonPairs.hpp` 仅包含一个空存根 `g_HeroModelData = {}`，因为完整的骨骼数据由 PreBuildEvent 调用 BoneExtractor 运行生成后填入。此步骤需要 .NET SDK 且 BoneExtractor 源码在主仓库中缺失的。直接编译后所有 `GetHitboxBones()` 调用返回 `nullptr`，导致自瞄无法锁定目标和骨骼 ESP 无法绘制。<br>
+<br>
+### 5.2 方案对比<br>
+<br>
+最初尝试了三种途径：<br>
+<br>
+| 方案 | 方法 | 结果 |<br>
+|---|---|---|<br>
+| IDA 提取 VITTLOCK.dll | 从 .rdata 段解析 STL 容器结构 | 数据嵌入在 133KB 静态初始化函数 `sub_180008530` 中，手动提取不现实 |<br>
+| 手写 VPK Python 解析器 | 按 VPK v2 二进制格式逐字节读取 | 成功定位目录树，但模型路径字符编码异常中止 |<br>
+| BoneExtractor 原版工具 | 从 GitHub 获取源码，配置 .NET 环境运行 | **成功生成 63 个英雄的完整数据** |<br>
+<br>
+### 5.3 VPK 文件格式分析<br>
+<br>
+Deadlock 的资源存储在 `game\citadel\pak01_dir.vpk`（索引文件，6.5MB）和 `pak01_000.vpk ~ pak01_270.vpk`（数据分片）中。VPK v2 的文件头结构：<br>
+<br>
+```<br>
+Offset&nbsp;&nbsp;Size&nbsp;&nbsp;Field<br>
+0x00&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;Magic = 0x55AA1234<br>
+0x04&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;Version = 2<br>
+0x08&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;TreeSize (目录树字节数)<br>
+0x0C&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;FileDataSectionSize<br>
+0x10&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;ArchiveMD5SectionSize<br>
+0x14&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;OtherMD5SectionSize<br>
+0x18&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;SignatureSectionSize<br>
+```<br>
+<br>
+依赖 .NET 10.0 + ValveResourceFormat NuGet 包。生成 63 个英雄模型、总计 235KB 的 `HeroSkeletonPairs.hpp`。<br>
+**目录树定位**：`TreeOffset = FileSize - TreeSize`<br>
+<br>
+### VPK 分析尝试<br>
+目录树中每个文件条目为 18 字节：<br>
+<br>
+在等待 .NET 10 SDK 期间，手动解析了 VPK v2 二进制格式：<br>
+```<br>
+Offset&nbsp;&nbsp;Size&nbsp;&nbsp;Field<br>
+0x00&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;CRC32<br>
+0x04&nbsp; &nbsp; 2&nbsp; &nbsp;&nbsp;&nbsp;PreloadBytes<br>
+0x06&nbsp; &nbsp; 2&nbsp; &nbsp;&nbsp;&nbsp;ArchiveIndex (对应 pak01_XXX.vpk 的分片编号)<br>
+0x08&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;EntryOffset&nbsp;&nbsp;(分片文件内的字节偏移)<br>
+0x0C&nbsp; &nbsp; 4&nbsp; &nbsp;&nbsp;&nbsp;EntryLength&nbsp;&nbsp;(压缩前大小)<br>
+0x10&nbsp; &nbsp; 2&nbsp; &nbsp;&nbsp;&nbsp;Terminator = 0xFFFF<br>
+```<br>
+<br>
+条目按 `Extension → Path → Filename` 的三层树结构组织。遍历时以空字符串标记层级结束。<br>
+<br>
+手动编写 Python VPK 解析器成功定位到扩展名 `vmdl_c` 下的 152 个英雄模型路径，但 `latin-1` 编码的目录名在 UTF-8 转换时触发 `UnicodeDecodeError`。<br>
+<br>
+### 5.4 BoneExtractor 源码分析<br>
+<br>
+工具的核心逻辑：<br>
+<br>
+```csharp<br>
+// Program.cs - 入口<br>
+var heroFilter = new Regex(<br>
+&nbsp; &nbsp; @"^models/heroes(?:_staging|_wip)?/",<br>
+&nbsp; &nbsp; RegexOptions.IgnoreCase | RegexOptions.Compiled);<br>
+<br>
+// VpkLocator.cs - 自动定位 Steam 库<br>
+// 读取 HKEY_CURRENT_USER\Software\Valve\Steam → SteamPath<br>
+// 解析 {SteamPath}\config\libraryfolders.vdf → 获取所有库目录<br>
+// 遍历各库下的 steamapps\common\Deadlock\game\citadel\pak01_dir.vpk<br>
+<br>
+// GameBoneExtractor.cs - 核心提取逻辑<br>
+var package = new Package();&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;// ValvePak 库<br>
+package.Read(vpkPath);&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp; // 打开 VPK<br>
+foreach (var entry in package.Entries) {<br>
+&nbsp; &nbsp; if (entry.Key.EndsWith(".vmdl_c") &amp;&amp; heroFilter.IsMatch(entry.Key)) {<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;var resource = new Resource();&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;// ValveResourceFormat 库<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;resource.Read(package, entry);&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;// 解析 .vmdl_c 模型<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;var skeleton = resource.GetSkeleton(); // 获取骨骼系统<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;// 提取 m_boneName[] → 构建 ModelBoneData<br>
+&nbsp; &nbsp; }<br>
+}<br>
+<br>
+// OutputBuilder.cs - C++ 代码生成<br>
+// 生成 inline const unordered_map&lt;string, ModelBoneData&gt; g_HeroModelData = {...};<br>
+```<br>
+Header: Magic(4B) + Version(4B) + TreeSize(4B) + FileDataSize(4B) + ...<br>
+Tree offset = FileSize - TreeSize<br>
+Entry: CRC(4B) + Preload(2B) + ArchiveIdx(2B) + Offset(4B) + Length(4B) + Term(2B)<br>
+<br>
+关键 NuGet 依赖：<br>
+- **ValveResourceFormat** (19.2.6339)：解析 Source 2 引擎的 `.vmdl_c`（编译后的模型文件），提取骨骼名称数组 `m_boneName[]` 和父子层级关系<br>
+- **ValvePak (SteamDatabase.ValvePak)**：VPK 压缩包的 .NET 实现，支持按路径读取单个文件，无需解压整个包<br>
+<br>
+### 5.5 骨骼分类算法<br>
+<br>
+从 `.vmdl_c` 中提取的骨骼名（如 `neck_0`, `spine_1`, `arm_upper_l`, `leg_lower_r`）通过启发式规则映射到五个部位槽位：<br>
+<br>
+```csharp<br>
+// GameBoneExtractor.cs 中的分类逻辑<br>
+static HitboxSlot ClassifyBone(string name) {<br>
+&nbsp; &nbsp; if (name.Contains("head")) return HitboxSlot.Head;<br>
+&nbsp; &nbsp; if (name.Contains("neck")) return HitboxSlot.Neck;<br>
+&nbsp; &nbsp; if (name.Contains("spine") || name.Contains("pelvis")) return HitboxSlot.Torso;<br>
+&nbsp; &nbsp; if (name.Contains("arm") || name.Contains("hand") || name.Contains("clav"))<br>
+&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;return HitboxSlot.Arms;<br>
+&nbsp; &nbsp; if (name.Contains("leg") || name.Contains("foot"))&nbsp;&nbsp;return HitboxSlot.Legs;<br>
+&nbsp; &nbsp; return HitboxSlot.Count; // 跳过未分类<br>
+}<br>
+```<br>
+<br>
+成功定位 4966 个 `vmdl_c` 条目，但字符编码问题导致解析中止。最终 BoneExtractor 工具完美解决。<br>
+骨骼父子连接 (BonePair) 通过 `.vmdl_c` 中的层级关系构建，用于骨架 ESP 绘制连线。<br>
+<br>
+### 5.6 运行与集成<br>
+<br>
+```powershell<br>
+# 安装 .NET 10.0 SDK（ValveResourceFormat 19.x 要求 net10.0）<br>
+https://dotnet.microsoft.com/download/dotnet/10.0<br>
+<br>
+# 还原 NuGet 包<br>
+dotnet restore<br>
+<br>
+# 运行，输出到项目 GameClient 目录<br>
+dotnet run -- "Andromeda-DeadLock-Base\Andromeda-DeadLock\GameClient\HeroSkeletonPairs.hpp"<br>
+```<br>
+<br>
+输出：<br>
+<br>
+```<li> Opening VPK: ...\pak01_dir.vpk</li><li> 4966 vmdl_c entries<br>
+&nbsp;&nbsp;[ok] models/heroes_staging/haze/haze.vmdl&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp; 22 pairs&nbsp;&nbsp;23 ids<br>
+&nbsp;&nbsp;[ok] models/heroes_staging/shiv/shiv.vmdl&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp; 22 pairs&nbsp;&nbsp;23 ids<br>
+&nbsp;&nbsp;[ok] models/heroes_wip/ivy/ivy.vmdl&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp; 24 pairs&nbsp;&nbsp;25 ids<br>
+&nbsp;&nbsp;...</li><li> 63 models extracted, 89 skipped<br>
+[+] Written: HeroSkeletonPairs.hpp (63 models)<br>
+```<br>
+<br>
+跳过 89 个文件的原因是：turret、projectile、LOD 模型、spectre_hand 等非玩家骨骼。63 个有效模型覆盖了游戏中全部可玩英雄及其变体形态。<br>
+<br>
+### 5.7 验证<br>
+<br>
+替换前后 DLL 大小对比：<br>
+<br>
+| 版本 | DLL 大小 | HeroSkeletonPairs.hpp |<br>
+|---|---|---|<br>
+| 空存根 | 6,353,920 bytes | 0 字节 |<br>
+| BoneExtractor 生成 | 6,578,176 bytes (+224KB) | 235KB, 63 模型 |<br>
+<br>
+注入游戏后验证：<br>
+- 骨骼 ESP：正常绘制英雄骨架连线<br>
+- 自瞄：`GetHitboxBones()` 返回有效数据，精确锁定头部/躯干等部位<br>
+- Code 中的 origin+Z Fallback 路径不再被触发<br>
+<br>
+成功定位 4966 个 `vmdl_c` 条目，但字符编码问题导致解析中止。最终 BoneExtractor 工具完美解决。<br>
+<br>
+## 六、编译环境搭建<br>
+<br>
+| 组件 | 版本 | 作用 |<br>
+|---|---|---|<br>
+| VS2026 Community | 18.6.2 | 主编译器 (v143 toolset) |<br>
+| VS2019 Community | 16.11.53 | Wrapper 编译器 |<br>
+| .NET 8.0 SDK | 8.0.421 | 基础运行时 |<br>
+| .NET 10.0 SDK | 10.0.300 | BoneExtractor |<br>
+| MySQL 9.3 | - | KeyGen 数据库 |<br>
+<br>
+编译命令：<br>
+<br>
+```bat<br>
+:: Andromeda DLL<br>
+MSBuild.exe Andromeda-DeadLock-Base.vcxproj /p:Configuration=Release /p:Platform=x64 /m<br>
+<br>
+:: Wrapper<br>
+cl.exe /O2 /MT /EHsc /std:c++17 /Fe:LIVELOCK.exe src\wrapper.cpp<br>
+```<br>
+<br>
+## 七、离线许可系统<br>
+<br>
+### 7.1 卡密设计<br>
+<br>
+16 字节 Payload → AES-256-CBC（随机 IV）→ Base32 → `"VITT-XXXXX-..."`：<br>
+<br>
+```cpp<br>
+struct KeyPayload {<br>
+&nbsp; &nbsp; uint32_t magic;&nbsp; &nbsp;&nbsp; &nbsp; // 0x56495454 ('VITT')<br>
+&nbsp; &nbsp; uint32_t days;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;// 有效期，0xFFFFFFFF = Trial<br>
+&nbsp; &nbsp; uint32_t created_ts;&nbsp;&nbsp;// 生成时间<br>
+&nbsp; &nbsp; uint32_t crc;&nbsp; &nbsp;&nbsp; &nbsp;&nbsp; &nbsp;// CRC32 校验<br>
+};<br>
+```<br>
+<br>
+### 7.2 激活流程设计<br>
+- 设计这个的初衷是想到哪些卖挂的该如何设计这个模式，然后把自己能想到的设计上去，想要完美阻拦大牛肯定是不可能的，只要内存dump下来就能慢慢<a href="https://www.52pojie.cn" target="_blank" class="relatedlink">破解</a>，我也没加服务器验证（因为没钱租服务器）<br>
+- 用户输入卡密 → AES 解密 → CRC 校验<br>
+- 首次激活：记录 `{HWID, start_time, days}` → DPAPI 加密存注册表<br>
+- 后续验证：比对 HWID → 计算剩余时间<br>
+- 防调试：6 项检测（PEB/DebugPort/DebugFlags/DebugObject/HwBp/API）→ 任一项触发 → Ban<br>
+- 防时间作弊：系统时间 + Windows InstallDate 交叉验证 + 防回滚<br>
+<br>
+### 7.3 KeyGen 数据库<br>
+<br>
+GUI 卡密生成器，通过 libmysql C API 直连 MySQL，每张卡密记录到 `deadlock.cards` 表，支持查询状态。<br>
+<br>
+## 八、总结<br>
+- 最终效果如下<br>
+<img id="aimg_Iuu2k" onclick="zoom(this, this.src, 0, 0, 0)" class="zoom" file="https://bbs.kanxue.com/upload/attach/202606/994967_JN8Q9CX3DTBW6ZQ.webp" onmouseover="img_onmouseoverfunc(this)" lazyloadthumb="1" border="0" alt="" src="https://bbs.kanxue.com/upload/attach/202606/994967_JN8Q9CX3DTBW6ZQ.webp"><br>
+<br>
+本次开发涉及以下技术栈：<br>
+<br>
+- **逆向**: AOB 字节模式扫描、Source 2 Schema 系统、VPK 二进制解析<br>
+- **引擎**: MinHook 函数钩子、ImGui D3D11 渲染、protobuf 网络消息<br>
+- **安全**: DPAPI 注册表加密、反调试检测、时间校验、CRC32/AES-256<br>
+- **工具链**: MSVC/MSBuild、Python、.NET Core、MySQL C API<br>
+<br>
+完整源代码和工具已整理归档，可作为 Source 2 引擎游戏学习的参考框架。</li></td></tr></tbody></table>
+
+
