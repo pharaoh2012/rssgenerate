@@ -1,0 +1,211 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/XY-Heruo/p/20384870" title="发布于 2026-06-08 20:38">
+    <span role="heading" aria-level="2">DeepAgents - 配置MCP Server</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        DeepAgents配置MCP Server
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>给 Agent 配上 tool 才能干活——查时间、调 API、操作日历。你可以直接用 LangChain 的 <code>@tool</code> 装饰器写本地函数给 Agent 用, 但如果这个 tool 也想通过 API 暴露给外部客户端远程调用, 那就得上 MCP 了。</p>
+<p>本文记录在一个实际项目中用 FastMCP 写 datetime 工具服务、再用 <code>langchain-mcp-adapters</code> 的 <code>MultiServerMCPClient</code> 接入 deepagents 的过程。</p>
+<p>依赖精简：</p>
+<pre><code>fastmcp&gt;=3.3.1                     # MCP server 框架
+langchain-mcp-adapters&gt;=0.2.2      # MCP -&gt; LangChain tool 适配
+deepagents&gt;=0.4.12
+fastapi&gt;=0.135.2
+</code></pre>
+<h2 id="mcp-tool-vs-agent-tool">MCP tool vs Agent tool</h2>
+<p>为什么要把 tool 写成 MCP server, 而不是直接用 <code>@tool</code> 装饰器写几个 LangChain tool 完事？</p>
+<p>关键区别在于<strong>调用方是谁</strong>。如果你的 tool 只给 Agent 自己用——比如一个内部格式化函数, 那写成 LangChain 的 <code>@tool</code> 就够了, 简单直接。但如果这个 tool 还想通过 HTTP API 暴露给外部客户端（比如另一个服务、一个前端页面、甚至 Postman 调试）, 那就得走 MCP——它本身就是标准协议, 任何支持 MCP 的客户端都能连上来用。</p>
+<p>所以项目里的策略是：datetime 类工具做成 MCP server, 因为后续可能会给其他服务调用；而某些纯内部辅助工具就继续用 <code>@tool</code>。两条腿走路, 不搞一刀切。</p>
+<h2 id="用-fastmcp-写一个-mcp-server">用 FastMCP 写一个 MCP Server</h2>
+<p>FastMCP 是目前 Python 侧写 MCP server 最省事的框架了。一个带时间工具的 server 长这样：</p>
+<pre><code class="language-python">from fastmcp import FastMCP
+from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
+from mcp.types import ToolAnnotations
+
+mcp = FastMCP(
+    name="datetime_server",
+    instructions="A server for datetime related operations",
+)
+mcp.add_middleware(
+    ErrorHandlingMiddleware(
+        include_traceback=True,
+        transform_errors=True,
+    )
+)
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_time_info(dt_str: str = "") -&gt; BasicTimeInfo:
+    """根据输入的时间字符串获取基本时间信息。未提供则默认使用当前UTC时间"""
+    ...
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def timezone_convert(utc_datetime: str, target_timezone: str) -&gt; str:
+    """将UTC时间转换为指定时区的时间"""
+    ...
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def datetime_diff(dt_str1: str, dt_str2: str) -&gt; DatetimeDiff:
+    """计算两个ISO格式日期时间字符串的时间差"""
+    ...
+</code></pre>
+<p>几点值得说的：</p>
+<ul>
+<li><strong><code>ToolAnnotations(readOnlyHint=True)</code></strong>：告诉调用方这些 tool 是只读的, 不会产生副作用。对 Agent 的推理有帮助, LLM 可以放心调用。如果你的工具会写数据（比如创建日历事件）, 就别加这个 annotation。</li>
+<li><strong><code>ErrorHandlingMiddleware</code></strong>：不然 tool 报错了 MCP server 给你返回一个干巴巴的 error code, 根本不知道哪出了问题。开了 <code>include_traceback</code> 和 <code>transform_errors</code> 之后, 错误信息会带着 traceback 返回给 client, 排查方便很多。</li>
+<li><strong>Pydantic 模型做返回值</strong>：<code>BasicTimeInfo</code>、<code>DatetimeDiff</code> 这些用 Pydantic 定义好的 model 作为 tool 返回值, 既有类型安全, 又在 MCP 协议层自动生成了 schema 描述, Agent 调用时知道字段含义。</li>
+</ul>
+<h2 id="multiservermcpclient从-mcp-加载-tool">MultiServerMCPClient：从 MCP 加载 tool</h2>
+<p>FastMCP 写好了 server, 怎么让 deepagents 能用上这些 tool？用 <code>langchain-mcp-adapters</code> 提供的 <code>MultiServerMCPClient</code>。</p>
+<p>它本质上是一个多 server 的客户端管理器——你告诉它每个 MCP server 的地址和传输方式, 它帮你建立连接、发现工具、转换成 LangChain 标准的 <code>BaseTool</code> 列表：</p>
+<pre><code class="language-python">from langchain_mcp_adapters.client import MultiServerMCPClient
+
+client = MultiServerMCPClient(
+    {
+        "datetime": {
+            "transport": "streamable_http",
+            "url": "http://127.0.0.1:3002/api/mcp/datetime",
+        }
+    }
+)
+
+tools = await client.get_tools()
+# tools 就是 list[BaseTool], 可以直接喂给 create_deep_agent()
+</code></pre>
+<p><code>transport</code> 目前主流就两种：<code>streamable_http</code>（适合网络调用、跨进程共享）和 <code>stdio</code>（适合本地子进程、单机部署）。本项目用的是前者, 因为 MCP server 是作为 FastAPI sub-app 挂载的, 不依赖进程间管道。</p>
+<p>如果是需要鉴权的远程 MCP server, 加 <code>headers</code> 就行：</p>
+<pre><code class="language-python">{
+    "didatick": {
+        "transport": "streamable_http",
+        "url": "https://mcp.dida365.com",
+        "headers": {
+            "Authorization": f"Bearer {cfg.DIDA_TOKEN}",
+        },
+    }
+}
+</code></pre>
+<h2 id="为什么单独搞了个-mcpservers-类">为什么单独搞了个 MCPServers 类</h2>
+<p>项目里没有把 <code>MultiServerMCPClient</code> 直接丢在 <code>AIAgent</code> 里, 而是单独抽了个 <code>MCPServers</code> 出来：</p>
+<pre><code class="language-python">class MCPServers:
+    def __init__(self):
+        self._client_datetime: MultiServerMCPClient = None
+        self._datetime_tools: list[BaseTool] = []
+        self._client_didatick: MultiServerMCPClient = None
+        self._didatick_tools: list[BaseTool] = []
+
+    async def get_datetime_tools(self) -&gt; list[BaseTool]:
+        if not self._datetime_tools:
+            await self._init_datetime_mcp()
+        return self._datetime_tools
+
+    async def get_didatick_tools(self) -&gt; list[BaseTool]:
+        if not self._didatick_tools:
+            await self._init_aididatick_mcp()
+        return self._didatick_tools
+</code></pre>
+<p>这么拆的理由很简单：<strong>SubAgent 可能只需要部分 MCP tool</strong>。如果你的应用里有多个 SubAgent——比如一个只负责查日历, 一个只负责查时间——让每个 SubAgent 只拿到它需要的 tool 列表, 可以避免 tool 过多导致 LLM 选择困难（所谓的 "tool overload" 问题）。</p>
+<p>每个 MCP server 的 tool 按 <code>get_xxx_tools()</code> 独立暴露, 上层可以自由组合：</p>
+<pre><code class="language-python">class AIAgent:
+    def __init__(self):
+        self._mcp_servers = MCPServers()
+
+    async def _init_tools(self):
+        # 这个 Agent 需要所有 tool
+        tools_mcp_datetime = await self._mcp_servers.get_datetime_tools()
+        tools_mcp_didatick = await self._mcp_servers.get_didatick_tools()
+        self._tools.extend(tools_mcp_datetime)
+        self._tools.extend(tools_mcp_didatick)
+
+    # 另一个 SubAgent 可能只拿 datetime:
+    #   tools = await self._mcp_servers.get_datetime_tools()
+</code></pre>
+<p>另外每个方法的懒加载 + 缓存逻辑保证了同一个 MCP server 只连一次。</p>
+<h2 id="fastapi-如何-mount-fastmcp-server">FastAPI 如何 mount FastMCP Server</h2>
+<p>FastMCP 内置了 ASGI app 的生成方法, 直接丢给 FastAPI 的 <code>mount()</code> 就行。但这里有个细节：lifespan 管理。</p>
+<p>FastMCP 有自己的 lifespan 逻辑（启动时注册 tool schema、注册 http handler 等）, FastAPI 也有自己的 lifespan（比如数据库连接池初始化等）。如果你直接 <code>app.mount()</code>, FastAPI 不会自动管子 app 的 lifespan, 启动顺序就可能出问题。</p>
+<p>解决办法是用 <code>fastmcp.utilities.lifespan.combine_lifespans</code>：</p>
+<pre><code class="language-python">from fastmcp.utilities.lifespan import combine_lifespans
+
+def create_app() -&gt; FastAPI:
+    # FastMCP 实例生成 ASGI app
+    datetime_mcp_app = datetime_mcp.http_app(path="/datetime")
+
+    # 合并两个 lifespan, 保证初始化顺序
+    app = FastAPI(lifespan=combine_lifespans(lifespan, datetime_mcp_app.lifespan))
+
+    # 挂载到 /api/mcp 路径下
+    app.mount("/api/mcp", datetime_mcp_app)
+
+    return app
+</code></pre>
+<p>实际访问路径就变成了 <code>/api/mcp/datetime</code>——<code>app.mount</code> 的 <code>/api/mcp</code> 是前缀, <code>http_app(path="/datetime")</code> 的 <code>/datetime</code> 是子路径。</p>
+<p>如果你的项目里有多个 MCP server 要挂载, 每个都调 <code>http_app(path="...")</code> 然后逐个 mount, 别忘了把它们的 lifespan 都塞到 <code>combine_lifespans</code> 里。</p>
+<p>最后, MCP client 连的就是本进程内的 server, 所以 endpoint 用 <code>127.0.0.1</code> 就行：</p>
+<pre><code class="language-python">endpoint = f"http://127.0.0.1:{cfg.SERVER_PORT}/api/mcp/datetime"
+</code></pre>
+<h2 id="agent-侧接入">Agent 侧接入</h2>
+<p><code>create_deep_agent()</code> 接收 tool 列表, 不管这些 tool 是本地 <code>@tool</code> 函数还是从 MCP 加载的, 对它来说都一样：</p>
+<pre><code class="language-python">class AIAgent:
+    async def _init_deep_agent(self):
+        if self._agent:
+            return
+
+        if not self._tools:
+            await self._init_tools()
+
+        self._agent = create_deep_agent(
+            model=self._llm,
+            tools=self._tools,          # 包含 MCP tool + 本地 tool
+            checkpointer=checkpointer,
+            system_prompt="...",
+            middleware=[
+                ToolRetryMiddleware(
+                    max_retries=2,
+                    retry_on=(TimeoutException,),
+                    on_failure="continue",
+                )
+            ],
+        )
+</code></pre>
+<p><code>ToolRetryMiddleware</code> 在这里有两个作用：</p>
+<ul>
+<li><strong><code>max_retries=2</code></strong>：MCP tool 走的 HTTP, 网络抖动、server 临时不可用都可能发生, 设 2 次重试可以避免一次抖动就把整个流程打断。</li>
+<li><strong><code>on_failure="continue"</code></strong>：重试用完还是失败了怎么办？<code>continue</code> 表示不中断 Agent 执行, 而是把失败信息交给 LLM。比如 AI 传错了参数导致 tool 报 <code>ValidationError</code>, <code>ToolRetryMiddleware</code> 把这个异常信息原样塞回给 LLM, LLM 看到之后可以自己修正参数重新调用。这比直接崩掉要实用得多。当然你也可以设成 <code>raise</code> 让异常直接抛出去, 看你业务需要。</li>
+</ul>
+<h2 id="改进点">改进点</h2>
+<ul>
+<li><strong>MCP server 独立部署</strong>：目前 <code>datetime_mcp</code> 作为 FastAPI sub-app 跟 Agent 跑在同一个进程里。如果 server 本身很重（比如需要 GPU 推理的视觉工具）, 应该拆出去独立部署, client 用远程 HTTP 连接。</li>
+<li><strong>多 server 的 tool 冲突</strong>：如果两个 MCP server 刚好提供了同名的 tool, <code>MultiServerMCPClient.get_tools()</code> 的行为取决于实现——可能会覆盖、也可能报错。最好在设计时就给每个 server 的 tool 加上有意义的前缀或命名空间。</li>
+<li><strong>streamable_http vs stdio</strong>：<code>streamable_http</code> 方便调试（你可以直接用 curl 打 MCP server）。<code>stdio</code> 有个隐藏的坑——如果每次 Agent 请求都创建新的 MCP 连接（用 <code>MultiServerMCPClient</code> 的 <code>connect()</code> / <code>disconnect()</code> 模式）, 后台会残留一堆 MCP server 子进程, 杀都杀不干净。而如果提前建好长连接复用, 又得自己管生命周期。回到本项目——Agent 调的是自己进程内的 MCP API, HTTP 走 <code>127.0.0.1</code> 也就多一层本地网络栈的 overhead, 实际延迟几乎感觉不到。除非你的 tool 调用量巨大到本地 HTTP 成为瓶颈, 否则 <code>streamable_http</code> 完全够用。</li>
+<li><strong>鉴权</strong>：远程 MCP server 目前靠 header 传 Bearer token。生产环境如果有 Token 过期策略，最好加上 token 过期刷新和重试逻辑, 不要在连接初始化的时候因为 401 就直接挂了。</li>
+<li>MCP Server的配置可以放在配置文件里面，这样以后还能动态配置。</li>
+</ul>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/XY-Heruo/" target="_blank">花酒锄作田</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/XY-Heruo/p/20384870" target="_blank">https://www.cnblogs.com/XY-Heruo/p/20384870</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-06-08 20:38">2026-06-08 20:38</span>&nbsp;
+<a href="https://www.cnblogs.com/XY-Heruo">花酒锄作田</a>&nbsp;
+阅读(<span id="post_view_count">54</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20384870);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FXY-Heruo%2Fp%2F20384870&amp;targetId=20384870&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
