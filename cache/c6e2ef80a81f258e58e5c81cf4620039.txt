@@ -1,0 +1,198 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/JuiceData/p/20471460" title="发布于 2026-06-12 11:37">
+    <span role="heading" aria-level="2">42 倍小文件性能提升、85% 吞吐增长：多云 AI 场景下的 JuiceFS 存储实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>星辰征途是一家聚焦 AI 搜索与电商场景多模态 AIGC 应用的初创公司，成立两年多，业务主要面向海外市场。公司目前的主要产品包括：Gensmo（gensmo.com） 聚焦时尚穿搭，提供虚拟试穿、造型推荐和商品搜索；ZooClaw（zooclaw.ai） 面向更广泛的生活与工作场景，提供 AI Agent 服务。</p>
+<p>本文将介绍星辰征途业务背后的存储实践，分享我们在统一存储选型、架构设计和性能调优中的思考与经验。目前，JuiceFS 已在生产环境使用一年多，管理文件数超过 1 亿，业务横跨 Oracle、DigitalOcean 和 GCP 三朵云，并成为支撑模型训练、推理、数据处理和在线 Agent 的统一存储层。</p>
+<h2 id="01-统一存储需求与建设思路">01 统一存储需求与建设思路</h2>
+<h3 id="四类场景四种-io-诉求">四类场景，四种 I/O 诉求</h3>
+<p>到目前为止，星辰征途在存储上主要涉及四类场景，支撑 Gensmo 和 ZooClaw 的业务。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2544292/202606/2544292-20260612113729354-2111416276.png" class="lazyload"></p>
+<p><strong>第一类：模型训练</strong><br>
+公司自研模型包括 Gensmo 的 try-on 模型和视频生成模型，用于向 C 端和 B 端客户展示穿搭效果、360° 模型动作或特效场景。模型训练涉及大文件的顺序写入和 checkpoint 保存，对存储系统要求：高容量、高性能顺序 I/O。</p>
+<p><strong>第二类：模型推理服务</strong><br>
+推理服务对 I/O 的核心需求是高并发顺序读，数据加载到本地缓存以提高命中率。</p>
+<p><strong>第三类：数据处理</strong><br>
+我们会抓取海外独立电商站的商品、服饰、评价等数据，用于训练模型和业务运营分析。该场景面临大量小文件（单张图片几百 KB），对存储系统的高 IOPS 并发能力是挑战。</p>
+<p>工程优化方面，我们使用 Ray Data 并行处理，将海量小文件聚合成 Parquet 大文件（几十 GB 到上百 GB），形成可复用的数据基础层，后续 embedding、检索、推荐等任务重复使用，大幅降低对文件系统的压力，同时兼顾训练和推理场景的需求。</p>
+<p><strong>第四类：在线 Agent</strong><br>
+在线 Agent 场景与前面主要的离线场景不同，虽然存在大量小文件，但这些文件是在线服务生成，且每个 Agent 的数据只读写自身，不涉及跨 Agent 分布式处理。存储系统需支撑高并发访问和快速响应，但不要求跨 Agent 数据协调。</p>
+<p>综合来看，这四类场景对存储系统提出了两类要求：离线训练、推理和数据处理需要高吞吐、高并发和缓存能力；在线 Agent 则更关注低延迟、数据隔离和稳定性。在明确这些业务需求之后，一个自然的问题是：是否需要考虑多云架构？从平台建设之初，我们的答案就是肯定的。</p>
+<h3 id="云中立不是理念是议价能力">云中立不是理念，是议价能力</h3>
+<p><strong>云中立的目的不是追求技术本身，而是满足基础设施团队的核心需求：保持算力和资源的可漂移性以及与不同云供应商的议价能力。</strong></p>
+<p>对于海外业务，如果计算和存储长期绑定在单一云供应商，随着业务增长或价格变化，灵活调整算力就会受限。尤其在 AI 场景中，GPU 资源价格和供应波动很大：当前便宜的资源，过一段时间可能价格上升或供应不足；业务增长后需要的计算规模，也可能原云供应商无法满足。</p>
+<p>因此，我们希望存储层与具体云厂商解耦，使数据保持云中立。这样，训练、推理或在线 Agent 工作负载可以漂移到更符合成本和性能要求的云上，而不需要反复复制或重新配置数据。</p>
+<h3 id="posix统一存储体验的基础">POSIX：统一存储体验的基础</h3>
+<p>另一个在平台建设需要考虑的核心问题就是：如何让研发团队在多云、多对象存储环境下获得一致的操作体验。</p>
+<p>对于单一业务场景来说，直接使用对象存储已经足够。但当训练、推理、数据处理和在线 Agent 共用同一套数据体系时，不同对象存储接口带来的开发和运维成本会被不断放大。因此，我们希望在底层存储之上提供统一抽象，<strong>而 POSIX 文件系统语义正是最适合承载这种抽象的方式。</strong></p>
+<p>通过 JuiceFS，我们将底层对象存储（无论是 GCS、S3 还是 R2）统一映射为 POSIX 文件系统，并挂载为本地路径。这样一来，从本地开发到生产环境，研发团队面对的始终是同一套文件系统接口和访问路径，而无需关心底层数据究竟存储在哪朵云、使用哪种对象存储。</p>
+<p><strong>简单来说，理想的云存储体验，是让工程师无需感知底层多云环境的存在，他们看到的永远是一条本地路径的数据。</strong>这也是我们后续选择 JuiceFS 的重要原因之一。</p>
+<h2 id="02-选型从-gcs-fuses3-fuse-到-juicefs">02 选型：从 GCS Fuse、S3 Fuse 到 JuiceFS</h2>
+<p>由于离线和在线场景的需求差异明显，存储选型也呈现出两条不同路径。</p>
+<h3 id="离线调研业界主流方案后一开始就选了-juicefs">离线：调研业界主流方案后，一开始就选了 JuiceFS</h3>
+<p>在离线场景中，我们面对的是多云环境和高吞吐需求。因此，在系统搭建之前，团队对业界主流方案进行了调研，并根据核心诉求逐一对比：</p>
+<ul>
+<li>自建并行文件系统：性能最强，但成本高、绑定硬件且跨云能力有限；</li>
+<li>云托管并行文件系统：省心，但锁定单一云厂商，成本仍高；</li>
+<li>裸 FUSE：成本低，但 POSIX 语义和性能都不足；</li>
+<li>缓存编排层：需要额外叠加底层存储，运维复杂。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>云中立</th>
+<th>POSIX 语义</th>
+<th>高吞吐</th>
+<th>分布式缓存</th>
+<th>成本 / 运维</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自建并行文件系统（如 Lustre）</td>
+<td>❌ 绑定硬件</td>
+<td>✅</td>
+<td>✅✅</td>
+<td>部分</td>
+<td>成本高，运维重</td>
+</tr>
+<tr>
+<td>云托管并行文件系统（如 Filestore）</td>
+<td>❌ 锁定单云</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>成本高，运维较轻</td>
+</tr>
+<tr>
+<td>对象存储 + FUSE（S3FS / GCS Fuse）</td>
+<td>⚠️ 锁云</td>
+<td>❌</td>
+<td>❌</td>
+<td>❌</td>
+<td>成本低，运维轻</td>
+</tr>
+<tr>
+<td>缓存编排层（Alluxio / Fluid）</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>需叠加底层存储，运维重</td>
+</tr>
+<tr>
+<td>JuiceFS</td>
+<td>✅ 后端任选</td>
+<td>✅ 完整</td>
+<td>✅</td>
+<td>✅ 内建</td>
+<td>对象存储成本，CSI 接入</td>
+</tr>
+</tbody>
+</table>
+<p>相比之下，JuiceFS 同时满足了我们对<strong>云中立、完整 POSIX、内建分布式缓存和对象存储后端</strong> 的核心要求，而其他方案基本都会缺少其中一环。因此，在离线场景下，我们没有太多犹豫，一开始就选定了 JuiceFS。</p>
+<h3 id="agent从-gcs-fuse-踩坑迁到-juicefs">Agent：从 GCS Fuse 踩坑，迁到 JuiceFS</h3>
+<p>早期业务主要部署在 Google 云上，使用 Google Cloud Storage（GCS）通过 GCS Fuse 挂载到 GKE Pod。实践中发现，这种方案无法满足在线 Agent 对稳定性、性能和云中立的要求。</p>
+<p><strong>最主要的问题是 SIGKILL 场景下的数据丢失</strong>。GCS Fuse 采用异步 write-back 机制，应用进程的 <code>write</code> 返回成功后，数据可能仍停留在本地缓冲区，并未真正写入 GCS。一旦 Pod 被 OOM kill 或 SIGKILL，已经“看起来写成功”的数据可能永久丢失，在 Agent 场景中会直接表现为会话数据丢失。</p>
+<p><strong>第二类问题是小文件性能和 POSIX 语义不足</strong>。Agent 工作目录中通常包含多个小文件，并存在频繁追加写入。GCS Fuse 在 <code>open</code>、<code>stat</code> 等操作上延迟较高，同时对 <code>rename</code>、<code>flock</code>、<code>symlink</code> 等 POSIX 语义支持不完整，难以满足在线服务的稳定运行要求。</p>
+<p><strong>第三类问题是云锁定和高并发稳定性</strong>。GCS Fuse 基本绑定在 GCP 生态内使用，不符合我们对云中立的要求；在高并发 Agent 场景下，稳定性也存在不足。</p>
+<p>基于这些问题，我们尝试将在线 Agent 场景迁移到 JuiceFS。</p>
+<p>JuiceFS 能解决数据丢失问题，关键在于它的写路径和独立元数据引擎。JuiceFS 将数据和元数据分离：数据 chunk 先上传到对象存储，元数据再原子提交到独立元数据引擎，这之后才算写成功。也就是说，写成功真正意味着数据已经落地，SIGKILL 不会丢失已确认的数据。</p>
+<p><strong>更本质地说，GCS Fuse 是以文件系统形式暴露对象存储，而 JuiceFS 是基于对象存储构建真正的文件系统。正是这层独立元数据引擎，加上完整 POSIX 支持、云中立、内建分布式缓存和生态工具链，使 JuiceFS 更符合在线 Agent 对可靠性、一致性和高并发访问的要求。</strong>目前，在线 Agent 已在生产环境稳定运行，JuiceFS 也成为公司多场景下的统一存储方案。</p>
+<h2 id="03-新架构juicefs-在多云的部署">03 新架构：JuiceFS 在多云的部署</h2>
+<h3 id="离线多云算力漂移统一元数据--r2">离线：多云算力漂移，统一元数据 + R2</h3>
+<p>针对离线场景云中立、算力漂移和高吞吐的需求，我们设计了如下架构：</p>
+<p>底层对象存储选择 Cloudflare R2 作为后端。R2 不绑定任何云厂商，且对出站流量免费，非常适合跨云的高吞吐训练场景。相比之下，其他对象存储如 GCS 或 AWS S3 虽然存储成本低，但出站流量费用可能极高，会显著增加离线训练成本。例如，GCS 一个月 1TB 的存储费用约 20 美元，但出站流量可能高达 20–140 美元。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2544292/202606/2544292-20260612113742196-1308700671.png" class="lazyload"></p>
+<p>在 R2 之上，我们部署了 JuiceFS 企业版，实现多云的统一文件系统。无论算力在 Oracle 还是 DigitalOcean，训练、推理或数据处理任务都使用同一套路径，工程师无需感知底层云变化。</p>
+<p>算力层包括 Oracle 上的 H100 GPU 和 DigitalOcean 上的 H200 GPU，运行 Slurm 和 KubeRay 的训练与推理统一方案。每个 GPU 节点的本地 NVMe 构建分布式缓存，形成跨节点共享缓存池。数据集首次访问时从 R2 回源，后续基本命中缓存，以吸收跨云访问带来的延迟。</p>
+<p>基础设施管理通过 Terraform 完成 IaaC 编排，所有网络、存储、训练任务、Ray 集群和推理引擎均可一键部署。只要云厂商支持 Kubernetes，计算资源和任务都可以无缝拉起，实现跨云快速扩展和资源调整。</p>
+<h3 id="在线低延迟优先与云内独立元数据">在线：低延迟优先与云内独立元数据</h3>
+<p>在线 Agent 场景以 ZooClaw 为例，核心诉求是为大量 Agent 提供统一存储底座，并实现统一管理、目录隔离和计费，更关注低延迟、小文件写入和高并发访问。如果存储链路跨云，I/O 延迟会明显上升，不适合在线服务。因此，我们尽量让对象存储、元数据服务和业务 Pod 都部署在同一朵云内。</p>
+<p>目前这套在线架构部署在 GCP 上，底层对象存储使用本云的 Google Cloud Storage（GCS），元数据层则在 GCP 私有 VPC 内部署独立的三节点 Raft 集群。这样可以让对象存储、元数据服务和业务 Pod 都留在同一云内，降低访问延迟，并提高小文件写密集场景下的 IOPS 表现。</p>
+<p>在 Kubernetes 层面，我们通过 JuiceFS CSI 挂载同一个 RWX PVC，不同 bot Pod 使用各自的 subPath 访问独立目录，并通过 token 按环境限制访问范围，实现文件系统级的数据隔离。对于每个 Agent 来说，它看到的是自己的本地工作目录；对于平台侧来说，底层仍然是一套统一的存储系统，便于统一管理和计费。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2544292/202606/2544292-20260612113750442-689008107.png" class="lazyload"></p>
+<p>如果未来 GCP 的资源或成本不再合适，这套架构仍然具备漂移能力。我们基于 Terraform 和 Kubernetes 进行编排，可以在另一朵云上拉起同样的计算和存储结构，再将对应的元数据与数据同步过去。在线 Agent 业务天然可以按 bot、用户或租户分批切换，因此不需要一次性整体迁移。</p>
+<p>回顾离线与在线两个场景，二者的目标不同：离线关注跨云共享、算力漂移和高吞吐，在线 Agent 则关注低延迟、高并发，同时保留按需漂移能力。因此，我们没有为所有场景套用同一种后端方案，而是在 JuiceFS 之上按场景做差异化设计。这样既保留了统一的数据管理和工程使用体验，也让每个场景都能选择更合适的元数据和对象存储部署方式。</p>
+<h2 id="04-调优实践分布式缓存--writeback--s3-gateway">04 调优实践：分布式缓存 / writeback / S3 Gateway</h2>
+<p>在统一架构落地后，我们仍需根据不同业务场景进行针对性的性能优化和访问策略调整。</p>
+<h3 id="同一个缓存两套优化策略">同一个缓存，两套优化策略</h3>
+<p>分布式缓存是 JuiceFS 中非常关键的能力，直接影响 IOPS、吞吐和访问延迟。在离线和在线两个场景中，缓存的目标与实现方式存在显著差异。</p>
+<p><strong>在离线场景中，核心目标是支撑大规模训练和数据处理的高吞吐，同时保障跨云共享和算力漂移。</strong>为此，我们尽量将 R2 中的数据缓存到本地。训练、推理和数据处理运行在配备 NVMe SSD 的 H100、H200 GPU 节点上，单节点约 50T，十几台节点可形成几百 T 的分布式缓存空间。首次访问数据需要从 R2 回源，速度相对较慢，但首读完成后，训练、数据处理和推理任务基本能命中缓存，I/O 性能接近本地访问。在离线场景中，因写入的是大规模 checkpoint 或模型权重文件（单个文件可达数百 GB 至数 TB），数据安全要求极高，因此通常不启用 writeback，以确保写入绝对安全。</p>
+<p>在线 Agent 场景的核心目标是低延迟、高并发的小文件访问，同时保证每个 Agent 的数据隔离。缓存主要用于提升小文件写入和访问性能，每个 Agent Pod 挂载同一个支持 RWX 的 PVC，并通过 subPath 隔离目录，缓存失效时间设置为 3,600 秒，覆盖高频访问场景。由于每个 Agent 通常只访问自己的目录，这种缓存策略不要求严格跨 Agent 数据一致性，数据仅在必要的离线分析或运营排查中与对象存储保持最终一致。</p>
+<p>在线场景中，为了进一步提升小文件写入和高并发性能，缓存策略可以配合 writeback 使用。<strong>Writeback 的核心目标是以可控的数据安全风险换取更高的写入吞吐</strong>。这意味着，在单个节点上运行的多个 Agent，如果某个 Agent 在写入过程中出现异常，仅会影响该 Agent 的单次产物，如 PPT、图片或临时文档，这些数据可以重新生成。借助 writeback，在线 Agent 在高并发、小文件写入时能够获得明显的性能提升，同时仍保持系统整体的稳定性和数据隔离。</p>
+<h3 id="一份数据多种接口">一份数据，多种接口</h3>
+<p>S3 Gateway 在我们的架构中承担数据分发层角色，将 JuiceFS 中的数据以标准 S3 接口对外提供服务。在 Agent 场景下，无论是配置文件，还是生成的 PPT、图片或视频，数据最终都存放在同一套 JuiceFS 文件系统中。然而，这些数据往往需要以 URL 的形式分享给外部用户，POSIX 挂载方式显然不适用。</p>
+<p>因此，我们通过 JuiceFS S3 Gateway 将同一份数据直接暴露为标准 S3 接口。内部服务继续使用 POSIX 接口，而外部系统通过 S3 或 HTTP 协议访问同一份数据，无需额外复制。为了提升安全性和访问性能，我们在 S3 Gateway 前增加了 Cloudflare Worker 和 CDN：用户请求先通过 Worker 完成路径校验和访问控制，再转发到 Gateway 获取数据，同时通过 CDN 边缘缓存和 ETag 校验减少回源请求。</p>
+<p>这种设计带来了两个核心收益：第一，多层访问隔离保证数据安全，包括 JuiceFS 目录隔离、S3 Gateway 权限控制以及 Worker 层的代码级校验；第二，通过 CDN 缓存减少跨区域访问的延迟，提高大文件（如视频或图片）的访问性能。对于全球用户而言，这意味着即使数据存储在 GCP 美东区域，用户也可以从最近的边缘节点高效访问内容。</p>
+<p>从整体架构来看，内部训练、推理和 Agent 服务使用 POSIX 文件系统，而对外分发则通过 S3 Gateway 提供标准接口。<strong>同一份数据支持多种访问方式，无需额外复制</strong>。</p>
+<h2 id="05-性能调优结果">05 性能调优结果</h2>
+<h3 id="离线场景顺序写吞吐提升-4缓存命中读-78-gbs">离线场景：顺序写吞吐提升 ~4×，缓存命中读 7–8 GB/s</h3>
+<p>在离线场景下，我们对顺序读写进行了性能基准测试。图表中展示了优化前后的对比：</p>
+<ul>
+<li>顺序写：单进程写入模型产出或 checkpoint 时约 700 MB/s，利用多进程、多节点并行写入可超过 1 GB/s，足以支撑大规模训练场景下的顺序写入需求。</li>
+<li>顺序读：数据处理阶段，将小文件聚合成大文件并加载到分布式缓存后，顺序读命中缓存可达到 6.7–7.8 GB/s，接近本地 NVMe 性能。模型推理任务也可直接从本地缓存加载 checkpoint，无需跨节点拷贝。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">测试项（JuiceFS on R2，离线）</th>
+<th style="text-align: left">无优化基线</th>
+<th style="text-align: left">优化后（分布式缓存 + 调参）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">顺序写：大块</td>
+<td style="text-align: left">~231 MB/s</td>
+<td style="text-align: left">~714 MB/s</td>
+</tr>
+<tr>
+<td style="text-align: left">顺序写：大批量 20–50 GB</td>
+<td style="text-align: left">~256–265 MB/s</td>
+<td style="text-align: left">840 MB/s ~ 1.1 GB/s</td>
+</tr>
+<tr>
+<td style="text-align: left">顺序读：分布式缓存命中</td>
+<td style="text-align: left">-</td>
+<td style="text-align: left">6.7 ~ 7.8 GB/s</td>
+</tr>
+<tr>
+<td style="text-align: left">顺序读：冷读回源 R2</td>
+<td style="text-align: left">-</td>
+<td style="text-align: left">~427 MB/s</td>
+</tr>
+</tbody>
+</table>
+<p>分布式缓存还带来了工程效率上的收益。训练、推理和数据处理可以共享同一套文件路径，减少了 checkpoint 在不同节点或服务之间复制的需求。新产出的模型权重可直接被推理服务加载，降低了数据流转成本，也提升了训练到部署的衔接效率。</p>
+<h3 id="在线场景小文件写入性能提升-42大文件吞吐提升-85">在线场景：小文件写入性能提升 ~42×，大文件吞吐提升 ~85%</h3>
+<p>最初方案中，元数据服务部署在 OCI，后端对象存储使用 R2，在线业务在 GCP 访问时需要跨公网，请求链路中的元数据 RTT（Round-Trip Time） 约为 12.7 ms，小文件吞吐只有约 24 files/s；同时，R2 偶发 30 s PUT 超时，甚至会影响 bot 的稳定性。</p>
+<p>优化措施包括：一是开启 writeback 并调整缓存 TTL，大文件写入吞吐提升约 85%；二是将元数据和对象存储迁移到 GCP 内网，元数据在私有 VPC 三节点 Raft 集群，对象存储改为 GCS 并结合 NVMe 缓存。优化后，元数据 RTT 降至约 5.8 ms，小文件吞吐提升至约 1000 files/s，整体性能约提升 42 倍。</p>
+<h2 id="06-小结"><strong>06 小结</strong></h2>
+<p>经过一年多实践，JuiceFS 已成为星辰征途基础设施中的核心存储层。它不仅支撑超过 1 亿文件、横跨三朵云和多类业务场景的稳定运行，更重要的是统一了训练、推理、数据处理和在线 Agent 的存储体系。</p>
+<p>对于一家海外初创公司而言，灵活且运维简便的基础设施至关重要，这有助于团队将精力集中在业务创新上。统一存储体系为上层业务和研发提供一致接口，而底层资源可以根据场景灵活调度：离线场景围绕算力成本实现动态漂移，在线场景优先保证低延迟和高并发，同时保留按需迁移能力。这样的设计既保持了上层体验的一致性，又使算力成本可议价、资源可漂移，为未来扩展到更多云和区域奠定了基础。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-06-12 11:38">2026-06-12 11:37</span>&nbsp;
+<a href="https://www.cnblogs.com/JuiceData">JuiceFS</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20471460);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FJuiceData%2Fp%2F20471460&amp;targetId=20471460&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
