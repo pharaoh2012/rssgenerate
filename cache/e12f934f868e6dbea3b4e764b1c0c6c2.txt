@@ -1,0 +1,981 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/diamondhusky/p/20350131" title="发布于 2026-06-06 21:11">
+    <span role="heading" aria-level="2">【.NET并发编程 - 14】无锁编程与内存模型：不加锁，也能线程安全？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="14-无锁编程与内存模型不加锁也能线程安全">14. 无锁编程与内存模型：不加锁，也能线程安全？</h1>
+<blockquote>
+<p><strong>本章 GitHub 仓库</strong>：<a href="https://github.com/Naughtyhusky/csharp-concurrency-cookbook/tree/dev" target="_blank" rel="noopener nofollow">csharp-concurrency-cookbook</a> ⭐</p>
+<p>欢迎 Star 和 Fork！所有代码示例都可以在仓库中找到并运行。</p>
+</blockquote>
+<hr>
+<h2 id="-本章导读">🎯 本章导读</h2>
+<blockquote>
+<p>📌 <strong>本文目标</strong>：搞清楚无锁编程的核心工具——<code>Interlocked</code>、<code>volatile</code>、<code>Thread.MemoryBarrier</code>；理解 .NET 内存模型与 CPU 指令重排的基本概念；学会用 CAS（Compare-And-Swap）实现无锁数据结构；掌握 <code>Lazy&lt;T&gt;</code> 和 <code>LazyInitializer</code> 做线程安全延迟初始化；以及最关键的——<strong>知道什么时候该用、什么时候不该碰</strong>。</p>
+</blockquote>
+<p>上一篇《ThreadLocal 与 AsyncLocal》我们聊的是"每个线程独占自己的数据"。今天我们来聊另一个维度的挑战：<strong>多个线程确实要共享同一份数据，但我不想加锁——怎么做？</strong></p>
+<p>你可能会问：不加锁能保证线程安全吗？</p>
+<p>答案是：<strong>可以，但代价是你需要更深入地了解 CPU 和内存是怎么工作的。</strong></p>
+<p>这篇文章，我会带你把这块硬骨头啃透。</p>
+<hr>
+<h2 id="-先聊聊为什么要无锁">🤔 先聊聊：为什么要"无锁"？</h2>
+<p>在第11篇《锁机制完全指南》里，我们详细介绍了 <code>lock</code>、<code>SemaphoreSlim</code>、<code>ReaderWriterLockSlim</code> 这些锁工具。锁这么好用，为什么还要折腾"无锁"？</p>
+<p>原因主要有三个：</p>
+<p><strong>1. 锁有性能开销</strong></p>
+<p>每次 <code>lock</code> 都涉及操作系统的互斥量（Mutex）或 Monitor 对象，有线程切换、内核态切换的开销。在高频、高并发的场景（比如每秒百万次操作的计数器），锁的开销可能成为瓶颈。</p>
+<p><strong>2. 锁可能导致死锁</strong></p>
+<p>锁的顺序一旦搞错，就可能出现经典的死锁。无锁算法没有"锁"这个概念，也就没有死锁。</p>
+<p><strong>3. 锁会造成线程饥饿</strong></p>
+<p>持有锁的线程被挂起，所有等待的线程都得干等着。无锁算法通常能保证"至少有一个线程在推进"（lock-free progress guarantee）。</p>
+<p>当然，无锁不是银弹——<strong>代码更复杂、更难调试、更容易出 bug</strong>。所以，本章最后我们也会聊什么时候该用、什么时候别碰。</p>
+<hr>
+<h2 id="-第一关interlocked--原子操作的瑞士军刀">⚡ 第一关：Interlocked —— 原子操作的瑞士军刀</h2>
+<p><code>System.Threading.Interlocked</code> 类提供了一组<strong>原子操作</strong>。所谓原子，就是操作要么完全发生，要么完全没发生，不存在"一半"的状态。</p>
+<h3 id="先看问题i-有多危险">先看问题：i++ 有多危险？</h3>
+<pre><code class="language-csharp">private static int _counter = 0;
+
+// 10 个线程各执行 100,000 次
+Parallel.For(0, 10, _ =&gt;
+{
+	for (int i = 0; i &lt; 100_000; i++)
+		_counter++; // ⚠️ 这是 3 步操作！
+});
+
+Console.WriteLine(_counter); // 期望 1,000,000，实际上每次执行这段代码，得到的结果可能都不一样，但是通常远小于 1,000,000！
+</code></pre>
+<p><code>_counter++</code> 看起来是一步，实际上是三步：</p>
+<ol>
+<li><strong>读取</strong>：把 <code>_counter</code> 从内存读到寄存器</li>
+<li><strong>加一</strong>：在寄存器里 +1</li>
+<li><strong>写回</strong>：把寄存器的值写回内存</li>
+</ol>
+<p>两个线程同时执行，就可能：</p>
+<ul>
+<li>线程A 读到 5</li>
+<li>线程B 读到 5（还没被 A 更新）</li>
+<li>线程A 写回 6</li>
+<li>线程B 写回 6（覆盖了 A 的结果！）</li>
+</ul>
+<p>本来应该是 7，结果是 6，丢了一次更新。</p>
+<h3 id="interlockedincrement--decrement--add">Interlocked.Increment / Decrement / Add</h3>
+<pre><code class="language-csharp">// ✅ 一行搞定，原子 +1
+Interlocked.Increment(ref _counter);
+
+// ✅ 原子 -1
+Interlocked.Decrement(ref _counter);
+
+// ✅ 原子 +n（返回加完后的新值）
+int newValue = Interlocked.Add(ref _counter, 5);
+
+// ✅ 64位原子读（在 32 位系统上，读 long 本身不是原子的！）
+long result = Interlocked.Read(ref _longCounter);
+</code></pre>
+<p>这几个方法背后，在 x86 上是 <code>LOCK XADD</code> 或 <code>LOCK INC</code> 指令，一条指令完成，CPU 保证原子性。</p>
+<hr>
+<h3 id="-cas无锁编程的基石">🌟 CAS：无锁编程的基石</h3>
+<p><code>Interlocked.CompareExchange</code> 就是大名鼎鼎的 <strong>CAS（Compare-And-Swap）</strong>，是整个无锁编程的基础。没有 CAS，就没有无锁算法——它是所有无锁数据结构的"原子弹"。</p>
+<h4 id="cas-是什么">CAS 是什么？</h4>
+<p>它的语义只有一句话：</p>
+<blockquote>
+<p><strong>"只有当前值等于预期值时，才把它替换成新值，整个操作原子完成，返回旧值"</strong></p>
+</blockquote>
+<p>用伪代码表示：</p>
+<pre><code class="language-csharp">// 这三步是一个不可分割的原子操作（CPU 层面是 CMPXCHG 指令）
+int old = *location;
+if (old == comparand)
+	*location = newValue;
+return old;
+
+// .NET 的写法：
+int original = Interlocked.CompareExchange(ref location, newValue, comparand);
+// 判断是否成功：
+bool success = (original == comparand);
+</code></pre>
+<p>注意返回值：<strong>不管有没有成功，都返回操作前的旧值</strong>。你通过判断"旧值是否等于你的预期值"来知道 CAS 是否成功。</p>
+<h4 id="为什么-cas-能保证原子性">为什么 CAS 能保证原子性？</h4>
+<p>在 x86 上，CAS 对应 <code>CMPXCHG</code> 指令，配合 <code>LOCK</code> 前缀（在多核 CPU 上会锁总线或使用缓存锁）：</p>
+<pre><code class="language-nasm">LOCK CMPXCHG [mem], reg   ; 原子：比较 [mem] 与 EAX，相等则把 reg 写入 [mem]
+</code></pre>
+<p>这是 CPU 在硬件层面保证的原子性，不是靠软件锁来实现的——这就是为什么它比 <code>lock</code> 语句快得多。</p>
+<hr>
+<h4 id="cas-自旋无锁算法的标准骨架">CAS 自旋：无锁算法的标准骨架</h4>
+<p>光有一次 CAS 是不够的，因为 CAS 可能失败（有其他线程抢先了）。解决方案是：<strong>失败了就重试</strong>，这就是 <strong>CAS 自旋（CAS Spin Loop）</strong>：</p>
+<pre><code class="language-csharp">while (true)
+{
+	int current = Volatile.Read(ref _field); // ① 读取当前值
+	int newValue = Compute(current);          // ② 基于当前值算出新值
+
+	int original = Interlocked.CompareExchange(ref _field, newValue, current);
+
+	if (original == current) return;          // ③ CAS 成功，退出
+	// ④ CAS 失败（original != current）：有人抢先修改了，重新来过
+}
+</code></pre>
+<p>这四步就是整个无锁算法的骨架，背下来，任何无锁算法都是在这个框架上扩展的。</p>
+<hr>
+<h4 id="实战1无锁最大值更新经典面试题">实战1：无锁最大值更新（经典面试题）</h4>
+<pre><code class="language-csharp">private static int _max = 0;
+
+private static void TryUpdateMax(int newValue)
+{
+	while (true)
+	{
+		int current = _max;
+		if (newValue &lt;= current) return; // 新值不比当前大，直接不用更新
+
+		// CAS：如果 _max 还是 current，就把它换成 newValue
+		int original = Interlocked.CompareExchange(ref _max, newValue, current);
+		if (original == current) return; // 成功！
+
+		// 失败：说明有别的线程在我读取 current 和执行 CAS 之间，抢先改了 _max
+		// 重新读取最新值，再判断一次
+	}
+}
+</code></pre>
+<p><strong>为什么不能用 <code>if (_max &lt; newValue) _max = newValue;</code>？</strong></p>
+<p>因为 <code>读取→判断→写入</code> 三步之间，可能被其他线程插入，导致：</p>
+<ul>
+<li>你读到 <code>_max = 5</code>，判断 <code>99 &gt; 5</code>，准备写</li>
+<li>另一个线程写入了 <code>_max = 200</code></li>
+<li>你把 <code>_max</code> 覆盖为 <code>99</code>，正确的最大值 200 丢失了！</li>
+</ul>
+<p>CAS 自旋保证了"读到值"和"写入值"是同一个时间点——一旦中间有人修改，CAS 失败，你重读重来。</p>
+<hr>
+<h4 id="实战2无锁的引用类型更新">实战2：无锁的引用类型更新</h4>
+<p>CAS 不只能用于整数，也能用于引用类型（本质上是比较指针地址）：</p>
+<pre><code class="language-csharp">// 原子地把一个链表头换成新节点
+private Node? _head;
+
+public void PrependNode(int value)
+{
+	var newNode = new Node(value);
+	while (true)
+	{
+		newNode.Next = _head;                    // 让新节点的 Next 指向当前头
+		// CAS：如果 _head 还是 newNode.Next，就换成 newNode
+		var original = Interlocked.CompareExchange(ref _head, newNode, newNode.Next);
+		if (original == newNode.Next) return;    // 成功
+		// 失败：_head 被别人改了，重新设置 newNode.Next 再试
+	}
+}
+</code></pre>
+<p>这就是无锁链表（和后面无锁栈）的核心原理。</p>
+<hr>
+<h4 id="实战3用-cas-实现自旋锁理解原理用生产别用">实战3：用 CAS 实现自旋锁（理解原理用，生产别用）</h4>
+<p>这个例子的价值不在于"让你去用"，而是让你看清楚 <code>lock</code> 的底层本质：</p>
+<pre><code class="language-csharp">public class SpinLockSimple
+{
+	private volatile int _locked = 0; // 0 = 未锁，1 = 已锁
+
+	public void Enter()
+	{
+		// 不断尝试把 0 换成 1，直到成功
+		while (Interlocked.CompareExchange(ref _locked, 1, 0) != 0)
+		{
+			// 锁被占用，自旋等待
+			Thread.SpinWait(1); // 让出 CPU 时间片的一小部分，避免完全占满 CPU
+		}
+		// 走到这里，说明我们成功把 _locked 从 0 换成了 1，拿到了锁
+	}
+
+	public void Exit()
+	{
+		Volatile.Write(ref _locked, 0); // 释放锁
+	}
+}
+
+// 使用方式
+var spinLock = new SpinLockSimple();
+spinLock.Enter();
+try
+{
+	// 临界区
+}
+finally
+{
+	spinLock.Exit();
+}
+</code></pre>
+<p>看到了吗？<code>lock</code> 关键字在最底层，就是这个 CAS 循环的变体（.NET 的 Monitor 比这复杂得多，加入了等待队列、自适应自旋等优化，但核心思路相同）。</p>
+<blockquote>
+<p>💡 .NET 内置了 <code>System.Threading.SpinLock</code> 结构体，是生产级的自旋锁实现，性能比上面这个简单版本好得多。短临界区且锁竞争不激烈时可以用它代替 <code>lock</code>。</p>
+</blockquote>
+<hr>
+<h4 id="cas-的天敌aba-问题">CAS 的天敌：ABA 问题</h4>
+<p>CAS 有一个著名的缺陷，叫 <strong>ABA 问题</strong>，你必须了解它。</p>
+<p><strong>场景：</strong> 假设 <code>_value = A</code></p>
+<ol>
+<li>线程1 读到 <code>current = A</code>，准备把它 CAS 换成 C</li>
+<li>线程1 被挂起</li>
+<li>线程2 把 <code>_value</code> 从 A 改成 B</li>
+<li>线程3 把 <code>_value</code> 从 B 改回 A</li>
+<li>线程1 恢复，执行 CAS：当前值是 A，预期是 A，<strong>CAS 成功了！</strong></li>
+</ol>
+<p>但问题是：<strong>这个 A 已经不是原来那个 A 了</strong>。中间发生了 A→B→A 的变化，CAS 没有察觉。</p>
+<p>在简单的整数计数场景，ABA 问题通常无害（值相同就够了）。但在<strong>无锁链表/队列/栈</strong>中，ABA 可能导致悬空指针、数据损坏。</p>
+<p><strong>解决方案：带版本号的 CAS（Tagged Pointer / Stamped Reference）</strong></p>
+<pre><code class="language-csharp">// 解决方案：把值和版本号打包在一起，版本号每次修改都递增
+// 这样即使值变回 A，(A, version=3) != (A, version=1)，CAS 就不会误判
+
+// .NET 中可以把值和版本打包到 long 里（高32位版本，低32位值）：
+private long _valueWithVersion = 0;
+
+private static (int value, int version) Unpack(long raw)
+	=&gt; ((int)(raw &amp; 0xFFFFFFFFL), (int)(raw &gt;&gt; 32));
+
+private static long Pack(int value, int version)
+	=&gt; ((long)version &lt;&lt; 32) | (uint)value;
+
+public bool TrySetWithVersion(int expected, int newValue)
+{
+	while (true)
+	{
+		long raw = Interlocked.Read(ref _valueWithVersion);
+		var (currentVal, currentVer) = Unpack(raw);
+
+		if (currentVal != expected) return false;
+
+		long newRaw = Pack(newValue, currentVer + 1); // 版本号 +1
+		long original = Interlocked.CompareExchange(ref _valueWithVersion, newRaw, raw);
+		if (original == raw) return true; // 成功（值和版本都匹配）
+	}
+}
+</code></pre>
+<p>实际上，.NET 的 <code>ConcurrentStack&lt;T&gt;</code>、<code>ConcurrentQueue&lt;T&gt;</code> 等内置集合，在内部也通过各种手段规避了 ABA 问题（GC 托管内存的特性使得对象地址通常不会复用，这在一定程度上缓解了 ABA）。</p>
+<hr>
+<h4 id="cas-的性能特征">CAS 的性能特征</h4>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无竞争（单线程）</td>
+<td>极快，接近普通赋值</td>
+</tr>
+<tr>
+<td>低竞争（少数线程偶尔碰撞）</td>
+<td>很快，偶尔重试一次就成功</td>
+</tr>
+<tr>
+<td>高竞争（大量线程频繁冲突）</td>
+<td><strong>性能急剧下降</strong>，大量线程在自旋，CPU 空转</td>
+</tr>
+</tbody>
+</table>
+<p>这就是为什么 <strong>CAS 适合低竞争场景</strong>。高竞争时，反而不如一把好锁（锁会让线程睡眠，让出 CPU，而不是自旋空转）。</p>
+<hr>
+<h3 id="exchange原子读改写">Exchange：原子读改写</h3>
+<pre><code class="language-csharp">// 把 sharedFlag 设为 1，返回旧值
+int old = Interlocked.Exchange(ref sharedFlag, 1);
+
+// 常用于"抢令牌"：谁把 0 换成 1，谁就成功
+if (old == 0)
+	Console.WriteLine("我抢到了令牌！");
+else
+	Console.WriteLine("令牌已被占用");
+</code></pre>
+<p><code>Exchange</code> 可以看作是 CAS 的特化版：不加条件判断，无论当前值是什么，直接替换。底层是 <code>XCHG</code> 指令，同样是原子的。</p>
+<hr>
+<h2 id="️-第二关volatile--让变量新鲜起来">👁️ 第二关：volatile —— 让变量"新鲜"起来</h2>
+<h3 id="先搞清楚一个反直觉的问题">先搞清楚一个反直觉的问题</h3>
+<p>考虑这段代码：</p>
+<pre><code class="language-csharp">private static bool _stop = false;
+
+var worker = new Thread(() =&gt;
+{
+	while (!_stop) // ← 这个循环可能永远不会退出！
+	{
+		// 做一些工作
+	}
+});
+worker.Start();
+
+Thread.Sleep(1000);
+_stop = true; // 主线程设置停止标志
+</code></pre>
+<p>在 <strong>Release 模式</strong> + <strong>编译器优化</strong> + <strong>某些 CPU 架构（如 ARM）</strong> 的情况下，worker 线程可能<strong>永远看不到</strong> <code>_stop = true</code>！</p>
+<p>为什么？因为：</p>
+<ul>
+<li><strong>编译器优化</strong>：编译器发现 worker 线程没有写 <code>_stop</code>，可能把 <code>_stop</code> 缓存到寄存器里（"你反正不会改它，每次都读内存太浪费了"）</li>
+<li><strong>CPU 缓存</strong>：每个 CPU 核心都有自己的 L1/L2 缓存，核心A 写了 <code>_stop</code>，核心B 的缓存里可能还是旧值</li>
+</ul>
+<h3 id="volatile-做了什么">volatile 做了什么</h3>
+<pre><code class="language-csharp">private static volatile bool _stop = false; // ← 加上 volatile
+</code></pre>
+<p><code>volatile</code> 告诉编译器和 CPU 两件事：</p>
+<ol>
+<li><strong>禁止缓存</strong>：每次读取都必须从主内存（或 CPU 缓存一致性协议保证的最新值）读，每次写入都必须立刻对其他线程可见</li>
+<li><strong>禁止重排</strong>：不允许把对这个字段的读写操作重排到其他操作的前面或后面（在 .NET 里，volatile 读含有 Acquire 语义，volatile 写含有 Release 语义）</li>
+</ol>
+<h3 id="volatileread--volatilewrite精确控制">Volatile.Read / Volatile.Write：精确控制</h3>
+<p>有时候字段不方便声明为 <code>volatile</code>（比如它在结构体里，或者你想精细控制），可以用：</p>
+<pre><code class="language-csharp">// 等价于读一个 volatile 字段
+int flag = Volatile.Read(ref _flag);
+
+// 等价于写一个 volatile 字段
+Volatile.Write(ref _data, 42);
+</code></pre>
+<p>这两个方法非常有用，可以在"普通字段"的局部特定访问点加上内存屏障语义，而不用把整个字段声明为 volatile。</p>
+<h3 id="️-volatile-的局限性">⚠️ volatile 的局限性</h3>
+<p>很多人以为 <code>volatile</code> 能保证线程安全，其实它只保证<strong>可见性</strong>，不保证<strong>原子性</strong>：</p>
+<pre><code class="language-csharp">private static volatile int _counter = 0;
+
+// ❌ volatile 救不了这个！
+// i++ 是三步，volatile 只保证每步读写是"新鲜的"，不保证三步合一
+Parallel.For(0, 10, _ =&gt;
+{
+	for (int i = 0; i &lt; 100_000; i++)
+		_counter++; // 仍然会丢数据！
+});
+</code></pre>
+<p><strong>记住</strong>：</p>
+<ul>
+<li>需要<strong>原子性</strong> → 用 <code>Interlocked</code></li>
+<li>需要<strong>可见性</strong> → 用 <code>volatile</code></li>
+<li>两个都需要 → 用 <code>Interlocked</code>（它隐含了可见性）</li>
+</ul>
+<hr>
+<h2 id="-第三关内存模型--cpu-脑子里在想啥">🧱 第三关：内存模型 —— CPU 脑子里在想啥？</h2>
+<p>这一节是本章最烧脑的部分，但也是区分"会写并发代码"和"真正理解并发"的分水岭。很多并发 bug 的根源，就藏在这里。我们一层一层地剥开来讲。</p>
+<hr>
+<h3 id="第一层你写的代码经过了几道变换才能执行">第一层：你写的代码，经过了几道"变换"才能执行？</h3>
+<p>大多数人认为：<strong>我写的代码 = CPU 执行的代码</strong>。实际上，在你的源代码到达 CPU 执行之前，要经过<strong>三道变换</strong>：</p>
+<pre><code>你写的 C# 代码
+    ↓ [Roslyn 编译器优化]
+IL 中间代码
+    ↓ [JIT / AOT 编译器优化]
+本机机器码
+    ↓ [CPU 乱序执行 + 缓存子系统]
+实际执行顺序
+</code></pre>
+<p>每一道变换都可能<strong>重排你的操作顺序</strong>，只要在<strong>单线程</strong>视角下"看起来结果一样"，它们就认为重排是合法的。</p>
+<p>但在多线程下，"另一个线程的视角"这件事，这三层优化都不会主动考虑——这就是为什么并发代码需要额外的同步手段。</p>
+<hr>
+<h3 id="第二层cpu-缓存架构--为什么一个核心的写入另一个核心看不到">第二层：CPU 缓存架构 —— 为什么一个核心的写入，另一个核心看不到？</h3>
+<p>现代 CPU 的存储层次结构（以 8 核 CPU 为例）：</p>
+<pre><code>核心0    核心1    核心2    ...    核心7
+  │        │        │               │
+ L1缓存  L1缓存  L1缓存  ...  L1缓存   ← 每个核心独有，约 32~64 KB，极快
+  │        │        │               │
+ L2缓存  L2缓存  L2缓存  ...  L2缓存   ← 每个核心独有或2核共享，约 256 KB~1 MB
+  └────────┴────────┴───────────────┘
+                    │
+                L3 缓存（所有核心共享，约 8~64 MB）
+                    │
+              主内存（RAM，几十 GB）
+</code></pre>
+<p>当核心0 写入一个变量时，这个写入首先发生在核心0 的 L1 缓存里，<strong>不一定立刻同步到 L3 或主内存</strong>。核心1 如果读这个变量，可能读到的是它自己 L1 缓存里的旧值。</p>
+<p>所以"线程A 写了一个值，线程B 却看不到"——不是因为写入没发生，而是<strong>写入还躺在核心A 的私有缓存里，没有广播给其他核心</strong>。</p>
+<h4 id="mesi-协议cpu-如何保证缓存一致性">MESI 协议：CPU 如何保证缓存一致性</h4>
+<p>别以为多核 CPU 对缓存不一致一无所知——它有 <strong>MESI 缓存一致性协议</strong>来维护缓存状态：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>M</strong>odified</td>
+<td>本核独有，已修改，与主内存不同，其他核必须先来问我要最新值</td>
+</tr>
+<tr>
+<td><strong>E</strong>xclusive</td>
+<td>本核独有，未修改，与主内存一致</td>
+</tr>
+<tr>
+<td><strong>S</strong>hared</td>
+<td>多个核共享，只读，与主内存一致</td>
+</tr>
+<tr>
+<td><strong>I</strong>nvalid</td>
+<td>缓存行已失效，数据不可用，必须重新从更高层级获取</td>
+</tr>
+</tbody>
+</table>
+<p>当核心0 修改一个处于 <strong>S（Shared）</strong> 状态的缓存行时，会发出 <code>RFO（Request For Ownership）</code> 信号，让其他所有持有该缓存行的核心将其标记为 <strong>I（Invalid）</strong>，然后核心0 的状态变为 <strong>M（Modified）</strong>。</p>
+<p>听起来很美好——所有核心都会"失效旧缓存，重新获取"。但关键问题在于：<strong>这个失效通知什么时候送达，什么时候被处理，是不确定的</strong>。</p>
+<blockquote>
+<p>💡 <strong>顺带一提：False Sharing（伪共享）</strong></p>
+<p>既然聊到了缓存行，这里有必要提一个与缓存行机制密切相关的性能杀手——<strong>False Sharing（伪共享）</strong>。</p>
+<p>CPU 读写内存的最小粒度不是一个字节、也不是一个 <code>int</code>，而是一整条<strong>缓存行（Cache Line，通常 64 字节）</strong>。如果两个线程各自修改的是<strong>逻辑上完全无关的两个变量</strong>，但这两个变量恰好落在同一条缓存行里，那么每次修改都会触发 MESI 协议的 RFO 争抢，导致缓存行在两个核心之间来回"乒乓"失效——明明没有数据竞争，性能却惨不忍睹。</p>
+<p>这个问题我们在这个系列第03篇《并发的底层：Thread、ThreadPool 与 Task》的「1.2 Thread 的上下文切换成本」章节中有详细的原理分析和性能实验，感兴趣的同学可以翻回去复习一下。这里只做一个简单的提醒：<strong>在设计无锁数据结构时，高频写入的字段一定要注意缓存行对齐，必要时用 <code>[StructLayout(LayoutKind.Explicit)]</code> 或 <code>[FieldOffset]</code> 手动填充，把不同线程写入的字段分隔到不同缓存行中。</strong></p>
+</blockquote>
+<hr>
+<h3 id="第三层store-buffer-与-invalidate-queue--明明写了为什么看不到的真正原因">第三层：Store Buffer 与 Invalidate Queue —— "明明写了，为什么看不到"的真正原因</h3>
+<p>这是内存模型最精髓也最难理解的部分。</p>
+<h4 id="store-buffer写缓冲区">Store Buffer（写缓冲区）</h4>
+<p>核心写入一个变量，需要先检查缓存行状态。如果缓存行不在 M 状态，需要先发 RFO 等待其他核心失效确认，才能写入。等待期间，CPU 不能傻站着——它会把<strong>写操作暂存到 Store Buffer</strong>，然后继续执行后面的指令。</p>
+<pre><code>核心0 执行：
+_data = 42;     → 写入 Store Buffer（还没提交到缓存）
+_flag = 1;      → 写入 Store Buffer（还没提交到缓存）
+↓
+... 一段时间后，RFO 完成 ...
+↓
+Store Buffer 中的写操作按顺序（或可能乱序！）提交到缓存
+</code></pre>
+<p><strong>问题</strong>：核心1 在读 <code>_flag</code> 时，可能已经看到 <code>_flag = 1</code>（从 L3 或核心0 的缓存广播过来了），但 <code>_data = 42</code> 还躺在核心0 的 Store Buffer 里，核心1 读到的 <code>_data</code> 还是旧值！</p>
+<p>这就是 <strong>Store-Load 重排</strong>：从其他核心看来，<code>_flag = 1</code> 的写入，比 <code>_data = 42</code> 的写入先"生效"了。即使在代码里 <code>_data = 42</code> 写在 <code>_flag = 1</code> 之前！</p>
+<h4 id="invalidate-queue失效队列">Invalidate Queue（失效队列）</h4>
+<p>当核心1 收到 "core0 修改了某个缓存行，请失效你的副本" 的消息时，它不会立刻处理（处理也需要时间）——它把这个失效请求放到 <strong>Invalidate Queue</strong> 里，先去干别的事。</p>
+<p><strong>问题</strong>：核心1 要读 <code>_data</code> 时，缓存里还有旧的副本，Invalidate Queue 里有一条"这条缓存行已失效"的消息，但还没处理——核心1 还是读到旧值！</p>
+<h4 id="两者组合经典的生产者-消费者可见性问题">两者组合：经典的"生产者-消费者"可见性问题</h4>
+<pre><code>核心0（生产者）：          核心1（消费者）：
+_data = 42;               while (_flag == 0) {}
+_flag = 1;                Console.WriteLine(_data); // 可能打印 0！
+</code></pre>
+<p>核心0 的视角：先写了 data，再写了 flag，一切正常。<br>
+核心1 的视角：可能先看到 flag=1，但 data=42 还在核心0 的 Store Buffer 里，所以读到的 data 是旧值 0。</p>
+<p><strong>这不是 Bug，这是 CPU 的"合法行为"。</strong> 内存模型就是规定了"在什么情况下，CPU 允许这样做，在什么情况下不允许"。</p>
+<hr>
+<h3 id="第四层内存屏障--告诉-cpu-这里不许乱">第四层：内存屏障 —— 告诉 CPU "这里不许乱"</h3>
+<p>内存屏障（Memory Barrier / Memory Fence）是解决上述问题的武器。屏障告诉 CPU：</p>
+<ul>
+<li>
+<p><strong>Store Barrier（写屏障 / Release）</strong>：把 Store Buffer 里所有暂存的写操作，全部冲刷（flush）到缓存，然后再执行屏障之后的指令。<strong>保证：屏障前的所有写入，在屏障后的写入之前，对其他核心可见。</strong></p>
+</li>
+<li>
+<p><strong>Load Barrier（读屏障 / Acquire）</strong>：处理 Invalidate Queue 里所有积压的失效请求，使之后的读操作能看到最新值。<strong>保证：屏障后的所有读取，不会读到屏障前"被缓存但已失效"的旧值。</strong></p>
+</li>
+<li>
+<p><strong>Full Barrier</strong>：Store Barrier + Load Barrier，双向都不允许重排。</p>
+</li>
+</ul>
+<pre><code class="language-csharp">// 正确的"生产者-消费者"模式：
+// 生产者：
+_data = 42;
+Thread.MemoryBarrier(); // ← Store Barrier：把 _data=42 冲刷出 Store Buffer
+_flag = 1;
+
+// 消费者：
+while (_flag == 0) { }
+Thread.MemoryBarrier(); // ← Load Barrier：处理 Invalidate Queue，确保后续读到最新值
+Console.WriteLine(_data); // ✅ 现在保证能看到 42
+</code></pre>
+<h4 id="x86-vs-arm谁帮你做了屏障">x86 vs ARM：谁帮你做了屏障？</h4>
+<p>这里是理解"跨平台并发 bug"的关键：</p>
+<table>
+<thead>
+<tr>
+<th>重排类型</th>
+<th>说明</th>
+<th style="text-align: center">x86/x64</th>
+<th style="text-align: center">ARM/ARM64</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Load-Load</strong></td>
+<td>两个读操作互换顺序</td>
+<td style="text-align: center">❌不会</td>
+<td style="text-align: center">✅可能</td>
+</tr>
+<tr>
+<td><strong>Store-Store</strong></td>
+<td>两个写操作互换顺序</td>
+<td style="text-align: center">❌不会</td>
+<td style="text-align: center">✅可能</td>
+</tr>
+<tr>
+<td><strong>Load-Store</strong></td>
+<td>先读后写，被改成先写后读</td>
+<td style="text-align: center">❌不会</td>
+<td style="text-align: center">✅可能</td>
+</tr>
+<tr>
+<td><strong>Store-Load</strong></td>
+<td>先写后读，被改成先读后写</td>
+<td style="text-align: center">✅<strong>会！</strong></td>
+<td style="text-align: center">✅可能</td>
+</tr>
+</tbody>
+</table>
+<p>x86 是<strong>强内存模型（TSO，Total Store Order）</strong>，硬件自动禁止了除 Store-Load 以外的所有重排。这就是为什么很多"无锁代码在 x86 上跑十年没问题，移植到 ARM 就崩了"。</p>
+<p>ARM 是<strong>弱内存模型</strong>，几乎所有重排都可能发生，需要程序员显式插入屏障指令（<code>DMB</code>、<code>DSB</code>）。</p>
+<p>.NET 运行时在生成机器码时，会根据目标 CPU 架构自动插入合适的屏障指令。所以<strong>只要你正确使用了 .NET 提供的同步原语</strong>（<code>lock</code>、<code>Interlocked</code>、<code>volatile</code>），就不需要关心底层是 x86 还是 ARM。<strong>手动写 <code>Thread.MemoryBarrier()</code> 是最后一招</strong>。</p>
+<hr>
+<h3 id="第五层acquirerelease-语义--内存模型的高层抽象">第五层：Acquire/Release 语义 —— 内存模型的高层抽象</h3>
+<p>底层的"Store Buffer / Invalidate Queue / 屏障指令"太底层了，难以直接推理。所以内存模型用<strong>获取（Acquire）/释放（Release）语义</strong>来描述约束：</p>
+<p><strong>Release 语义</strong>（用于写操作）：</p>
+<blockquote>
+<p>在这个写操作之前的所有读/写，不能被重排到这个写操作之后。<br>
+（相当于在写操作之前插入 Store Barrier）</p>
+</blockquote>
+<p><strong>Acquire 语义</strong>（用于读操作）：</p>
+<blockquote>
+<p>在这个读操作之后的所有读/写，不能被重排到这个读操作之前。<br>
+（相当于在读操作之后插入 Load Barrier）</p>
+</blockquote>
+<p>这两个语义组合使用，构成了经典的<strong>"happens-before"关系</strong>：</p>
+<pre><code>线程A（Release 写）               线程B（Acquire 读）
+_data = 42;    ←──────────────── 所有这些写入        │
+_message = "hello"; ◄────────────────────────────── │ happens-before
+Volatile.Write(ref _flag, 1); ─────────────────────► Volatile.Read(ref _flag) == 1
+                                                     │ ↓
+                                                     _data;    // 保证能看到 42
+                                                     _message; // 保证能看到 "hello"
+</code></pre>
+<p><strong>一旦线程B 的 Acquire 读看到了线程A 的 Release 写的结果，就建立了 happens-before 关系：线程A 在 Release 写之前的所有操作，对线程B 在 Acquire 读之后的所有操作都是可见的。</strong></p>
+<h4 id="net-中各个工具的-acquirerelease-语义">.NET 中各个工具的 Acquire/Release 语义</h4>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th style="text-align: center">Acquire 语义</th>
+<th style="text-align: center">Release 语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lock</code> 进入</td>
+<td style="text-align: center">✅</td>
+<td style="text-align: center"></td>
+</tr>
+<tr>
+<td><code>lock</code> 退出</td>
+<td style="text-align: center"></td>
+<td style="text-align: center">✅</td>
+</tr>
+<tr>
+<td><code>volatile</code> 读</td>
+<td style="text-align: center">✅</td>
+<td style="text-align: center"></td>
+</tr>
+<tr>
+<td><code>volatile</code> 写</td>
+<td style="text-align: center"></td>
+<td style="text-align: center">✅</td>
+</tr>
+<tr>
+<td><code>Volatile.Read</code></td>
+<td style="text-align: center">✅</td>
+<td style="text-align: center"></td>
+</tr>
+<tr>
+<td><code>Volatile.Write</code></td>
+<td style="text-align: center"></td>
+<td style="text-align: center">✅</td>
+</tr>
+<tr>
+<td><code>Interlocked</code> 所有操作</td>
+<td style="text-align: center">✅</td>
+<td style="text-align: center">✅（Full Barrier）</td>
+</tr>
+<tr>
+<td><code>Thread.MemoryBarrier()</code></td>
+<td style="text-align: center">✅</td>
+<td style="text-align: center">✅（Full Barrier）</td>
+</tr>
+<tr>
+<td><code>Task.Run</code> / <code>await</code> 的调度</td>
+<td style="text-align: center">✅（继续执行时）</td>
+<td style="text-align: center">✅（发布任务时）</td>
+</tr>
+</tbody>
+</table>
+<p>有了这张表，你就能判断任何并发代码是否正确：<strong>写方用 Release 语义写标志，读方用 Acquire 语义读标志，happens-before 建立，可见性保证。</strong></p>
+<hr>
+<h3 id="第六层实战--亲眼见证内存可见性问题">第六层：实战 —— 亲眼见证内存可见性问题</h3>
+<p>纸上谈兵不够，来看一个真实可复现的例子：</p>
+<pre><code class="language-csharp">// 没有任何同步的标志位
+private static bool _ready = false;
+private static int _value = 0;
+
+// 线程A（生产者）
+var producer = new Thread(() =&gt;
+{
+    _value = 42;  // 先写数据
+    _ready = true; // 再设置标志
+});
+
+// 线程B（消费者）
+var consumer = new Thread(() =&gt;
+{
+    while (!_ready) { } // 等待标志
+    // ⚠️ 在 Release 模式 + ARM 上，可能打印 0！
+    // ⚠️ 在 Debug 模式 + x86 上，通常正常（因为 Debug 模式优化少）
+    Console.WriteLine(_value);
+});
+</code></pre>
+<p><strong>正确写法1：用 volatile</strong></p>
+<pre><code class="language-csharp">private static volatile bool _ready = false; // volatile 写 = Release，volatile 读 = Acquire
+private static int _value = 0;
+
+// 生产者：
+_value = 42;
+_ready = true; // volatile 写，Release 语义，_value=42 的写入不会被重排到这句之后
+
+// 消费者：
+while (!_ready) { } // volatile 读，Acquire 语义，之后的读取能看到生产者的所有写入
+Console.WriteLine(_value); // ✅ 保证打印 42
+</code></pre>
+<p><strong>正确写法2：用 Interlocked（更明确）</strong></p>
+<pre><code class="language-csharp">private static int _ready = 0;
+private static int _value = 0;
+
+// 生产者：
+_value = 42;
+Interlocked.Exchange(ref _ready, 1); // Full Barrier，比 volatile 更强
+
+// 消费者：
+while (Interlocked.CompareExchange(ref _ready, 0, 0) == 0) { } // Full Barrier
+Console.WriteLine(_value); // ✅ 保证打印 42
+</code></pre>
+<p><strong>正确写法3：用 Thread.MemoryBarrier（最显式）</strong></p>
+<pre><code class="language-csharp">// 生产者：
+_value = 42;
+Thread.MemoryBarrier(); // 冲刷 Store Buffer，_value=42 对外可见
+_ready = true;
+
+// 消费者：
+while (!_ready) { }
+Thread.MemoryBarrier(); // 处理 Invalidate Queue
+Console.WriteLine(_value); // ✅ 保证打印 42
+</code></pre>
+<hr>
+<h3 id="threadmemorybarrier显式内存屏障的使用场景">Thread.MemoryBarrier()：显式内存屏障的使用场景</h3>
+<p>既然 <code>volatile</code> 和 <code>Interlocked</code> 已经够用，什么时候才真的需要手写 <code>Thread.MemoryBarrier()</code>？</p>
+<p><strong>场景1：对普通数组/结构体字段的批量写入，然后发布一个标志</strong></p>
+<pre><code class="language-csharp">// 初始化一个大对象的多个字段，然后发布它
+_buffer[0] = 1;
+_buffer[1] = 2;
+_buffer[2] = 3;
+// ... 写了很多字段 ...
+Thread.MemoryBarrier(); // ← 保证上面所有写入对外可见，然后才发布
+Volatile.Write(ref _isReady, true);
+</code></pre>
+<p><strong>场景2：精细控制屏障位置，避免不必要的 Full Barrier 开销</strong></p>
+<p><code>Interlocked</code> 每次都是 Full Barrier，成本相对较高。有时只需要单向屏障：</p>
+<pre><code class="language-csharp">// 只需要 Release 语义（只需要 Store Barrier）
+Thread.MemoryBarrier(); // 手动插入，比 Interlocked.Exchange 开销小
+_flag = 1;
+</code></pre>
+<blockquote>
+<p>⚠️ 这是纳秒级的极限优化，99.9% 的代码不需要。<strong>除非你在写运行时或框架底层代码，否则看到需要手写 MemoryBarrier 的场景，先质疑自己的代码结构是否有问题。</strong></p>
+</blockquote>
+<hr>
+<h3 id="常见误区汇总">常见误区汇总</h3>
+<p><strong>误区1："我在 x86 上测试没问题，就一定没问题"</strong></p>
+<p>x86 的强内存模型帮你屏蔽了大多数重排，但如果你的代码部署到 ARM 服务器（AWS Graviton、Azure Ampere、Apple Silicon）或 Android/iOS 设备，就可能出 bug。</p>
+<p><strong>误区2："用了 volatile 就线程安全了"</strong></p>
+<p>volatile 只解决可见性问题。<code>_counter++</code> 写成 <code>volatile _counter++</code> 仍然不是原子的。</p>
+<p><strong>误区3："只要不重排，就没问题"</strong></p>
+<p>即使没有指令重排，仅仅是 CPU 缓存的延迟同步（Store Buffer 未 flush），就可能导致可见性问题。</p>
+<p><strong>误区4："<code>lock</code> 只是互斥，不涉及内存"</strong></p>
+<p>错。<code>lock</code> 进入时有 Acquire 屏障，退出时有 Release 屏障，这正是 <code>lock</code> 能保证临界区内读写对外正确可见的原因。</p>
+<hr>
+<h3 id="用一张图串起来">用一张图串起来</h3>
+<pre><code>你的代码（happens-before 的约束）
+          ↕ 
+.NET 内存模型（volatile/Interlocked/lock 的语义规范）
+          ↕
+JIT 编译器（按内存模型规范生成屏障指令）
+          ↕
+CPU 硬件（MFENCE/DMB 指令 + MESI 协议保证执行正确性）
+          ↕
+其他线程实际看到的内存状态
+</code></pre>
+<p>只要你正确使用了 .NET 提供的同步原语，这个链条就是完整的，可见性和顺序性都有保证。</p>
+<hr>
+<h2 id="️-第四关用-cas-搭一个无锁栈">🏗️ 第四关：用 CAS 搭一个无锁栈</h2>
+<p>理论讲完了，来个实战。我们用 CAS 实现一个无锁栈，这个算法叫 <strong>Treiber Stack</strong>（1986 年提出，至今仍是经典）。</p>
+<pre><code class="language-csharp">public class LockFreeStack&lt;T&gt;
+{
+	private sealed class Node(T value)
+	{
+		public readonly T Value = value;
+		public Node? Next;
+	}
+
+	private volatile Node? _head;
+
+	// 无锁 Push
+	public void Push(T value)
+	{
+		var newNode = new Node(value);
+		while (true)
+		{
+			newNode.Next = _head;    // 新节点指向当前头
+			// CAS：如果 _head 还是 newNode.Next，就换成 newNode
+			if (Interlocked.CompareExchange(ref _head, newNode, newNode.Next) == newNode.Next)
+				return; // 成功！
+			// 失败了，说明有人抢先改了 _head，重新尝试
+		}
+	}
+
+	// 无锁 Pop
+	public bool TryPop(out T? value)
+	{
+		while (true)
+		{
+			Node? head = _head;
+			if (head is null) { value = default; return false; }
+
+			// CAS：如果 _head 还是 head，就换成 head.Next
+			if (Interlocked.CompareExchange(ref _head, head.Next, head) == head)
+			{
+				value = head.Value;
+				return true; // 成功！
+			}
+			// 失败了，重新尝试
+		}
+	}
+}
+</code></pre>
+<p><strong>Push 的逻辑</strong>：</p>
+<ol>
+<li>创建新节点 <code>newNode</code></li>
+<li>让 <code>newNode.Next</code> 指向当前的 <code>_head</code></li>
+<li>CAS：把 <code>_head</code> 从 <code>newNode.Next</code> 换成 <code>newNode</code></li>
+<li>如果这一瞬间 <code>_head</code> 已经被别的线程改了，重读重试</li>
+</ol>
+<p><strong>Pop 的逻辑</strong>：</p>
+<ol>
+<li>读取当前头节点 <code>head</code></li>
+<li>CAS：把 <code>_head</code> 从 <code>head</code> 换成 <code>head.Next</code></li>
+<li>如果被抢先，重读重试</li>
+</ol>
+<p>这个实现是线程安全的，而且没有锁！</p>
+<blockquote>
+<p>💡 注意：实际生产代码里，<code>System.Collections.Concurrent.ConcurrentStack&lt;T&gt;</code> 内部就是类似的无锁实现，不需要自己写。自己写只是为了理解原理。</p>
+</blockquote>
+<hr>
+<h2 id="-第五关lazyt--线程安全的懒加载">😴 第五关：Lazy&lt;T&gt; —— 线程安全的懒加载</h2>
+<p>延迟初始化（Lazy Initialization）是一个很常见的需求：某个对象创建开销很大，我希望到真正用的时候再创建。</p>
+<p>老的写法（double-check locking）既繁琐又容易出错：</p>
+<pre><code class="language-csharp">// ❌ 老写法：容易写错
+private static volatile MyService? _instance;
+private static readonly object _lock = new();
+
+public static MyService Instance
+{
+	get
+	{
+		if (_instance == null)
+		{
+			lock (_lock)
+			{
+				if (_instance == null)
+					_instance = new MyService();
+			}
+		}
+		return _instance;
+	}
+}
+</code></pre>
+<p>现代写法，用 <code>Lazy&lt;T&gt;</code>：</p>
+<pre><code class="language-csharp">// ✅ 新写法：一行搞定，默认线程安全
+private static readonly Lazy&lt;MyService&gt; _instance =
+	new(() =&gt; new MyService());
+
+public static MyService Instance =&gt; _instance.Value;
+</code></pre>
+<h3 id="lazythreadsafetymode三种模式">LazyThreadSafetyMode：三种模式</h3>
+<p><code>Lazy&lt;T&gt;</code> 有三种线程安全模式，通过 <code>LazyThreadSafetyMode</code> 枚举控制：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>说明</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ExecutionAndPublication</code>（默认）</td>
+<td>加锁，工厂函数只执行一次</td>
+<td>大多数场景</td>
+</tr>
+<tr>
+<td><code>PublicationOnly</code></td>
+<td>不加锁，多个线程可能各自执行工厂函数，但只有一个结果会被发布（CAS 竞争）</td>
+<td>工厂函数无副作用、开销极小</td>
+</tr>
+<tr>
+<td><code>None</code></td>
+<td>完全不线程安全</td>
+<td>确定单线程使用时</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-csharp">// PublicationOnly 模式：性能略好，但工厂函数可能被调用多次
+var lazy = new Lazy&lt;MyService&gt;(
+	() =&gt; new MyService(),
+	LazyThreadSafetyMode.PublicationOnly
+);
+</code></pre>
+<h3 id="lazyinitializerensureinitialized">LazyInitializer.EnsureInitialized</h3>
+<p>如果你不想用 <code>Lazy&lt;T&gt;</code> 包装类，可以用 <code>LazyInitializer.EnsureInitialized</code> 直接初始化字段：</p>
+<pre><code class="language-csharp">private static MyService? _service;
+
+// 多线程调用，保证只初始化一次
+var service = LazyInitializer.EnsureInitialized(
+	ref _service,
+	() =&gt; new MyService()
+);
+</code></pre>
+<p>它的语义是 <code>PublicationOnly</code>：允许多个线程竞争执行工厂函数，CAS 保证只有一个结果被发布。</p>
+<hr>
+<h2 id="-什么时候用无锁什么时候别碰">🚦 什么时候用无锁？什么时候别碰？</h2>
+<p>讲了这么多，最关键的问题来了：<strong>我应该什么时候用这些东西？</strong></p>
+<h3 id="-适合用无锁的场景">✅ 适合用无锁的场景</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐工具</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>简单计数器（高频递增/递减）</td>
+<td><code>Interlocked.Increment/Decrement</code></td>
+</tr>
+<tr>
+<td>简单标志位（一写多读）</td>
+<td><code>volatile bool</code></td>
+</tr>
+<tr>
+<td>单例/延迟初始化</td>
+<td><code>Lazy&lt;T&gt;</code></td>
+</tr>
+<tr>
+<td>读-改-写的原子操作</td>
+<td><code>Interlocked.CompareExchange</code></td>
+</tr>
+<tr>
+<td>性能极其敏感的并发数据结构</td>
+<td>CAS + 自旋，或直接用 .NET 内置的并发集合</td>
+</tr>
+</tbody>
+</table>
+<h3 id="-不适合不需要无锁的场景">❌ 不适合/不需要无锁的场景</h3>
+<ul>
+<li><strong>业务逻辑复杂的临界区</strong>：用 <code>lock</code> 或 <code>SemaphoreSlim</code>，正确性比性能更重要</li>
+<li><strong>没有性能瓶颈的地方</strong>：过早优化是万恶之源，先写对，再优化</li>
+<li><strong>你对内存模型不够了解的场景</strong>：无锁代码的 bug 极难复现和调试，宁可多加一个锁</li>
+</ul>
+<p><strong>一个实用的决策流程：</strong></p>
+<pre><code>是否有性能问题？
+  ├── 没有 → 用 lock，简单安全
+  └── 有 → 是否是简单的计数/标志位？
+			  ├── 是 → Interlocked / volatile
+			  └── 否 → 考虑内置并发集合（ConcurrentDictionary 等）
+						  └── 还不行 → 认真学习内存模型再写无锁代码
+</code></pre>
+<hr>
+<h2 id="-net-10-新特性systemthreadinglock">🔬 .NET 10 新特性：System.Threading.Lock</h2>
+<p>顺带一提，.NET 9/10 引入了新的 <code>System.Threading.Lock</code> 类型，比 <code>lock(object)</code> 更明确、性能更好：</p>
+<pre><code class="language-csharp">// .NET 9+ 推荐写法
+private readonly Lock _lock = new();
+
+using (_lock.EnterScope())
+{
+	// 临界区
+}
+
+// 或者用 lock 语法（编译器会自动识别 Lock 类型，生成更优化的代码）
+lock (_lock)
+{
+	// 临界区
+}
+</code></pre>
+<p>虽然这不是"无锁"，但在不需要无锁的场景里，这是更现代的选择。</p>
+<hr>
+<h2 id="-本章小结">📋 本章小结</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>解决的问题</th>
+<th>注意事项</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Interlocked.Increment/Decrement</code></td>
+<td>原子计数</td>
+<td>只适合简单加减</td>
+</tr>
+<tr>
+<td><code>Interlocked.CompareExchange</code> (CAS)</td>
+<td>无锁的条件更新</td>
+<td>需要配合自旋循环</td>
+</tr>
+<tr>
+<td><code>Interlocked.Exchange</code></td>
+<td>原子读改写</td>
+<td>无条件替换</td>
+</tr>
+<tr>
+<td><code>volatile</code></td>
+<td>保证字段的可见性</td>
+<td>不保证复合操作原子性！</td>
+</tr>
+<tr>
+<td><code>Volatile.Read/Write</code></td>
+<td>对非 volatile 字段加精确屏障</td>
+<td>用于性能敏感的精细控制</td>
+</tr>
+<tr>
+<td><code>Thread.MemoryBarrier</code></td>
+<td>显式内存屏障</td>
+<td>高级用法，大多数时候不需要</td>
+</tr>
+<tr>
+<td><code>Lazy&lt;T&gt;</code></td>
+<td>线程安全延迟初始化</td>
+<td>默认模式适合绝大多数场景</td>
+</tr>
+<tr>
+<td><code>LazyInitializer</code></td>
+<td>轻量级延迟初始化</td>
+<td>PublicationOnly 语义</td>
+</tr>
+</tbody>
+</table>
+<p><strong>核心原则</strong>：</p>
+<ol>
+<li><strong>能用高层抽象，就不要手搓底层</strong>：.NET 的并发集合（<code>ConcurrentDictionary</code>、<code>ConcurrentStack</code> 等）内部已经实现了无锁或精细锁，直接用</li>
+<li><strong>volatile ≠ Interlocked</strong>：搞清楚可见性和原子性的区别</li>
+<li><strong>CAS 自旋是无锁算法的标准模式</strong>：读→算→CAS→失败重试</li>
+<li><strong>内存模型的问题在 ARM 上更容易触发</strong>：不要只在 x86 上测试</li>
+</ol>
+<hr>
+<h2 id="-参考资料">🔗 参考资料</h2>
+<ul>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/api/system.threading.interlocked" target="_blank" rel="noopener nofollow">Interlocked Class - Microsoft Docs</a></li>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/volatile" target="_blank" rel="noopener nofollow">volatile (C# Reference) - Microsoft Docs</a></li>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/standard/threading/overview-of-synchronization-primitives" target="_blank" rel="noopener nofollow">Memory Barriers and Interlocked Operations - Microsoft Docs</a></li>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/api/system.lazy-1" target="_blank" rel="noopener nofollow">Lazy<t> Class - Microsoft Docs</t></a></li>
+<li><a href="https://en.wikipedia.org/wiki/Treiber_stack" target="_blank" rel="noopener nofollow">Treiber Stack - Wikipedia</a></li>
+<li><a href="https://csharpindepth.com/articles/singleton" target="_blank" rel="noopener nofollow">.NET Memory Model - Jon Skeet's C# in Depth</a></li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-06-06 21:12">2026-06-06 21:11</span>&nbsp;
+<a href="https://www.cnblogs.com/diamondhusky">呆萌哈士奇</a>&nbsp;
+阅读(<span id="post_view_count">50</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20350131);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdiamondhusky%2Fp%2F20350131&amp;targetId=20350131&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
