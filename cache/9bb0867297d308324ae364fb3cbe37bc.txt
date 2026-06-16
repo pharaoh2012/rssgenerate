@@ -1,0 +1,167 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/kewei/p/20578940" title="发布于 2026-06-16 17:58">
+    <span role="heading" aria-level="2">kestrel 的 ssl 行为分析</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h3 id="前言">前言</h3>
+<p>我有个项目使用了 <a href="https://github.com/xljiulang/CYarp" target="_blank" rel="noopener nofollow">CYarp</a>，相当于把 kestrel 做了对外的网关，最近给他更新 ssl 证书时，浏览器访问服务是正常的，但客户端设备的连接时炸了，表现为无法信任服务器证书。同时我发现，这个 ssl 证书放到 nginx 上，客户端设备的连接又是完全正常的，当然 kestrel 和 nginx 是同样的 linux-x64 环境。</p>
+<h3 id="问题定位">问题定位</h3>
+<p>我找来一台老的 centos 做客户端，使用 curl 来请求到 kestrel 的接口，也得到了服务器证书验证不通过的问题，然后使用 openssl 客户端来获取 kestrel 和 nginx 返回的证书链做对比：</p>
+<pre><code class="language-bash">openssl s_client -connect xxx.com:443 -showcerts
+</code></pre>
+<p>发现 nginx 返回的证书链和证书文件提供的证书链是吻合的，但 kestrel 返回的证书链短了一节，这个发现惊呆了我，因为我潜意识里都认为在 linux 上 kestrel 会完使用用户自定义指定的证书链。</p>
+<p>老的 ssl 证书还有20天的时长，这个给我有足够长的时间来分析 kestrel 的 ssl 行为了。</p>
+<h3 id="分析-servercertificatechain">分析 ServerCertificateChain</h3>
+<blockquote>
+<p>先提供结论：kestrel 目前只能读取到 Endpoint 下配置的 pem 格式证书文件的证书链，其它三种情况都有BUG。</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>证书配置位置</th>
+<th>证书文件类型</th>
+<th>证书链读取</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Endpoint</td>
+<td>PEM</td>
+<td>√</td>
+</tr>
+<tr>
+<td>Endpoint</td>
+<td>Pfx</td>
+<td>×</td>
+</tr>
+<tr>
+<td>Default</td>
+<td>PEM</td>
+<td>×</td>
+</tr>
+<tr>
+<td>Default</td>
+<td>Pfx</td>
+<td>×</td>
+</tr>
+</tbody>
+</table>
+<p>遇到问题不要慌，先 AI 分析一波，AI 告诉要设置 ServerCertificateChain</p>
+<pre><code class="language-csharp">builder.WebHost.ConfigureKestrel(kestrel =&gt;
+{
+    kestrel.ConfigureHttpsDefaults(https =&gt;
+    { 
+        https.ServerCertificateChain = 自己实现从证书文件读取;
+    });
+});
+</code></pre>
+<p>我有点想怼 AI，kestrel 不可能不读取证书文件的证书链，于是我加了行 ServerCertificateChain 不为 null 的断言，同时在配置文件的默认证书了放了 ssl 证书：</p>
+<pre><code class="language-csharp">builder.WebHost.ConfigureKestrel(kestrel =&gt;
+{
+    kestrel.ConfigureHttpsDefaults(https =&gt;
+    { 
+        https.OnAuthenticate = (context, options) =&gt;
+        {
+            Debug.Assert(https.ServerCertificateChain is not null);
+        };
+    });
+});
+</code></pre>
+<pre><code class="language-json">{
+  "Kestrel": {
+    "Endpoints": {
+      "Https": {
+        "Url": "https://*:443"       
+    },
+    "Certificates": {
+      "Default": {
+        "Path": "certs/test_bundle.crt",
+        "KeyPath": "certs/test.key"
+      }
+    }
+  }
+}
+</code></pre>
+<p>结果还真炸起来了，Debug.Assert 断言不通过！<br>
+这泥马 https.ServerCertificateChain 为 null，证书链短一节我一点都不觉得荒唐了，但为什么为 null 呢，我翻了 ASP.NET core 的 issues，找到25年3月报告的一个问题：<a href="https://github.com/dotnet/aspnetcore/issues/60709" target="_blank" rel="noopener nofollow">Kestrel inconsistent certificate chain handling between endpoint and default configuration</a>，描述的是证书放到 Default 节点后，表现为和放到 Endpoint(Https) 节点不一样，我们现在把配置文件改成如下：</p>
+<pre><code class="language-json">{
+  "Kestrel": {
+    "Endpoints": {
+      "Https": {
+        "Url": "https://*:443",
+        "Certificate": {
+            "Path": "certs/test_bundle.crt",
+            "KeyPath": "certs/test.key"
+        }
+      }  
+    }
+  }
+}
+</code></pre>
+<p>现在能读取到 ServerCertificateChain，看来AI说得没错，https.ServerCertificateChain = 自己实现从证书文件读取，可以弥补 Default 证书不读取证书链的问题，假设我们手动设置了 ServerCertificateChain，证书也是配置在Endpoint下，最终保留的来源于哪里的证书链呢？做了以下实验后，发现是证书文件的证书链优先。</p>
+<pre><code class="language-csharp">builder.WebHost.ConfigureKestrel(kestrel =&gt;
+{
+    kestrel.ConfigureHttpsDefaults(https =&gt;
+    { 
+        // 手动设置 ServerCertificateChain
+        https.ServerCertificateChain = [];
+        https.OnAuthenticate = (context, options) =&gt;
+        {
+            // 断言成立，如果能读取到证书文件的证书链，手动设置的 ServerCertificateChain 会被覆盖
+            Debug.Assert(https.ServerCertificateChain is not null &amp;&amp; https.ServerCertificateChain.Count &gt; 0);
+        };
+    });
+});
+</code></pre>
+<p>我把证书格式改成带证书链的 pfx，配置在 Endpoint 节下，发现 kestrel 读取到的证书链不为 null ，但总是 0 个元素，翻看最新的源码，看到 kestrel 目前只简单粗暴的通过 <code>X509Certificate2Collection.ImportFromPemFile())</code> 来读取证书链，对于 pfx 格式，这肯定 import 不到内容哈。</p>
+<h3 id="使用-servercertificatechain">使用 ServerCertificateChain</h3>
+<p>经过上述深入的分析，只要我们使用 PEM 格式的证书文件，并且配置在 Endpoint 节下，那么 kestrel 就能使用上证书文件里提供的中间证书，最后生成和 nginx 一样的证书链。</p>
+<p>我迫不及待地搭建了一个测试服务器，用上和 nginx 一样的 PEM 证书，满怀信心地使用 openssl 客户端来验证，可我发现还是验证不通过!</p>
+<p>我确定 kestrel 已经从 PEM 证书文件里原封地读取到了证书链且设置了 https.ServerCertificateChain，但在 tls 握手时，服务器响应的证书链变短了。</p>
+<p>翻看了 <a href="https://github.com/dotnet/aspnetcore/blob/v10.0.9/src/Servers/Kestrel/Core/src/Middleware/HttpsConnectionMiddleware.cs#L112" target="_blank" rel="noopener nofollow">HttpsConnectionMiddleware</a> 源码，发现 serverCertificateContext 的构建方式是依赖于系统证书 store，https.ServerCertificateChain 只不过是其构建过程中可能用到的辅料罢了，或者说几乎所有服务器操作系统环境，https.ServerCertificateChain 有值或为 null ，生成的 serverCertificateContext 一般都不会有差异。</p>
+<p>我们通过自定义生成 ServerCertificateContext 并应用到 kestrel，最终发现生成的证书链和 nginx 的完全一样，在客户端设备上进行 https 连接成功。</p>
+<pre><code class="language-csharp">builder.WebHost.ConfigureKestrel(kestrel =&gt;
+{
+    kestrel.ConfigureHttpsDefaults(https =&gt;
+    {
+        https.OnAuthenticate = (context, options) =&gt;
+        {
+            var chain = https.ServerCertificateChain;
+            Debug.Assert(chain is not null &amp;&amp; chain.Count &gt; 0);
+
+            // ServerCertificateContext 要缓存，不能每次 OnAuthenticate 都创建新的 ServerCertificateContext，否则性能会非常差。
+            var serverCertificate = options.ServerCertificate as X509Certificate2;
+            var trust = SslCertificateTrust.CreateForX509Collection(chain);
+            options.ServerCertificateContext = SslStreamCertificateContext.Create(serverCertificate!, chain, false, trust);
+        };
+    });
+});
+</code></pre>
+<h3 id="通用避坑方案">通用避坑方案</h3>
+<p>我想实现一个避坑库，让使用者加一行代码，就能避开 kestrel 的上述行为，而开发者的项目的证书文件类型能继续保留为 pfx 格式，也允许只配置默认证书为所有 https Endpoint 共享，同时要求这个库不能影响到开发者既有的 https 配置委托代码或 Endpoint 配置委托代码的执行，也不能让 https tls握手时的性能不可接受的下降。</p>
+<p>我做了很久的构思，在实现上推倒了又重来多次，终于实现了一个相对高效的 OnAuthenticate 实现，最终让 kestrel 的证书链结果与 nginx 的一致，库命名为 <a href="https://github.com/xljiulang/ServerCertificateChain.Kestrel" target="_blank" rel="noopener nofollow">ServerCertificateChain.Kestrel</a>。</p>
+<h3 id="总结">总结</h3>
+<p>我建议大家没事别把 kestrel ssl 裸奔，因为 kestrel 在 ssl 这块兼容性不像 nginx 那样坚如磐石。最后不管有没有 ssl 裸奔，也可以都了解一下 kestrel 目前在 ssl 上的不足。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-06-16 17:59">2026-06-16 17:58</span>&nbsp;
+<a href="https://www.cnblogs.com/kewei">jiulang</a>&nbsp;
+阅读(<span id="post_view_count">27</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20578940);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fkewei%2Fp%2F20578940&amp;targetId=20578940&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
