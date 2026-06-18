@@ -1,0 +1,124 @@
+
+		<h1 class="postTitle">
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xingzheanan/p/20626804" title="发布于 2026-06-18 12:02">
+    <span role="heading" aria-level="2">并发性能优化复盘</span>
+    
+
+</a>
+
+		</h1>
+		<div class="clear"></div>
+		<div class="postBody">
+			<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<hr>
+<p>上周服务治理系统的同事（注意不是客户）发现一个问题，他调用的 api 接口不稳定。有时候正常，有时候报错，关键是大部分时候都是报错。</p>
+<p>更关键的是这个接口是我开发的。</p>
+<p>好吧，理所当然的他来找我。第一时间“男人的第六感”告诉我是后端服务处理时间太长了，导致客户端在超时时间内未处理完成。要不把 timeout 改大点？在一想咱是干开发的，不能治标不治本。</p>
+<p>于是，开始接口优化之路。</p>
+<p>这个接口的大致情况是这样：</p>
+<ol>
+<li>服务治理系统调用 <code>/environments/list</code> 获取平台的所有环境，假设每个环境对应一个 kubernetes 集群。我们的平台大概有 30 个环境。</li>
+<li>服务治理系统调用 <code>/environments/:name/resouce</code> 获取对应环境下资源。</li>
+<li>后端 <code>environments/:name/resource</code>  会并发起多个协程访问代理系统的 api，获取到结果并处理后返回给调用方。</li>
+</ol>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1498760/202606/1498760-20260618115859827-594368028.png" class="lazyload"></p>
+<p>服务治理系统的使用场景是：</p>
+<ol>
+<li>每天晚上调用 <code>environments/list</code> 获取平台的所有环境，然后遍历调用 <code>/environments/:name/resource</code> 获取所有环境下的资源。</li>
+<li>服务治理系统只调用一次，不会重复/并发调用。</li>
+</ol>
+<p>我们首先排查 <code>/environments/list</code> api，<code>postman</code> 调用发现第一次调用 30ms，第二次调用 4ms。</p>
+<p>前后调用差这么大是因为我们用了缓存，<code>client-go</code> 第一次获取资源会缓存资源到内存，第二次调用直接从内存中拿资源。这是合理的，在开发初期也和调用方说过了。</p>
+<p>看起来这个 api 不需要怎么优化，就算是 30ms 也是可以接受的。</p>
+<p>继续排查 <code>/environments/:name/resource</code> api，<code>postman</code> 调用花费一分多钟，第二次调用花费 50 多秒。<br>
+这还得了，1 个环境花费一分钟，三十个环境要 30 分钟。叔可以忍，婶都不能忍。</p>
+<p>确定了问题 api，我们继续深入看逻辑。看到日志打印里有很多 error:</p>
+<pre><code class="language-bash">tenant xxx can not access to tenant xxxx
+</code></pre>
+<p>为什么租户 xxx 不能访问 xxxx 呢？配置信息都是客户配好的，不太会配置这么多错的啊。</p>
+<p>虽然心里有点疑问，但是还是相信代码没有问题。接着看逻辑，突然好像发现了一个并发竞态问题。问题是这样：</p>
+<ol>
+<li>为了加速 api 的响应，后端创建 20 个协程并发访问代理系统接口获取信息并处理。</li>
+<li>并发协程会创建自己的代理系统客户端，然后拿着这个客户端请求代理系统 api。</li>
+<li>并发协程的代理系统客户端，有一部分配置是公用的，一部分是协程独有的。</li>
+</ol>
+<p>为了降低客户端的创建，减少内存。我们用 <code>sync.Once</code> 包创建通用客户端，然后协程定制通用客户端。示例如下：</p>
+<pre><code class="language-go">type proxyClient struct {
+	proxyAdress string    // 通用配置
+	tenant      string    // 协程独有配置
+}
+
+func (c *proxyClient) Request() {
+	// 请求代理系统获取响应
+}
+
+// 并发调用 New 创建代理系统客户端
+func New(adress string, tenant string) *proxyClient {
+	var c = new(proxyClient)
+	once.Do(
+		c = &amp;proxyClient{proxyAdress: adress}
+		}
+	)
+	c.tenant = tenant  // 1
+	return c
+}
+</code></pre>
+<p>这里问题在于 1 ，这里并发访问客户端的共享资源 <code>tenant</code> 会导致竞态。既然找到了问题，解决就不难了，我们把客户端拆成 base 客户端和协程客户端。base 客户端是共用的，而协程客户端是协程专用的。</p>
+<p>接着在请求发现日志 <code>tenant xxx can not access to tenant xxxx</code> 报错消失了。没想到性能优化的第一站是修复 bug 🤦</p>
+<p>现在业务逻辑看起来没问题了。继续优化性能。我们发现 <code>client-go</code> 在缓存资源时大概需要 20ms 左右，整个 api 用时 1m 左右。</p>
+<p>那么第一个优化思路来了，可以把缓存逻辑提前吗？我们在程序启动时预热缓存，这样调用 api 直接从缓存中拿数据就行。</p>
+<p>说干就干，优化之后在此请求大概在 40s 左右，单个 api 表现不错（别忘了，我们还有 30个环境呢）。</p>
+<p>在问了调用方，他们的超时时间设置了 3分钟，我们的 40s 1 个环境处理速度，极大概率还是超时，还得优化。</p>
+<p>我们发现后端有两个系统代理 api 请求是无关联的，但是在协程内是串形执行的，我们统计发现两个 api 调用时间差不多都是 50ms 左右。<br>
+如果串形执行这两个 api 需要 100ms 左右。如果并行执行会不会到 50ms 左右？这样多个并发请求时间省下来应该也挺可观的。能不能优化这里，让两个 api 并发执行呢？</p>
+<p>我们开始并发这两个 api（红色框），示意图如下：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1498760/202606/1498760-20260618120044066-1145757584.png" class="lazyload"></p>
+<p>接着调用 api，结果让我们大跌眼镜。不仅时间没减少反而变多了，请求花了 1m30s 左右，脑子里蹦出来一句国骂：ri 了 dog 了...</p>
+<p>好吧😑，既然结果是这样只能接受了。</p>
+<p>平复好心情我们在分析整体的接口是 IO 阻塞型的，大部分时间协程都是在等待代理系统的响应。代理系统是我们不想碰的，我们只想优化我们的平台系统接口。</p>
+<p>那能不能继续加大并发，多个协程并发等 IO 请求。虽然单个请求时间没变，但是并发处理的请求多啊。</p>
+<p>有了这个想法，我们把并发请求从 20 提升到 100。</p>
+<p>继续调用 api，“奇迹出现了” 我们的接口花了 20s 左右，意味着我们砍掉了一半的时间，太棒了！</p>
+<p>从全局来看，服务治理系统每个环境调用一次 api，每次调用需要预热缓存，然后创建 100 个并发协程。<br>
+这样也会有问题：</p>
+<ol>
+<li>每次调用都需要预热缓存，实际只需要预热一次就够了。</li>
+<li>每次调用创建 100 个协程，go 运行时需要管理这 100 个协程的创建/销毁/复用/调度，增加了运行时的负担。</li>
+</ol>
+<p>我们可以为系统提供一个新的 api 以解决上述问题，新的 api 对所有环境只需要预热一次缓存，并且所有环境只创建 100 个协程处理，不用每次调用创建 100 个协程，减轻了运行时压力。</p>
+<p>我们用这个新 api 做测试，调用花费了 2m30s 左右，满足客户端调用 3m 超时的限制（后来才知道客户端其实设置的是 5m 的超时）。</p>
+<p>太棒了！现在问题解决了，但是还有一个疑问没解决：为什么并发那两个协程请求时间不降反升呢？</p>
+<p>笔者想可能是理论上并发，实际是 go 运行时的压力大了，本来串形调用，虽然是阻塞 IO 但是阻塞时间并不长，只有 50ms 左右。现在不仅要阻塞，还要调度协程，算下来时间反而超过了串形执行时间。</p>
+<p>一句话就是 go 运行时压力增加了（由于内网开发环境限制，笔者没有用 pprof 证实是不是运行时调度花了时间）。</p>
+<p>后来在 <a href="" rel="noopener nofollow">《Concurrency in Go 中文笔记》</a>一书中看到作者说的几种情况非常贴近我们的实践：</p>
+<pre><code class="language-bash">扇出（Fan-out）是一个术语，用于描述启动多个goroutines以处理来自管道的输入的过程，并且扇入（fan-in）是描述将多个结果组合到一个通道中的过程的术语。
+
+那么在什么情况下适用于这种模式呢？如果出现以下两种情况，你就可以考虑这么干了：
+
+- 不依赖模块之前的计算结果。
+- 运行需要很长时间。
+</code></pre>
+<p>我们这里要并发（扇出）那两个协程但是运行时间很短，不满足这里的运行需要很长时间情况，导致请求时间不降反增。</p>
+<pre><code class="language-bash">对于 IO 阻塞型可增大并发量来降低时间
+</code></pre>
+<p>这里我们就是通过增大并发量来降低时间的，正好对应上了。</p>
+<hr>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    芝兰生于空谷，不以无人而不芳。
+</div>
+<div class="clear"></div>
+
+		</div>
+		<div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-06-18 12:03">2026-06-18 12:02</span>&nbsp;
+<a href="https://www.cnblogs.com/xingzheanan">胡云Troy</a>&nbsp;
+阅读(<span id="post_view_count">161</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20626804);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxingzheanan%2Fp%2F20626804&amp;targetId=20626804&amp;targetType=0" target="_blank">举报</a>
+</div>
+	
