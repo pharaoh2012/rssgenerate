@@ -1,0 +1,263 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/RainbowC0/p/20343006" title="发布于 2026-06-19 22:42">
+    <span role="heading" aria-level="2">CUDA软件实现跨线程块同步</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文针对CUDA设备端跨线程块同步需求，在计算能力低于9.0（如RTX 4090 8.9、V100 7.0）无法使用集群同步的情况下，通过分析协作组grid.sync()源码，揭示了其基于屏障变量原子自增与符号位翻转的软件实现机制。借鉴该原理，设计并实现了一种自定义的跨块同步函数sync_ctas，兼容低计算能力设备。测试表明，该软件方案正确完成同步且性能优于原生网格同步（约1.1~3.5倍），为小批量数据多线程块协同处理提供了高效可行的替代方案。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p></p><div class="toc"><div class="toc-container-header">目录</div><ul><li><a href="#cuda-线程同步" rel="noopener nofollow">CUDA 线程同步</a></li><li><a href="#协作组同步" rel="noopener nofollow">协作组同步</a></li><li><a href="#grid_groupsync-源码分析" rel="noopener nofollow">grid_group::sync() 源码分析</a></li><li><a href="#实现自定义跨块同步" rel="noopener nofollow">实现自定义跨块同步</a></li><li><a href="#测试" rel="noopener nofollow">测试</a></li><li><a href="#小结" rel="noopener nofollow">小结</a></li></ul></div><p></p>
+<p>笔者的毕设项目与 CUDA 相关，最近需要实现设备端跨线程块同步操作。查阅了相关 API 后发现有一个集群（Cluster）同步操作可用，但是集群需要计算能力 9.0+，而服务器配备 RTX 4090（计算能力 8.9），一些云算力提供 V100（计算能力 7.0）、T4（计算能力 7.5）均不达要求。最终参考了协作组的网格同步函数实现了兼容低计算能力的自定义跨线程块同步。</p>
+<h2 id="cuda-线程同步">CUDA 线程同步</h2>
+<p>传统 CUDA 编程模型是面向线程的单指令多线程（Single-Instruction Multi-Thread, SIMT）模型，线程结构从高到低分为网格（grid）、线程块（block）、线程束（warp）、线程（thread）。</p>
+<p>启动一个核函数（kernel）时，会把它分配到一个流多处理器（Streaming Multiprocessor, SM）上的多个流处理器（Streaming Processor, SP）上。受 SM 的寄存器等资源限制，GPU 会以 32 个线程组成一个线程束（warp）进行调度。线程束是调度和运行的基本单位。Volta 架构（计算能力 7.0）之前，线程束内的所有线程共享程序计数器（PC），并行执行相同的指令；从 Volta 架构开始，每个束内线程拥有独立的 PC，实现了更灵活的 SIMT 模型。</p>
+<p>当一个并行任务存在多个步骤及数据依赖时，需要等待前一步所有线程执行完毕后才能执行后一步任务，这需要线程同步。CUDA 支持三种级别的线程同步：</p>
+<ul>
+<li><strong>网格同步</strong>：当一个网格的所有线程均完成一个步骤后进行同步。主机端可以将任务按照步骤拆分为多个 kernel 依次执行实现网格同步，设备端则需要借助协作线程组执行<code>grid.sync()</code>实现。</li>
+<li><strong>线程块同步</strong>：当一个线程块内的所有线程均完成一个步骤后进行同步。设备端通过<code>__syncthreads()</code>原语或者<code>__barrier_sync()</code>实现。</li>
+<li><strong>线程束同步</strong>：当一个线程束内的所有线程均完成一个步骤后进行同步。Volta 架构之前线程束始终同步执行，之后需要通过设备端原语<code>__sync_warp()</code>实现。</li>
+</ul>
+<p>当并行处理批量数据时，如果一条数据分配到一个线程块，那么内部使用<code>__syncthreads()</code>即可。然而，面对小批量数据时，这种分配方式导致 SM 利用率低下，通常需要将单个数据分配到多个线程块以充分利用 SM 资源。</p>
+<h2 id="协作组同步">协作组同步</h2>
+<p>CUDA 9 引入协作组（Cooperative Groups）用于组织通信线程组。协作组提供了更多层级的通信线程组划分与同步方法。协作组相关功能需要通过<code>cooperative_groups.h</code>引入，除了提供了网格、线程块、线程束级别的协作组同步功能，还支持集群、线程块分片（thread block tile）等介于不同级别之间的协作组。</p>
+<p>使用较多的是网格同步，通过<code>cooperative_groups::this_grid()</code>取得当前网格协作组后，调用<code>grid_group::sync()</code>方法可进行网格同步。集群介于网格和线程块之间，由多个线程块组成，通过<code>cooperative_groups::this_cluster().sync()</code>进行集群同步。CUDA API 中网格同步使用软件实现，而集群同步使用<code>__cluster_barrier_arrive()</code>和<code>__cluster_barrier_wait()</code>等原语实现，要求计算能力 9.0 及以上。为了实现低计算能力的类似集群同步功能，我们可以参考网格同步来软件实现。</p>
+<h2 id="grid_groupsync-源码分析">grid_group::sync() 源码分析</h2>
+<p>以 CUDA 12.8 版本 API 源码为例，查看<code>grid_group::sync()</code>源码：</p>
+<pre><code class="language-cpp">_CG_QUALIFIER void sync() const {
+    if (!is_valid()) {
+        _CG_ABORT();
+    }
+    details::grid::sync(&amp;_data.grid.gridWs-&gt;barrier);
+}
+</code></pre>
+<p><code>is_valid()</code>用于验证<code>_data.grid.gridWs</code>是否非空，<code>_data.grid.gridWs-&gt;barrier</code>是当前网格的一个屏障变量。继续查看<code>details::grid::sync()</code>源码：</p>
+<pre><code class="language-cpp">_CG_STATIC_QUALIFIER void sync(unsigned int *bar) {
+    unsigned int token = details::sync_grids_arrive(bar);
+    details::sync_grids_wait(token, bar);
+}
+</code></pre>
+<p>可以看到同步操作分为同步到达和同步两步。先查看<code>details::sync_grids_arrive()</code>源码：</p>
+<pre><code class="language-cpp">typedef unsigned int barrier_t;
+
+_CG_STATIC_QUALIFIER bool is_cta_master() {
+    return (threadIdx.x + threadIdx.y + threadIdx.z == 0);
+}
+
+_CG_STATIC_QUALIFIER unsigned int sync_grids_arrive(volatile barrier_t *arrived) {
+    unsigned int oldArrive = 0;
+
+    __barrier_sync(0); // 块内同步
+
+    if (is_cta_master()) { // CTA内主线程
+        unsigned int expected = gridDim.x * gridDim.y * gridDim.z; // 待同步的线程数量。每个线程块取一个主线程，即线程块的总数
+        bool gpu_master = (blockIdx.x + blockIdx.y + blockIdx.z == 0); // 判断网格内主线程块
+        unsigned int nb = 1; // 屏障自增量
+
+        if (gpu_master) {
+            // 主块的自增量需要单独设置，保证所有nb之和为0x80000000
+            nb = 0x80000000 - (expected - 1);
+        }
+
+NV_IF_ELSE_TARGET(NV_PROVIDES_SM_70,
+        // Barrier update with release; polling with acquire
+        // SM 7.0 以上使用带有release语义的原子自加
+        asm volatile("atom.add.release.gpu.u32 %0,[%1],%2;" : "=r"(oldArrive) : _CG_ASM_PTR_CONSTRAINT((unsigned int*)arrived), "r"(nb) : "memory");
+        ,
+        // Fence; barrier update; volatile polling; fence
+        // 否则使用内存屏障&amp;原子相加
+        __threadfence();
+        oldArrive = atomicAdd((unsigned int*)arrived, nb);
+        );
+    }
+    // 返回为自增前的屏障值
+    return oldArrive;
+}
+</code></pre>
+<p>在此我们可以看到该同步屏障变量的使用方式。<code>sync_grids_arrive()</code>通过<code>__barrier_sync(0)</code>进行线程块同步，并通过<code>is_cta_master()</code>选择块内第一个线程来更新<code>arrived</code>屏障避免块内冲突；对于GPU/网格内的主线程，设置<code>nb = 0x80000000 - (expected - 1)</code>以保证所有屏障自增量<code>nb</code>之和为 0x80000000。这样一来，当屏障初始化为 0 时，执行依次网格同步后取值为 0x80000000，再次执行则恢复到 0，屏障可以循环使用。</p>
+<pre><code class="language-cpp">_CG_STATIC_QUALIFIER bool bar_has_flipped(unsigned int old_arrive, unsigned int current_arrive) {
+    return (((old_arrive ^ current_arrive) &amp; 0x80000000) != 0);
+}
+
+_CG_STATIC_QUALIFIER void sync_grids_wait(unsigned int oldArrive, volatile barrier_t *arrived) {
+    if (is_cta_master()) { // 仅 CTA 内主线程处理
+NV_IF_ELSE_TARGET(NV_PROVIDES_SM_70,
+        // 计算能力不低于 7.0 时使用带有 acquire 语义得加载指令读取屏障变量，并与屏障旧值比较符号
+        unsigned int current_arrive;
+        do {
+            asm volatile("ld.acquire.gpu.u32 %0,[%1];" : "=r"(current_arrive) : _CG_ASM_PTR_CONSTRAINT((unsigned int *)arrived) : "memory");
+        } while (!bar_has_flipped(oldArrive, current_arrive));
+        ,
+        // 否则直接读取比较，并用内存屏障保证内存可见性
+        while (!bar_has_flipped(oldArrive, *arrived));
+        __threadfence();
+        );
+    }
+
+    __barrier_sync(0); // 线程块同步
+}
+</code></pre>
+<p><code>sync_grids_wait()</code>通过循环等待屏障变量最高位变动（0→0x80000000，0x80000000→0）实现同步。</p>
+<h2 id="实现自定义跨块同步">实现自定义跨块同步</h2>
+<p>笔者遇到的场景是需要对<code>blockIdx.y</code>相同的多个<code>blockIdx.x</code>不同线程块进行同步。基于以上分析，我们可以为<code>blockIdx.y</code>相同的每一组线程设定一个屏障变量 barrier，然后将组内同步数量<code>expected</code>设为<code>gridDim.x * gridDim.z</code>、主块判断<code>gpu_master</code>设定为<code>blockIdx.x == 0 &amp;&amp; blockIdx.z == 0</code>，即可达到效果。同步函数如下：</p>
+<pre><code class="language-cpp">// sync_ctas.cuh
+#pragma once
+#define bar_has_flipped(a,b) ((((a)^(b))&amp;0x80000000)!=0)
+__device__ __inline__ void sync_ctas(unsigned *bar) {
+  unsigned nb = blockIdx.x == 0 ? 0x80000000 - (gridDim.x - 1) : 1;
+  if (threadIdx.x == 0) {
+    unsigned oldarr, cuarr;
+#if __CUDA__ARCH__ &gt;= 700
+    asm __volatile__("atom.add.release.gpu.u32 %0,[%1],%2;":"=r"(oldarr):"l"(bar),"r"(nb):"memory");
+#else
+    __threadfence();
+    oldarr = atomicAdd(bar, nb);
+#endif
+    do {
+#if __CUDA_ARCH__ &gt;= 700
+      asm __volatile__("ld.acquire.gpu.u32 %0,[%1];":"=r"(cuarr):"l"(bar):"memory");
+#else
+      cuarr = *(volatile unsigned*)bar;
+#endif
+    } while (!bar_has_flipped(oldarr, cuarr));
+#if __CUDA_ARCH__ &lt; 700
+    __threadfence();
+#endif
+  }
+  __barrier_sync(0);
+}
+</code></pre>
+<h2 id="测试">测试</h2>
+<p>通过以下代码验证该同步功能。该代码实现了对一个数组的簇内分段重置，并与网格同步进行对比。</p>
+<pre><code class="language-cpp">#include &lt;cooperative_groups.h&gt;
+#include "sync_ctas.cuh"
+#define CHECK(code) \
+  {auto c=(code);\
+  if (c!=cudaSuccess) {\
+    fprintf(stderr, __FILE__":%d: %s\n", __LINE__, cudaGetErrorString(c));\
+    abort();\
+  }}
+namespace cg = cooperative_groups;
+ 
+template &lt;bool grid_sync&gt;
+__device__ __inline__ void sync(unsigned *barrier) {
+  if constexpr (grid_sync) {
+    cg::this_grid().sync();
+  } else {
+    sync_ctas(barrier);
+  }
+}
+ 
+template &lt;bool grid_sync, bool verify=false&gt;
+__global__ void reset(int *arr, unsigned l, unsigned *barriers) {
+  auto &amp;cid = blockIdx.x;
+  auto &amp;id = blockIdx.y;
+  auto barrier = barriers + id;
+  arr += l * id;
+  int val = 0;
+  // 重置10次
+  for (int j=0; j&lt;10; j++) {
+    // 多块协同重置arr
+    for (unsigned i=cid * blockDim.x + threadIdx.x; i &lt; l; i += blockDim.x * gridDim.x) {
+      arr[i] = val;
+    }
+    sync&lt;grid_sync&gt;(barrier);
+    if constexpr (verify) { // 单个线程校验同步逻辑正确
+      if (threadIdx.x == 0 &amp;&amp; cid == 0 &amp;&amp; id == 0) {
+        for (unsigned i=0; i &lt; l; i++) {
+          if (arr[i] != val) {
+            printf("err %d\n", id);
+            break;
+          }
+        }
+      }
+      sync&lt;grid_sync&gt;(barrier);
+    }
+    val = ~val;
+  }
+}
+ 
+int main() {
+  int l = 512;
+  int *arr;
+  unsigned *barr;
+  cudaMalloc(&amp;arr, l*32*sizeof(int));
+  cudaMalloc(&amp;barr, 32*sizeof(unsigned));
+  cudaMemsetAsync(barr, 0, 32*sizeof(unsigned));
+  cudaEvent_t st, mid, s2, end;
+  dim3 gd(4,32,1), bd(128,1,1);
+  cudaEventCreate(&amp;st);
+  cudaEventCreate(&amp;mid);
+  cudaEventCreate(&amp;s2);
+  cudaEventCreate(&amp;end);
+  // 校验效果
+  void *args[] = {&amp;arr, &amp;l, &amp;barr};
+  cudaLaunchKernel(reset&lt;false, true&gt;, gd, bd, args, 0, 0);
+  // 比较耗时
+  cudaEventRecord(st);
+  cudaLaunchKernel(reset&lt;false&gt;, gd, bd, args, 0, 0);
+  cudaEventRecord(mid);
+  cudaEventRecord(s2);
+  cudaLaunchCooperativeKernel(reset&lt;true&gt;, gd, bd, args, 0, 0);
+  cudaEventRecord(end);
+  cudaDeviceSynchronize();
+  float elp;
+  cudaEventElapsedTime(&amp;elp, st, mid);
+  printf("ctas_sync %g ms\n", elp);
+  cudaEventElapsedTime(&amp;elp, s2, end);
+  printf("grid_sync %g ms\n", elp);
+  cudaFree(arr);
+  cudaFree(barr);
+  cudaEventDestroy(st);
+  cudaEventDestroy(mid);
+  cudaEventDestroy(s2);
+  cudaEventDestroy(end);
+  CHECK(cudaGetLastError());
+  return 0;
+}
+</code></pre>
+<p>在 RTX 4090（24G）显卡上测试，多次运行结果如下：</p>
+<pre><code class="language-shellsession">root@node12:~# ./a.out
+ctas_sync 0.013312 ms
+grid_sync 0.047104 ms
+root@node12:~# ./a.out
+ctas_sync 0.011264 ms
+grid_sync 0.012288 ms
+root@node12:~# ./a.out
+ctas_sync 0.012288 ms
+grid_sync 0.017408 ms
+root@node12:~# ./a.out
+ctas_sync 0.011264 ms
+grid_sync 0.012288 ms
+root@node12:~# ./a.out
+ctas_sync 0.022528 ms
+grid_sync 0.070656 ms
+</code></pre>
+<p>可以看到验证核函数没有输出错误字段，说明同步功能正常；输出中软件多块同步始终比网格同步更快（约1.1x~3.5x），证明了软件簇同步比网格同步更高效。</p>
+<h2 id="小结">小结</h2>
+<p>本文探讨了 CUDA 的线程同步方式，并阅读协作组网格同步源码，在此基础上实现了软件级的多组同步，并通过测试验证了该方案的有效性。</p>
+<hr>
+<p>原文链接：<a href="https://www.cnblogs.com/RainbowC0/p/20343006" target="_blank">https://www.cnblogs.com/RainbowC0/p/20343006</a>，未经作者许可禁止转载。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-06-19 22:43">2026-06-19 22:42</span>&nbsp;
+<a href="https://www.cnblogs.com/RainbowC0">RainbowC0</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20343006);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FRainbowC0%2Fp%2F20343006&amp;targetId=20343006&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
