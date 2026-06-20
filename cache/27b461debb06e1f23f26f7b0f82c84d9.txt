@@ -1,0 +1,288 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Goblinscholar/p/20654161" title="发布于 2026-06-19 16:31">
+    <span role="heading" aria-level="2">深度学习进阶（三十一）FlashAttention：IO 感知的精确注意力</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><a href="https://www.cnblogs.com/Goblinscholar/p/20577098" target="_blank">上一篇</a>我们把现代大模型的五个核心模块拼回了 LLaMA 这个完整案例中，可以看到注意力机制仍然是计算最密集的部分。</p>
+<p>而这个密集程度在序列变长时，会变得越来越恐怖：</p>
+<blockquote>
+<p><strong>标准自注意力的计算复杂度和空间复杂度都是 <span class="math inline">\(O(n^2)\)</span>：序列长度翻倍，计算量翻四倍，内存占用也翻四倍。</strong></p>
+</blockquote>
+<p>而在之前，我们用 <a href="https://www.cnblogs.com/Goblinscholar/p/20373378" target="_blank">KV Cache</a> 解决了<strong>推理阶段</strong>的重复计算问题，但<strong>训练和长序列推理中的注意力计算本身</strong>，仍然是一个巨大的计算瓶颈。<br>
+因此，在展开正式多模态前，会再插入几篇现代工程优化技术的相关内容作为支撑。</p>
+<p>一直以来，针对 Attention 的计算量问题主要有两条路线：</p>
+<ol>
+<li><strong>近似注意力</strong>：如稀疏注意力、低秩近似等，总结来说就是压缩，用质量换速度。</li>
+<li><strong>更好的硬件利用</strong>：充分利用 GPU 的计算单元，让显存的数据搬运不再成为瓶颈，这也是现代 LLM 的主流。</li>
+</ol>
+<p>22 年的论文：<a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener nofollow"><strong><em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em></strong></a> 走的就是第二条路。</p>
+<p>它不仅没有牺牲精度，反而在注意力计算上实现了 2-4 倍的实际加速，并将注意力<strong>中间结果的显存占用</strong>从 <span class="math inline">\(O(n^2)\)</span> 降到了 <span class="math inline">\(O(n)\)</span>。 其核心观点是：</p>
+<blockquote>
+<p><strong>注意力计算慢，不是计算量太大，而是显存搬运太频繁。</strong></p>
+</blockquote>
+<p>这一技术涉及到 GPU 相关的硬件知识，因此先行补充：</p>
+<h1 id="1--gpu-上的注意力">1.  GPU 上的注意力</h1>
+<h2 id="11-计算指标和-gpu-核心构建">1.1 计算指标和 GPU 核心构建</h2>
+<p>我们知道支撑 LLM 庞大算力的基础设施是 GPU，因此要理解 FlashAttention，首先需要理解 GPU 是怎么工作的。</p>
+<p>先展开两个核心指标：</p>
+<ol>
+<li><strong>FLOPs（Floating Point Operations）</strong>：指浮点运算次数，代表“<strong>计算量</strong>”。也就是 GPU 的计算单元需要做多少次乘法和加法，衡量的是算法的算力消耗。</li>
+<li><strong>IO（Input/Output）</strong>：指数据在不同内存之间的搬运次数与字节量，代表“<strong>访存量</strong>”。也就是数据从慢速显存搬到快速缓存，计算完再搬回去的开销。</li>
+</ol>
+<p>很显然，前者是我们的算法账，而后者则是硬件相关的开销，在训练和推理中，二者都缺一不可。<br>
+我们已经十分熟悉在代码上进行算法优化的逻辑，而 <strong>FlashAttention 是首个把 IO 优化思想引入注意力机制的工作。</strong></p>
+<p>由此我们继续展开，现代 GPU 有两种主要的存储空间：</p>
+<ol>
+<li><strong>HBM（High Bandwidth Memory，高带宽显存）</strong>：容量大（A100 有 40/80GB），但带宽有限，我们在市面上听说的多少 GB 的显卡，指的都是 HBM。</li>
+<li><strong>SRAM（片上共享内存）</strong>：容量极小（A100 每个 SM 只有 192KB），但带宽极高，速度极快，它的层次和 CPU 中的 cache 相似，但更加受我们操作者控制。</li>
+</ol>
+<p><strong>为了获得最高计算效率，GPU 的计算单元往往只直接读写 SRAM，不会直接访问 HBM。</strong><br>
+所以，要从 HBM 读取数据到 SRAM，再从 SRAM 做计算，最后把结果写回 HBM，这一过程涉及大量 IO 操作。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3708248/202606/3708248-20260619162307935-1706216091.png" alt="abbb133b-ef69-4e58-83ce-9fc133efaa3f.png" loading="lazy"></p>
+<h2 id="12-注意力中的-io-操作">1.2 注意力中的 IO 操作</h2>
+<p>我们对标准注意力计算的过程已经十分熟悉了，这里我们扩展开来，看看其计算在 GPU 上的具体 IO 过程：<br>
+<img src="https://img2024.cnblogs.com/blog/3708248/202606/3708248-20260619162657324-656343828.png" alt="a1537138-5570-488c-abf1-9a5d3c93f83a.png" loading="lazy"></p>
+<p>注意这里反复进行了 <strong>6 次 HBM ↔ SRAM 的数据搬运</strong>。<br>
+举个例子：对于序列长度 <span class="math inline">\(n=1024\)</span>、维度（多头总和） <span class="math inline">\(d=64\)</span>、批量大小 <span class="math inline">\(b=1\)</span> 的情况，我们进行一个估计:</p>
+<p></p><div class="math display">\[\text{总搬运量} \approx \underbrace{6}_{\text{搬运趟数}} \times \underbrace{(2n^2 + nd)}_{\text{每趟搬运的元素量}} \times \underbrace{2}_{\text{FP16字节数}} \quad \text{字节} 
+\]</div><p></p><p>假设 FP16，最终大约的数据量就是</p>
+<p></p><div class="math display">\[6 \times (2 \times 1024^2 + 1024 \times 64) \times 2 \approx 25\quad MB
+\]</div><p></p><p>现在扩展上下文到 <span class="math inline">\(n=64K\)</span> ，这个数字就会暴涨：</p>
+<p></p><div class="math display">\[\text{IO}
+\approx
+6\times
+(2\times65536^2+65536\times64)
+\times2
+\approx 96\ \text{GB}
+\]</div><p></p><p>而一个 GPU 的 HBM 带宽大约是 2 TB/s，也就是说<strong>仅仅数据搬运（IO）就要 40 多毫秒</strong>。注意这只是<strong>一次</strong>注意力计算。</p>
+<p>相比之下，A100 的算力高达 312 TFLOPS，完成这些矩阵乘法的实际计算（FLOPs）可能只需要不到 1 毫秒。计算单元极快。<br>
+于是我们发现了问题：</p>
+<blockquote>
+<p><strong>标准注意力的瓶颈不在计算（FLOPs），而在访存（IO）。是数据搬运太慢，导致 GPU 大量时间在“空转等数据”。</strong></p>
+</blockquote>
+<p>由此，FlashAttention 开始了优化：</p>
+<h1 id="2-flashattention-的核心思路">2. FlashAttention 的核心思路</h1>
+<p>FlashAttention 的想法很直接：</p>
+<blockquote>
+<p><strong>与其把整个 Q、K、V 搬来搬去，不如每次只加载一小块到 SRAM 上进行完所有计算，再写回 HBM。</strong></p>
+</blockquote>
+<p>这样，原本需要在 HBM 和 SRAM 之间来回搬运多次的数据，现在就只需要一次完整的读取和一次写入。<br>
+但这里有一个硬性问题：</p>
+<blockquote>
+<p><strong>Softmax 是一个全局操作：要计算某个位置的 softmax，需要知道所有位置的分数。</strong></p>
+</blockquote>
+<p>而如果要使用刚刚说的分块计算，显然每个块只能看到自己的局部信息，怎么算全局 softmax 得到注意力权重？</p>
+<p>答案是 18 年 NVIDIA 研究者的论文 <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener nofollow"><em><strong>Online normalizer calculation for softmax</strong></em></a>提出的 <strong>Online Softmax（在线 Softmax）</strong>。</p>
+<h2 id="21-online-softmax">2.1 Online Softmax</h2>
+<p>我们知道，对于一个包含 <span class="math inline">\(n\)</span> 个元素的向量 <span class="math inline">\(x = [x_1, x_2, \dots, x_n]\)</span>，Softmax 函数将其转换为概率分布 <span class="math inline">\(y = [y_1, y_2, \dots, y_n]\)</span> 的标准公式为：</p>
+<p></p><div class="math display">\[y_i = \frac{e^{x_i}}{\sum_{j=1}^{n} e^{x_j}} 
+\]</div><p></p><p>但在实际工程中，我们往往并不会使用这个公式，而是使用 <strong>Safe Softmax</strong>：</p>
+<p></p><div class="math display">\[y_i = \frac{e^{x_i - m}}{\sum_{j=1}^{n} e^{x_j - m}} \quad \text{其中 } m = \max(x) 
+\]</div><p></p><p>这是因为指数函数 <span class="math inline">\(e^x\)</span> 增长极快。如果 <span class="math inline">\(x_i\)</span> 比较大（比如 1000），<span class="math inline">\(e^{1000}\)</span> 会直接<strong>超出计算机浮点数的表示范围</strong>，变成 inf（无穷大），导致最终计算结果是 NaN。<br>
+因此，Safe Softmax 在分子分母同除以一个常数 <span class="math inline">\(e^m\)</span>，通常取向量中的最大值 <span class="math inline">\(m = \max(x)\)</span>。<br>
+因为<strong>指数相减等于相除</strong>，不会改变最终的相对比例，但把所有指数都拉到了 <span class="math inline">\(\le 0\)</span> 的范围，避免了上溢出。<br>
+但这仍然没有解决我们现在的问题，因为无论是取最大值，还是计算分母，我们还是需要遍历所有元素。</p>
+<p>而 Online Softmax 的思想是这样的：</p>
+<blockquote>
+<p><strong>当数据无法一次性全部读入内存，或者需要分块计算时，可以使用流式更新的方式计算最大值 <span class="math inline">\(m\)</span> 和分母 <span class="math inline">\(d\)</span>（即 <span class="math inline">\(\sum e^{x_j - m}\)</span>）。</strong></p>
+</blockquote>
+<p>假设我们正在逐个读取向量的元素，到第 <span class="math inline">\(i\)</span> 个元素时，更新最大值：</p>
+<p></p><div class="math display">\[m_i = \max(m_{i-1}, x_i) 
+\]</div><p></p><p>然后更新分母：</p>
+<p></p><div class="math display">\[d_i = d_{i-1} \cdot e^{m_{i-1} - m_i} + e^{x_i - m_i} 
+\]</div><p></p><p>最终结果：</p>
+<p></p><div class="math display">\[y_i = \frac{e^{x_i - m_n}}{d_n} 
+\]</div><p></p><p>其核心技巧是 <span class="math inline">\(d_i\)</span> 的公式中的 <span class="math inline">\(e^{m_{i-1} - m_i}\)</span> ，这一项的作用是<strong>当遇到更大的新最大值 <span class="math inline">\(m_i\)</span> 时，把之前累加的分母 <span class="math inline">\(d_{i-1}\)</span> “按比例缩小”，使其基准与新的最大值对齐。</strong></p>
+<p>我们来看一个简单实例，假设向量为 <span class="math inline">\(x=[2,1,3]\)</span>，初始化 <span class="math inline">\(m_0=-\infty, d_0=0\)</span> ：</p>
+<p>第一步，我们读入 2，更新最大值和分母：</p>
+<p></p><div class="math display">\[m_1=\max(-\infty,2)=2
+，
+d_1
+=
+0\cdot e^{-\infty}
++
+e^{2-2}
+=
+1
+\]</div><p></p><p>此时：</p>
+<p></p><div class="math display">\[m_1=2,\qquad d_1=1
+\]</div><p></p><p>继续，第二步读入 1，再次更新：</p>
+<p></p><div class="math display">\[m_2=\max(2,1)=2，d_2
+=
+1\cdot e^{2-2}
++
+e^{1-2}\approx1.368
+\]</div><p></p><p>现在：</p>
+<p></p><div class="math display">\[m_2=2,\qquad d_2\approx1.368
+\]</div><p></p><p>继续第三步读入 3：</p>
+<p></p><div class="math display">\[m_3=\max(2,3)=3
+\]</div><p></p><p>注意这里最大值发生变化，因此之前累加的分母会重新缩放：</p>
+<p></p><div class="math display">\[d_3
+=
+d_2\cdot e^{2-3}
++
+e^{3-3}=
+1.368\times e^{-1}+1\approx1.503
+\]</div><p></p><p>最终得到：</p>
+<p></p><div class="math display">\[m=3,d\approx1.503
+\]</div><p></p><p></p><div class="math display">\[\text{Softmax}(x)
+=
+\left[
+\frac{e^{2-3}}{1.503},
+\frac{e^{1-3}}{1.503},
+\frac{e^{3-3}}{1.503}
+\right]\approx
+[0.245,\;0.090,\;0.665]
+\]</div><p></p><p><strong>与标准 Safe Softmax 的结果完全一致。</strong> 整个过程中，我们只需要维护两个标量：<span class="math inline">\(m_i,d_i\)</span> 即可，而不需要等全部数据读完后再计算。</p>
+<p>但很显然，这种 Online Softmax 是逐个更新，并不符合 FlashAttention 分块计算逻辑，因此，我们还要再进行适配：</p>
+<h2 id="22-把-online-softmax-嵌入注意力">2.2 把 Online Softmax 嵌入注意力</h2>
+<p>在注意力中，我们不仅要算 softmax，还要用 softmax 的结果乘以 V，得到最终输出，由此，FlashAttention 的最终做法是：</p>
+<blockquote>
+<p><strong>固定一个Q块，不断流过所有KV块，累积输出并修正</strong>。</p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/3708248/202606/3708248-20260619162325117-1947356029.png" alt="d3ad6edf-f62c-423b-ac1a-113d2ebee69b.png" loading="lazy"></p>
+<p>再展开一下这个过程，对于某个 Q 块，读取当前的 K 块和 V 块到 SRAM 并进行以下步骤：</p>
+<ol>
+<li>对当前的 Q 块与 K 块算分数矩阵。</li>
+<li>对分数矩阵做局部 softmax，得到局部权重。</li>
+<li>用局部权重乘以 V 块，得到局部输出。</li>
+<li>基于当前已处理的块维护全局 <span class="math inline">\(m\)</span> 和 <span class="math inline">\(d\)</span>，并用它们<strong>修正</strong>之前累积的输出。</li>
+</ol>
+<p>为了方便理解，我们只看<strong>单个 Query Token</strong>。<br>
+对于这个 Token 来说，它需要和所有 Key Token 计算注意力分数，然后做一次完整的 Softmax。因此，它会维护三个状态：</p>
+<ol>
+<li><span class="math inline">\(m\)</span>：目前见过的最大注意力分数。</li>
+<li><span class="math inline">\(d\)</span>：Softmax 的归一化分母。</li>
+<li><span class="math inline">\(O\)</span>：当前已经累积得到的输出向量。</li>
+</ol>
+<p>当 KV 被分成多个块依次加载时，这三个量会随着块的处理不断更新，假设已经处理了前 <span class="math inline">\(j-1\)</span> 个 KV 块，我们得到如下累积量：</p>
+<ol>
+<li><span class="math inline">\(m_{\text{prev}}\)</span>：前 <span class="math inline">\(j-1\)</span> 个块中的最大分数。</li>
+<li><span class="math inline">\(d_{\text{prev}}\)</span>：前 <span class="math inline">\(j-1\)</span> 个块的指数修正和。</li>
+<li><span class="math inline">\(O_{\text{prev}}\)</span>：前 <span class="math inline">\(j-1\)</span> 个块的部分输出。</li>
+</ol>
+<p>现在开始处理第 <span class="math inline">\(j\)</span> 个 KV 块：</p>
+<ol>
+<li>当前 Query 与这一块 Key 计算注意力分数：</li>
+</ol>
+<p></p><div class="math display">\[S_j=QK_j^T  
+\]</div><p></p><ol start="2">
+<li>求出当前块中的最大分数：</li>
+</ol>
+<p></p><div class="math display">\[m_j=\max(S_j)  
+\]</div><p></p><ol start="3">
+<li>更新截至目前的全局最大值：</li>
+</ol>
+<p></p><div class="math display">\[m_{\text{new}}=
+\max(m_{\text{prev}},m_j)  
+\]</div><p></p><ol start="4">
+<li>按照 Online Softmax 的思想，修正之前累计的分母：</li>
+</ol>
+<p></p><div class="math display">\[d_{\text{new}}
+=
+e^{m_{\text{prev}}-m_{\text{new}}}  
+d_{\text{prev}}  
++  
+e^{m_j-m_{\text{new}}}  
+\sum e^{S_j-m_j}  
+\]</div><p></p><p>这里第一项对应历史 KV 块的贡献，第二项对应当前 KV 块的贡献。当新的最大值出现时，历史部分会自动重新缩放到新的基准下。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3708248/202606/3708248-20260619162323033-213009962.png" alt="4c25839e-068b-4cb9-9486-f5a0e1f50d95 (1).png" loading="lazy"></p>
+<ol start="5">
+<li>修正之前的输出，并加上当前块的贡献：</li>
+</ol>
+<p></p><div class="math display">\[O_{\text{new}}=
+\frac{d_{\text{prev}}}{d_{\text{new}}}  
+e^{m_{\text{prev}}-m_{\text{new}}}  
+O_{\text{prev}}  
++  
+\frac{e^{m_j-m_{\text{new}}}}{d_{\text{new}}}  
+\text{softmax}_j(S_j)V_j  
+\]</div><p></p><p><img src="https://img2024.cnblogs.com/blog/3708248/202606/3708248-20260619162316687-1702615440.png" alt="0282d607-638c-46cd-8403-0f0dc3fd8d46.png" loading="lazy"><br>
+这样处理完当前块后，就得到了新的：</p>
+<p></p><div class="math display">\[(m_{\text{new}},d_{\text{new}},O_{\text{new}})  
+\]</div><p></p><p>随后继续读取下一个 KV 块重复这一过程，直到所有 KV 块都被遍历完成。</p>
+<p><strong>需要强调的是，上述推导是针对单个 Query Token 进行说明的。实际 FlashAttention 中会同时处理一整个 Q 块，因此这里的 <span class="math inline">\(m\)</span>、<span class="math inline">\(d\)</span> 和 <span class="math inline">\(O\)</span> 实际上并不是标量，而是对应每行 Query Token 分别维护的一组向量状态。</strong></p>
+<p>总结来说，FlashAttention 可以看成代码里的嵌套循环，其中外层循环遍历 KV 块，内层循环遍历 Q 块。<br>
+整个过程中，<strong>只有 QKV 块从HBM 加载，最终的输出 O 写入 HBM</strong>，中间的所有结果都只存在于 SRAM 中，不写回 HBM。<br>
+这就是 FlashAttention 在注意力中引入 IO 优化思想得到的突破。</p>
+<h1 id="3-flashattention-的局限和后续发展">3. FlashAttention 的局限和后续发展</h1>
+<p>FlashAttention 虽然解决了 IO 瓶颈，但它仍然没有完全发挥 GPU 的计算能力，论文报告，FlashAttention 在 A100 上只达到了 <strong>25-40% 的理论峰值 FLOPs</strong>。<br>
+其原因大体分析如下：</p>
+<ol>
+<li><strong>非矩阵乘法的开销</strong>：softmax 的指数运算、逐元素的乘法和加法等操作，不如矩阵乘法高效。</li>
+<li><strong>线程块和 warp 的调度</strong>：FlashAttention 在并行化上还有优化空间，部分线程块可能处于空闲状态。</li>
+<li><strong>共享内存的读写</strong>：虽然减少了 HBM 读写，但 SRAM 内部的通信也存在开销。</li>
+</ol>
+<p>但这也同时说明了该方向仍然存在极大的优化空间。<br>
+在此之后，23 年的论文：<a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener nofollow"><strong><em>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</em></strong></a>提出了 FlashAttention-2，对 FlashAttention 的工作分配进行了系统性的优化，其核心内容是通过应用<strong>更多矩阵乘法，优化线程并行，线程内分工</strong>的方式，以更好的并行得到加速效果。</p>
+<p><strong>FlashAttention-2 中的各种“榨干 GPU” 的优化其实更符合现代工业标准。但这里涉及到较多的操作系统和硬件内容，就不再详细展开了。</strong><br>
+FlashAttention-2 将 GPU 利用率从 FA1 的 25-40% 提升到了 <strong>50-73%</strong>，相比 FA1 实现了大约 <strong>2 倍的速度提升</strong>。</p>
+<p>还没结束，24 年的论文：<a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener nofollow"><strong><em>FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</em></strong></a> 将目光投向了新一代的 Hopper 架构 GPU（H100）。</p>
+<p>这是因为前两代 FlashAttention 虽然在 A100 上表现优异，但在 H100 上，FA2 也只达到约 <strong>35% 的硬件利用率</strong>。<br>
+在前两代的基础上，FA3 利用 H100 特有的的 <strong>TMA（Tensor Memory Accelerator）</strong> 硬件单元和实现异步处理，又在 FP8 支持的前提下应用了更多解耦分工和细节优化，最终对比如下：</p>
+<table>
+<thead>
+<tr>
+<th>版本</th>
+<th>年份</th>
+<th>硬件</th>
+<th>核心改进</th>
+<th>GPU 利用率</th>
+<th>加速比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FA1</td>
+<td>2022</td>
+<td>A100</td>
+<td>IO 感知 + 分块 + Online Softmax</td>
+<td>25-40%</td>
+<td>基准</td>
+</tr>
+<tr>
+<td>FA2</td>
+<td>2023</td>
+<td>A100</td>
+<td>更好的工作分配和并行化</td>
+<td>50-73%</td>
+<td>~2× vs FA1</td>
+</tr>
+<tr>
+<td>FA3</td>
+<td>2024</td>
+<td>H100</td>
+<td>异步 TMA + Warp 特化 + FP8</td>
+<td>75% (FP16) / ~60% (FP8)</td>
+<td>1.5-2× vs FA2</td>
+</tr>
+</tbody>
+</table>
+<p>总结来说，FlashAttention 系列产生的影响远超论文本身的数值，其对显存占用降低让长上下文成为可能，同时让精确注意力重新成为主流。</p>
+<p>在 FA 出现之前，为了解决显存占用 <span class="math inline">\(O(n^2)\)</span> 的问题，研究者们提出了大量近似注意力方法：稀疏注意力、低秩注意力等。这些方法各有各的妥协。<br>
+而 FlashAttention 证明了：<strong>不需要精度妥协，只要把 IO 优化做好，精确注意力不仅更快，效果也更好。</strong> 此后，近似注意力方法的热度大幅下降。</p>
+<p>并且，这种把目光投向硬件，IO 感知的思路已经超越了注意力本身：FlashFFTConv、FlashDecoding、甚至一些 Mamba 的工程实现都受到其启发。<br>
+如今， FlashAttention 系列仍然在进化中。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.27291666666666664" data-date-updated="2026-06-19 23:04">2026-06-19 16:31</span>&nbsp;
+<a href="https://www.cnblogs.com/Goblinscholar">哥布林学者</a>&nbsp;
+阅读(<span id="post_view_count">64</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20654161);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FGoblinscholar%2Fp%2F20654161&amp;targetId=20654161&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
