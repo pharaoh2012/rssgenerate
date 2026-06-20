@@ -1,0 +1,258 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/jiangxinnju/p/20666852" title="发布于 2026-06-20 13:27">
+    <span role="heading" aria-level="2">逆向一个被遗忘的DVD游戏格式：从DES加密到Rust模拟器</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="缘起">缘起</h2>
+<p>前阵子翻出一台老的便携 DVD 播放器，发现里面居然有游戏菜单。七个分类，80 多款游戏。查了一下发现这东西叫 Native32，凌阳科技的芯片方案，2005-2011 年间大量用在 DVD 播放器和车载显示器上。</p>
+<p>游戏由 Potatoo Multimedia Studio 开发，格式是私有的，没有公开文档。硬件淘汰后整个游戏库基本消失了。Internet Archive 上有人存了游戏文件，但原文写道"没有已知的方法可以在真实硬件之外运行它们"。</p>
+<p>我用 Rust 逆向了这个格式并实现了模拟器。记录一下技术细节。</p>
+<blockquote>
+<p><strong>[图1: FHUI 主菜单界面 — 七个游戏分类]</strong><br>
+<img src="https://raw.githubusercontent.com/jiangxincode/Native32Emu/master/docs/images/root/FHUI.png" alt="FHUI 主菜单" loading="lazy"></p>
+</blockquote>
+<h2 id="文件格式">文件格式</h2>
+<p>所有文件共享同一二进制格式，魔数头 <code>_YUVGamemaker 1.3.12</code>。</p>
+<pre><code>偏移    内容
+0x00    SWFT 缩略图（可选，跳过）
+---     _YUV / ARGB 色彩空间标记
+---     生成器字符串（48字节，如 "Resolution_320x240"）
+---     基础偏移量（colorspace + 0x60）
+---     加密头部（32字节）  ← 资源偏移量藏在这里
+---     光标数据
+---     声音表 → 帧表 → 图像表 → 动作表 → 影片表 → 按钮表
+</code></pre>
+<p>32 字节加密头部是关键——里面藏了资源表的偏移量。不解密就什么都读不出来。</p>
+<p>资源对象类型：Image(1)、Movie(2)、Button(3)、Action(4)、Sound(5)。</p>
+<p>两种使用方式：</p>
+<ul>
+<li><strong>独立游戏</strong> — 单个 <code>.smf</code> 文件包含所有资源（如教育类游戏）</li>
+<li><strong>跳板+场景</strong> — 11KB 的 <code>.smf</code> 跳板文件 + 多个 <code>.ssl</code> 场景文件（如赤刃）</li>
+</ul>
+<h2 id="des-加密">DES 加密</h2>
+<h3 id="不是标准-des">不是标准 DES</h3>
+<p>文件头 32 字节用 DES ECB 加密。我直接用了标准 DES 库，解出来全是乱码。又试了 3DES、DESede，都不对。</p>
+<p>对比参考实现的输入输出后发现：凌阳用的是<strong>自定义 DES</strong>。算法框架和标准 DES 一样（初始置换 → 16 轮 Feistel → 最终置换），但所有置换表和 S-boxes 全部不同。</p>
+<p>密钥来自常量 <code>aber3801</code>，和芯片型号 SPHE8202 相关。</p>
+<h3 id="需要手写的查找表">需要手写的查找表</h3>
+<p>一共 8 组非标准查找表：</p>
+<pre><code class="language-rust">pub const INITIAL_MESSAGE_PERMUTATION: [u8; 64] = [
+    0x3a, 0x32, 0x2a, 0x22, 0x1a, 0x12, 0x0a, 0x02,
+    0x3c, 0x34, 0x2c, 0x24, 0x1c, 0x14, 0x0c, 0x04,
+    // ...
+];
+
+pub const FINAL_MESSAGE_PERMUTATION: [u8; 64] = [ /* 64个值 */ ];
+pub const MESSAGE_SHUFFLE: [u8; 48] = [ /* 48个值 */ ];
+pub const RIGHT_SUB_MESSAGE_PERMUTATION: [u32; 32] = [ /* 32个值 */ ];
+pub const INITIAL_KEY_PERMUTATION: [u8; 56] = [ /* 56个值 */ ];
+pub const SUB_KEY_PERMUTATION: [u8; 48] = [ /* 48个值 */ ];
+pub const DES_SBOXES: [[u8; 64]; 8] = [ /* 8×64 = 512个值 */ ];
+pub const KEY_SHIFT_SIZES: [u8; 16] = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
+</code></pre>
+<p>验证方式：对比参考实现的输入输出对，逐个表核对。任何一个值错了解密结果就是错的。</p>
+<p>DES 解密是整个项目的"守门人"——解不开就什么都做不了。这一步花了我整个项目三分之一的时间。</p>
+<h2 id="action-虚拟机">Action 虚拟机</h2>
+<h3 id="指令集">指令集</h3>
+<p>36 个操作码的栈式虚拟机。操作码值和 Flash ActionScript 高度重合（<code>GotoFrame=0x81</code>, <code>Push=0x96</code>, <code>If=0x9d</code>），但字节码编码不同。凌阳大概参考了 AS 的设计但自己搞了一套。</p>
+<p>操作码分类：</p>
+<pre><code>帧控制:  NextFrame(0x04), PreviousFrame(0x05), Play(0x06), Stop(0x07)
+算术:    Add(0x0a), Subtract(0x0b), Multiply(0x0c), Divide(0x0d)
+比较:    Equals(0x0e), Less(0x0f), StringEquals(0x13), StringLess(0x29)
+逻辑:    And(0x10), Or(0x11), Not(0x12)
+变量:    GetVariable(0x1c), SetVariable(0x1d)
+精灵:    CloneSprite(0x24), RemoveSprite(0x25)
+跳转:    GotoFrame(0x81), Jump(0x99), If(0x9d), Call(0x9e)
+宿主:    Push(0x96), GetUrl2(0x9a)
+</code></pre>
+<h3 id="宿主调用">宿主调用</h3>
+<p><code>GetUrl2</code> 操作码是 Native32 特有的扩展。Flash 中 <code>GetUrl2</code> 用于加载网页，Native32 用它来调用平台 API：</p>
+<ul>
+<li><code>SSL+SSL_PlayNext+&lt;路径&gt;</code> → 加载下一个场景</li>
+<li><code>SSL+SSL_SaveSSLData+&lt;变量&gt;</code> → 保存存档</li>
+<li><code>SSL+SSL_GetSSLData+&lt;变量&gt;</code> → 读取存档</li>
+<li><code>LoadImage+&lt;精灵&gt;+D+&lt;路径&gt;</code> → 加载 .dat 名称横幅</li>
+<li><code>LoadImage+&lt;精灵&gt;+J+&lt;路径&gt;</code> → 加载 .dat 预览截图</li>
+<li><code>StartGame+&lt;路径&gt;</code> → 启动游戏</li>
+<li><code>GetFileNum+&lt;目录&gt;</code> → 返回游戏数量</li>
+<li><code>GetFirstFile+&lt;目录&gt;</code> → 获取第一个游戏名</li>
+<li><code>GetNextFile+&lt;目录&gt;</code> → 获取下一个游戏名</li>
+</ul>
+<p>需要实现 <code>VmHost</code> trait 来桥接 VM 和宿主系统。独立桌面端和 libretro 核心各自实现这个 trait。</p>
+<h3 id="vm-骨架">VM 骨架</h3>
+<pre><code class="language-rust">pub struct ActionVM {
+    stack: Vec&lt;Value&gt;,
+    vars: HashMap&lt;String, Value&gt;,
+    pc: usize,
+    bytecode: Vec&lt;u8&gt;,
+}
+
+impl ActionVM {
+    pub fn execute_frame(&amp;mut self, host: &amp;mut dyn VmHost) -&gt; Result&lt;()&gt; {
+        loop {
+            let opcode = self.read_u8()?;
+            match opcode {
+                0x00 =&gt; return Ok(()),
+                0x04 =&gt; host.next_frame(),
+                0x96 =&gt; self.push()?,
+                0x99 =&gt; self.jump()?,
+                0x9a =&gt; {
+                    let url = self.pop_string()?;
+                    host.get_url2(&amp;url)?;
+                }
+                0x9d =&gt; self.conditional_jump()?,
+                _ =&gt; return Err(anyhow!("Unknown opcode: 0x{:02x}", opcode)),
+            }
+        }
+    }
+}
+</code></pre>
+<p>VM 本身不复杂——36 个 match 分支，一个栈，一个变量表。麻烦的是宿主调用的实现，每个调用都需要理解原机的行为语义。</p>
+<h2 id="图像解码">图像解码</h2>
+<h3 id="yuv-420">YUV 4:2:0</h3>
+<p>Y 通道全分辨率，U/V 半分辨率需 2x 垂直插值。压缩用 packbits + RLE 混合编码。</p>
+<p>插值的边界处理有点 tricky——边缘像素不能简单复制，否则色块边界很明显。参考实现用了一种"借用"策略：U/V 值为 0 时借用相邻行的值。</p>
+<pre><code class="language-rust">fn interpolate_y(data: &amp;[u8], w: usize, h: usize) -&gt; Vec&lt;u8&gt; {
+    let h1 = h * 2;
+    let mut result = vec![0u8; w * h1];
+    for y in 0..h {
+        for dy in 0..2 {
+            for x in 0..w {
+                let val = if dy == 0 {
+                    if y == 0 || get(y * w + x) != 0 {
+                        get(y * w + x)
+                    } else {
+                        get((y - 1) * w + x)
+                    }
+                } else {
+                    if y == h - 1 || get(y * w + x) != 0 {
+                        get(y * w + x)
+                    } else {
+                        get((y + 1) * w + x)
+                    }
+                };
+                result[(y * 2 + dy) * w + x] = val;
+            }
+        }
+    }
+    result
+}
+</code></pre>
+<h3 id="argb1555">ARGB1555</h3>
+<p>16 位格式，直接位移解码。5 位分量乘 8 扩展到 8 位。</p>
+<h2 id="ssl-多文件系统">SSL 多文件系统</h2>
+<p>大游戏的加载流程：</p>
+<pre><code>EBBLADE.smf (11KB 跳板)
+  → NALOGO.mpg（Logo 视频）
+  → BBSTART.SSL（标题，1.8MB）
+  → BBMENU.SSL（主菜单，3.5MB）
+  → BBPLAY10.SSL（第1关，2.6MB）
+  → BBPLAY20 → BBPLAY30 → ...
+  → BBFINISH.SSL / BBOVER.SSL
+</code></pre>
+<p><code>.ssl</code> 和 <code>.smf</code> 用完全相同的二进制格式。区别仅在用途。</p>
+<p>存档格式：<code>.ssl_sav</code> 文件，纯文本数字字符串。比如 <code>1109600000002</code>。</p>
+<p><code>NA32SSL</code> 目录下有两套完全独立的游戏集——CHINESE（中文教育）和 ENGLISH（英文动作），不是翻译关系。</p>
+<h3 id="fhui-菜单">FHUI 菜单</h3>
+<p><code>FHUI.smf</code> 是前端启动器，通过宿主调用枚举游戏列表：</p>
+<ol>
+<li><code>GetFileNum+EACT</code> → 返回数量</li>
+<li><code>GetFirstFile+EACT</code> → 第一个游戏</li>
+<li><code>GetNextFile+EACT</code> → 下一个游戏</li>
+<li><code>LoadImage+&lt;精灵&gt;+D+&lt;路径&gt;</code> → 从 .dat 解码名称横幅</li>
+<li><code>LoadImage+&lt;精灵&gt;+J+&lt;路径&gt;</code> → 从 .dat 解码预览截图</li>
+<li><code>StartGame+&lt;路径&gt;</code> → 启动游戏</li>
+</ol>
+<p><code>.dat</code> 文件魔数头 <code>INFO</code>，嵌入两块 YUV 图像（名称横幅 + 预览截图，描述文字已烘焙进图像里）。</p>
+<h2 id="mpeg-1-解码器">MPEG-1 解码器</h2>
+<p>《钢铁风暴》《风暴之翼》有 3D 动画过场，MPEG-1 格式。我用纯 Rust 实现了解码器。</p>
+<p>实现内容：</p>
+<ul>
+<li>MPEG-1 系统流解复用（分离视频和音频）</li>
+<li>I 帧解码（帧内编码）</li>
+<li>P 帧解码（帧间编码，前向预测）</li>
+<li>宏块解码（16×16 块）</li>
+<li>运动补偿</li>
+<li>DCT 反变换</li>
+<li>VLC 变长编码解表</li>
+<li>YCbCr → RGB 色彩空间转换</li>
+</ul>
+<p>最大的坑是运动补偿——P 帧有 16 种运动矢量模式（16x16、16x8、8x16、8x8），最初只实现了 16x16，结果过场动画出现马赛克块。</p>
+<p>MPEG-1 的文档质量参差不齐，ISO 11172 很多细节描述得含糊。真正有用的参考是 ffmpeg、mpeg_play 等开源实现的源码。</p>
+<h2 id="架构">架构</h2>
+<pre><code>native32emu-core      → 平台无关引擎（库）
+native32emu           → 桌面端（minifb）
+native32emu-libretro  → libretro 核心
+</code></pre>
+<p>Emulator 结构体零平台依赖，持有所有游戏状态：</p>
+<pre><code class="language-rust">pub struct Emulator {
+    pub reader: Native32Reader,
+    pub sprites: SpriteSystem,
+    pub frame_player: FramePlayer,
+    pub vm: ActionVM,
+    pub audio: AudioEngine,
+    pub renderer: Renderer,
+    pub input: InputHandler,
+    pub save_manager: SaveManager,
+    pub content_loader: ContentLoader,
+    pub file_browser: FileBrowser,
+    pub video_player: Option&lt;VideoPlayer&gt;,
+    pub pending_videos: Vec&lt;String&gt;,
+    pub auto_skip_cutscenes: bool,
+}
+</code></pre>
+<p>libretro 核心的 <code>retro_run()</code> 就是一个 <code>emu.tick()</code> 调用加上视频/音频回调。</p>
+<h2 id="兼容性">兼容性</h2>
+<p>84 款游戏全部通过测试。</p>
+<blockquote>
+<p><img src="https://raw.githubusercontent.com/jiangxincode/Native32Emu/master/docs/images/EACT/EBBLADE.png" alt="赤刃" loading="lazy"></p>
+</blockquote>
+<blockquote>
+<p><img src="https://raw.githubusercontent.com/jiangxincode/Native32Emu/master/docs/images/EACT/EMETAL.png" alt="钢铁风暴" loading="lazy"></p>
+</blockquote>
+<blockquote>
+<p><img src="https://raw.githubusercontent.com/jiangxincode/Native32Emu/master/docs/images/EACT/EGUNFIRE.png" alt="枪火" loading="lazy"></p>
+</blockquote>
+<blockquote>
+<p><img src="https://raw.githubusercontent.com/jiangxincode/Native32Emu/master/docs/images/EACT/ESTORM.png" alt="风暴之翼" loading="lazy"></p>
+</blockquote>
+<blockquote>
+<p><img src="https://raw.githubusercontent.com/jiangxincode/Native32Emu/master/docs/images/EPUZ/ERuneWod.png" alt="符文之语" loading="lazy"></p>
+</blockquote>
+<p>几个有意思的发现：</p>
+<ul>
+<li>《风暴之翼》的过场动画里有个角色说 “Shit”——在儿童 DVD 播放器上，确实离谱</li>
+<li>《符文之语》的文件名是 ERuneWod.smf，少了个 r（应该是 ERuneWord），导致在菜单里排序异常</li>
+<li>NA32SSL 目录下中文和英文两套游戏是完全不同的内容，不是翻译关系</li>
+<li>一些 8Bit Game 分类里的 NES ROM 是那种你懂的不当 ROM hack——”Dick Dug” 和 “Dick &amp; Milk”</li>
+<li>《枪火》的标题画面里有 “Start” 和 “Option” 两个按钮，但 Option 功能实际上没有实现</li>
+</ul>
+<h2 id="链接">链接</h2>
+<ul>
+<li><a href="https://github.com/jiangxincode/Native32Emu" target="_blank" rel="noopener nofollow">GitHub</a></li>
+<li><a href="https://docs.libretro.com/library/native32emu/" target="_blank" rel="noopener nofollow">libretro 文档</a></li>
+<li><a href="https://bootleggames.fandom.com/wiki/Native_32" target="_blank" rel="noopener nofollow">BootlegGames Wiki</a></li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.08541666666666667" data-date-updated="2026-06-20 15:30">2026-06-20 13:27</span>&nbsp;
+<a href="https://www.cnblogs.com/jiangxinnju">AloysHF</a>&nbsp;
+阅读(<span id="post_view_count">29</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20666852);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjiangxinnju%2Fp%2F20666852&amp;targetId=20666852&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
