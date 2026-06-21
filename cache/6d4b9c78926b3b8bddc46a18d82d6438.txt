@@ -1,0 +1,1307 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/smartloli/p/20684447" title="发布于 2026-06-21 22:21">
+    <span role="heading" aria-level="2">一文读懂 OpenAI Codex 源码的原理、架构与未来</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="1-概述">1. 概述</h2>
+<p>如果你第一次打开 <code>codex-main</code> 这个源码目录，很容易被它的规模吓住：顶层有 npm 包、Rust workspace、SDK、app-server、MCP、插件、技能、沙箱、TUI、云任务、线程存储、模型提供商、登录认证等大量模块。它不像一个传统命令行工具，也不像一个简单的 ChatGPT 包装器。更准确地说，Codex CLI 是一个“本地运行的智能软件工程代理”：它能理解用户目标，读取项目上下文，调用模型推理，决定是否执行命令或修改文件，把工具结果回传给模型，再持续推进任务直到给出最终结果。</p>
+<p>本文基于当前工作区的 <code>codex-main</code> 源码目录进行分析，目标是让初学者也能看懂 Codex 的基本原理，同时给有工程背景的读者足够的架构细节。文章会围绕四个问题展开：</p>
+<p>第一，Codex 到底是什么？它和普通命令行工具、普通聊天机器人有什么区别？</p>
+<p>第二，Codex 的源码是如何组织的？哪些 crate 或目录承担核心职责？</p>
+<p>第三，Codex 的核心执行原理是什么？从用户输入一条需求，到模型调用 shell、修改文件、读取 MCP 资源、输出最终答案，中间经过了哪些关键步骤？</p>
+<p>第四，从工程实践角度看，我们可以怎样使用 Codex、扩展 Codex，或者从它的架构中学习如何设计自己的 AI Agent？</p>
+<p>先给出一句通俗但准确的定义：</p>
+<p>Codex 是一个以 Rust 为核心实现的本地软件工程 Agent 运行时，它通过协议层连接 UI、CLI、App Server 和无交互执行入口，通过 core 会话循环连接模型和工具，通过沙箱、审批、配置、MCP、技能、插件等机制把“模型会想”变成“系统能安全地做事”。</p>
+<p>从源码看，Codex 并不是把用户问题直接发给模型，然后打印模型回答这么简单。它更像一个小型操作系统，里面有输入队列、事件队列、会话状态、权限系统、工具注册表、上下文管理器、模型客户端、执行沙箱、插件系统和持久化存储。模型只是决策核心之一，真正把 Agent 做成产品的是围绕模型的一整套工程系统。</p>
+<p>为了帮助初学者建立直觉，我们先用一个简化流程表示 Codex 的工作方式：</p>
+<div class="mermaid">flowchart TD
+    A[用户输入任务] --&gt; B[CLI/TUI/App Server 接收请求]
+    B --&gt; C[加载配置、权限、AGENTS.md、技能和插件]
+    C --&gt; D[构建模型可见上下文]
+    D --&gt; E[向模型发起 Responses API 请求]
+    E --&gt; F{模型输出什么}
+    F --&gt;|普通回复| G[记录消息并展示给用户]
+    F --&gt;|工具调用| H[ToolRouter 匹配工具]
+    H --&gt; I[审批与沙箱检查]
+    I --&gt; J[执行 shell、apply_patch、MCP、web、子代理等工具]
+    J --&gt; K[工具结果写回会话历史]
+    K --&gt; E
+    G --&gt; L[结束当前 turn]
+</div><p>这个循环是理解 Codex 的关键。传统 CLI 往往是“一条命令 -&gt; 一个结果”，聊天机器人往往是“一段上下文 -&gt; 一段文本”。Codex 则是“一段目标 -&gt; 多轮推理 -&gt; 多次工具调用 -&gt; 状态更新 -&gt; 最终交付”。它的源码复杂度主要来自三个方面：</p>
+<ol>
+<li>模型需要看到足够上下文，但上下文窗口有限，所以需要压缩、裁剪和结构化注入。</li>
+<li>模型需要调用真实工具，但工具可能读写文件、联网、执行命令，所以必须有权限、沙箱和审批。</li>
+<li>Codex 要服务多种入口，包括交互式 TUI、无交互 <code>exec</code>、IDE/桌面 App、MCP Server、Cloud 任务等，所以需要稳定协议和分层架构。</li>
+</ol>
+<p>接下来进入源码层面的系统拆解。</p>
+<h2 id="2-内容">2. 内容</h2>
+<p>简要介绍：<code>codex-main</code> 是一个多语言单仓库，外层 npm 包负责分发和启动，核心能力集中在 <code>codex-rs</code> Rust workspace。最重要的主线是：<code>codex-cli/bin/codex.js</code> 找到对应平台的原生二进制，Rust <code>cli</code> 解析命令，<code>tui</code> 或 <code>exec</code> 或 <code>app-server</code> 建立会话，<code>core</code> 运行 Agent 主循环，<code>protocol</code> 定义客户端与 Agent 之间的操作和事件，<code>tools</code> 负责把模型输出映射成真实工具调用，<code>sandboxing</code> 和权限系统负责限制风险。</p>
+<h3 id="21-codex-不是聊天壳而是-agent-runtime">2.1 Codex 不是“聊天壳”，而是 Agent Runtime</h3>
+<p>很多初学者第一次理解 AI 编程工具时，会把它想成：</p>
+<div class="mermaid">flowchart LR
+    U[用户：帮我修 bug] --&gt; P[程序：把问题发给模型]
+    P --&gt; M[模型：返回一段代码]
+    M --&gt; S[程序：显示代码]
+</div><p>这只是最早期的代码助手形态。Codex 源码展示的是更成熟的 Agent 形态：</p>
+<div class="mermaid">flowchart LR
+    U[用户：帮我修 bug] --&gt; A[Codex：读取项目规则]
+    A --&gt; B[搜索相关文件]
+    B --&gt; C[运行测试]
+    C --&gt; D[分析失败]
+    D --&gt; E[修改代码]
+    E --&gt; F[再运行测试]
+    F --&gt; G[汇总结论]
+</div><p>这个过程中，模型需要不断“看见”外部世界。它不能只凭训练记忆回答，因为当前项目的代码、测试失败、用户本地环境、未提交变更、配置文件和工具输出都在实时变化。Codex 的核心价值就在于把这些外部信息纳入一个受控循环。</p>
+<p>在 <code>codex-rs/core/src/session/turn.rs</code> 中，源码对 <code>run_turn</code> 的注释已经把核心机制讲得很清楚：每一次 sampling request，模型可能返回函数调用，也可能返回助手消息。如果返回工具调用，Codex 执行工具并把工具输出作为下一次请求的输入；如果返回普通助手消息，就记录进历史并认为当前 turn 完成。</p>
+<p>也就是说，Codex 的“智能”不只是模型能力，还包括它周围的运行时能力：</p>
+<ul>
+<li>它能把模型输出解析成结构化工具调用。</li>
+<li>它能把工具调用映射到本地实现。</li>
+<li>它能在执行前检查权限与审批策略。</li>
+<li>它能把执行结果转换成模型能理解的 <code>ResponseInputItem</code>。</li>
+<li>它能维护线程、turn、上下文窗口、token 预算和持久化记录。</li>
+</ul>
+<p>如果我们把 Codex 当成一个系统来观察，可以把它拆成五层：</p>
+<div class="mermaid">flowchart TB
+    U[用户入口层：CLI / TUI / exec / App Server / MCP Server] --&gt; P[协议层：Op / Event / Thread / Turn]
+    P --&gt; C[核心层：Session / Turn / Context / ModelClient]
+    C --&gt; T[工具层：ToolRouter / ToolRegistry / ToolRuntime]
+    T --&gt; S[执行与安全层：sandbox / approval / permission profile]
+    C --&gt; M[模型与外部服务：OpenAI Responses API / WebSocket / HTTP / MCP]
+</div><p>其中最重要的源码目录如下：</p>
+<pre><code class="language-text">codex-main/
+├── README.md                         # 项目入口说明，介绍安装方式和产品形态
+├── codex-cli/
+│   └── bin/codex.js                  # npm 包入口，定位并启动平台原生二进制
+├── codex-rs/
+│   ├── Cargo.toml                    # Rust workspace，列出大量内部 crate
+│   ├── cli/                          # 顶层命令行解析与子命令分发
+│   ├── tui/                          # 交互式终端 UI
+│   ├── exec/                         # 非交互执行入口，适合脚本和 CI
+│   ├── core/                         # Agent 核心：会话、turn、工具、上下文、模型调用
+│   ├── protocol/                     # 核心协议类型：Op、Event、SandboxPolicy 等
+│   ├── app-server/                   # App/IDE 等宿主形态可复用的服务端
+│   ├── app-server-protocol/          # App Server v1/v2 JSON-RPC 协议
+│   ├── codex-api/                    # OpenAI API / Responses API 访问层
+│   ├── codex-client/                 # HTTP/SSE/WebSocket 客户端基础能力
+│   ├── model-provider/               # 模型提供商抽象
+│   ├── mcp-server/、codex-mcp/       # MCP 相关能力
+│   ├── core-skills/、skills/         # 技能加载与注入
+│   ├── core-plugins/、plugin/        # 插件 manifest、市场和本地插件
+│   ├── sandboxing/                   # 跨平台沙箱抽象
+│   ├── linux-sandbox/                # Linux Landlock / bubblewrap 支持
+│   ├── windows-sandbox-rs/           # Windows 受限 token、ACL、WFP 等
+│   ├── thread-store/                 # 线程持久化抽象
+│   ├── rollout/、rollout-trace/      # 会话记录、回放和调试
+│   └── tools/                        # 工具规范和共享工具定义
+└── sdk/
+    ├── python/                       # Python SDK
+    └── typescript/                   # TypeScript SDK
+</code></pre>
+<p>从这个目录可以看出，Codex 的核心不是某一个巨大文件，而是一组职责明确的 crate。<code>core</code> 是大脑和调度中心，但它并不直接承担所有事情：协议在 <code>protocol</code>，UI 在 <code>tui</code>，无交互运行在 <code>exec</code>，App 集成在 <code>app-server</code>，沙箱在 <code>sandboxing</code>，插件和技能也拆成独立模块。</p>
+<p>这正是大型 Agent 工程的第一条经验：不要把“模型调用、工具实现、UI 展示、权限控制、配置读取、状态存储”塞进一个文件。它们变化频率不同，风险边界不同，测试方式也不同。</p>
+<h3 id="22-从安装启动看-codex-的第一层架构">2.2 从安装启动看 Codex 的第一层架构</h3>
+<p>Codex 可以通过 <code>npm install -g @openai/codex</code>、Homebrew 或安装脚本安装。源码中的 <code>codex-cli/package.json</code> 定义了 npm 包名和可执行入口：</p>
+<pre><code class="language-json">{
+  "name": "@openai/codex",
+  "bin": {
+    "codex": "bin/codex.js"
+  },
+  "type": "module"
+}
+</code></pre>
+<p>但 <code>codex.js</code> 并不实现 Agent 本身。它做的是平台适配：根据 <code>process.platform</code> 和 <code>process.arch</code> 判断目标三元组，例如 macOS arm64 对应 <code>aarch64-apple-darwin</code>，Linux x64 对应 <code>x86_64-unknown-linux-musl</code>，Windows x64 对应 <code>x86_64-pc-windows-msvc</code>。然后它到对应平台包的 <code>vendor/&lt;target&gt;/bin/codex</code> 下寻找真正的原生二进制，最后用 <code>spawn</code> 把参数原样转发过去。</p>
+<p>简化版代码可以这样理解：</p>
+<pre><code class="language-js">// 简化示例：根据平台选择原生 Codex 二进制
+const targetMap = {
+  "darwin-arm64": "aarch64-apple-darwin",
+  "darwin-x64": "x86_64-apple-darwin",
+  "linux-x64": "x86_64-unknown-linux-musl",
+  "win32-x64": "x86_64-pc-windows-msvc",
+};
+
+const key = `${process.platform}-${process.arch}`;
+const targetTriple = targetMap[key];
+
+// 真实源码会处理更多平台、包管理器提示和信号转发
+const binaryPath = `vendor/${targetTriple}/bin/codex`;
+
+// 关键逻辑：Node 只负责启动，Agent 主体在 Rust 二进制里
+spawn(binaryPath, process.argv.slice(2), {
+  stdio: "inherit",
+  env: process.env,
+});
+</code></pre>
+<p>这个设计有几个好处：</p>
+<ol>
+<li>npm 生态用户安装方便，不需要自己编译 Rust。</li>
+<li>真正运行时代码是原生二进制，启动快，资源控制强。</li>
+<li>平台差异被集中处理，Rust 侧可以根据目标平台启用不同沙箱实现。</li>
+<li>Node 入口保留了信号转发能力，用户按 Ctrl-C 时能把信号传给子进程。</li>
+</ol>
+<p>初学者可以把 <code>codex-cli/bin/codex.js</code> 理解为“门卫”，它不负责推理，只负责把你带到真正的入口。</p>
+<p>进入 Rust 之后，<code>codex-rs/cli/src/main.rs</code> 使用 <code>clap</code> 定义了顶层命令。源码里的 <code>Subcommand</code> 很能说明 Codex 的产品边界：</p>
+<ul>
+<li><code>Exec</code>：非交互运行 Codex。</li>
+<li><code>Review</code>：无交互代码审查。</li>
+<li><code>Login</code> / <code>Logout</code>：认证管理。</li>
+<li><code>Mcp</code>：管理外部 MCP server。</li>
+<li><code>Plugin</code>：管理 Codex 插件。</li>
+<li><code>McpServer</code>：把 Codex 作为 MCP server 运行。</li>
+<li><code>AppServer</code>：运行 app server 或相关工具。</li>
+<li><code>App</code>：启动桌面 App。</li>
+<li><code>Doctor</code>：诊断本地安装、配置、认证和运行环境。</li>
+<li><code>Sandbox</code>：在 Codex 提供的沙箱里运行命令。</li>
+<li><code>Resume</code> / <code>Fork</code> / <code>Archive</code> / <code>Delete</code> / <code>Unarchive</code>：会话管理。</li>
+<li><code>Cloud</code>：浏览 Codex Cloud 任务并应用变更。</li>
+</ul>
+<p>这说明 Codex CLI 不是单一命令，而是一个多入口工具箱。默认不带子命令时进入交互式 TUI；带 <code>exec</code> 时进入无交互模式；带 <code>mcp-server</code> 时变成 MCP 服务；带 <code>app-server</code> 时面向桌面或 IDE 宿主。</p>
+<h3 id="23-rust-workspace为什么-codex-拆成这么多-crate">2.3 Rust workspace：为什么 Codex 拆成这么多 crate</h3>
+<p><code>codex-rs/Cargo.toml</code> 是理解源码组织的关键。它的 workspace members 非常多，包括 <code>core</code>、<code>protocol</code>、<code>tui</code>、<code>exec</code>、<code>app-server</code>、<code>codex-api</code>、<code>codex-mcp</code>、<code>sandboxing</code>、<code>thread-store</code>、<code>core-skills</code>、<code>core-plugins</code>、<code>model-provider</code> 等。</p>
+<p>初学者可能会问：为什么不用一个 crate？原因很实际。</p>
+<p>第一，Codex 是多宿主系统。TUI、exec、App Server 和 MCP Server 都需要复用同一个核心 Agent，但它们的输入输出完全不同。把协议、核心、UI、无交互处理拆开，才能让同一个 core 服务多种入口。</p>
+<p>第二，Codex 是安全敏感系统。执行 shell、修改文件、联网、读取本地资源都需要被严格约束。沙箱和权限逻辑必须独立、可测试、可复用，不能和 UI 代码混在一起。</p>
+<p>第三，Codex 是可扩展系统。MCP、插件、技能、动态工具、子代理都属于扩展点。扩展点如果散落在主循环里，会让系统越来越难维护。</p>
+<p>第四，Codex 需要跨平台。macOS 有 Seatbelt，Linux 有 Landlock/bubblewrap，Windows 有受限 token、ACL、WFP 等机制。跨平台安全抽象需要独立模块承载。</p>
+<p>源码中的 <code>AGENTS.md</code> 也明确提醒贡献者：“resist adding code to codex-core”。这句话很重要。<code>codex-core</code> 已经很大，团队希望新功能优先放到更合适的 crate，而不是继续膨胀核心 crate。这是大型 Rust 项目常见的工程约束：核心越大，编译越慢，依赖越乱，测试越难，评审风险越高。</p>
+<p>我们可以把核心 crate 职责概括如下：</p>
+<pre><code class="language-text">入口层：
+  cli/               解析命令，分发到 TUI、exec、登录、插件、MCP 等功能
+  tui/               交互式终端体验
+  exec/              非交互模式，保证 stdout/stderr 语义清晰
+  app-server/        给桌面、IDE、远程控制等提供服务端能力
+
+协议层：
+  protocol/          Codex 内部 Op/Event/权限/配置/用户输入等类型
+  app-server-protocol/ App Server JSON-RPC 协议和 v2 API
+
+核心层：
+  core/              Session、Turn、上下文、工具调度、模型请求、审批
+  thread-store/      会话持久化抽象
+  rollout/           本地记录和恢复
+
+工具与扩展层：
+  tools/             工具名称、规范和共享结构
+  core-skills/       技能发现、加载、渲染、注入
+  core-plugins/      插件 manifest、市场和安装状态
+  codex-mcp/         MCP server 配置、工具暴露和连接
+
+执行与安全层：
+  sandboxing/        跨平台沙箱选择和命令转换
+  linux-sandbox/     Linux 沙箱实现
+  windows-sandbox-rs/ Windows 沙箱实现
+  shell-command/     shell 命令解析与安全判断
+  execpolicy/        执行策略检查
+
+模型与服务层：
+  codex-api/         Responses API、SSE、WebSocket、Realtime 等端点封装
+  codex-client/      HTTP 传输、重试、错误等基础客户端
+  model-provider/    模型提供商抽象
+  login/             ChatGPT/API key/令牌等认证
+</code></pre>
+<p>如果你想快速入门源码，不建议从 <code>core/src/session/turn.rs</code> 第一行开始硬啃。更好的阅读顺序是：</p>
+<ol>
+<li>看 <code>README.md</code>，理解产品形态。</li>
+<li>看 <code>codex-cli/bin/codex.js</code>，理解 npm 入口只负责启动原生二进制。</li>
+<li>看 <code>codex-rs/cli/src/main.rs</code>，理解顶层子命令。</li>
+<li>看 <code>codex-rs/protocol/src/protocol.rs</code>，理解 <code>Op</code> 和 <code>EventMsg</code>。</li>
+<li>看 <code>codex-rs/core/src/session/turn.rs</code> 的 <code>run_turn</code> 注释和主循环。</li>
+<li>看 <code>codex-rs/core/src/tools/spec_plan.rs</code> 和 <code>router.rs</code>，理解工具如何注册与分发。</li>
+<li>看 <code>codex-rs/core/src/exec.rs</code>、<code>safety.rs</code>、<code>sandboxing/src/lib.rs</code>，理解执行安全。</li>
+</ol>
+<h2 id="3-核心原理一个-codex-turn-是怎样跑起来的">3. 核心原理：一个 Codex turn 是怎样跑起来的</h2>
+<h3 id="31-协议层submission-queue-与-event-queue">3.1 协议层：Submission Queue 与 Event Queue</h3>
+<p><code>codex-rs/protocol/src/protocol.rs</code> 的文件注释写明：它定义了 Codex session 中客户端与 Agent 之间的协议，采用 Submission Queue / Event Queue 模式进行异步通信。</p>
+<p>这个设计非常关键。Codex 不是同步函数调用：</p>
+<pre><code class="language-text">answer = codex.ask(prompt)
+</code></pre>
+<p>而是更接近：</p>
+<div class="mermaid">flowchart LR
+    A[客户端提交 Op] --&gt; B[Agent 异步处理]
+    B --&gt; C[Agent 不断发出 Event]
+    C --&gt; D[客户端根据 Event 更新 UI]
+</div><p><code>Submission</code> 结构包含：</p>
+<ul>
+<li><code>id</code>：用于关联提交和事件。</li>
+<li><code>op</code>：实际操作，例如用户输入、取消、配置更新等。</li>
+<li><code>client_user_message_id</code>：客户端侧用户消息 id。</li>
+<li><code>trace</code>：W3C trace 上下文，用于跨异步任务追踪。</li>
+</ul>
+<p><code>Op</code> 是“客户端要 Agent 做什么”，<code>EventMsg</code> 是“Agent 告诉客户端发生了什么”。这种设计有两个直接好处：</p>
+<p>第一，UI 可以实时展示状态。模型推理、工具执行、shell 输出、补丁应用、审批请求、错误信息都可以变成事件流，而不是等所有事情结束才一次性返回。</p>
+<p>第二，多入口可以复用同一套事件。TUI 可以把事件渲染成终端界面；<code>exec --json</code> 可以输出 JSONL；App Server 可以把事件转成 JSON-RPC 通知；测试可以捕获事件做断言。</p>
+<p>可以用下面的简化类型帮助理解：</p>
+<pre><code class="language-rust">// 简化示例：真实源码里的类型更丰富
+enum Op {
+    UserTurn { input: Vec&lt;UserInput&gt; },
+    Interrupt,
+    ConfigureSession,
+}
+
+enum EventMsg {
+    SessionConfigured,
+    TurnStarted,
+    AgentMessageDelta,
+    ExecCommandBegin,
+    ExecCommandOutputDelta,
+    ApplyPatchApprovalRequest,
+    TurnCompleted,
+    Error,
+}
+</code></pre>
+<p>对于初学者来说，只要记住一点：Codex 的 UI 不直接驱动模型细节，它通过协议提交请求并消费事件。协议层是 Codex 多端复用的基础。</p>
+<h3 id="32-会话层threadsessionturn-的关系">3.2 会话层：Thread、Session、Turn 的关系</h3>
+<p>Codex 源码中逐渐用 <code>Thread</code> 替代早期的 <code>Conversation</code> 命名。一个 thread 可以理解为一次长期任务会话，里面包含多个 turn；每个 turn 是一次用户输入或自动推进触发的模型执行周期。</p>
+<p>在 <code>codex-rs/core/src/codex_thread.rs</code> 中，<code>CodexThread</code> 是对底层 <code>Codex</code> session 的封装。它提供了：</p>
+<ul>
+<li><code>submit</code>：提交 <code>Op</code>。</li>
+<li><code>shutdown_and_wait</code>：关闭会话。</li>
+<li><code>steer_input</code>：向运行中的 turn 注入用户输入。</li>
+<li><code>inject_if_running</code>：向当前活跃 turn 注入模型可见项目。</li>
+<li><code>try_start_turn_if_idle</code>：在线程空闲时启动自动 turn。</li>
+<li><code>set_thread_memory_mode</code>：设置线程是否适合后续记忆生成。</li>
+</ul>
+<p><code>ThreadConfigSnapshot</code> 则保存当前线程配置快照，包括：</p>
+<ul>
+<li>模型和模型提供商。</li>
+<li>service tier。</li>
+<li>approval policy。</li>
+<li>permission profile。</li>
+<li>workspace roots。</li>
+<li>reasoning effort 和 summary。</li>
+<li>personality。</li>
+<li>collaboration mode。</li>
+<li>multi-agent mode。</li>
+<li>session source。</li>
+</ul>
+<p>这说明 Codex 的 thread 不是“聊天记录”这么简单，它携带运行时配置、权限、工作目录、模型选择、协作模式和来源信息。这样的设计让 resume、fork、App Server、多代理协作成为可能。</p>
+<p>再看 <code>codex-rs/core/src/session/session.rs</code>，<code>Session</code> 保存当前 Agent 运行上下文：</p>
+<ul>
+<li><code>thread_id</code>：线程 id。</li>
+<li><code>tx_event</code>：向客户端发送事件。</li>
+<li><code>agent_status</code>：Agent 状态。</li>
+<li><code>conversation</code>：实时会话管理。</li>
+<li><code>active_turn</code>：当前活跃 turn。</li>
+<li><code>input_queue</code>：用户输入队列。</li>
+<li><code>guardian_review_session</code>：审查/审批相关会话。</li>
+<li><code>services</code>：模型客户端、MCP、插件、analytics、扩展等服务集合。</li>
+</ul>
+<p><code>SessionConfiguration</code> 则保存运行配置，例如 provider、collaboration mode、developer instructions、加载到的 AGENTS.md、base instructions、approval policy、permission profile、workspace roots、codex home、session source、dynamic tools 等。</p>
+<p>从这些结构可以看出 Codex 的状态模型：</p>
+<div class="mermaid">flowchart LR
+    Thread[Thread 长期会话] --&gt; Session[Session 运行上下文]
+    Session --&gt; Turn1[Turn 1]
+    Session --&gt; Turn2[Turn 2]
+    Session --&gt; TurnN[Turn N]
+    Session --&gt; History[历史与 rollout]
+    Session --&gt; Config[配置快照]
+    Session --&gt; Services[模型/MCP/插件/技能/状态服务]
+</div><p>这种分层能解决一个实际问题：用户可能在一个任务里连续输入多次，也可能中断、恢复、fork，甚至让子代理执行子任务。如果没有清晰的 Thread/Session/Turn 边界，状态很快会乱。</p>
+<h3 id="33-run_turncodex-的核心循环">3.3 <code>run_turn</code>：Codex 的核心循环</h3>
+<p><code>codex-rs/core/src/session/turn.rs</code> 是整套系统最核心的文件之一。它的 <code>run_turn</code> 做了很多事情，但可以拆成以下阶段：</p>
+<p>第一阶段，准备模型客户端 session。<code>ModelClientSession</code> 是 turn 级别的对象，用于缓存 WebSocket 连接、sticky routing token 和前一次请求信息。源码注释强调：每个 turn 都要创建新的 <code>ModelClientSession</code>，不能跨 turn 复用，否则会把上一个 turn 的 sticky routing token 带到下一个 turn。</p>
+<p>第二阶段，必要时执行 pre-sampling compact。上下文窗口有限，如果历史太长，Codex 会在采样前进行压缩，避免请求超过模型上下文限制。</p>
+<p>第三阶段，记录上下文更新。Codex 会把当前工作目录、AGENTS.md、技能、插件、工具说明、用户输入等组织成模型可见内容。</p>
+<p>第四阶段，构建技能和插件注入。<code>build_skills_and_plugins</code> 会根据用户显式提及、配置、可用技能、插件和连接器，决定哪些内容注入模型上下文。</p>
+<p>第五阶段，运行 hooks 并记录输入。Codex 支持生命周期 hooks，例如 session start、pre tool use、post tool use、turn stop 等。这些 hook 可以为企业治理、日志、审批和上下文增强提供入口。</p>
+<p>第六阶段，进入 loop。每轮循环会：</p>
+<ol>
+<li>取出 pending input。</li>
+<li>构建 sampling request input。</li>
+<li>调用 <code>run_sampling_request</code>。</li>
+<li>处理模型输出。</li>
+<li>如果模型请求工具，就执行工具并把结果写回历史。</li>
+<li>如果模型给出最终消息且没有后续工作，就结束 turn。</li>
+<li>如果 token 接近限制且还需要继续，就执行 auto compact。</li>
+</ol>
+<p>把这个主循环写成伪代码，大概是：</p>
+<pre><code class="language-rust">// 简化示例：用中文注释解释 Codex turn 的核心思想
+async fn run_turn(input: Vec&lt;TurnInput&gt;) -&gt; Result&lt;Option&lt;String&gt;&gt; {
+    // 1. 为当前 turn 创建模型会话，缓存本 turn 内的连接和路由状态
+    let mut client_session = model_client.new_session();
+
+    // 2. 如果上下文太长，先压缩历史，避免超过上下文窗口
+    run_pre_sampling_compact_if_needed().await?;
+
+    // 3. 注入 AGENTS.md、技能、插件、环境信息和用户输入
+    record_context_and_inputs(input).await?;
+
+    loop {
+        // 4. 把会话历史转换成模型请求
+        let request_input = history.for_prompt();
+
+        // 5. 向模型发请求，模型可能返回文本，也可能返回工具调用
+        let output = run_sampling_request(&amp;mut client_session, request_input).await?;
+
+        // 6. 如果模型请求工具，执行工具并把结果写回历史
+        if output.needs_tool_follow_up {
+            execute_tools_and_record_outputs(output.tool_calls).await?;
+            continue;
+        }
+
+        // 7. 如果期间用户又输入了内容，继续循环处理
+        if has_pending_input().await {
+            continue;
+        }
+
+        // 8. 没有后续工作，当前 turn 结束
+        return Ok(output.last_agent_message);
+    }
+}
+</code></pre>
+<p>这个循环体现了 Agent 与普通 LLM 应用的根本差异：模型不是一次性给答案，而是在“模型 -&gt; 工具 -&gt; 模型 -&gt; 工具”的闭环里逐步完成任务。</p>
+<div class="mermaid">flowchart LR
+    A[模型推理] --&gt; B{需要工具吗}
+    B --&gt;|需要| C[调用工具]
+    C --&gt; D[工具返回结果]
+    D --&gt; A
+    B --&gt;|不需要| E[输出最终回复]
+</div><h3 id="34-模型客户端responses-apiwebsocket-与-http-fallback">3.4 模型客户端：Responses API、WebSocket 与 HTTP fallback</h3>
+<p><code>codex-rs/core/src/client.rs</code> 是 Codex 与模型提供商通信的重要封装。文件开头的注释非常有价值，它说明了几个设计点：</p>
+<ul>
+<li><code>ModelClient</code> 是 session 级别对象，保存稳定配置和状态，例如认证、provider 选择、conversation id、传输 fallback 状态。</li>
+<li>每个 turn 的模型选择、reasoning 控制、telemetry 和元数据都显式传入 streaming/unary 方法。</li>
+<li><code>ModelClientSession</code> 是 turn 级别对象，用于在一个 turn 内复用 Responses WebSocket 连接。</li>
+<li>WebSocket prewarm 是 best-effort，用于让后续请求复用连接。</li>
+<li>如果 WebSocket 失败，会走正常的 stream retry/fallback 逻辑。</li>
+</ul>
+<p>源码里能看到一系列请求头和端点常量，例如：</p>
+<ul>
+<li><code>X_CODEX_INSTALLATION_ID_HEADER</code></li>
+<li><code>X_CODEX_TURN_STATE_HEADER</code></li>
+<li><code>X_CODEX_TURN_METADATA_HEADER</code></li>
+<li><code>X_CODEX_PARENT_THREAD_ID_HEADER</code></li>
+<li><code>RESPONSES_ENDPOINT = "/responses"</code></li>
+<li><code>RESPONSES_COMPACT_ENDPOINT = "/responses/compact"</code></li>
+</ul>
+<p>这说明 Codex 不是简单地把 prompt 发给模型。它还维护安装 id、turn metadata、窗口 id、父线程 id、sticky routing 状态等工程信息。这些信息用于服务端路由、调试、指标、压缩、子代理关联和稳定性保障。</p>
+<p>对初学者来说，可以这样理解：</p>
+<div class="mermaid">sequenceDiagram
+    participant Core as codex-core
+    participant Client as ModelClientSession
+    participant API as Responses API
+    Core-&gt;&gt;Client: 创建 turn 级会话
+    Client-&gt;&gt;API: 可选 WebSocket prewarm
+    Core-&gt;&gt;Client: stream(request_input, tools, metadata)
+    Client-&gt;&gt;API: /responses 或 WebSocket 请求
+    API--&gt;&gt;Client: SSE/WebSocket 事件流
+    Client--&gt;&gt;Core: ResponseEvent
+    Core-&gt;&gt;Core: 解析文本、推理、工具调用
+</div><p>这种设计让 Codex 可以在交互式体验中边生成边展示，也可以在无交互模式中输出结构化 JSONL。</p>
+<h3 id="35-工具系统模型如何动手做事">3.5 工具系统：模型如何“动手做事”</h3>
+<p>Agent 的关键能力不是会聊天，而是能安全地调用工具。Codex 的工具系统主要由几个文件构成：</p>
+<ul>
+<li><code>codex-rs/core/src/tools/spec_plan.rs</code>：决定当前 turn 暴露哪些工具。</li>
+<li><code>codex-rs/core/src/tools/router.rs</code>：把模型输出转换成 <code>ToolCall</code> 并分发。</li>
+<li><code>codex-rs/core/src/tools/registry.rs</code>：工具运行时接口、hook、telemetry 和输出转换。</li>
+<li><code>codex-rs/core/src/tools/parallel.rs</code>：控制工具并行执行、取消和失败响应。</li>
+<li><code>codex-rs/core/src/tools/handlers/</code>：内置工具 handler。</li>
+</ul>
+<p><code>handlers</code> 目录列出了 Codex 的很多内置工具能力：</p>
+<ul>
+<li><code>shell</code> / <code>unified_exec</code>：执行 shell 命令。</li>
+<li><code>apply_patch</code>：应用补丁。</li>
+<li><code>mcp</code>：调用 MCP 工具。</li>
+<li><code>mcp_resource</code>：列出和读取 MCP 资源。</li>
+<li><code>plan</code>：更新计划。</li>
+<li><code>request_permissions</code>：请求权限。</li>
+<li><code>request_user_input</code>：请求用户输入。</li>
+<li><code>tool_search</code>：搜索延迟加载工具。</li>
+<li><code>view_image</code>：查看本地图像。</li>
+<li><code>current_time</code>：读取当前时间。</li>
+<li><code>multi_agents</code> / <code>agent_jobs</code>：多代理协作。</li>
+<li><code>new_context_window</code>：开启新上下文窗口。</li>
+<li><code>list_available_plugins_to_install</code> / <code>request_plugin_install</code>：插件发现与安装请求。</li>
+</ul>
+<p><code>ToolRouter::build_tool_call</code> 会把模型输出中的 <code>ResponseItem</code> 转成内部 <code>ToolCall</code>。它处理三类主要工具调用：</p>
+<ol>
+<li><code>FunctionCall</code>：普通函数工具。</li>
+<li><code>ToolSearchCall</code>：工具搜索。</li>
+<li><code>CustomToolCall</code>：自定义工具调用。</li>
+</ol>
+<p>简化后可以理解为：</p>
+<pre><code class="language-rust">// 简化示例：把模型输出转换为 Codex 内部工具调用
+fn build_tool_call(item: ResponseItem) -&gt; Option&lt;ToolCall&gt; {
+    match item {
+        // 模型请求函数工具
+        ResponseItem::FunctionCall { name, arguments, call_id, .. } =&gt; {
+            Some(ToolCall {
+                tool_name: ToolName::plain(name),
+                call_id,
+                payload: ToolPayload::Function { arguments },
+            })
+        }
+
+        // 模型请求自定义工具
+        ResponseItem::CustomToolCall { name, input, call_id, .. } =&gt; {
+            Some(ToolCall {
+                tool_name: ToolName::plain(name),
+                call_id,
+                payload: ToolPayload::Custom { input },
+            })
+        }
+
+        // 普通消息不是工具调用
+        _ =&gt; None,
+    }
+}
+</code></pre>
+<p>工具注册表 <code>ToolRegistry</code> 则保存工具名到 handler 的映射。每个 handler 实现统一接口，提供：</p>
+<ul>
+<li>工具名。</li>
+<li>工具 schema。</li>
+<li>是否对模型可见。</li>
+<li>是否支持并行。</li>
+<li>如何处理调用。</li>
+<li>如何把结果转换成模型可见输出。</li>
+<li>如何暴露 pre/post tool hook payload。</li>
+</ul>
+<p>这让 Codex 可以做到“同一套工具协议，不同工具实现”。shell、patch、MCP、插件工具、动态工具都能通过统一的路由和执行框架运行。</p>
+<h3 id="36-工具并行取消和失败恢复">3.6 工具并行、取消和失败恢复</h3>
+<p><code>codex-rs/core/src/tools/parallel.rs</code> 处理工具并行执行。这里有一个工程细节值得学习：不是所有工具都能安全并行。比如两个只读查询工具可以并行，但两个写文件工具如果同时跑，可能互相覆盖。源码中的 <code>ToolCallRuntime</code> 会询问 router：这个工具是否支持并行。</p>
+<p>它使用一个 <code>RwLock</code>：</p>
+<ul>
+<li>支持并行的工具拿读锁。</li>
+<li>不支持并行的工具拿写锁。</li>
+</ul>
+<p>这样多个并行安全工具可以同时运行，而互斥工具会串行执行。</p>
+<p>伪代码如下：</p>
+<pre><code class="language-rust">// 简化示例：用读写锁控制工具并行
+async fn dispatch_tool(call: ToolCall) {
+    let supports_parallel = router.tool_supports_parallel(&amp;call);
+
+    if supports_parallel {
+        // 中文注释：并行安全工具共享读锁，可以同时执行
+        let _guard = parallel_execution.read().await;
+        router.dispatch(call).await;
+    } else {
+        // 中文注释：有副作用或不安全工具拿写锁，避免并发冲突
+        let _guard = parallel_execution.write().await;
+        router.dispatch(call).await;
+    }
+}
+</code></pre>
+<p>同时，工具执行还需要支持取消。用户可能中断 turn，shell 命令可能超时，后台进程可能需要清理。<code>ToolCallRuntime</code> 使用 <code>CancellationToken</code> 和 <code>AbortOnDropHandle</code> 处理取消。如果工具被取消，它会返回一个模型可见的 aborted response，而不是让整个系统状态不明。</p>
+<p>这也是 Agent 工程很容易被忽视的地方：工具调用不是函数调用那么纯粹。真实命令可能卡住、超时、输出巨大、产生子进程、修改文件、要求审批。Codex 在工具层做了大量工程防护。</p>
+<h2 id="4-架构拆解从源码目录看-codex-的模块边界">4. 架构拆解：从源码目录看 Codex 的模块边界</h2>
+<h3 id="41-入口层clituiexecapp-server">4.1 入口层：CLI、TUI、Exec、App Server</h3>
+<p>Codex 有多个入口，但核心都汇聚到同一套 session/thread 机制。</p>
+<p>交互式 TUI 在 <code>codex-rs/tui/</code>。<code>tui/src/lib.rs</code> 中可以看到大量 UI 模块：<code>app</code>、<code>bottom_pane</code>、<code>chatwidget</code>、<code>history_cell</code>、<code>markdown_render</code>、<code>slash_command</code>、<code>status</code>、<code>token_usage</code>、<code>resume_picker</code> 等。TUI 的职责是把协议事件渲染成用户能理解的终端界面，同时收集用户输入并发送到 App Server/Core。</p>
+<p>无交互模式在 <code>codex-rs/exec/</code>。<code>exec/src/lib.rs</code> 文件顶部明确要求：</p>
+<ul>
+<li>默认输出模式下，stdout 只能写最终消息。</li>
+<li><code>--json</code> 模式下，stdout 必须是 JSONL，每行一个事件。</li>
+<li>其他输出必须写到 stderr。</li>
+</ul>
+<p>这个要求非常工程化。因为 <code>codex exec</code> 很可能用于脚本、CI 或管道，如果 stdout 混入日志，就会破坏调用者解析。</p>
+<p>App Server 在 <code>codex-rs/app-server/</code>，协议在 <code>app-server-protocol/</code>。v2 协议里有 <code>ThreadStartParams</code>、<code>ThreadStartResponse</code>、<code>ThreadSettingsUpdateParams</code> 等结构，说明它面向更复杂的宿主，例如桌面 App、IDE、远程控制和其他客户端。App Server 把 Codex 的能力封装成 JSON-RPC 风格接口，让前端或宿主不用直接链接 <code>core</code> 内部实现。</p>
+<p>三者关系可以这样理解：</p>
+<div class="mermaid">flowchart TD
+    CLI[cli/src/main.rs] --&gt; TUI[tui: 交互式终端]
+    CLI --&gt; EXEC[exec: 无交互任务]
+    CLI --&gt; APPSERVER[app-server: 宿主服务]
+    TUI --&gt; CORE[core: Agent 主循环]
+    EXEC --&gt; APPSERVER
+    APPSERVER --&gt; CORE
+    CORE --&gt; PROTOCOL[protocol: Op/Event/Model/Permission 类型]
+</div><p>这里有一个有趣细节：TUI 和 exec 都越来越多地复用 app-server client/in-process app server。这说明 Codex 正在把“运行一个 Agent thread”从具体 UI 中抽离出来，让不同客户端都通过稳定服务接口访问核心能力。</p>
+<h3 id="42-协议层core-protocol-与-app-server-protocol">4.2 协议层：Core Protocol 与 App Server Protocol</h3>
+<p>Codex 有两类重要协议：</p>
+<p>第一类是 <code>codex-rs/protocol</code>，它是 core 内部会话协议，定义 <code>Op</code>、<code>EventMsg</code>、<code>SandboxPolicy</code>、<code>AskForApproval</code>、<code>UserInput</code>、<code>ResponseItem</code> 等核心类型。</p>
+<p>第二类是 <code>codex-rs/app-server-protocol</code>，它面向 App Server 客户端，提供 v1/v2 JSON-RPC API，包含 thread、turn、permission、model、plugin、mcp、config、environment 等接口。</p>
+<p>为什么要分两层？因为 core 内部协议更贴近 Agent 运行时，而 App Server 协议更贴近产品宿主。内部可以演进得更快，外部协议需要更稳定、更容易导出 schema、TypeScript 类型和实验字段控制。</p>
+<p>在 <code>app-server-protocol/src/protocol/v2/thread.rs</code> 中，<code>ThreadStartParams</code> 包含很多宿主可传的配置：</p>
+<ul>
+<li><code>model</code></li>
+<li><code>model_provider</code></li>
+<li><code>service_tier</code></li>
+<li><code>cwd</code></li>
+<li><code>runtime_workspace_roots</code></li>
+<li><code>approval_policy</code></li>
+<li><code>approvals_reviewer</code></li>
+<li><code>sandbox</code></li>
+<li><code>permissions</code></li>
+<li><code>config</code></li>
+<li><code>base_instructions</code></li>
+<li><code>developer_instructions</code></li>
+<li><code>personality</code></li>
+<li><code>multi_agent_mode</code></li>
+<li><code>ephemeral</code></li>
+<li><code>environments</code></li>
+<li><code>dynamic_tools</code></li>
+<li><code>selected_capability_roots</code></li>
+</ul>
+<p>这说明 Codex 的外部 API 不是“传 prompt”那么简单，而是允许宿主完整控制运行环境、权限、模型和工具。</p>
+<p>对于想设计自己 Agent 系统的人，这里有一个启发：如果你希望同一个 Agent 核心能服务 CLI、Web、IDE、桌面端和自动化任务，就应该尽早抽象协议边界，不要把 UI 操作直接写进核心逻辑。</p>
+<h3 id="43-配置层config-不是简单读取-toml">4.3 配置层：Config 不是简单读取 TOML</h3>
+<p><code>codex-rs/core/src/config/mod.rs</code> 是一个很大的文件，涉及配置加载、权限 profile、模型 provider、MCP server、插件、特性开关、Windows 沙箱、网络代理、认证存储、project doc 限制等。</p>
+<p>Codex 的配置不是“读取一个 config.toml 然后用默认值补齐”。它需要合并多个配置层：</p>
+<ul>
+<li>用户全局配置。</li>
+<li>项目配置。</li>
+<li>profile 配置。</li>
+<li>managed/admin requirements。</li>
+<li>CLI <code>-c</code> 覆盖。</li>
+<li>云配置 bundle。</li>
+<li>插件和 MCP 贡献。</li>
+</ul>
+<p>它还需要做约束检查。例如企业管理员可能限制某些权限或 hook，配置层必须知道某个值来自哪里，是否允许被更高优先级覆盖。</p>
+<p>源码中可以看到 <code>ConfigLayerStack</code>、<code>ConfigRequirements</code>、<code>Constrained</code>、<code>RequirementSource</code> 等概念。这些都是为了把“配置”升级成“可追踪、可约束、可解释”的运行时输入。</p>
+<p>一个简化的 <code>config.toml</code> 可能像这样：</p>
+<pre><code class="language-toml"># 示例：Codex 配置片段，真实字段以当前版本文档和源码为准
+model = "gpt-5.2-codex"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[permissions]
+# 中文注释：限制 Codex 默认只能写工作区，避免误改系统文件
+default = "workspace-write"
+
+[mcp_servers.docs]
+# 中文注释：注册一个 MCP server，让 Codex 能读取外部文档资源
+command = "node"
+args = ["./mcp-docs-server.js"]
+</code></pre>
+<p>配置层的关键不是字段多少，而是“配置影响运行时行为”。比如：</p>
+<ul>
+<li><code>approval_policy</code> 会影响 shell 和 patch 是否需要用户确认。</li>
+<li><code>sandbox_mode</code> 会影响文件系统和网络访问。</li>
+<li><code>model</code> 会影响请求的模型和 reasoning 参数。</li>
+<li>MCP server 配置会影响工具列表。</li>
+<li>skill/plugin 配置会影响模型可见上下文和可用工具。</li>
+</ul>
+<h3 id="44-agentsmd把项目规则注入模型上下文">4.4 AGENTS.md：把项目规则注入模型上下文</h3>
+<p><code>codex-rs/core/src/agents_md.rs</code> 专门处理 AGENTS.md 发现和用户指令拼装。文件注释说明了规则：</p>
+<ol>
+<li>从当前工作目录向上查找项目根，默认项目根标记是 <code>.git</code>。</li>
+<li>从项目根到当前工作目录，依次收集每一层的 <code>AGENTS.md</code>。</li>
+<li>不会越过项目根。</li>
+<li>还支持本地 override 文件 <code>AGENTS.override.md</code>。</li>
+<li>总注入大小受 <code>project_doc_max_bytes</code> 限制，默认来自 <code>DEFAULT_PROJECT_DOC_MAX_BYTES</code>。</li>
+</ol>
+<p>这个机制很重要，因为代码库里的约定通常比通用模型知识更可靠。比如：</p>
+<ul>
+<li>本项目用 <code>just test</code>，不要直接 <code>cargo test</code>。</li>
+<li>生成代码必须符合某种风格。</li>
+<li>修改配置后必须更新 schema。</li>
+<li>UI 文本变化要更新 snapshot。</li>
+<li>某些目录不能改。</li>
+</ul>
+<p>Codex 会把这些规则作为模型可见上下文注入，让模型在当前项目里“守规矩”。</p>
+<p>一个典型 <code>AGENTS.md</code> 可以这样写：</p>
+<pre><code class="language-markdown"># 项目协作规则
+
+- 始终使用中文回复用户。
+- 修改 Rust 代码后运行 `just fmt`。
+- 涉及 `core` 行为变更时优先添加集成测试。
+- 不要直接修改生成文件，先修改生成源。
+- 代码注释保持简短，只解释关键逻辑。
+</code></pre>
+<p>从 Agent 设计角度看，AGENTS.md 是一种“仓库级长期提示词”，但它不是随便拼 prompt，而是有明确发现顺序、大小限制和来源记录。这比把所有规则硬编码在系统提示词里更灵活。</p>
+<h3 id="45-技能与插件把一次性提示词变成可复用能力">4.5 技能与插件：把一次性提示词变成可复用能力</h3>
+<p>Codex 支持 skills 和 plugins。源码中相关模块包括：</p>
+<ul>
+<li><code>codex-rs/core/src/skills.rs</code></li>
+<li><code>codex-rs/core-skills/</code></li>
+<li><code>codex-rs/skills/</code></li>
+<li><code>codex-rs/core-plugins/</code></li>
+<li><code>codex-rs/plugin/</code></li>
+</ul>
+<p>技能可以理解为可复用工作流。例如“创建 Word 文档”“处理电子表格”“控制浏览器”“生成图片”等。技能通常包含 <code>SKILL.md</code>，里面描述什么时候使用、如何使用、需要读取哪些参考文件、有哪些脚本或模板。</p>
+<p>插件则更像一个可安装包，可以包含：</p>
+<ul>
+<li>skills</li>
+<li>MCP server 配置</li>
+<li>apps</li>
+<li>hooks</li>
+<li>interface 元数据</li>
+<li>图标和截图等资源</li>
+</ul>
+<p><code>core-plugins/src/manifest.rs</code> 会解析插件 manifest。源码里能看到 manifest 支持字段：</p>
+<ul>
+<li><code>name</code></li>
+<li><code>version</code></li>
+<li><code>description</code></li>
+<li><code>keywords</code></li>
+<li><code>skills</code></li>
+<li><code>mcpServers</code></li>
+<li><code>apps</code></li>
+<li><code>hooks</code></li>
+<li><code>interface</code></li>
+</ul>
+<p>一个简化插件 manifest 可以这样理解：</p>
+<pre><code class="language-json">{
+  "name": "docs-helper",
+  "version": "0.1.0",
+  "description": "为项目文档提供检索和生成能力",
+  "skills": "./skills",
+  "mcpServers": "./mcp.json",
+  "hooks": "./hooks.toml",
+  "interface": {
+    "displayName": "Docs Helper",
+    "shortDescription": "项目文档助手"
+  }
+}
+</code></pre>
+<p>技能与插件的区别可以这样记：</p>
+<ul>
+<li>AGENTS.md：当前仓库的规则。</li>
+<li>Skill：某类任务的可复用工作流。</li>
+<li>Plugin：可安装的能力包，可能包含 skill、MCP、hook、app 和界面元数据。</li>
+<li>MCP：让 Codex 连接外部工具和数据源的协议。</li>
+</ul>
+<p>Codex 在每个 turn 里会根据用户提及、配置和可用技能，决定是否注入技能说明。<code>maybe_emit_implicit_skill_invocation</code> 还会根据命令和工作目录识别隐式技能调用，并上报 analytics。这个设计让技能不是“永远塞进上下文”，而是按需注入，减少 token 浪费。</p>
+<h3 id="46-mcp外部世界的工具与资源入口">4.6 MCP：外部世界的工具与资源入口</h3>
+<p>MCP 是 Model Context Protocol 的缩写。Codex 源码中 <code>codex-rs/core/src/mcp.rs</code> 的 <code>McpManager</code> 负责把配置、插件和扩展贡献的 MCP server 合成运行时配置。</p>
+<p>它支持几类来源：</p>
+<ul>
+<li>用户配置的 MCP server。</li>
+<li>插件选择带来的 MCP server。</li>
+<li>扩展在运行时贡献或移除的 MCP server。</li>
+<li>Codex apps 兼容性内置 server。</li>
+</ul>
+<p><code>McpManager::runtime_config</code> 会应用内置兼容、插件注册和 runtime overlay，最终得到当前 session/thread 可用的 MCP 配置。<code>effective_servers</code> 还会结合认证状态做 gating。</p>
+<p>MCP 对 Codex 很重要，因为它把 Agent 从“只能访问本地 shell 和文件”扩展到“可以访问外部授权数据和工具”。例如：</p>
+<ul>
+<li>读取 Google Docs 或 Notion 文档。</li>
+<li>查询 GitHub issue。</li>
+<li>调用内部服务。</li>
+<li>访问知识库。</li>
+<li>执行业务系统工具。</li>
+</ul>
+<p>在工具层，Codex 有 <code>mcp</code> handler 和 <code>mcp_resource</code> handler，用于调用 MCP 工具、列出 MCP 资源、读取 MCP 资源模板等。模型看到的是统一工具接口，Codex 负责把调用转发到对应 MCP server。</p>
+<p>一个简化 MCP server 配置可以这样写：</p>
+<pre><code class="language-toml">[mcp_servers.local_docs]
+command = "node"
+args = ["./tools/mcp-local-docs.js"]
+
+# 中文注释：Codex 启动时会根据配置拉起该 server，并把可用工具暴露给模型
+</code></pre>
+<h2 id="5-安全机制让-agent-能做事但不能乱做事">5. 安全机制：让 Agent 能做事，但不能乱做事</h2>
+<h3 id="51-权限模型审批策略与-permission-profile">5.1 权限模型：审批策略与 Permission Profile</h3>
+<p>一旦 Agent 具备执行命令、修改文件、访问网络或调用外部工具的能力，它就不再只是“生成文本”的系统，而是在真实开发环境里产生副作用的执行主体。Codex 的安全机制不是单点实现，而是由配置、审批、权限 profile、沙箱和工具安全检查共同组成。</p>
+<p><code>codex-rs/protocol/src/protocol.rs</code> 定义了 <code>AskForApproval</code>、<code>SandboxPolicy</code> 等核心类型。<code>SessionConfiguration</code> 中保存 <code>approval_policy</code>、<code>approvals_reviewer</code> 和 <code>permission_profile_state</code>。工具执行前会根据当前策略决定：</p>
+<ul>
+<li>自动批准。</li>
+<li>请求用户批准。</li>
+<li>直接拒绝。</li>
+<li>在沙箱中执行。</li>
+</ul>
+<p><code>codex-rs/core/src/safety.rs</code> 的 <code>assess_patch_safety</code> 是一个很好的例子。它会判断 apply_patch 是否为空、审批策略是什么、补丁目标是否被限制在可写路径内、当前平台是否有可用沙箱、是否需要询问用户。如果补丁试图写出项目外，且策略不允许审批升级，就会拒绝。</p>
+<p>简化逻辑如下：</p>
+<pre><code class="language-rust">// 简化示例：补丁安全判断
+fn assess_patch_safety(action: Patch, policy: ApprovalPolicy, sandbox: SandboxPolicy) -&gt; Decision {
+    if action.is_empty() {
+        return Decision::Reject("空补丁不能执行");
+    }
+
+    if action.only_writes_allowed_paths(&amp;sandbox) {
+        // 中文注释：补丁只写允许路径，可以在沙箱中自动执行
+        return Decision::AutoApprove;
+    }
+
+    if policy.allows_user_approval() {
+        // 中文注释：风险较高但允许用户审批，交给用户决定
+        return Decision::AskUser;
+    }
+
+    // 中文注释：既不安全，也不能升级审批，直接拒绝
+    Decision::Reject("写入路径不被允许")
+}
+</code></pre>
+<p>这个机制体现了一个重要原则：Agent 的默认能力应该受限，只有在策略允许时才扩大权限。尤其是写文件、联网、执行命令这些操作，不能完全交给模型自觉。</p>
+<h3 id="52-沙箱macoslinuxwindows-的平台差异">5.2 沙箱：macOS、Linux、Windows 的平台差异</h3>
+<p><code>codex-rs/sandboxing/src/lib.rs</code> 是跨平台沙箱抽象入口。它会根据平台导出不同实现：</p>
+<ul>
+<li>Linux：Landlock / bubblewrap。</li>
+<li>macOS：Seatbelt。</li>
+<li>Windows：受限 token、ACL、WFP 等。</li>
+</ul>
+<p><code>sandboxing</code> 模块提供：</p>
+<ul>
+<li><code>SandboxManager</code></li>
+<li><code>SandboxCommand</code></li>
+<li><code>SandboxExecRequest</code></li>
+<li><code>SandboxType</code></li>
+<li><code>compatibility_sandbox_policy_for_permission_profile</code></li>
+<li><code>get_platform_sandbox</code></li>
+</ul>
+<p>真正执行 shell 时，<code>codex-rs/core/src/exec.rs</code> 会先构建 <code>ExecParams</code>，再通过 <code>build_exec_request</code> 转成可执行请求，最终走 <code>sandboxing::execute_env</code>。<code>ExecParams</code> 包含命令、cwd、timeout/cancellation、环境变量、网络代理、sandbox permissions、Windows sandbox level、justification 等信息。</p>
+<p>一个 shell 调用不是简单的：</p>
+<pre><code class="language-rust">Command::new("bash").arg("-lc").arg(cmd).output()
+</code></pre>
+<p>而是类似：</p>
+<div class="mermaid">flowchart TD
+    A[模型请求 shell] --&gt; B[Codex 解析命令]
+    B --&gt; C[检查审批策略]
+    C --&gt; D[选择沙箱类型]
+    D --&gt; E[准备网络策略和文件系统权限]
+    E --&gt; F[启动子进程]
+    F --&gt; G[流式采集 stdout/stderr]
+    G --&gt; H{是否超时或取消}
+    H --&gt;|是| I[清理进程组]
+    H --&gt;|否| J[等待命令正常结束]
+    I --&gt; K[截断过大输出]
+    J --&gt; K
+    K --&gt; L[把结构化结果回传模型]
+</div><p><code>core/src/exec.rs</code> 里还有很多细节：</p>
+<ul>
+<li>默认命令超时 <code>DEFAULT_EXEC_COMMAND_TIMEOUT_MS</code> 为 10 秒。</li>
+<li>输出有硬 cap，避免命令输出过大导致 OOM。</li>
+<li>stdout/stderr live delta 数量有限制。</li>
+<li>超时后需要等待 I/O drain，但也有 drain timeout，防止孙进程继承 fd 导致读取任务永远挂起。</li>
+<li>取消时会尝试清理进程组。</li>
+</ul>
+<p>这说明 Codex 对真实命令执行的复杂性有充分处理。很多自制 Agent demo 只调用 <code>subprocess.run</code>，一旦命令卡住、输出巨大或产生后台进程，就会出现不稳定行为。Codex 的实现更接近生产系统。</p>
+<h3 id="53-shellapply_patch-与危险操作">5.3 Shell、apply_patch 与危险操作</h3>
+<p>Codex 对不同工具采用不同安全策略。</p>
+<p>对于 <code>apply_patch</code>，安全重点是路径约束：补丁是否只修改允许写入的路径？是否会写出项目外？当前平台能否 enforce sandbox？</p>
+<p>对于 shell，安全重点更复杂：命令可能删除文件、联网、启动服务、写系统目录、泄露环境变量、执行无限循环。Codex 通过 shell command 解析、安全命令判断、审批策略、沙箱和输出限制共同控制风险。</p>
+<p>对于 MCP，安全重点是外部授权和工具后果。某些 MCP 工具可能是只读资源查询，某些可能修改外部系统。Codex 需要根据工具暴露、审批模板和配置决定是否允许模型直接调用。</p>
+<p>对于插件和 hooks，安全重点是来源和启用策略。企业环境可能只允许 managed hooks，避免用户或项目任意 hook 影响执行。</p>
+<p>这也是为什么 Codex 源码中有大量“看起来不是 AI”的代码：权限、沙箱、配置、认证、持久化、事件、日志、测试。这些代码不是附属品，而是 Agent 产品可用的前提。</p>
+<h2 id="6-上下文工程让模型看到该看的不看不该看的">6. 上下文工程：让模型看到该看的，不看不该看的</h2>
+<h3 id="61-模型可见上下文的组成">6.1 模型可见上下文的组成</h3>
+<p>Codex 每次请求模型时，不是只发送用户输入。它会构建一个模型可见上下文，可能包含：</p>
+<ul>
+<li>base instructions。</li>
+<li>developer instructions。</li>
+<li>用户输入。</li>
+<li>当前工作目录和环境信息。</li>
+<li>AGENTS.md 规则。</li>
+<li>可用工具 schema。</li>
+<li>技能和插件说明。</li>
+<li>MCP 工具信息。</li>
+<li>当前时间提醒。</li>
+<li>token budget 提醒。</li>
+<li>历史消息。</li>
+<li>工具调用结果。</li>
+<li>文件差异或执行输出。</li>
+<li>子代理消息。</li>
+</ul>
+<p>这些内容由 <code>core/src/context/</code>、<code>context_manager/</code>、<code>session/turn.rs</code>、<code>skills.rs</code>、<code>plugins/</code> 等模块共同完成。</p>
+<p>源码中的 <code>AGENTS.md</code> 贡献规则也体现了上下文预算思想：项目文档有最大字节数，超过会截断。<code>AGENTS.md</code> 不是越多越好，因为模型上下文窗口有限，太多规则会挤占真正任务内容。</p>
+<p>Codex 的 <code>AGENTS.md</code> 中也强调模型可见上下文的工程要求：</p>
+<ul>
+<li>不要重写历史，应该增量构建上下文。</li>
+<li>避免频繁改变上下文导致缓存 miss。</li>
+<li>注入项必须有大小上限。</li>
+<li>大于 1k token 的新注入项需要特别关注。</li>
+<li>所有注入 fragment 应该有结构化定义。</li>
+</ul>
+<p>这些规则非常适合所有 Agent 工程学习。上下文不是字符串拼接，而是有生命周期、预算、来源和结构的运行时数据。</p>
+<h3 id="62-压缩与新上下文窗口">6.2 压缩与新上下文窗口</h3>
+<p>Agent 执行复杂任务时，历史会越来越长。Codex 通过 compact 机制处理上下文窗口压力。</p>
+<p>在 <code>run_turn</code> 中可以看到：</p>
+<ul>
+<li>turn 开始前可能运行 pre-sampling compact。</li>
+<li>每次 sampling 后会计算 token 状态。</li>
+<li>如果 token limit reached 且还需要 follow-up，会运行 auto compact。</li>
+<li>如果开启新上下文窗口，也会调整 pending input drain 策略。</li>
+</ul>
+<p>这类机制解决的是长期任务问题。比如用户让 Codex 分析一个大型代码库并修复多个测试，过程中可能产生几十次工具调用。如果每次都把完整历史塞给模型，很快超出上下文窗口；如果随意丢历史，模型又会忘记任务目标和已做决策。</p>
+<p>压缩的目标不是“把历史变短”这么简单，而是保留决策相关信息：</p>
+<ul>
+<li>用户目标。</li>
+<li>已完成步骤。</li>
+<li>关键发现。</li>
+<li>修改过的文件。</li>
+<li>测试结果。</li>
+<li>未解决问题。</li>
+<li>当前约束和下一步。</li>
+</ul>
+<p>可以把 compact 看成 Agent 的“工作记忆整理”。它决定长期任务能否可靠继续。</p>
+<h3 id="63-prompt-cache-与上下文稳定性">6.3 Prompt Cache 与上下文稳定性</h3>
+<p>源码和项目规则都强调避免频繁改变模型可见上下文，因为这会影响 prompt cache。对于长上下文任务，缓存命中能显著降低延迟和成本。Codex 因此倾向于：</p>
+<ul>
+<li>增量记录历史。</li>
+<li>把可变项和稳定项分开。</li>
+<li>避免每次请求都重新生成大段不同文本。</li>
+<li>对工具 schema、base instructions、项目规则保持稳定。</li>
+</ul>
+<p>这对初学者可能有点抽象。可以类比浏览器缓存：如果网页静态资源 URL 每次都变，浏览器就没法缓存；如果 prompt 前缀每次都变，模型侧缓存也难命中。</p>
+<p>因此，一个高质量 Agent 不只是“prompt 写得好”，还要“prompt 结构稳定”。</p>
+<h2 id="7-实践示例从源码学习如何使用和扩展-codex">7. 实践示例：从源码学习如何使用和扩展 Codex</h2>
+<h3 id="71-示例一用-codex-exec-做无交互代码审查">7.1 示例一：用 <code>codex exec</code> 做无交互代码审查</h3>
+<p><code>codex exec</code> 适合脚本和 CI 场景。它的关键特点是输出可控：默认 stdout 只输出最终消息，<code>--json</code> 输出 JSONL 事件流。</p>
+<p>示例命令：</p>
+<pre><code class="language-bash"># 中文注释：让 Codex 无交互审查当前工作区改动
+codex exec "请审查当前 git diff，找出可能的 bug、风险和缺失测试"
+</code></pre>
+<p>如果希望机器读取事件，可以使用 JSON 模式：</p>
+<pre><code class="language-bash"># 中文注释：JSONL 模式适合 CI 或上层系统解析
+codex exec --json "运行测试并修复失败，如果需要修改文件请直接修改"
+</code></pre>
+<p>从源码角度看，这会走 <code>codex-rs/exec/src/lib.rs</code>。它会加载配置、解析 CLI 参数、创建 in-process app server/client，启动 thread/turn，并用不同 event processor 处理事件：</p>
+<ul>
+<li>human output processor：面向人类阅读。</li>
+<li>jsonl output processor：面向机器消费。</li>
+</ul>
+<p>你可以把 <code>codex exec</code> 当成“可脚本化的 Codex Agent”。它和交互式 TUI 共享核心能力，但更适合自动化。</p>
+<h3 id="72-示例二编写-agentsmd-让-codex-遵守项目规范">7.2 示例二：编写 AGENTS.md 让 Codex 遵守项目规范</h3>
+<p>假设你的项目是 Rust 服务，要求所有修改必须格式化并运行特定测试。可以在仓库根目录创建：</p>
+<pre><code class="language-markdown"># AGENTS.md
+
+## 开发规则
+
+- 始终使用中文回复。
+- 修改 Rust 代码后运行 `just fmt`。
+- 不要直接运行全量测试，除非用户要求；优先运行相关 crate 的测试。
+- 修改 `core` 或协议类型时，必须说明兼容性影响。
+- 生成代码要添加简短中文注释解释关键逻辑。
+
+## 验证命令
+
+- 格式化：`just fmt`
+- core 测试：`just test -p codex-core`
+- TUI 测试：`just test -p codex-tui`
+</code></pre>
+<p>Codex 会从项目根到当前目录收集 AGENTS.md。若子目录有更具体规则，它也会按路径顺序追加。比如：</p>
+<pre><code class="language-text">repo/
+├── AGENTS.md
+└── crates/
+    └── api/
+        └── AGENTS.md
+</code></pre>
+<p>当 Codex 在 <code>crates/api</code> 下工作时，会看到根目录规则和 <code>crates/api/AGENTS.md</code> 的规则。这样不同子项目可以有局部约束。</p>
+<h3 id="73-示例三设计一个最小-mcp-工具">7.3 示例三：设计一个最小 MCP 工具</h3>
+<p>如果你想让 Codex 访问一个本地知识库，可以写一个 MCP server。下面不是完整生产实现，只展示思想：</p>
+<pre><code class="language-js">// mcp-local-notes.js
+// 中文注释：这是极简示意，真实 MCP server 需要按 SDK 协议实现
+const notes = {
+  "release-process": "发布前需要运行测试、更新 changelog、创建 tag。",
+  "deploy": "部署由 CI 自动完成，不要手动登录服务器修改文件。",
+};
+
+async function searchNotes(query) {
+  // 中文注释：根据关键词返回相关笔记
+  return Object.entries(notes)
+    .filter(([key, value]) =&gt; key.includes(query) || value.includes(query))
+    .map(([key, value]) =&gt; ({ key, value }));
+}
+
+// 中文注释：真实实现中，这里需要把 searchNotes 暴露为 MCP tool
+</code></pre>
+<p>在 Codex 配置中注册：</p>
+<pre><code class="language-toml">[mcp_servers.local_notes]
+command = "node"
+args = ["./mcp-local-notes.js"]
+</code></pre>
+<p>当 MCP server 正确实现协议后，Codex 可以在工具列表中看到它，并在需要时调用。这样你就能把企业内部知识库、项目文档、数据库查询、工单系统等接入 Codex。</p>
+<h3 id="74-示例四理解工具-handler-的最小抽象">7.4 示例四：理解工具 handler 的最小抽象</h3>
+<p>Codex 的工具 handler 实际接口比较复杂，因为要支持 schema、暴露模式、hooks、telemetry、并行、取消等。我们用一个简化 Rust 示例表达核心思想：</p>
+<pre><code class="language-rust">// 中文注释：这是教学示例，不是 Codex 源码的完整接口
+trait ToolRuntime {
+    fn name(&amp;self) -&gt; &amp;'static str;
+    fn schema(&amp;self) -&gt; JsonSchema;
+    fn supports_parallel(&amp;self) -&gt; bool;
+
+    async fn handle(&amp;self, input: serde_json::Value) -&gt; ToolResult;
+}
+
+struct CurrentTimeTool;
+
+impl ToolRuntime for CurrentTimeTool {
+    fn name(&amp;self) -&gt; &amp;'static str {
+        "current_time"
+    }
+
+    fn schema(&amp;self) -&gt; JsonSchema {
+        // 中文注释：告诉模型这个工具需要什么参数
+        JsonSchema::object()
+    }
+
+    fn supports_parallel(&amp;self) -&gt; bool {
+        true
+    }
+
+    async fn handle(&amp;self, _input: serde_json::Value) -&gt; ToolResult {
+        // 中文注释：执行真实逻辑，并把结果转换成模型可读输出
+        ToolResult::text(chrono::Utc::now().to_rfc3339())
+    }
+}
+</code></pre>
+<p>真实 Codex 的 <code>CoreToolRuntime</code> 做得更完整，还支持：</p>
+<ul>
+<li><code>pre_tool_use_payload</code></li>
+<li><code>post_tool_use_payload</code></li>
+<li><code>with_updated_hook_input</code></li>
+<li><code>telemetry_tags</code></li>
+<li><code>create_diff_consumer</code></li>
+<li><code>waits_for_runtime_cancellation</code></li>
+</ul>
+<p>这些能力让工具不只是“执行函数”，还可以被 hook 检查、被监控、被取消、被增量展示。</p>
+<h3 id="75-示例五一个迷你-agent-主循环">7.5 示例五：一个迷你 Agent 主循环</h3>
+<p>如果你想自己实现一个非常简化的 Codex-like Agent，可以从这个伪代码开始：</p>
+<pre><code class="language-rust">// 中文注释：教学版迷你 Agent，只保留核心循环
+async fn mini_agent_loop(user_goal: String, tools: ToolRegistry) -&gt; anyhow::Result&lt;String&gt; {
+    let mut history = Vec::new();
+
+    // 中文注释：记录用户目标
+    history.push(Message::user(user_goal));
+
+    loop {
+        // 中文注释：把历史和工具 schema 发给模型
+        let response = call_model(&amp;history, tools.schemas()).await?;
+
+        match response {
+            ModelResponse::FinalText(text) =&gt; {
+                // 中文注释：模型给出最终答案，任务结束
+                history.push(Message::assistant(text.clone()));
+                return Ok(text);
+            }
+
+            ModelResponse::ToolCall(call) =&gt; {
+                // 中文注释：模型请求工具，先检查权限
+                if !is_allowed(&amp;call) {
+                    history.push(Message::tool_error(call.id, "权限不足"));
+                    continue;
+                }
+
+                // 中文注释：执行工具，并把结果写回历史
+                let output = tools.dispatch(call).await;
+                history.push(Message::tool_output(output));
+            }
+        }
+    }
+}
+</code></pre>
+<p>这个示例缺少大量生产能力：沙箱、审批、上下文压缩、并行控制、取消、事件流、持久化、MCP、插件、技能、认证、错误恢复。但它已经体现 Codex 的核心范式：模型负责决策，宿主负责执行和约束，结果再回到模型。</p>
+<h2 id="8-用途codex-能解决什么问题">8. 用途：Codex 能解决什么问题</h2>
+<h3 id="81-本地开发助手">8.1 本地开发助手</h3>
+<p>Codex 最直接的用途是本地开发助手。它能：</p>
+<ul>
+<li>解释代码库结构。</li>
+<li>搜索相关文件。</li>
+<li>修改代码。</li>
+<li>运行测试。</li>
+<li>根据错误继续修复。</li>
+<li>总结改动。</li>
+<li>做代码审查。</li>
+<li>生成文档。</li>
+</ul>
+<p>与传统代码补全相比，Codex 更适合跨文件、跨步骤任务。比如：</p>
+<pre><code class="language-text">请分析这个项目的认证流程，找出 access token 过期后的刷新路径，并补充缺失测试。
+</code></pre>
+<p>这个任务需要阅读多个文件、理解调用链、修改测试、运行验证。它不是单行补全能解决的。</p>
+<h3 id="82-自动化工程任务">8.2 自动化工程任务</h3>
+<p><code>codex exec</code> 让 Codex 可以进入脚本化场景：</p>
+<ul>
+<li>CI 中自动审查 PR。</li>
+<li>批量升级依赖。</li>
+<li>生成迁移说明。</li>
+<li>检查配置漂移。</li>
+<li>运行诊断并输出 JSONL。</li>
+<li>对失败测试做初步分析。</li>
+</ul>
+<p>因为 exec 模式严格区分 stdout/stderr，适合上层系统集成。</p>
+<h3 id="83-代码审查与安全辅助">8.3 代码审查与安全辅助</h3>
+<p>Codex 的 review 子命令和 guardian/review 相关模块说明它也面向审查场景。它可以帮助识别：</p>
+<ul>
+<li>行为回归。</li>
+<li>并发风险。</li>
+<li>权限绕过。</li>
+<li>缺失测试。</li>
+<li>API 兼容性问题。</li>
+<li>配置变更风险。</li>
+</ul>
+<p>当然，AI 审查不能替代人工评审，尤其是安全、金融、隐私、生产事故相关变更。但它可以做第一轮扫描，让人工评审更聚焦。</p>
+<h3 id="84-多代理协作">8.4 多代理协作</h3>
+<p>源码中出现了 <code>multi_agents</code>、<code>agent_jobs</code>、<code>agent-graph-store</code>、<code>external-agent-sessions</code> 等模块，说明 Codex 正在支持更复杂的多代理协作。</p>
+<p>多代理的典型价值是并行探索。例如一个大任务可以拆成：</p>
+<ul>
+<li>子代理 A 阅读后端认证逻辑。</li>
+<li>子代理 B 阅读前端登录流程。</li>
+<li>子代理 C 阅读测试和 CI 配置。</li>
+<li>主代理汇总结果并修改代码。</li>
+</ul>
+<p>这能减少等待时间，也能让不同上下文分开管理。但多代理也带来新问题：如何传递上下文、如何防止重复修改、如何合并结论、如何限制并发、如何避免子代理无限扩散。Codex 源码中有最大深度、最大并发、等待超时等配置，正是在处理这些工程风险。</p>
+<h3 id="85-企业内部知识与工具集成">8.5 企业内部知识与工具集成</h3>
+<p>通过 MCP、插件、skills 和 hooks，Codex 可以接入企业内部系统：</p>
+<ul>
+<li>私有文档库。</li>
+<li>工单系统。</li>
+<li>代码托管平台。</li>
+<li>内部部署平台。</li>
+<li>安全扫描工具。</li>
+<li>设计系统资源。</li>
+<li>数据库只读查询。</li>
+</ul>
+<p>相比把所有数据复制进 prompt，MCP 让 Agent 按需访问资源；相比把所有逻辑写进核心，插件让能力可以独立发布和启用；相比把规则写在口头约定里，hooks 可以做机械化治理。</p>
+<h2 id="9-源码中的工程亮点">9. 源码中的工程亮点</h2>
+<h3 id="91-清晰的事件流设计">9.1 清晰的事件流设计</h3>
+<p>Codex 的 SQ/EQ 模式让 Agent 运行过程变成事件流。这对用户体验和调试都很重要。用户可以看到：</p>
+<ul>
+<li>模型正在思考。</li>
+<li>哪个工具开始执行。</li>
+<li>shell 输出了什么。</li>
+<li>是否请求审批。</li>
+<li>补丁是否应用。</li>
+<li>turn 是否完成。</li>
+</ul>
+<p>对开发者来说，事件流也利于测试。测试可以等待某个事件，而不是 sleep 固定时间。</p>
+<h3 id="92-输出和资源限制意识">9.2 输出和资源限制意识</h3>
+<p>源码中对输出 cap、I/O drain timeout、token budget、上下文大小、AGENTS.md 最大字节数都有明确限制。大型 Agent 最怕“无界”：</p>
+<ul>
+<li>无界 stdout 会撑爆内存。</li>
+<li>无界上下文会超过模型限制。</li>
+<li>无界工具并发会互相干扰。</li>
+<li>无界子代理会失控。</li>
+<li>无界文档注入会让模型忽略重点。</li>
+</ul>
+<p>Codex 的实现处处体现“给每个入口加上边界”。</p>
+<h3 id="93-多端复用而不是多套逻辑">9.3 多端复用而不是多套逻辑</h3>
+<p>TUI、exec、App Server、MCP Server 都建立在相同 core 能力上。这避免了不同入口行为不一致。例如同样的审批策略、沙箱规则、工具执行、AGENTS.md 加载应该在所有入口一致生效。</p>
+<h3 id="94-安全默认值与审批升级">9.4 安全默认值与审批升级</h3>
+<p>Codex 不假设模型永远正确，也不假设用户希望 Agent 拥有无限权限。它通过 permission profile、sandbox、approval policy 和 tool hooks 让权限可控。</p>
+<p>这对 AI 编程工具尤其重要。因为模型可能误判命令后果，例如执行 <code>rm -rf</code>、覆盖配置、安装未知依赖、访问网络等。安全系统的目标不是让 Agent 什么都不能做，而是让它在“可解释、可审批、可约束”的框架内做事。</p>
+<h3 id="95-可扩展但有治理边界">9.5 可扩展但有治理边界</h3>
+<p>MCP、插件、技能、hooks 都让 Codex 变得可扩展。但源码也显示，扩展不是无边界的。比如：</p>
+<ul>
+<li>插件 manifest 需要解析和路径验证。</li>
+<li>MCP server 有运行时配置和认证 gating。</li>
+<li>hooks 可以被 managed requirements 限制。</li>
+<li>skill 注入有范围和预算。</li>
+<li>dynamic tools 通过协议显式传入。</li>
+</ul>
+<p>这说明成熟 Agent 平台必须同时提供“扩展能力”和“治理能力”。</p>
+<h2 id="10-前景codex-这类软件工程-agent-会走向哪里">10. 前景：Codex 这类软件工程 Agent 会走向哪里</h2>
+<h3 id="101-从代码助手到工程代理">10.1 从代码助手到工程代理</h3>
+<p>过去的代码助手主要解决“写一段代码”。Codex 这类 Agent 更进一步，解决“完成一个工程任务”。工程任务通常包括：</p>
+<ul>
+<li>理解需求。</li>
+<li>理解现有代码。</li>
+<li>制定计划。</li>
+<li>修改多个文件。</li>
+<li>运行验证。</li>
+<li>处理失败。</li>
+<li>汇报风险。</li>
+</ul>
+<p>未来的软件工程 Agent 会越来越像一个初级到中级工程师的工作台，而不是一个补全插件。</p>
+<h3 id="102-本地与云端协作">10.2 本地与云端协作</h3>
+<p>Codex 源码和 README 都显示它有本地 CLI、IDE、桌面 App 和 Codex Web/Cloud 等形态。未来很可能形成混合模式：</p>
+<ul>
+<li>本地 Agent 处理需要本地环境、未提交代码、私有文件的任务。</li>
+<li>云端 Agent 处理耗时、并行、可隔离的任务。</li>
+<li>App/IDE 负责可视化、审批、审查和上下文管理。</li>
+<li>MCP/插件连接企业系统。</li>
+</ul>
+<p>这对开发者意味着：AI 工具不会只存在于编辑器侧边栏，而会贯穿本地终端、CI、代码托管平台、知识库和云端执行环境。</p>
+<h3 id="103-权限与审计会越来越重要">10.3 权限与审计会越来越重要</h3>
+<p>当 Agent 能改代码、跑命令、访问内部系统后，企业一定会关注：</p>
+<ul>
+<li>谁授权了这次操作？</li>
+<li>Agent 读了哪些数据？</li>
+<li>写了哪些文件？</li>
+<li>调用了哪些外部工具？</li>
+<li>为什么执行这个命令？</li>
+<li>是否符合组织策略？</li>
+</ul>
+<p>Codex 源码中的 telemetry、approval、permission profile、hooks、thread store、rollout trace 都是在为这些问题打基础。未来 Agent 平台的竞争，不只在模型能力，也在安全、审计、治理和可观测性。</p>
+<h3 id="104-多代理会成为复杂任务的常态">10.4 多代理会成为复杂任务的常态</h3>
+<p>单个 Agent 的上下文和时间有限。复杂任务天然适合拆分。多代理能带来并行收益，但也需要更好的协调机制。Codex 里已经有多代理工具、agent job、spawn/wait/send message 等能力。未来可能会看到：</p>
+<ul>
+<li>更精细的角色分工。</li>
+<li>更强的上下文选择。</li>
+<li>更可靠的结果合并。</li>
+<li>更清晰的子代理审计。</li>
+<li>更严格的并发和权限控制。</li>
+</ul>
+<h3 id="105-agent-开发会平台化">10.5 Agent 开发会平台化</h3>
+<p>今天我们写一个 Agent demo 很容易，但写一个可用的 Agent 产品很难。Codex 源码展示了平台化方向：</p>
+<ul>
+<li>协议层标准化。</li>
+<li>工具层标准化。</li>
+<li>插件和技能可安装。</li>
+<li>MCP 连接外部世界。</li>
+<li>hooks 做生命周期治理。</li>
+<li>app-server 支持多宿主。</li>
+<li>thread-store 支持持久化和恢复。</li>
+</ul>
+<p>未来开发者可能不会从零写 Agent，而是在类似 Codex 的平台上写技能、插件、MCP server 和策略。</p>
+<h2 id="11-给初学者的源码阅读路线">11. 给初学者的源码阅读路线</h2>
+<h3 id="111-第一阶段建立全局地图">11.1 第一阶段：建立全局地图</h3>
+<p>先不要急着读所有代码。建议按下面顺序：</p>
+<pre><code class="language-text">README.md
+codex-cli/bin/codex.js
+codex-rs/Cargo.toml
+codex-rs/cli/src/main.rs
+codex-rs/protocol/src/protocol.rs
+</code></pre>
+<p>目标是回答：</p>
+<ul>
+<li>Codex 有哪些入口？</li>
+<li>Rust workspace 有哪些主要 crate？</li>
+<li>CLI 子命令有哪些？</li>
+<li>core 协议有哪些操作和事件？</li>
+</ul>
+<h3 id="112-第二阶段理解主循环">11.2 第二阶段：理解主循环</h3>
+<p>重点读：</p>
+<pre><code class="language-text">codex-rs/core/src/session/turn.rs
+codex-rs/core/src/session/session.rs
+codex-rs/core/src/codex_thread.rs
+codex-rs/core/src/client.rs
+</code></pre>
+<p>目标是回答：</p>
+<ul>
+<li>什么是 thread/session/turn？</li>
+<li><code>run_turn</code> 做了哪些阶段？</li>
+<li>模型请求如何发出？</li>
+<li>工具结果如何回灌？</li>
+<li>上下文压缩在哪里触发？</li>
+</ul>
+<h3 id="113-第三阶段理解工具系统">11.3 第三阶段：理解工具系统</h3>
+<p>重点读：</p>
+<pre><code class="language-text">codex-rs/core/src/tools/spec_plan.rs
+codex-rs/core/src/tools/router.rs
+codex-rs/core/src/tools/registry.rs
+codex-rs/core/src/tools/parallel.rs
+codex-rs/core/src/tools/handlers/
+</code></pre>
+<p>目标是回答：</p>
+<ul>
+<li>当前 turn 暴露哪些工具由谁决定？</li>
+<li>模型输出如何变成 ToolCall？</li>
+<li>handler 如何返回模型可见输出？</li>
+<li>工具如何并行、取消和失败恢复？</li>
+</ul>
+<h3 id="114-第四阶段理解安全与配置">11.4 第四阶段：理解安全与配置</h3>
+<p>重点读：</p>
+<pre><code class="language-text">codex-rs/core/src/config/mod.rs
+codex-rs/core/src/safety.rs
+codex-rs/core/src/exec.rs
+codex-rs/sandboxing/src/lib.rs
+codex-rs/linux-sandbox/src/
+codex-rs/windows-sandbox-rs/src/
+</code></pre>
+<p>目标是回答：</p>
+<ul>
+<li>配置如何合并？</li>
+<li>权限 profile 如何影响沙箱？</li>
+<li>apply_patch 如何判断安全？</li>
+<li>shell 执行如何超时、截断、取消？</li>
+<li>不同平台沙箱如何抽象？</li>
+</ul>
+<h3 id="115-第五阶段理解扩展生态">11.5 第五阶段：理解扩展生态</h3>
+<p>重点读：</p>
+<pre><code class="language-text">codex-rs/core/src/agents_md.rs
+codex-rs/core/src/skills.rs
+codex-rs/core-skills/
+codex-rs/core-plugins/src/manifest.rs
+codex-rs/core/src/mcp.rs
+codex-rs/codex-mcp/
+</code></pre>
+<p>目标是回答：</p>
+<ul>
+<li>AGENTS.md 如何发现和注入？</li>
+<li>skill 如何被加载和触发？</li>
+<li>plugin manifest 支持哪些能力？</li>
+<li>MCP server 如何合成运行时配置？</li>
+</ul>
+<h2 id="12-常见误解澄清">12. 常见误解澄清</h2>
+<h3 id="121-codex-不是只会调用-shell-的脚本">12.1 Codex 不是只会调用 shell 的脚本</h3>
+<p>shell 是重要工具，但 Codex 还有 apply_patch、MCP、技能、插件、计划、权限请求、用户输入请求、图像查看、多代理等能力。shell 只是工具生态的一部分。</p>
+<h3 id="122-codex-不是完全由模型控制">12.2 Codex 不是完全由模型控制</h3>
+<p>模型可以请求工具，但宿主会检查权限、沙箱、审批、工具暴露、并行策略和取消状态。真正执行权在 Codex runtime，不在模型文本本身。</p>
+<h3 id="123-agentsmd-不是普通-readme">12.3 AGENTS.md 不是普通 README</h3>
+<p>AGENTS.md 是模型可见的项目规则文件。它会进入 Codex 上下文，影响模型行为。README 面向人类，AGENTS.md 面向 Agent 协作规范。</p>
+<h3 id="124-mcp-不是插件的替代品">12.4 MCP 不是插件的替代品</h3>
+<p>MCP 是连接外部工具和资源的协议。插件是可安装能力包，可能包含 MCP 配置、skills、hooks、apps 和界面元数据。二者可以组合使用。</p>
+<h3 id="125-上下文越多不一定越好">12.5 上下文越多不一定越好</h3>
+<p>上下文太多会浪费 token、降低关注重点、影响缓存命中，甚至触发压缩。高质量 Agent 需要精准注入上下文，而不是把所有东西都塞给模型。</p>
+<h2 id="13-总结">13. 总结</h2>
+<p>Codex 源码最值得学习的地方，不是某一个神奇 prompt，也不是某一个复杂算法，而是它把“AI 编程助手”工程化成了一个完整 Agent 平台。</p>
+<p>从 <code>codex-main</code> 可以看到一个清晰分层：</p>
+<ul>
+<li><code>codex-cli</code> 负责 npm 入口和平台二进制启动。</li>
+<li><code>cli</code> 负责顶层命令分发。</li>
+<li><code>tui</code>、<code>exec</code>、<code>app-server</code> 提供不同使用形态。</li>
+<li><code>protocol</code> 定义核心操作和事件。</li>
+<li><code>core</code> 负责 session、turn、上下文、模型请求和工具调度。</li>
+<li><code>tools</code> 体系让模型能安全调用 shell、patch、MCP、计划、多代理等能力。</li>
+<li><code>sandboxing</code>、<code>safety</code>、<code>permissions</code>、<code>approval</code> 确保 Agent 能做事但不乱做事。</li>
+<li><code>AGENTS.md</code>、skills、plugins、MCP 让 Codex 适配不同项目和组织环境。</li>
+<li><code>thread-store</code>、<code>rollout</code>、<code>rollout-trace</code> 支持持久化、恢复和调试。</li>
+</ul>
+<p>如果用一句话概括 Codex 的架构思想：</p>
+<p>模型负责推理和决策，Codex runtime 负责上下文、工具、安全、状态和产品化体验。</p>
+<p>这也是未来软件工程 Agent 的核心方向。真正可用的 Agent 不会只是一个大模型接口，而是一套把模型接入真实工程世界的运行时系统。它需要会读项目规则，会管理上下文，会安全执行命令，会请求审批，会连接外部工具，会记录历史，会恢复任务，会在不同入口提供一致能力。</p>
+<p>对于初学者，建议不要一开始就陷入所有细节。先抓住主线：</p>
+<div class="mermaid">flowchart LR
+    A[用户输入] --&gt; B[协议提交]
+    B --&gt; C[会话配置]
+    C --&gt; D[上下文构建]
+    D --&gt; E[模型请求]
+    E --&gt; F[工具调用]
+    F --&gt; G[安全执行]
+    G --&gt; H[结果回灌]
+    H --&gt; I{是否完成}
+    I --&gt;|否| D
+    I --&gt;|是| J[结束任务]
+</div><p>理解了这条主线，再看 <code>core/src/session/turn.rs</code>、<code>tools/router.rs</code>、<code>tools/spec_plan.rs</code>、<code>core/src/client.rs</code>、<code>core/src/exec.rs</code>、<code>core/src/safety.rs</code>，很多看似复杂的源码都会变得有章可循。</p>
+<h2 id="14-结束语">14. 结束语</h2>
+<p>这篇博客就和大家分享到这里，如果大家在研究学习的过程当中有什么问题，可以加群进行讨论或发送邮件给我，我会尽我所能为您解答，与君共勉！</p>
+<p>另外，博主出新书了《<a href="https://item.jd.com/14421833.html" target="_blank" rel="noopener nofollow"><strong><span style="color: rgba(255, 0, 0, 1)">Hadoop与Spark大数据全景解析</span></strong></a>》、同时已出版的《<a href="https://item.jd.com/14699434.html" target="_blank" rel="noopener nofollow"><span style="color: rgba(22, 119, 255, 1)">深入理解Hive</span></a>》、《<a href="https://item.jd.com/12455361.html" target="_blank" rel="noopener nofollow"><span style="color: rgba(22, 119, 255, 1)">Kafka并不难学</span></a>》和《<a href="https://item.jd.com/12371763.html" target="_blank" rel="noopener nofollow"><span style="color: rgba(22, 119, 255, 1)">Hadoop大数据挖掘从入门到进阶实战</span></a>》也可以和新书配套使用，喜欢的朋友或同学， 可以在公告栏那里点击购买链接购买博主的书进行学习，在此感谢大家的支持。关注下面公众号，根据提示，可免费获取书籍的教学视频。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div>
+<b class="b1"></b><b class="b2 d1"></b><b class="b3 d1"></b><b class="b4 d1"></b>
+<div class="b d1 k">  
+联系方式：
+<br>
+邮箱：smartloli.org@gmail.com
+<br>
+<strong style="color: green">QQ群（Hive与AI实战【新群】）：935396818</strong>
+<br>
+QQ群（Hadoop - 交流社区1）：424769183
+<br>
+QQ群（Kafka并不难学）：825943084
+<br>
+温馨提示：请大家加群的时候写上加群理由（姓名＋公司/学校），方便管理员审核，谢谢！
+<br>
+<h3>热爱生活，享受编程，与君共勉！</h3>  
+</div>
+<b class="b4b d1"></b><b class="b3b d1"></b><b class="b2b d1"></b><b class="b1b"></b>
+</div>
+<br>
+<div>
+<b class="b1"></b><b class="b2 d1"></b><b class="b3 d1"></b><b class="b4 d1"></b>
+<div class="b d1 k">
+<h3>公众号：</h3>
+<h3><img style="width: 8%; margin-left: 10px" src="https://www.cnblogs.com/images/cnblogs_com/smartloli/1324636/t_qr.png"></h3>
+</div>
+<b class="b4b d1"></b><b class="b3b d1"></b><b class="b2b d1"></b><b class="b1b"></b>
+</div>
+<br>
+<div>
+<b class="b1"></b><b class="b2 d1"></b><b class="b3 d1"></b><b class="b4 d1"></b>
+<div class="b d1 k">
+<h3>作者：哥不是小萝莉 ［<a style="color: green" href="http://www.kafka-eagle.org/" target="_blank">关于我</a>］［<a style="color: green" href="http://www.cnblogs.com/smartloli/p/4241701.html" target="_blank">犒赏</a>］</h3>
+<h3>出处：<a style="color: green" href="http://www.cnblogs.com/smartloli/" target="_blank">http://www.cnblogs.com/smartloli/</a></h3>
+<h3>转载请注明出处，谢谢合作！</h3>
+</div>
+<b class="b4b d1"></b><b class="b3b d1"></b><b class="b2b d1"></b><b class="b1b"></b>
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-06-21 22:22">2026-06-21 22:21</span>&nbsp;
+<a href="https://www.cnblogs.com/smartloli">哥不是小萝莉</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20684447);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsmartloli%2Fp%2F20684447&amp;targetId=20684447&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
