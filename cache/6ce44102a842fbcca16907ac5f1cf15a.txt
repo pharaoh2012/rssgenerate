@@ -1,0 +1,326 @@
+
+		<h2>
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/liuziyi1/p/20768003" title="发布于 2026-06-24 14:48">
+    <span role="heading" aria-level="2">深入理解 Redis 哨兵模式：高可用架构的自动容错实践</span>
+    
+
+</a>
+
+		</h2>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>在生产环境中，Redis 作为缓存或数据库，一旦宕机就可能造成服务雪崩。<strong>哨兵模式（Sentinel）</strong> 正是为此而生——它能自动完成故障发现与主从切换，无需人工干预。本文将系统梳理哨兵模式的原理、功能、选主逻辑，并通过一个完整的搭建示例，带你掌握这套高可用方案。</p>
+<h2 id="一核心概览">一、核心概览</h2>
+<p>Redis 哨兵模式是一套分布式的高可用解决方案，核心目标就一个：</p>
+<blockquote>
+<p><strong>当主节点宕机时，自动将某个从节点提升为新主节点，让集群继续正常服务。</strong></p>
+</blockquote>
+<p>整个系统由一组哨兵进程和一组Redis实例组成，哨兵之间通过共识机制完成故障判定和切换。</p>
+<p>下图展示了典型的哨兵架构：</p>
+<div class="mermaid">graph TD
+    subgraph 哨兵集群
+        S1[Sentinel 1]
+        S2[Sentinel 2]
+        S3[Sentinel 3]
+    end
+
+    subgraph Redis 集群
+        M[Master]
+        R1[Slave 1]
+        R2[Slave 2]
+    end
+
+    S1 --&gt;|监控| M
+    S1 --&gt;|监控| R1
+    S1 --&gt;|监控| R2
+    S2 --&gt;|监控| M
+    S2 --&gt;|监控| R1
+    S2 --&gt;|监控| R2
+    S3 --&gt;|监控| M
+    S3 --&gt;|监控| R1
+    S3 --&gt;|监控| R2
+    S1 &lt;--&gt;|通信| S2
+    S1 &lt;--&gt;|通信| S3
+    S2 &lt;--&gt;|通信| S3
+    M --&gt; R1
+    M --&gt; R2
+</div><h2 id="二工作原理">二、工作原理</h2>
+<p>哨兵模式依赖三个关键机制实现自动化运维。</p>
+<h3 id="1-分布式监控与协商">1. 分布式监控与协商</h3>
+<ul>
+<li>每个哨兵节点会同时监控所有 Redis 节点（主、从）以及其他哨兵节点。</li>
+<li>当某个哨兵发现某节点不可达时，会将其标记为<strong>主观下线（SDOWN）</strong>。</li>
+<li>随后它会询问其他哨兵，当足够数量（可配置的 <code>quorum</code>）的哨兵都认为该节点已下线，就将其标记为<strong>客观下线（ODOWN）</strong>，并触发故障转移。</li>
+</ul>
+<div class="mermaid">sequenceDiagram
+    participant S1 as Sentinel 1
+    participant S2 as Sentinel 2
+    participant S3 as Sentinel 3
+    participant M as Master
+
+    Note over S1,M: 正常心跳监控
+    S1-&gt;&gt;M: PING
+    M--xS1: 无响应
+    S1-&gt;&gt;S1: 判定 SDOWN
+    S1-&gt;&gt;S2: 询问 Master 状态
+    S1-&gt;&gt;S3: 询问 Master 状态
+    S2--&gt;&gt;S1: 也认为下线
+    S3--&gt;&gt;S1: 也认为下线
+    S1-&gt;&gt;S1: 达成 quorum，判定 ODOWN
+    S1-&gt;&gt;S2: 发起故障转移投票
+    S2--&gt;&gt;S1: 同意
+    S3--&gt;&gt;S1: 同意
+    S1-&gt;&gt;S1: 选举新 Master，执行切换
+</div><h3 id="2-三个核心定时任务">2. 三个核心定时任务</h3>
+<p>哨兵通过三个周期性的任务维持整个集群的健康感知：</p>
+<table>
+<thead>
+<tr>
+<th>频率</th>
+<th>任务</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每 10 秒</td>
+<td>向所有 Master / Slave 发送 <code>INFO</code></td>
+<td>获取最新的 Redis 拓扑结构</td>
+</tr>
+<tr>
+<td>每 2 秒</td>
+<td>向 <code>__sentinel__:hello</code> 频道发布/订阅</td>
+<td>哨兵间交换信息、发现新哨兵</td>
+</tr>
+<tr>
+<td>每 1 秒</td>
+<td>向所有节点（哨兵+Redis）发送 <code>PING</code></td>
+<td>心跳检测，判断节点是否存活</td>
+</tr>
+</tbody>
+</table>
+<p>这三个任务构成一个闭环：<br>
+<code>心跳发现异常</code> → <code>协商确认下线</code> → <code>从拓扑中选择新主</code> → <code>广播新主信息</code>。</p>
+<div class="mermaid">graph LR
+    subgraph 每10秒
+        A[INFO 命令] --&gt; B[更新拓扑]
+    end
+    subgraph 每2秒
+        C[发布/订阅 hello 频道] --&gt; D[哨兵发现彼此]
+    end
+    subgraph 每1秒
+        E[PING 心跳] --&gt; F{超时?}
+        F --&gt;|是| G[主观下线]
+    end
+    G --&gt; H[询问其他哨兵]
+    H --&gt; I{达成 quorum?}
+    I --&gt;|是| J[客观下线 + 故障转移]
+    B --&gt; K[选主参考]
+    K --&gt; J
+</div><h2 id="三四大核心功能">三、四大核心功能</h2>
+<p>哨兵不仅仅是一个“看门狗”，它还承担了服务发现和通知的职责。</p>
+<ol>
+<li>
+<p><strong>监控 (Monitoring)</strong><br>
+持续检查主从节点是否在线、角色是否正确。</p>
+</li>
+<li>
+<p><strong>自动故障转移 (Automatic Failover)</strong><br>
+主节点故障后，自动从从节点中选举一个提升为新主节点，并通知其他从节点跟随新主。</p>
+</li>
+<li>
+<p><strong>配置提供者 (Configuration Provider)</strong><br>
+客户端直接连接哨兵，哨兵充当服务发现中心，返回当前主节点的地址。这样主节点变化时，客户端无需修改配置。</p>
+<pre><code class="language-text">客户端 -&gt; 哨兵: “mymaster 的主是谁？”
+哨兵 -&gt; 客户端: “当前主节点是 192.168.6.217:7002”
+客户端 -&gt; 新主: 正常读写
+</code></pre>
+</li>
+<li>
+<p><strong>通知 (Notification)</strong><br>
+当发生下线、故障转移等事件时，可通过脚本（如 <code>sentinel notification-script</code>）或发布/订阅机制通知管理员。</p>
+</li>
+</ol>
+<h2 id="四选主逻辑">四、选主逻辑</h2>
+<p>当原主节点被判定客观下线，哨兵会按以下优先级从所有健康的从节点中选出新主：</p>
+<ol>
+<li><strong>优先级</strong>：<code>slave-priority</code> 配置值越小的从节点越优先（默认均为100）。</li>
+<li><strong>偏移量</strong>：复制偏移量越大，表示从主节点同步的数据越完整。</li>
+<li><strong>运行 ID</strong>：在优先级和偏移量都相同的情况下，选择运行 ID 字典序最小的节点（保证确定性）。</li>
+</ol>
+<blockquote>
+<p>这种多层策略确保选出的新主既能最快接管，又拥有最完整的数据。</p>
+</blockquote>
+<h2 id="五实战搭建一主两从三哨兵">五、实战：搭建一主两从三哨兵</h2>
+<p>假设我们有三台机器，部署规划如下（可部署在同一机器不同端口，生产环境应分散到不同物理机）：</p>
+<table>
+<thead>
+<tr>
+<th>主机 IP</th>
+<th>端口</th>
+<th>组件</th>
+<th>版本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>192.168.6.217</td>
+<td>7001</td>
+<td>Redis (master)</td>
+<td>6.2.14</td>
+</tr>
+<tr>
+<td>192.168.6.217</td>
+<td>7002</td>
+<td>Redis (slave)</td>
+<td>6.2.14</td>
+</tr>
+<tr>
+<td>192.168.6.217</td>
+<td>7003</td>
+<td>Redis (slave)</td>
+<td>6.2.14</td>
+</tr>
+<tr>
+<td>192.168.6.212</td>
+<td>27001</td>
+<td>Sentinel</td>
+<td>6.2.14</td>
+</tr>
+<tr>
+<td>192.168.6.212</td>
+<td>27002</td>
+<td>Sentinel</td>
+<td>6.2.14</td>
+</tr>
+<tr>
+<td>192.168.6.212</td>
+<td>27003</td>
+<td>Sentinel</td>
+<td>6.2.14</td>
+</tr>
+</tbody>
+</table>
+<h3 id="部署原则">部署原则</h3>
+<ul>
+<li><strong>物理分散</strong>：哨兵节点决不要部署在同一台物理机上，否则宿主机宕机会导致整个哨兵集群失效。</li>
+<li><strong>奇数个节点</strong>：至少 3 个且为奇数，保证故障判定时能达成多数派（quorum）。</li>
+<li><strong>管控粒度</strong>：根据规模选择，可一套哨兵管控一套 Redis，也可一套哨兵管控多套（通过不同主节点名区分）。</li>
+</ul>
+<h3 id="步骤一搭建-redis-主从">步骤一：搭建 Redis 主从</h3>
+<p>一主两从的配置省略，确保 <code>7001</code> 为主，<code>7002</code>、<code>7003</code> 为从即可。</p>
+<h3 id="步骤二配置并启动-sentinel">步骤二：配置并启动 Sentinel</h3>
+<p>创建数据目录和配置文件，这里以 <code>27001</code> 为例，其余两个同理。</p>
+<pre><code class="language-bash">mkdir -p /usr/local/redis6/data/sentinel_{27001,27002,27003}
+</code></pre>
+<p><strong>sentinel_27001.conf</strong> 关键配置：</p>
+<pre><code class="language-conf">port 27001
+daemonize yes
+logfile "/usr/local/redis6/log/27001.log"
+dir /usr/local/redis6/data/sentinel_27001
+
+# 监控的主节点名称为 mymaster，ip:port，quorum=2
+sentinel monitor mymaster 192.168.6.217 7001 2
+sentinel auth-pass mymaster 123456
+sentinel down-after-milliseconds mymaster 10000
+</code></pre>
+<p>同样的方式生成 <code>27002</code> 和 <code>27003</code> 的配置文件，只需修改端口和日志、数据目录即可。</p>
+<p>启动所有哨兵：</p>
+<pre><code class="language-bash">nohup redis-sentinel /usr/local/redis6/conf/sentinel_27001.conf &amp;
+nohup redis-sentinel /usr/local/redis6/conf/sentinel_27002.conf &amp;
+nohup redis-sentinel /usr/local/redis6/conf/sentinel_27003.conf &amp;
+</code></pre>
+<p>验证哨兵进程：</p>
+<pre><code class="language-bash">ps -ef | grep sentinel
+</code></pre>
+<h2 id="六常用运维命令">六、常用运维命令</h2>
+<p>连接任意哨兵即可查看集群状态。</p>
+<pre><code class="language-bash">redis-cli -p 27001
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>INFO Sentinel</code></td>
+<td>查看本哨兵视角的整体信息</td>
+</tr>
+<tr>
+<td><code>SENTINEL SENTINELS mymaster</code></td>
+<td>列出监控 <code>mymaster</code> 的其他哨兵</td>
+</tr>
+<tr>
+<td><code>SENTINEL masters</code></td>
+<td>列出所有被监控的主节点</td>
+</tr>
+<tr>
+<td><code>SENTINEL master mymaster</code></td>
+<td>查看 <code>mymaster</code> 的详细状态</td>
+</tr>
+<tr>
+<td><code>SENTINEL get-master-addr-by-name mymaster</code></td>
+<td>获取当前主节点地址</td>
+</tr>
+<tr>
+<td><code>SENTINEL REPLICAS mymaster</code></td>
+<td>查看 <code>mymaster</code> 的所有从节点</td>
+</tr>
+</tbody>
+</table>
+<h2 id="七故障转移测试">七、故障转移测试</h2>
+<h3 id="1-正常查看主节点">1. 正常查看主节点</h3>
+<pre><code class="language-bash">redis-cli -p 27001
+&gt; SENTINEL get-master-addr-by-name mymaster
+1) "192.168.6.217"
+2) "7001"
+</code></pre>
+<h3 id="2-模拟主节点宕机">2. 模拟主节点宕机</h3>
+<pre><code class="language-bash">redis-cli -p 7001 -a 123456
+&gt; SHUTDOWN
+</code></pre>
+<p>此时哨兵会在 <code>down-after-milliseconds</code> (10秒) 后判定主观下线，并经过协商达到 <code>quorum</code> 后执行故障转移。再次查询主节点，应该已经切换到新的从节点（例如 <code>7002</code>）：</p>
+<pre><code class="language-bash">&gt; SENTINEL get-master-addr-by-name mymaster
+1) "192.168.6.217"
+2) "7002"
+</code></pre>
+<h3 id="3-强制故障转移">3. 强制故障转移</h3>
+<p>即使主节点正常，你也可以通过命令直接触发切换，用于演练或维护。</p>
+<pre><code class="language-bash">redis-cli -p 27001
+&gt; SENTINEL FAILOVER mymaster
+OK
+</code></pre>
+<p>切换后立即生效，客户端通过哨兵获取到的新主地址也会更新。</p>
+<h2 id="八客户端如何接入">八、客户端如何接入？</h2>
+<p>使用哨兵模式时，客户端不再直接连接 Redis 的固定 IP，而是连接哨兵，并指定主节点名称（如 <code>mymaster</code>）。主流客户端（Jedis、Lettuce、redis-py 等）都支持 Sentinel 模式。例如 Java 的 Jedis：</p>
+<pre><code class="language-java">Set&lt;String&gt; sentinels = new HashSet&lt;&gt;();
+sentinels.add("192.168.6.212:27001");
+sentinels.add("192.168.6.212:27002");
+sentinels.add("192.168.6.212:27003");
+JedisSentinelPool pool = new JedisSentinelPool("mymaster", sentinels);
+</code></pre>
+<p>无论后端主节点如何漂移，客户端都能从哨兵自动获取最新地址。</p>
+<h2 id="九总结">九、总结</h2>
+<p>Redis 哨兵模式用一套轻量的分布式监控组件，解决了 Redis 单点故障的自动恢复问题。它的核心运作依赖三个定时任务、主观/客观下线判定、以及基于优先级的选主逻辑。部署时要牢记<strong>物理分散、奇数节点、合理规划 quorum</strong>。再配合客户端的哨兵感知能力，即可构建出一个生产可用的 Redis 高可用方案。</p>
+<blockquote>
+<p>但在数据分片、横向扩展场景下，Redis Cluster 才是更好的选择。哨兵模式主要解决高可用，不提供数据分片。对于读多写少、单机内存可容纳全量数据的业务，哨兵模式简洁、高效，至今仍被广泛采用。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+		<p class="postfoot">
+			posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-06-24 14:49">2026-06-24 14:48</span>&nbsp;
+<a href="https://www.cnblogs.com/liuziyi1">刘子毅</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20768003);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fliuziyi1%2Fp%2F20768003&amp;targetId=20768003&amp;targetType=0" target="_blank">举报</a>
+
+		</p>
+	
