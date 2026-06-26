@@ -1,0 +1,207 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/seatunnel/p/20804076" title="发布于 2026-06-25 15:26">
+    <span role="heading" aria-level="2">当 Cancel 一直无法结束：记一次 Apache SeaTunnel 中 CANCELING 状态卡死问题的排查过程</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        此前，我在 Apache SeaTunnel 中曾处理过一个问题：用户执行 Cancel 操作后，任务有时会一直停留在 CANCELING 状态，无法结束。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>作者 | Doyeon Kim<br>
+译者 | Debra</p>
+<p>此前，我在 Apache SeaTunnel 中曾处理过一个问题：用户执行 Cancel 操作后，任务有时会一直停留在 <strong>CANCELING</strong> 状态，无法结束。</p>
+<p>起初，我以为这只是一个普通的取消流程 Bug。</p>
+<p>可能是死锁、重试逻辑陷入死循环，或者某个状态转换环节出了问题。</p>
+<p>但随着排查不断深入，我发现事情远比想象中复杂。</p>
+<p>这个问题涉及 Master 与 Worker 之间的通信，Master Failover（主节点切换）；作业状态恢复时机；以及任务状态通知过程中某个异常的处理逻辑。</p>
+<p>因此，我写下了本文记录整个问题的排查过程，以及为什么最终我选择引入 <strong>Force Stop（强制停止）</strong> 机制，而不是直接调整现有的 Cancel 流程。</p>
+<h1 id="背景">背景</h1>
+<p>SeaTunnel 的 Zeta 引擎采用集群模式运行作业。</p>
+<p>其中，Master 节点负责管理作业级状态；Worker 节点负责执行 Task Group。当用户发起 Cancel 操作时，Master 需要向对应的 Worker 发送取消请求。任务结束或取消完成后，Worker 再将最终状态回传给 Master。</p>
+<p>简化后的流程如下：</p>
+<pre><code class="language-text">用户发起 Cancel
+        ↓
+Master 向 Worker 发送取消请求
+        ↓
+Worker 取消或完成任务
+        ↓
+Worker 向 Master 汇报最终状态
+        ↓
+Master 更新 Job 状态
+</code></pre>
+<p>乍看之下，这个流程并不复杂。</p>
+<p>但在分布式系统中，每一个环节都可能受到节点故障、集群成员变化以及 Master 恢复过程等因素的影响。而这些因素都可能引发竞态条件（Race Condition）。</p>
+<h1 id="问题现象">问题现象</h1>
+<p>问题的表现很直接：</p>
+<pre><code class="language-text">Job 一直停留在 CANCELING 状态
+</code></pre>
+<p>用户已经执行了取消操作，但任务始终无法进<code>CANCELED </code>等最终状态。</p>
+<p>最开始，我把排查重点放在：<code>Master → Worker</code>这条取消请求链路上。</p>
+<h1 id="第一个怀疑对象取消请求链路">第一个怀疑对象：取消请求链路</h1>
+<p>在 Master 端，SeaTunnel 会向 Worker 发送<code> CancelTaskOperation</code>。</p>
+<p>这里有一个关键逻辑：在发送取消请求之前，系统会先检查当前任务所在的执行节点是否仍然存在于集群成员列表中。</p>
+<p>核心逻辑如下：</p>
+<pre><code class="language-java">while (!taskFuture.isDone()
+        &amp;&amp; nodeEngine
+                .getClusterService()
+                .getMember(executionAddress = getCurrentExecutionAddress())
+            != null) {
+    try {
+        nodeEngine
+                .getOperationService()
+                .createInvocationBuilder(
+                        Constant.SEATUNNEL_SERVICE_NAME,
+                        new CancelTaskOperation(taskGroupLocation),
+                        executionAddress)
+                .invoke()
+                .get();
+        return;
+    } catch (Exception e) {
+        Thread.sleep(2000);
+    }
+}
+</code></pre>
+<p>这一点立刻引起了我的注意。</p>
+<p>如果由于心跳异常等原因，Worker 节点暂时从集群视图中消失，那么循环可能会直接退出，甚至连 Cancel 请求都没有发送出去。</p>
+<p>因此，我最初的猜测是：</p>
+<blockquote>
+<p>Master 认为取消流程已经处理完毕，但 Worker 实际上从未收到 Cancel 请求。</p>
+</blockquote>
+<p>这个方向确实值得关注。不过后来我发现，仅凭这一点还不足以解释为什么 Job 会一直停留在 CANCELING 状态。</p>
+<p>因为即便错过了 Cancel 请求，任务最终仍有可能正常结束，并将最终状态上报给 Master。</p>
+<p>于是，我开始把视线转向另一个方向：</p>
+<p><strong>当 Worker 向 Master 汇报最终任务状态时，究竟会发生什么？</strong></p>
+<h1 id="更关键的链路worker--master-的状态通知">更关键的链路：Worker → Master 的状态通知</h1>
+<p>当任务进入最终状态后，Worker 会调用<code> notifyTaskStatusToMaster()</code>，将状态上报给 Master。</p>
+<p>该方法的设计思路是：在通知成功之前持续进行重试。</p>
+<pre><code class="language-java">while (isRunning &amp;&amp; !notifyStateSuccess) {
+    InvocationFuture&lt;Object&gt; invoke =
+            nodeEngine
+                    .getOperationService()
+                    .createInvocationBuilder(
+                            SeaTunnelServer.SERVICE_NAME,
+                            new NotifyTaskStatusOperation(
+                                    taskGroupLocation, taskExecutionState),
+                            nodeEngine.getMasterAddress())
+                    .invoke();
+
+    try {
+        invoke.get();
+        notifyStateSuccess = true;
+    } catch (JobNotFoundException e) {
+        notifyStateSuccess = true;
+    } catch (ExecutionException e) {
+        if (e.getCause() instanceof JobNotFoundException) {
+            notifyStateSuccess = true;
+        } else {
+            Thread.sleep(sleepTime);
+        }
+    }
+}
+</code></pre>
+<p>乍看之下，这套重试机制本身并没有什么问题。</p>
+<p>但其中对 <code>JobNotFoundException</code> 的处理却至关重要。</p>
+<p>如果 Worker 收到 <code>JobNotFoundException</code>，它会将 <code>notifyStateSuccess</code> 设为 <code>true</code>，并停止后续重试。</p>
+<p>在很多情况下，这样的处理是合理的。因为如果 Master 上已经找不到对应的 Job，往往意味着该 Job 已经结束，并且已经从运行中的 Job 列表中移除。</p>
+<p>但在 Master Failover 场景下，这种假设就可能带来问题。</p>
+<p><img alt="" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3195851/202606/3195851-20260625151627306-2100686045.jpg" class="lazyload"></p>
+<h1 id="jobnotfoundexception-的特殊处理逻辑">JobNotFoundException 的特殊处理逻辑</h1>
+<p>在 Master 端，任务状态更新时会先检查 <code>runningJobMasterMap</code>：</p>
+<pre><code>public void updateTaskExecutionState(TaskExecutionState taskExecutionState) {
+    TaskGroupLocation taskGroupLocation = taskExecutionState.getTaskGroupLocation();
+    JobMaster runningJobMaster = runningJobMasterMap.get(taskGroupLocation.getJobId());
+
+    if (runningJobMaster == null) {
+        throw new JobNotFoundException(
+                String.format("Job %s not running", taskGroupLocation.getJobId()));
+    }
+    runningJobMaster.updateTaskExecutionState(taskExecutionState);
+}
+</code></pre>
+<p>通常情况下，<code>runningJobMaster == null</code> 表示该 Job 已经不再运行。</p>
+<p>然而，还有另一种可能的时间窗口。</p>
+<p>在 Master Failover 期间，新的 Master 可能尚未完全恢复 <code>runningJobMasterMap</code>。如果 Worker 恰好在这段时间内上报最终任务状态，新 Master 就可能无法找到对应的 <code>JobMaster</code>，并抛出 <code>JobNotFoundException</code>。</p>
+<p>随后，Worker 会将这个异常视为成功处理，并停止重试。</p>
+<p>问题发生的过程可能如下：</p>
+<ol>
+<li>一个 Job 正在执行取消操作。</li>
+<li>Master 发生切换。</li>
+<li>Worker 完成任务，并上报最终任务状态。</li>
+<li>新 Master 尚未完全恢复 <code>runningJobMasterMap</code>。</li>
+<li>Master 抛出 <code>JobNotFoundException</code>。</li>
+<li>Worker 将其视为成功处理，并停止重试。</li>
+<li>Master 在恢复完成后，始终没有收到最终任务状态。</li>
+<li>Job 一直停留在 <code>CANCELING</code> 状态。</li>
+</ol>
+<p>这正是我发现问题的关键。</p>
+<p>问题不仅仅在于 Cancel RPC 可能发送失败，更重要的是，Worker 的最终状态通知有可能在 Master 恢复期间丢失。</p>
+<h1 id="为什么我选择新增-force-stop而不是直接修改-cancel">为什么我选择新增 Force Stop，而不是直接修改 Cancel</h1>
+<p>定位到问题后，我考虑过几种不同的解决方案：</p>
+<ul>
+<li>调整 JobNotFoundException 的处理逻辑；</li>
+<li>等待 runningJobMasterMap 完全恢复后再处理状态通知；</li>
+<li>将更多运行时状态持久化到分布式存储；</li>
+<li>重构现有的 Cancel 状态机。</li>
+</ul>
+<p>但这个问题具有偶发性，而且高度依赖特定的时序条件。</p>
+<p>与此同时，正常的 Cancel 流程又是整个执行生命周期中非常敏感的一部分。直接修改这部分逻辑，可能会引入新的行为变化，或者带来额外的性能开销。</p>
+<p>因此，我首先选择了一种更务实的方案。</p>
+<p>我没有改变现有 Cancel 的语义，而是新增了一套独立的 Force Stop 机制。</p>
+<p>思路其实很简单：</p>
+<p>如果优雅取消（Graceful Cancellation）无法继续推进，那么运维人员就需要一种明确的手段来最终确定 Job 的状态。</p>
+<h1 id="cancel-与-force-stop-的区别">Cancel 与 Force Stop 的区别</h1>
+<p>让我来解释下 Cancel 与 Force Stop 的区别。</p>
+<h2 id="cancel">Cancel</h2>
+<p>Cancel 属于一种优雅终止（Graceful Shutdown）机制。</p>
+<p>它会向正在运行的任务发送停止请求，并依赖正常的任务生命周期以及 Worker 的状态通知链路来完成整个过程。</p>
+<h2 id="force-stop">Force Stop</h2>
+<p>Force Stop 则是一种面向运维恢复的机制。</p>
+<p>它不应该依赖远端 Worker 是否仍然能够正常响应。Master 会根据自身的判断直接完成 Job 状态的终结和相关资源的清理。</p>
+<p>简单来说：</p>
+<pre><code class="language-text">Cancel     = 尝试以优雅的方式停止 Job
+Force Stop = 当 Cancel 无法继续推进时，直接终结 Job
+</code></pre>
+<p>Force Stop 的目的并不是取代 Cancel。它是一条专门用于处理卡死场景的兜底路径。</p>
+<h1 id="我的收获">我的收获</h1>
+<p>这次问题让我意识到，一个 Job 状态卡住，并不一定是负责更新该状态的那段代码出了问题。</p>
+<p>在这个案例中，一开始最可疑的是 Cancel 请求链路。但最终发现，更关键的问题其实出在 Worker 到 Master 的状态通知链路上。</p>
+<p>在正常情况下，<code>JobNotFoundException</code> 看起来是一个合理的终止条件；但在 Master Failover 场景下，它也可能意味着：</p>
+<blockquote>
+<p>新的 Master 尚未完成 Job 的恢复。</p>
+</blockquote>
+<p>这两种含义有着本质区别。</p>
+<p>而这样一个细微的差别，恰恰决定了 Worker 应该停止重试，还是继续重试。</p>
+<p>这也再次提醒我，在分布式系统中，异常处理本身就是状态机的一部分，而不仅仅是错误处理逻辑。</p>
+<h1 id="总结">总结</h1>
+<p>导致任务卡在 <code>CANCELING</code> 状态的原因，并不只是 Cancel 请求发送失败这么简单。</p>
+<p>Worker 可能已经完成了任务，并尝试向 Master 上报最终状态；但如果这一过程恰好发生在 Master Failover 期间，而新的 Master 尚未完全恢复运行中的 Job 状态，Master 就可能抛出 <code>JobNotFoundException</code>。由于 Worker 将这一异常视为任务已经到达终态的信号，因此停止了后续重试。最终，Master 错过了这次最终状态通知，导致 Job 一直停留在 <code>CANCELING</code> 状态。</p>
+<p>针对这种情况，我引入了 Force Stop 作为一种实用的恢复机制。</p>
+<p>它并不会取代正常的 Cancel 流程，而是在优雅取消无法继续推进时，为运维人员提供一种能够最终完成 Job 状态收敛的手段。</p>
+<p>这次问题排查带给我最大的启发其实很简单：</p>
+<blockquote>
+<p>在分布式系统中，困难的并不只是把请求发送出去。真正困难的是，当请求与故障、恢复或状态延迟发生竞态时，系统究竟应该相信什么。</p>
+</blockquote>
+<p>目前，我主要参与 Apache SeaTunnel 的开发工作，重点关注 Zeta 引擎、Connector 以及分布式执行相关机制，大家可以关注下我的开源工作  <a href="https://github.com/dybyte" target="_blank" rel="noopener nofollow">https://github.com/dybyte</a> 。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-06-25 15:27">2026-06-25 15:26</span>&nbsp;
+<a href="https://www.cnblogs.com/seatunnel">ApacheSeaTunnel</a>&nbsp;
+阅读(<span id="post_view_count">64</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20804076);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fseatunnel%2Fp%2F20804076&amp;targetId=20804076&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
