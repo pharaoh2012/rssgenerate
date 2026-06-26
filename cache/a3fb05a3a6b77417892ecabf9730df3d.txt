@@ -1,0 +1,642 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/manuscript/p/20830335" title="发布于 2026-06-26 11:30">
+    <span role="heading" aria-level="2">Kubernetes（1.31 到 1.35）集群、CRI containerd（1.7 到 2.3）升级流程与问题记录</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="前言">前言</h1>
+<p>集群运行已近一年，Kubernetes 与底层容器运行时（CRI）containerd 都长期未更新，趁前后没什么事，对集群做了一次整体升级：</p>
+<ul>
+<li><strong>Kubernetes</strong>：<code>v1.31.14</code> → <code>v1.35.6</code></li>
+<li><strong>containerd</strong>：<code>1.7.27</code> → <code>2.3.2</code></li>
+</ul>
+<p>本文是这次升级的完整流程记录，将升级流程与遇到的问题都整理进来了。后续升级时如果遇到什么新问题，也都会更新到本文中。</p>
+<p>升级前的集群状态：</p>
+<pre><code class="language-bash"># kubectl get node -o wide
+NAME    STATUS   ROLES           AGE    VERSION    OS-IMAGE             KERNEL-VERSION      CONTAINER-RUNTIME
+x.x.x   Ready    control-plane   342d   v1.31.14   Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://1.7.27
+x.x.x   Ready    control-plane   342d   v1.31.14   Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://1.7.27
+x.x.x   Ready    control-plane   342d   v1.31.14   Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://1.7.27
+</code></pre>
+<h1 id="kubernetes-升级">Kubernetes 升级</h1>
+<h2 id="1版本升级规划">1.版本升级规划</h2>
+<p>K8s <a href="https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/" target="_blank" rel="noopener nofollow">官方文档</a>明确说明：</p>
+<blockquote>
+<p>Skipping MINOR versions when upgrading is unsupported</p>
+</blockquote>
+<p>也就是说，从 <code>v1.31.14</code> 升级到 <code>v1.35.6</code>，不能一步到位，必须<strong>逐个版本升级</strong>，共经历四跳：</p>
+<pre><code>v1.31.14 -&gt; v1.32.x -&gt; v1.33.x -&gt; v1.34.x -&gt; v1.35.6
+</code></pre>
+<h2 id="2版本升级流程">2.版本升级流程</h2>
+<p>由于不能跳版本，<code>v1.31 -&gt; v1.35</code> 本质上是<strong>把单次升级流程重复执行四遍</strong>：</p>
+<blockquote>
+<p>以下步骤针对<strong>每个控制平面节点</strong>：每完成一个版本升级后，所有节点同步升级，再进入下一个版本升级流程。</p>
+</blockquote>
+<h3 id="21腾空节点">2.1.腾空节点</h3>
+<p>只对当前升级的节点进行：</p>
+<pre><code class="language-bash">kubectl drain xxx \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --timeout=300s
+</code></pre>
+<h3 id="22备份-etcd">2.2.备份 ETCD</h3>
+<blockquote>
+<p>在<strong>所有控制平面节点</strong>上执行。</p>
+</blockquote>
+<pre><code class="language-bash">ETCDCTL_API=3
+etcdctl --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        snapshot save /root/backup/etcd-$(date +%F-%H%M).db
+</code></pre>
+<p>执行成功后输出一堆 <code>info</code> 日志，最终看到 <code>Snapshot saved at ...</code> 就备份成功了：</p>
+<pre><code class="language-json">{"level":"info","ts":"xxxx-xx-xx","caller":"snapshot/v3_snapshot.go:65","msg":"created temporary db file","path":"/backup/etcd-xxxx-xx-xx-xxxx.db.part"}
+{"level":"info","ts":"xxxx-xx-xx","logger":"client","caller":"v3@v3.5.21/maintenance.go:212","msg":"opened snapshot stream; downloading"}
+{"level":"info","ts":"xxxx-xx-xx","caller":"snapshot/v3_snapshot.go:88","msg":"fetched snapshot","endpoint":"https://127.0.0.1:2379","size":"xx MB","took":"xx second ago"}
+{"level":"info","ts":"xxxx-xx-xx","caller":"snapshot/v3_snapshot.go:97","msg":"saved","path":"/backup/etcd-xxxx-xx-xx-xxxx.db"}
+Snapshot saved at /backup/etcd-x.x.x-xxxx.db
+</code></pre>
+<h3 id="23更新软件源">2.3.更新软件源</h3>
+<p>当前环境使用<a href="https://mirrors.tuna.tsinghua.edu.cn/help/kubernetes/" target="_blank" rel="noopener nofollow">清华源</a>。每次版本升级，都需要把旧版本源注释或清理，换成新版本源并下载对应的仓库公钥。</p>
+<blockquote>
+<p>在<strong>所有控制平面节点</strong>更新：</p>
+</blockquote>
+<pre><code class="language-bash"># 下载前先将旧版本公钥改名备份一下,等升级结束后再清理
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key \
+  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+# 配置新版本源
+# $K8S_VERSION: 具体要升级的版本
+cat /etc/apt/sources.list.d/kubernetes.list
+deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] http://mirrors4.tuna.tsinghua.edu.cn/kubernetes/core:/stable:/$K8S_VERSION/deb/ /
+
+# 更新源
+apt-get update
+
+# 列出当前可用版本
+apt-cache madison kubeadm | head -n 1
+   # 示例输出
+   kubeadm | 1.32.13-1.1 | http://mirrors4.tuna.tsinghua.edu.cn/kubernetes/core:/stable:/v1.32/deb  Packages
+apt-cache madison kubelet | head -n 1
+apt-cache madison kubectl | head -n 1
+
+# 确认组件未被 apt 锁定(hold)
+apt-mark showhold | grep -Ei "kubeadm|kubelet|kubectl"
+</code></pre>
+<h3 id="24验证升级计划">2.4.验证升级计划</h3>
+<p>检查可升级到哪些版本，并验证当前集群是否可升级。<a href="https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-upgrade/#cmd-upgrade-plan" target="_blank" rel="noopener nofollow">该命令</a>只能在存在 kubeconfig 文件 <code>admin.conf</code> 的控制平面节点上运行。</p>
+<pre><code class="language-bash"># 安装目标版本的 kubeadm
+apt-get install -y kubeadm='1.32.13-1.1'
+
+# 确认版本
+kubeadm version
+
+# 验证升级计划: kubeadm 会列出当前版本/目标版本/各组件变更
+kubeadm upgrade plan
+# 输出内容(忽略输出的版本信息)
+[preflight] Running pre-flight checks.
+[upgrade/config] Reading configuration from the "kubeadm-config" ConfigMap in namespace "kube-system"...
+[upgrade/config] Use 'kubeadm init phase upload-config --config your-config-file' to re-upload it.
+[upgrade] Running cluster health checks
+[upgrade] Fetching available versions to upgrade to
+[upgrade/versions] Cluster version: 1.32.13
+[upgrade/versions] kubeadm version: v1.33.13
+I0622 18:27:10.934338 3715038 version.go:261] remote version is much newer: v1.36.2; falling back to: stable-1.33
+[upgrade/versions] Target version: v1.33.13
+[upgrade/versions] Latest version in the v1.32 series: v1.32.13
+
+Components that must be upgraded manually after you have upgraded the control plane with 'kubeadm upgrade apply':
+COMPONENT   NODE    CURRENT    TARGET
+kubelet     x.x.x   v1.32.13   v1.33.13
+kubelet     x.x.x   v1.32.13   v1.33.13
+kubelet     x.x.x   v1.32.13   v1.33.13
+
+Upgrade to the latest stable version:
+
+COMPONENT                 NODE      CURRENT    TARGET
+kube-apiserver            x.x.x     v1.32.13   v1.33.13
+kube-apiserver            x.x.x     v1.32.13   v1.33.13
+kube-apiserver            x.x.x     v1.32.13   v1.33.13
+kube-controller-manager   x.x.x     v1.32.13   v1.33.13
+kube-controller-manager   x.x.x     v1.32.13   v1.33.13
+kube-controller-manager   x.x.x     v1.32.13   v1.33.13
+kube-scheduler            x.x.x     v1.32.13   v1.33.13
+kube-scheduler            x.x.x     v1.32.13   v1.33.13
+kube-scheduler            x.x.x     v1.32.13   v1.33.13
+kube-proxy                          1.32.13    v1.33.13
+CoreDNS                             v1.11.3    v1.12.0
+etcd                      x.x.x     3.5.24-0   3.5.24-0
+etcd                      x.x.x     3.5.24-0   3.5.24-0
+etcd                      x.x.x     3.5.24-0   3.5.24-0
+
+You can now apply the upgrade by executing the following command:
+
+        kubeadm upgrade apply v1.33.13
+_____________________________________________________________________
+
+The table below shows the current state of component configs as understood by this version of kubeadm.
+Configs that have a "yes" mark in the "MANUAL UPGRADE REQUIRED" column require manual config upgrade or
+resetting to kubeadm defaults before a successful upgrade can be performed. The version to manually
+upgrade to is denoted in the "PREFERRED VERSION" column.
+
+API GROUP                 CURRENT VERSION   PREFERRED VERSION   MANUAL UPGRADE REQUIRED
+kubeproxy.config.k8s.io   v1alpha1          v1alpha1            no
+kubelet.config.k8s.io     v1beta1           v1beta1             no
+</code></pre>
+<h3 id="25关闭-kube-apiserver-连接">2.5.关闭 kube-apiserver 连接</h3>
+<p>因为 <code>kube-apiserver</code>/<code>etcd</code> 静态 Pod 始终在运行，所以执行 kubeadm 升级时，对服务器正在进行的请求将停滞。可以在运行 <code>kubeadm upgrade apply</code> 命令前主动停止 <code>kube-apiserver</code> 进程几秒钟。这样可以能让正在进行的请求完成处理并关闭现有连接，最大限度地减少 etcd 停机的后果：</p>
+<pre><code class="language-bash">killall -s SIGTERM kube-apiserver
+</code></pre>
+<h3 id="26集群升级">2.6.集群升级</h3>
+<h4 id="261控制节点升级">2.6.1.控制节点升级</h4>
+<p><a href="https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-upgrade/#cmd-upgrade-apply" target="_blank" rel="noopener nofollow">该命令</a><span style="color: rgba(255, 0, 0, 1)"><strong>只需执行一次</strong></span>，且仅可在具有 kubeconfig 文件 <code>admin.conf</code> 的控制平面节点上运行。它的作用是：</p>
+<ol>
+<li>
+<p>preflight：升级前预检查；</p>
+</li>
+<li>
+<p>control-plane：升级本节点上的控制平面实例；</p>
+</li>
+<li>
+<p>upload-config：将 kubeadm 和 kubelet 配置上传到 ConfigMap（集群级，唯一）；</p>
+<p>3.1. /kubeadm：将 ClusterConfiguration 写入 kubeadm-config ConfigMap；</p>
+<p>3.2. /kubelet：将 kubelet 配置写入 kubelet-config ConfigMap；</p>
+</li>
+<li>
+<p>kubelet-config：升级本节点的 kubelet 配置；</p>
+</li>
+<li>
+<p>bootstrap-token：配置 bootstrap token 和 cluster-info RBAC 规则（集群级，唯一）；</p>
+</li>
+<li>
+<p>addon：升级默认插件（CoreDNS、kube-proxy）；</p>
+</li>
+<li>
+<p>post-upgrade：升级后任务。</p>
+</li>
+</ol>
+<pre><code class="language-bash"># 第一个控制平面节点用 apply
+kubeadm upgrade apply 1.32.13
+# 输出内容
+[upgrade] Reading configuration from the "kubeadm-config" ConfigMap in namespace "kube-system"...
+[upgrade/preflight] Running preflight checks
+[upgrade] Running cluster health checks
+[upgrade/preflight] You have chosen to upgrade the cluster version to "v1.32.13"
+[upgrade/versions] Cluster version: v1.31.14
+[upgrade/versions] kubeadm version: v1.32.13
+[upgrade] Are you sure you want to proceed? [y/N]: y
+[upgrade/preflight] Pulling images required for setting up a Kubernetes cluster
+[upgrade/preflight] This might take a minute or two, depending on the speed of your internet connection
+# 这里告警提示: 基础镜像版本不一致
+# 参考 '问题处理 1.1 基础镜像版本不一致' 解决
+W0622 16:00:12 checks.go:843] detected that the sandbox image "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.8" of the container runtime is inconsistent with that used by kubeadm. It is recommended to use "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10" as the CRI sandbox image.
+[upgrade/control-plane] Upgrading your Static Pod-hosted control plane to version "v1.32.13" (timeout: 5m0s)...
+[upgrade/staticpods] Preparing for "etcd" upgrade
+[upgrade/staticpods] Renewing etcd-server / etcd-peer / etcd-healthcheck-client certificate
+[upgrade/staticpods] Moving new manifest to ".../etcd.yaml" and backing up old manifest
+[upgrade/staticpods] Component "etcd" upgraded successfully!
+[upgrade/etcd] Waiting for etcd to become available
+[upgrade/staticpods] Preparing for "kube-apiserver" upgrade
+[upgrade/staticpods] Renewing apiserver / apiserver-kubelet-client / front-proxy-client / apiserver-etcd-client certificate
+[upgrade/staticpods] Component "kube-apiserver" upgraded successfully!
+[upgrade/staticpods] Component "kube-controller-manager" upgraded successfully!
+[upgrade/staticpods] Component "kube-scheduler" upgraded successfully!
+[upgrade/control-plane] The control plane instance for this node was successfully upgraded!
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+[kubelet] Creating a ConfigMap "kubelet-config" in namespace kube-system
+[upgrade/kubeconfig] The kubeconfig files for this node were successfully upgraded!
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+[upgrade/addon] Skipping upgrade of addons because control plane instances [x.x.x x.x.x] have not been upgraded
+[upgrade] SUCCESS! A control plane node of your cluster was upgraded to "v1.32.13".
+[upgrade] Now please proceed with upgrading the rest of the nodes by following the right order.
+</code></pre>
+<h4 id="262其余节点升级">2.6.2.其余节点升级</h4>
+<p>在上面某台 master 节点执行 apply 后执行<a href="https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-upgrade/#cmd-upgrade-node" target="_blank" rel="noopener nofollow">该命令</a>。与 <code>apply</code> 相比，<code>node</code> 没有 <code>upload-config</code> 和 <code>bootstrap-token</code> 这两个集群级阶段，这正是它可以在多个节点上重复执行的原因。在 <code>control-plane</code> 阶段，当前节点是控制平面就升级控制平面实例，是工作节点则跳过，因此该命令可同时用于两种节点：</p>
+<blockquote>
+<p><em>"Upgrade the control plane instance deployed on this node, <strong>if any</strong>"</em></p>
+</blockquote>
+<pre><code class="language-bash"># 其余控制节点/Node 节点
+kubeadm upgrade node
+# 输出内容
+[upgrade] Reading configuration from the "kubeadm-config" ConfigMap in namespace "kube-system"...
+[upgrade] Use 'kubeadm init phase upload-config --config your-config-file' to re-upload it.
+[upgrade/preflight] Running pre-flight checks
+[upgrade/preflight] Pulling images required for setting up a Kubernetes cluster
+[upgrade/preflight] This might take a minute or two, depending on the speed of your internet connection
+[upgrade/preflight] You can also perform this action beforehand using 'kubeadm config images pull'
+W0622 18:36:03.656485 1715747 checks.go:843] detected that the sandbox image "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.8" of the container runtime is inconsistent with that used by kubeadm.It is recommended to use "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10" as the CRI sandbox image.
+[upgrade/control-plane] Upgrading your Static Pod-hosted control plane instance to version "v1.33.13"...
+[upgrade/staticpods] Writing new Static Pod manifests to "/etc/kubernetes/tmp/kubeadm-upgraded-manifests2277431111"
+[upgrade/staticpods] Preparing for "etcd" upgrade
+[upgrade/staticpods] Renewing etcd-server certificate
+[upgrade/staticpods] Renewing etcd-peer certificate
+[upgrade/staticpods] Renewing etcd-healthcheck-client certificate
+[upgrade/staticpods] Restarting the etcd static pod and backing up its manifest to "/etc/kubernetes/tmp/kubeadm-backup-manifests-2026-06-22-18-36-49/etcd.yaml"
+[upgrade/staticpods] Waiting for the kubelet to restart the component
+[upgrade/staticpods] This can take up to 5m0s
+[apiclient] Found 3 Pods for label selector component=etcd
+[upgrade/staticpods] Component "etcd" upgraded successfully!
+[upgrade/etcd] Waiting for etcd to become available
+[upgrade/staticpods] Preparing for "kube-apiserver" upgrade
+[upgrade/staticpods] Renewing apiserver certificate
+[upgrade/staticpods] Renewing apiserver-kubelet-client certificate
+[upgrade/staticpods] Renewing front-proxy-client certificate
+[upgrade/staticpods] Renewing apiserver-etcd-client certificate
+[upgrade/staticpods] Moving new manifest to "/etc/kubernetes/manifests/kube-apiserver.yaml" and backing up old manifest to "/etc/kubernetes/tmp/kubeadm-backup-manifests-2026-06-22-18-36-49/kube-apiserver.yaml"
+[upgrade/staticpods] Waiting for the kubelet to restart the component
+[upgrade/staticpods] This can take up to 5m0s
+[apiclient] Found 3 Pods for label selector component=kube-apiserver
+[upgrade/staticpods] Component "kube-apiserver" upgraded successfully!
+[upgrade/staticpods] Preparing for "kube-controller-manager" upgrade
+[upgrade/staticpods] Renewing controller-manager.conf certificate
+[upgrade/staticpods] Moving new manifest to "/etc/kubernetes/manifests/kube-controller-manager.yaml" and backing up old manifest to "/etc/kubernetes/tmp/kubeadm-backup-manifests-2026-06-22-18-36-49/kube-controller-manager.yaml"
+[upgrade/staticpods] Waiting for the kubelet to restart the component
+[upgrade/staticpods] This can take up to 5m0s
+[apiclient] Found 3 Pods for label selector component=kube-controller-manager
+[upgrade/staticpods] Component "kube-controller-manager" upgraded successfully!
+[upgrade/staticpods] Preparing for "kube-scheduler" upgrade
+[upgrade/staticpods] Renewing scheduler.conf certificate
+[upgrade/staticpods] Moving new manifest to "/etc/kubernetes/manifests/kube-scheduler.yaml" and backing up old manifest to "/etc/kubernetes/tmp/kubeadm-backup-manifests-2026-06-22-18-36-49/kube-scheduler.yaml"
+[upgrade/staticpods] Waiting for the kubelet to restart the component
+[upgrade/staticpods] This can take up to 5m0s
+[apiclient] Found 3 Pods for label selector component=kube-scheduler
+[upgrade/staticpods] Component "kube-scheduler" upgraded successfully!
+[upgrade/control-plane] The control plane instance for this node was successfully upgraded!
+## 此告警是指配置中 controlPlaneEndpoint 与实际 bindPort 不一致
+## 参考 '问题处理 1.3' 处（在本文中是符合预期的）
+W0622 18:38:43.473778 1715747 endpoint.go:57] [endpoint] WARNING: port specified in controlPlaneEndpoint overrides bindPort in the controlplane address
+[upgrade/kubeconfig] The kubeconfig files for this node were successfully upgraded!
+W0622 18:38:50.167686 1715747 postupgrade.go:117] Using temporary directory /etc/kubernetes/tmp/kubeadm-kubelet-config2351329468 for kubelet config. To override it set the environment variable KUBEADM_UPGRADE_DRYRUN_DIR
+[upgrade] Backing up kubelet config file to /etc/kubernetes/tmp/kubeadm-kubelet-config2351329468/config.yaml
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+[addons] Applied essential addon: CoreDNS
+W0622 18:38:50.338251 1715747 endpoint.go:57] [endpoint] WARNING: port specified in controlPlaneEndpoint overrides bindPort in the controlplane address
+[addons] Applied essential addon: kube-proxy
+</code></pre>
+<h3 id="27升级-kubelet-与-kubectl">2.7.升级 kubelet 与 kubectl</h3>
+<pre><code class="language-bash">apt-get install -y kubelet='1.32.13-1.1' kubectl='1.32.13-1.1'
+
+# 升级后会自动重启 kubelet containerd(可通过日志观察)
+# systemctl daemon-reload
+# systemctl restart kubelet/containerd
+</code></pre>
+<h3 id="28恢复节点调度并验证">2.8.恢复节点调度并验证</h3>
+<pre><code class="language-bash">kubectl uncordon xxx
+kubectl get node -o wide
+</code></pre>
+<p>确认节点 <code>VERSION</code> 更新后，登录下一个控制平面节点，重复上述步骤。</p>
+<blockquote>
+<p>注：上述 2.1 ～ 2.8 步要在<strong>所有控制节点</strong>上都走一遍；且四要分别四次执行版本升级，即整体循环四次...</p>
+</blockquote>
+<h1 id="containerd-升级">Containerd 升级</h1>
+<p>K8s 集群升级后，参考 containerd 官网<a href="https://containerd.io/releases/#kubernetes-support" target="_blank" rel="noopener nofollow">版本对应关系</a>，计划将 containerd 升到 <a href="https://github.com/containerd/containerd/releases/tag/v2.3.2" target="_blank" rel="noopener nofollow">2.3.2</a>。虽然 <a href="https://testgrid.k8s.io/sig-node-containerd" target="_blank" rel="noopener nofollow">Kubernetes test grid</a> 中 1.35 未覆盖 containerd 2.3.x，但二者 CRI Version 一致，且官方<a href="https://containerd.io/releases/#upgrade-path" target="_blank" rel="noopener nofollow">升级路径</a>支持 LTS 跨版本升级，因此本次直接从 1.7.27 直接升级到 2.3.2：</p>
+<blockquote>
+<p>Upgrades are supported for sequential minor releases. For example, an upgrade from 2.0 to 2.1 is supported, but an upgrade from 2.0 to 2.2 is not. Patch releases are always backward compatible with their minor version.</p>
+<p>In addition to sequential minor release upgrades, direct upgrades between sequential LTS (Long Term Stable) releases are also supported. For example, a direct upgrade from 1.7 (LTS) to 2.3 (LTS) will be tested and supported, but 1.7 (LTS) to 2.6 (LTS, tentatively) will not. This allows users who prefer to stay on LTS releases to have a clear and safe upgrade path.</p>
+</blockquote>
+<p>升级前的状态：</p>
+<pre><code class="language-bash"># containerd --version
+containerd github.com/containerd/containerd v1.7.27 05044ec0a9a75232cad458027ca83437aae3f4da
+
+# runc --version
+runc version 1.4.3
+commit: v1.4.3-0-gbb14dabeb
+spec: 1.3.0
+go: go1.25.11
+libseccomp: 2.6.0
+
+# kubectl get node -o wide
+NAME    STATUS   ROLES           AGE    VERSION   INTERNAL-IP   OS-IMAGE             KERNEL-VERSION      CONTAINER-RUNTIME
+x.x.x   Ready    control-plane   346d   v1.35.6   x.x.x.x       Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://2.3.2
+x.x.x   Ready    control-plane   346d   v1.35.6   x.x.x.x       Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://2.3.2
+x.x.x   Ready    control-plane   346d   v1.35.6   x.x.x.x       Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://2.3.2
+</code></pre>
+<h2 id="1升级前检查">1.升级前检查</h2>
+<p>先查询当前版本是否有废弃配置 / API 提示：</p>
+<pre><code class="language-bash"># ctr deprecations list
+# ctr deprecations list --format json
+</code></pre>
+<p>从 containerd 2.0 开始，官方<a href="https://github.com/containerd/containerd/blob/main/releases/cri-containerd.DEPRECATED.txt" target="_blank" rel="noopener nofollow">废弃</a>了 <code>cri-containerd-(cni-)&lt;VERSION&gt;-&lt;OS&gt;-&lt;ARCH&gt;.tar.gz</code> 全量安装包。他<a href="https://github.com/containerd/containerd/blob/release/1.5/docs/cri/installation.md#release-tarball" target="_blank" rel="noopener nofollow">最初</a>是面向 k8s 提供的：把 containerd、runc 和 CNI 打包在一起，无需再分别下载各个组件，便于快速安装。不过自 k8s 1.24 <a href="https://kubernetes.io/docs/setup/production-environment/container-runtimes/" target="_blank" rel="noopener nofollow">移除 Dockershim</a> 起，containerd 社区也在<a href="https://github.com/containerd/containerd/issues/6541" target="_blank" rel="noopener nofollow">讨论</a>中决定不再维护全量包。在 <a href="https://containerd.io/docs/main/getting-started/" target="_blank" rel="noopener nofollow">2.0 版本后</a>改为各组件由用户按需安装依赖。</p>
+<p>因此，从 2.0 开始，containerd 作为 K8s CRI 时，需要分别安装以下三个组件：</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>下载地址</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>containerd</td>
+<td><a href="https://github.com/containerd/containerd/releases" target="_blank" rel="noopener nofollow">https://github.com/containerd/containerd/releases</a></td>
+</tr>
+<tr>
+<td>runc</td>
+<td><a href="https://github.com/opencontainers/runc/releases" target="_blank" rel="noopener nofollow">https://github.com/opencontainers/runc/releases</a></td>
+</tr>
+<tr>
+<td>CNI plugins</td>
+<td><a href="https://github.com/containernetworking/plugins/releases" target="_blank" rel="noopener nofollow">https://github.com/containernetworking/plugins/releases</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="2升级流程">2.升级流程</h2>
+<blockquote>
+<p>所有 k8s 节点<strong>依次</strong>完成 2.1 ～ 2.7 中所有操作</p>
+</blockquote>
+<h3 id="21腾空节点-1">2.1.腾空节点</h3>
+<pre><code class="language-bash">kubectl cordon xxx
+kubectl drain xxx --ignore-daemonsets --delete-emptydir-data --timeout=300s
+</code></pre>
+<h3 id="22下载新版本组件">2.2.下载新版本组件</h3>
+<pre><code class="language-bash">wget "https://github.com/containerd/containerd/releases/download/v2.3.2/containerd-2.3.2-linux-amd64.tar.gz"
+wget "https://github.com/opencontainers/runc/releases/download/v1.4.3/runc.amd64"
+wget "https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz"
+</code></pre>
+<h3 id="23停止-containerd">2.3.停止 containerd</h3>
+<pre><code class="language-bash">systemctl stop containerd
+</code></pre>
+<h3 id="24升级-runc">2.4.升级 runc</h3>
+<pre><code class="language-bash"># 查询旧版本
+# runc --version
+runc version 1.2.5
+commit: v1.2.5-0-g59923ef1
+spec: 1.2.0
+go: go1.23.7
+
+# 备份旧版本
+mv /usr/local/sbin/runc /usr/local/sbin/runc_1.2.5.old
+
+# 替换为新版本
+mv ./runc.amd64 /usr/local/sbin/runc
+chmod 755 /usr/local/sbin/runc
+
+# 确认版本
+runc --version
+runc version 1.4.3
+commit: v1.4.3-0-gbb14dabeb
+spec: 1.3.0
+go: go1.25.11
+libseccomp: 2.6.0
+</code></pre>
+<h3 id="25升级-cni-plugins">2.5.升级 CNI plugins</h3>
+<p>看下更新前 <code>/opt/cni/bin/</code> 下的内容：</p>
+<pre><code class="language-bash"># ll /opt/cni/bin/
+total 215M
+-rwxr-xr-x 1 root root 4.0M Jul 15  2025 tuning
+-rwxr-xr-x 1 root root 4.3M Jul 15  2025 portmap
+-rwxr-xr-x 1 root root 3.9M Jul 15  2025 loopback
+-rwxr-xr-x 1 root root 3.8M Jul 15  2025 host-local
+-rwxr-xr-x 1 root root 2.7M Jul 15  2025 flannel
+-rwxr-xr-x 1 root root  66M Jul 15  2025 calico-ipam
+-rwxr-xr-x 1 root root  66M Jul 15  2025 calico
+-rwxr-xr-x 1 root root 4.3M Jul 15  2025 bandwidth
+-rwxr-xr-x 1 root root 4.3M Aug 30  2024 macvlan
+-rwxr-xr-x 1 root root 3.8M Aug 30  2024 sbr
+-rwxr-xr-x 1 root root 4.6M Aug 30  2024 bridge
+-rwxr-xr-x 1 root root  11M Aug 30  2024 dhcp
+-rwxr-xr-x 1 root root 4.3M Aug 30  2024 dummy
+-rwxr-xr-x 1 root root 4.8M Aug 30  2024 firewall
+-rwxr-xr-x 1 root root 4.2M Aug 30  2024 host-device
+-rwxr-xr-x 1 root root 4.3M Aug 30  2024 ipvlan
+-rw-r--r-- 1 root root  12K Aug 30  2024 LICENSE
+-rwxr-xr-x 1 root root 4.4M Aug 30  2024 ptp
+-rw-r--r-- 1 root root 2.3K Aug 30  2024 README.md
+-rwxr-xr-x 1 root root 3.1M Aug 30  2024 static
+-rwxr-xr-x 1 root root 4.3M Aug 30  2024 tap
+-rwxr-xr-x 1 root root 4.3M Aug 30  2024 vlan
+-rwxr-xr-x 1 root root 4.0M Aug 30  2024 vrf
+</code></pre>
+<p>解压新版本到 CNI 目录（会覆盖同名插件）：</p>
+<pre><code class="language-bash">tar zxvf ./cni-plugins-linux-amd64-v1.9.1.tgz -C /opt/cni/bin/
+</code></pre>
+<p>查看更新后内容：</p>
+<pre><code class="language-bash"># ll /opt/cni/bin/
+total 228M
+-rwxr-xr-x 1 root root 4.2M Mar 16 22:18 host-local
+-rw-r--r-- 1 root root  12K Mar 16 22:18 LICENSE
+-rw-r--r-- 1 root root 2.3K Mar 16 22:18 README.md
+-rwxr-xr-x 1 root root 3.7M Mar 16 22:18 static
+-rwxr-xr-x 1 root root  14M Mar 16 22:18 dhcp
+-rwxr-xr-x 1 root root 5.3M Mar 16 22:18 tap
+-rwxr-xr-x 1 root root 5.1M Mar 16 22:18 vlan
+-rwxr-xr-x 1 root root 5.1M Mar 16 22:18 ipvlan
+-rwxr-xr-x 1 root root 4.2M Mar 16 22:18 loopback
+-rwxr-xr-x 1 root root 5.1M Mar 16 22:18 macvlan
+-rwxr-xr-x 1 root root 5.3M Mar 16 22:18 ptp
+-rwxr-xr-x 1 root root 5.5M Mar 16 22:18 bridge
+-rwxr-xr-x 1 root root 5.1M Mar 16 22:18 dummy
+-rwxr-xr-x 1 root root 5.0M Mar 16 22:18 host-device
+-rwxr-xr-x 1 root root 4.9M Mar 16 22:18 portmap
+-rwxr-xr-x 1 root root 4.4M Mar 16 22:18 sbr
+-rwxr-xr-x 1 root root 4.2M Mar 16 22:18 tuning
+-rwxr-xr-x 1 root root 4.5M Mar 16 22:18 vrf
+-rwxr-xr-x 1 root root 5.5M Mar 16 22:18 firewall
+-rwxr-xr-x 1 root root 4.9M Mar 16 22:18 bandwidth
+-rwxr-xr-x 1 root root 2.7M Jul 15  2025 flannel
+-rwxr-xr-x 1 root root  66M Jul 15  2025 calico-ipam
+-rwxr-xr-x 1 root root  66M Jul 15  2025 calico
+</code></pre>
+<h3 id="26升级-containerd">2.6.升级 containerd</h3>
+<p>更新前 <code>/usr/local/bin/</code> 下的 containerd 相关文件：</p>
+<pre><code class="language-bash"># ll /usr/local/bin/
+total 279M
+lrwxrwxrwx 1 root root   33 Jul 14  2025 nerdctl -&gt; /usr/local/containerd/bin/nerdctl
+-rwxr-xr-x 1 demo demo  23M Mar 28  2025 etcd
+-rwxr-xr-x 1 demo demo  18M Mar 28  2025 etcdctl
+-rwxr-xr-x 1 root root  27M Mar 18  2025 ctd-decoder
+-rwxr-xr-x 1 root root  55M Mar 18  2025 crictl
+-rwxr-xr-x 1 root root  56M Mar 18  2025 critest
+-rwxr-xr-x 1 root root  39M Mar 18  2025 containerd
+-rwxr-xr-x 1 root root 6.4M Mar 18  2025 containerd-shim
+-rwxr-xr-x 1 root root 7.4M Mar 18  2025 containerd-shim-runc-v1
+-rwxr-xr-x 1 root root  13M Mar 18  2025 containerd-shim-runc-v2
+-rwxr-xr-x 1 root root  18M Mar 18  2025 containerd-stress
+-rwxr-xr-x 1 root root  19M Mar 18  2025 ctr
+</code></pre>
+<p>解压新版本（<code>--strip-components=1</code> 去掉压缩包内的 <code>bin/</code> 目录层级，直接覆盖到 <code>/usr/local/bin/</code>）：</p>
+<pre><code class="language-bash"># tar tf containerd-2.3.2-linux-amd64.tar.gz 
+bin/
+bin/containerd
+bin/containerd-shim-runc-v2
+bin/ctr
+bin/containerd-stress
+
+# tar -xzvf containerd-2.3.2-linux-amd64.tar.gz --strip-components=1 -C /usr/local/bin/
+</code></pre>
+<p>更新后（containerd 主程序及相关组件更新为 <code>Jun 19</code> 时间戳；注意旧版的 <code>containerd-shim</code>、<code>containerd-shim-runc-v1</code> 等 2.0 已废弃的 shim 仍保留，但不再使用）：</p>
+<pre><code class="language-bash"># ll /usr/local/bin/
+total 286M
+-rwxr-xr-x 1 root root  42M Jun 19 07:14 containerd
+-rwxr-xr-x 1 root root 8.1M Jun 19 07:14 containerd-shim-runc-v2
+-rwxr-xr-x 1 root root  22M Jun 19 07:14 containerd-stress
+-rwxr-xr-x 1 root root  25M Jun 19 07:14 ctr
+lrwxrwxrwx 1 root root   33 Jul 14  2025 nerdctl -&gt; /usr/local/containerd/bin/nerdctl
+-rwxr-xr-x 1 demo demo  23M Mar 28  2025 etcd
+-rwxr-xr-x 1 demo demo  18M Mar 28  2025 etcdctl
+-rwxr-xr-x 1 root root  27M Mar 18  2025 ctd-decoder
+-rwxr-xr-x 1 root root  55M Mar 18  2025 crictl
+-rwxr-xr-x 1 root root  56M Mar 18  2025 critest
+# 2.0 已废弃
+-rwxr-xr-x 1 root root 6.4M Mar 18  2025 containerd-shim
+# 2.0 已废弃
+-rwxr-xr-x 1 root root 7.4M Mar 18  2025 containerd-shim-runc-v1
+</code></pre>
+<h3 id="27重启-containerd-并验证">2.7.重启 containerd 并验证</h3>
+<pre><code class="language-bash">systemctl restart containerd
+systemctl status containerd
+</code></pre>
+<h2 id="3验证升级结果">3.验证升级结果</h2>
+<p>逐节点升级完成后，确认运行时版本已更新为 <code>containerd://2.3.2</code>：</p>
+<pre><code class="language-bash"># kubectl get node -o wide
+NAME    STATUS   ROLES           AGE    VERSION   INTERNAL-IP   OS-IMAGE             KERNEL-VERSION      CONTAINER-RUNTIME
+x.x.x   Ready    control-plane   344d   v1.35.6   x.x.x.x       Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://2.3.2
+x.x.x   Ready    control-plane   344d   v1.35.6   x.x.x.x       Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://2.3.2
+x.x.x   Ready    control-plane   344d   v1.35.6   x.x.x.x       Ubuntu 24.04.4 LTS   6.8.0-124-generic   containerd://2.3.2
+</code></pre>
+<h1 id="问题处理">问题处理</h1>
+<h2 id="1kubernetes-问题处理">1.Kubernetes 问题处理</h2>
+<h3 id="11基础镜像版本不一致">1.1.基础镜像版本不一致</h3>
+<h4 id="问题原因">问题原因</h4>
+<p>新版 kubeadm 默认使用的 pause 镜像版本与节点上 containerd 配置的不一致。</p>
+<h4 id="表现形式">表现形式</h4>
+<p>在执行 kubeadm upgrade apply 时，可能会出现基础镜像不一致的告警</p>
+<pre><code class="language-text">detected that the sandbox image "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.8" of the container runtime is inconsistent with that used by kubeadm. It is recommended to use "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10" as the CRI sandbox image.
+</code></pre>
+<h4 id="解决方式">解决方式</h4>
+<p>查看当前 kubeadm 期望的镜像版本：</p>
+<pre><code class="language-bash"># kubeadm config images list
+# 此处报错是由于无法连接 "https://dl.k8s.io/release/stable-1.txt",但不影响输出所需镜像
+W0626 10:30:12.306990 2755682 version.go:108] could not fetch a Kubernetes version from the internet: unable to get URL "https://dl.k8s.io/release/stable-1.txt": Get "https://dl.k8s.io/release/stable-1.txt": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+W0626 10:30:12.307154 2755682 version.go:109] falling back to the local client version: v1.35.6
+registry.k8s.io/kube-apiserver:v1.35.6
+registry.k8s.io/kube-controller-manager:v1.35.6
+registry.k8s.io/kube-scheduler:v1.35.6
+registry.k8s.io/kube-proxy:v1.35.6
+registry.k8s.io/coredns/coredns:v1.13.1
+registry.k8s.io/pause:3.10.1
+registry.k8s.io/etcd:3.6.6-0
+
+# 查看当前 containerd 实际配置
+grep -i 'pause:' /etc/containerd/config.toml
+    sandbox_image = "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.8"
+</code></pre>
+<p>把 containerd 配置中的 pause 版本更新到提示的新版本，然后重启 containerd 即可：</p>
+<pre><code class="language-bash">sed -i 's#pause:3.8#pause:3.10.1#' /etc/containerd/config.toml
+systemctl restart containerd
+</code></pre>
+<h3 id="12集群更新使用的版本格式问题">1.2.集群更新使用的版本格式问题</h3>
+<h4 id="问题原因-1">问题原因</h4>
+<p>升级时 <code>kubeadm upgrade apply</code> 所用版本不是 K8s 版本号</p>
+<h4 id="表现形式-1">表现形式</h4>
+<p>升级时提示版本无效</p>
+<pre><code class="language-bash"># kubeadm upgrade apply 1.33.13-1.1
+error execution phase preflight: the version argument is invalid due to these errors:
+        - Specified version to upgrade to "v1.33.13-1.1" is an unstable version
+          and such upgrades weren't allowed via setting the --allow-*-upgrades flags
+Can be bypassed if you pass the --force flag
+</code></pre>
+<h4 id="解决方式-1">解决方式</h4>
+<p><code>kubeadm upgrade apply</code> 所用的版本必须是 <strong>K8s 版本号</strong>（如 <code>1.33.13</code>），而不是 apt 包的 Ubuntu 格式（如 <code>1.33.13-1.1</code>）：</p>
+<pre><code class="language-bash"># kubeadm upgrade apply 1.33.13
+</code></pre>
+<h3 id="13集群配置中-controlplaneendpoint-与实际-bindport-不一致">1.3.集群配置中 controlPlaneEndpoint 与实际 bindPort 不一致</h3>
+<h4 id="问题原因-2">问题原因</h4>
+<p><strong>这个告警无需在意</strong>，它只是提示 <code>controlPlaneEndpoint</code> 覆盖了 <code>bindPort</code>。本集群用 HAProxy 做负载均衡，前端监听 <code>16443</code>，再转发给后端 kube-apiserver 的 <code>6443</code>，所以这个覆盖正是预期行为。</p>
+<h4 id="表现形式-2">表现形式</h4>
+<p>升级过程中 kubeadm upgrade 输出：</p>
+<pre><code class="language-text">WARNING: port specified in controlPlaneEndpoint overrides bindPort in the controlplane address
+</code></pre>
+<h4 id="解决方式-2">解决方式</h4>
+<p>符合预期即可，无需解决：</p>
+<pre><code class="language-bash"># ss -nltup | grep 6443
+tcp   LISTEN 0      2000         0.0.0.0:16443      0.0.0.0:*    users:(("haproxy",pid=1892947,fd=10))                  
+tcp   LISTEN 0      2000       127.0.0.1:16443      0.0.0.0:*    users:(("haproxy",pid=1892947,fd=11))                  
+tcp   LISTEN 0      16384              *:6443             *:*    users:(("kube-apiserver",pid=1697748,fd=4))
+
+
+# kubectl -n kube-system get cm kubeadm-config -o yaml | grep -i 'controlPlaneEndpoint'
+    controlPlaneEndpoint: 10.51.0.249:16443
+
+
+# cat /etc/haproxy/haproxy.cfg
+global
+  maxconn   2000
+  ulimit-n  16384
+  log       127.0.0.1  local0  err
+  stats     timeout    30s
+
+defaults
+  log      global
+  mode     http
+  option   httplog
+  timeout  connect         5000
+  timeout  client          50000
+  timeout  server          50000
+  timeout  http-request    15s
+  timeout  http-keep-alive 15s
+
+frontend monitor-in
+  bind         *:33305
+  mode         http
+  option       httplog
+  monitor-uri  /monitor
+
+frontend k8s-master
+  bind                       0.0.0.0:16443
+  bind                       127.0.0.1:16443
+  mode                       tcp
+  option                     tcplog
+  tcp-request inspect-delay  5s
+  default_backend            k8s-master
+
+backend k8s-master
+  mode            tcp
+  option          tcplog
+  option          tcp-check
+  balance         roundrobin
+  default-server  inter 10s   downinter         5s     rise  2  fall  2  slowstart  60s  maxconn  250  maxqueue  256  weight  100
+  server          x.x.x   x.x.x.x:6443  check
+  server          x.x.x   x.x.x.x:6443  check
+  server          x.x.x   x.x.x.x:6443  check
+</code></pre>
+<h3 id="14集群更新使用的-containerd-版本过旧">1.4.集群更新使用的 containerd 版本过旧</h3>
+<h4 id="问题原因-3">问题原因</h4>
+<p>使用的 containerd 版本较旧：K8s 1.36 版本后会删除 "从 kubelet 配置读 cgroupDriver" 这个老机制（fallback），<a href="https://kubernetes.io/blog/2025/09/12/kubernetes-v1-34-cri-cgroup-driver-lookup-now-ga/" target="_blank" rel="noopener nofollow">改用</a> CRI 的 <strong><a href="https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/#KubeletCgroupDriverFromCRI" target="_blank" rel="noopener nofollow">RuntimeConfig</a></strong> 方法从 containerd 直接探测。但当前 containerd 1.7 不支持这个新方法，所以出现警告。根据<a href="https://kubernetes.io/docs/setup/production-environment/container-runtimes/#systemd-cgroup-driver" target="_blank" rel="noopener nofollow">官网说明</a>，在 K8s 1.38 版本前完成 containerd 升级即可。</p>
+<h4 id="表现形式-3">表现形式</h4>
+<p>在 <code>v1.34.x</code> 升级到 <code>v1.35.x</code> 时，kubeadm 输出 <code>ContainerRuntimeVersion</code> 告警：</p>
+<pre><code class="language-bash"># kubeadm upgrade apply 1.35.6
+[upgrade/preflight] Running preflight checks
+        [WARNING ContainerRuntimeVersion]: You must update your container runtime to a version
+        that supports the CRI method RuntimeConfig. Falling back to using cgroupDriver from
+        kubelet config will be removed in 1.36. For more information, see
+        https://git.k8s.io/enhancements/keps/sig-node/4033-group-driver-detection-over-cri
+</code></pre>
+<h4 id="解决方式-3">解决方式</h4>
+<p>升级 containerd 版本即可</p>
+<h2 id="2containerd-问题处理">2.Containerd 问题处理</h2>
+<p>本次升级流程中，暂无 containerd 问题。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.011805555555555555" data-date-updated="2026-06-26 11:47">2026-06-26 11:30</span>&nbsp;
+<a href="https://www.cnblogs.com/manuscript">怎么还在写代码</a>&nbsp;
+阅读(<span id="post_view_count">103</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20830335);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmanuscript%2Fp%2F20830335&amp;targetId=20830335&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
