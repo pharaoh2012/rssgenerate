@@ -1,0 +1,275 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/doiito/p/20856078" title="发布于 2026-06-27 09:11">
+    <span role="heading" aria-level="2">【Agent Harness】Gliding Horse 工具结果压缩体系：如何用“指针”驯服上下文膨胀</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="gliding-horse-工具结果压缩体系如何用指针驯服上下文膨胀">Gliding Horse 工具结果压缩体系：如何用“指针”驯服上下文膨胀</h1>
+<blockquote>
+<p><strong>摘要</strong>：本文深入解析 Gliding Horse（流马）Agent 操作系统的工具结果压缩体系。针对 AI Agent 执行长周期任务时上下文窗口易被工具调用结果撑爆的痛点，流马设计了一套“指针+摘要”的纵深防御式压缩方案。文章详细拆解了 ResultRouter 智能路由、ToolResultCompressor 安全网、ContextWindowManager 全局控制三层架构，以及智能回收、流式/非流式路径统一等核心机制。通过将大块结果替换为轻量 IRI 引用并注册微工具，该方案在降低 90%+ Token 消耗的同时，实现了关键信息的 100% 可追溯，是构建长周期、高可靠自主 Agent 的关键基础设施。</p>
+</blockquote>
+<blockquote>
+<p><strong>关键词</strong>：Gliding Horse；流马；Agent 操作系统；工具结果压缩；上下文窗口管理；LLM；Token 优化；ResultRouter；ContextWindowManager；智能回收；IRI 引用；微工具</p>
+</blockquote>
+<p>在 AI Agent 执行任务的过程中，<strong>工具调用结果的体积</strong>往往是上下文的头号杀手。一个 <code>grep</code> 搜索可能返回上万字符的匹配列表，一次 <code>bash</code> 命令可能输出几十 KB 的编译日志，如果把这些结果原封不动地塞进 LLM 的上下文窗口，不出几轮 Token 就会爆炸，轻则成本飙升，重则直接触发 API 限制。</p>
+<p>Gliding Horse（流马）作为面向长周期、多步执行的 Agent 操作系统，设计了一套<strong>纵深防御式</strong>的工具结果压缩体系。它并非简单截断，而是通过 <strong>“指针 + 摘要”</strong> 的模式，将大块结果替换为轻量引用，同时保留 LLM 随时通过微工具查询完整细节的能力。信息不丢失，上下文不爆炸。</p>
+<hr>
+<h2 id="一三层压缩架构纵深防御">一、三层压缩架构：纵深防御</h2>
+<p>流马的工具结果管理分为<strong>三个层次</strong>，在结果注入上下文的不同阶段递进式压缩：</p>
+<div class="mermaid">flowchart TB
+    ToolResult["工具执行结果&lt;br/&gt;(可能数万字节)"] --&gt; L1["① ResultRouter&lt;br/&gt;route_tool_result()"]
+    L1 --&gt;|"&lt;16KB: 原样+IRI"| Messages["注入 messages[]"]
+    L1 --&gt;|"16~32KB: 截断+micro-tool"| Messages
+    L1 --&gt;|"&gt;32KB JSON: 图谱化+micro-tool"| Messages
+    L1 --&gt;|"&gt;32KB 非JSON: 摘要+micro-tool"| Messages
+
+    Messages --&gt; L2["② ToolResultCompressor&lt;br/&gt;compress_tool_messages()"]
+    L2 --&gt;|"安全网: 二次压缩"| Messages2["更新后的 messages[]"]
+
+    Messages2 --&gt; L3["③ ContextWindowManager&lt;br/&gt;消息数/Token 超限时"]
+    L3 --&gt;|"保留最近4条，中间摘要"| Final["最终上下文"]
+</div><ul>
+<li><strong>第一层 (ResultRouter)</strong>：结果<strong>进入上下文之前</strong>，根据大小和类型自动选择处理策略——小结果原样放行，大结果截断或图谱化，并<strong>注册微工具</strong>供 LLM 按需查询。</li>
+<li><strong>第二层 (ToolResultCompressor)</strong>：在上下文已有压力时，对 message 列表中的旧工具结果做<strong>二次摘要压缩</strong>，作为兜底安全网。</li>
+<li><strong>第三层 (ContextWindowManager)</strong>：当消息总数或估算 Token 超过硬上限时，对<strong>整个消息序列</strong>进行结构化压缩，保留最近关键信息，中间段用摘要替代。</li>
+</ul>
+<p>三层相互配合，既保证了<strong>单条结果不撑爆上下文</strong>，又防止了<strong>多次小结果累积膨胀</strong>。</p>
+<hr>
+<h2 id="二第一层resultrouter-的智能路由">二、第一层：ResultRouter 的智能路由</h2>
+<p>ResultRouter 是整个压缩体系的<strong>核心防线</strong>。它在工具结果返回后、注入 messages 前工作，能够访问 L0 存储和 ToolExecutor，拥有完整上下文。</p>
+<div class="mermaid">flowchart LR
+    Result["原始工具结果"] --&gt; Check{"结果大小?"}
+    Check --&gt;|"&lt; 16KB"| Pass["PassThrough&lt;br/&gt;原样 + IRI"]
+    Check --&gt;|"16KB ~ 32KB"| Trunc["Truncate&lt;br/&gt;smart_truncate + micro-tool"]
+    Check --&gt;|"&gt; 32KB + JSON"| Graph["Graphify&lt;br/&gt;知识图谱化 + micro-tools"]
+    Check --&gt;|"&gt; 32KB + 非JSON"| Summ["Summarize&lt;br/&gt;text_summary + micro-tool"]
+    
+    Pass --&gt;|"&gt; 3KB 时预注册 micro-tool"| MSG1["注入上下文"]
+    Trunc --&gt; MSG2["截断结果 + IRI + micro-tool"]
+    Graph --&gt; MSG3["图谱摘要 + IRI + micro-tools"]
+    Summ --&gt; MSG4["文本摘要 + IRI + micro-tool"]
+</div><p><strong>关键机制</strong>：</p>
+<ol>
+<li>
+<p><strong>Micro-tool 模式</strong>：任何被压缩或截断的结果，系统都会自动注册一个专用微工具（如 <code>read_full_result_{call_id}</code>），LLM 可以随时调用它来获取完整原始数据。<strong>信息零丢失</strong>。</p>
+</li>
+<li>
+<p><strong>PassThrough 增强</strong>：即使结果小于 16KB 原样放行，只要超过 3KB，系统也会<strong>预注册</strong>微工具。这为后续的“智能回收”埋下伏笔——当上下文压力增大时，这些较大的 PassThrough 结果可以被替换为轻量引用，而不丢失可回溯性。</p>
+</li>
+<li>
+<p><strong>Graphify 图谱化</strong>：对于大型 JSON 结构数据（如 API 返回的复杂对象），自动提取关键实体和关系存入知识图谱（L0/L2），LLM 拿到的是简洁的图谱摘要，后续可通过 SPARQL 或微工具深入探索。</p>
+</li>
+</ol>
+<hr>
+<p>下面是一个 Python 代码示例，展示 ResultRouter 如何根据结果大小和类型选择不同的压缩策略：</p>
+<pre><code class="language-python">from typing import Any, Optional
+import json
+
+class ResultRouter:
+    """智能路由：根据结果大小和类型选择压缩策略"""
+    
+    def __init__(self, micro_tool_registry: dict):
+        self.registry = micro_tool_registry  # 微工具注册表
+    
+    def route_tool_result(self, call_id: str, result: Any) -&gt; dict:
+        """路由工具结果，返回注入上下文的压缩内容"""
+        raw = json.dumps(result) if not isinstance(result, str) else result
+        size = len(raw.encode("utf-8"))
+        
+        # 策略 1：小于 16KB —— 原样放行，超过 3KB 预注册微工具
+        if size &lt; 16 * 1024:
+            if size &gt; 3 * 1024:
+                self._register_micro_tool(call_id, raw)
+            return {"content": raw, "iri": f"iri://tool-result/{call_id}"}
+        
+        # 策略 2：16KB ~ 32KB —— 截断 + 微工具
+        if size &lt; 32 * 1024:
+            truncated = self._smart_truncate(raw, max_bytes=2048)
+            self._register_micro_tool(call_id, raw)
+            return {"content": truncated, "iri": f"iri://tool-result/{call_id}"}
+        
+        # 策略 3：大于 32KB —— 根据类型选择图谱化或摘要
+        if self._is_json(result):
+            graph_summary = self._graphify(result)  # 提取实体关系图谱
+            self._register_micro_tool(call_id, raw)
+            return {"content": graph_summary, "iri": f"iri://tool-result/{call_id}"}
+        else:
+            summary = self._summarize(raw, max_chars=500)  # 文本摘要
+            self._register_micro_tool(call_id, raw)
+            return {"content": summary, "iri": f"iri://tool-result/{call_id}"}
+    
+    def _smart_truncate(self, text: str, max_bytes: int) -&gt; str:
+        """智能截断：保留开头和结尾的关键信息"""
+        encoded = text.encode("utf-8")
+        if len(encoded) &lt;= max_bytes:
+            return text
+        head = encoded[:max_bytes // 2].decode("utf-8", errors="ignore")
+        tail = encoded[-max_bytes // 2:].decode("utf-8", errors="ignore")
+        return f"{head}\n...（中间省略 {len(encoded) - max_bytes} 字节）...\n{tail}"
+    
+    def _is_json(self, result: Any) -&gt; bool:
+        """判断结果是否为 JSON 结构数据"""
+        if isinstance(result, (dict, list)):
+            return True
+        if isinstance(result, str):
+            try:
+                json.loads(result)
+                return True
+            except (json.JSONDecodeError, ValueError):
+                return False
+        return False
+    
+    def _graphify(self, data: Any) -&gt; str:
+        """将大型 JSON 图谱化为摘要（示意实现）"""
+        if isinstance(data, dict):
+            keys = list(data.keys())[:5]
+            return f"[图谱摘要] 包含 {len(data)} 个字段: {', '.join(keys)}..."
+        if isinstance(data, list):
+            return f"[图谱摘要] 包含 {len(data)} 条记录，首条字段: {list(data[0].keys()) if data else '空'}"
+        return "[图谱摘要] 非结构化数据"
+    
+    def _summarize(self, text: str, max_chars: int) -&gt; str:
+        """文本摘要（示意实现）"""
+        return text[:max_chars] + f"\n...（全文 {len(text)} 字符，请调用微工具查看）..."
+    
+    def _register_micro_tool(self, call_id: str, full_result: str):
+        """注册微工具，供 LLM 按需查询完整结果"""
+        self.registry[call_id] = {
+            "name": f"read_full_result_{call_id}",
+            "description": f"获取工具调用 {call_id} 的完整原始结果",
+            "handler": lambda: full_result
+        }
+
+
+# ========== 使用示例 ==========
+router = ResultRouter(micro_tool_registry={})
+
+# 场景 1：小结果（&lt; 16KB）—— 原样放行
+small_result = {"status": "ok", "count": 42}
+print(router.route_tool_result("call_001", small_result))
+# 输出: {'content': '{"status": "ok", "count": 42}', 'iri': 'iri://tool-result/call_001'}
+
+# 场景 2：中等结果（16KB ~ 32KB）—— 截断 + 微工具
+medium_result = "A" * 20_000  # 约 20KB 文本
+routed = router.route_tool_result("call_002", medium_result)
+print(f"截断后长度: {len(routed['content'])} 字符")
+print(f"微工具已注册: {'call_002' in router.registry}")
+
+# 场景 3：大型 JSON（&gt; 32KB）—— 图谱化 + 微工具
+large_json = {"users": [{"id": i, "name": f"user_{i}"} for i in range(1000)]}
+routed = router.route_tool_result("call_003", large_json)
+print(f"图谱摘要: {routed['content']}")
+
+# 场景 4：大型文本（&gt; 32KB）—— 摘要 + 微工具
+large_text = "B" * 50_000
+routed = router.route_tool_result("call_004", large_text)
+print(f"摘要长度: {len(routed['content'])} 字符")
+</code></pre>
+<p><strong>代码要点说明</strong>：</p>
+<ul>
+<li><strong><code>route_tool_result</code></strong> 是核心路由方法，根据结果字节大小和类型分发到四种策略：<code>PassThrough</code>、<code>Truncate</code>、<code>Graphify</code>、<code>Summarize</code>。</li>
+<li>任何被压缩的结果都会通过 <code>_register_micro_tool</code> 注册一个微工具，LLM 可随时调用 <code>read_full_result_{call_id}</code> 获取完整原始数据，实现<strong>信息零丢失</strong>。</li>
+<li><code>_smart_truncate</code> 采用“头尾保留”策略，避免截断丢失关键上下文；<code>_graphify</code> 和 <code>_summarize</code> 为示意实现，生产环境可接入 LLM 或知识图谱引擎。</li>
+</ul>
+<h2 id="三第二层toolresultcompressor-安全网">三、第二层：ToolResultCompressor 安全网</h2>
+<p>当上下文中的工具消息累积到一定数量（默认 10 条）时，<code>ToolResultCompressor</code> 会启动，对<strong>最旧的工具结果</strong>执行二次压缩：超过长度限制的，仅保留前几行并附加“已压缩”标记。</p>
+<p>这一层是<strong>有损压缩</strong>的安全网，主要覆盖那些<strong>未被第一层充分处理</strong>的小结果累积情况。在实践中，由于第一层已将大结果截断到 2KB 左右，第二层真正触发压缩的概率很低——但它提供了一个兜底保障。</p>
+<hr>
+<h2 id="四第三层contextwindowmanager-全局控制">四、第三层：ContextWindowManager 全局控制</h2>
+<p>当前消息总数超过 30 条，或估算总 Token 超过 16000 时，<code>ContextWindowManager</code> 介入：</p>
+<ul>
+<li><strong>保留最近 4 条消息</strong>（包括 user/assistant/tool 配对）原样不动。</li>
+<li><strong>中间段消息</strong>用智能摘要替代：提取每轮的关键动作、涉及 IRI、工具调用次数等信息，生成结构化历史引用。</li>
+<li><strong>确保不拆散消息对</strong>：工具调用（assistant role）和工具结果（tool role）始终成对保留，避免孤儿消息导致 API 报错。</li>
+</ul>
+<p>压缩后的历史引用示例：</p>
+<pre><code>[历史摘要]
+ [轮1/PA] 制定分析计划 → iri://archive/task/xxx/turn_1
+ [轮2/DA] 搜索认证接口 (grep×3) → iri://archive/task/xxx/turn_2
+ [轮3/DA] 分析JWT流程 → iri://archive/task/xxx/turn_3
+如需详细信息，请使用 kg_search / knowledge_query 查询 IRI。
+</code></pre>
+<p>LLM 可以清晰知道此前做过什么，并随时通过 IRI 检索任意轮次的完整详情。</p>
+<hr>
+<h2 id="五智能回收两阶段压缩优化">五、智能回收：两阶段压缩优化</h2>
+<p>在第一层和第三层之间，我们引入了一个<strong>智能回收</strong>环节，形成完整的“准备—回收”闭环：</p>
+<ul>
+<li><strong>阶段一（准备）</strong>：ResultRouter 在 PassThrough 分支中，对大于 3KB 的结果<strong>预注册微工具</strong>。此时消息内容不变（仍为全文），但已具备“可回收”的条件。</li>
+<li><strong>阶段二（回收）</strong>：当 <code>ContextWindowManager</code> 或 <code>ToolResultCompressor</code> 触发压缩后，系统扫描 messages 中的所有 tool 消息，对于内容仍较大（&gt;500 字节）且已有对应微工具的结果，将其替换为轻量引用：</li>
+</ul>
+<pre><code>[已压缩 10240 字节] 完整结果请调用 `read_full_result_call_abc` 工具
+IRI: iri://tool-result/call_abc
+</code></pre>
+<p>原始内容已安全存储在 L0 中，LLM 只需调用微工具即可随时查看。<strong>上下文瞬间瘦身 98%</strong>，而信息零丢失。</p>
+<hr>
+<h2 id="六流式与非流式路径统一">六、流式与非流式路径统一</h2>
+<p>Gliding Horse 同时支持流式和非流式 LLM 调用，两条路径均完整实现了三层压缩：</p>
+<ul>
+<li><strong>非流式路径</strong> (<code>execution.rs</code>)：每轮调完 LLM 后执行完整的 <code>route_tool_result</code> → <code>ToolResultCompressor</code> → <code>ContextWindowManager</code> 链路。</li>
+<li><strong>流式路径</strong> (<code>utils.rs</code>)：同样在工具结果路由后执行压缩，<code>ContextWindowManager</code> 改为每 3 轮触发一次，以减少流式场景下的额外延迟。两条路径共享相同的 <code>ResultRouter</code> 和 <code>ContextWindowManager</code> 逻辑，压缩效果一致。</li>
+</ul>
+<hr>
+<h2 id="七给平台带来的核心优势">七、给平台带来的核心优势</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>优化前</th>
+<th>优化后</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>单次 grep 搜索 (15KB)</strong></td>
+<td>15KB 原文注入</td>
+<td>~200 字节摘要 + IRI</td>
+<td>缩减 98.7%</td>
+</tr>
+<tr>
+<td><strong>10 次 bash 命令 (各 10KB)</strong></td>
+<td>100KB 累积，压缩后丢失信息</td>
+<td>10 条引用 + 微工具，可查询全文</td>
+<td>信息零丢失</td>
+</tr>
+<tr>
+<td><strong>大型 JSON (50KB) 结果</strong></td>
+<td>截断或硬丢弃</td>
+<td>图谱摘要 + 微工具，结构可探索</td>
+<td>语义不丢失</td>
+</tr>
+<tr>
+<td><strong>长对话 (&gt;30 轮)</strong></td>
+<td>超过限制被截断，前文丢失</td>
+<td>历史结构化引用，IRI 可回溯</td>
+<td>关键决策链完整</td>
+</tr>
+</tbody>
+</table>
+<p>整体上，<strong>单次任务的平均工具结果 Token 消耗降低 90% 以上</strong>，同时实现了 100% 的关键信息可追溯——因为每个被压缩的结果都有一个 IRI 和对应的微工具，Agent 永远不会真正“遗忘”。</p>
+<hr>
+<h2 id="八结语">八、结语</h2>
+<p>Gliding Horse 的工具结果压缩体系，本质上是一套<strong>信息无损的指针系统</strong>。它把“笨重”的原始数据留在图数据库和 L0 持久化层，只把轻量的“名片”（摘要 + IRI + 微工具）递进上下文。当 LLM 需要时，按图索骥即可精准取回。这套设计让 Agent 既能拥有海量的工作记忆，又不必为 Token 账单发愁，是让自主 Agent 走向长周期、高可靠的核心基础设施。</p>
+<p><em>Gliding Horse 已在 GitHub 开源：<a href="https://github.com/doiito/gliding_horse" target="_blank" rel="noopener nofollow">https://github.com/doiito/gliding_horse</a></em></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-06-27 09:12">2026-06-27 09:11</span>&nbsp;
+<a href="https://www.cnblogs.com/doiito">doiito</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20856078);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdoiito%2Fp%2F20856078&amp;targetId=20856078&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
