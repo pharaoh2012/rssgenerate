@@ -1,0 +1,581 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shanyou/p/20884135" title="发布于 2026-06-28 08:55">
+    <span role="heading" aria-level="2">将 Rust 绑定到 .NET 10：Oxigraph 的 FFI 桥接实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文采用的方案——JSON over raw C strings + 不透明指针句柄 + GCHandle 固定的回调——在保持代码简洁的同时，提供了完整的跨语言互操作能力
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>本文详细介绍了如何将 <a href="https://github.com/oxigraph/oxigraph" target="_blank" rel="noopener nofollow">Oxigraph</a>（一个用 Rust 编写的高性能图数据库）通过 FFI 桥接的方式绑定到 .NET 10，覆盖工具链设计、数据协议、内存管理、回调机制和构建流水线的完整过程。</p>
+<h2 id="一架构概览">一、架构概览</h2>
+<pre><code>┌──────────────────────────────────────────────────────────┐
+│  .NET 应用层                                              │
+│  ┌──────────┐  ┌────────────────┐  ┌──────────────────┐  │
+│  │  Model   │  │     Store      │  │  CustomFunctions │  │
+│  │ (record) │  │  (SPARQL+I/O)  │  │  (C#→Rust 回调)  │  │
+│  └────┬─────┘  └───────┬────────┘  └────────┬─────────┘  │
+│       │                │                    │             │
+│  ┌────┴────────────────┴────────────────────┴─────────┐  │
+│  │              Interop 层 (FFI/Json)                  │  │
+│  │  NativeMethods.g.cs  │  SafeHandles  │  FFIHelper   │  │
+│  │  StreamInterop.cs    │  Term JSON Converters        │  │
+│  └──────────────────────┬──────────────────────────────┘  │
+└─────────────────────────┼─────────────────────────────────┘
+                          │ P/Invoke + JSON 字符串
+┌─────────────────────────┼─────────────────────────────────┐
+│  oxigraph_dotnet.dll    │  (Rust cdylib)                   │
+│  ┌──────────────────────┴──────────────────────────────┐  │
+│  │  ffi.rs (~2774 行)                                  │  │
+│  │  ├─ Store CRUD/Match/SPARQL                         │  │
+│  │  ├─ File/Stream/Callback I/O                        │  │
+│  │  ├─ Lazy Query Iterator                             │  │
+│  │  ├─ Chunked Bulk Loader                             │  │
+│  │  ├─ QueryResults Serialization                      │  │
+│  │  ├─ Dataset (In-Memory) + Canonicalization          │  │
+│  │  └─ Custom Functions / Aggregate                    │  │
+│  ├─ stream_ffi.rs: CallbackReader / CallbackWriter     │  │
+│  ├─ error.rs:     {"ok":...} / {"error":...} 协议      │  │
+│  └─ model_ffi.rs: JSON↔Quad 序列化                     │  │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  oxigraph + oxrdf (Rust crate) + RocksDB            │  │
+│  └─────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+</code></pre>
+<p>核心设计原则：<strong>零复制复杂数据类型，全量 JSON 序列化跨 FFI 边界</strong>。Rust 侧所有函数签名遵循统一模式：<code>(*const c_char) → *mut c_char</code>，输入和输出都是 JSON 字符串。</p>
+<h2 id="二工具链">二、工具链</h2>
+<h3 id="21-rust-侧cdylib">2.1 Rust 侧：cdylib</h3>
+<p><code>dotnet/src/oxigraph-dotnet/Cargo.toml</code>：</p>
+<pre><code class="language-toml">[package]
+name = "oxigraph-dotnet"
+version = "0.5.7"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]   # ← 编译为动态链接库
+
+[dependencies]
+oxigraph = { path = "../../../lib/oxigraph" }
+oxrdf = { path = "../../../lib/oxrdf", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"            # 体积优化（减小 .dll 尺寸）
+lto = true                 # 链接时优化
+</code></pre>
+<p>产物：</p>
+<ul>
+<li>Windows: <code>oxigraph_dotnet.dll</code></li>
+<li>Linux: <code>liboxigraph_dotnet.so</code></li>
+<li>macOS: <code>liboxigraph_dotnet.dylib</code></li>
+</ul>
+<h3 id="22-net-侧libraryimport-生成源">2.2 .NET 侧：<code>LibraryImport</code> 生成源</h3>
+<p>.NET 10 使用源生成器 <code>LibraryImport</code>（取代旧的 <code>DllImport</code>）进行 P/Invoke：</p>
+<pre><code class="language-csharp">// NativeMethods.g.cs — 自动生成的 FFI 绑定
+internal static partial class OxigraphNative
+{
+    private const string LibName = "oxigraph_dotnet";
+
+    [LibraryImport(LibName, EntryPoint = "oxigraph_store_open",
+                   StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr store_open(string path);
+
+    [LibraryImport(LibName, EntryPoint = "oxigraph_store_query",
+                   StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr store_query(IntPtr handle, string queryJson);
+
+    [LibraryImport(LibName, EntryPoint = "oxigraph_register_custom_function",
+                   StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr register_custom_function(
+        string name, IntPtr callback);
+    // ... 共 60+ 个 FFI 函数
+}
+</code></pre>
+<p>关键差异：<code>LibraryImport</code> 是源生成器模式，编译时生成封送代码，避免了 <code>DllImport</code> 的运行时 IL 生成和 AOT 兼容问题。</p>
+<h3 id="23-构建流水线">2.3 构建流水线</h3>
+<p><code>build_package.py</code> 编排整个构建过程：</p>
+<pre><code class="language-python"># 步骤 1: 编译 Rust cdylib
+cargo build --release -p oxigraph-dotnet --features rocksdb
+
+# 步骤 2: 编译 C# 项目
+dotnet build dotnet/ -c Release
+
+# 步骤 3: 将 .dll 拷贝到测试输出目录
+# 步骤 4: 运行 xUnit 测试
+dotnet test dotnet/tests/Oxigraph.Tests -c Release
+</code></pre>
+<h2 id="三数据协议json-over-ffi">三、数据协议：JSON over FFI</h2>
+<h3 id="31-统一响应格式">3.1 统一响应格式</h3>
+<p>所有 Rust FFI 函数返回 <code>*mut c_char</code>（JSON 字符串），包含两种可能的格式：</p>
+<pre><code class="language-json">{"ok": &lt;result&gt;}
+// 或
+{"error": {"kind": "store"|"parse"|"invalid_argument", "message": "..."}}
+</code></pre>
+<p>C# 侧 <code>FFIHelper</code> 统一处理：</p>
+<pre><code class="language-csharp">// 带返回值的调用
+internal static T Call&lt;T&gt;(Func&lt;IntPtr&gt; ffiCall) where T : class
+{
+    IntPtr jsonPtr = ffiCall();
+    string json = ReadAndFree(jsonPtr);  // Marshal.PtrToStringUTF8 + free_string
+    ThrowIfError(json);                  // 检查 {"error":...}
+    using var doc = JsonDocument.Parse(json);
+    return JsonSerializer.Deserialize&lt;T&gt;(
+        doc.RootElement.GetProperty("ok").GetRawText())!;
+}
+
+// 无返回值的调用
+internal static void CallVoid(Func&lt;IntPtr&gt; ffiCall)
+{
+    IntPtr jsonPtr = ffiCall();
+    string json = ReadAndFree(jsonPtr);
+    ThrowIfError(json);
+}
+</code></pre>
+<h3 id="32-错误映射">3.2 错误映射</h3>
+<p>Rust 错误类型自动映射为 C# 异常：</p>
+<pre><code class="language-csharp">private static Exception MapError(string kind, string message)
+{
+    return kind switch
+    {
+        "store"             =&gt; new StoreException(message),
+        "parse"             =&gt; new ParseException(message),
+        "invalid_argument"  =&gt; new ArgumentException(message),
+        _                   =&gt; new OxigraphException($"[{kind}] {message}"),
+    };
+}
+</code></pre>
+<h3 id="33-不透明句柄opaque-handles">3.3 不透明句柄（Opaque Handles）</h3>
+<p>Rust 对象不直接暴露给 C#，而是通过指针传递：</p>
+<pre><code class="language-rust">// Rust 侧：Store 包装为 Box&lt;UnsafeCell&lt;Store&gt;&gt;，返回指针的 u64 表示
+fn store_to_handle(store: Store) -&gt; *mut c_char {
+    let boxed = Box::new(UnsafeCell::new(store));
+    let ptr = Box::into_raw(boxed);
+    let handle_value = ptr as u64;
+    // 返回 {"ok":{"handle":12345678}}
+    ok_json(&amp;handle_value)
+}
+</code></pre>
+<pre><code class="language-csharp">// C# 侧：SafeHandle 封装原始指针，确保析构
+internal sealed class StoreSafeHandle : SafeHandleZeroOrMinusOneIsInvalid
+{
+    protected override bool ReleaseHandle()
+    {
+        OxigraphNative.store_destroy(handle);  // Rust 侧 drop(Box::from_raw(ptr))
+        return true;
+    }
+}
+</code></pre>
+<p>所有句柄类型：</p>
+<table>
+<thead>
+<tr>
+<th>Rust 类型</th>
+<th>C# SafeHandle</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>StoreHandle</code> = <code>*mut UnsafeCell&lt;Store&gt;</code></td>
+<td><code>StoreSafeHandle</code></td>
+<td>Store 读写</td>
+</tr>
+<tr>
+<td><code>DatasetHandle</code> = <code>*mut UnsafeCell&lt;Dataset&gt;</code></td>
+<td><code>DatasetSafeHandle</code></td>
+<td>Dataset</td>
+</tr>
+<tr>
+<td><code>QuadIterHandle</code> = <code>*mut UnsafeCell&lt;ReaderQuadParser&gt;</code></td>
+<td><code>QuadIterSafeHandle</code></td>
+<td>懒解析迭代器</td>
+</tr>
+<tr>
+<td><code>QueryResultsHandle</code> = <code>*mut QueryResultsWrapper</code></td>
+<td><code>QueryResultsSafeHandle</code></td>
+<td>流式查询结果</td>
+</tr>
+</tbody>
+</table>
+<h2 id="四stream-回调机制">四、Stream 回调机制</h2>
+<p>对于 .NET Stream 的读写（<code>LoadFromStream</code> / <code>DumpToStream</code>），无法简单地把 Stream<br>
+传过去，因为 Rust 不认识 .NET 的 <code>Stream</code> 类型。解决方案：<strong>C 风格回调</strong>。</p>
+<h3 id="41-rust-侧实现-read--write-trait">4.1 Rust 侧：实现 <code>Read</code> / <code>Write</code> trait</h3>
+<pre><code class="language-rust">pub type ReadFn = unsafe extern "C" fn(
+    context: *mut c_void, buf: *mut u8, buf_size: i32
+) -&gt; i32;
+
+pub struct CallbackReader {
+    context: *mut c_void,
+    callback: ReadFn,
+}
+
+impl Read for CallbackReader {
+    fn read(&amp;mut self, buf: &amp;mut [u8]) -&gt; io::Result&lt;usize&gt; {
+        let result = unsafe {
+            (self.callback)(self.context, buf.as_mut_ptr(), buf.len() as i32)
+        };
+        match result {
+            n if n &gt; 0 =&gt; Ok(n as usize),
+            0 =&gt; Ok(0),      // EOF
+            -1 =&gt; Err(...),  // Error
+        }
+    }
+}
+</code></pre>
+<p><code>CallbackWriter</code> 对 <code>Write</code> trait 实现类似。</p>
+<h3 id="42-c-侧gchandle-固定的委托">4.2 C# 侧：GCHandle 固定的委托</h3>
+<pre><code class="language-csharp">[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+internal delegate int ReadCallback(IntPtr context, IntPtr buffer, int bufferSize);
+
+internal sealed class ReadContext : IDisposable
+{
+    private readonly Stream _stream;
+    private readonly byte[] _buffer;
+    private readonly GCHandle _gcHandle;  // ← 防止 GC 回收委托
+
+    public readonly IntPtr ContextPtr;
+    public readonly ReadCallback Callback;
+
+    public ReadContext(Stream stream)
+    {
+        _stream = stream;
+        Callback = ReadImpl;
+        _gcHandle = GCHandle.Alloc(Callback);  // 固定委托
+        ContextPtr = (IntPtr)_gcHandle;        // 作为 context 传递
+    }
+
+    private int ReadImpl(IntPtr context, IntPtr buffer, int bufferSize)
+    {
+        try
+        {
+            int read = _stream.Read(_buffer, 0, Math.Min(bufferSize, _buffer.Length));
+            Marshal.Copy(_buffer, 0, buffer, read);
+            return read;
+        }
+        catch { return -1; }
+    }
+
+    public void Dispose() { _gcHandle.Free(); }
+}
+</code></pre>
+<p>调用链：<code>C# Stream.Read()</code> → 拷贝到 Rust buffer → Rust <code>Read</code> trait → <code>RdfParser.for_reader()</code></p>
+<h2 id="五自定义函数回调桥">五、自定义函数回调桥</h2>
+<p>SPARQL 自定义函数需要 Rust 在执行查询时回调到 C#。这是最复杂的 FFI 场景：<strong>Rust 调用 C#，C# 再把结果返回给 Rust。</strong></p>
+<h3 id="51-简单自定义函数">5.1 简单自定义函数</h3>
+<pre><code class="language-rust">// Rust 侧：函数指针类型
+type CustomFnCallback = unsafe extern "C" fn(args_json: *const c_char) -&gt; *mut c_char;
+
+// 全局注册表
+static CUSTOM_FUNCTIONS: LazyLock&lt;Mutex&lt;HashMap&lt;String, CustomFnCallback&gt;&gt;&gt; = ...;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn oxigraph_register_custom_function(
+    name: *const c_char,
+    callback: CustomFnCallback,  // C# 函数的指针
+) -&gt; *mut c_char {
+    CUSTOM_FUNCTIONS.lock().unwrap().insert(name_str, callback);
+    ok_json(&amp;"registered")
+}
+</code></pre>
+<p>Rust 收到 <code>callback</code> 后，在 SPARQL 评估时调用它：</p>
+<pre><code>Rust SPARQL evaluator → 遇到 my:func(?x)
+→ 查找 CUSTOM_FUNCTIONS["http://example.com/myFunc"]
+→ 调用 callback(args_json)  // ← 跨 FFI 边界回调到 C#
+→ 收到返回的 result_json
+→ 继续 SPARQL 评估
+</code></pre>
+<p>C# 侧：</p>
+<pre><code class="language-csharp">// BridgeDelegate：接收 JSON 参数数组，返回 JSON Term
+private delegate IntPtr BridgeDelegate(IntPtr argsJsonPtr);
+
+private static IntPtr BridgeImpl(IntPtr argsJsonPtr)
+{
+    var json = Marshal.PtrToStringUTF8(argsJsonPtr);
+    // json: ["http://example.com/myFunc", {"type":"literal","value":"hello"}]
+
+    using var doc = JsonDocument.Parse(json);
+    var name = doc.RootElement[0].GetString();
+    // 解析剩余元素为 ITerm[]
+    var terms = ...;
+    // 调用 .NET 函数
+    var result = _functions[name](terms);
+    // 序列化结果返回给 Rust
+    return Marshal.StringToHGlobalAnsi(JsonSerializer.Serialize(result));
+}
+
+// 固定 BridgeDelegate，防止 GC 回收
+private static readonly GCHandle _gcHandle = GCHandle.Alloc(_bridge);
+private static readonly IntPtr _bridgePtr =
+    Marshal.GetFunctionPointerForDelegate(_bridge);
+</code></pre>
+<h3 id="52-自定义聚合函数">5.2 自定义聚合函数</h3>
+<p>聚合函数需要更复杂的 4 回调协议：</p>
+<pre><code>Rust 调用:
+  new_fn()     → 返回 ctx handle（GCHandle 包装的 C# 对象）
+  acc_fn(ctx, term_json)  → 每行数据调用一次
+  finish_fn(ctx) → 返回聚合结果
+  free_fn(ctx) → 释放 C# 对象
+</code></pre>
+<pre><code class="language-rust">// Rust 适配器：实现 oxigraph::sparql::AggregateFunctionAccumulator
+struct CallbackAggregateAccumulator {
+    ctx: *mut c_void,
+    acc_fn: AggregateAccCallback,
+    finish_fn: AggregateFinishCallback,
+    free_fn: AggregateFreeCallback,
+}
+
+impl AggregateFunctionAccumulator for CallbackAggregateAccumulator {
+    fn accumulate(&amp;mut self, element: Term) {
+        let json = serde_json::to_string(&amp;element).unwrap();
+        let c_str = CString::new(json).unwrap();
+        unsafe { (self.acc_fn)(self.ctx, c_str.as_ptr()) };
+    }
+
+    fn finish(&amp;mut self) -&gt; Option&lt;Term&gt; {
+        let ptr = unsafe { (self.finish_fn)(self.ctx) };
+        // 解析 C# 返回的 JSON Term 或 null
+        if ptr.is_null() { return None; }
+        let json = unsafe { c_str_to_str(ptr) };
+        serde_json::from_str(json).unwrap_or(None)
+    }
+}
+</code></pre>
+<h2 id="六rdf-数据类型的-json-序列化">六、RDF 数据类型的 JSON 序列化</h2>
+<p>Rust 的 serde 格式直接映射到 C# 的 <code>System.Text.Json</code>。两端使用相同的tagged-enum JSON 模式：</p>
+<pre><code class="language-json">// NamedNode
+{"type": "uri",     "value": "http://example.com/s"}
+
+// BlankNode
+{"type": "bnode",   "value": "b1_abc123"}
+
+// Literal (plain)
+{"type": "literal", "value": "hello"}
+
+// Literal (language-tagged)
+{"type": "literal", "value": "bonjour", "language": "fr"}
+
+// Literal (typed)
+{"type": "literal", "value": "42",
+ "datatype": {"type":"uri","value":"http://www.w3.org/2001/XMLSchema#integer"}}
+
+// Triple (RDF-star)
+{"type": "triple",
+ "subject":   {"type":"uri","value":"http://s"},
+ "predicate": {"type":"uri","value":"http://p"},
+ "object":    {"type":"uri","value":"http://o"}}
+
+// DefaultGraph
+{"type": "default"}
+</code></pre>
+<p>C# 侧自定义 Converter：</p>
+<pre><code class="language-csharp">public class TermConverter : JsonConverter&lt;ITerm&gt;
+{
+    public override ITerm? Read(ref Utf8JsonReader reader, ...)
+    {
+        using var doc = JsonDocument.ParseValue(ref reader);
+        var kind = doc.RootElement.GetProperty("type").GetString();
+        return kind switch
+        {
+            "uri"     =&gt; new NamedNode(doc.RootElement.GetProperty("value").GetString()!),
+            "bnode"   =&gt; new BlankNode(doc.RootElement.GetProperty("value").GetString()!),
+            "literal" =&gt; /* 解析 value/language/datatype/direction */,
+            "triple"  =&gt; JsonSerializer.Deserialize&lt;Triple&gt;(root.GetRawText())!,
+            _ =&gt; throw new JsonException($"Unknown term type: {kind}")
+        };
+    }
+}
+</code></pre>
+<p>通过这种 JSON 约定，C# 的 <code>record</code> 类型与 Rust 的 serde 序列化保持了精确对应，无需额外的中间表示层。</p>
+<h2 id="七流式查询结果懒迭代器">七、流式查询结果：懒迭代器</h2>
+<p>SPARQL 查询可能返回百万级结果。为避免将全部结果物化到一个 JSON 数组中，实现了流式迭代器：</p>
+<pre><code class="language-rust">// oxigraph_store_query_iter：返回不透明句柄，不包含结果数据
+pub extern "C" fn oxigraph_store_query_iter(
+    handle: StoreHandle,
+    query_json: *const c_char,
+) -&gt; *mut c_char {
+    // ... 执行查询，获取 QueryResults
+    // 包装为 QueryResultsWrapper 枚举
+    // 返回 {"ok":{"handle":...}}  — 不包含任何数据行
+}
+
+// 每次取一行
+pub extern "C" fn oxigraph_query_iter_next_solution(
+    handle: QueryResultsHandle
+) -&gt; *mut c_char {
+    // 调用 iter.next()，返回单行 JSON 或 null
+}
+</code></pre>
+<p>C# 侧 <code>LazySolutionList</code>：按需向 Rust 请求下一行，支持 <code>IReadOnlyList&lt;T&gt;</code> 接口：</p>
+<pre><code class="language-csharp">private void MaterializeUpTo(int required)
+{
+    while (_materialized.Count &lt; required)
+    {
+        var ptr = OxigraphNative.query_iter_next_solution(_handle);
+        var json = Marshal.PtrToStringUTF8(ptr) ?? "null";
+        OxigraphNative.free_string(ptr);
+
+        if (okVal is null) { _count = _materialized.Count; return; }
+        _materialized.Add(new QuerySolution(okVal));
+    }
+}
+</code></pre>
+<h2 id="八chunked-bulk-loader">八、Chunked Bulk Loader</h2>
+<p>大数据加载使用 RocksDB 的批量加载路径，以 10,000 个 quad 为一批：</p>
+<pre><code class="language-csharp">public void BulkExtend(IEnumerable&lt;Quad&gt; quads)
+{
+    const int chunkSize = 10_000;
+
+    // 1. 开始批量加载器
+    var handle = store_bulk_extend_begin();
+
+    // 2. 分批喂入数据
+    foreach (var quad in quads)
+    {
+        chunk.Add(quad);
+        if (chunk.Count &gt;= chunkSize) {
+            store_bulk_extend_add_chunk(handle, JsonSerializer.Serialize(chunk));
+            chunk.Clear();
+        }
+    }
+
+    // 3. 提交
+    store_bulk_extend_add_chunk(handle, JsonSerializer.Serialize(chunk));
+    store_bulk_extend_commit(handle);
+}
+
+// 异常时自动取消：
+// bulkHandle 的 ReleaseHandle 调用 store_bulk_extend_cancel
+</code></pre>
+<pre><code class="language-rust">// Rust 侧：RocksDB BulkLoader
+pub extern "C" fn oxigraph_store_bulk_extend_commit(handle) {
+    let loader: Box&lt;BulkLoader&gt; = Box::from_raw(handle as *mut _);
+    loader.commit()?;
+}
+</code></pre>
+<h2 id="九内存管理">九、内存管理</h2>
+<h3 id="91-safehandle--确定性析构">9.1 SafeHandle — 确定性析构</h3>
+<p>所有 Rust 句柄都包装在 .NET <code>SafeHandle</code> 中。即使进程异常终止（<code>AppDomain</code> 卸载、<code>ThreadAbortException</code>），CLR 也会调用 <code>ReleaseHandle</code>。</p>
+<pre><code class="language-csharp">internal sealed class StoreSafeHandle : SafeHandleZeroOrMinusOneIsInvalid
+{
+    protected override bool ReleaseHandle()
+    {
+        OxigraphNative.store_destroy(handle);  // Rust: drop(Box::from_raw(ptr))
+        return true;
+    }
+}
+</code></pre>
+<h3 id="92-gchandle--防止委托被-gc-回收">9.2 GCHandle — 防止委托被 GC 回收</h3>
+<p>当一个 C# 委托被传递给 Rust 侧持有，必须用 <code>GCHandle</code> 固定它：</p>
+<pre><code class="language-csharp">private static readonly GCHandle _gcHandle = GCHandle.Alloc(_bridge);
+private static readonly IntPtr _bridgePtr =
+    Marshal.GetFunctionPointerForDelegate(_bridge);
+</code></pre>
+<p><code>GCHandle.Alloc</code> 确保委托在托管堆上不会被移动或回收，Rust 侧函数指针始终有效。</p>
+<h3 id="93-字符串生命周期">9.3 字符串生命周期</h3>
+<pre><code class="language-rust">// Rust 返回的字符串必须由调用方释放
+pub extern "C" fn oxigraph_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() { unsafe { drop(CString::from_raw(ptr)); } }
+}
+</code></pre>
+<pre><code class="language-csharp">// C# 侧：每次 FFI 调用后立即释放 Rust 字符串
+private static string ReadAndFree(IntPtr ptr)
+{
+    string json = Marshal.PtrToStringUTF8(ptr);
+    OxigraphNative.free_string(ptr);
+    return json;
+}
+</code></pre>
+<h2 id="十线程安全">十、线程安全</h2>
+<p>Rust 侧使用 <code>UnsafeCell&lt;Store&gt;</code> 包装 Store，<code>UnsafeCell</code> 不提供任何同步语义：</p>
+<pre><code class="language-rust">pub type StoreHandle = *mut UnsafeCell&lt;Store&gt;;
+</code></pre>
+<p>C# 侧明确标注：</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// An RDF store backed by RocksDB (on disk) or in-memory.
+/// Thread safety: not guaranteed. Callers must synchronize concurrent access.
+/// &lt;/summary&gt;
+</code></pre>
+<p>异步 API 使用 <code>Task.Run</code> 将阻塞操作移到线程池，但不改变线程安全语义。所有对同一 Store 的并发访问（包括 async 方法）必须由调用方串行化。</p>
+<h2 id="十一关键指标">十一、关键指标</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Rust FFI 函数</td>
+<td>60+ 个 <code>#[unsafe(no_mangle)]</code></td>
+</tr>
+<tr>
+<td>C# <code>LibraryImport</code></td>
+<td>60+ 个 <code>partial</code> 方法</td>
+</tr>
+<tr>
+<td>协议格式</td>
+<td>JSON（<code>{"ok":...}</code> / <code>{"error":...}</code>）</td>
+</tr>
+<tr>
+<td>句柄类型</td>
+<td>5 种 SafeHandle</td>
+</tr>
+<tr>
+<td>回调方向</td>
+<td>Rust→C#（CustomFunctions、Stream 回调）</td>
+</tr>
+<tr>
+<td>流式查询</td>
+<td>懒迭代器，逐行 FFI 调用</td>
+</tr>
+<tr>
+<td>构建工具</td>
+<td><code>cargo</code> + <code>dotnet</code> + <code>build_package.py</code></td>
+</tr>
+<tr>
+<td>测试</td>
+<td>280 xUnit 测试，全部通过</td>
+</tr>
+</tbody>
+</table>
+<h2 id="十二总结">十二、总结</h2>
+<p>将 Oxigraph 从 Rust 绑定到 .NET 的核心挑战在于设计一个<strong>简单可靠的 FFI 协议</strong>。本文采用的方案——JSON over raw C strings + 不透明指针句柄 + GCHandle 固定的回调——在保持代码简洁的同时，提供了完整的跨语言互操作能力。</p>
+<p>这一模式适用于任何需要将 Rust 原生库暴露给 .NET 的场景：</p>
+<ol>
+<li>用 <code>cdylib</code> 编译 Rust 到动态链接库</li>
+<li>用 <code>LibraryImport</code> 源生成器做 P/Invoke</li>
+<li>用 JSON 作为数据交换格式（两端的序列化库天然兼容）</li>
+<li>用 <code>SafeHandle</code> + <code>GCHandle</code> 管理跨语言生命周期</li>
+<li>用 C 风格回调实现双向调用</li>
+<li>用 <code>Task.Run</code> 包装提供异步 API</li>
+</ol>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>欢迎大家扫描下面二维码成为我的客户，扶你上云</p>
+<img src="https://images.cnblogs.com/cnblogs_com/shanyou/57459/o_220125090408_%E9%82%80%E8%AF%B7%E4%BA%8C%E7%BB%B4%E7%A0%81-258px.jpeg" width="170">
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0020833333333333333" data-date-updated="2026-06-28 08:58">2026-06-28 08:55</span>&nbsp;
+<a href="https://www.cnblogs.com/shanyou">张善友</a>&nbsp;
+阅读(<span id="post_view_count">29</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20884135);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshanyou%2Fp%2F20884135&amp;targetId=20884135&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
