@@ -1,0 +1,182 @@
+
+    <h2 class="postTitle"><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/luojin765/p/20959578" title="发布于 2026-06-30 13:41">
+    <span role="heading" aria-level="2">Winform 能用 Native AOT 吗？—TDS 项目实战尝试</span>
+    
+
+</a>
+</h2>
+    <div class="postText"><div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="winform-能用-native-aot-吗tds-项目的实战尝试">winform 能用 Native AOT 吗？——TDS 项目的实战尝试</h1>
+<hr>
+<p>采用 .NET Native AOT 编译出来的 exe 启动快、体积小、不依赖运行时，做小工具非常合适，关键代码也没那么容易反编译泄漏开。但是传统 winform 重度依赖反射和动态代码生成，跟 AOT 的静态编译理念天然冲突。在 <a href="https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/" target="_blank" rel="noopener nofollow">.NET Native AOT 官方文档</a> 的"Limitations"章节，里面列了几条硬限制：不支持动态加载（<code>Assembly.LoadFile</code>）、不支持运行时代码生成（<code>System.Reflection.Emit</code>）、不支持 C++/CLI 等。实际上，当直接试对 winform 项目执行 <code>dotnet publish</code> 开启 AOT 时，SDK 会抛出一个 <strong>NETSDK1175</strong> 错误，提示语是"Windows Forms is not supported or recommended with trimming enabled". 但这个措辞在社区里有不少争议，有人提了 PR 要求改成偏向"not recommended"而非"not supported", 因为在一些场景下,winform项目修改修改是能够AOT发布的。</p>
+<p>刚好，我们的 <strong>TDS</strong>项目有一个中等复杂度的 winform 版本。这篇文章就是把它改成 AOT 发布的完整记录。<br>
+核心结论写在前面：发布完20mb大小（avalonia版本开启压缩后单文件发布体积相似）绝大多数功能都能跑，COM 是主要短板，配置和代码改动非常有限，不建议直接用于生产环境，但对于小工具来说完全值得一试。</p>
+<p>请关注萤火初芒,回复tds即可回去免费开源仓库地址噢!</p>
+<h2 id="一项目背景tds-是什么为什么要试">一、项目背景：TDS 是什么，为什么要试？</h2>
+<p>TDS 是一个开源桌面版搜索工具，最初以 Winform 版本UI开发，后来考虑界面和速度，全部替换为了Avalonia。最初的 winform版本在开源前我们已经用了很长时间了,是一个相对完整的Winform项目，大致使用到：</p>
+<ul>
+<li>自定义窗口样式（无边框、自定义消息）</li>
+<li><strong>Virtualized ListView</strong>（大数据量的虚拟化列表）</li>
+<li><strong>ImageList</strong> 与图标/缩略图动态绑定</li>
+<li><strong>NotifyIcon</strong> 系统托盘</li>
+<li>右键上下文菜单</li>
+<li>常见标准控件（Button、Label、Panel、SplitContainer、TreeView 等）</li>
+<li>与系统环境的交互(USN处理,文件IO等,快捷键等)</li>
+</ul>
+<p>选择这个项目去试 AOT 的理由也很直接：如果这样一个中等复杂度的 winform 项目都能通过 AOT 编译并正常运行，那大多数 winform 小工具大概率也可以。</p>
+<h2 id="二改动第一步目标框架升级到-net10--开启-publishaot">二、改动第一步：目标框架升级到 net10 + 开启 PublishAot</h2>
+<p>第一步是把 <code>.csproj</code> 里的 <code>TargetFramework</code> 从 <code>net9.0-windows</code> 改成 <code>net10.0-windows</code>，然后加上 <code>PublishAot</code> 配置。</p>
+<pre><code class="language-xml">&lt;PropertyGroup&gt;
+    &lt;OutputType&gt;WinExe&lt;/OutputType&gt;
+    &lt;TargetFramework&gt;net10.0-windows&lt;/TargetFramework&gt;
+    &lt;UseWindowsForms&gt;true&lt;/UseWindowsForms&gt;
+    &lt;PublishAot&gt;true&lt;/PublishAot&gt;
+&lt;/PropertyGroup&gt;
+</code></pre>
+<p><code>PublishAot</code> 这个配置的意思是：告诉 .NET SDK，在发布阶段使用 <strong>Native AOT 编译器</strong>（基于 ILCompiler，而非传统的 JIT 编译器）将整个程序集——包括所有依赖的托管代码——<strong>提前编译成本机机器码并链接成一个独立的可执行文件</strong>。它做的事可以简单概括为三步：</p>
+<ol>
+<li><strong>IL → 机器码</strong>：把所有的 C# IL（包括依赖库的 IL）一次性编译成目标平台的机器码（x64 / ARM64 等）。</li>
+<li><strong>裁剪（Trim）</strong>：遍历整个调用图，把所有"没有被任何代码引用的类型、方法、字段"从最终输出中移除。这一步是 AOT 能大幅缩减体积的关键——但也是"反射不兼容"的根源：<strong>编译期看不到的反射调用会被当成无引用而裁剪掉</strong>。</li>
+<li><strong>链接（Link）</strong>：把编译好的机器码、运行时（GC、ThreadPool、类型系统等）、以及所有静态资源打包成一个单一的 <code>.exe</code> 文件。</li>
+</ol>
+<p>用一句话说就是：<strong><code>dotnet publish</code> 出来的是一个不依赖 .NET 运行时、双击就能直接跑的 exe</strong>。</p>
+<h2 id="三改动第二步用-_suppresswinformtrimerror-跳过-sdk-拦截">三、改动第二步：用 _SuppresswinformTrimError 跳过 SDK 拦截</h2>
+<p>加上 <code>PublishAot</code> 后执行 <code>dotnet publish -c Release</code>，<strong>第一次发布就被 SDK 拦截了</strong>，错误信息是：</p>
+<pre><code>NETSDK1175: 启用剪裁时，不支持或不推荐使用 Windows 窗体。
+</code></pre>
+<p>这个错误是 SDK 在编译早期的一道<strong>前置保护</strong>：它检测到当前项目引用了 <code>Microsoft.WindowsDesktop.App</code> 框架（winform 就在其中），同时 <code>PublishAot</code> 启用了 Trim 分析。因为 winform 内部有大量反射调用路径，SDK 选择在最前面拦下，防止用户在不知情的情况下发布一个可能运行时崩溃的 exe。</p>
+<p>要跳过这道拦截，需要在 <code>.csproj</code> 里添加一个 MSBuild 属性：</p>
+<pre><code class="language-xml">&lt;PropertyGroup&gt;
+    &lt;_SuppresswinformTrimError&gt;true&lt;/_SuppresswinformTrimError&gt;
+&lt;/PropertyGroup&gt;
+</code></pre>
+<p>这个配置的作用很简单：<strong>告诉 SDK"我知道 winform 有 trim 不安全的路径，我接受这些风险，请继续编译"</strong>。它不会自动修复任何 trim 分析警告，只是把 NETSDK1175 错误降级掉，让发布流程能走到下一步。</p>
+<blockquote>
+<p>⚠️ 这个属性以下划线开头，说明它是<strong>内部属性，不在官方公开 API 文档中</strong>。社区里也有人提过 PR 希望把它重命名为 <code>_SuppresswinformTrimWarning</code>，因为加上它之后确实能正常。它只应该用于实验和非生产环境。</p>
+</blockquote>
+<p>加上这个配置后重新执行 <code>dotnet publish -c Release</code>，这次编译<strong>通过了</strong>——但生成的 exe <strong>启动后立刻闪退</strong>。这回不是编译期的问题了，我们再继续往下看。</p>
+<hr>
+<h2 id="四改动第三步关键图标资源加载方式的替换">四、改动第三步（关键）：图标资源加载方式的替换</h2>
+<p>前面说到，exe <strong>启动后立刻闪退</strong>。记录崩溃日志，能看到这样的异常堆栈：</p>
+<pre><code>UI Application UnhandledException:
+Could not resolve assembly 'System.Reflection.Metadata.AssemblyNameInfo'.
+
+   at System.Reflection.TypeNameResolver.ResolveAssembly(AssemblyNameInfo)
+   at System.Reflection.TypeNameResolver.GetType(String, ...)
+   ...
+   at System.Resources.ManifestBasedResourceGroveler
+       .InternalGetResourceSetFromSerializedData(Stream, ...)
+   at System.Resources.ResourceManager.GetObject(String, ...)
+   at tdsCshapu.Form1.InitializeComponent()
+   at tdsCshapu.Form1..ctor()
+   at tdsCshapu.Program.Main()
+</code></pre>
+<p>关键路径：<strong><code>InitializeComponent()</code> → <code>ResourceManager.GetObject()</code> → <code>TypeNameResolver.ResolveAssembly</code> → 找不到 <code>AssemblyNameInfo</code> 程序集</strong>。</p>
+<p>这是因为 winform 设计器为每个 Form 生成了一个 <code>.resx</code> 文件，里面以<strong>序列化形式</strong>存储了图标、图片等资源对象的元数据。在 JIT 模式下，<code>ResourceManager</code> 通过反射反序列化这些数据来重建对象——但在 AOT 编译后，<strong>反序列化过程中需要的某些类型（<code>System.Reflection.Metadata.AssemblyNameInfo</code> 等）在 trim 阶段被移除了</strong>，运行时自然解析失败。</p>
+<p>具体到我们的代码，<code>Form1.Designer.cs</code> 里标准的资源加载代码是这样的：</p>
+<pre><code class="language-csharp">System.ComponentModel.ComponentResourceManager resources =
+    new System.ComponentModel.ComponentResourceManager(typeof(Form1));	//初始化resourceManager
+notifyIcon1.Icon = (System.Drawing.Icon)resources.GetObject("notifyIcon1.Icon");	//挂载资源到控件中
+</code></pre>
+<p><code>ComponentResourceManager</code> 走到 <code>ResourceManager.GetObject</code> 内部时，会尝试反序列化 <code>.resx</code> 中存储的图标元数据——触发上面那串调用链，然后崩溃。</p>
+<p>解决方案是：<strong>手动写一个通过 <code>Assembly.GetManifestResourceStream</code> 直接加载 <code>.ico</code> 二进制流的方法，完全绕过 <code>ComponentResourceManager</code> 和 <code>.resx</code> 路径</strong>。</p>
+<p>我们在 <code>Form1.Designer.cs</code>（或者一个单独的辅助类）里加上这个方法：</p>
+<pre><code class="language-csharp">private Icon LoadIconFromResource(string resourceName)
+{
+    // resourceName 格式：项目默认命名空间.文件夹名.文件名.ico
+    var assembly = Assembly.GetExecutingAssembly();
+    var fullResourceName = assembly.GetManifestResourceNames()
+        .FirstOrDefault(name =&gt; name.EndsWith(resourceName));
+
+    if (fullResourceName == null)
+        return null;
+
+    using (var stream = assembly.GetManifestResourceStream(fullResourceName))
+    {
+        if (stream != null)
+        {
+            return new Icon(stream);
+        }
+    }
+    return null;
+}
+</code></pre>
+<p>然后把原来依赖 <code>ComponentResourceManager</code> 的那两行替换成：</p>
+<pre><code class="language-csharp">notifyIcon1.Icon = LoadIconFromResource("tds32-32.ico");
+this.Icon = LoadIconFromResource("tds32-32.ico");
+</code></pre>
+<p>这里有一个关键前提：<strong>图标文件必须设置为"嵌入的资源"</strong>。在 <code>.csproj</code> 里确认 <code>.ico</code> 文件被正确地标记为 <code>&lt;EmbeddedResource&gt;</code>：</p>
+<pre><code class="language-xml">&lt;ItemGroup&gt;
+    &lt;EmbeddedResource Include="Resources\tds32-32.ico" /&gt;
+&lt;/ItemGroup&gt;
+</code></pre>
+<p>或者在 Visual Studio 里，把图标文件的 <strong>生成操作（Build Action）</strong> 设为 <strong>"嵌入的资源（Embedded Resource）"</strong>。</p>
+<blockquote>
+<p>这里有一个重要的理解：<code>Assembly.GetManifestResourceStream</code> 在 NativeAOT 里<strong>不是"真正的反射"</strong>。它只是在编译期就已知且被嵌入到 PE 资源段的元数据表上做一次常量级查找——AOT 编译器会把标记为 <code>EmbeddedResource</code> 的文件连同它的名字一起写进最终映像，并生成一段<strong>无反射、无动态代码生成的存根代码</strong>。因此这种用法在 AOT 下是安全的。</p>
+</blockquote>
+<p>做完这一步，重新发布，exe 启动成功——托盘图标和窗体图标都正常显示,程序也正常运行了。<br>
+<img alt="snapshot_20260630_133620_848" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3529796/202606/3529796-20260630133936131-2127312245.png" class="lazyload"></p>
+<hr>
+<h2 id="五硬边界com-互操作的限制">五、硬边界：COM 互操作的限制</h2>
+<p>所有功能基本都跑通了，但有一条硬边界碰上了——<strong>COM 互操作</strong>。</p>
+<p>这不只是我们项目遇到的问题。微软官方的 Native AOT 限制列表里明确把 <strong>"Windows: No built-in COM"</strong> 列在第一条。这个限制的覆盖面比很多人想象的更广——剪贴板、拖放、RichEdit 控件、Shell 接口等底层都涉及 COM。</p>
+<p>TDS 的 winform 版本里受影响的场景是：在文件列表上右键，弹出 <strong>Windows 系统原生的 Shell 上下文菜单</strong>（资源管理器里的"打开方式/发送到/属性"菜单）。核心调用涉及 <strong><code>Marshal.GetTypedObjectForIUnknown</code></strong>——把非托管 <code>IUnknown</code> 指针包装成托管 RCW（Runtime Callable Wrapper）的方法：</p>
+<pre><code class="language-csharp">var pUnknown = ...; // 从 Shell API 获取的 IUnknown 指针
+var shellFolder = Marshal.GetTypedObjectForIUnknown(pUnknown, typeof(IShellFolder));
+</code></pre>
+<p>这条路径在 AOT 下无法工作的原因有两层：</p>
+<ol>
+<li><strong>RCW 的动态生成</strong>——AOT 编译器在编译期无法确定最终会传入什么 <code>IID</code>、什么接口，因此不能预生成对应的包装代码。</li>
+<li><strong>Trim 移除元数据</strong>——<code>typeof(IShellFolder)</code> 对应的元数据在 trim 阶段可能被视作"没有托管代码直接调用"而移除。</li>
+</ol>
+<p>尽管部分第三方库试图通过 <code>ComWrappers</code> 机制绕过内置 COM 路径，可以为 winform 提供有限的 AOT COM 支持，但即便是最新版仍有大部分 API 仍然可能无法正常使用。因此目前还是放弃系统原生 Shell 菜单支持了，aot编译下强行打开系统菜单程序会直接崩溃。</p>
+<h2 id="六结论与展望">六、结论与展望</h2>
+<p>回到开头的那个问题：<strong>winform 能用 Native AOT 吗？</strong></p>
+<p>如果只看结果——我们在 TDS 项目中完成了 <code>dotnet publish -r win-x64 -c Release</code> 并拿到了一个可独立运行的 exe，绝大多数核心功能正常工作——那么答案偏乐观。</p>
+<p>但仔细拆开来看，这是一个比较微妙的状态：</p>
+<ul>
+<li>winform 团队在 <a href="https://github.com/dotnet/winform/issues/4649" target="_blank" rel="noopener nofollow">dotnet/winform#4649</a> 里长期推进 trimming 兼容工作，到 .NET 10 时已有部分路径清理完毕。</li>
+<li>SDK 层面的 NETSDK1175 错误主要起保护作用，加上 <code>_SuppresswinformTrimError</code> 后确实可编译。社区里有人形容它是"挡板"而非"铁门"。</li>
+<li>COM 相关的限制（<code>Marshal.GetTypedObjectForIUnknown</code>、<code>BuiltInComInterop</code>）是 AOT 自身的硬边界，跟 winform 本身无关。</li>
+</ul>
+<p>所以更准确的表述是：在 .NET 10 下，不涉及 COM 动态互操作的中等复杂度 winform 项目，通过合理配置和少量代码调整，可以成功产出可运行的 AOT exe。但它不是官方推荐的发布方式，<code>_SuppresswinformTrimError</code> 是一个内部逃逸通道而非公开 API，不保证所有路径都安全。</p>
+<p>如果项目重度依赖：</p>
+<ul>
+<li>COM 互操作（尤其是动态 IID 解析和 <code>Marshal.GetTypedObjectForIUnknown</code>）</li>
+<li><code>ComponentResourceManager</code> / <code>.resx</code> 反射式资源加载</li>
+<li><code>DataGridView</code> 数据绑定（反射枚举属性路径会被 trim 移除）</li>
+<li><code>RichTextBox</code>（底层 RichEdit COM 控件包装）</li>
+<li>大量 <code>System.Reflection</code> 调用</li>
+</ul>
+<p>那 AOT 适配的坑会显著增多，<strong>建议在评估清楚之前不要轻易上生产</strong>。</p>
+<p>但反过来看，对于<strong>小型工具类应用</strong>——快速截屏、文件批量重命名、剪贴板历史管理、系统托盘监控程序、简单数据录入——winform + AOT 的组合确实很有吸引力：</p>
+<ul>
+<li><strong>零运行时依赖</strong>：exe 发出去就能跑，用户不用装 .NET</li>
+<li><strong>启动接近瞬间</strong>：AOT 省去了 JIT 编译时间</li>
+<li><strong>体积可接受</strong>：实测简单 winform AOT exe 约 10–20 MB</li>
+</ul>
+<p><strong>两个我们没有用到的"高频高风险"控件：</strong></p>
+<ul>
+<li><strong>DataGridView</strong>：社区反馈在 AOT 下容易出现列类型解析失败的问题（因为内部的 <code>DataGridViewColumnType</code> 映射依赖反射枚举所有加载程序集的类型）。</li>
+<li><strong>RichTextBox</strong>：底层的 <code>RichEdit</code> COM 控件包装存在 RCW 生成问题，与第五节描述的 COM 限制同一类。</li>
+</ul>
+<p>如果在用这两个控件，AOT 适配的难度会更大——但也不是完全不可能，只是需要更深的拦截和替换。</p>
+<p>以后想做一个 Windows 小工具，又不想让用户装运行时、也不想用 C++ 或其他依赖重新造一遍 UI 轮子——熟悉的WinForm + AOT 这个组合值得放进你的工具箱里。配置改三行，代码改几处，出来的就是一个孤零零的 exe，跑在用户机器上，又快又省心。</p>
+<h2 id="七最后">七、最后</h2>
+<p>本文记录了 TDS 项目的 winform 版本向 Native AOT 做的一次完整适配尝试。从结果来看，它的可行度比我在动手之前预期的要高得多——尤其是想到连 Virtualized ListView、NotifyIcon、自定义绘制这些 winform 的"高级功能"都跑通了，这个组合对未来做小工具的吸引力确实不小。</p>
+<p>如果你在实际操作中遇到了新的坑或者有不同的体会，欢迎随时与我们交流。我们非常期待听到你的反馈和经验，以便我们能够进一步完善内容，帮助更多开发者。请继续关注我们的公众号"<strong>萤火初芒</strong>"，回复tds即可回去免费开源仓库地址. 我们将持续分享更多有趣且实用的技术内容，与大家一起学习交流，共同进步。</p>
+<hr>
+
+
+</div>
+<div class="clear"></div>
+</div>
+    <p class="postfoot">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-06-30 13:41">2026-06-30 13:41</span>&nbsp;
+<a href="https://www.cnblogs.com/luojin765">LdotJdot</a>&nbsp;
+阅读(<span id="post_view_count">21</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(20959578);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fluojin765%2Fp%2F20959578&amp;targetId=20959578&amp;targetType=0" target="_blank">举报</a>
+</p>
