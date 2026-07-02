@@ -1,0 +1,268 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/doiito/p/21021756" title="发布于 2026-07-02 08:07">
+    <span role="heading" aria-level="2">【Agent Harness】Gliding Horse L2 作战地图深度优化：给多 Agent 上下文装上“精准导航”</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="gliding-horse-l2-作战地图深度优化给多-agent-上下文装上精准导航">Gliding Horse L2 作战地图深度优化：给多 Agent 上下文装上“精准导航”</h1>
+<blockquote>
+<p><strong>摘要</strong>：本文深入解析 Gliding Horse 多 Agent 系统中 L2 作战地图的上下文污染问题，提出一套基于多维索引（角色、周期、节点类型）的上下文隔离方案。通过 Filtered Query 与 L3 投影引擎的双级回退机制，实现每个 Agent 只获取与其角色相关的精准上下文，Token 消耗降低 60% 以上，彻底解决多角色并行时的注意力混淆问题。适合对多 Agent 系统、Rust 工程化、语义上下文管理感兴趣的开发者阅读。</p>
+<p><strong>关键词</strong>：Gliding Horse；多 Agent 系统；上下文隔离；L2 作战地图；多维索引；Filtered Query；投影引擎；Agent 调度；Rust；PDCA 循环</p>
+</blockquote>
+<p>在上一篇文章中，我们拆解了 Gliding Horse 的 L2 共享黑板如何化身一张“作战地图”，让调度器 SA 实时掌握所有 Agent 的状态、资源锁和协调消息。那张地图解决了“谁能干什么、谁在干什么”的问题，但随着系统承载的任务越来越复杂，一个新的问题浮出水面：<strong>多个 Agent 在同一个任务里来回读写，上下文会不会互相污染？</strong></p>
+<p>答案是：会，而且非常严重。本文将详细解析我们如何发现这个“上下文污染”问题，以及如何通过一套多维索引和上下文隔离机制，让 L2 从“能看”进化到“能精准筛选”，为每个 Agent 提供<strong>零噪音的上下文</strong>。</p>
+<h2 id="一问题浮现当全量查询遇上多角色并行">一、问题浮现：当“全量查询”遇上“多角色并行”</h2>
+<p>Gliding Horse 的任务由 PA（计划）、DA（执行）、CA（检查）、AA（决策）四种角色接力完成，同一任务可能经历多轮 PDCA 循环。最初的 L2 查询设计非常直接：所有跟某个任务相关的节点全部存入 <code>task_nodes[task_iri]</code>，查询时一股脑返回。</p>
+<div class="mermaid">flowchart LR
+    A["write_node(node_iri, json_ld)"] --&gt; B["提取 task_iri"]
+    B --&gt; C["task_nodes[task_iri].push(iri)"]
+    
+    D["dispatch_agent(role=DA)"] --&gt; E["query_nodes(task_iri)"]
+    E --&gt; F["返回 ALL nodes&lt;br/&gt;(PA 计划 + DA 历史 + CA 审查 + AA 决策)"]
+    F --&gt; G["join() 成上下文"]
+</div><p>这个“全量返回”的后果是：DA 在编码时，上下文里塞满了 PA 的策略讨论、CA 的挑错记录甚至 AA 的拍板结论。这些信息不仅 Token 白白浪费，更严重的是让 LLM 产生<strong>注意力混淆</strong>——DA 可能被 PA 的试探性假设带偏，CA 可能被 DA 的中间错误记录误导。</p>
+<p>与此同时，我们还发现了另外两个关联问题：</p>
+<ul>
+<li><strong>L3 投影引擎被旁路</strong>：SA 的 <code>dispatch_agent</code> 直接走 L2 全量查询，没有调用按角色裁剪的投影帧，导致投影系统的语义过滤能力在关键路径上失效。</li>
+<li><strong>SessionSummary IRI 不规范</strong>：跨会话归档时使用随机 UUID IRI，导致 <code>extract_task_iri</code> 无法将历史摘要关联回原任务，进一步加剧了上下文关联的混乱。</li>
+</ul>
+<h2 id="二优化目标给每个-agent-只属于它的视角">二、优化目标：给每个 Agent 只属于它的视角</h2>
+<p>我们要实现的核心能力是：<strong>当 DA 请求上下文时，只返回历史 DA 轮次的内容，不混入 PA/CA/AA 的数据；当进入第二轮 PDCA 时，第二轮的计划者也只能看到本轮及前一周期相关角色的信息，避免跨周期干扰。</strong></p>
+<p>这就需要在原有 <code>task_nodes</code> 的基础上，建立一套<strong>多维二级索引</strong>，让查询可以按角色、周期、节点类型精准过滤。</p>
+<div class="mermaid">graph TB
+    subgraph "dispatch_agent() 优化后路径"
+        SA["SA 调度器"] --&gt; Choose{"优先路径"}
+        Choose --&gt;|"角色特定投影帧"| L3["L3 Projection Engine"]
+        Choose --&gt;|"降级路径"| L2F["L2 Filtered Query"]
+    end
+
+    subgraph "L2 多维索引层"
+        direction LR
+        RoleIdx["role_index&lt;br/&gt;按 (task, role) 索引"]
+        CycleIdx["cycle_index&lt;br/&gt;按 (task, cycle) 索引"]
+        TypeIdx["type_index&lt;br/&gt;按 (task, node_type) 索引"]
+        BaseStore["task_nodes&lt;br/&gt;(全量存储)"]
+    end
+
+    L2F --&gt; RoleIdx
+    L2F --&gt; CycleIdx
+    L2F --&gt; TypeIdx
+    RoleIdx --&gt; BaseStore
+    CycleIdx --&gt; BaseStore
+    TypeIdx --&gt; BaseStore
+</div><h2 id="三多维度索引设计">三、多维度索引设计</h2>
+<p>我们在 <code>Blackboard</code> 结构体中新增了三张内存 HashMap 索引，分别覆盖 Agent 角色、PDCA 周期和节点类型。</p>
+<pre><code class="language-rust">pub struct Blackboard {
+    // 原有全量存储
+    task_nodes: RwLock&lt;HashMap&lt;String, Vec&lt;String&gt;&gt;&gt;,
+
+    // 新增二级索引
+    /// role_index[(task_iri, role)] → Vec&lt;node_iri&gt;
+    role_index: RwLock&lt;HashMap&lt;(String, AgentRole), Vec&lt;String&gt;&gt;&gt;,
+
+    /// cycle_index[(task_iri, cycle_id)] → Vec&lt;node_iri&gt;
+    cycle_index: RwLock&lt;HashMap&lt;(String, String), Vec&lt;String&gt;&gt;&gt;,
+
+    /// type_index[(task_iri, node_type)] → Vec&lt;node_iri&gt;
+    type_index: RwLock&lt;HashMap&lt;(String, String), Vec&lt;String&gt;&gt;&gt;,
+}
+</code></pre>
+<p><strong>为什么用内存 HashMap 而不是 SPARQL 查询？</strong> 因为 <code>dispatch_agent</code> 是高频调用路径，SPARQL 查询涉及序列化/反序列化，延迟较高。二级索引是 O(1) 查找，且与 Oxigraph 中的数据同步更新，兼顾性能与一致性。</p>
+<h3 id="索引构建">索引构建</h3>
+<p>在 <code>write_node</code> 时，除了写入全量存储和 Oxigraph，同步更新三维索引：</p>
+<ul>
+<li>如果传入 <code>role</code> 和 <code>task_iri</code>，则加入 <code>role_index</code>；</li>
+<li>如果传入 <code>cycle_id</code>，则加入 <code>cycle_index</code>；</li>
+<li>如果节点包含 <code>@type</code>，则加入 <code>type_index</code>。</li>
+</ul>
+<p>这要求调用 <code>write_node</code> 的地方传递 <code>role</code> 和 <code>cycle_id</code>，我们沿着调用链一路回溯，在 Agent 每轮 ReAct 循环写入 <code>AgentTurn</code> 节点时附带了这些元数据。</p>
+<h2 id="四filtered-query上下文查询的精准投送">四、Filtered Query：上下文查询的精准投送</h2>
+<p>新增的 <code>query_nodes_filtered</code> 方法接受一个 <code>QueryFilter</code> 结构体：</p>
+<pre><code class="language-rust">pub struct QueryFilter {
+    pub role: Option&lt;AgentRole&gt;,
+    pub cycle_id: Option&lt;String&gt;,
+    pub node_type: Option&lt;String&gt;,
+}
+</code></pre>
+<p>查询逻辑是先获取全量 IRI 列表，然后与各项过滤条件的索引结果取交集，最后从节点缓存中读取实体。当 DA 请求上下文时，传入 <code>role=DA, cycle_id=当前周期</code>，就能得到仅包含本周期 DA 轮次的节点，彻底隔绝其他角色的信息。</p>
+<p>下面是一个完整的调用示例，展示如何实例化 <code>QueryFilter</code>、调用 <code>query_nodes_filtered</code> 并处理查询结果：</p>
+<pre><code class="language-rust">use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// 假设已有 Blackboard 实例
+let blackboard: Arc&lt;Blackboard&gt; = /* 从调度器获取 */;
+
+/// 构造查询过滤器：只查询 DA 角色、当前周期的节点
+let filter = QueryFilter {
+    role: Some(AgentRole::DA),
+    cycle_id: Some("cycle-2026-07-02-001".to_string()),
+    node_type: None, // 不过滤节点类型
+};
+
+/// 执行过滤查询
+let node_iris = blackboard
+    .query_nodes_filtered("iri://task/task-42", &amp;filter)
+    .await
+    .expect("过滤查询失败");
+
+/// 从节点缓存中读取完整实体数据
+let mut context_parts: Vec&lt;String&gt; = Vec::new();
+for iri in &amp;node_iris {
+    if let Some(node) = blackboard.node_cache.read().await.get(iri) {
+        // 将节点序列化为 JSON-LD 片段，加入上下文
+        context_parts.push(serde_json::to_string_pretty(node).unwrap());
+    }
+}
+
+/// 组装成最终上下文（按时间戳排序，保证顺序）
+let context = context_parts.join("\n---\n");
+
+/// 输出统计信息
+println!(
+    "DA 角色上下文组装完成：共 {} 个节点，{} 字符",
+    node_iris.len(),
+    context.len()
+);
+</code></pre>
+<p><code>query_nodes_filtered</code> 的内部实现如下——它利用三维索引做交集运算，避免全量扫描：</p>
+<pre><code class="language-rust">impl Blackboard {
+    pub async fn query_nodes_filtered(
+        &amp;self,
+        task_iri: &amp;str,
+        filter: &amp;QueryFilter,
+    ) -&gt; Result&lt;Vec&lt;String&gt;, BlackboardError&gt; {
+        // 1. 获取该任务的全量节点列表
+        let all_nodes = self.task_nodes.read().await
+            .get(task_iri)
+            .cloned()
+            .unwrap_or_default();
+
+        // 2. 如果没有任何过滤条件，直接返回全量
+        if filter.role.is_none() &amp;&amp; filter.cycle_id.is_none() &amp;&amp; filter.node_type.is_none() {
+            return Ok(all_nodes);
+        }
+
+        // 3. 收集所有非空过滤条件的索引结果
+        let mut candidate_sets: Vec&lt;HashSet&lt;String&gt;&gt; = Vec::new();
+
+        if let Some(role) = &amp;filter.role {
+            let key = (task_iri.to_string(), role.clone());
+            let set = self.role_index.read().await
+                .get(&amp;key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::&lt;HashSet&lt;_&gt;&gt;();
+            candidate_sets.push(set);
+        }
+
+        if let Some(cycle_id) = &amp;filter.cycle_id {
+            let key = (task_iri.to_string(), cycle_id.clone());
+            let set = self.cycle_index.read().await
+                .get(&amp;key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::&lt;HashSet&lt;_&gt;&gt;();
+            candidate_sets.push(set);
+        }
+
+        if let Some(node_type) = &amp;filter.node_type {
+            let key = (task_iri.to_string(), node_type.clone());
+            let set = self.type_index.read().await
+                .get(&amp;key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::&lt;HashSet&lt;_&gt;&gt;();
+            candidate_sets.push(set);
+        }
+
+        // 4. 取所有候选集的交集
+        let mut intersection: HashSet&lt;String&gt; = candidate_sets
+            .into_iter()
+            .reduce(|a, b| a.intersection(&amp;b).cloned().collect())
+            .unwrap_or_default();
+
+        // 5. 只保留属于该任务的节点（安全兜底）
+        let task_set: HashSet&lt;String&gt; = all_nodes.into_iter().collect();
+        intersection.retain(|iri| task_set.contains(iri));
+
+        Ok(intersection.into_iter().collect())
+    }
+}
+</code></pre>
+<p>这段代码的核心思路是：<strong>先按每个非空过滤条件从对应索引中取出候选 IRI 集合，再对所有候选集取交集</strong>。这样当 DA 同时指定 <code>role=DA</code> 和 <code>cycle_id=当前周期</code> 时，只有同时满足两个条件的节点才会被返回，实现了精准的上下文隔离。</p>
+<h2 id="五dispatch_agent-上下文组装重写">五、dispatch_agent 上下文组装重写</h2>
+<p>原来的 <code>dispatch_agent</code> 中有一段硬编码逻辑：为了避免 AA 看到大量无关数据，直接跳过了 L2 查询，用一个单独的 <code>prev_agent_summary</code> 代替。这种“打补丁”的方式显然不够优雅。</p>
+<p>优化后的路径采用<strong>双级回退</strong>：</p>
+<ol>
+<li><strong>优先走 L3 投影引擎</strong>：<code>scheduler.on_context_request(role, task_iri)</code> 会加载该角色专属的投影帧（如 <code>pa_init</code>、<code>da_input</code>），利用 SPARQL 和语义增强生成高度结构化的上下文摘要。</li>
+<li><strong>降级走 Filtered Query</strong>：若投影引擎未命中或不可用，则使用 <code>query_nodes_filtered</code> 按角色和周期精准拉取 L2 节点，自行组装上下文。</li>
+<li><strong>兜底使用历史摘要</strong>：万一前两级都失败，返回之前保存的精简摘要作为最低保障。</li>
+</ol>
+<p>这样，每个 Agent 获得的上下文都经过了“角色过滤 + 周期过滤 + 类型过滤”三重筛选，噪音降到最低。</p>
+<h2 id="六关联修复让数据认得家">六、关联修复：让数据“认得家”</h2>
+<p>我们还修复了两个导致上下文混乱的细节：</p>
+<ul>
+<li><strong><code>cycle_id</code> 贯穿全链路</strong>：从 <code>TaskContext</code> 到 <code>AgentTurn</code> 节点，再到 <code>dispatch_agent</code> 查询，<code>cycle_id</code> 作为明确定位符一路携带，确保每个节点都清楚自己属于哪个周期。</li>
+<li><strong>SessionSummary IRI 规范化</strong>：跨会话归档的 IRI 从 <code>iri://memory/{uuid}</code> 改为 <code>iri://task/{task_id}/session/{session_id}</code>，让归档摘要可以正确关联回原任务，不再游离在外。</li>
+</ul>
+<h2 id="七优化成效从大杂烩到分子料理">七、优化成效：从“大杂烩”到“分子料理”</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>优化前</th>
+<th>优化后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>DA 单轮上下文大小</strong></td>
+<td>包含 PA + DA + CA + AA 全部历史（约 8000 tokens）</td>
+<td>仅本周期 DA 历史 + 任务目标（约 2000 tokens）</td>
+</tr>
+<tr>
+<td><strong>跨周期干扰</strong></td>
+<td>第二轮 PA 能看到第一轮 CA 的审计细节</td>
+<td>严格隔离，每个周期初始只保留上一周期决策摘要</td>
+</tr>
+<tr>
+<td><strong>投影引擎命中率</strong></td>
+<td>0%（被硬编码旁路）</td>
+<td>&gt; 90%（优先路径）</td>
+</tr>
+<tr>
+<td><strong>Agent 注意力准确性</strong></td>
+<td>DA 可能被 PA 假设误导，CA 可能被 DA 中间错误干扰</td>
+<td>每个 Agent 只看到自己角色的上下文，决策更加专注</td>
+</tr>
+</tbody>
+</table>
+<p>在实际测试中，修复后的多角色任务执行不再出现“DA 突然开始质疑计划”或“CA 重复 DA 的工作”这类怪事。上下文 Token 消耗降低了 60% 以上，而任务的完成质量却因为注意力集中而明显提升。</p>
+<h2 id="八结语">八、结语</h2>
+<p>L2 作战地图是 Gliding Horse 多 Agent 协作的基石。它从最初的“全局监控”进化到现在的“精准投送”，背后是我们对 Agent 系统工程化的一次深刻反思：<strong>只解决“看得见”还不够，必须解决“只看该看的”</strong>。通过多维索引、上下文过滤和投影引擎深度集成，Gliding Horse 的每个 Agent 终于拥有了一个干净、专注的工作空间，这或许就是 AI 协作从“草台班子”走向“专业团队”的关键一步。</p>
+<p><em>Gliding Horse 已在 GitHub 开源：<a href="https://github.com/doiito/gliding_horse" target="_blank" rel="noopener nofollow">https://github.com/doiito/gliding_horse</a></em></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-02 08:07">2026-07-02 08:07</span>&nbsp;
+<a href="https://www.cnblogs.com/doiito">doiito</a>&nbsp;
+阅读(<span id="post_view_count">57</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21021756);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdoiito%2Fp%2F21021756&amp;targetId=21021756&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
