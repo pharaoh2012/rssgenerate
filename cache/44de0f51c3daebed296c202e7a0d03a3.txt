@@ -1,0 +1,328 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/tangkengdashen/p/21056548" title="发布于 2026-07-02 21:05">
+    <span role="heading" aria-level="2">WebSocket 重连后的数据连续性补偿方案：缺口检测、REST 回补与留痕设计</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        摘要：WebSocket 行情断流后重连成功，系统显示一切正常——但中间缺的那几根 K 线不会自己回来。连接恢复不等于数据连续，断流窗口必须通过 REST K 线独立回补，并用 gap_report 记录每一次补偿的细节和结果。本文给出检测缺口、分段幂等回补、状态判定、失败处理和不可恢复判定的完整方案，附带表结构建议、单元测试用例清单和可直接集成的 Python 骨架代码。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>摘要：WebSocket 行情断流后重连成功，系统显示一切正常——但中间缺的那几根 K 线不会自己回来。连接恢复不等于数据连续，断流窗口必须通过 REST K 线独立回补，并用 gap_report 记录每一次补偿的细节和结果。本文给出检测缺口、分段幂等回补、状态判定、失败处理和不可恢复判定的完整方案，附带表结构建议、单元测试用例清单和可直接集成的 Python 骨架代码。</p>
+</blockquote>
+<hr>
+<h2 id="一重连成功图表却骗了你">一、重连成功，图表却骗了你</h2>
+<p>凌晨三点，行情监控脚本告警：WebSocket 断开。五秒后重连成功，日志显示连接恢复，心跳正常。</p>
+<p>你看了一眼 K 线图，没有跳空，没有断崖，价格曲线平滑。于是关掉告警继续睡觉。</p>
+<p>两周后跑策略回测，发现那天的分钟线有几根不对。排查了很久才找到根因：凌晨断流那段时间缺了几分钟数据，而重连后 WebSocket 只推送了当前快照，没有把断流窗口的 K 线补回来。你看到的平滑曲线，其实是前端把缺失段直接连起来了。</p>
+<blockquote>
+<p><strong>重连成功 ≠ 数据连续。</strong> 连接 watch dog 只能证明传输通道恢复了，不能证明断流期间的 K 线已经完整补回。补偿这件事必须由业务层主动完成：检测缺口、回补数据、校验完整性、留痕记录，缺一不可。</p>
+</blockquote>
+<hr>
+<h2 id="二为什么-watch-dog-发现断流却不能证明数据完整">二、为什么 watch dog 发现断流，却不能证明数据完整</h2>
+<p>一个典型的 WebSocket watch dog 只做三件事：心跳超时检测、连接状态监控、重连触发。这三件事全部围绕“连接”展开。</p>
+<p>它不回答以下问题：断流期间到底缺了几根 K 线？重连后收到的第一条数据，时间戳和断流前最后一条是否连续？回补的数据是不是完整覆盖了缺失窗口，还是只补了一部分？</p>
+<p><strong>连接是传输层的概念，K 线是业务层的概念。</strong> 传输层的恢复，不能自动推导出业务数据的完整。这个推导必须由业务层主动完成。</p>
+<p>常见的三种缺数据情况：</p>
+<ul>
+<li><strong>缺段</strong>：断流窗口内的 K 线全部缺失，重连后直接跳到当前时间，旧数据永久丢失。</li>
+<li><strong>缺条</strong>：窗口内部分 K 线缺失，比如 10 分钟内缺了 3 根，整体数据看起来连续，细查才发现空洞。</li>
+<li><strong>重复覆盖</strong>：重连后推送了部分重叠数据，但不是完整窗口，导致你误以为补全了，其实还有缺口。</li>
+</ul>
+<p>这三种情况，如果不主动做缺口检测，都会被“连接正常”的状态掩盖。</p>
+<hr>
+<h2 id="三缺口检测拿应该有和实际有做集合差">三、缺口检测：拿“应该有”和“实际有”做集合差</h2>
+<p>缺口检测的核心逻辑很清晰：根据 K 线周期和你自己维护的交易日历，生成断流窗口内“应该有”的时间序列，然后与本地实际已落地的时间序列做集合差。</p>
+<pre><code class="language-python">from typing import List
+from datetime import datetime
+
+
+def detect_gaps(expected_times: List[datetime],
+                actual_times: List[datetime]) -&gt; dict:
+    """
+    检测缺口：expected_times 是断流窗口内理论上应该存在的 bar 时间点，
+    actual_times 是本地已确认写入的 bar 时间点（来自数据库记录或本地聚合后的 bar_time）。
+    返回缺失、重叠和意外时间点。
+    """
+    expected_set = set(expected_times)
+    actual_set = set(actual_times)
+
+    missing = sorted(expected_set - actual_set)
+    overlap = sorted(expected_set &amp; actual_set)
+    unexpected = sorted(actual_set - expected_set)
+
+    return {
+        "gap_count": len(missing),
+        "missing": missing,
+        "overlap_count": len(overlap),
+        "unexpected_count": len(unexpected),
+        "is_complete": len(missing) == 0 and len(unexpected) == 0
+    }
+</code></pre>
+<p><strong>expected_times 怎么来？</strong> 根据请求的 interval 和断流起止时间推算。例如 1 分钟 K 线，断流 10 分钟，就应该有 10 个 expected_times。推算时必须参照交易日历，排除非交易时段、午休和节假日——否则会把不应该有 K 线的时段也计入“缺失”，导致 expected_count 虚高，回补窗口永远有一批“无法补上”的缺口。交易日历的维护是整个方案中最容易被低估成本的部分。</p>
+<p><strong>actual_times 怎么来？</strong> actual_times 不能直接等同于 WebSocket 收到的 bar 的时间戳，因为 WebSocket 推送的只是“那一刻看到的行情快照”，不是“已经持久化到本地的业务时间轴”。actual_times 应取自本地数据库已确认写入的 bar 的时间列表，或本地聚合后产生的有效业务时间轴。这样，实际存在的数据和应该存在的数据之间的差值，才是真正需要回补的缺口。</p>
+<hr>
+<h2 id="四为什么必须用-rest-回补而不是让-websocket-重新推">四、为什么必须用 REST 回补，而不是让 WebSocket 重新推</h2>
+<p>这是协议设计层面的取舍。WebSocket 是面向实时推送的轻量通道，服务端推送的是“当前及未来”的增量数据。如果要求它在重连后补推所有历史快照，服务端就需要为每一个连接维护快照缓存和增量序列——这与实时推送的定位相矛盾。因此，历史回补必须走另一条通道：REST K 线接口，按需拉取指定时间窗口的完整历史数组。</p>
+<p>MCP 工具只适合 AI 按需查询，不应放进自动化监控的断流回补链路。REST K 线接口是这个场景下最合适的选择：一次请求拿一个完整时间窗口的 K 线，返回结构确定，不依赖连接状态。但要注意，<strong>REST K 线是回补查询通道，不承诺完整恢复所有断流数据。</strong> 如果断流窗口超出了数据源的历史覆盖范围，或者该时段数据因其他原因不可用，回补可能只拿到部分数据，甚至完全拿不到。</p>
+<hr>
+<h2 id="五回补实现分段拉取幂等写入状态判定">五、回补实现：分段拉取、幂等写入、状态判定</h2>
+<p>检测到缺口后，下一步是用 REST K 线接口把缺失窗口的数据拉回来。拉回的数据不能直接入库，需要经过完整性校验，并且保证同一缺口只回补一次。</p>
+<pre><code class="language-python">def fetch_kline_gap(symbol: str,
+                    interval: str,
+                    start: datetime,
+                    end: datetime) -&gt; dict:
+    """
+    用 REST K 线接口回补缺失窗口。
+    实际调用时替换为具体数据源的端点、鉴权方式和参数。
+    返回结构包含 recovered_times 列表，用于后续覆盖检查。
+    """
+    # 教学骨架，具体实现以数据源官方文档为准
+    # 示例：resp = requests.get(kline_url, headers={"X-API-Key": key},
+    #                            params={"symbol": symbol, "interval": interval,
+    #                                    "start": start, "end": end})
+    # 返回：{"klines": [...], "raw_snapshot": {...}}
+    pass
+</code></pre>
+<h3 id="51-幂等回补同一窗口不重复写入">5.1 幂等回补：同一窗口不重复写入</h3>
+<p>每次发起 REST 回补前，先查询 <code>gap_report</code> 表，用 <code>symbol + interval + gap_start + gap_end</code> 四个字段组成唯一键，如果已有成功（status=full）的回补记录，直接跳过本次请求。这避免了因重试导致的重复写入和 API 配额浪费。</p>
+<h3 id="52-状态判定full-必须检查-recovered_times-覆盖-missing_times">5.2 状态判定：full 必须检查 recovered_times 覆盖 missing_times</h3>
+<p>状态 <code>full</code> 不能只看 <code>recovered_count &gt;= expected_count</code>。必须将回补返回的 K 线时间列表 <code>recovered_times</code> 与缺失列表 <code>missing_times</code> 做集合差，确认 <code>missing_times</code> 是 <code>recovered_times</code> 的子集，并且所有期望的时间点都已补回。只有时间点完全覆盖，且数据经过解析校验无误，才能标记为 <code>full</code>。</p>
+<pre><code class="language-python">def determine_status(missing_times: List[datetime],
+                     recovered_klines: List[dict],
+                     request_error: str = None) -&gt; str:
+    """根据缺失时间点与回补时间点的覆盖关系，判定回补状态。"""
+    if request_error:
+        return "failed"
+
+    if not recovered_klines:
+        return "empty"
+
+    recovered_times = {bar["time"] for bar in recovered_klines}
+    missing_set = set(missing_times)
+
+    if missing_set.issubset(recovered_times):
+        return "full"
+    elif recovered_times &amp; missing_set:
+        return "partial"
+    else:
+        return "empty"
+</code></pre>
+<h3 id="53-恢复作业状态recovery_job">5.3 恢复作业状态：recovery_job</h3>
+<p>每次从检测缺口到回补结束，是一个 recovery_job。它记录整个过程的元信息，便于监控和追溯。</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>job_id</code></td>
+<td>唯一标识，UUID</td>
+</tr>
+<tr>
+<td><code>symbol</code></td>
+<td>标的代码</td>
+</tr>
+<tr>
+<td><code>interval</code></td>
+<td>K 线周期</td>
+</tr>
+<tr>
+<td><code>gap_start</code></td>
+<td>缺口起始时间</td>
+</tr>
+<tr>
+<td><code>gap_end</code></td>
+<td>缺口结束时间</td>
+</tr>
+<tr>
+<td><code>expected_count</code></td>
+<td>应有 K 线条数</td>
+</tr>
+<tr>
+<td><code>recovered_count</code></td>
+<td>实际回补条数</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>pending / fetching / full / partial / empty / failed / unrecoverable</td>
+</tr>
+<tr>
+<td><code>raw_snapshot_id</code></td>
+<td>原始响应哈希</td>
+</tr>
+<tr>
+<td><code>created_at</code></td>
+<td>作业创建时间</td>
+</tr>
+<tr>
+<td><code>completed_at</code></td>
+<td>完成时间</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="六推荐表结构">六、推荐表结构</h2>
+<p>以下表结构用于支持断流回补的完整生命周期。</p>
+<h3 id="61-gap_report-表">6.1 gap_report 表</h3>
+<pre><code class="language-sql">CREATE TABLE gap_report (
+    id            BIGSERIAL PRIMARY KEY,
+    symbol        VARCHAR(20) NOT NULL,
+    interval      VARCHAR(5)  NOT NULL,
+    gap_start     TIMESTAMP   NOT NULL,
+    gap_end       TIMESTAMP   NOT NULL,
+    expected_count INT        NOT NULL,
+    recovered_count INT      NOT NULL DEFAULT 0,
+    raw_snapshot_id VARCHAR(32),
+    status        VARCHAR(20) NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','fetching','full','partial','empty','failed','unrecoverable')),
+    note          TEXT,
+    reported_at   TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE (symbol, interval, gap_start, gap_end)
+);
+</code></pre>
+<h3 id="62-raw_snapshot-存储">6.2 raw_snapshot 存储</h3>
+<p>原始响应不拆散入库，以 JSON 文件形式存储在对象存储或本地文件系统。<code>raw_snapshot_id</code> 作为外键关联，文件路径如 <code>snapshots/{YYYY-MM}/{job_id}.json</code>。</p>
+<h3 id="63-recovery_job-表">6.3 recovery_job 表</h3>
+<pre><code class="language-sql">CREATE TABLE recovery_job (
+    job_id        UUID PRIMARY KEY,
+    symbol        VARCHAR(20) NOT NULL,
+    interval      VARCHAR(5)  NOT NULL,
+    gap_start     TIMESTAMP   NOT NULL,
+    gap_end       TIMESTAMP   NOT NULL,
+    expected_count INT        NOT NULL,
+    recovered_count INT      NOT NULL DEFAULT 0,
+    status        VARCHAR(20) NOT NULL DEFAULT 'pending',
+    raw_snapshot_id VARCHAR(32),
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    completed_at  TIMESTAMP WITH TIME ZONE
+);
+</code></pre>
+<hr>
+<h2 id="七失败分支处理">七、失败分支处理</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>失败场景</th>
+<th>处理方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>①</td>
+<td>REST 回补请求返回空 <code>data</code></td>
+<td>先标 <code>empty</code>，确认参数和权限无误后，若该时段超出历史覆盖范围则升级为 <code>unrecoverable</code></td>
+</tr>
+<tr>
+<td>②</td>
+<td>回补条数不足，时间点未覆盖全部缺失</td>
+<td><code>status=partial</code>，明确标注哪些缺失时间点仍未补回</td>
+</tr>
+<tr>
+<td>③</td>
+<td>交易日历误判导致 expected 不准确</td>
+<td><code>note</code> 中标注“交易日历可能不准确”，不强制补数</td>
+</tr>
+<tr>
+<td>④</td>
+<td>interval 不一致（回补用了和订阅不同的周期）</td>
+<td>阻断，修正 interval 参数后重新拉取</td>
+</tr>
+<tr>
+<td>⑤</td>
+<td>同一段缺口被重复回补写入</td>
+<td>利用 gap_report 的唯一约束拒绝重复，幂等跳过</td>
+</tr>
+<tr>
+<td>⑥</td>
+<td>raw_snapshot 未保存</td>
+<td><code>status=failed</code>，<code>note</code> 中标注“缺失原始快照”，该条报告标记为不可复查</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="八单元测试思路">八、单元测试思路</h2>
+<p>编写单元测试时，不依赖真实 WebSocket 或 REST 调用，用模拟的 expected_times 和 recovered_klines 覆盖以下五种场景。</p>
+<h3 id="测试用例-1正常无缺口">测试用例 1：正常无缺口</h3>
+<ul>
+<li>输入：<code>missing_times=[]</code>，<code>recovered_klines</code> 有对应的 bar</li>
+<li>预期：<code>is_complete=True</code>，状态 <code>full</code></li>
+</ul>
+<h3 id="测试用例-2缺-3-根回补恰好覆盖">测试用例 2：缺 3 根，回补恰好覆盖</h3>
+<ul>
+<li>输入：<code>missing_times</code> 包含 3 个时间点，<code>recovered_klines</code> 精确包含这 3 个时间点</li>
+<li>预期：状态 <code>full</code>，<code>recovered_count == expected_count</code></li>
+</ul>
+<h3 id="测试用例-3recovered_count-够但-recovered_times-不覆盖-missing_times">测试用例 3：recovered_count 够，但 recovered_times 不覆盖 missing_times</h3>
+<ul>
+<li>输入：<code>missing_times = [T1, T2, T3]</code>，<code>recovered_klines</code> 有 3 根但时间点是 <code>[T1, T2, T4]</code></li>
+<li>预期：状态 <code>partial</code>，因为 <code>T3</code> 仍缺失，不能判定为 <code>full</code></li>
+</ul>
+<h3 id="测试用例-4rest-返回空">测试用例 4：REST 返回空</h3>
+<ul>
+<li>输入：<code>recovered_klines=[]</code>，<code>request_error=None</code></li>
+<li>预期：状态 <code>empty</code>，并进一步检查是否应升级为 <code>unrecoverable</code></li>
+</ul>
+<h3 id="测试用例-5重复回补幂等">测试用例 5：重复回补幂等</h3>
+<ul>
+<li>输入：同一 <code>symbol + interval + gap_start + gap_end</code> 已有 <code>status=full</code> 的记录</li>
+<li>预期：回补前置检查发现已成功回补，直接跳过本次请求，不重复写入</li>
+</ul>
+<hr>
+<h2 id="九整体流程">九、整体流程</h2>
+<p>整个断流补偿链路如下：</p>
+<p><strong>WebSocket 断流 → watch dog 触发重连 → 重连成功后立即执行 <code>detect_gaps</code>（actual_times 取自本地数据库已落地的 bar 时间轴）→ 确认缺失窗口 → 分段调用 REST K 线接口回补 → 每条回补数据经过 Decimal 及 OHLC 校验 → 判定覆盖状态（full/partial/empty） → 写入 gap_report 和 recovery_job 记录 → raw_snapshot 归档保存。</strong></p>
+<p>全部完成后检查 status 分布。若存在 <code>unrecoverable</code> 或 <code>partial</code>，通知下游策略该时段数据不完整，相关回测结果需要复核。只有全部窗口标记为 <code>full</code>，这次断流才算真正“补偿完毕”。</p>
+<hr>
+<h2 id="十tickdb-的工程边界">十、TickDB 的工程边界</h2>
+<p>上面这套断流检测、REST 回补和 gap_report 留痕流程，是一套通用的工程方法，不绑定任何特定数据源。如果你用 TickDB 做行情接入，它在断流回补场景中承担两个明确的角色：</p>
+<ul>
+<li><strong>WebSocket 负责持续推送</strong>：实时行情通过 WebSocket 通道到达，是数据 watch dog 的输入。TickDB WebSocket 使用 <code>api_key</code> 作为 query 参数鉴权。</li>
+<li><strong>REST K 线负责历史回补</strong>：断流窗口的缺失 K 线通过 REST 接口拉取。TickDB REST 使用 <code>X-API-Key</code> Header 鉴权。</li>
+</ul>
+<p>两个通道各司其职，不能混用。WebSocket 不是历史数据源，REST K 线不是实时推送通道。MCP 是给 AI 工具按需查询用的，不适合放进自动化监控的断流回补链路。</p>
+<p>所有端点、字段路径、时间戳语义，以 TickDB 官方文档和你自己的实测为准。</p>
+<hr>
+<h2 id="十一断流回补的最小检查清单">十一、断流回补的最小检查清单</h2>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 重连后，有没有根据订阅的 interval 和交易日历生成 expected_times？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 有没有用本地已写入的实际 bar 时间轴作为 actual_times，做集合差确认缺口？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 缺口回补是不是用 REST K 线接口按段拉取，而不是靠 WebSocket 重新推送？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 回补前有没有检查 gap_report 表，防止重复写入同一缺口（幂等）？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>full</code> 状态的判定是否基于 recovered_times 完全覆盖 missing_times，而不仅仅是数量？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>partial</code> 的记录有没有明确标注哪些时间点仍未补回？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>empty</code> 的记录有没有确认是否应转为 <code>unrecoverable</code>？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 原始响应是否保存了 raw_snapshot，供事后复查？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 全部回补完成后有没有检查 status 分布，确认是否存在 unrecoverable 窗口？</label></li>
+</ul>
+<hr>
+<p><strong>你们现在监控 WebSocket 断流，是只看了连接状态，还是已经做了缺口检测和回补留痕？遇到过最隐蔽的一次数据缺失，最后是怎么发现的？</strong></p>
+<p>📡 本文以 TickDB WebSocket 和 REST K 线接口作为行情接入示例。文中代码为 Python 教学骨架，不依赖任何特定数据源的端点或字段。本文仅讨论断流回补的工程方法，不构成投资建议。</p>
+<p><strong>标签</strong>：Python, WebSocket, K线, 数据回补, 工程实践, TickDB</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-02 21:05">2026-07-02 21:05</span>&nbsp;
+<a href="https://www.cnblogs.com/tangkengdashen">Agent践行员</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21056548);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Ftangkengdashen%2Fp%2F21056548&amp;targetId=21056548&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
