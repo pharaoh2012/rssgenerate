@@ -1,0 +1,155 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/vivotech/p/21029106" title="发布于 2026-07-02 10:27">
+    <span role="heading" aria-level="2">从 10 分钟到 1 秒：ES 深度分页任意跳页的三轮优化实战</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<blockquote data-first-child="" data-pid="vLnu_mJK">作者：vivo 互联网服务器团队- Chen Yifan<br>本文介绍了一种基于 search_after + Redis 多级锚点缓存的 Elasticsearch 深度分页跳页方案。针对 Elasticsearch 原生不支持随机跳页的限制，通过三轮优化——分段预热缓存、最近锚点定位 + Elasticsearch 查询提速（禁用 _source/关闭 track_total_hits）、大区间预热 + 小分页精细锚点——将 50 万数据量下的任意跳页响应时间从 10 分钟级优化至 1 秒以内。</blockquote>
+<p data-pid="qlP-iVQs">1 分钟看图掌握核心要点👇</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="1540" width="1080" data-caption="" data-size="normal" data-rawwidth="1080" data-rawheight="1540" data-original-token="v2-ad6f417e147b66915095f690251652f1" data-original="https://picx.zhimg.com/v2-ad6f417e147b66915095f690251652f1_r.jpg" data-actualsrc="https://picx.zhimg.com/v2-ad6f417e147b66915095f690251652f1_1440w.jpg" data-lazy-status="ok" data-src="https://picx.zhimg.com/80/v2-ad6f417e147b66915095f690251652f1_720w.webp"></div>
+</figure>
+<h2>一、背景</h2>
+<p data-pid="8K-cDKTV">悟空活动系统目前支撑了一系列大型的摄影比赛活动，在赛事评审环节，管理后台需要对数十万级参赛作品进行集中展示、筛选与评审，尤其在筛选环节涉及到对作品进行多维度条件筛选（评审等级、作者信息、拍摄单元等）。该业务场景本质上是一个“高数据量 + 多维组合筛选 + 深度分页”的后台检索系统。后台页面列表查询最初通过 MySQL 多表关联查询实现。</p>
+<p data-pid="HoVRfT5i">随着赛事规模逐年扩大，参赛作品量级持续攀升，列表查询需要关联多张业务表并进行复杂条件筛选。在数据规模和并发请求不断增长的情况下，MySQL 查询逐渐暴露出以下问题：</p>
+<ul>
+<li data-pid="R1Qc7rYR">多表关联查询复杂，SQL 执行成本较高；</li>
+<li data-pid="sVEbHDO-">数据量持续增长，查询耗时明显上升；</li>
+<li data-pid="3Y-a-z9r">高并发场景下数据库压力较大，影响系统整体稳定性。</li>
+</ul>
+<p data-pid="5w-M30pc">为降低数据库查询压力并提升检索性能，我们对系统进行了重构优化，将原有的 MySQL 列表查询逻辑迁移至 Elasticsearch，利用 Elasticsearch 在大规模数据检索与多维条件组合过滤方面的优势来承载后台的页面查询能力。</p>
+<p data-pid="NTjpZyJu">在实际业务场景中，用户可能会在评审结束以及评审过程中进行随机跳页查询来查看评审数据以及作品信息。但是 Elasticsearch 自身目前的查询能力只提供了用于顺序翻找的 scroll API 以及 search after，无法直接跳转至任意页。为了不影响用户的使用体验，因此进行 Elasticsearch 深度分页的优化。</p>
+<h2>二、基础方案选择</h2>
+<p data-pid="ZKZSMBQD">目前 Elasticsearch 所提供的深度查询的方案主要有三种：from+size、scroll API 以及 search after。对于用户点击深度分页的场景，Elasticsearch 官方更推荐使用 search after。而 scroll API 则更适合应用于后台大规模数据扫描的应用场景来对整批索引数据进行稳定地的遍历查询。为了直观对比三种方案的流程和优劣，我们绘制了以下的流程图。</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="431" width="571" data-caption="" data-size="normal" data-rawwidth="571" data-rawheight="431" data-original-token="v2-ecb109a326b8440bf00de192baf33edd" data-original="https://pic2.zhimg.com/v2-ecb109a326b8440bf00de192baf33edd_r.jpg" data-actualsrc="https://pic2.zhimg.com/v2-ecb109a326b8440bf00de192baf33edd_1440w.jpg" data-lazy-status="ok" data-src="https://pic2.zhimg.com/80/v2-ecb109a326b8440bf00de192baf33edd_720w.webp"></div>
+</figure>
+<p data-pid="kO1jUJAc">如图所示，方案一有着最大数量的限制，方案二会占用大量的 Elasticsearch 内存给集群造成压力。最终我们选择方案三，相对于方案一，该方案不需要计算大量的偏移数据，而相比于方案二该方案采用无状态查询方式，不需要在 Elasticsearch 节点上维护额外的查询上下文更适合用户的在线查询场景。</p>
+<h2>三、跳页解决方案演进</h2>
+<h2>3.1 阶段一：基础方案</h2>
+<p data-pid="7NX6sZnZ">在确定使用 search_after 作为深度分页的基础查询方式后，我们首先实现了一套基于 缓存 + search_after 的分页方案，用于在一定程度上支持用户的深度分页查询。</p>
+<p data-pid="Na8Q3UVU">由于 search_after 只能基于上一页的排序位置进行顺序翻页，而无法直接跳转至任意分页位置，因此需要通过额外的缓存机制记录部分分页位置对应的 search_after 值，从而减少顺序查询的次数。</p>
+<p data-pid="w0o95oLI">在该阶段的方案中，我们设计了一种分段预热的缓存策略。</p>
+<ul>
+<li data-pid="dDzkHWT5"><strong>异步预热：</strong>当用户首次进入列表页面进行查询时，系统会启动一个异步线程在后台按照 1000 条数据为一个步长对查询结果进行预热处理。</li>
+<li data-pid="X1dVwoJm"><strong>多粒度缓存：</strong>在每个步长位置，系统会继续按照当前系统预设的分页大小（10、20、50、100）分别记录当前查询结果最后一条数据对应的 sortValues。</li>
+<li data-pid="b280eCol"><strong>Redis 存储：</strong>将该数据的位置和对应的 sortValues 缓存到 Redis 的 hash 结构中。</li>
+</ul>
+<p data-pid="99lEFwRH">当用户访问的分页位置超过 Elasticsearch 默认的深度分页限制（10000）之后，系统会根据用户当前的分页大小，计算出当前页面的开始位置（from）并从 10000 对应的缓存锚点位置重新开始执行 search_after 查询，并按照用户当前查询的分页大小顺序向后推进。直到命中目标位置（from）。之后再进行一次 search_after 查询查询出当前页面的全部数据。同时，在推进过程中，系统会继续补充新的 search_after 锚点缓存，以逐步完善缓存中的分页位置数据。</p>
+<p data-pid="DjWDDR8D">该方案在命中缓存时会根据当前缓存的 search_after 值再进行一次 search_after 查出指定页面的相对数据，查询效率相对较快，在 1 秒钟内能够返回结果。</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="587" width="864" data-caption="" data-size="normal" data-rawwidth="864" data-rawheight="587" data-original-token="v2-6dcd891e0a7ea0b14f085ac0b0dbfeb7" data-original="https://pic2.zhimg.com/v2-6dcd891e0a7ea0b14f085ac0b0dbfeb7_r.jpg" data-actualsrc="https://pic2.zhimg.com/v2-6dcd891e0a7ea0b14f085ac0b0dbfeb7_1440w.jpg" data-lazy-status="ok" data-src="https://pic2.zhimg.com/80/v2-6dcd891e0a7ea0b14f085ac0b0dbfeb7_720w.webp"></div>
+</figure>
+<p data-pid="5V3N4K3H">然而，该方案在实际运行过程中仍然存在一定局限性：</p>
+<ul>
+<li data-pid="GKu8YEqI">当用户第一次访问某个较深的分页位置时，由于缓存尚未完全构建，系统仍然需要执行大量顺序 search_after 查询；</li>
+<li data-pid="BwN0BoIn">锚点缓存依赖于预热过程，若用户访问的分页区间分布较为随机，缓存命中率可能较低；</li>
+<li data-pid="bkkADH_F">在极端情况下，用户直接跳转到较深的分页位置时，查询延迟仍然较高。如下图所示：对于八十万级的数据量级，用户第一次进去直接跳转最后一页需要十分钟左右的预热时间。</li>
+</ul>
+<h2>3.2 阶段二：性能优化</h2>
+<h3>3.2.1 优化点一：引入最近锚点定位</h3>
+<p data-pid="L-JD-hyC">在阶段一的方案中，系统通过缓存部分 search_after 游标来辅助深度分页查询，在一定程度上缓解了顺序翻页带来的性能问题。然而，该方案仍然存在一个明显的不足：当用户直接跳转到较深的分页位置时，如果目标页附近没有可用的缓存游标，系统仍然需要执行较多次顺序 search_after 查询，导致查询耗时较长。</p>
+<p data-pid="eQ1wvpX4">我们认为既然已经在用户第一次访问时做了缓存预热的操作，那在后续的操作中我们也想尽可能地最大程度地利用已经缓存的锚点提高查询效率。那么很容易就可以想到在用户每次的查询过程中，找到距离当前数据最近的一次 searchAfter 记录，并根据该记录动态计算出和目标页面所相差的数据条数，再进行一次 searchAfter 操作来跳到目标页数。</p>
+<p data-pid="ojjZgfXL">为了实现该想法，我们引入了 Redis ZSet 作为偏移量索引。不再生硬地从头扫描，而是在数据链路上钉上“锚点”。</p>
+<p data-pid="KwzEfa4n"><strong>1.动态锚点预热</strong></p>
+<ul>
+<li data-pid="0fLRumJD"><strong>步长机制：</strong>&nbsp;用户首次进入时，系统以 1000 条为步长，自动向后预热。</li>
+<li data-pid="lgEKhxaY"><strong>缓存结构：</strong>&nbsp;将查询位置存为 score，将 Elasticsearch 的 sortValues 存为 value，维护在 Redis ZSet 中。</li>
+</ul>
+<p data-pid="6o0DkAmY"><strong>2. “跳板式”精准命中</strong></p>
+<ul>
+<li data-pid="XkGn_Il9"><strong>坐标换算：</strong>&nbsp;根据 pageNum * pageSize 计算目标位置 from。</li>
+<li data-pid="_T7J57no"><strong>快速定位：</strong>&nbsp;利用 ZSet 的 reverseRangeBy-<br>Score 命令，毫秒级锁定小于且最接近目标位置的那个“锚点”。</li>
+<li data-pid="8doQO-vQ"><strong>区间收缩：&nbsp;</strong>将原本几十万量级的扫描，瞬间收缩到 1000 条以内的微小区间。</li>
+</ul>
+<p data-pid="DNBHR0zj"><strong>3. 远程跳跃保护</strong></p>
+<p data-pid="5AuY_W0I">设置最大缓存间隔。若最近锚点距离目标过远，系统先进行大区间的预热构建，快速逼近目标区间后，再切换到小步长精确命中。</p>
+<p data-pid="S2vCw874">详细流程如下图所示：</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="576" width="864" data-caption="" data-size="normal" data-rawwidth="864" data-rawheight="576" data-original-token="v2-06d44274e8e9837b27d17f81226a511f" data-original="https://picx.zhimg.com/v2-06d44274e8e9837b27d17f81226a511f_r.jpg" data-actualsrc="https://picx.zhimg.com/v2-06d44274e8e9837b27d17f81226a511f_1440w.jpg" data-lazy-status="ok" data-src="https://picx.zhimg.com/80/v2-06d44274e8e9837b27d17f81226a511f_720w.webp"></div>
+</figure>
+<p data-pid="T15ldSI6"><strong>效果：</strong>同等数据量下跳到最后一页的时间从 10 分钟降到约 6 分钟，预热完成后任意跳页约 3 秒。有进步，但还不够。</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="634" width="864" data-caption="" data-size="normal" data-rawwidth="864" data-rawheight="634" data-original-token="v2-95c1607e6b6cfe9a71dfbb3edff2ded3" data-original="https://pic4.zhimg.com/v2-95c1607e6b6cfe9a71dfbb3edff2ded3_r.jpg" data-actualsrc="https://pic4.zhimg.com/v2-95c1607e6b6cfe9a71dfbb3edff2ded3_1440w.jpg" data-lazy-status="ok" data-src="https://pic4.zhimg.com/80/v2-95c1607e6b6cfe9a71dfbb3edff2ded3_720w.webp"></div>
+</figure>
+<h3>3.2.2 优化点二：优化 Elasticsearch 查询效率</h3>
+<p data-pid="rf4BgCV4">目前来说，最耗时的部分还是在于缓存的预热和大幅度跳页之后根据就近锚点深度查找的过程中的 Elasticsearch 查找操作，对于五十万级别的数据量级，按照 1000 的步长进行搜索构造，需要在预热过程中进行 500 次查询操作，如果每次的查询时间耗时较长，总和加起来耗时会非常庞大。而预热阶段我们根本不需要完整的文档数据，只需要 sortValues。</p>
+<p data-pid="IJCsgTAe">于是我们做了两个关键调整：</p>
+<p data-pid="DKTchV8A"><strong>（1）禁用_source 字段</strong></p>
+<p data-pid="WIAajxZ3">Elasticsearch 查询默认会返回完整的 _source 文档内容，这涉及大量磁盘 I/O 和反序列化开销。在预热阶段，我们只需要排序值，完全可以通过"_source": false 跳过文档内容的读取。</p>
+<p data-pid="nGtsENJx"><strong>（2）关闭 track_total_hits</strong></p>
+<p data-pid="8X2IDdpg">Elasticsearch 查询默认会计算匹配文档的总数（total_hits），这需要扫描所有匹配文档。在 search_after 预热场景中，我们并不关心总数，关闭后可以省去这部分开销。</p>
+<p data-pid="W8l43uX-">下图是未禁用相关参数的耗时：</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="258" width="864" data-caption="" data-size="normal" data-rawwidth="864" data-rawheight="258" data-original-token="v2-3d58097bcb3b4d7a67bd8db5ff96d5e0" data-original="https://pic3.zhimg.com/v2-3d58097bcb3b4d7a67bd8db5ff96d5e0_r.jpg" data-actualsrc="https://pic3.zhimg.com/v2-3d58097bcb3b4d7a67bd8db5ff96d5e0_1440w.jpg" data-lazy-status="ok" data-src="https://pic3.zhimg.com/80/v2-3d58097bcb3b4d7a67bd8db5ff96d5e0_720w.webp"></div>
+</figure>
+<p data-pid="uz5O2Y93">而下图则是在禁用_source 以及关闭掉 track_total_hits 之后的同等耗时，每次查询大概在 500ms 左右，相较于默认查询，耗时有了显著减少。</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="240" width="864" data-caption="" data-size="normal" data-rawwidth="864" data-rawheight="240" data-original-token="v2-67c8a1c4214ad4eccd7061fd52885e50" data-original="https://pic3.zhimg.com/v2-67c8a1c4214ad4eccd7061fd52885e50_r.jpg" data-actualsrc="https://pic3.zhimg.com/v2-67c8a1c4214ad4eccd7061fd52885e50_1440w.jpg" data-lazy-status="ok" data-src="https://pic3.zhimg.com/80/v2-67c8a1c4214ad4eccd7061fd52885e50_720w.webp"></div>
+</figure>
+<p data-pid="2fTlr9vD">此外，在查询开销降低后，我们进一步调整了分页预热的步长策略。相比于原先较小的分页步长，在减少返回数据量的前提下，可以适当增大每次查询获取的数据量，从而减少与 Elasticsearch 的交互次数，提高整体预热效率。经过多次测试与调优后，我们将预热步长调整为 5000 条数据。在该配置下，系统在用户首次跳转至最后一页时，整体查询时间已经能够稳定控制在一分钟以内，相比初始方案有了明显提升。但在实际使用过程中，如果用户直接跳转至任意较深的分页位置，系统仍然需要通过已有锚点执行少量 search_after 顺序推进查询，因此整体查询耗时仍可能达到 1 秒以上。因此当前方案在随机跳页场景下仍然存在进一步优化的空间。</p>
+<h3>3.2.3 优化点三：分割预热区间</h3>
+<p data-pid="ScXfUUed">第二版解决了预热速度的问题，但仍然有一个痛点：预热后跳页仍需约 1 秒。原因是锚点粒度仍然是 5000，用户请求的页码大概率不会刚好落在锚点上，还需要做一段距离的顺序推进。</p>
+<p data-pid="htu7wP8a">因此我们进一步思考，如果我们能把锚点粒度做到和最小分页大小一致（比如 10 条），那用户跳到任何页都能直接命中缓存，只需要一次 search_after 查询就能拿到结果。</p>
+<p data-pid="-Mcc7Sxc">为了实现这个构想，同时又不拖慢主预热链路，我们设计了一套“大区间同步 + 小区间异步”的分层架构：</p>
+<ol>
+<li data-pid="IOh6LLpL">系统维持原有的逻辑，以 5000 条数据为一个大区间进行预热查询，确保主进度的覆盖。</li>
+<li data-pid="XvP7tN-X">在获取到大区间数据后，后台同步启动一个异步线程,以最小分页大小（如 pageSize = 10）为基础单位,将 5000 条的大结果集，切割成 500 个细小的分页区间并构建缓存。</li>
+<li data-pid="FfM80yti">当用户发起跳页请求时会直接定位到该页码对应的细粒度锚点。取出对应的 search_after 值。</li>
+</ol>
+<p data-pid="tYOLkwvE">最终的流程如下图所示：</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="962" width="1079" data-caption="" data-size="normal" data-rawwidth="1079" data-rawheight="962" data-original-token="v2-30bcbec9bfb027b47279f7ceaadbbe91" data-original="https://pic2.zhimg.com/v2-30bcbec9bfb027b47279f7ceaadbbe91_r.jpg" data-actualsrc="https://pic2.zhimg.com/v2-30bcbec9bfb027b47279f7ceaadbbe91_1440w.jpg" data-lazy-status="ok" data-src="https://pic2.zhimg.com/80/v2-30bcbec9bfb027b47279f7ceaadbbe91_720w.webp"></div>
+</figure>
+<p data-pid="Ryxg21Df">通过这种“大区间预热 + 小分页锚点缓存”的策略，系统在保证缓存覆盖范围的同时，将随机跳页场景下的顺序查询次数降至最低，从而有效提升了深度分页查询的响应速度，并进一步提高了缓存命中率。在测试环境的实际测试中可以发现，对于七十万级的数据量级，预热完成后随机点击页面的 RT 也基本能够保证在 1s 以内。</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="585" width="864" data-caption="" data-size="normal" data-rawwidth="864" data-rawheight="585" data-original-token="v2-05c4c2a378c16d9e870dade87d8add38" data-original="https://pic3.zhimg.com/v2-05c4c2a378c16d9e870dade87d8add38_r.jpg" data-actualsrc="https://pic3.zhimg.com/v2-05c4c2a378c16d9e870dade87d8add38_1440w.jpg" data-lazy-status="ok" data-src="https://pic3.zhimg.com/80/v2-05c4c2a378c16d9e870dade87d8add38_720w.webp"></div>
+</figure>
+<p data-pid="5ckpiL8s">线上模拟的五十万级数据级别的响应时间也都在理想范围内：</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="429" width="803" data-caption="" data-size="normal" data-rawwidth="803" data-rawheight="429" data-original-token="v2-2e070e8579916c46782bd7628a376dcb" data-original="https://pic2.zhimg.com/v2-2e070e8579916c46782bd7628a376dcb_r.jpg" data-actualsrc="https://pic2.zhimg.com/v2-2e070e8579916c46782bd7628a376dcb_1440w.jpg" data-lazy-status="ok" data-src="https://pic2.zhimg.com/80/v2-2e070e8579916c46782bd7628a376dcb_720w.webp"></div>
+</figure>
+<h2>四、目前问题</h2>
+<p data-pid="6Z2g1iU0">在上述优化方案中，为了减少深度分页时的顺序查询次数，我们通过 Redis 对 search_after 锚点进行了缓存，从而在用户跳页时能够快速定位到接近目标位置的数据区间。然而，在实际运行过程中也暴露出了一个新的问题：数据漂移，具体表现为：</p>
+<ul>
+<li data-pid="45EzWgH8">新数据写入后，原来"最后一页"的锚点可能不再是真正的尾部，跳到最后一页可能返回空页；</li>
+<li data-pid="1F6Q1C_w">数据删除后，某些锚点对应的位置可能出现数据重复或缺失。</li>
+</ul>
+<p data-pid="-Melk0S-">该问题产生的根本原因在于 Elasticsearch 索引数据与 Redis 中缓存的分页锚点之间并非强一致关系。在当前方案中，分页锚点是在预热阶段通过查询 Elasticsearch 生成并缓存到 Redis 中的，这些锚点本质上记录的是某一时刻 Elasticsearch 索引数据在特定排序条件下的位置。</p>
+<p data-pid="Zu_oDlHa">当上述情况发生时，Elasticsearch 中的真实数据顺序可能已经发生变化，而 Redis 中缓存的锚点仍然对应的是旧的数据位置。此时，当系统使用 Redis 中的锚点作为 search_after 的起点继续执行查询时，实际的分页起始位置就可能与用户期望的分页位置产生偏差，从而出现数据漂移现象。</p>
+<p data-pid="alkhgFUr"><strong>应对策略：</strong></p>
+<ul>
+<li data-pid="zPOEx27A">该方案本质上更适用于数据相对稳定的查询场景——在我们的业务中，深度分页的使用高峰主要在数据趋于稳定的后期阶段，数据大量变化的概率较小；</li>
+<li data-pid="2nxRdwFw">对于可能出现的空页问题，系统会清除缓存并基于最新的 Elasticsearch 数据重新预热；</li>
+<li data-pid="dFvzHzLs">如果你的场景中数据变更非常频繁，可能需要考虑其他方案（如基于时间戳或版本号的增量更新策略）。</li>
+</ul>
+<h2>五、思考</h2>
+<p data-pid="wjvnJc84">回顾整个优化过程，核心思路可以提炼为：</p>
+<figure data-size="normal">
+<div class="RichText-ConditionalImagePortal"><img class="origin_image zh-lightbox-thumb lazy lazyload" height="178" width="610" data-caption="" data-size="normal" data-rawwidth="610" data-rawheight="178" data-original-token="v2-e368d94e3a8786232722a15a77875ad7" data-original="https://pic4.zhimg.com/v2-e368d94e3a8786232722a15a77875ad7_r.jpg" data-actualsrc="https://pic4.zhimg.com/v2-e368d94e3a8786232722a15a77875ad7_1440w.jpg" data-lazy-status="ok" data-src="https://pic4.zhimg.com/80/v2-e368d94e3a8786232722a15a77875ad7_720w.webp"></div>
+</figure>
+<p data-pid="5dW-m9-9">这次优化的过程，本质上不只是一次 Elasticsearch 性能调优，更是一次面对多目标约束时如何拆解问题、逐步逼近最优解的工程实践。希望这些经验对遇到类似问题的同学有所帮助。</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    分享 vivo 互联网技术干货与沙龙活动，推荐最新行业动态与热门会议。
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-02 10:28">2026-07-02 10:27</span>&nbsp;
+<a href="https://www.cnblogs.com/vivotech">vivo互联网技术</a>&nbsp;
+阅读(<span id="post_view_count">75</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21029106);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fvivotech%2Fp%2F21029106&amp;targetId=21029106&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
