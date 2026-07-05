@@ -1,0 +1,198 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/laggage/p/21093702" title="发布于 2026-07-03 22:20">
+    <span role="heading" aria-level="2">EFCore AsSplitQuery + 非唯一排序 + Take 导致 Include 集合丢失</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>最近排查了一个很隐蔽的生产 bug：一个 CSV 导出接口，部分订单的 <code>InvoiceAmount</code>（发票金额）导出成了 0，但数据库里这些订单明明有非 0 的付款记录。而且很邪门——带关键字 <code>search</code> 的导出没问题，全量导出才复现。</p>
+<p>查到最后，根因是 EF Core 的 <strong>拆分查询（<code>AsSplitQuery</code>）+ 非唯一 <code>ORDER BY</code> + <code>Skip/Take</code></strong> 三者一起触发的一个数据正确性陷阱。这个坑在官方文档里其实有一句警告，但很容易被忽略，记录一下。</p>
+<blockquote>
+<p>环境：EF Core 7 + Npgsql 7 + PostgreSQL。EF Core 5/6/8 同样适用（拆分查询从 5.0 引入）。</p>
+</blockquote>
+<h2 id="现象">现象</h2>
+<p>一个"列表/导出"查询，大致长这样（简化）：</p>
+<pre><code class="language-csharp">var items = await db.Orders
+    .AsNoTrackingWithIdentityResolution()
+    .AsSplitQuery()                       // 关键点 1：拆分查询
+    .Where(o =&gt; o.ShopId == shopId)
+    .Include(o =&gt; o.Payments)             // 关键点 2：Include 一个集合
+    .OrderByDescending(o =&gt; o.SubmittedDate)   // 关键点 3：排序列不唯一
+    .Take(5000)                           // 关键点 4：Skip/Take 截断
+    .ToListAsync();
+
+// 之后在内存里映射：取第一笔"提交订单"付款的金额
+foreach (var o in items)
+{
+    var pay = o.Payments.FirstOrDefault(p =&gt; p.Type == PaymentType.Submit);
+    model.InvoiceAmount = pay?.InvoiceAmount ?? 0;   // ← 部分行这里变成了 0
+}
+</code></pre>
+<p><code>Payments</code> 集合对一部分订单<strong>没加载出来（是空集合）</strong>，于是 <code>pay</code> 为 null，<code>InvoiceAmount</code> 落到默认值 0。但这些订单在库里其实是有付款记录的。</p>
+<h2 id="复现">复现</h2>
+<p>用一个最小工程就能稳定复现（同 EF/Npgsql 版本，本地 PostgreSQL）。造 2000 条订单，每条都挂<strong>一笔非 0 付款</strong>，并且让 <code>SubmittedDate</code> <strong>大量重复</strong>（模拟批量导入产生的相同时间戳）：</p>
+<details>
+<summary>最小复现代码</summary>
+<pre><code class="language-csharp">public class Order
+{
+    public Guid Id { get; set; }
+    public Guid ShopId { get; set; }
+    public DateTime SubmittedDate { get; set; }
+    public List&lt;Payment&gt; Payments { get; set; } = new();
+}
+public class Payment
+{
+    public int Id { get; set; }
+    public Guid OrderId { get; set; }
+    public decimal InvoiceAmount { get; set; }
+}
+
+// 造数据：2000 单，每单一笔金额 100 的付款；SubmittedDate 只有 5 个不同值（大量并列）
+for (int i = 0; i &lt; 2000; i++)
+{
+    var id = Guid.NewGuid();
+    rows.Add(new Order {
+        Id = id, ShopId = shopId,
+        SubmittedDate = baseDate.AddDays(i % 5),   // ← 制造并列
+        Payments = { new Payment { OrderId = id, InvoiceAmount = 100m } }
+    });
+}
+
+// 对比几种查询，统计"加载出来 Payments 为空"的行数
+async Task Run(bool split, bool tieBreaker, int take)
+{
+    IQueryable&lt;Order&gt; q = db.Orders.AsNoTrackingWithIdentityResolution()
+        .Where(o =&gt; o.ShopId == shopId).Include(o =&gt; o.Payments);
+    q = split ? q.AsSplitQuery() : q.AsSingleQuery();
+    IOrderedQueryable&lt;Order&gt; oq = q.OrderByDescending(o =&gt; o.SubmittedDate);
+    if (tieBreaker) oq = oq.ThenBy(o =&gt; o.Id);
+    var items = await oq.Take(take).ToListAsync();
+    int empty = items.Count(o =&gt; o.Payments.Count == 0);
+    Console.WriteLine($"split={split} tie={tieBreaker} take={take} -&gt; 空集合行数={empty}");
+}
+</code></pre>
+</details>
+<p>结果一目了然：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>空集合行数（= 金额丢失）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AsSplitQuery</code> + 非唯一排序 + <code>Take(500)</code>（截断）</td>
+<td><strong>54 / 500 ❌</strong></td>
+</tr>
+<tr>
+<td>同上 + <code>.ThenBy(o =&gt; o.Id)</code>（唯一排序）</td>
+<td>0 ✅</td>
+</tr>
+<tr>
+<td><code>AsSplitQuery</code> + <code>Take(5000)</code>（&gt; 总数，不截断）</td>
+<td>0 ✅</td>
+</tr>
+<tr>
+<td><code>AsSingleQuery</code> + <code>Take(500)</code>（不拆分）</td>
+<td>0 ✅</td>
+</tr>
+</tbody>
+</table>
+<p>这也解释了开头那个"带 search 反而正常"的怪现象：<code>search</code> 只命中单个店铺、结果远小于 <code>Take</code> 上限，<strong>没发生截断</strong>；全量导出结果集超过 <code>Take</code>，才触发。</p>
+<h2 id="根因">根因</h2>
+<p><code>AsSplitQuery</code> 会把<strong>每个集合 Include 拆成一条独立的 SQL</strong>。主查询查订单主体，<code>Payments</code> 单独用一条子查询去 JOIN。这条集合子查询会把主查询的过滤 + 排序 + <code>LIMIT</code> <strong>重新算一遍</strong>，用来确定"要给哪些主实体加载集合"，大概长这样：</p>
+<pre><code class="language-sql">-- 集合子查询（简化）
+SELECT p.*
+FROM (
+    SELECT o."Id", o."SubmittedDate"
+    FROM "Orders" o
+    WHERE o."ShopId" = @shop
+    ORDER BY o."SubmittedDate" DESC       -- ← 注意这里没有唯一列
+    LIMIT 5000
+) AS t0
+JOIN "Payments" p ON p."OrderId" = t0."Id"
+ORDER BY t0."SubmittedDate" DESC
+</code></pre>
+<p>问题就在这条子查询的 <code>ORDER BY ... LIMIT</code> 上：<strong><code>SubmittedDate</code> 不唯一</strong>。当结果集超过 <code>LIMIT</code> 需要截断时，边界上那批"时间相同"的并列行，主查询和这条集合子查询各自 <code>LIMIT</code> 选中的行集<strong>可能不一样</strong>（PostgreSQL 对并列行的物理顺序不做保证，两次执行计划不同就可能选出不同的行）。于是：主查询返回的某些订单，其 <code>Id</code> 不在集合子查询选中的行集里 → <code>Payments</code> join 不上 → 空集合 → 金额变 0。</p>
+<h3 id="一个关键细节ef-只给主查询补了主键">一个关键细节：EF 只给"主查询"补了主键</h3>
+<p>用 <code>ToQueryString()</code> 看<strong>主查询</strong>的 SQL，会发现 EF Core 其实<strong>自动</strong>在 <code>ORDER BY</code> 末尾补了主键：</p>
+<pre><code class="language-sql">-- 主查询（未加 tiebreaker 时）EF 也会自动补 PK：
+... ORDER BY o."SubmittedDate" DESC, o."Id"
+</code></pre>
+<p>但这个"自动补主键"的行为<strong>只作用于主查询，不会传播到拆分出来的集合子查询</strong>！集合子查询的内层 <code>LIMIT</code> 还是只按 <code>SubmittedDate</code> 排。这就是主查询和集合子查询"选出不同行集"的根本原因，也是为什么 bug 只影响集合 Include、不影响主体字段。</p>
+<h2 id="解决办法">解决办法</h2>
+<p><strong>给排序显式加一个唯一列（主键）作为 tiebreaker</strong>，让排序在整条查询里全局唯一——这样它会同时出现在集合子查询的内层排序里，两边 <code>LIMIT</code> 选中的行集就一致了：</p>
+<pre><code class="language-csharp">.OrderByDescending(o =&gt; o.SubmittedDate)
+.ThenBy(o =&gt; o.Id)        // ← 唯一 tiebreaker，一行搞定
+</code></pre>
+<p>如果排序是用 <code>System.Linq.Dynamic.Core</code> 的字符串写的（<code>OrderBy("submittedDate desc")</code>），拼一个主键即可：<code>OrderBy("submittedDate desc, Id")</code>；或者强转后 <code>ThenBy</code>：</p>
+<pre><code class="language-csharp">queryable = ((IOrderedQueryable&lt;Order&gt;)queryable.OrderBy(sortStr)).ThenBy(o =&gt; o.Id);
+</code></pre>
+<p>其它思路（不如加 tiebreaker）：</p>
+<ul>
+<li><strong><code>AsSingleQuery()</code></strong>：单条 SQL 不存在多子查询分歧，能规避。但集合 Include 多时会笛卡尔积膨胀，正是当初改用拆分查询的原因，不划算。</li>
+<li><strong>换一个本身唯一的排序列</strong>：治标，换个非唯一列又会中招。</li>
+</ul>
+<blockquote>
+<p>官方文档原话（Single vs. Split Queries）：<br>
+<em>"When using split queries with Skip/Take, pay special attention to making your query ordering fully unique; not doing so could cause incorrect data to be returned."</em><br>
+排序不唯一在<strong>单查询</strong>里最多顺序不稳定，但在<strong>拆分查询 + Skip/Take</strong>里会直接返回<strong>错误数据</strong>。</p>
+</blockquote>
+<h2 id="性能加个-guid-主键排序会不会变慢">性能：加个 GUID 主键排序会不会变慢？</h2>
+<p>主键是随机 GUID、本身无序，担心它拖慢排序是合理的，但这里基本无影响，原因有二：</p>
+<ol>
+<li><strong>主查询计划根本没变</strong>——前面说了，EF 本来就给主查询的 <code>ORDER BY</code> 自动补了主键。加 <code>.ThenBy(Id)</code> 只是把这个排序也<strong>同步到了集合子查询</strong>，那条昂贵的 top-N 排序在改之前就一直在付。</li>
+<li><strong>Id 只是次级 tiebreaker</strong>，不是范围扫描键。主排序列（<code>SubmittedDate</code>）走索引拿到有序数据，Id 只在"主键列相等"的并列小组内排序。PostgreSQL（13+）用 <strong>Incremental Sort</strong> 处理：走同一个 <code>SubmittedDate</code> 索引，只对小分组做内存 quicksort。</li>
+</ol>
+<p><code>EXPLAIN (ANALYZE)</code> 实测（3.5w 行取 5000，warm cache）：</p>
+<pre><code>-- 无 tiebreaker： ORDER BY SubmittedDate DESC
+Limit -&gt; Index Scan using IX_Orders_SubmittedDate      Execution ~10 ms
+
+-- 有 tiebreaker： ORDER BY SubmittedDate DESC, Id
+Limit -&gt; Incremental Sort (Presorted Key: SubmittedDate,  -- 同一个索引
+            Full-sort Groups: 157  quicksort  Peak Memory: 27kB)
+      -&gt; Index Scan using IX_Orders_SubmittedDate       Execution ~7 ms
+</code></pre>
+<p>两者走同一个索引，差异在噪声范围内。前提是<strong>主排序列要有索引</strong>（否则 <code>, Id</code> 可能退化成全表排序），<code>SubmittedDate</code> / <code>CreatedDate</code> 这类排序列一般都建了索引。唯一要留意的极端情况：某个排序值上有海量并列行（比如批量导入几万行同一时间戳），那一组会做较大的内存 quicksort，但受 <code>LIMIT</code> 截断、纯内存、GUID 排序很快——而且这恰恰是<strong>必须有 tiebreaker 才能保证数据正确</strong>的数据形态。</p>
+<h2 id="小结--checklist">小结 / Checklist</h2>
+<p>只要满足下面全部条件，就要警惕这个坑：</p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 用了 <code>AsSplitQuery()</code>（或全局配了 <code>UseQuerySplittingBehavior(SplitQuery)</code>）</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>Include</code> 了<strong>集合</strong>导航属性</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 有 <code>Skip</code> / <code>Take</code>（分页 / 导出限量）</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>ORDER BY</code> 的列<strong>不唯一</strong>（时间、状态、名称……）</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 结果集<strong>可能超过</strong> <code>Take</code> 上限（会真正截断）</label></li>
+</ul>
+<p>修复就一句话：<strong>给排序补一个唯一列（通常是主键）做 tiebreaker</strong>。顺带一提，这个坑不只影响"金额变 0"——任何拆分加载的集合（明细行、子记录）都可能在分页边界上间歇性丢数据，只是不一定有人核对，隐蔽得很。</p>
+<h2 id="参考">参考</h2>
+<ul>
+<li>EF Core 官方文档：<a href="https://learn.microsoft.com/en-us/ef/core/querying/single-split-queries" target="_blank" rel="noopener nofollow">Single vs. Split Queries</a></li>
+<li>PostgreSQL：<a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener nofollow">Incremental Sort</a>（PG 13+）</li>
+</ul>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>作者：<a href="https://www.cnblogs.com/laggage/" target="_blank">Laggage</a></p>
+<p>出处：<a href="https://www.cnblogs.com/laggage/p/21093702" target="_blank">https://www.cnblogs.com/laggage/p/21093702</a></p>
+<p>说明：转载请注明来源</p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-03 22:20">2026-07-03 22:20</span>&nbsp;
+<a href="https://www.cnblogs.com/laggage">Laggage</a>&nbsp;
+阅读(<span id="post_view_count">8</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21093702);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Flaggage%2Fp%2F21093702&amp;targetId=21093702&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
