@@ -1,0 +1,646 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zrui-xyu/p/21235877" title="发布于 2026-07-08 10:40">
+    <span role="heading" aria-level="2">秒杀系统如何设计</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文介绍秒杀系统设计，核心思路是分层限流+异步削峰+最终一致性。前端/网关拦截大部分流量，用Redis+Lua脚本原子扣减库存杜绝超卖，通过MQ异步下单削峰，最后以数据库乐观锁兜底，兼顾高性能与数据一致性。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="如何设计一个高并发的秒杀系统超卖问题如何解决">如何设计一个高并发的秒杀系统？超卖问题如何解决？</h2>
+<p>设计秒杀系统，核心就三个字：<strong>快、稳、准</strong>。</p>
+<ul>
+<li><strong>快</strong>：响应要快，流量要在上游就被挡住。</li>
+<li><strong>稳</strong>：系统不能崩，要层层削峰。</li>
+<li><strong>准</strong>：库存不能多扣，绝对不能超卖。</li>
+</ul>
+<p>咱们直接看一个全局架构图，心里先有个底 👇</p>
+<div class="mermaid">graph TD
+    A[👤 用户请求] --&gt;|1.静态化/答题| B[🌩️ CDN + 前端限流]
+    B --&gt;|2.刷票/验证| C[🚪 网关层-令牌桶限流]
+    C --&gt;|3.资格校验| D[💻 秒杀业务层]
+    D --&gt;|4.原子扣减| E[⚡ Redis Cluster]
+    E --&gt;|库存充足| F[📬 消息队列 MQ]
+    E --&gt;|库存不足| G[💔 直接返回'售罄']
+    F --&gt;|异步下单| H[🔄 订单消费者]
+    H --&gt;|5.乐观锁扣减| I[(🗄️ MySQL数据库)]
+    I --&gt; J[✅ 下单成功]
+</div><div class="mermaid">graph TB
+    User[👤 用户] --&gt; CDN[🌐 CDN/静态页]
+    CDN --&gt; LB[⚖️ 负载均衡 Nginx]
+    LB --&gt; Gateway[🚪 API 网关 限流/鉴权/黑名单]
+    Gateway --&gt; Web[🖥️ Web 服务层]
+    Web --&gt; Redis[💎 Redis 库存预减+请求排队]
+    Web --&gt; MQ[📬 消息队列 削峰填谷]
+    MQ --&gt; DB[🗄️ 数据库 异步下单]
+    Web --&gt; DB_Slave[📖 从库 订单查询]
+
+    style Redis fill:#f9f,stroke:#333,stroke-width:2px
+    style MQ fill:#fc6,stroke:#333,stroke-width:2px
+    style DB fill:#6cf,stroke:#333,stroke-width:2px
+</div><p>这个链路，就是我们今天要手撕的全部。</p>
+<h3 id="秒杀系统的三大核心挑战-️">秒杀系统的三大核心挑战 ⚠️</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: center"><strong>挑战</strong></th>
+<th style="text-align: center"><strong>本质问题</strong></th>
+<th style="text-align: center"><strong>后果</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center">瞬时高并发</td>
+<td style="text-align: center">短时间内流量暴增 100-1000 倍</td>
+<td style="text-align: center">服务器雪崩、数据库宕机</td>
+</tr>
+<tr>
+<td style="text-align: center">超卖问题</td>
+<td style="text-align: center">并发读写导致库存不一致</td>
+<td style="text-align: center">订单量 <code>&gt;</code> 库存量，资损</td>
+</tr>
+<tr>
+<td style="text-align: center">恶意请求</td>
+<td style="text-align: center">脚本刷单、黄牛抢购</td>
+<td style="text-align: center">普通用户抢不到，体验差</td>
+</tr>
+</tbody>
+</table>
+<h3 id="整体架构设计-️">整体架构设计 🏗️</h3>
+<p>秒杀系统的核心思想是：<strong>分层限流 + 异步削峰 + 最终一致性</strong>，把流量层层拦截，最终只有极少部分请求能到达数据库。</p>
+<div class="mermaid">graph TD
+    A[用户请求] --&gt; B[CDN静态资源]
+    A --&gt; C[前端限流]
+    C --&gt; D[Nginx负载均衡+限流]
+    D --&gt; E[网关层限流+黑名单]
+    E --&gt; F[秒杀服务集群]
+    F --&gt; G["Redis缓存层&lt;br/&gt;(库存+限流+用户标记)"]
+    G --&gt; H["MQ消息队列&lt;br/&gt;(异步削峰)"]
+    H --&gt; I[订单服务]
+    I --&gt; J["数据库&lt;br/&gt;(最终库存扣减)"]
+    J --&gt; K[支付服务]
+</div><h3 id="核心流程拆解按时间线告诉你每一步在做什么">核心流程拆解（按时间线，告诉你每一步在做什么）</h3>
+<p>我用一个时序图，把一次正确的秒杀请求走通：</p>
+<div class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant CDN as CDN/静态页
+    participant GW as 网关
+    participant Redis as Redis
+    participant MQ as 消息队列
+    participant DB as 数据库
+
+    U-&gt;&gt;CDN: 1. 打开秒杀页面（静态HTML+JS）
+    CDN--&gt;&gt;U: 返回页面（秒杀开始前按钮置灰）
+    Note over U,CDN: 前端防作弊：按钮防抖、验证码、问答
+
+    U-&gt;&gt;GW: 2. 点击秒杀（携带token+商品ID+验证码）
+    GW-&gt;&gt;GW: 限流校验（令牌桶/漏桶），黑名单过滤
+    GW-&gt;&gt;Redis: 3. 资格预扣：DECR 库存
+    alt 库存 &gt; 0
+        Redis--&gt;&gt;GW: 扣减成功，返回成功
+        GW--&gt;&gt;U: 提示“排队中，请稍候”
+        GW-&gt;&gt;MQ: 4. 发送秒杀请求消息（用户ID+商品ID）
+    else 库存已空
+        Redis--&gt;&gt;GW: 库存不足
+        GW--&gt;&gt;U: 直接返回“已抢光”
+    end
+
+    MQ-&gt;&gt;DB: 5. 消费者拉取消息，异步创建订单
+    DB--&gt;&gt;MQ: 创建成功
+    MQ-&gt;&gt;Redis: 6. 标记该用户已下单成功
+    U-&gt;&gt;GW: 7. 轮询/推送 获取秒杀结果
+    GW-&gt;&gt;Redis: 查结果缓存
+    Redis--&gt;&gt;GW: 返回状态
+    GW--&gt;&gt;U: 成功页 / 失败页
+</div><h4 id="设计原则">设计原则：</h4>
+<ul>
+<li>能在前端拦截的，绝不放到后端</li>
+<li>能在缓存拦截的，绝不放到数据库</li>
+<li>能异步处理的，绝不同步处理</li>
+</ul>
+<h3 id="高并发解决方案-">高并发解决方案 🚄</h3>
+<h4 id="1-前端层限流-">1. 前端层限流 ✋</h4>
+<ul>
+<li>按钮置灰 + 倒计时，防止重复点击
+<ul>
+<li>点击抢购前，先弹出个滑块验证码或者简单的数学题。</li>
+<li>别小看这一步，它能直接把脚本党和手速慢的人分流出去，还顺带把瞬时峰值的尖峰削平了。</li>
+</ul>
+</li>
+<li>验证码 / 滑块验证，拦截机器请求</li>
+<li>随机延迟请求，分散流量峰值</li>
+<li>动静分离 &amp; CDN 🗂️
+<ul>
+<li>把秒杀页面做成<strong>纯静态 HTML</strong>，直接甩到 CDN 上。</li>
+<li>页面里秒杀按钮开始时是灰的，<strong>千万不要提前暴露真正的下单 URL</strong>。</li>
+<li>到点了，才通过一个额外请求动态获取秒杀地址（<code>/getSeckillPath</code>），这个 URL 还可以做成一次性的、加盐动态生成的。</li>
+</ul>
+</li>
+</ul>
+<p>秒杀最怕的就是海量请求直接把服务器打崩。所以，<strong>要将 99% 的不必要流量，拦截在上游。</strong></p>
+<h4 id="2-网关层限流-">2. 网关层限流 🚦</h4>
+<ul>
+<li>Nginx 配置limit_req_zone，按 IP 限流</li>
+<li>黑名单机制，封禁恶意 IP 和用户</li>
+<li>网关层令牌桶算法，限制总 QPS
+<ul>
+<li>在网关层，给秒杀接口加上<strong>令牌桶或漏桶限流器</strong>。</li>
+<li>比如：这个接口每秒只能放行 5000 个请求。多出来的直接快速失败，返回“挤不进去啦，请稍后再试~ 😅”。宁可把流量扼杀在此，也别让它冲垮下游。</li>
+</ul>
+</li>
+</ul>
+<h4 id="3-服务层限流-️">3. 服务层限流 🛡️</h4>
+<ul>
+<li>分布式限流：Redis+Lua 脚本实现令牌桶</li>
+<li>熔断降级：秒杀服务过载时，直接返回 "活动火爆"</li>
+<li>业务隔离：秒杀服务独立部署，不影响核心业务</li>
+</ul>
+<h4 id="4-缓存层优化-">4. 缓存层优化 💾</h4>
+<ul>
+<li>商品详情页静态化，CDN 加速</li>
+<li>活动开始前，将库存预热到 Redis</li>
+<li>使用 Redis Cluster 分片，提高并发能力</li>
+</ul>
+<h4 id="5-异步削峰-">5. 异步削峰 📥</h4>
+<ul>
+<li>库存扣减成功后，发送消息到 MQ</li>
+<li>订单服务异步消费消息，创建订单</li>
+<li>前端轮询 /websocket 通知用户抢购结果</li>
+</ul>
+<h3 id="超卖问题的终极解决方案-">超卖问题的终极解决方案 ✅</h3>
+<p>超卖的根本原因是：<strong>多个线程同时读取到相同的库存值，然后各自扣减，导致最终库存为负。</strong></p>
+<h4 id="方案对比-">方案对比 📊</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align: center"><strong>方案</strong></th>
+<th style="text-align: center"><strong>实现方式</strong></th>
+<th style="text-align: center"><strong>优点</strong></th>
+<th style="text-align: center"><strong>缺点</strong></th>
+<th style="text-align: center"><strong>适用场景</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center">数据库行锁</td>
+<td style="text-align: center"><code>UPDATE goods SET stock=stock-1 WHERE id=? AND stock&gt;0</code></td>
+<td style="text-align: center">简单可靠</td>
+<td style="text-align: center">数据库压力大</td>
+<td style="text-align: center">低并发秒杀</td>
+</tr>
+<tr>
+<td style="text-align: center">悲观锁</td>
+<td style="text-align: center"><code>SELECT ... FOR UPDATE</code></td>
+<td style="text-align: center">绝对不会超卖</td>
+<td style="text-align: center">性能极差，死锁风险</td>
+<td style="text-align: center">几乎不用</td>
+</tr>
+<tr>
+<td style="text-align: center">乐观锁</td>
+<td style="text-align: center">版本号机制</td>
+<td style="text-align: center">性能较好</td>
+<td style="text-align: center">高并发下成功率低</td>
+<td style="text-align: center">中低并发</td>
+</tr>
+<tr>
+<td style="text-align: center">Redis+Lua</td>
+<td style="text-align: center">原子脚本扣减库存</td>
+<td style="text-align: center">性能极高，原子性</td>
+<td style="text-align: center">依赖 Redis 可靠性</td>
+<td style="text-align: center">高并发秒杀 ✅</td>
+</tr>
+<tr>
+<td style="text-align: center">分布式锁</td>
+<td style="text-align: center">Redisson 分布式锁</td>
+<td style="text-align: center">通用性强</td>
+<td style="text-align: center">性能一般，复杂度高</td>
+<td style="text-align: center">复杂业务场景</td>
+</tr>
+</tbody>
+</table>
+<p><strong>面试官插话：你说了那么多，如果流量真的冲进来了，超卖问题到底怎么解决？</strong></p>
+<p><strong>我</strong>： 这正是秒杀的灵魂所在。我们<strong>绝对不能在数据库层面直接排队扣减</strong>，那样 MySQL 会直接死给你看。</p>
+<p><strong>核心方案：Redis 预减库存 + 数据库最终一致性扣减</strong></p>
+<h4 id="推荐方案redislua-原子脚本-">推荐方案：Redis+Lua 原子脚本 🌟</h4>
+<p>这是目前互联网大厂最主流的解决方案，<strong>性能最高且绝对不会超卖</strong>。</p>
+<p>我们把秒杀库存提前预热到 Redis 里。关键是，<strong>扣减操作必须原子化</strong>。我们用的不是多条 Redis 命令，而是一段 <strong>Lua 脚本</strong>：</p>
+<pre><code class="language-lua">-- 原子扣减库存脚本
+local stockKey = KEYS[1]
+local userKey = KEYS[2]
+local userId = ARGV[1]
+
+-- 1. 判断用户是否已经抢购过
+if redis.call('sismember', userKey, userId) == 1 then
+    return -1 -- 已抢购
+end
+
+-- 2. 判断库存是否充足
+local stock = tonumber(redis.call('get', stockKey))
+if stock &lt;= 0 then
+    return 0 -- 库存不足
+end
+
+-- 3. 扣减库存并标记用户已抢购
+redis.call('decr', stockKey)
+redis.call('sadd', userKey, userId)
+return 1 -- 抢购成功
+</code></pre>
+<p><strong>为什么这样能防止超卖？</strong> 因为 Redis 是单线程执行命令的，Lua 脚本在执行时会把整个脚本当成一个原子操作。绝对不会出现“读到还有库存，但去扣的时候被别人扣光了”的读后写竞态条件。🛡️</p>
+<p><strong>快返回、异步下单：MQ 削峰</strong> 📬</p>
+<ul>
+<li>Redis 扣减成功后，我们<strong>不立刻操作数据库</strong>。</li>
+<li>而是马上给用户返回“抢购成功，正在创建订单...”。</li>
+<li>同时，把“用户ID、商品ID”等必要信息，闪电般地扔进 <strong>RocketMQ</strong> 或 <strong>Kafka</strong> 里。服务端就直接结束了。</li>
+<li>这一步，把瞬时的百万级并发，变成了后端消费服务可以慢慢处理的<strong>流式消息</strong>，削峰填谷。</li>
+</ul>
+<h4 id="为什么-lua-脚本能保证原子性">为什么 Lua 脚本能保证原子性？</h4>
+<ul>
+<li>Redis 是单线程执行的</li>
+<li>整个 Lua 脚本会作为一个整体执行</li>
+<li>执行过程中不会被其他命令打断</li>
+</ul>
+<h4 id="最终一致性保证-">最终一致性保证 🤝</h4>
+<p>Redis 扣减成功后，通过 MQ 异步创建订单。如果订单创建失败，需要进行库存回补：</p>
+<ol>
+<li>订单服务消费消息失败，发送死信消息</li>
+<li>库存回补服务消费死信消息，将库存加回 Redis</li>
+<li>定时任务扫描超时未支付订单，自动取消并回补库存</li>
+</ol>
+<h3 id="️-数据库最后的兜底防线">🛡️ 数据库——最后的兜底防线</h3>
+<p><strong>面试官追问：那如果消息队列出错了，或者 Redis 有什么问题，数据库层面怎么兜底？</strong></p>
+<p><strong>我</strong>： 问得好。MySQL 是最后一道闸门，我们必须做最坏的打算。</p>
+<h4 id="方案乐观锁防超卖">方案：乐观锁防超卖</h4>
+<p>消费服务慢慢从 MQ 拉消息，真正去创建订单、扣减数据库库存时，必须用乐观锁。</p>
+<pre><code class="language-sql">-- 不用版本号，直接用库存数当条件，更简洁
+UPDATE seckill_product 
+SET stock = stock - 1 
+WHERE id = #{productId} 
+AND stock &gt;= 1;  -- 核心兜底条件
+</code></pre>
+<ul>
+<li>执行完后，看返回值。如果这个 SQL 影响行数为 0，说明<strong>库存其实已经没了</strong>（可能 Redis 那边因为主从延迟或异常，多扣了一点点）。</li>
+<li>此时，进行补偿操作：把 Redis 里多扣的库存加回去，然后标记该订单失败或回滚。整个链路最终一致。</li>
+</ul>
+<h3 id="-极限挑战热点数据问题怎么解">🔥 极限挑战：热点数据问题怎么解？</h3>
+<p>如果是不限量的茅台，谁也救不了，只能用更大的集群硬扛。但我们可以：</p>
+<ul>
+<li><strong>业务隔离</strong>：把秒杀系统单独部署，不和日常业务抢资源。</li>
+<li><strong>JVM 本地缓存</strong>：如果某个商品真的是绝对热点，可以把它的部分库存前置到服务本地的内存里，用 <code>AtomicInteger</code> 自旋扣减，再定时异步同步给 Redis。这样连 Redis 的网络开销都省了。💨</li>
+</ul>
+<h3 id="其他关键问题处理-️">其他关键问题处理 🛠️</h3>
+<ol>
+<li><strong>防黄牛</strong>：一人一单限制、实名认证、收货地址校验</li>
+<li><strong>数据一致性</strong>：最终一致性模型，定时对账</li>
+<li><strong>容灾备份</strong>：Redis 主从 + 哨兵，数据库主从复制</li>
+<li><strong>监控告警</strong>：实时监控 QPS、库存、订单量，异常告警</li>
+</ol>
+<h3 id="总结-">总结 📝</h3>
+<p>同学，我们回顾下这场秒杀设计的整个逻辑闭环，一张图记牢：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: center">层次</th>
+<th style="text-align: center">核心组件/策略</th>
+<th style="text-align: center">解决的核心问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center">👆 前端/网关</td>
+<td style="text-align: center">CDN、验证码、动态URL、网关令牌桶</td>
+<td style="text-align: center">挡住垃圾流量，削减尖峰</td>
+</tr>
+<tr>
+<td style="text-align: center">⚡ 核心业务</td>
+<td style="text-align: center"><strong>Redis + Lua 原子扣减</strong></td>
+<td style="text-align: center"><strong>彻底杜绝超卖</strong></td>
+</tr>
+<tr>
+<td style="text-align: center">🔄 异步处理</td>
+<td style="text-align: center">消息队列 RocketMQ/Kafka</td>
+<td style="text-align: center">削峰填谷，将并发变流式</td>
+</tr>
+<tr>
+<td style="text-align: center">🗄️ 最终兜底</td>
+<td style="text-align: center"><strong>数据库乐观锁（库存 ≥ 1）</strong></td>
+<td style="text-align: center">防止极端情况下数据不一致</td>
+</tr>
+<tr>
+<td style="text-align: center">📈 可观测性</td>
+<td style="text-align: center">监控、告警、限流动态调整</td>
+<td style="text-align: center">随时知道系统还能撑多久</td>
+</tr>
+</tbody>
+</table>
+<p>高并发秒杀系统的设计精髓就是：<strong>"挡"、"削"、"异"</strong> 三个字</p>
+<ul>
+<li><strong>挡</strong>：在前端、网关、缓存层挡住 99.9% 的流量</li>
+<li><strong>削</strong>：用消息队列削平流量峰值</li>
+<li><strong>异</strong>：将非核心流程异步化</li>
+</ul>
+<p>超卖问题的最优解是<strong>Redis+Lua 原子脚本</strong>，它在保证原子性的同时，提供了极高的性能，完全能扛住百万级 QPS 的秒杀场景。</p>
+<h2 id="核心代码">核心代码</h2>
+<h3 id="核心代码实现带技术亮点">核心代码实现（带技术亮点）</h3>
+<h4 id="1-redis-原子性库存预扣lua-脚本">1. Redis 原子性库存预扣（Lua 脚本）💡</h4>
+<p><strong>技术亮点</strong>：用 Lua 脚本将 "库存判断 + 扣减 + 用户限购" 打包成<strong>原子操作</strong>，彻底解决 Redis 并发下的竞态问题，比多次 Redis 调用性能高 3 倍以上。</p>
+<pre><code class="language-java">/**
+ * 原子性预扣减库存（Lua脚本实现）
+ * @param goodsId 商品ID
+ * @param userId 用户ID
+ * @param limitCount 每人限购数量
+ * @return 0-成功 1-库存不足 2-已达限购上限
+ */
+public int deductStock(Long goodsId, Long userId, int limitCount) {
+    String luaScript = """
+        local stockKey = KEYS[1]
+        local userKey = KEYS[2]
+        local limit = tonumber(ARGV[1])
+        
+        -- 1. 判断用户是否已达限购上限
+        local userBuyCount = redis.call('HGET', userKey, ARGV[2])
+        if userBuyCount and tonumber(userBuyCount) &gt;= limit then
+            return 2
+        end
+        
+        -- 2. 判断库存是否充足
+        local stock = redis.call('GET', stockKey)
+        if not stock or tonumber(stock) &lt;= 0 then
+            return 1
+        end
+        
+        -- 3. 扣减库存+记录用户购买数量
+        redis.call('DECR', stockKey)
+        redis.call('HINCRBY', userKey, ARGV[2], 1)
+        return 0
+    """;
+
+    List&lt;String&gt; keys = Arrays.asList(
+        "seckill:stock:" + goodsId,
+        "seckill:user:" + goodsId
+    );
+
+    return (Integer) redisTemplate.execute(
+        new DefaultRedisScript&lt;&gt;(luaScript, Integer.class),
+        keys,
+        limitCount,
+        userId.toString()
+    );
+}
+</code></pre>
+<h4 id="2-分布式防重锁redisson-可重入锁--看门狗">2. 分布式防重锁（Redisson 可重入锁 + 看门狗）🔒</h4>
+<p><strong>技术亮点</strong>：解决原生 SETNX 锁的 "锁过期但业务未执行完" 问题，Redisson 看门狗自动续期，支持可重入，是生产环境唯一推荐的分布式锁实现。</p>
+<pre><code class="language-java">/**
+ * 防止同一用户重复下单
+ */
+public Result seckill(Long goodsId, Long userId) {
+    String lockKey = "seckill:lock:" + goodsId + ":" + userId;
+    RLock lock = redissonClient.getLock(lockKey);
+
+    try {
+        // 尝试获取锁，最多等待0秒，锁默认30秒过期（看门狗自动续期）
+        if (!lock.tryLock(0, TimeUnit.SECONDS)) {
+            return Result.error("请勿重复提交请求");
+        }
+
+        // 执行库存预扣减
+        int result = deductStock(goodsId, userId, 1);
+        if (result == 1) {
+            return Result.error("商品已售罄");
+        }
+        if (result == 2) {
+            return Result.error("您已参与过本次秒杀");
+        }
+
+        // 生成订单ID，发送消息到Kafka
+        String orderId = UUID.randomUUID().toString();
+        kafkaTemplate.send("seckill-order-topic", 
+            new SeckillMessage(orderId, goodsId, userId));
+
+        return Result.success("排队成功，请等待订单生成");
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return Result.error("系统繁忙，请稍后再试");
+    } finally {
+        // 释放锁
+        if (lock.isHeldByCurrentThread()) {
+            lock.unlock();
+        }
+    }
+}
+</code></pre>
+<h4 id="3-消息队列幂等性消费者-">3. 消息队列幂等性消费者 ✅</h4>
+<p><strong>技术亮点</strong>：用订单 ID 作为唯一标识实现幂等性，解决 Kafka 消息重复消费导致的重复下单问题，同时配合事务保证消息处理的原子性。</p>
+<pre><code class="language-java">/**
+ * Kafka秒杀订单消费者（幂等性实现）
+ */
+@KafkaListener(topics = "seckill-order-topic", groupId = "seckill-group")
+public void onMessage(ConsumerRecord&lt;String, String&gt; record) {
+    SeckillMessage message = JSON.parseObject(record.value(), SeckillMessage.class);
+    String orderId = message.getOrderId();
+
+    // 1. 幂等性判断：如果订单已存在，直接返回
+    if (orderService.existOrder(orderId)) {
+        log.info("订单已存在，重复消费，orderId: {}", orderId);
+        return;
+    }
+
+    // 2. 事务处理：创建订单+扣减数据库库存
+    try {
+        orderService.createOrderWithStockDeduct(message);
+    } catch (Exception e) {
+        log.error("订单创建失败，orderId: {}", orderId, e);
+        // 发送到死信队列，人工处理
+        kafkaTemplate.send("seckill-dlq-topic", record.value());
+    }
+}
+</code></pre>
+<h4 id="4-数据库最终库存扣减行锁--乐观锁">4. 数据库最终库存扣减（行锁 + 乐观锁）📊</h4>
+<p><strong>技术亮点</strong>：用 MySQL 行锁防止超卖，同时用乐观锁版本号控制并发更新，在保证数据一致性的前提下最大化性能。</p>
+<pre><code class="language-sql">-- 最终库存扣减（行锁实现，绝对不会超卖）
+UPDATE seckill_goods 
+SET stock_count = stock_count - 1,
+    version = version + 1
+WHERE goods_id = #{goodsId} 
+  AND stock_count &gt; 0 
+  AND version = #{version};
+</code></pre>
+<h4 id="5-接口层的防刷与排队反馈限流--秒杀结果异步通知">5. 接口层的防刷与排队反馈（限流 + 秒杀结果异步通知）</h4>
+<pre><code class="language-java">@RestController
+public class SeckillController {
+    @Autowired
+    private SeckillStockService stockService;
+    @Autowired
+    private RocketMQTemplate mqTemplate;
+    @Autowired
+    private StringRedisTemplate redis;
+
+    // 秒杀接口
+    @PostMapping("/seckill/exec")
+    public Result exec(@RequestParam String itemId, 
+                       @RequestParam String captcha,
+                       HttpServletRequest request) {
+        String uid = getLoginUserId(request);
+        // 1. 验证码校验（防脚本）
+        if (!checkCaptcha(uid, captcha)) {
+            return Result.fail("验证码错误");
+        }
+        // 2. 用户级限流：每人只允许一次请求
+        String limitKey = "seckill:limit:" + itemId + ":" + uid;
+        Boolean limited = redis.opsForValue()
+                .setIfAbsent(limitKey, "1", Duration.ofMinutes(1));
+        if (Boolean.FALSE.equals(limited)) {
+            return Result.fail("请勿重复提交");
+        }
+        // 3. 库存预扣
+        boolean deducted = stockService.deductStock(itemId, 10); // 10个分片
+        if (!deducted) {
+            return Result.fail("已抢光");
+        }
+        // 4. 发送 MQ 消息，异步下单
+        SeckillMessage msg = new SeckillMessage(uid, itemId);
+        mqTemplate.asyncSend("seckill_order", msg, new SendCallback() {
+            @Override public void onSuccess(SendResult result) {}
+            @Override public void onException(Throwable e) {
+                // 发送失败，补偿恢复库存 + 删除 limitKey
+                // ... 异常处理逻辑，可发一条补偿消息
+            }
+        });
+        // 5. 立即返回排队结果，前端轮询查结果
+        return Result.ok("排队中，请稍候查看结果");
+    }
+
+    // 查询秒杀结果
+    @GetMapping("/seckill/result")
+    public Result queryResult(@RequestParam String itemId, HttpServletRequest req) {
+        String uid = getLoginUserId(req);
+        String resultKey = "seckill:result:" + itemId + ":" + uid;
+        String result = redis.opsForValue().get(resultKey);
+        if (result == null) {
+            return Result.ok("排队中");
+        }
+        return Result.ok(result); // "success" 或 "fail"
+    }
+}
+</code></pre>
+<p><strong>技术亮点</strong>：</p>
+<ul>
+<li><strong>Redis 用户限流</strong> 挡掉绝大多重复请求。</li>
+<li><strong>异步返回</strong>：秒杀接口耗时控制在 10ms 内，不阻塞用户。</li>
+<li><strong>失败补偿逻辑</strong>（生产需进一步细化）。</li>
+</ul>
+<h3 id="核心技术难点与解决方案">核心技术难点与解决方案</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: center"><strong>技术难点</strong></th>
+<th style="text-align: center"><strong>问题本质</strong></th>
+<th style="text-align: center"><strong>解决方案</strong></th>
+<th style="text-align: center"><strong>技术亮点</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center"><strong>库存超卖问题 ⚠️</strong></td>
+<td style="text-align: center">并发读写导致数据不一致，多个线程同时读到相同库存</td>
+<td style="text-align: center">1. Redis Lua 脚本原子预扣2. MySQL 行锁最终扣减3. 库存回补机制</td>
+<td style="text-align: center">双层防护，Redis 挡 99% 流量，DB 做最终兜底，绝对不会超卖</td>
+</tr>
+<tr>
+<td style="text-align: center"><strong>分布式锁可靠性问题 🔓</strong></td>
+<td style="text-align: center">原生 SETNX 锁过期但业务未执行完，导致多个线程同时拿到锁</td>
+<td style="text-align: center">1. Redisson 可重入锁2. 看门狗自动续期3. 锁释放 finally 块</td>
+<td style="text-align: center">解决了锁过期、死锁、不可重入三大问题，生产级可靠</td>
+</tr>
+<tr>
+<td style="text-align: center"><strong>消息丢失与重复消费 📨</strong></td>
+<td style="text-align: center">Kafka 消息在生产、传输、消费过程中可能丢失或重复</td>
+<td style="text-align: center">1. 生产者 ack=all + 重试2. 消费者手动提交 offset3. 订单 ID 幂等性</td>
+<td style="text-align: center">保证消息至少被消费一次，且不会重复处理</td>
+</tr>
+<tr>
+<td style="text-align: center"><strong>库存与订单一致性问题 🧩</strong></td>
+<td style="text-align: center">库存扣减成功但订单创建失败，导致库存丢失</td>
+<td style="text-align: center">1. 最终一致性模型2. 定时任务补偿3. 死信队列人工处理</td>
+<td style="text-align: center">用异步 + 补偿代替强事务，性能提升 10 倍以上</td>
+</tr>
+<tr>
+<td style="text-align: center"><strong>热点商品性能瓶颈 🔥</strong></td>
+<td style="text-align: center">单个商品百万级并发请求，导致 Redis 单节点 CPU 打满</td>
+<td style="text-align: center">1. 热点商品单独隔离2. Redis 库存分片3. 本地缓存预热</td>
+<td style="text-align: center">将热点流量分散到多个节点，单节点 QPS 从 10 万提升到 100 万</td>
+</tr>
+<tr>
+<td style="text-align: center"><strong>恶意请求与刷单问题 🤖</strong></td>
+<td style="text-align: center">脚本机器人批量抢购，普通用户抢不到</td>
+<td style="text-align: center">1. 多层验证码（滑块 / 点选）2. 设备指纹识别3. 风控系统实时拦截</td>
+<td style="text-align: center">拦截 99% 以上的恶意请求，保证活动公平性</td>
+</tr>
+<tr>
+<td style="text-align: center"><strong>系统高可用问题 🚨</strong></td>
+<td style="text-align: center">秒杀流量突增导致服务雪崩</td>
+<td style="text-align: center">1. Sentinel 限流降级2. 服务集群多活部署3. 全链路压测提前验证</td>
+<td style="text-align: center">系统过载时自动保护核心功能，不会整体宕机</td>
+</tr>
+<tr>
+<td style="text-align: center"><strong>订单超时取消问题 ⏰</strong></td>
+<td style="text-align: center">用户下单后未支付，需要自动取消并回补库存</td>
+<td style="text-align: center">1. Redisson 延迟队列2. 定时任务兜底扫描</td>
+<td style="text-align: center">延迟队列精确到秒级，比定时任务性能高 100 倍</td>
+</tr>
+</tbody>
+</table>
+<h4 id="-难点解决亮点图解以超卖为例">🔁 难点解决亮点图解（以“超卖”为例）</h4>
+<div class="mermaid">flowchart LR
+    A[用户请求] --&gt; B{Redis Lua&lt;br/&gt;DECR 分片 key}
+    B --&gt;|剩余 &gt;=0| C[允许进入排队]
+    B --&gt;|小于 0| D[直接拒绝]
+    C --&gt; E[MQ 异步下单]
+    E --&gt; F{DB 乐观锁&lt;br/&gt;UPDATE stock&gt;0}
+    F --&gt;|影响行数&gt;0| G[下单成功]
+    F --&gt;|影响行数=0| H[失败+补偿]
+    G --&gt; I[更新 Redis 结果]
+    H --&gt; J[回滚 Redis 库存]
+</div><p><strong>核心思路</strong>：</p>
+<ul>
+<li><strong>Redis 做快速准入</strong>（高效，允许少量超卖“假象”）</li>
+<li><strong>DB 做最终兜底</strong>（利用行锁/乐观锁严格不准超卖）</li>
+<li><strong>失败补偿</strong>：DB 发现库存真没了，Redis 加的库存要吐回去。</li>
+</ul>
+<p>这样一套组合拳，既保证了高并发下的性能，又用最终一致性保证不超卖，大厂里就是这么玩的 😎。</p>
+<h3 id="面试加分项总结-">面试加分项总结 ✨</h3>
+<ol>
+<li><strong>不要只说 "用 Redis 扣库存"</strong>，一定要提到<strong>Lua 脚本原子性</strong>，这是区分初级和中级工程师的关键</li>
+<li><strong>不要只说 "用分布式锁"</strong>，一定要提到<strong>Redisson 看门狗机制</strong>，说明你了解分布式锁的坑</li>
+<li><strong>不要只说 "用消息队列削峰"</strong>，一定要提到<strong>幂等性和消息可靠性</strong>，说明你考虑了生产环境的异常情况</li>
+<li><strong>不要只说 "不超卖"</strong>，一定要提到<strong>Redis+DB 双层防护</strong>，以及<strong>库存回补机制</strong>，说明你考虑了全流程的一致性</li>
+</ol>
+<p>【<strong>别走，交个朋友</strong>】<br>
+我是Rain ，一个喜欢把复杂技术讲透、让代码落地的实践者。<br>
+如果你厌倦了四处收集碎片化的八股文，想看看一线项目里真实的架构决策和踩坑记录，欢迎来我的公众号「<strong>Rain的Java大神之路</strong>」坐坐。<br>
+在这里，我会把每一次技术复盘、每一个项目的设计源码，毫无保留地分享给你。<br>
+关注后回复「源码」，我为你准备了几份我亲手注释的高并发项目核心源码，希望能帮你少走一些弯路。<br>
+🔥<strong>技术这条路很酷，我们结伴同行。</strong><br>
+🚀<strong>Keep Coding, Keep Loving —— 与所有 Java 同路人共勉。</strong></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-08 10:41">2026-07-08 10:40</span>&nbsp;
+<a href="https://www.cnblogs.com/zrui-xyu">Rain的Java大神实战圈</a>&nbsp;
+阅读(<span id="post_view_count">70</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21235877);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzrui-xyu%2Fp%2F21235877&amp;targetId=21235877&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

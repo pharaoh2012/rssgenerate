@@ -1,0 +1,283 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/gsyifan/p/21238964" title="发布于 2026-07-08 11:23">
+    <span role="heading" aria-level="2">.NET 程序保护实战系列 06 · 方法体加密：密钥在手才能执行的代码</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        方法体加密在安全性和性能之间达到了优秀的平衡——静态分析完全无法看到方法实现，运行时首次解密后性能不受影响。配合代码虚拟化，可以分层保护不同敏感度的方法。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="06--方法体加密密钥在手才能执行的代码">06 · 方法体加密：密钥在手才能执行的代码</h1>
+<h2 id="目录">目录</h2>
+<ol>
+<li><a href="#1-%E9%97%AE%E9%A2%98il-%E6%98%8E%E6%96%87%E5%AD%98%E6%94%BE%E5%9C%A8%E7%A8%8B%E5%BA%8F%E9%9B%86%E4%B8%AD" rel="noopener nofollow">问题：IL 明文存放在程序集中</a></li>
+<li><a href="#2-%E6%A0%B8%E5%BF%83%E6%80%9D%E8%B7%AF%E6%8F%90%E5%8F%96%E5%8A%A0%E5%AF%86%E6%9B%BF%E6%8D%A2%E8%A7%A3%E5%AF%86%E6%89%A7%E8%A1%8C" rel="noopener nofollow">核心思路：提取、加密、替换、解密执行</a></li>
+<li><a href="#3-%E6%96%B9%E6%B3%95%E4%BD%93-stub%E5%8F%82%E6%95%B0%E6%89%93%E5%8C%85%E4%B8%8E-methodguard-%E8%B0%83%E7%94%A8" rel="noopener nofollow">方法体 Stub：参数打包与 MethodGuard 调用</a></li>
+<li><a href="#4-dynamicmethod-%E8%BF%90%E8%A1%8C%E6%97%B6%E9%87%8D%E5%BB%BA-il" rel="noopener nofollow">DynamicMethod 运行时重建 IL</a></li>
+<li><a href="#5-iled-%E5%BA%8F%E5%88%97%E5%8C%96%E6%A0%BC%E5%BC%8F" rel="noopener nofollow">ILED 序列化格式</a></li>
+<li><a href="#6-%E5%BC%82%E5%B8%B8%E5%A4%84%E7%90%86%E5%99%A8eh%E7%9A%84%E9%87%8D%E5%BB%BA" rel="noopener nofollow">异常处理器（EH）的重建</a></li>
+<li><a href="#7-ldstr-%E6%8C%87%E4%BB%A4%E7%9A%84%E7%89%B9%E6%AE%8A%E5%A4%84%E7%90%86" rel="noopener nofollow">ldstr 指令的特殊处理</a></li>
+<li><a href="#8-token-%E8%A7%A3%E6%9E%90owner-%E6%A8%A1%E5%9D%97%E7%9A%84%E5%85%B3%E9%94%AE%E4%BD%9C%E7%94%A8" rel="noopener nofollow">Token 解析：owner 模块的关键作用</a></li>
+<li><a href="#9-%E6%96%B9%E6%B3%95%E9%80%89%E6%8B%A9%E4%B8%8E%E9%99%90%E5%88%B6" rel="noopener nofollow">方法选择与限制</a></li>
+<li><a href="#10-%E6%80%A7%E8%83%BD%E4%B8%8E%E5%AE%89%E5%85%A8%E6%80%A7" rel="noopener nofollow">性能与安全性</a></li>
+<li><a href="#11-%E7%BB%93%E8%AF%AD" rel="noopener nofollow">结语</a></li>
+</ol>
+<hr>
+<blockquote>
+<p><strong>注意</strong>：方法体加密（MethodEncryptionStep）是 TWSoft.AssemblyProtector 的高级保护功能，其核心实现涉及自研的 ILED 序列化引擎和 DynamicMethod 重建算法。本文介绍整体架构和关键设计决策，<strong>具体加密算法和 ILED 序列化源码不公开</strong>。</p>
+</blockquote>
+<hr>
+<h2 id="1-问题il-明文存放在程序集中">1. 问题：IL 明文存放在程序集中</h2>
+<p>.NET 程序的 IL 代码以明文形式存储在 <code>.text</code> 节中。即使是混淆后的程序，使用 dnSpy 打开，右键方法 → "Edit Method Body" → 可以看到完整的 IL：</p>
+<pre><code>.method public hidebysig static float64 Calculate(float64 a, float64 b) cil managed
+{
+  .maxstack 2
+  IL_0000: ldarg.0
+  IL_0001: ldarg.1
+  IL_0002: add
+  IL_0003: ret
+}
+</code></pre>
+<p>方法体加密的目标：<strong>让这个方法体在静态分析时不可见，只有在运行时通过正确的密钥才能解密并执行</strong>。</p>
+<hr>
+<h2 id="2-核心思路提取加密替换解密执行">2. 核心思路：提取、加密、替换、解密执行</h2>
+<pre><code>保护时（build-time）:
+
+1. 提取目标方法的完整 IL 体
+   ├── IL 指令字节码
+   ├── 局部变量签名 (local signature)
+   ├── 异常处理器表
+   └── 方法签名 (返回类型、参数类型)
+
+2. 序列化为 ILED 格式（IL Encoded Data）
+
+3. 加密 → 以 ManifestResource 嵌入程序集
+
+4. 替换原方法体为 stub：
+   → 创建 object[] 参数数组
+   → 加载方法 token
+   → 调用 MethodGuard.Invoke(token, args)
+   → 如有返回值则 unbox + ret
+</code></pre>
+<pre><code>运行时（run-time）:
+
+1. 首次调用 → MethodGuard.Invoke(token, args)
+2. 二分查找 token 对应的加密数据
+3. 解密 → 反序列化 ILED → 解析 IL + EH + local sig
+4. 通过 DynamicMethod + ILGenerator 重建完整方法体
+5. 缓存 DynamicMethod 委托 → 之后调用 O(1)
+6. 执行并返回结果
+</code></pre>
+<hr>
+<h2 id="3-方法体-stub参数打包与-methodguard-调用">3. 方法体 Stub：参数打包与 MethodGuard 调用</h2>
+<p>原方法签名：</p>
+<pre><code class="language-csharp">float Calculate(float a, float b)
+</code></pre>
+<p>替换后的 stub：</p>
+<pre><code class="language-il">// 创建参数数组
+ldc.i4.2
+newarr System.Object
+dup
+ldc.i4.0
+ldarg.0
+box float64
+stelem.ref
+dup
+ldc.i4.1
+ldarg.1
+box float64
+stelem.ref
+
+// 加载 token
+ldc.i4 &lt;methodToken&gt;
+
+// 调用 MethodGuard
+call object MethodGuard::Invoke(uint token, object[] args)
+
+// 还原返回值
+unbox.any float64
+ret
+</code></pre>
+<p><code>ldarg.0</code> → 原方法的第一个参数 <code>a</code>（注意 .NET 实例方法中 <code>ldarg.0</code> = <code>this</code>，静态方法的 <code>ldarg.0</code> = 第一个参数）</p>
+<hr>
+<h2 id="4-dynamicmethod-运行时重建-il">4. DynamicMethod 运行时重建 IL</h2>
+<p>运行时，<code>MethodGuard.Invoke</code> 解密数据后调用 <code>CreateDynamicMethod</code>，通过 <code>ILGenerator</code> 逐条发出 IL 指令：</p>
+<pre><code class="language-csharp">// 伪代码示意（非真实源码）
+DynamicMethod dm = new DynamicMethod("", returnType, paramTypes, ownerModule);
+ILGenerator il = dm.GetILGenerator();
+
+// 声明局部变量
+foreach (var local in locals)
+    il.DeclareLocal(local.Type);
+
+// 重建 IL
+foreach (var instruction in instructions)
+{
+    switch (instruction.OpCode)
+    {
+        case OpCodes.Ldarg_0: il.Emit(OpCodes.Ldarg_0); break;
+        case OpCodes.Add: il.Emit(OpCodes.Add); break;
+        case OpCodes.Call: il.Emit(OpCodes.Call, ResolveMethod(instruction.Token)); break;
+        // ... 200+ 条指令映射 ...
+    }
+}
+
+// 异常处理器
+foreach (var eh in exceptionHandlers)
+{
+    il.BeginExceptionBlock();
+    // emit try body
+    il.BeginCatchBlock(eh.CatchType);
+    // emit catch body
+    il.EndExceptionBlock();
+}
+
+var del = dm.CreateDelegate(delegateType);
+</code></pre>
+<hr>
+<h2 id="5-iled-序列化格式">5. ILED 序列化格式</h2>
+<p>ILED 是我们自研的 IL 二进制序列化格式，高效紧凑（通常比原始 IL 体小 30-50%）：</p>
+<pre><code>[Header]
+  4 bytes: Total size
+  2 bytes: Version
+
+[LocalSignature]
+  2 bytes: Sig length
+  N bytes: Signature blob
+
+[ILBody]
+  2 bytes: IL code length
+  N bytes: IL bytecode + token resolution hints
+
+[ExceptionHandlers]
+  2 bytes: EH count
+  8 bytes per EH: Try[offset,len] + Handler[offset,len] + type
+</code></pre>
+<p>加密后添加魔术头 <code>0xCAFEBABE</code>，存储为 ManifestResource。</p>
+<hr>
+<h2 id="6-异常处理器eh的重建">6. 异常处理器（EH）的重建</h2>
+<p><code>DynamicMethod</code> 通过 <code>ILGenerator</code> 支持异常处理器，但有以下限制：</p>
+<ul>
+<li>不支持 fault 块</li>
+<li>finally 需要手动管理局部变量槽</li>
+<li><code>leave</code> 指令需要指定目标 label</li>
+</ul>
+<p>我们的重建器正确处理所有 EH 类型，并为 finally/fault 生成补偿逻辑。</p>
+<hr>
+<h2 id="7-ldstr-指令的特殊处理">7. ldstr 指令的特殊处理</h2>
+<p><code>DynamicMethod</code> 的 <code>ResolveString</code> 不回退到 owner 模块的 <code>#US</code> 字符串堆。处理策略：</p>
+<ul>
+<li>保护时收集所有 <code>Ldstr</code> 指令的字符串</li>
+<li>序列化到 ILED 数据中（不依赖模块元数据）</li>
+<li>重建时通过 <code>ILGenerator</code> 重新 <code>Emit(OpCodes.Ldstr, "the string")</code></li>
+</ul>
+<hr>
+<h2 id="8-token-解析owner-模块的关键作用">8. Token 解析：owner 模块的关键作用</h2>
+<p>与虚拟化不同，方法体加密有一个关键优势：<strong>DynamicMethod 的 owner 模块 = 当前保护模块</strong>。</p>
+<pre><code class="language-csharp">// _ownerModule = typeof(MethodGuard).Module = 目标程序集
+DynamicMethod dm = new DynamicMethod("", returnType, paramTypes, _ownerModule);
+</code></pre>
+<p>因此 IL 中的 token（如 <code>call 0x0A000001</code>）可以直接在 owner 模块中解析——不需要虚拟化那样的"名称反射"机制。这既简化了实现，也提升了运行时性能。</p>
+<hr>
+<h2 id="9-方法选择与限制">9. 方法选择与限制</h2>
+<p>自动跳过以下方法：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>泛型方法</td>
+<td>DynamicMethod 不支持泛型实例化</td>
+</tr>
+<tr>
+<td>含 <code>ref struct</code> 局部变量</td>
+<td><code>Span&lt;T&gt;</code> 等不能 boxing</td>
+</tr>
+<tr>
+<td>值类型实例方法</td>
+<td>this 指针语义复杂</td>
+</tr>
+<tr>
+<td>byref-like 返回/参数</td>
+<td>不能 boxing</td>
+</tr>
+<tr>
+<td>抽象方法 / P/Invoke / 无方法体</td>
+<td>—</td>
+</tr>
+<tr>
+<td>含 <code>ldftn</code>/<code>ldvirtftn</code></td>
+<td>函数指针无法传递</td>
+</tr>
+</tbody>
+</table>
+<p>通过 <code>--method-scope</code> 控制加密范围：</p>
+<ul>
+<li><code>All</code> — 所有合格方法</li>
+<li><code>EntryPointOnly</code> — 仅入口点方法</li>
+<li><code>ByMethodName</code> — 按名称指定（<code>--method-names "Calculate;Verify"</code>）</li>
+</ul>
+<hr>
+<h2 id="10-性能与安全性">10. 性能与安全性</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>原生</th>
+<th>方法体加密</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>首次调用</td>
+<td>~10ns</td>
+<td>~0.5-2ms（解密+DynamicMethod 创建）</td>
+</tr>
+<tr>
+<td>后续调用</td>
+<td>~10ns</td>
+<td>~10ns（缓存委托直接调用）</td>
+</tr>
+<tr>
+<td>额外内存</td>
+<td>0</td>
+<td>+ 解密缓冲区 + DynamicMethod 缓存</td>
+</tr>
+</tbody>
+</table>
+<p>首次调用有毫秒级延迟，但后续调用与原生代码无异——因为 DynamicMethod 一经 JIT 编译即与普通方法无差别。</p>
+<hr>
+<h2 id="11-结语">11. 结语</h2>
+<p>方法体加密在安全性和性能之间达到了优秀的平衡——静态分析完全无法看到方法实现，运行时首次解密后性能不受影响。配合代码虚拟化，可以分层保护不同敏感度的方法。</p>
+<p>下一篇将讲解 <strong>JIT Hook 保护</strong>——另一种方法保护策略，仅在 .NET Framework 上可用。</p>
+<hr>
+<blockquote>
+<p>本文由 TWSoft.AssemblyProtector 驱动。方法体加密核心源码不公开，商业授权用户可获取完整实现。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-08 11:23">2026-07-08 11:23</span>&nbsp;
+<a href="https://www.cnblogs.com/gsyifan">翼帆</a>&nbsp;
+阅读(<span id="post_view_count">41</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21238964);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fgsyifan%2Fp%2F21238964&amp;targetId=21238964&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
