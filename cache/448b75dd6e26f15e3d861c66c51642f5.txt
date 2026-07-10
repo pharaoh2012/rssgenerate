@@ -1,0 +1,1028 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sxq-blog/p/21326505" title="发布于 2026-07-10 13:54">
+    
+
+    <span role="heading" aria-level="2">3D-VLA 方法原理详解</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="3d-vla-方法原理详解">3D-VLA 方法原理详解</h1>
+<h2 id="1-方法想解决什么问题">1. 方法想解决什么问题</h2>
+<p>传统视觉语言动作模型常见做法是：</p>
+<ol>
+<li>输入当前图像和语言指令。</li>
+<li>模型直接输出动作。</li>
+<li>机器人按动作执行。</li>
+</ol>
+<p>这种方式有一个核心缺陷：模型容易只在二维图像空间里“看起来懂了任务”，但并没有显式建立三维物理世界的状态变化。例如“把薯片袋拿出来”“关上抽屉”“把钱放进保险柜”这些任务，不只是识别物体，还需要理解：</p>
+<ul>
+<li>物体在三维空间中的位置。</li>
+<li>当前状态和目标状态有什么差别。</li>
+<li>哪些物体会移动，哪些环境结构要保持。</li>
+<li>动作执行后世界应该变成什么样。</li>
+</ul>
+<p>3D-VLA 的核心思想是：不要让模型直接从当前观察跳到动作，而是先让模型具备“想象目标状态”的能力。也就是先回答：</p>
+<blockquote>
+<p>如果这个指令完成了，世界应该长什么样？</p>
+</blockquote>
+<p>这个“目标世界”可以是目标 RGB 图像、目标 RGB-D 图像，也可以是目标点云。然后再基于当前状态和目标状态生成机器人动作。</p>
+<p>因此 3D-VLA 的方法可以概括为：</p>
+<blockquote>
+<p>用 3D 场景表示作为语言模型的输入，让语言模型在文本 token、3D token、目标生成 token 和动作 token 之间推理；当它需要预测未来状态时，调用 embodied diffusion model 生成目标图像或目标点云；最终将当前状态、目标状态和任务意图转化为机器人动作 token。</p>
+</blockquote>
+<h2 id="2-整体框架">2. 整体框架</h2>
+<p>3D-VLA 由三类能力组成：</p>
+<ol>
+<li>
+<p><strong>3D Vision-Language-Action Model</strong></p>
+<p>这是中枢模型。它基于 3D-LLM / BLIP2 / Flan-T5 的思想，把三维场景特征转成语言模型能读的 token embedding，并输出自然语言、目标生成请求或动作 token。</p>
+</li>
+<li>
+<p><strong>Embodied Diffusion Models</strong></p>
+<p>这是“目标想象器”。输入当前状态和语言指令，生成任务完成后的目标状态。仓库中包含两种：</p>
+<ul>
+<li>Goal Image LDM：生成目标 RGB 或 RGB-D 图像。</li>
+<li>Goal Point Cloud Diffusion Model：生成目标点云。</li>
+</ul>
+</li>
+<li>
+<p><strong>Robot Control Tokenization</strong></p>
+<p>这是“动作接口”。机器人动作被离散成语言模型能输出的特殊 token，例如位置 token、旋转 token、夹爪开合 token 和动作分隔 token。语言模型通过生成 token 序列来表示一串机器人控制命令。</p>
+</li>
+</ol>
+<p>整体数据流如下：</p>
+<pre><code class="language-text">当前多视角/RGB-D观察
+        |
+        v
+3D特征提取与点云/体素表示
+        |
+        v
+Q-Former压缩为少量3D scene tokens
+        |
+        v
+3D Vision-Language-Action LLM
+        |
+        +--&gt; 输出目标生成请求 token
+        |         |
+        |         v
+        |   Goal Image / Point Cloud Diffusion Model
+        |         |
+        |         v
+        |   生成目标图像或目标点云
+        |
+        +--&gt; 输出动作 token
+                  |
+                  v
+            解码成机器人动作
+</code></pre>
+<p>为了避免这个流程过于抽象，下面用一个具体任务走一遍。</p>
+<p>示例任务：</p>
+<pre><code class="language-text">用户指令: close bottom drawer
+当前观察: 机器人看到一个柜子，底层抽屉是打开的；系统已有当前场景点云 start_pc
+目标结果: 底层抽屉应该被关上，生成对应目标点云 goal_pc，并进一步产生关抽屉动作
+</code></pre>
+<p>对应的数据流可以展开成：</p>
+<pre><code class="language-text">1. 传感器/数据集给出当前状态
+
+   RGB-D / 多视角图像 / 点云
+   start_pc = [N, 6]
+   每个点包含 [x, y, z, r, g, b]
+
+        |
+        v
+
+2. 构建 3D 场景表示
+
+   从当前状态中采样固定数量的点，例如 2048 或 8192 个点。
+   坐标做归一化，颜色/语义特征保留。
+   如果走 3D-VLA LLM，则还会有 pc_feat = [N, 1408] 的点级特征。
+
+        |
+        v
+
+3. Q-Former 把大量 3D 点压缩成 scene tokens
+
+   输入:
+     pc_feat: [1, T, N, 1408]
+     pc:      [1, T, N, 3]
+
+   输出:
+     scene_tokens: [1, T, 32, hidden_dim]
+
+   这些 scene tokens 会插入到文本里的 &lt;scene&gt; 位置。
+
+        |
+        v
+
+4. 3D-VLA LLM 理解任务并产生中间意图
+
+   输入文本可以理解为:
+     "The initial scene is &lt;scene&gt;&lt;/scene&gt;. close bottom drawer"
+
+   插入 scene tokens 后，LLM 看到的不是纯文本，而是:
+     文本 token + 当前 3D 场景 embedding
+
+   方法级输出可能是:
+     "I should &lt;pcd&gt; close bottom drawer &lt;/pcd&gt;"
+
+   这表示模型决定先生成一个“抽屉关闭后”的目标点云。
+
+        |
+        v
+
+5. Goal Point Cloud Diffusion 生成目标状态
+
+   输入:
+     start_pc:    当前点云 [1, 6, N]
+     instruction: "close bottom drawer"
+     x_T:         随机噪声目标点云 [1, 6, N]
+
+   扩散模型每一步预测噪声:
+     model_input = concat(x_t, start_pc)  # [1, 12, N]
+     noise_pred = transformer(model_input, timestep, text="close bottom drawer")
+     x_{t-1} = scheduler.step(noise_pred, x_t)
+
+   输出:
+     goal_pc: 预测的关闭抽屉后点云 [1, 6, N]
+
+        |
+        v
+
+6. 当前状态和目标状态一起形成控制上下文
+
+   这里不能理解成“只把 goal_pc 直接丢给 action head”。
+   action 预测至少需要三类信息:
+
+   - 当前执行场景: 机器人现在面对的 3D 状态，也就是 current_scene / start_pc。
+   - 目标或意图上下文: goal_pc、goal_image，或由它们重新编码出的 goal_scene_tokens。
+   - 执行提示: 例如 "Execute now."，告诉 LLM 当前要从理解/想象阶段切换到动作输出阶段。
+
+   在方法图里，Robot Control 阶段画的是:
+     User: &lt;scene&gt;[embed]&lt;/scene&gt; Execute now.
+
+   这个 &lt;scene&gt;[embed]&lt;/scene&gt; 可以理解为用于控制的 3D 上下文 embedding。
+   它通常应表达“现在在哪里、要达到什么状态”这类信息，而不是裸目标状态本身。
+
+   一种更清楚的控制输入写法是:
+     "Current scene: &lt;scene&gt;&lt;/scene&gt;. Goal scene: &lt;scene&gt;&lt;/scene&gt;. Execute now."
+
+   输出动作 token:
+     &lt;aloc...&gt;&lt;aloc...&gt;&lt;aloc...&gt;&lt;arot...&gt;&lt;arot...&gt;&lt;arot...&gt;&lt;gripper...&gt;&lt;ACT_SEP&gt;...
+
+        |
+        v
+
+7. 动作 token 解码成机器人控制量
+
+   &lt;aloc*&gt;    -&gt; 末端执行器位置
+   &lt;arot*&gt;    -&gt; 末端执行器姿态
+   &lt;gripper*&gt; -&gt; 夹爪开合
+   &lt;ACT_SEP&gt;  -&gt; 动作步之间的分隔
+
+   最终得到一段关上底层抽屉的控制轨迹。
+</code></pre>
+<p>如果走 goal image 分支，步骤 5 换成：</p>
+<pre><code class="language-text">输入:
+  当前图像 image
+  指令 "close bottom drawer"
+  随机图像 latent x_T
+
+扩散过程:
+  model_input = concat(noisy_goal_image_latent, current_image_latent)
+  noise_pred = UNet(model_input, timestep, text="close bottom drawer")
+
+输出:
+  goal_image = 关闭底层抽屉后的目标图像
+</code></pre>
+<p>所以“整体数据流”真正表达的是：3D-VLA 先把当前世界编码成 LLM 能读的 scene tokens；LLM 决定任务需要什么目标状态；扩散模型生成这个目标状态；最后把当前执行场景、目标/意图上下文和 <code>Execute now</code> 这类执行提示一起作为控制输入，生成动作 token。它不是一条单纯的图像到动作流水线，而是一条带有“目标想象”中间环节的世界模型流水线。</p>
+<h2 id="3-输入表示如何把-3d-世界喂给语言模型">3. 输入表示：如何把 3D 世界喂给语言模型</h2>
+<p>这一节要回答一个最基本的问题：</p>
+<blockquote>
+<p>机器人看到的是图像、深度和点云，为什么最后能变成 LLM 可以读的 <code>&lt;scene&gt;</code>？</p>
+</blockquote>
+<p>先抓住一句话：3D-VLA 不把原始图片直接塞给 LLM，而是先把环境整理成一批“带位置的 3D 点”，再把这些点压缩成少量 scene tokens。</p>
+<p>可以把它想成给 LLM 准备一张三维版的场景清单。清单里的每一行大概是：</p>
+<pre><code class="language-text">第 i 个 3D 点:
+  它在哪里:       x, y, z
+  它看起来像什么: 视觉/语义特征 pc_feat[i]
+</code></pre>
+<p>例如“关上底层抽屉”这个任务里，场景中可能有很多点：</p>
+<pre><code class="language-text">点A: 位置在柜子底层抽屉把手附近，语义上像金属把手
+点B: 位置在抽屉面板上，语义上像木质抽屉
+点C: 位置在桌面边缘，语义上像桌面
+点D: 位置在背景墙上，语义上像无关背景
+</code></pre>
+<p>LLM 最终要知道的不是一张照片，而是“哪些东西在三维空间的哪里”。这就是第 3 节的核心。</p>
+<h3 id="31-第一步从观察中得到一批-3d-点">3.1 第一步：从观察中得到一批 3D 点</h3>
+<p>原始观察可以来自：</p>
+<ul>
+<li>单视角或多视角 RGB 图像。</li>
+<li>深度图或 RGB-D 图像。</li>
+<li>已经预处理好的点云。</li>
+</ul>
+<p>如果有 RGB-D 或多视角信息，就可以把像素反投影到 3D 空间，得到点云。每个点至少有空间坐标：</p>
+<pre><code class="language-text">pc[i] = [x, y, z]
+</code></pre>
+<p>这里的 <code>pc</code> 可以理解为 point coordinates，也就是“点在哪里”。</p>
+<p>在代码的数据集中，<code>pc</code> 最终会被整理成：</p>
+<pre><code class="language-text">pc: [T, N, 3]
+</code></pre>
+<p>含义是：</p>
+<ul>
+<li><code>T</code>：这个样本里有几个 3D 状态。常见最大值是 2，可以表示当前状态和目标状态。</li>
+<li><code>N</code>：每个状态采样多少个点。</li>
+<li><code>3</code>：每个点的三维坐标 <code>[x, y, z]</code>。</li>
+</ul>
+<h3 id="32-第二步给每个-3d-点配一个视觉语义特征">3.2 第二步：给每个 3D 点配一个视觉语义特征</h3>
+<p>只有坐标还不够。坐标只能说明“这里有一个点”，但不能说明“这个点属于抽屉、杯子、把手还是背景”。</p>
+<p>所以每个点还需要一个视觉特征：</p>
+<pre><code class="language-text">pc_feat[i] = 这个点看起来像什么
+</code></pre>
+<p>在当前仓库的数据格式里，每个点的视觉特征是 1408 维：</p>
+<pre><code class="language-text">pc_feat: [T, N, 1408]
+</code></pre>
+<p>可以不用纠结 1408 维每一维具体代表什么。直观理解就够了：</p>
+<pre><code class="language-text">pc[i]      告诉模型: 这个点在哪里
+pc_feat[i] 告诉模型: 这个点是什么/像什么
+</code></pre>
+<p>README 中提到的数据处理依赖 SAM、ConceptFusion、3D-CLR 等工具，可以理解为这些工具提前帮模型把图像和 3D 点变成了“带语义的点特征”。也就是说，3D-VLA LLM 训练时通常不是从原始图片端到端重新提取全部 3D 特征，而是读取已经预处理好的 3D features 和 point coordinates。</p>
+<h3 id="33-第三步把不同大小的点云整理成固定长度">3.3 第三步：把不同大小的点云整理成固定长度</h3>
+<p>真实场景的点数不固定。有的场景可能有几十万个点，有的场景点更少。但神经网络训练时需要每个 batch 形状一致，所以要采样成固定数量的点。</p>
+<p>源码确认：<code>ThreeDVQADataset</code> 会把每个 3D 状态采样到固定 <code>sample_num</code>。如果点太多，就随机采样；如果点太少，就复制已有点补齐。</p>
+<p>整理后的一个样本大概是：</p>
+<pre><code class="language-text">sample = {
+    pc_feat:    [T, N, 1408],  # N个点分别是什么/像什么
+    pc:         [T, N, 3],     # N个点分别在哪里
+    text_input: instruction_or_question,
+    answer:     target_text_or_action_tokens
+}
+</code></pre>
+<p>举一个更具体的例子：</p>
+<pre><code class="language-text">text_input:
+  "The initial scene is &lt;scene&gt;&lt;/scene&gt;. close bottom drawer"
+
+pc:
+  当前场景里 N 个点的 3D 坐标
+
+pc_feat:
+  这 N 个点对应的视觉语义特征
+
+answer:
+  模型应该输出的文本、目标生成 token 或动作 token
+</code></pre>
+<h3 id="34-第四步把坐标信息加进点特征里">3.4 第四步：把坐标信息加进点特征里</h3>
+<p>如果只看 <code>pc_feat</code>，模型可能知道某个点“像抽屉把手”，但不知道它在底层还是顶层、在左边还是右边。因此 3D-VLA 会把坐标也编码进去。</p>
+<p>源码确认：BLIP2/T5 模型中会把 x/y/z 三个坐标 clamp 到 0 到 255 的范围，分别查 positional embedding，再拼接成接近 1408 维的坐标编码，加到点特征上。</p>
+<p>可以把它理解为：</p>
+<pre><code class="language-text">每个点送入 Q-Former 前的表示 =
+    这个点的视觉语义特征
+  + 这个点的三维位置编码
+</code></pre>
+<p>这样模型看到的就不是孤立的“抽屉特征”，而是“位于底层某个空间位置的抽屉特征”。</p>
+<h3 id="35-这一节的最简总结">3.5 这一节的最简总结</h3>
+<p>第 3 节其实只讲一件事：把三维世界整理成 LLM 前端可用的输入。</p>
+<pre><code class="language-text">原始 RGB-D / 点云
+        |
+        v
+一批 3D 点坐标 pc = [T, N, 3]
+        |
+        v
+每个点配一个视觉语义特征 pc_feat = [T, N, 1408]
+        |
+        v
+采样/补齐到固定 N 个点
+        |
+        v
+把坐标位置编码加到视觉特征上
+        |
+        v
+交给 Q-Former 压缩成 &lt;scene&gt; 对应的 scene tokens
+</code></pre>
+<p>所以，<code>pc</code> 和 <code>pc_feat</code> 的区别可以一句话记住：</p>
+<pre><code class="language-text">pc      = 点在哪里
+pc_feat = 点是什么
+</code></pre>
+<h2 id="4-q-former把大量-3d-点压缩成少量-scene-tokens">4. Q-Former：把大量 3D 点压缩成少量 scene tokens</h2>
+<p>点云或体素特征数量很多，不能直接全部塞进大语言模型。3D-VLA 使用 BLIP2 风格的 Q-Former 做压缩。</p>
+<p>Q-Former 的输入是：</p>
+<pre><code class="language-text">pc_feat_with_position: [B, T, N, 1408]
+</code></pre>
+<p>Q-Former 内部有固定数量的 learnable query tokens。仓库中默认是 32 个 query token。每个 query token 通过 cross-attention 从所有 3D 点特征中抽取信息，最终每个 3D 状态被压缩成 32 个语言模型尺度的 embedding。</p>
+<p>也就是说：</p>
+<pre><code class="language-text">N个3D点/体素特征  --&gt;  32个scene embeddings
+</code></pre>
+<p>这些 scene embeddings 再经过线性投影，变成 Flan-T5 可以接收的 hidden size。</p>
+<p>伪代码如下：</p>
+<pre><code class="language-python">def encode_3d_scene(pc_feat, pc_coord):
+    # pc_feat: 每个3D点的视觉语义特征，形状为 [B, T, N, 1408]
+    # pc_coord: 每个3D点的空间坐标，形状为 [B, T, N, 3]
+
+    # 先把坐标离散到0-255范围，再查位置编码
+    pos_emb = positional_encoding(clamp(pc_coord, 0, 255))
+
+    # 把“点是什么”和“点在哪里”加在一起，形成带空间信息的点特征
+    point_tokens = pc_feat + 0.1 * pos_emb
+
+    scene_tokens = []
+    for each_state in range(T):
+        # 每个3D状态用32个可学习query从N个点里提取关键信息
+        query = learnable_query_tokens(num=32)
+        compressed = q_former_cross_attention(
+            query=query,
+            key_value=point_tokens[:, each_state]
+        )
+
+        # 把Q-Former输出投影到T5/LLM能接收的hidden维度
+        scene_tokens.append(linear_project_to_t5(compressed))
+
+    # 返回每个3D状态对应的scene tokens，形状为 [B, T, 32, t5_hidden_dim]
+    return scene_tokens
+</code></pre>
+<p>关键点是：Q-Former 不是把点云转成文字，而是把 3D 场景转成一组软 token embedding。这些 token 对语言模型来说就像“插入到句子里的视觉上下文”。</p>
+<h2 id="5-scene-token把-3d-embedding-插进语言上下文">5. <code>&lt;scene&gt;</code> token：把 3D embedding 插进语言上下文</h2>
+<p>3D-VLA 不是简单地把 scene embeddings 接在文本前面，而是使用特殊 token 作为插入位置。</p>
+<p>输入文本中会出现类似：</p>
+<pre><code class="language-text">The initial scene is &lt;scene&gt;&lt;/scene&gt;. Find some snacks for me.
+</code></pre>
+<p>模型在 tokenizer 层面加入了：</p>
+<pre><code class="language-text">&lt;scene&gt;, &lt;/scene&gt;
+</code></pre>
+<p>当输入文本 token 中遇到 <code>&lt;scene&gt;</code> 时，模型会在这个位置后面插入对应的 32 个 3D scene embeddings。</p>
+<p>如果一个样本有多个 3D 状态，就可以有多个 <code>&lt;scene&gt;</code> 占位符，每个占位符对应一个 3D 特征块。</p>
+<p>伪代码如下：</p>
+<pre><code class="language-python">def insert_scene_embeddings(text_tokens, scene_embeddings):
+    # text_tokens: 已经分词的文本，其中包含 &lt;scene&gt; 占位符
+    # scene_embeddings: 每个 &lt;scene&gt; 对应的一组3D embedding，形状为 [num_scenes, 32, hidden_dim]
+
+    output_embeddings = []
+    scene_index = 0
+
+    for token in text_tokens:
+        # 普通文本token直接查语言模型词表embedding
+        output_embeddings.append(embed_text_token(token))
+
+        if token == "&lt;scene&gt;":
+            # 遇到 &lt;scene&gt; 时，把对应的32个3D scene tokens插入到文本后面
+            output_embeddings.extend(scene_embeddings[scene_index])
+            scene_index += 1
+
+    # 返回“文本embedding + 3D embedding”混合后的LLM输入
+    return output_embeddings
+</code></pre>
+<p>这种设计的好处是：语言可以显式指代 3D 场景。模型不需要猜“这批视觉 embedding 是什么”，因为输入句子已经告诉它：这里是当前场景、这里是目标场景、这里是执行环境。</p>
+<h2 id="6-interaction-tokens把语言目标生成和动作统一成-token-接口">6. Interaction tokens：把语言、目标生成和动作统一成 token 接口</h2>
+<p>3D-VLA 的一个重要设计是把不同模态的交互都包装成特殊 token。</p>
+<p>仓库中加入的特殊 token 包括：</p>
+<pre><code class="language-text">位置:
+&lt;loc0&gt; ... &lt;loc255&gt;
+
+3D场景:
+&lt;scene&gt; &lt;/scene&gt;
+
+物体:
+&lt;obj&gt; &lt;/obj&gt;
+
+目标图像:
+&lt;image&gt; &lt;/image&gt;
+
+目标点云:
+&lt;pcd&gt; &lt;/pcd&gt;
+
+动作:
+&lt;aloc0&gt; ... &lt;aloc255&gt;
+&lt;arot0&gt; ... &lt;arot255&gt;
+&lt;gripper0&gt; &lt;gripper1&gt;
+&lt;ACT_SEP&gt;
+</code></pre>
+<p>这使得语言模型可以输出一种“混合程序”：</p>
+<pre><code class="language-text">Sure, I should &lt;pcd&gt; pick up &lt;obj&gt; the chip bag &lt;/obj&gt; &lt;loc...&gt; &lt;/pcd&gt;
+</code></pre>
+<p>含义不是普通自然语言，而是：</p>
+<ul>
+<li><code>&lt;pcd&gt;</code> 表示接下来要生成目标点云。</li>
+<li><code>&lt;obj&gt;...&lt;/obj&gt;</code> 标记目标物体。</li>
+<li><code>&lt;loc...&gt;</code> 标记目标相关空间位置。</li>
+<li><code>&lt;/pcd&gt;</code> 表示目标点云请求结束。</li>
+</ul>
+<p>对于机器人控制，输出可能类似：</p>
+<pre><code class="language-text">&lt;aloc12&gt;&lt;aloc98&gt;&lt;aloc43&gt;&lt;arot7&gt;&lt;arot200&gt;&lt;arot15&gt;&lt;gripper1&gt;&lt;ACT_SEP&gt;...
+</code></pre>
+<p>这表示一串离散化后的动作参数。模型不是直接输出浮点控制量，而是像生成文本一样生成动作 token，再由后处理把 token 解码回连续动作空间。</p>
+<h3 id="为什么要用-token-统一接口">为什么要用 token 统一接口</h3>
+<p>这样做有三个好处：</p>
+<ol>
+<li>
+<p><strong>统一学习目标</strong></p>
+<p>无论是回答问题、请求目标生成、描述物体位置，还是输出动作，本质上都变成 sequence-to-sequence 的 token 预测。</p>
+</li>
+<li>
+<p><strong>可组合</strong></p>
+<p>模型可以先生成“我需要一个目标点云”，再由扩散模型生成目标状态，之后再基于当前状态和目标/意图上下文生成动作。</p>
+</li>
+<li>
+<p><strong>可解释</strong></p>
+<p>中间输出不是黑盒向量，而是带有结构的 token 序列。人可以看出模型正在想象图像、点云，还是直接控制机器人。</p>
+</li>
+</ol>
+<h2 id="7-3d-vla-llm-的训练目标">7. 3D-VLA LLM 的训练目标</h2>
+<p>3D-VLA 的 LLM 部分本质上是条件文本生成：</p>
+<pre><code class="language-text">输入:  3D场景 + 用户指令/问题
+输出:  答案、目标生成请求、目标描述或动作token序列
+</code></pre>
+<p>训练时使用标准 teacher forcing：</p>
+<pre><code class="language-python">def train_3d_vla_llm(sample):
+    # 1. 把样本里的3D点特征和坐标编码成scene tokens
+    scene_tokens = encode_3d_scene(sample.pc_feat, sample.pc)
+
+    # 2. 把scene tokens插入到文本里的 &lt;scene&gt; 位置
+    input_embeddings = insert_scene_embeddings(
+        tokenize(sample.text_input),
+        scene_tokens
+    )
+
+    # 3. answer是监督信号，可能是普通答案、目标生成token或动作token
+    target_tokens = tokenize(sample.answer)
+
+    # 4. 用teacher forcing训练T5生成目标token序列
+    logits = t5(
+        encoder_inputs=input_embeddings,
+        decoder_inputs=target_tokens[:-1]
+    )
+
+    # 5. 计算下一个token预测的交叉熵损失
+    loss = cross_entropy(logits, target_tokens[1:])
+    update_trainable_parameters(loss)
+</code></pre>
+<p>源码确认的训练细节：</p>
+<ul>
+<li>语言模型基于 Flan-T5。</li>
+<li>T5 主体参数被冻结。</li>
+<li>T5 的输入/输出 embedding 会训练，因为新增了大量特殊 token。</li>
+<li>Q-Former 和从 Q-Former 到 T5 hidden size 的投影层承担 3D 对齐。</li>
+<li>训练样本的答案字段可以有多个 answer，训练时会展开为多个目标序列。</li>
+</ul>
+<p>这种设计不是从零训练一个大模型，而是把预训练语言模型作为推理核心，然后学习如何把 3D 场景嵌入到它能理解的 token 空间里。</p>
+<h2 id="8-goal-image--rgb-d-latent-diffusion-model">8. Goal Image / RGB-D Latent Diffusion Model</h2>
+<p>Goal Image LDM 用来回答：</p>
+<blockquote>
+<p>给定当前图像和语言指令，任务完成后的图像应该是什么样？</p>
+</blockquote>
+<p>训练样本形式是：</p>
+<pre><code class="language-text">当前图像 input_image
+语言指令 edit_prompt
+目标图像 edited_image
+可选当前深度 input_depth
+可选目标深度 edited_depth
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">input_image:  桌上有瓶子和海绵
+edit_prompt:  move water bottle near sponge
+edited_image: 瓶子移动到海绵附近后的图像
+</code></pre>
+<h3 id="81-它为什么基于-instructpix2pix">8.1 它为什么基于 InstructPix2Pix</h3>
+<p>InstructPix2Pix 的任务是：</p>
+<pre><code class="language-text">输入原图 + 编辑指令 -&gt; 输出编辑后的图
+</code></pre>
+<p>机器人目标图像生成也可以看成一种编辑：</p>
+<pre><code class="language-text">当前状态图像 + 任务指令 -&gt; 完成任务后的目标状态图像
+</code></pre>
+<p>所以 3D-VLA 直接使用 Stable Diffusion / InstructPix2Pix 风格的 latent diffusion training。</p>
+<h3 id="82-rgb-版本的训练过程">8.2 RGB 版本的训练过程</h3>
+<p>RGB 版本使用 VAE 把图像压到 latent 空间：</p>
+<pre><code class="language-text">目标图像 edited_image -&gt; target_latent
+当前图像 input_image -&gt; condition_latent
+语言指令 edit_prompt -&gt; text_embedding
+</code></pre>
+<p>训练时对目标 latent 加噪：</p>
+<pre><code class="language-text">noisy_target_latent = add_noise(target_latent, noise, timestep)
+</code></pre>
+<p>然后把 noisy target latent 和 condition latent 在通道维拼接，送入 UNet：</p>
+<pre><code class="language-text">UNet输入 = concat(noisy_target_latent, condition_latent)
+UNet条件 = text_embedding + timestep
+UNet输出 = predicted_noise
+loss = MSE(predicted_noise, true_noise)
+</code></pre>
+<p>RGB 图像的 latent 通常是 4 通道，因此：</p>
+<pre><code class="language-text">noisy目标latent: 4 channels
+当前图像condition latent: 4 channels
+UNet输入: 8 channels
+UNet输出: 4 channels
+</code></pre>
+<p>伪代码如下：</p>
+<pre><code class="language-python">def train_goal_image_ldm(batch):
+    # 当前图像是条件，目标图像是扩散模型要学习生成的结果
+    input_image = batch["original_pixel_values"]
+    goal_image = batch["edited_pixel_values"]
+    instruction = batch["input_ids"]
+
+    # 把目标图像和当前图像都编码到Stable Diffusion的latent空间
+    goal_latent = vae.encode(goal_image).sample() * vae_scaling
+    input_latent = vae.encode(input_image).mode()
+
+    # 随机选择扩散步，并给目标latent加噪声
+    t = sample_random_timestep()
+    noise = randn_like(goal_latent)
+    noisy_goal = scheduler.add_noise(goal_latent, noise, t)
+
+    # 文本指令作为条件；当前图像latent也作为条件
+    text_cond = clip_text_encoder(instruction)
+    model_input = concat_channels(noisy_goal, input_latent)
+
+    # UNet学习预测加到目标latent上的噪声
+    pred_noise = unet(model_input, t, text_cond)
+    loss = mse(pred_noise, noise)
+
+    # 只更新扩散UNet相关参数
+    update_unet(loss)
+</code></pre>
+<h3 id="83-rgb-d-版本如何扩展">8.3 RGB-D 版本如何扩展</h3>
+<p>RGB-D 版本把 RGB 和 depth 分别经过 VAE 编码，然后在 latent 通道上拼接：</p>
+<pre><code class="language-text">RGB目标latent:   4 channels
+Depth目标latent: 4 channels
+目标latent合计:  8 channels
+
+RGB当前latent:   4 channels
+Depth当前latent: 4 channels
+当前condition:   8 channels
+
+UNet输入: 16 channels
+UNet输出: 8 channels
+</code></pre>
+<p>源码确认：训练脚本会修改 UNet 的输入卷积和输出卷积，使其支持 RGB-D 的 16 通道输入和 8 通道输出。新增通道部分从预训练权重中尽量复制已有通道，其余初始化为零或新权重。</p>
+<h3 id="84-推理过程">8.4 推理过程</h3>
+<p>推理时没有目标图像。模型从随机噪声 latent 开始，逐步去噪：</p>
+<pre><code class="language-python">def infer_goal_image(input_image, instruction):
+    # 当前图像提供“从哪里开始变化”的条件
+    input_latent = vae.encode(input_image).mode()
+
+    # 文本指令提供“要变成什么样”的条件
+    text_cond = clip_text_encoder(instruction)
+
+    # 推理时没有目标图像，所以从随机latent噪声开始
+    x = random_latent()
+
+    for t in scheduler.timesteps:
+        # 每一步都把当前去噪状态和原始图像条件拼在一起
+        model_input = concat_channels(x, input_latent)
+        pred_noise = unet(model_input, t, text_cond)
+
+        # 根据预测噪声，从x_t更新到x_{t-1}
+        x = scheduler.step(pred_noise, t, x)
+
+    # 最终latent解码成目标图像
+    goal_image = vae.decode(x)
+    return goal_image
+</code></pre>
+<p>仓库推理默认使用：</p>
+<ul>
+<li>50 个 denoising steps。</li>
+<li>text guidance scale。</li>
+<li>image guidance scale。</li>
+<li>如果是 RGB-D，则分别 decode RGB latent 和 depth latent。</li>
+</ul>
+<h2 id="9-goal-point-cloud-diffusion-model">9. Goal Point Cloud Diffusion Model</h2>
+<p>Goal Point Cloud Diffusion Model 用来回答：</p>
+<blockquote>
+<p>给定当前点云和语言指令，任务完成后的目标点云应该是什么样？</p>
+</blockquote>
+<p>训练样本来自 RLBench，每个样本包含：</p>
+<pre><code class="language-text">start_pc:    初始点云
+end_pc:      目标点云
+instruction: 任务文字
+</code></pre>
+<p>每个点通常包含 6 个通道：</p>
+<pre><code class="language-text">[x, y, z, r, g, b]
+</code></pre>
+<h3 id="91-点云预处理">9.1 点云预处理</h3>
+<p>训练时会做几个关键预处理：</p>
+<ol>
+<li>
+<p>采样固定数量的点。</p>
+<p>仓库训练默认是 2048 点；推理配置中可以用 8192 点。</p>
+</li>
+<li>
+<p>对起始点云和目标点云使用同一套采样索引。</p>
+<p>这样第 <code>i</code> 个起始点和第 <code>i</code> 个目标点在训练中形成对应关系，扩散模型学习的是整组点的状态变化。</p>
+</li>
+<li>
+<p>归一化坐标。</p>
+<p>把起始点云和目标点云合在一起计算中心和半径，再把坐标归一化到单位球附近。这样不同场景尺度不会让模型训练不稳定。</p>
+</li>
+</ol>
+<p>伪代码：</p>
+<pre><code class="language-python">def preprocess_pointcloud_pair(start_pc, end_pc, sample_size):
+    # 1. 对起始点云采样固定数量的点
+    # 这里对start_pc和end_pc使用同一组索引，保持点的对应关系
+    idx = random_sample_indices(len(start_pc), sample_size)
+    start_pc = start_pc[idx]
+    end_pc = end_pc[idx]
+
+    # 2. 用起始点云和目标点云共同计算归一化中心和尺度
+    xyz_all = concat(start_pc[:, :3], end_pc[:, :3])
+    center = mean(xyz_all)
+    radius = max_norm(xyz_all - center)
+
+    # 3. 只归一化xyz坐标，颜色/其他通道保持原来的语义
+    start_pc[:, :3] = (start_pc[:, :3] - center) / radius
+    end_pc[:, :3] = (end_pc[:, :3] - center) / radius
+
+    # 返回处理后的“当前点云”和“目标点云”
+    return start_pc, end_pc
+</code></pre>
+<h3 id="92-为什么改造-point-e">9.2 为什么改造 Point-E</h3>
+<p>Point-E 原本是文本/图像条件点云生成模型。3D-VLA 需要的不是“从零生成一个物体点云”，而是：</p>
+<pre><code class="language-text">当前点云 + 语言指令 -&gt; 目标点云
+</code></pre>
+<p>所以它把模型输入改成：</p>
+<pre><code class="language-text">concat(noisy_goal_pc, start_pc)
+</code></pre>
+<p>如果每个点云是 6 通道，那么拼接后是 12 通道：</p>
+<pre><code class="language-text">noisy_goal_pc: 6 channels
+start_pc:      6 channels
+model_input:  12 channels
+model_output: 6 channels predicted noise
+</code></pre>
+<p>源码确认：<code>GoalPointDiffusionTransformer.modify_layer()</code> 会把输入线性层改为 12 通道，把输出线性层改为 6 通道，并尽量继承 Point-E 预训练权重。</p>
+<h3 id="93-训练过程">9.3 训练过程</h3>
+<p>训练目标和图像扩散类似，只是对象从 image latent 换成 point cloud tensor。</p>
+<pre><code class="language-python">def train_goal_pointcloud_diffusion(batch):
+    # start_pc是当前状态点云，goal_pc是任务完成后的目标点云
+    start_pc = batch["start_pc"]   # [B, N, 6]，每个点是[x,y,z,r,g,b]
+    goal_pc = batch["end_pc"]      # [B, N, 6]
+    text = batch["instruction"]
+
+    # 扩散模型按通道优先格式处理点云，所以从[B,N,6]转成[B,6,N]
+    start_pc = transpose_to_channels_first(start_pc)  # [B, 6, N]
+    goal_pc = transpose_to_channels_first(goal_pc)    # [B, 6, N]
+
+    # 随机选择扩散时间步，并给目标点云加噪声
+    t = sample_random_timestep()
+    noise = randn_like(goal_pc)
+    noisy_goal = scheduler.add_noise(goal_pc, noise, t)
+
+    # 把“带噪目标点云”和“当前点云”拼接，作为模型输入
+    model_input = concat_channels(noisy_goal, start_pc)  # [B, 12, N]
+
+    # Transformer根据当前点云、时间步和文本指令预测目标点云上的噪声
+    pred_noise = point_transformer(
+        x=model_input,
+        timestep=t,
+        input_pointcloud=start_pc,
+        texts=text
+    )
+
+    # 训练目标是让预测噪声接近真实噪声
+    loss = mse(pred_noise, noise)
+    update_model(loss)
+</code></pre>
+<p>模型内部使用：</p>
+<ul>
+<li>timestep embedding 表示当前扩散步。</li>
+<li>CLIP text embedding 表示语言指令。</li>
+<li>transformer backbone 建模点之间的全局关系。</li>
+<li>conditioning dropout 支持 classifier-free guidance。</li>
+</ul>
+<h3 id="94-推理过程">9.4 推理过程</h3>
+<p>推理时从随机点云噪声开始，在每一步只更新目标点云那 6 个通道，起始点云条件保持不变。</p>
+<pre><code class="language-python">def infer_goal_pointcloud(start_pc, instruction):
+    # 先把输入点云采样、归一化成模型需要的格式
+    start_pc = normalize_and_sample(start_pc)
+
+    # 推理时没有目标点云，所以从随机噪声点云开始
+    x_goal = randn([1, 6, N])
+
+    # 前6个通道是正在去噪的目标点云，后6个通道是固定的当前点云条件
+    x = concat_channels(x_goal, start_pc)  # [1, 12, N]
+
+    for t in scheduler.timesteps:
+        # 条件分支：带文本指令，预测“按指令完成任务”的去噪方向
+        pred_noise_cond = model(x, t, start_pc, texts=[instruction])
+
+        if use_classifier_free_guidance:
+            # 无条件分支：不输入文本，用于classifier-free guidance
+            pred_noise_uncond = model(x, t, start_pc, texts=[None])
+
+            # 放大文本指令带来的方向差异，让生成结果更听指令
+            pred_noise = pred_noise_uncond + scale * (
+                pred_noise_cond - pred_noise_uncond
+            )
+        else:
+            pred_noise = pred_noise_cond
+
+        # 只更新前6个通道，也就是目标点云；当前点云条件保持不变
+        x[:, :6] = scheduler.step(pred_noise, t, x[:, :6])
+
+    # 返回最终生成的目标点云
+    return x[:, :6]
+</code></pre>
+<p>仓库推理默认使用 64 个 reverse diffusion steps，classifier-free guidance scale 为 2.0。</p>
+<h2 id="10-目标想象如何服务机器人控制">10. 目标想象如何服务机器人控制</h2>
+<p>3D-VLA 最重要的思想不是“额外训练一个生成模型”，而是把目标生成变成动作规划前的中间世界模型。</p>
+<p>完整方法可以分成两阶段：</p>
+<h3 id="阶段一goal-imagination">阶段一：Goal Imagination</h3>
+<p>输入当前场景和用户指令：</p>
+<pre><code class="language-text">User: The initial scene is &lt;scene&gt;[embed]&lt;/scene&gt;. Find some snacks for me.
+</code></pre>
+<p>3D-VLA LLM 生成带结构的响应：</p>
+<pre><code class="language-text">Robot: Sure, I should &lt;pcd&gt; pick up &lt;obj&gt; the chip bag &lt;/obj&gt; [loc tokens] &lt;/pcd&gt;
+</code></pre>
+<p>这表示模型判断：为了完成任务，应该在目标点云空间中想象“薯片袋被拿起”后的状态。</p>
+<p>随后系统把 <code>&lt;pcd&gt;...&lt;/pcd&gt;</code> 中的语义、目标物体和位置 token 交给 point cloud diffusion model，生成目标点云。</p>
+<p>如果输出的是 <code>&lt;image&gt;...&lt;/image&gt;</code>，则调用 goal image diffusion model，生成目标图像或 RGB-D 图像。</p>
+<h3 id="阶段二robot-control">阶段二：Robot Control</h3>
+<p>得到目标状态后，系统进入 Robot Control 阶段。这里的 action 预测输入不是“只有目标状态”。更准确地说，输入是一个控制上下文，至少包括：</p>
+<ul>
+<li><strong>当前执行场景</strong>：机器人此刻所在的 3D 场景，包含当前物体位置、障碍物、抽屉/柜子等结构状态。</li>
+<li><strong>目标状态或目标意图</strong>：Goal Imagination 生成的目标图像/目标点云，或由目标状态重新编码得到的 scene tokens。</li>
+<li><strong>执行提示文本</strong>：例如 <code>Execute now.</code>，告诉 LLM 这一步要输出动作 token，而不是继续描述或继续想象。</li>
+</ul>
+<p>方法图中简化写成：</p>
+<pre><code class="language-text">User: &lt;scene&gt;[current_or_goal_embed]&lt;/scene&gt; Execute now.
+</code></pre>
+<p>这句话容易造成误解。它不是说 action 预测只看一个目标点云，而是说控制阶段仍然通过 <code>&lt;scene&gt;...&lt;/scene&gt;</code> 这个接口把 3D 控制上下文插入 LLM。这个 scene embedding 可以来自当前状态、目标状态，或者当前状态和目标状态共同构成的表示。对于真实控制任务，只知道目标状态通常不够，因为动作还依赖机器人当前末端位置、当前物体位置、可碰撞结构和执行起点。</p>
+<p>一种更明确的展开形式是：</p>
+<pre><code class="language-text">User: Current scene is &lt;scene&gt;[current_embed]&lt;/scene&gt;.
+      Goal scene is &lt;scene&gt;[goal_embed]&lt;/scene&gt;.
+      Execute now.
+</code></pre>
+<p>模型输出动作 token：</p>
+<pre><code class="language-text">Robot: Actions are: [action tokens]
+</code></pre>
+<p>这些 action tokens 再被解码为机器人轨迹或离散控制序列。</p>
+<p>源码边界也要说清楚：当前公开仓库定义了 action special tokens，也实现了 3D scene embedding 插入 LLM 的机制；但没有完整释放“当前状态 + 目标状态 -&gt; 动作控制器”的端到端控制脚本。因此这里讲的是 3D-VLA 方法层面的控制输入结构，不是公开代码里已经完整落地的控制数据格式。</p>
+<p>高层伪代码：</p>
+<pre><code class="language-python">def run_3dvla_policy(observation, user_instruction):
+    # 1. 从机器人当前观察中构建3D场景
+    current_scene = build_3d_scene(observation)
+
+    # 2. 把当前3D场景编码成LLM可以接收的scene tokens
+    current_scene_tokens = encode_3d_scene(
+        current_scene.features,
+        current_scene.coordinates
+    )
+
+    # 3. 先让LLM根据当前场景和用户指令判断是否需要目标想象
+    reasoning_text = llm_generate(
+        text=f"The initial scene is &lt;scene&gt;&lt;/scene&gt;. {user_instruction}",
+        scene_tokens=[current_scene_tokens]
+    )
+
+    if contains_goal_image_request(reasoning_text):
+        # 4a. 如果LLM输出了&lt;image&gt;请求，就调用目标图像扩散模型
+        goal_prompt = parse_between(reasoning_text, "&lt;image&gt;", "&lt;/image&gt;")
+        goal_state = goal_image_ldm.generate(
+            input_image=observation.rgb_or_rgbd,
+            instruction=goal_prompt
+        )
+
+        # 把生成的目标图像重新编码成控制阶段可用的3D/scene上下文
+        goal_scene_tokens = encode_goal_state(goal_state)
+
+    elif contains_goal_pointcloud_request(reasoning_text):
+        # 4b. 如果LLM输出了&lt;pcd&gt;请求，就调用目标点云扩散模型
+        goal_prompt = parse_between(reasoning_text, "&lt;pcd&gt;", "&lt;/pcd&gt;")
+        goal_state = goal_pcd_diffusion.generate(
+            input_pointcloud=current_scene.pointcloud,
+            instruction=goal_prompt
+        )
+
+        # 把生成的目标点云编码成控制阶段可用的scene tokens
+        goal_scene_tokens = encode_goal_state(goal_state)
+
+    else:
+        # 4c. 如果LLM没有要求目标想象，就直接基于当前场景执行
+        goal_scene_tokens = None
+
+    # 5. 动作预测不能只看目标状态；有目标时同时输入当前场景和目标场景
+    if goal_scene_tokens is not None:
+        action_text = llm_generate(
+            text="Current scene is &lt;scene&gt;&lt;/scene&gt;. "
+                 "Goal scene is &lt;scene&gt;&lt;/scene&gt;. "
+                 "Execute now.",
+            scene_tokens=[current_scene_tokens, goal_scene_tokens]
+        )
+    else:
+        # 没有显式目标状态时，只输入当前场景和执行提示
+        action_text = llm_generate(
+            text="Current scene is &lt;scene&gt;&lt;/scene&gt;. Execute now.",
+            scene_tokens=[current_scene_tokens]
+        )
+
+    # 6. 从LLM输出文本中解析动作token，并解码成机器人动作
+    action_tokens = parse_action_tokens(action_text)
+    robot_actions = decode_action_tokens(action_tokens)
+    return robot_actions
+</code></pre>
+<p>这里的核心是：LLM 不只是“看图说动作”，而是可以把任务拆成“当前状态理解 -&gt; 目标状态想象 -&gt; 动作生成”。</p>
+<h2 id="11-动作-token-如何表达机器人控制">11. 动作 token 如何表达机器人控制</h2>
+<p>仓库中加入了三类动作 token：</p>
+<pre><code class="language-text">&lt;aloc0&gt; ... &lt;aloc255&gt;
+&lt;arot0&gt; ... &lt;arot255&gt;
+&lt;gripper0&gt; &lt;gripper1&gt;
+&lt;ACT_SEP&gt;
+</code></pre>
+<p>它们可以表达一个 7D end-effector action：</p>
+<pre><code class="language-text">位置: x, y, z
+旋转: roll, pitch, yaw 或其他旋转参数化
+夹爪: open / close
+</code></pre>
+<p>一种典型解码方式是：</p>
+<pre><code class="language-python">def decode_action_step(tokens):
+    # 前3个位置token表示末端执行器目标位置的离散bin
+    x_bin = parse("&lt;aloc*&gt;", tokens[0])
+    y_bin = parse("&lt;aloc*&gt;", tokens[1])
+    z_bin = parse("&lt;aloc*&gt;", tokens[2])
+
+    # 后3个旋转token表示末端执行器目标姿态的离散bin
+    r1_bin = parse("&lt;arot*&gt;", tokens[3])
+    r2_bin = parse("&lt;arot*&gt;", tokens[4])
+    r3_bin = parse("&lt;arot*&gt;", tokens[5])
+
+    # 夹爪token表示开合状态
+    gripper = 1 if tokens[6] == "&lt;gripper1&gt;" else 0
+
+    # 把离散bin还原成连续空间中的位置和旋转
+    xyz = dequantize_position(x_bin, y_bin, z_bin)
+    rot = dequantize_rotation(r1_bin, r2_bin, r3_bin)
+
+    # 返回一个单步7D动作
+    return Action(xyz=xyz, rotation=rot, gripper=gripper)
+</code></pre>
+<p>多步动作之间用 <code>&lt;ACT_SEP&gt;</code> 分隔：</p>
+<pre><code class="language-python">def decode_action_sequence(token_sequence):
+    # &lt;ACT_SEP&gt; 用来分隔多个动作步
+    chunks = split_by_token(token_sequence, "&lt;ACT_SEP&gt;")
+
+    # 每一段token解码成一个机器人动作
+    return [decode_action_step(chunk) for chunk in chunks]
+</code></pre>
+<p>源码确认：当前公开代码中定义了这些 action special tokens，但没有完整释放 action token 到真实机器人控制器的后处理实现。因此本文对 7D 动作解码细节属于方法层解释，而不是公开仓库中已完整实现的控制栈。</p>
+<h2 id="12-三类训练任务之间的关系">12. 三类训练任务之间的关系</h2>
+<p>3D-VLA 不是只训练一个模型，而是多种任务共同形成能力。</p>
+<h3 id="121-3d-vla-llm-对齐训练">12.1 3D-VLA LLM 对齐训练</h3>
+<p>目标：让语言模型读懂 3D 场景，并输出正确文本、目标请求或动作 token。</p>
+<p>输入：</p>
+<pre><code class="language-text">3D场景特征 + 语言问题/指令
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">答案 / 目标生成token / 动作token
+</code></pre>
+<p>损失：</p>
+<pre><code class="language-text">token cross entropy
+</code></pre>
+<h3 id="122-goal-image-ldm-训练">12.2 Goal Image LDM 训练</h3>
+<p>目标：学习当前图像到目标图像的任务条件变化。</p>
+<p>输入：</p>
+<pre><code class="language-text">当前RGB/RGB-D + 指令
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">目标RGB/RGB-D
+</code></pre>
+<p>损失：</p>
+<pre><code class="language-text">diffusion noise prediction MSE
+</code></pre>
+<h3 id="123-goal-point-cloud-diffusion-训练">12.3 Goal Point Cloud Diffusion 训练</h3>
+<p>目标：学习当前点云到目标点云的任务条件变化。</p>
+<p>输入：</p>
+<pre><code class="language-text">当前点云 + 指令
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">目标点云
+</code></pre>
+<p>损失：</p>
+<pre><code class="language-text">diffusion noise prediction MSE
+</code></pre>
+<p>三者的关系可以理解为：</p>
+<pre><code class="language-text">LLM负责决定“应该想象什么/应该执行什么”
+Diffusion负责生成“完成任务后的世界状态”
+Action tokens负责把目标状态落实为控制命令
+</code></pre>
+<h2 id="13-关键设计为什么有效">13. 关键设计为什么有效</h2>
+<h3 id="131-显式引入目标状态">13.1 显式引入目标状态</h3>
+<p>如果直接输出动作，模型必须隐式学会：</p>
+<pre><code class="language-text">当前状态 -&gt; 目标状态 -&gt; 动作
+</code></pre>
+<p>3D-VLA 把中间的目标状态显式化：</p>
+<pre><code class="language-text">当前状态 -&gt; 目标想象 -&gt; 动作
+</code></pre>
+<p>这让模型更容易处理长时程任务，因为目标状态是一个可观察、可训练、可检查的中间变量。</p>
+<h3 id="132-使用-3d-表示而不是只用-2d-图像">13.2 使用 3D 表示而不是只用 2D 图像</h3>
+<p>二维图像容易受到视角、遮挡和尺度影响。3D 点云/体素表示能更直接表达：</p>
+<ul>
+<li>物体的真实空间位置。</li>
+<li>操作目标和障碍物之间的距离。</li>
+<li>抽屉、柜子、桌面等结构的三维关系。</li>
+<li>机器人末端执行器应该到达的位置。</li>
+</ul>
+<h3 id="133-用-token-统一多模态接口">13.3 用 token 统一多模态接口</h3>
+<p>把位置、物体、图像请求、点云请求和动作全部做成 token，使得系统可以复用大语言模型的序列生成能力，而不需要为每种输出设计完全不同的 head。</p>
+<h3 id="134-用扩散模型建模多解目标">13.4 用扩散模型建模多解目标</h3>
+<p>同一个任务可能有多个合理目标状态。例如“把杯子移到海绵附近”，杯子可以放在海绵左边、右边或前面。扩散模型天然适合生成多模态分布，而不是只回归一个平均结果。</p>
+<h3 id="135-冻结大语言模型主体训练对齐层和特殊-token">13.5 冻结大语言模型主体，训练对齐层和特殊 token</h3>
+<p>冻结 Flan-T5 主体可以保留语言模型已有的推理和泛化能力，同时降低训练成本。训练 Q-Former、投影层和新增 token embedding，让模型学会把 3D 世界接入语言空间。</p>
+<h2 id="14-最简洁的完整伪代码">14. 最简洁的完整伪代码</h2>
+<p>下面是一份把 3D-VLA 方法串起来的端到端伪代码。它表达的是论文方法的完整运行逻辑；当前公开仓库没有把这段闭环控制流程封装成同一个可直接运行的入口。</p>
+<pre><code class="language-python">class ThreeDVLA:
+    def __init__(self):
+        # 3D场景编码器：把点云/3D特征压缩成scene tokens
+        self.scene_encoder = QFormer3DEncoder()
+
+        # 带特殊token的语言模型：负责推理、请求目标生成、输出动作token
+        self.llm = FlanT5WithSpecialTokens()
+
+        # 目标图像生成模型：当前图像 + 指令 -&gt; 目标图像
+        self.goal_image_model = GoalImageLatentDiffusion()
+
+        # 目标点云生成模型：当前点云 + 指令 -&gt; 目标点云
+        self.goal_pcd_model = GoalPointCloudDiffusion()
+
+    def encode_scene(self, observation):
+        # 从观察中构建点级视觉特征和3D坐标
+        pc_feat, pc_coord = build_3d_features(observation)
+
+        # 编码成LLM可以通过&lt;scene&gt;读取的scene tokens
+        return self.scene_encoder(pc_feat, pc_coord)
+
+    def imagine_goal(self, observation, instruction):
+        # 先把当前观察编码成3D上下文
+        scene_tokens = self.encode_scene(observation)
+
+        # 让LLM根据当前场景和用户指令判断是否需要生成目标状态
+        response = self.llm.generate(
+            text="The initial scene is &lt;scene&gt;&lt;/scene&gt;. " + instruction,
+            scene_tokens=[scene_tokens],
+        )
+
+        if has_tag(response, "image"):
+            # LLM请求目标图像时，调用goal image diffusion
+            goal_instruction = extract_tag(response, "image")
+            return self.goal_image_model.generate(
+                input_image=observation.rgb_or_rgbd,
+                instruction=goal_instruction,
+            )
+
+        if has_tag(response, "pcd"):
+            # LLM请求目标点云时，调用goal point cloud diffusion
+            goal_instruction = extract_tag(response, "pcd")
+            return self.goal_pcd_model.generate(
+                input_pointcloud=observation.pointcloud,
+                instruction=goal_instruction,
+            )
+
+        # 如果LLM没有请求目标生成，则返回空，后续直接基于当前场景执行
+        return None
+
+    def act(self, observation, instruction):
+        # 动作阶段始终需要当前执行场景
+        current_scene_tokens = self.encode_scene(observation)
+
+        # 先尝试想象目标状态
+        goal_state = self.imagine_goal(observation, instruction)
+
+        if goal_state is not None:
+            # 有目标状态时，把目标状态也编码成scene tokens
+            goal_scene_tokens = self.encode_scene(goal_state)
+
+            # 动作预测同时输入当前场景和目标场景
+            action_text = self.llm.generate(
+                text="Current scene is &lt;scene&gt;&lt;/scene&gt;. "
+                     "Goal scene is &lt;scene&gt;&lt;/scene&gt;. "
+                     "Execute now.",
+                scene_tokens=[current_scene_tokens, goal_scene_tokens],
+            )
+        else:
+            # 没有显式目标状态时，只基于当前场景和执行提示输出动作
+            action_text = self.llm.generate(
+                text="Current scene is &lt;scene&gt;&lt;/scene&gt;. Execute now.",
+                scene_tokens=[current_scene_tokens],
+            )
+
+        # 将LLM生成的动作token解析并解码成机器人控制量
+        action_tokens = parse_action_tokens(action_text)
+        return decode_robot_actions(action_tokens)
+</code></pre>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/sxq-blog/" target="_blank">S-X-Q</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/sxq-blog/p/21326505" target="_blank">https://www.cnblogs.com/sxq-blog/p/21326505</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.05" data-date-updated="2026-07-10 15:06">2026-07-10 13:54</span>&nbsp;
+<a href="https://www.cnblogs.com/sxq-blog">S-X-Q</a>&nbsp;
+阅读(<span id="post_view_count">34</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21326505);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsxq-blog%2Fp%2F21326505&amp;targetId=21326505&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
