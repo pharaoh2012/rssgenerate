@@ -1,0 +1,1038 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/CtripDBA/p/21332731" title="发布于 2026-07-10 16:03">
+    
+
+    <span role="heading" aria-level="2">数据库软限制相关研究</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="1-背景">【1. 背景】</h2>
+<p>某服务器在执行全量备份期间，MySQL 错误日志中出现如下报错：</p>
+<pre><code class="language-C">[ERROR] [MY-012592] [InnoDB] Operating system error number 24 in a file operation.
+[ERROR] [MY-012596] [InnoDB] Error number 24 means 'Too many open files'
+[Note]  [MY-012597] [InnoDB] Refer to your operating system documentation for operating system error code information.
+</code></pre>
+<p>OS error 24（EMFILE）表示进程打开的文件描述符数量已达到操作系统限制。在备份过程中，InnoDB 需要同时访问大量 .ibd 数据文件，导致瞬时文件描述符需求大幅增加，从而触发该限制。</p>
+<p>此次报错反映出数据库实例及相关进程在操作系统资源软限制（soft limit）和 MySQL 文件描述符参数两个层面存在配置不当的问题，需要对相关参数进行统一梳理与优化。同时也需要对数据库实例的相关资源使用进行系统性的研究。</p>
+<p>文章后续示例使用linux系统版本为AlmaLinux 9.2，mysql以及mysql源码选择的是8.0.44版本。</p>
+<h2 id="2-文件句柄数">【2. 文件句柄数】</h2>
+<p>文件句柄（又称文件描述符）是操作系统内核分配给进程的整数编号，用于标识已打开的资源。Linux 系统采用"一切皆文件"的设计理念，不仅普通文件会占用文件句柄，网络连接、管道、设备等资源也会占用。</p>
+<p>对于 MySQL 而言，以下每个资源均会消耗文件句柄：</p>
+<ul>
+<li>每个 .ibd 数据文件（innodb_file_per_table=ON 时每表一个）</li>
+<li>binlog、redo log、undo log 等日志文件</li>
+<li>每个客户端连接对应的 socket</li>
+<li>临时文件</li>
+</ul>
+<h3 id="21-系统级别限制">【2.1 系统级别限制】</h3>
+<p><code>/proc/sys/fs/file-max</code></p>
+<p>这是整个操作系统所有进程能打开的文件描述符总量上限，由内核管理：</p>
+<pre><code class="language-Bash">[***@******* ~]$ cat /proc/sys/fs/file-max
+9223372036854775807
+</code></pre>
+<p><code>/proc/sys/fs/file-nr</code></p>
+<p>记录文件句柄使用情况的只读文件，包含三个数值：已分配句柄数、未使用句柄数（通常为 0）、系统最大句柄数</p>
+<pre><code class="language-Bash">[***@******** fs]$ cat /proc/sys/fs/file-nr
+2081        32        9223372036854775807
+</code></pre>
+<h3 id="22-进程级别限制">【2.2 进程级别限制】</h3>
+<p><code>/etc/security/limits.conf</code></p>
+<p>对所有用户的设置，在/etc/security/limits.conf文件，其是可以对系统用户、组进行cpu、文件数等限制的，通过它可以针对某个用户或全部进行限制。但不能超越系统的限制，以下是一个典型的配置：</p>
+<pre><code class="language-Bash"># /etc/security/limits.conf
+#
+#This file sets the resource limits for the users logged in via PAM.
+#It does not affect resource limits of the system services.
+#
+#Also note that configuration files in /etc/security/limits.d directory,
+#which are read in alphabetical order, override the settings in this
+#file in case the domain is the same or more specific.
+#That means for example that setting a limit for wildcard domain here
+#can be overriden with a wildcard setting in a config file in the
+#subdirectory, but a user specific setting here can be overriden only
+#with a user specific setting in the subdirectory.
+#
+#Each line describes a limit for a user in the form:
+#
+#&lt;domain&gt;        &lt;type&gt;  &lt;item&gt;  &lt;value&gt;
+#
+#Where:
+#&lt;domain&gt; can be:
+#        - a user name
+#        - a group name, with @group syntax
+#        - the wildcard *, for default entry
+#        - the wildcard %, can be also used with %group syntax,
+#                 for maxlogin limit
+#
+#&lt;type&gt; can have the two values:
+#        - "soft" for enforcing the soft limits
+#        - "hard" for enforcing hard limits
+#
+#&lt;item&gt; can be one of the following:
+#        - core - limits the core file size (KB)
+#        - data - max data size (KB)
+#        - fsize - maximum filesize (KB)
+#        - memlock - max locked-in-memory address space (KB)
+#        - nofile - max number of open file descriptors
+#        - rss - max resident set size (KB)
+#        - stack - max stack size (KB)
+#        - cpu - max CPU time (MIN)
+#        - nproc - max number of processes
+#        - as - address space limit (KB)
+#        - maxlogins - max number of logins for this user
+#        - maxsyslogins - max number of logins on the system
+#        - priority - the priority to run user process with
+#        - locks - max number of file locks the user can hold
+#        - sigpending - max number of pending signals
+#        - msgqueue - max memory used by POSIX message queues (bytes)
+#        - nice - max nice priority allowed to raise to values: [-20, 19]
+#        - rtprio - max realtime priority
+#
+#&lt;domain&gt;      &lt;type&gt;  &lt;item&gt;         &lt;value&gt;
+#
+
+#*               soft    core            0
+#*               hard    rss             10000
+#@student        hard    nproc           20
+#@faculty        soft    nproc           20
+#@faculty        hard    nproc           50
+#ftp             hard    nproc           0
+#@student        -       maxlogins       4
+
+# End of file
+
+* - nofile 65536
+* - nproc 65536
+* - sigpending 65536
+root       soft    nofile    unlimited
+root       soft    nproc     unlimited
+</code></pre>
+<p>/etc/security/limits.conf 用于设置通过 PAM 登录（如 SSH）的用户的资源限制，不影响系统服务的资源限制。系统不仅会读取该文件，还会读取 /etc/security/limits.d/ 目录下的所有 .conf 文件，按文件名字母顺序依次读取，后读的配置会覆盖先前的。</p>
+<p>但若 limits.conf 中为具体用户配置了限制：</p>
+<pre><code class="language-Plain">mysql   soft   nofile   65536
+</code></pre>
+<p>则 limits.d/ 目录中的通配符配置无法覆盖该设置。只有在 limits.d/ 中也为该用户配置相同项，才能将其覆盖。</p>
+<p>如下代码块中 20-nproc.conf 文件中 nofile 的参数就是进程真正的文件句柄数的限制</p>
+<pre><code class="language-Plain">[***@****** limits.d]$ cd /etc/security/limits.d/
+[***@****** limits.d]$ ll
+total 4
+-rw-r--r-- 1 root root 250 Oct 22  2024 20-nproc.conf
+[***@****** limits.d]$ cat 20-nproc.conf
+# Default limit for number of user's processes to prevent
+# accidental fork bombs.
+# See rhbz #432903 for reasoning.
+*
+* - nofile 65536
+* - nproc 65536
+* - sigpending 65536
+nproc
+root     soft  nofile    unlimited
+root     soft  nproc     unlimited
+</code></pre>
+<h3 id="23-mysql级别限制">【2.3 mysql级别限制】</h3>
+<p>当前所有部署的mysql服务由systemd托管。</p>
+<p>mysqld的systemd的配置文件在/usr/lib/systemd/system/mysqld.service，也可以通过systemctl show system-mysqld查看</p>
+<pre><code class="language-Bash">[***@***** system]$ cat /usr/lib/systemd/system/mysqld.service
+# Copyright (c) 2015, 2025, Oracle and/or its affiliates.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is designed to work with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have either included with
+# the program or referenced in the documentation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License, version 2.0, for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+#
+# systemd service file for MySQL forking server
+#
+
+[Unit]
+Description=MySQL Server
+Documentation=man:mysqld(8)
+Documentation=http://dev.mysql.com/doc/refman/en/using-systemd.html
+After=network-online.target
+Wants=network-online.target
+After=syslog.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+User=mysql
+Group=mysql
+
+Type=forking
+PIDFile=/var/run/mysqld/mysqld.pid
+
+# Disable service start and stop timeout logic of systemd for mysqld service.
+TimeoutSec=0
+
+# Execute pre and post scripts as root
+# hence, + prefix is used
+
+# Needed to create system tables
+ExecStartPre=+/usr/bin/mysqld_pre_systemd
+
+# Start main service
+ExecStart=/usr/bin/numactl --interleave=all /usr/sbin/mysqld --daemonize --pid-file=/var/run/mysqld/mysqld.pid $MYSQLD_OPTS
+
+# Use this to switch malloc implementation
+EnvironmentFile=-/etc/sysconfig/mysql
+
+# Sets open_files_limit
+LimitNOFILE=65535
+
+Restart=on-failure
+
+RestartPreventExitStatus=1
+
+# Set enviroment variable MYSQLD_PARENT_PID. This is required for restart.
+Environment=MYSQLD_PARENT_PID=1
+
+PrivateTmp=false
+StartLimitInterval=120
+StartLimitBurst=30
+</code></pre>
+<p>mysql的参数里 和LimitNOFILE直接对应的是open_files_limit</p>
+<pre><code class="language-SQL">mysql&gt;show variables like '%open_files_limit%';
++------------------+-------+
+| Variable_name    | Value |
++------------------+-------+
+| open_files_limit | 65535 |
++------------------+-------+
+1 row in set (0.00 sec)
+</code></pre>
+<p>mysql<a href="https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_open_files_limit" target="_blank" rel="noopener nofollow">官方手册</a>中也明确说明在使用systemd启动的mysql服务中open_files_limit不能超过LimitNOFILE值。</p>
+<h3 id="24-文件描述符总结">【2.4 文件描述符总结】</h3>
+<pre><code class="language-Bash">系统级 (fs.file-max)
+    └── 用户进程级 (limits.conf)
+    └── systemd (system-mysqld)
+             └── MySQL (open_files_limit)
+</code></pre>
+<h3 id="25--fd运维操作">【2.5  fd运维操作】</h3>
+<h4 id="251-修改操作系统fd限制">【2.5.1 修改操作系统fd限制】</h4>
+<pre><code class="language-Bash"># 临时修改（重启后失效）
+sysctl -w fs.file-max=1000000
+# 永久修改
+echo "fs.file-max = 1000000" &gt;&gt; /etc/sysctl.conf
+sysctl -p
+# 验证是否生效
+cat /proc/sys/fs/file-max
+</code></pre>
+<h4 id="252-修改进程级fd限制">【2.5.2 修改进程级fd限制】</h4>
+<pre><code class="language-Bash"># 查看当前进程级限制
+ulimit -n          # soft limit
+ulimit -Hn         # hard limit
+
+# 临时修改（当前会话生效）
+ulimit -n 65536
+
+# 永久修改，编辑 /etc/security/limits.conf
+vi /etc/security/limits.conf
+
+# 添加以下内容（针对所有用户）
+*     soft    nofile    65536
+*     hard    nofile    65536
+
+# 针对 mysql 用户单独设置（推荐）
+mysql soft    nofile    65536
+mysql hard    nofile    65536
+
+# 修改后重新登录生效，验证
+ulimit -n
+</code></pre>
+<h4 id="253-修改systemd-fd限制">【2.5.3 修改systemd fd限制】</h4>
+<pre><code class="language-Bash"># 查看 mysqld service 当前 fd 限制
+systemctl show mysqld | grep LimitNOFILE
+
+# 使用 override 文件（修改）
+sudo mkdir -p /etc/systemd/system/system-mysqld.d/
+sudo touch /etc/systemd/system/mysqld.service.d/override.conf
+echo -e "[Service] LimitNOFILE = 65536" | sudo tee /etc/systemd/system/system-mysqld.slice.d/override.conf
+
+# 重载配置
+sudo systemctl daemon-reload 
+
+# 验证是否生效（查看 mysqld 进程实际 fd 限制）
+cat /proc/$(pidof mysqld)/limits | grep "open files"
+</code></pre>
+<h4 id="254-linux查看进程文件句柄使用数量">【2.5.4 linux查看进程文件句柄使用数量】</h4>
+<pre><code class="language-Bash">#查看特定进程的文件句柄
+ls /proc/&lt;pid&gt;/fd | wc -l
+#实时监控进程的文件句柄
+watch -n 1 "ls /proc/&lt;pid&gt;/fd | wc -l"
+</code></pre>
+<h2 id="3-打开表">【3. 打开表】</h2>
+<h3 id="31-mysql表打开机制">【3.1 mysql表打开机制】</h3>
+<p><a href="https://dev.mysql.com/doc/refman/8.0/en/table-cache.html" target="_blank" rel="noopener nofollow">mysql官方文档</a></p>
+<p>在 MySQL 中，"打开表"不是一个抽象概念，而是具有明确系统行为的操作。当 MySQL 执行涉及某张表的 SQL 时，在实际访问数据前，必须先完成对该表的打开操作——即将表的元信息、文件句柄等资源加载到内存中。</p>
+<p>MySQL 采用多线程架构，因此多个客户端可以同时对同一张表发送查询。每个 session 各自维护独立的表句柄，而不是所有连接共享一个表句柄。</p>
+<p>下图是一条sql打开表的完整的链路<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1247138/202607/1247138-20260710150612989-910856631.png" class="lazyload"><br>
+在以下情况下，MySQL 会关闭未使用的表并将其从表缓存中删除：</p>
+<ul>
+<li>当缓存已满，线程尝试打开缓存中不存在的表时。</li>
+<li>当缓存包含的条目超过 table_open_cache一定数量，并且缓存中的某个表不再被任何线程使用时。</li>
+<li>当发生表刷新操作时。这发生在有人发出flush table等命令时。</li>
+</ul>
+<h3 id="32-table-cache">【3.2 Table Cache】</h3>
+<h4 id="321-tablecache基本介绍-">【3.2.1 tablecache基本介绍 】</h4>
+<p>Table Cache 是 MySQL 在内存中维护的专用缓冲区，用于存储已打开表的文件句柄和相关状态信息。其核心作用是用内存换 I/O：将已打开的表句柄保留在内存中，下次访问同一张表时直接复用，避免重复的文件打开操作。</p>
+<p><a href="https://dev.mysql.com/doc/refman/8.0/en/server-system-variables.html#sysvar_table_open_cache" target="_blank" rel="noopener nofollow">table_open_cache</a>是 Table Cache 的核心参数，表示 Table Cache 中最多可以同时缓存的表句柄数。其所需值与 max_connections 直接相关，假设数据库有 N 张表，集群支持 M 个并发连接，则 table_open_cache 的理论最大值为 N × M。</p>
+<p>在高并发场景下，所有线程共享同一个 Table Cache 会产生严重的锁竞争——每次访问 Cache 都需要加锁。MySQL 5.6.6 引入了 table_open_cache_instances 参数来解决该问题，将全局表缓存拆分成 N 个独立分区，每个分区各自拥有锁。table_open_cache_instances 的值代表分区数量，线程在某个分区获取所需表句柄后即可直接使用。</p>
+<p>MySQL 8.0 的 table_open_cache_instances 默认值为 16，建议不超过 CPU 核心数。若存在大量触发器，可能会增加内存压力。</p>
+<h4 id="322-源码解析">【3.2.2 源码解析】</h4>
+<p>mysql中每一个表由table这个结构体定义，table结构体中定义了一个TABLE_SHARE指针，TABLE_SHARE中存放了这个表的元数据。包括表名、库名、字段定义、索引结构、字符集、触发器解析代码、frm 文件读出的所有静态信息等。</p>
+<pre><code>//table.h:1400
+struct TABLE
+{
+  ....
+  TABLE_SHARE *s;
+  ....
+}</code></pre>
+<pre><code>//table.h :691
+struct TABLE_SHARE
+{
+ TABLE_SHARE() { memset(this, 0, sizeof(*this)); }
+  /** Category of this table. */
+  TABLE_CATEGORY table_category;
+  /* hash of field names (contains pointers to elements of field array) */
+  HASH  name_hash;      /* hash of field names */
+  MEM_ROOT mem_root;
+  TYPELIB keynames;     /* Pointers to keynames */
+  TYPELIB fieldnames;     /* Pointer to fieldnames */
+  TYPELIB *intervals;     /* pointer to interval info */
+  mysql_mutex_t LOCK_ha_data;           /* To protect access to ha_data */
+  TABLE_SHARE *next, **prev;            /* Link to unused shares */
+  Table_cache_element **cache_element;
+  ........
+}</code></pre>
+<p>其中，cache_element指向了一个一张表在某一个分片（Table_cache_element）中的存在记录。</p>
+<p>Table_cache_element记录了这个cache中的used_tables和free_tables。</p>
+<pre><code>//table.h
+class Table_cache_element
+{
+private:
+  typedef I_P_List <table, i_p_list_adapter<table,="" &table::cache_next,="" &table::cache_prev=""> &gt; TABLE_list;
+                                    
+  TABLE_list used_tables;
+  TABLE_list free_tables;
+  TABLE_SHARE *share;
+
+public:
+
+  Table_cache_element(TABLE_SHARE *share_arg)
+    : share(share_arg)
+  {
+  }
+
+  TABLE_SHARE * get_share() const { return share; };
+
+  friend class Table_cache;
+  friend class Table_cache_manager;
+  friend class Table_cache_iterator;
+};</table,></code></pre>
+<p>此外，MySQL 全局维护一个 Table_cache，其充当加锁的基本单位。</p>
+<p>LOCK_open 是 MySQL 的全局互斥锁，用于保护表的打开/关闭操作，包括 TABLE_SHARE 的创建与销毁以及数据字典的访问。</p>
+<p>引入分片 Table_cache 的目的之一是减少对 LOCK_open 的竞争。</p>
+<pre><code>//table_cache.cc
+class Table_cache
+{
+private:
+   /**
+    table cache 锁保护以下数据：
+    m_unused_tables 链表。
+    m_cache 哈希表。
+    本 cache 中各 Table_cache_element 对象的 used_tables、free_tables 链表。
+    m_table_count —— 本 cache 中 TABLE 对象的总数。
+    TABLE_SHARE::cache_element[] 数组中对应本 cache 的元素。
+    TABLE 对象中的 in_use 成员。
+    此外，更新 refresh_version、table_def_shutdown_in_progress 变量以及 TABLE_SHARE::version 成员时，需要持有所有 cache 的互斥锁。
+    设计意图是：任何在指定 table cache 中找到缓存表对象的查询，只需锁定该互斥锁实例，而无需锁定 LOCK_open。
+    但创建和释放 TABLE 对象时仍需要 LOCK_open。
+    不过，大多数 MySQL Server 的使用场景应能将 cache 大小设置得足够大，使得绝大多数查询只需锁定该互斥锁实例，而无需锁定 LOCK_open。
+    */
+  mysql_mutex_t m_lock;
+  /**
+  Table_cache_element 对象的哈希表。
+  凡是在本 Table_cache 中有 TABLE 对象的表/table share，都在此哈希表中有一个对应的 Table_cache_element，
+  其中存储了该表在本 cache 中的空闲 TABLE 对象链表和已使用 TABLE 对象链表。
+  哈希键为 Table_cache_element::share::table_cache_key。
+  */
+  HASH m_cache;
+  .......
+  }
+  
+ bool Table_cache_manager::init()
+ {
+  Table_cache::init_psi_keys();
+  for (uint i= 0; i &lt; table_cache_instances; i++)
+  {
+    if (m_table_cache[i].init())
+    {
+      for (uint j= 0; j &lt; i; j++)
+        m_table_cache[i].destroy();
+      return true;
+    }
+  }
+  return false;
+}</code></pre>
+<p><code>table_open_cache_instances</code>可以在Table_cache_manager::init()看到是直接控制m_table_cache生成个数的参数。</p>
+<p><code>table_open_cache</code>保存 的是TABLE对象本身</p>
+<p>TABLE对象是一个表被某个连接打开后的"运行时实例"，mysql官方文档说<code>table_open_cache_instances</code>过高导致内存压力大，主要是因为<code>TABLE</code>对象的对象的触发器开销本身挂在在TABLE::mem_root上，每一个<code>TABLE</code>实例都是独立的,并发连接数乘上去之后内存消耗就很显著了。如果表中有大型触发器需要适当调低<code>table_open_cache_instances</code>。</p>
+<h3 id="33-操作系统底层视角">【3.3 操作系统底层视角】</h3>
+<p>mysql8.0打开一张表的所有调用链如下（源码以8.0.44版本为例）</p>
+<p><code>open_tables() -&gt;sql/sql_base.cc:5759行</code></p>
+<p>SQL 层入口，遍历语句中所有 Table_ref 链表，申请 MDL 锁流程。</p>
+<p><code>open_and_process_table() -&gt;sql/sql_base.cc:4913行</code></p>
+<p>对单个 Table_ref 做分类处理：区分临时表与普通表，最终对普通表发起打开。</p>
+<p><code>open_table() -&gt;sql/sql_base.cc:2806行</code></p>
+<p>先查 Table Cache，命中则直接复用；未命中则获取 TABLE_SHARE，分配新 TABLE 对象，调用下层打开实体文件。</p>
+<p><code>open_table_from_share() -&gt;sql/table.cc:2877行</code></p>
+<p>根据 TABLE_SHARE 中的元数据初始化 TABLE 对象（字段、索引、分区等），然后通过存储引擎接口向下打开物理文件。</p>
+<p><code>handler::ha_open() -&gt;sql/handler.cc:2773行</code></p>
+<p>handler 基类的通用打开逻辑，处理只读降级、统计信息初始化等公共事务，再通过虚函数 open() 把打开表的动作到具体的存储引擎上。</p>
+<p><code>ha_innobase::open() -&gt;storage/innobase/handler/ha_innodb.cc:7191行</code></p>
+<p>InnoDB 引擎层入口，解析表名、设置事务隔离相关参数，调用 InnoDB 字典层加载表的内部元数据。</p>
+<p><code>dd_open_table() -&gt;storage/innobase/dict/dict0dd.cc:5404行</code></p>
+<p>从 MySQL Data Dictionary 读取表定义，构建 InnoDB 内部的 dict_table_t 结构，并触发表空间文件的关联与打开。</p>
+<p><code>fil_ibd_open() -&gt;storage/innobase/fil/fil0fil.cc:5777行</code></p>
+<p>构造 Datafile 对象，调用 open_read_only 打开表空间文件。</p>
+<p><code>Datafile::open_read_only() -&gt;storage/innobase/fsp/fsp0file.cc:112行</code></p>
+<p>InnoDB 表空间文件对象的只读打开封装，调用 OS 抽象层的简化打开接口。</p>
+<p><code>os_file_create_simple_no_error_handling-&gt; os_file_create_simple_no_error_handling_func() -&gt;storage/innobase/os/os0file.cc:3270行</code></p>
+<p>os_file_create_simple_no_error_handling是os_file_create_simple_no_error_handling_func函数的包装宏。</p>
+<p>在os_file_create_simple_no_error_handling_func函数中，InnoDB 跨平台的 OS 抽象层，直接发起open()系统调用。</p>
+<p><code>::open() -&gt;POSIX 系统调用</code></p>
+<p>对于打开一张表的操作，操作系统在这个过程中做的事情主要有：找到文件（路径解析+inode定位）、确认权限、通过open(2)分配访问句柄（fd）。真正的磁盘 I/O 发生在后续查询执行阶段，而不是打开阶段。操作系统成功打开后，fd 沿调用链一路返回给 InnoDB 的 fil system，后续所有对该表的读写 I/O 都通过这个 fd 进行。</p>
+<h3 id="34-table_open_cache与innodb_open_files">【3.4 table_open_cache与innodb_open_files】</h3>
+<h4 id="341-innodb_open_files介绍">【3.4.1 innodb_open_files介绍】</h4>
+<p>引入一个场景，某数据库有压测的需求，需要大量的并发连接数，当把max_connection调整到30000，table_open_cache也调整到30000，发现偶尔还是有进程卡在open table状态，然后检查了一下当Open_tables是30000的时候 mysql实例实际使用的文件句柄仅仅只有25000左右，同时该实例长期有1w左右的连接数，说明mysql实例实际使用的文件句柄数不尽尽和打开表的数量有关，还应该有别的参数在控制这一过程。</p>
+<pre><code>mysql&gt; SHOW GLOBAL STATUS LIKE 'Open_tables%';
++---------------+-------+
+| Variable_name | Value |
++---------------+-------+
+| Open_tables   | 30000 |
++---------------+-------+
+1 row in set (0.01 sec)</code></pre>
+<pre><code>[***@******** ~]$ sudo ls /proc/4146482/fd | wc -l
+25706</code></pre>
+<p>从3.2.2的源码流程可以看出，当mysql试图打开一张表时，首先会在内存的TableCache中创建一个Table对象，这个对象仅仅和内存使用有关系，也就是table_open_cache的数量只对server层有意义，实际在打开文件的是innodb层，innodb实际上也维护了一个自己的缓存池用于缓存打开的InnoDB .ibd 文件，使用<code>innodb_open_files</code>参数控制可以同时打开的.ibd文件数量的大小。</p>
+<h4 id="342-源码分析">【3.4.2 源码分析】</h4>
+<pre><code>//默认值0 PLUGIN_VAR_READONLY代表启动mysql实例后不可更改
+static MYSQL_SYSVAR_LONG(
+    open_files, innobase_open_files, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "How many files at the maximum InnoDB keeps open at the same time.",
+    nullptr, nullptr, 0L, 0L, INT32_MAX, 0);</code></pre>
+<p>下面的代码片段展示了innobase_open_files的初始化过程：</p>
+<p>1.当innobase_open_files没有显式设置时(初始值为0),会有一个300的兜底值，如果srv_file_per_table打开了且table_open_cache大于300则把innobase_open_files调整到和table_open_cache相等。因为当srv_file_per_table打开时,每一张表对应一个.ibd文件,文件句柄要和表缓存匹配，否则缓存会没有意义。</p>
+<p>2.当innobase_open_files的值超过open_files_limit的时候，会触发一个warn并且强制截断到table_open_cache。</p>
+<pre><code>//sql/sys_vars.cc:5111
+  //这里放上来说明用户视角的table_open_cache变量绑定的cpp变量是table_cache_size，文章在后面不会区分这两个名词
+  static Sys_var_ulong Sys_table_cache_size(
+    "table_open_cache",
+    "The number of cached open tables "
+    "(total for all table cache instances)",
+    GLOBAL_VAR(table_cache_size), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 512 * 1024), DEFAULT(TABLE_OPEN_CACHE_DEFAULT),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+    ON_UPDATE(fix_table_cache_size), nullptr,
+    /* table_open_cache is used as a sizing hint by the performance schema. */
+    sys_var::PARSE_EARLY);
+  
+  
+  //storage/innobase/handler/ha_innodb.cc:4949行
+  if (innobase_open_files &lt; 10) {
+    innobase_open_files = 300;
+    if (srv_file_per_table &amp;&amp; table_cache_size &gt; 300) {
+      innobase_open_files = table_cache_size;
+    }
+  }
+
+  if (innobase_open_files &gt; (long)open_files_limit) {
+    ib::warn(ER_IB_MSG_539) &lt;&lt; "innodb_open_files should not be greater"
+                               " than the open_files_limit.\n";
+    if (innobase_open_files &gt; (long)table_cache_size) {
+      innobase_open_files = table_cache_size;
+    }
+  }</code></pre>
+<pre><code>//storage/innobase/srv/srvOstart.cc:1661行
+ fil_init(innobase_get_open_files_limit());
+
+//storage/innobase/handler/ha_innodb.cc:5112行 
+long innobase_get_open_files_limit() { return innobase_open_files; }
+
+//storage/innobase/fil/fil0fil.cc:3618行
+void fil_init(ulint max_n_open) {
+  static_assert((1 &lt;&lt; UNIV_PAGE_SIZE_SHIFT_MAX) == UNIV_PAGE_SIZE_MAX,
+                "(1 &lt;&lt; UNIV_PAGE_SIZE_SHIFT_MAX) != UNIV_PAGE_SIZE_MAX");
+
+  static_assert((1 &lt;&lt; UNIV_PAGE_SIZE_SHIFT_MIN) == UNIV_PAGE_SIZE_MIN,
+                "(1 &lt;&lt; UNIV_PAGE_SIZE_SHIFT_MIN) != UNIV_PAGE_SIZE_MIN");
+
+  ut_a(fil_system == nullptr);
+
+  ut_a(max_n_open &gt; 0);
+
+  fil_system = ut::new_withkey<fil_system>(UT_NEW_THIS_FILE_PSI_KEY, MAX_SHARDS,
+                                           max_n_open);
+}
+ 
+  </fil_system></code></pre>
+<p>对于3.4.1的场景来说，该实例的innodb_open_files只有12000，所以该实例使用的文件句柄数大概是12000(ibd)+11000(连接数)+系统文件占用的文件句柄(binlog,redolog,系统表等) 约等于25000多。</p>
+<p>当我们需要提高某个mysql实例的文件缓存数目时，正确的做法应该是同时提高table_open_cache和innodb_open_files两个参数，而不是单纯提高table_open_cache。</p>
+<h3 id="35-常用运维操作">【3.5 常用运维操作】</h3>
+<pre><code>-- 查看当前配置值
+SHOW VARIABLES LIKE 'table_open_cache%';
+
+--监控表打开数量
+SHOW GLOBAL STATUS LIKE 'Open_tables%'; /*当前打开表的数量*/
+SHOW GLOBAL STATUS LIKE 'Opened_tables';/*历史总打开表的数量*/
+
+--监控缓存使用情况
+SHOW GLOBAL STATUS LIKE 'Table_open_cache%';
+/*
+Table_open_cache_hits 代表打开表时缓存命中次数    
+Table_open_cache_misses 代表打开表时缓存未命中次数  
+Table_open_cache_overflows 代表缓存溢出次数，使用完一个TABLE 对象后，尝试将其返回缓存但缓存已满，会从缓存中驱逐一个对象
+*/
+
+-- 计算缓存命中率
+SELECT
+  hits,
+  misses,
+  ROUND(hits / (hits + misses) * 100, 2) AS hit_ratio_pct
+FROM (
+  SELECT
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status
+     WHERE VARIABLE_NAME = 'Table_open_cache_hits') + 0  AS hits,
+    (SELECT VARIABLE_VALUE FROM performance_schema.global_status
+     WHERE VARIABLE_NAME = 'Table_open_cache_misses') + 0 AS misses
+) t;
+
+-- 关闭所有空闲表，清空缓存
+FLUSH TABLES;
+
+-- 只刷新指定表
+FLUSH TABLES db_name.table_name;
+
+-- 清零所有 status 计数，重新观察命中率变化趋势
+FLUSH STATUS;
+
+</code></pre>
+<h3 id="36-总结">【3.6 总结】</h3>
+<p>第一层：OS 层 — open_files_limit</p>
+<p>管的是整个进程的文件描述符总数。mysqld 启动时会向操作系统申请，实际拿到多少取决于配置值和 <code>ulimit -n</code> 谁更小，结果可以通过 <code>SHOW VARIABLES LIKE 'open_files_limit'</code> 确认。这个池子是共享的——socket、binlog、redo log、.ibd 文件全都从这里使用。</p>
+<p>第二层：Server 层 — table_open_cache</p>
+<p>管的是 Server 层缓存的 TABLE 对象数量，每张打开的表对应一个，里面存储表的元数据、统计信息等。超出上限后按 LRU 淘汰最久没用的，但淘汰 TABLE 对象不等于释放 fd，具体需要看存储层的处理。<code>table_open_cache_instances</code>（默认 16）把缓存分成多个分片，主要是为了降低锁竞争。</p>
+<p>第三层：InnoDB 引擎层 — innodb_open_files</p>
+<p>管的是 InnoDB 内部实际持有的 .ibd 文件句柄数。fil_system 维护了一个独立的 fd LRU 链表，超出上限就关掉最久没访问的句柄，下次用到再重新 open。mysql实例具体真正使用了多少文件句柄由它决定。启动时 MySQL 会自动检查，确保 innodb_open_files 不超过 open_files_limit，超了也没意义。默认值一般取 <code>min(table_open_cache, 300)</code>。</p>
+<h2 id="4-线程与连接">【4. 线程与连接】</h2>
+<h3 id="41-mysql是如何管理连接的">【4.1 mysql是如何管理连接的】</h3>
+<p><a href="https://dev.mysql.com/doc/refman/8.0/en/connection-interfaces.html#connection-interfaces-interfaces" target="_blank" rel="noopener nofollow">mysql官方文档</a></p>
+<p><code>max_connections</code>直接控制mysql可以允许的最大连接数，如果服务器因达到 <code>max_connections</code> 限制而拒绝连接，则会递增 <code>Connection_errors_max_connections</code> 状态变量。</p>
+<p><code>mysqld</code> 实际上允许 <code>max_connections + 1</code> 个客户端连接。额外的一个连接保留给拥有 <code>CONNECTION_ADMIN</code> 权限（的账户使用。通过将该权限授予管理员而非普通用户,管理员即使在最大数量的非特权客户端已连接的情况下，仍可连接服务器并使用 <code>SHOW PROCESSLIST</code> 诊断问题。</p>
+<p>同时mysql也支持配置特殊的管理接口(8.0.14新增),在my.cnf增加两行</p>
+<pre><code>[mysqld]
+admin_address=127.0.0.1   # 管理接口监听的 IP
+admin_port=33062          # 管理接口的端口（默认就是 33062）</code></pre>
+<p>通过管理员接口进入的连接也能够无视<code>max_connections</code>的限制。</p>
+<p>相关源码如下：</p>
+<pre><code>//sql/conn_handler/connection_handler_manager.cc:104行
+bool Connection_handler_manager::check_and_incr_conn_count(
+    bool is_admin_connection) {
+  bool connection_accepted = true;
+  mysql_mutex_lock(&amp;LOCK_connection_count);
+  //先检查再+1 实际上允许max_connections + 1个连接
+  if (connection_count &gt; max_connections &amp;&amp; !is_admin_connection) {
+    connection_accepted = false;
+    m_connection_errors_max_connection++;
+  } else {
+    ++connection_count;
+
+    if (connection_count &gt; max_used_connections) {
+      max_used_connections = connection_count;
+      max_used_connections_time = time(nullptr);
+    }
+  }
+  mysql_mutex_unlock(&amp;LOCK_connection_count);
+  return connection_accepted;
+}
+
+//sql/auth/sql_authentication.cc:3740行
+static inline bool check_restrictions_for_com_connect_command(THD *thd) {
+  //管理员接口 必须是有SERVICE_CONNECTION_ADMIN权限的用户才能连接
+  if (thd-&gt;is_admin_connection() &amp;&amp;
+      !thd-&gt;m_main_security_ctx
+           .has_global_grant(STRING_WITH_LEN("SERVICE_CONNECTION_ADMIN"))
+           .first) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             "SERVICE_CONNECTION_ADMIN");
+    return true;
+  }
+  //对于没有高级权限的普通用户，如果并发连接数已达上限 max_connections，则拒绝新连接。
+  //拥有上述任一特权的用户不受此限制，可以突破 max_connections 上限登录
+  if (!(thd-&gt;m_main_security_ctx.check_access(SUPER_ACL) ||
+        thd-&gt;m_main_security_ctx
+            .has_global_grant(STRING_WITH_LEN("CONNECTION_ADMIN"))
+            .first ||
+        thd-&gt;m_main_security_ctx
+            .has_global_grant(STRING_WITH_LEN("SERVICE_CONNECTION_ADMIN"))
+            .first)) {
+    if (!Connection_handler_manager::get_instance()
+             -&gt;valid_connection_count()) {  // too many connections
+      my_error(ER_CON_COUNT_ERROR, MYF(0));
+      return true;
+    }
+  }
+
+  return false;
+}
+</code></pre>
+<h3 id="42-thread_stack和thread_cache_size">【4.2 thread_stack和thread_cache_size】</h3>
+<h4 id="421--thread_stack线程栈大小">【4.2.1  thread_stack：线程栈大小】</h4>
+<p>thread_stack 控制 MySQL 为每个连接线程分配的栈空间大小,MySQL 8.0 将默认值统一调整为 1MB。</p>
+<pre><code>//include/my_thread.h:55
+#define DEFAULT_THREAD_STACK (1024UL * 1024UL)
+
+//sql/sys_vars.cc:3989
+static Sys_var_ulong Sys_thread_stack(
+    "thread_stack", "The stack size for each thread",
+    READ_ONLY GLOBAL_VAR(my_thread_stack_size), CMD_LINE(REQUIRED_ARG),
+#if defined(__clang__) &amp;&amp; defined(HAVE_UBSAN)
+    // Clang with DEBUG needs more stack, esp. with UBSAN.
+    VALID_RANGE(DEFAULT_THREAD_STACK, ULONG_MAX),
+#else
+    VALID_RANGE(128 * 1024, ULONG_MAX),
+#endif
+    DEFAULT(DEFAULT_THREAD_STACK), BLOCK_SIZE(1024));</code></pre>
+<p>thread_stack 不仅在创建线程时起作用，在查询执行过程中也是实时检测的依据。</p>
+<pre><code>//sql/check_stack.cc:110行
+bool check_stack_overrun(const THD *thd, long margin, unsigned char *buf) {
+  assert(thd == current_thd);
+  assert(stack_direction == -1 || stack_direction == 1);
+  long stack_used =
+      used_stack(thd-&gt;thread_stack, reinterpret_cast<char *="">(&amp;stack_used));
+  if (stack_used &gt;= static_cast<long>(my_thread_stack_size - margin) ||
+      DBUG_EVALUATE_IF("simulate_stack_overrun", true, false)) {
+    if (buf != nullptr) buf[0] = '\0';
+    char *ebuff = new (std::nothrow) char[MYSQL_ERRMSG_SIZE];
+    if (ebuff) {
+      snprintf(ebuff, MYSQL_ERRMSG_SIZE,
+               ER_THD(thd, ER_STACK_OVERRUN_NEED_MORE), stack_used,
+               my_thread_stack_size, margin);
+      my_message(ER_STACK_OVERRUN_NEED_MORE, ebuff, MYF(ME_FATALERROR));
+      delete[] ebuff;
+    }
+    return true;
+  }
+#ifndef NDEBUG
+  max_stack_used = std::max(max_stack_used.load(), stack_used);
+#endif
+  return false;
+}</long></char></code></pre>
+<p>mysql在运行过程中不会真的等到了栈溢出了报错，而是选择距离栈底margin直接时就主动报错。</p>
+<p>margin值的来源如下</p>
+<pre><code>//sql/sql_const.h:139行
+#if defined HAVE_UBSAN &amp;&amp; SIZEOF_CHARP == 4
+constexpr const long STACK_MIN_SIZE{30000};  // Abort if less stack during eval.
+#else
+constexpr const long STACK_MIN_SIZE{20000};  // Abort if less stack during eval.
+#endif
+
+
+
+//sql/sp_head.cc:2013行
+ /*
+    Just reporting a stack overrun error
+    (@sa check_stack_overrun()) requires stack memory for error
+    message buffer. Thus, we have to put the below check
+    relatively close to the beginning of the execution stack,
+    where available stack margin is still big. As long as the check
+    has to be fairly high up the call stack, the amount of memory
+    we "book" for has to stay fairly high as well, and hence
+    not very accurate. The number below has been calculated
+    by trial and error, and reflects the amount of memory necessary
+    to execute a single stored procedure instruction, be it either
+    an SQL statement, or, heaviest of all, a CALL, which involves
+    parsing and loading of another stored procedure into the cache
+    (@sa db_load_routine() and Bug#10100).
+
+    TODO: that should be replaced by proper handling of stack overrun error.
+
+    Stack size depends on the platform:
+      - for most platforms (8 * STACK_MIN_SIZE) is enough;
+      - for Solaris SPARC 64 (10 * STACK_MIN_SIZE) is required.
+      - for clang and ASAN/UBSAN we need even more stack space.
+  */
+
+  {
+#if defined(__clang__) &amp;&amp; defined(HAVE_ASAN)
+    const int sp_stack_size = 12 * STACK_MIN_SIZE;
+#elif defined(__clang__) &amp;&amp; defined(HAVE_UBSAN)
+    const int sp_stack_size = 16 * STACK_MIN_SIZE;
+#else
+    const int sp_stack_size = 8 * STACK_MIN_SIZE;
+#endif
+
+    if (check_stack_overrun(thd, sp_stack_size, (uchar *)&amp;old_packet))
+      return true;
+  }</code></pre>
+<p>可以看到存储过程设置的margin是普通查询的8～16倍，这就是为什么深度嵌套的存储过程特别容易触发 Thread stack overrun。mysql源码在注释中也解释了这一设计的目的：</p>
+<blockquote>
+<p>仅仅报告栈溢出错误（参见 <code>check_stack_overrun()</code>）就需要占用栈内存来存放错误消息缓冲区。因此，我们必须将以下检查放在执行栈相对靠近开头的位置，此时可用的栈余量还比较充裕。由于该检查必须位于调用栈的较高位置，我们为其"预留"的内存量也必须保持较高水平，因而不会非常精确。下面的数值是通过反复试验得出的，反映了执行单条存储过程指令所需的内存量——无论是 SQL 语句，还是其中最重的 CALL 语句（涉及将另一个存储过程解析并加载到缓存中，参见 <code>db_load_routine()</code> 和 Bug#10100）。</p>
+</blockquote>
+<h4 id="422-thread_cache_size线程缓存数量">【4.2.2 thread_cache_size：线程缓存数量】</h4>
+<p>thread_cache_size的变量定义如下：</p>
+<pre><code class="language-C++">//sql/sys_vars.cc:5150
+static Sys_var_ulong Sys_thread_cache_size(
+    "thread_cache_size", "How many threads we should keep in a cache for reuse",
+    GLOBAL_VAR(Per_thread_connection_handler::max_blocked_pthreads),
+    CMD_LINE(REQUIRED_ARG, OPT_THREAD_CACHE_SIZE), VALID_RANGE(0, 16384),
+    DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, nullptr,
+    ON_UPDATE(modify_thread_cache_size));
+</code></pre>
+<p>缓存中的线程连接断开后，该工作线程不立即销毁，而是挂起（block）在条件变量上等待复用；当新连接到来时直接唤醒该线程，免去创建/销毁线程的开销。线程一旦超出缓存上限才会真正退出。</p>
+<p>下面是线程缓存的工作代码</p>
+<pre><code class="language-C++">//sql/conn_handler/connection_handler_per_thread.cc:144行
+Channel_info *Per_thread_connection_handler::block_until_new_connection() {
+  Channel_info *new_conn = nullptr;
+  mysql_mutex_lock(&amp;LOCK_thread_cache);
+  if (blocked_pthread_count &lt; max_blocked_pthreads &amp;&amp; !shrink_cache) {
+    /* Don't kill the pthread, just block it for reuse */
+    DBUG_PRINT("info", ("Blocking pthread for reuse"));
+
+    /*
+      mysys_var is bound to the physical thread,
+      so make sure mysys_var-&gt;dbug is reset to a clean state
+      before picking another session in the thread cache.
+    */
+    DBUG_POP();
+    assert(!_db_is_pushed_());
+
+    // Block pthread
+    blocked_pthread_count++;
+    while (!connection_events_loop_aborted() &amp;&amp; !wake_pthread &amp;&amp; !shrink_cache)
+      mysql_cond_wait(&amp;COND_thread_cache, &amp;LOCK_thread_cache);
+    blocked_pthread_count--;
+
+    if (shrink_cache &amp;&amp; blocked_pthread_count &lt;= max_blocked_pthreads) {
+      mysql_cond_signal(&amp;COND_flush_thread_cache);
+    }
+
+    if (wake_pthread) {
+      wake_pthread--;
+      if (!waiting_channel_info_list-&gt;empty()) {
+        new_conn = waiting_channel_info_list-&gt;front();
+        waiting_channel_info_list-&gt;pop_front();
+        DBUG_PRINT("info", ("waiting_channel_info_list-&gt;pop %p", new_conn));
+      } else {
+        assert(0);  // We should not get here.
+      }
+    }
+  }
+  mysql_mutex_unlock(&amp;LOCK_thread_cache);
+  return new_conn;
+}
+</code></pre>
+<p>只有当：当前缓存的空闲线程数 &lt; 允许的最大值（<code>thread_cache_size</code>）且没有在缩减缓存（<code>shrink_cache</code>）时，才去缓存这个线程 ，否则直接返回nullptr。</p>
+<p>线程进入缓存 blocked_pthread_count++，随后线程在条件变量<code>COND_thread_cache</code>上睡眠，三个退出条件：connection_events_loop_aborted() mysql正在关闭，wake_pthread有新连接到来需要唤醒线程，shrink_cache有主动收缩线程缓存。当线程唤醒时，从等待队列的头部取出新连接的Channel_info并返回。</p>
+<h3 id="43--线程与系统资源的关系">【4.3  线程与系统资源的关系】</h3>
+<p><a href="https://dev.mysql.com/doc/refman/8.0/en/memory-use.html" target="_blank" rel="noopener nofollow">mysql官方文档</a></p>
+<p>mysql启动时会为以下这些项目申请内存：</p>
+<ul>
+<li>InnoDB Buffer Pool</li>
+<li>打开表缓存</li>
+<li>每个连接线程的内存</li>
+<li>内部临时表</li>
+<li>Performance Schema 内存</li>
+<li>blob列缓冲</li>
+<li>其他</li>
+</ul>
+<p>本节重点介绍每个连接线程的内存的使用情况是什么样子的。</p>
+<h4 id="431-线程栈">【4.3.1 线程栈】</h4>
+<p>线程栈是 OS 在 pthread_create 时分配的内核资源，不经过 MySQL 的 malloc，由 thread_stack 系统变量控制其大小（默认1M）（在4.2.1节有介绍）</p>
+<h4 id="432-net-io-缓冲区">【4.3.2 NET I/O 缓冲区】</h4>
+<blockquote>
+<p>The connection buffer and result buffer each begin with a size equal to <code>net_buffer_length</code> bytes, but are dynamically enlarged up to <code>max_allowed_packet</code> bytes as needed. The result buffer shrinks to <code>net_buffer_length</code> bytes after each SQL statement. While a statement is running, a copy of the current statement string is also allocated.</p>
+</blockquote>
+<p>I/O 缓冲区承担着所有网络数据的收发，在连接对象创建之后，紧接着mysql就会为连接申请I/O 缓冲区。它的初始大小由变量<code>net_buffer_length</code>控制</p>
+<pre><code class="language-C++">// sql/sql_client.cc:40
+// 设置初始包大小和最大包大小上限 默认值16kb
+net-&gt;max_packet      = (uint)global_system_variables.net_buffer_length;
+net-&gt;max_packet_size = max(net_buffer_length, max_allowed_packet);
+</code></pre>
+<p>当接收到超过当前缓冲区大小数据的包时会动态扩容</p>
+<pre><code class="language-C++">// sql-common/net_serv.cc:217
+bool net_realloc(NET *net, size_t length) {
+    if (length &gt;= net-&gt;max_packet_size) {
+        // 超过 max_allowed_packet，直接报错，不扩容
+        net-&gt;last_errno = ER_NET_PACKET_TOO_LARGE;
+        return true;
+    }
+    // 按 IO_SIZE对齐向上取整，然后 my_realloc
+    pkt_length = (length + IO_SIZE - 1) &amp; ~(IO_SIZE - 1);
+    buff = (uchar *)my_realloc(key_memory_NET_buff, net-&gt;buff,
+                               pkt_length + NET_HEADER_SIZE + COMP_HEADER_SIZE,
+                               MYF(MY_WME));
+    net-&gt;buff_end = buff + (net-&gt;max_packet = (ulong)pkt_length);
+}
+</code></pre>
+<p>释放这一内存发生在连接彻底关闭时</p>
+<pre><code class="language-C++">// sql-common/net_serv.cc:207
+void net_end(NET *net) {
+    my_free(net-&gt;buff);
+    net-&gt;buff = nullptr;
+}
+</code></pre>
+<p>当连接断开但是线程进入线程缓存等待复用时，net_end()不会被调用,net io缓冲区不会被释放，这意味着 <code>thread_cache_size</code> 越大，驻留在缓存中的空闲线程越多，常驻内存就越高。mysql的官方文档也解释了这一点。</p>
+<blockquote>
+<p><em>When a thread is no longer needed, the memory allocated to it is released and returned to the system unless the thread goes back into the thread cache. In that case, the memory remains allocated.</em></p>
+</blockquote>
+<h4 id="433-sort-缓冲区">【4.3.3 Sort 缓冲区】</h4>
+<p>sort缓冲区是一个查询级别的缓冲区，当线程执行的sql含有排序操作时分配，查询结束后释放。</p>
+<p>sort缓冲区大小由<code>sort_buffer_size</code>控制，<code>sort_buffer_size</code>是每一个排序操作所能申请的内存块大小的上限。</p>
+<pre><code class="language-C++">//sql/sys_vars.cc:4857行
+static Sys_var_ulong Sys_sort_buffer(
+    "sort_buffer_size",
+    "Each thread that needs to do a sort allocates a buffer of this size",
+    HINT_UPDATEABLE SESSION_VAR(sortbuff_size), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(MIN_SORT_MEMORY, ULONG_MAX), DEFAULT(DEFAULT_SORT_MEMORY),
+    BLOCK_SIZE(1));
+</code></pre>
+<p>缓冲区采用<strong>增量式分配</strong>策略，从最小块开始，每次扩大 50%，直到达到<code>sort_buffer_size</code>的上限：</p>
+<pre><code class="language-C++">// sql/filesort_utils.cc:316
+bool Filesort_buffer::allocate_block(size_t num_bytes) {
+    if (m_current_block_size == 0)
+        next_block_size = MIN_SORT_MEMORY;          // 第一块：最小起步值默认 32kb
+    else
+        next_block_size = m_current_block_size
+                        + m_current_block_size / 2; // 后续：每次增长 50%
+
+    // 不超过 sort_buffer_size 上限
+    next_block_size = min(max(next_block_size, num_bytes), space_left);
+
+    new_block = (uchar *)my_malloc(
+        key_memory_Filesort_buffer_sort_keys, next_block_size, MYF(0));
+}
+</code></pre>
+<p>当内存上限不足以容纳所有排序数据时，溢出部分写入 <code>mysql_tmpdir</code> 下的磁盘临时文件。结果集小时无需临时文件，结果集大时最多产生两个（<code>tempfile</code> 存储已排序数据，<code>chunk_file</code> 存储分片元数据），对应官方文档所说的"zero to two temporary files"。</p>
+<p>这也是大数据量排序拖慢 SQL 的核心原因：内存装不下时，原本纯内存的排序变成了多轮磁盘溢写 + 归并读回，I/O 代价远高于内存操作。可以通过状态变量直接观测：</p>
+<pre><code class="language-SQL">SHOW STATUS LIKE 'Sort_merge_passes';
+</code></pre>
+<p><code>Sort_merge_passes</code> 不为 0 即说明发生了磁盘归并。</p>
+<h4 id="434-随机读缓冲区">【4.3.4 随机读缓冲区】</h4>
+<p>随机读缓冲区大小由<code>read_rnd_buffer_size</code>变量控制</p>
+<pre><code class="language-C++">//sql/sys_vars.cc:3900行
+static Sys_var_ulong Sys_read_rnd_buff_size(
+    "read_rnd_buffer_size",
+    "When reading rows in sorted order after a sort, the rows are read "
+    "through this buffer to avoid a disk seeks",
+    HINT_UPDATEABLE SESSION_VAR(read_rnd_buff_size), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, INT_MAX32), DEFAULT(256 * 1024), BLOCK_SIZE(1));
+</code></pre>
+<p><code>read_rnd_buffer_size</code>默认值256KB,session查询级别的变量。该缓冲区用于排序后的回表读取阶段，排序完成后，MySQL 拿到的是一批按排序键有序、但按物理位置随机分布的行指针。如果逐条去主键索引回表，会产生大量随机 I/O。随机读缓冲区的作用是将这些行指针先批量缓冲，按物理地址排序后再顺序读取，将随机 I/O 转换为顺序 I/O。</p>
+<h4 id="435-statement-digest-内存">【4.3.5 Statement Digest 内存】</h4>
+<p>Digest 内存大小由<code>max_digest_length</code>变量控制</p>
+<pre><code class="language-C++">// sql/sys_vars.cc:3900
+static Sys_var_long Sys_max_digest_length(
+    "max_digest_length",
+    "Maximum length considered for digest text.",
+    READ_ONLY GLOBAL_VAR(max_digest_length),
+    VALID_RANGE(0, 1024 * 1024),
+    DEFAULT(1024), BLOCK_SIZE(1));
+</code></pre>
+<p><code>max_digest_length</code>默认值是1kb，这块内存在连接建立时分配，用于 Performance Schema 对 SQL 语句进行<strong>归一化处理</strong>（将具体参数替换为 `?`，生成语句指纹），以便 `events_statements_summary_by_digest` 等表按语句模式聚合统计。生命周期与连接相同。</p>
+<h3 id="44-常用运维操作">【4.4 常用运维操作】</h3>
+<h4 id="441-连接与线程监控">【4.4.1 连接与线程监控】</h4>
+<pre><code class="language-SQL">-- 显示当前连接总数
+SHOW STATUS LIKE 'Threads_connected';
+
+-- 查看活跃连接状态
+SELECT *
+FROM information_schema.PROCESSLIST
+WHERE COMMAND != 'Binlog Dump'
+  AND COMMAND != 'Binlog Dump GTID'
+  AND USER != 'system user'
+  and COMMAND != 'sleep'
+ORDER BY TIME DESC
+
+-- 根据ip分组统计连接数
+SELECT 
+    SUBSTRING_INDEX(host, ':', 1) as ip_address, 
+    COUNT(*) as connected_nums  
+FROM information_schema.processlist 
+WHERE db IS NOT NULL 
+  AND db NOT IN ('configdb', 'information_schema', 'mysql', 'performance_schema', 'sys') 
+GROUP BY ip_address 
+ORDER BY connected_nums DESC 
+LIMIT 20;
+
+--根据数据库分组统计连接数
+SELECT 
+    DB ,
+    COUNT(*) AS total_conn
+FROM information_schema.PROCESSLIST
+WHERE DB IS NOT NULL
+GROUP BY DB
+ORDER BY total_conn DESC;
+
+--根据ip,数据库共同分组统计连接数
+SELECT
+    SUBSTRING_INDEX(HOST, ':', 1) AS ip,
+    DB,
+    COUNT(*) AS conn_count
+FROM information_schema.PROCESSLIST
+WHERE DB IS NOT NULL
+GROUP BY ip, DB
+ORDER BY conn_count DESC
+limit 100;
+</code></pre>
+<h4 id="442-线程缓存评估">【4.4.2 线程缓存评估】</h4>
+<pre><code class="language-SQL">-- 查看线程缓存相关的状态变量
+SHOW STATUS LIKE 'Threads_%';
+
+-- 说明：
+-- Threads_cached    : 当前缓存中的空闲线程数
+-- Threads_created   : 由于缓存不足而新建的线程总数
+-- Threads_connected : 当前连接数
+-- Threads_running   : 当前正在执行查询的线程数
+
+-- 计算缓存命中率
+-- 如果 Threads_created 增长缓慢，说明缓存命中率高
+</code></pre>
+<h4 id="443-杀死长连接与闲置连接">【4.4.3 杀死长连接与闲置连接】</h4>
+<pre><code class="language-SQL">--快速kill某个ip的连接
+system sudo rm /tmp/kill.sql;
+select concat('kill ',id,';') from information_schema.processlist where host like '127.0.0.1%'  into outfile '/tmp/kill.sql';
+source /tmp/kill.sql;
+
+--kill长时间sleep的连接
+system sudo rm /tmp/kill.sql;
+select concat('kill ',id,';') from information_schema.processlist 
+where command='sleep' and time &gt; 300 into outfile '/tmp/kill.sql';
+source /tmp/kill.sql;
+</code></pre>
+<h2 id="5-mysql的启动调整">【5. mysql的启动调整】</h2>
+<p>MySQL 启动时会根据系统资源和配置参数自动调整某些参数，同时MySQL 官方文档也给出了基于场景的推荐值。</p>
+<pre><code class="language-C++">//sql/mysqld.cc:8834
+static void adjust_related_options(ulong *requested_open_files) {
+  adjust_open_files_limit(requested_open_files);      
+  adjust_max_connections(*requested_open_files);       
+  adjust_table_cache_size(*requested_open_files);      
+  adjust_table_def_size();                            
+}
+</code></pre>
+<p><strong>第一步：调整open_files_limit</strong></p>
+<pre><code class="language-C++">static void adjust_open_files_limit(ulong *requested_open_files) {
+  ulong limit_1, limit_2, limit_3, request_open_files, effective_open_files;
+  // 计算方式 1：每个表 2 个 fd，加上连接和基础 fd
+  limit_1 = 10 + max_connections + table_cache_size * 2;
+  // 计算方式 2：预留足够的 fd 给所有连接
+  limit_2 = max_connections * 5;
+  // 计算方式 3：默认最小值 5000（若用户未指定）
+  limit_3 = open_files_limit ? open_files_limit : 5000;
+  // 取三者中的最大值
+  request_open_files = max(max(limit_1, limit_2), limit_3);
+  // 调用操作系统 API 实际设置 limit（没法超过os的限制）
+  effective_open_files = my_set_max_open_files(request_open_files);
+  open_files_limit = effective_open_files;
+  if (requested_open_files)
+    *requested_open_files = min(effective_open_files, request_open_files);
+}
+</code></pre>
+<p>mysql首先会自动调整open_files_limit的参数的值，计算公式为<code>max(10 + max_connections + table_cache * 2, max_connections * 5，用户在配置文件指定的值，如果没有指定默认5000)</code>，然后检查计算值是不是超过的os的限制。最后把计算出的open_files_limit值写入requested_open_files指向的地址（requested_open_files初始值是0）</p>
+<p><strong>第二步：调整max_connections</strong></p>
+<pre><code class="language-C++">static constexpr const ulong TABLE_OPEN_CACHE_MIN{400};
+
+static void adjust_max_connections(ulong requested_open_files) {
+  ulong limit;
+
+  // 基于文件描述符数量反推能支持的最大连接数
+  limit = requested_open_files - 10 - TABLE_OPEN_CACHE_MIN * 2;
+
+  if (limit &lt; max_connections) {
+    // 若计算出的限制小于配置值，则向下调整
+    LogErr(WARNING_LEVEL, ER_CHANGED_MAX_CONNECTIONS, limit, max_connections);
+    max_connections = limit;
+  }
+}
+</code></pre>
+<p>当第一步计算出的requested_open_files值不足以支持用户配置的 <code>max_connections</code> 时，MySQL 会自动降低<code>max_connections</code>。计算公式为<code>max_connections = requested_open_files - 10 - 400*2</code></p>
+<p><strong>第三步：调整table_open_cache</strong></p>
+<pre><code class="language-C++">static void adjust_table_cache_size(ulong requested_open_files) {
+  ulong limit;
+
+  // 从剩余的文件描述符中分配表缓存
+  // 默认每个表分配 2 个 fd
+  limit = max((requested_open_files - 10 - max_connections) / 2,
+              TABLE_OPEN_CACHE_MIN);  // 400 是最小值
+
+  if (limit &lt; table_cache_size) {
+    LogErr(WARNING_LEVEL, ER_CHANGED_TABLE_OPEN_CACHE, limit, table_cache_size);
+    table_cache_size = limit;
+  }
+
+  // 计算每个实例的缓存大小
+  table_cache_size_per_instance = table_cache_size / table_cache_instances;
+}
+</code></pre>
+<p>最后mysql用调整过的requested_open_files和max_connections最后计算出调整过的table_cache_size。当 fd 不足时，优先保证连接，其次降低表缓存。</p>
+<p><strong>第四步：调整 table_definition_cache</strong></p>
+<pre><code class="language-C++">static void adjust_table_def_size() {
+  ulong default_value;
+  sys_var *var;
+
+  // 基于表缓存大小自动计算 table_definition_cache
+  default_value = min(400 + table_cache_size / 2, 2000);
+  
+  
+  var = find_static_system_variable("table_definition_cache");
+  assert(var != nullptr);
+  var-&gt;update_default(default_value);
+ 
+  //当用户未显式指定时才调整
+  if (!table_definition_cache_specified)
+    table_def_size = default_value;
+}
+</code></pre>
+<p><code>table_definition_cache</code> 是<strong>表定义的缓存</strong>，用来缓存表的元数据信息（表结构、列定义等）。</p>
+<p>公式：max(400 + table_cache_size/2, min(400 + table_cache_size/2, 2000))</p>
+<p>这个参数只会在用户没有定义的时候调整</p>
+<h2 id="总结">【总结】</h2>
+<p>本文涉及到的主要的mysql的参数依赖如下图：<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1247138/202607/1247138-20260710160832164-1913251884.png" class="lazyload"></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.004166666666666667" data-date-updated="2026-07-10 16:09">2026-07-10 16:03</span>&nbsp;
+<a href="https://www.cnblogs.com/CtripDBA">携程DBA</a>&nbsp;
+阅读(<span id="post_view_count">108</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21332731);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FCtripDBA%2Fp%2F21332731&amp;targetId=21332731&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

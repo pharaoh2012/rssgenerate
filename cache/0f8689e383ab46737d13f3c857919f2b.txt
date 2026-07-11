@@ -1,0 +1,238 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ai-old-six/p/21312121" title="发布于 2026-07-10 09:34">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">Hermes Skill Runtime 架构拆解：三层加载如何压住 Agent 上下文成本</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        Hermes 用 ​Level 0​/1/2 分层披露，把技能发现、完整说明和参考文件拆开，降低 Agent 上下文成本
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>Hermes 用 ​<strong>Level 0</strong>​/1/2 分层披露，把技能发现、完整说明和参考文件拆开，降低 Agent 上下文成本。</p>
+</blockquote>
+<p>Hermes 的 <strong>Skill System</strong> 看起来只是一个“按名字加载 Markdown 文件”的工具，但真正有意思的地方不在读取文件本身，而在它怎样控制上下文成本、怎样处理本地技能和外部技能的边界、怎样让插件技能进入同一套解析链路，又不把用户会话一开始就塞满。</p>
+<p>这套设计的核心判断很明确：技能系统不能像传统插件市场一样，把所有内容预先索引、预先展开、预先注入。Agent 会话里的<strong>上下文窗口</strong>太贵，技能越多，越不能一次性把所有细节暴露给模型。Hermes 选择了一条更朴素的路：​<strong>运行时扫描</strong>​，分层披露，只有在真正用到某个技能时才付出更多 token。<br>
+<img alt="inline-01.jpg" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093348120-665280028.jpg" class="lazyload"></p>
+<p><em>图：模型先看到技能地图，而不是一次性读完整手册</em></p>
+<h2 id="skill-runtime-的基本边界主目录外部目录与命名空间">Skill Runtime 的基本边界：主目录、外部目录与命名空间</h2>
+<p>Hermes 把 <code>~/.hermes/skills/</code> 视为技能的主目录。它是默认读写位置，也是本地技能的单一真实来源。外部目录通过 <code>external_dirs</code> 接入，更多承担扩展和共享的角色，默认不会改变本地主目录的权威性。</p>
+<p>典型目录长这样：</p>
+<pre><code>~/.hermes/skills/
+├── category/
+│   └── skill-name/
+│       └── SKILL.md
+├── .hub/
+│   ├── lock.json
+│   ├── quarantine/
+│   └── audit.log
+├── .bundled_manifest
+└── .archive/
+</code></pre>
+<p>这里有几个工程取舍。<code>SKILL.md</code> 是技能入口；<code>.hub</code> 保存 Hub 相关的本地状态；<code>.archive</code> 和 <code>.bundled_manifest</code> 属于维护层数据，不应该参与正常技能扫描。Hermes 在遍历时会主动排除这些目录，也会跳过 <code>.git</code>、<code>node_modules</code>、虚拟环境、缓存目录等高噪声路径。</p>
+<pre><code>EXCLUDED_SKILL_DIRS = frozenset((
+    ".git", ".github", ".hub", ".archive",
+    ".venv", "venv", "node_modules", "site-packages",
+    "__pycache__", ".tox", ".nox", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache"
+))
+</code></pre>
+<p>命名空间是另一条边界。普通技能用 <code>skill-name</code> 解析，插件技能用 <code>namespace:skill</code> 解析。这个冒号并不是装饰，它告诉运行时先拆出插件命名空间，再去插件目录里找对应技能。没有这个规则，插件生态很快会撞名。</p>
+<pre><code>def parse_qualified_name(name: str) -&gt; Tuple[Optional[str], str]:
+    if ":" not in name:
+        return None, name
+    return tuple(name.split(":", 1))
+</code></pre>
+<p>本地优先也很关键。同名技能出现时，Hermes 不会让外部目录悄悄覆盖用户本地版本；真正发生多候选冲突时，它会返回明确错误和所有匹配路径，让用户改用完整相对路径。这个决定减少了“为什么今天调用的不是昨天那个技能”的排查成本。</p>
+<h2 id="level-0skills_list-只给模型一张轻量地图">Level 0：skills_list 只给模型一张轻量地图</h2>
+<p>会话启动时，Hermes 不会把每个技能的正文都塞进上下文。<code>skills_list()</code> 只返回技能元数据，大约是一个固定的 token 成本。原文估算 Level 0 约为 3k tokens，这笔成本会在会话启动时支付；后面的完整技能内容和参考文件，只有在触发时才成为边际成本。</p>
+<pre><code>Level 0: skills_list()              -&gt; 仅技能元数据，约 3k tokens
+Level 1: skill_view(name)           -&gt; 完整 SKILL.md，通常 10-100k tokens
+Level 2: skill_view(name, path)     -&gt; 技能目录内的某个参考文件
+</code></pre>
+<p>Level 0 的目标不是“让模型读懂所有技能”，而是让模型知道有哪些技能、每个技能大概负责什么、是否适合当前平台和环境。它更像一张地图，不是一本手册。<br>
+<img alt="mermaid-01.png" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093339894-296659400.png" class="lazyload"></p>
+<p><em>图：Level 0 从目录扫描到条件激活过滤的完整链路</em></p>
+<p>返回值只保留必要字段：</p>
+<pre><code>{
+  "name": "skill-name",
+  "description": "Brief description...",
+  "category": "category-name",
+  "tags": ["tag1", "tag2"]
+}
+</code></pre>
+<p>这个阶段的扫描没有依赖 SQLite 或预构建 JSON 索引。Hermes 每次执行 <code>skills_list()</code> 都会重新扫文件系统：</p>
+<pre><code>def iter_skill_index_files(skills_dir: Path, filename: str):
+    for root, dirs, files in os.walk(skills_dir, followlinks=True):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
+        if filename in files:
+            yield Path(root) / filename
+</code></pre>
+<p><code>dirs[:]</code> 的原地修改是一个小但实用的优化。它不是在遍历后过滤结果，而是在 <code>os.walk()</code> 继续递归之前剪掉不该进入的目录。技能数量少于千级时，这种按需扫描足够简单，维护成本也比额外索引低。</p>
+<p>Level 0 还会处理平台和环境匹配。<code>platforms</code> 为空时默认通过；<code>macos</code> 会映射到 <code>darwin</code>，<code>linux</code>、<code>windows</code> 也有对应映射。Termux 需要特殊处理，因为它跑在 Android 上，却经常要兼容 Linux 技能。</p>
+<pre><code>PLATFORM_MAP = {
+    "macos": "darwin",
+    "linux": "linux",
+    "windows": "win32"
+}
+</code></pre>
+<p>环境字段也在这个阶段过滤。Hermes 内置识别 <code>kanban</code>、<code>docker</code>、<code>s6</code>，未知环境默认通过。这个默认值有点宽松，但它避免了一个更糟的问题：新环境还没被运行时认识时，技能全部消失。</p>
+<pre><code>_KNOWN_ENVIRONMENTS = frozenset({"kanban", "docker", "s6"})
+</code></pre>
+<p>条件激活是 Level 0 里更像 Agent 的部分。技能可以声明 <code>requires_toolsets</code>、<code>requires_tools</code>，也可以声明 <code>fallback_for_toolsets</code>、<code>fallback_for_tools</code>。前者表示依赖不可用就隐藏；后者表示主工具可用时自己退场。比如一个 DuckDuckGo 搜索技能可以只在正式 Web 工具不可用时出现。<br>
+<img alt="mermaid-02.png" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093339211-1341369641.png" class="lazyload"></p>
+<p><em>图：依赖工具与 fallback 工具共同决定技能是否显示</em></p>
+<p>这样做的好处是，模型看到的不是“所有可能工具”，而是当前会话真正有意义的工具。对 Agent 来说，这比单纯减少 token 更重要，因为候选越乱，错误调用的概率越高。</p>
+<h2 id="level-1skill_view-的难点在名字解析而不是读文件">Level 1：skill_view 的难点在名字解析，而不是读文件</h2>
+<p>当模型决定使用某个技能时，才进入 Level 1。<code>skill_view(name)</code> 会读取完整 <code>SKILL.md</code>，执行必要的前置处理，然后把完整技能说明交给模型。<br>
+<img alt="mermaid-03.png" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093340935-2082450339.png" class="lazyload"></p>
+<p><em>图：Level 1 的命名解析、冲突检查与内容预处理</em></p>
+<p>四层名称解析策略体现了兼容性优先级：</p>
+<pre><code># 策略 1：直接路径
+direct_path = search_dir / name
+if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+    return direct_path / "SKILL.md"
+
+# 策略 2：递归按目录名匹配
+for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+    if found_skill_md.parent.name == name:
+        return found_skill_md
+
+# 策略 3：按 frontmatter 的 name 字段匹配
+fm, _ = _parse_frontmatter(fm_content)
+if fm.get("name") == name:
+    return found_skill_md
+
+# 策略 4：兼容旧式扁平 .md 文件
+for found_md in search_dir.rglob(f"{name}.md"):
+    if found_md.name != "SKILL.md":
+        return found_md
+</code></pre>
+<p>直接路径优先，说明 Hermes 鼓励用户在冲突时显式指定位置。目录名匹配符合大多数人的直觉；frontmatter 名称匹配给重命名目录留下空间；legacy <code>.md</code> 负责兼容旧技能。</p>
+<p>真正撞名时，运行时不会装作没事：</p>
+<pre><code>if len(candidates) &gt; 1:
+    return json.dumps({
+        "success": False,
+        "error": f"Ambiguous skill name &amp;#x27;{name}&amp;#x27;: {len(candidates)} skills match",
+        "matches": [str(smd) for _, smd in candidates],
+        "hint": "Use full relative path instead"
+    })
+</code></pre>
+<p>这比“按某个顺序静默选第一个”可靠得多。技能是会执行命令、写文件、访问外部系统的，名称解析上的模糊不该被吞掉。</p>
+<p>插件技能在 Level 1 里走一条相似但带命名空间的链路。<code>skill_view("plugin:skill")</code> 会先定位插件，再找插件内的技能。如果插件存在但技能不存在，运行时可以列出可用技能；如果找到了，会在返回内容前附加上下文横幅，提醒模型这是哪个插件的一部分，以及有哪些 sibling skills 可以用限定名调用。</p>
+<pre><code>[Bundle context: This skill is part of the &amp;#x27;plugin&amp;#x27; plugin.
+Sibling skills: skill1, skill2.
+Use qualified form to invoke siblings (e.g. plugin:skill1).]
+</code></pre>
+<p>Level 1 的后半段是技能内容预处理。Hermes 支持模板变量：</p>
+<pre><code>${HERMES_SKILL_DIR}  -&gt; 当前技能目录的绝对路径
+${HERMES_SESSION_ID} -&gt; 当前会话 ID
+</code></pre>
+<p>如果配置允许，还可以执行内联 shell：</p>
+<pre><code>Current date: !`date -u +%Y-%m-%d`
+Git branch: !`git -C ${HERMES_SKILL_DIR} rev-parse --abbrev-ref HEAD`
+</code></pre>
+<p>这个能力很锋利，所以它应该被视为受控扩展，而不是普通 Markdown 特性。技能内容一旦能执行命令，路径安全和注入检测就必须跟上。Hermes 对技能名做了绝对路径、Windows drive、<code>..</code> 路径穿越检查，也内置了一批 prompt injection 模式，例如 <code>ignore previous instructions</code>、<code>system prompt:</code>、<code>&lt;system&gt;</code>。</p>
+<p>Hub 安装技能还有额外安全扫描，重点检查数据渗出、破坏性命令、Shell 注入和 prompt 注入。它不能证明技能一定安全，但能挡住一批低成本攻击。</p>
+<p>配置注入也发生在 Level 1。技能可以在 frontmatter 里声明自己需要的配置项：</p>
+<pre><code>metadata:
+  hermes:
+    config:
+      - key: wiki.path
+        description: Path to wiki directory
+        default: ~/wiki
+        prompt: Wiki directory path
+</code></pre>
+<p>运行时会从配置文件读取 <code>skills.config.&lt;logical_key&gt;</code>，没有值就用默认值，再展开 <code>~</code> 和环境变量。最后把结果追加到技能内容里：</p>
+<pre><code>[Skill config (from ~/.hermes/config.yaml):
+  wiki.path = /Users/erik/wiki
+]
+</code></pre>
+<p>这里可以看出 Hermes 对“技能加载”和“技能管理”分得很清楚。加载是按需读取和注入；管理则走 <code>skill_manage</code>，支持 <code>create</code>、<code>patch</code>、<code>edit</code>、<code>delete</code>、<code>write_file</code>、<code>remove_file</code>。如果开启 <code>skills.write_approval</code>，写入不会直接落盘，而是进入 <code>~/.hermes/pending/skills/</code>，等待用户 review、diff、approve 或 reject。</p>
+<h2 id="level-2参考文件把长技能拆成可控切片">Level 2：参考文件把长技能拆成可控切片</h2>
+<p><img alt="inline-02.jpg" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093348847-1406496016.jpg" class="lazyload"></p>
+<p><em>图：低频细节被延后到参考文件，按需进入上下文</em></p>
+<p>很多技能的主文件不应该无限膨胀。Hermes 的 Level 2 允许按路径读取技能目录内的参考文件：</p>
+<pre><code>skill_view("skill-name", "references/api.md")
+</code></pre>
+<p>这一步解决的是另一个 token 问题：有些知识只在特定分支下需要，比如 API 细节、样式规范、平台适配说明。把这些内容全塞进 <code>SKILL.md</code>，会让每次技能加载都变重；拆到 <code>references/</code> 以后，主技能只负责路由和原则，细节按需进入上下文。</p>
+<p>可以把三层加载理解成这张表：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>入口</th>
+<th>模型拿到什么</th>
+<th>主要成本</th>
+<th>适合放什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Level 0</td>
+<td><code>skills_list()</code></td>
+<td>名称、描述、分类、标签</td>
+<td>会话启动固定成本</td>
+<td>技能发现与选择信号</td>
+</tr>
+<tr>
+<td>Level 1</td>
+<td><code>skill_view(name)</code></td>
+<td>完整 <code>SKILL.md</code></td>
+<td>使用技能时的边际成本</td>
+<td>工作流、边界、关键规则</td>
+</tr>
+<tr>
+<td><strong>Level 2</strong></td>
+<td><code>skill_view(name, path)</code></td>
+<td>某个参考文件</td>
+<td>分支触发成本</td>
+<td>API 细节、模板、长规范</td>
+</tr>
+</tbody>
+</table>
+<p>原文尾部提到的性能优化、安全机制、平台环境匹配，其实都应该放回这三层里看。Level 0 负责过滤和候选控制；Level 1 负责解析、预处理和安全检查；Level 2 负责把低频细节延后。这样理解后，Hermes Skill System 就不是“技能列表 + 技能详情”的二段式接口，而是一套围绕上下文窗口设计的运行时。</p>
+<h2 id="一次完整调用从会话启动到技能内容进入上下文">一次完整调用：从会话启动到技能内容进入上下文</h2>
+<p>会话启动时，Hermes 读取配置，解析外部目录，然后扫描技能元数据：<br>
+<img alt="mermaid-04.png" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093340334-1837897841.png" class="lazyload"></p>
+<p><em>图：会话启动时只注入精简技能元数据</em></p>
+<p>用户触发技能后，完整内容才进入模型上下文：<br>
+<img alt="mermaid-05.png" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093338228-2115976819.png" class="lazyload"></p>
+<p><em>图：技能被触发后才读取完整说明进入上下文</em></p>
+<p>如果技能再请求 <code>references/api.md</code>，才进入 Level 2。这个顺序让技能系统可以支持很多技能，又不会在每次会话里一次性支付全部成本。</p>
+<h2 id="这个设计真正解决的问题">这个设计真正解决的问题</h2>
+<p>Hermes 的选择并不复杂。它没有上来做一套重索引系统，也没有把技能包管理做成独立数据库。它依赖文件系统、frontmatter、运行时扫描和少量缓存，换来的好处是透明、容易调试、容易迁移。</p>
+<p>我更认可这套系统的一点，是它把 Agent 运行时最稀缺的资源放在了设计中心。技能不是越完整越好，也不是越早暴露越好。Level 0 让模型知道“有什么”，Level 1 让模型知道“这个技能怎么用”，Level 2 只在需要时补上“具体细节”。这是一个很适合 Agent 时代的插件系统思路：能力可以很多，但上下文必须克制。</p>
+<p>如果后续要继续演进，真正值得加强的可能不是复杂索引，而是两个方向：一是更好的冲突解释和推荐限定路径，二是对 <code>references/</code> 的结构化摘要，让模型在进入 <strong>Level 2</strong> 前就能判断该读哪个文件。前者减少用户困惑，后者继续压低 token 成本。至于数据库化索引，除非技能数量和外部目录规模真的上来了，否则它未必比现在的按需扫描更划算。<br>
+<img alt="aaa_compressed_under_1M.png" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3798513/202607/3798513-20260710093341383-509975456.png" class="lazyload"></p>
+<h2 id="推荐阅读">推荐阅读</h2>
+<p><a href="https://mp.weixin.qq.com/s?__biz=Mzg2OTcxMDIzNA==&amp;mid=2247484274&amp;idx=1&amp;sn=80c616a2edd6f12bcdcfdee37cc11e92&amp;scene=21#wechat_redirect" target="_blank" rel="noopener nofollow">Agent Runtime 架构拆解：Prompt 如何变成可校验的执行链路</a></p>
+<p><a href="https://mp.weixin.qq.com/s?__biz=Mzg2OTcxMDIzNA==&amp;mid=2247484273&amp;idx=1&amp;sn=f0333be702105353d7f425cc56b4cbf0&amp;scene=21#wechat_redirect" target="_blank" rel="noopener nofollow">Agent 评测系统架构：从指标分层到 GT/Judge 闭环的工程化落地</a></p>
+<p><a href="https://mp.weixin.qq.com/s?__biz=Mzg2OTcxMDIzNA==&amp;mid=2247484272&amp;idx=1&amp;sn=f43cdd3b818ae8686447fc82b95e7b24&amp;scene=21#wechat_redirect" target="_blank" rel="noopener nofollow">团队落地 Agent 工程化 Loop 的一些必看小技巧！</a></p>
+<p><a href="https://mp.weixin.qq.com/s?__biz=Mzg2OTcxMDIzNA==&amp;mid=2247484155&amp;idx=1&amp;sn=647cb1d358a2fd1bb61dc5bbd9d08347&amp;scene=21#wechat_redirect" target="_blank" rel="noopener nofollow">SkillOpt 架构拆解：把 Skill 文本当参数，用执行轨迹训练 Agent</a></p>
+<p><a href="https://mp.weixin.qq.com/s?__biz=Mzg2OTcxMDIzNA==&amp;mid=2247484092&amp;idx=1&amp;sn=202230fe2beb80cd6953ee75d126ea59&amp;scene=21#wechat_redirect" target="_blank" rel="noopener nofollow">Agent Skill Eval：从触发信号到 A/B 基准，如何把 Skill 做成可回归工程单元</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-10 09:35">2026-07-10 09:34</span>&nbsp;
+<a href="https://www.cnblogs.com/ai-old-six">AI小老六</a>&nbsp;
+阅读(<span id="post_view_count">157</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21312121);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fai-old-six%2Fp%2F21312121&amp;targetId=21312121&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
