@@ -1,0 +1,195 @@
+
+        <h1 class="postTitle">
+            <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/token-ai/p/21347451" title="发布于 2026-07-10 23:41">
+    
+
+    <span role="heading" aria-level="2">Agent Runtime 不是一个库,是一个你要运维的进程</span>
+    
+
+</a>
+
+        </h1>
+        <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="agent-runtime-不是一个库是一个你要运维的进程">Agent Runtime 不是一个库,是一个你要运维的进程</h1>
+<h2 id="聊聊-opencowork-为什么把-agent-运行时搬进了一个独立的-net-原生进程">——聊聊 OpenCoWork 为什么把 Agent 运行时搬进了一个独立的 .NET 原生进程</h2>
+<blockquote>
+<p>项目地址:<strong><a href="https://github.com/AIDotNet/OpenCowork" target="_blank" rel="noopener nofollow">https://github.com/AIDotNet/OpenCowork</a></strong> —— 欢迎点个 Star,下面聊的所有细节都能在源码里对得上。</p>
+</blockquote>
+<hr>
+<h2 id="一先看现在长什么样三个进程各干各的">一、先看现在长什么样:三个进程,各干各的</h2>
+<p>现在一次 agent 运行,横跨三个操作系统级别的角色:</p>
+<p><strong>渲染进程(React 19)</strong> —— 纯 UI。它负责把用户的意图打包成一个 <code>SidecarAgentRunRequest</code>(<code>sidecar-protocol.ts</code> 里那个字段多到吓人的接口),然后把回来的事件流渲染成对话、工具卡片、审批弹窗。它<strong>不跑</strong> agent loop,一个字节的 provider 请求都不发。</p>
+<p><strong>Electron 主进程(Node.js)</strong> —— 运维层,不是运行时。核心是 <code>native-worker.ts</code> 里的 <code>NativeWorkerManager</code>。它干的事一句话概括:<strong>把那个原生进程当成一个需要 7×24 照看的服务来伺候</strong>——拉起、连不上就重连、定时心跳、崩了按退避重启、系统睡眠/唤醒特殊处理、进程死了要主动把它名下的 run 判死刑。它是个 supervisor,不是 agent。</p>
+<p><strong>原生 Worker(.NET net10.0,AOT)</strong> —— 这才是 Agent Runtime 本体。<code>sidecars/OpenCowork.Native.Worker/</code>,195 个 <code>.cs</code> 文件,光 <code>AgentRuntime</code> 一个模块就三万多行。agent loop、四家 provider 的传输层(OpenAI Chat / OpenAI Responses / Anthropic Messages / Gemini + Vertex)、工具执行、子 agent、团队、上下文压缩、SQLite、MCP、SSH……全在这一个原生二进制里。</p>
+<p>三者之间怎么说话?<strong>长度前缀的 MessagePack 帧,走 Unix domain socket / Windows named pipe</strong>。4 字节大端长度头 + msgpack body,请求带自增 id 做 req/resp,事件用 <code>agent/stream</code> 单向推。这不是 HTTP,不是 gRPC,就是一条你自己管生死的本地 socket。</p>
+<p>那个 agent loop 本身,平平无奇,就该平平无奇(<code>OpenAIChatRuntime.cs</code>):</p>
+<pre><code class="language-csharp">for (var iteration = 1; !hasIterationLimit || iteration &lt;= requestedMaxIterations; iteration++)
+</code></pre>
+<p>一轮 provider turn,吐 <code>iteration_start</code> / <code>text_delta</code> / <code>tool_use</code> / <code>iteration_end</code>,执行工具,把结果喂回去,直到 stop reason 或者撞到 max iterations。<strong>循环的形状不值钱,值钱的是循环外面那一圈。</strong></p>
+<pre><code>┌─────────────────┐   MessagePack over        ┌──────────────────────────┐
+│  渲染进程 (UI)   │   IPC (invoke/send)       │   Electron 主进程 (Node)  │
+│  React 19        │ ────────────────────────▶ │   NativeWorkerManager     │
+│  只发起 + 订阅   │ ◀──────────────────────── │   = supervisor / router   │
+└─────────────────┘   agent/stream 事件流      └────────────┬─────────────┘
+                                                            │ 长度前缀 msgpack
+                                                            │ over UDS / named pipe
+                                                            ▼
+                                            ┌───────────────────────────────┐
+                                            │  .NET Native Worker (sidecar)  │
+                                            │  net10.0 · PublishAot          │
+                                            │  ★ Agent Runtime 本体 ★        │
+                                            │  loop · providers · tools ·    │
+                                            │  sub-agents · SQLite · MCP     │
+                                            └───────────────────────────────┘
+</code></pre>
+<hr>
+<h2 id="二几个我觉得值得拿出来讲的决定">二、几个我觉得值得拿出来讲的决定</h2>
+<h3 id="1-把进程边界画在运行时而不只画在-ui-和逻辑之间">1. 把进程边界画在"运行时",而不只画在 UI 和逻辑之间</h3>
+<p>大部分 Electron 应用的进程边界是"渲染进程管 UI,主进程管系统 API"。我们多画了一刀:<strong>agent loop 单独一个 OS 进程</strong>。</p>
+<p>好处不是玄学,是实打实的四条:</p>
+<ul>
+<li><strong>崩溃隔离</strong>:worker 段错误、OOM、AOT 裁剪掉了某个反射路径直接挂了——你的窗口纹丝不动。回到开头那条 SQLite commit,现在 SQLite 通过 SQLitePCLRaw 活在 .NET worker 里,跟 Electron 的 Node ABI <strong>一点关系都没有了</strong>。那个债,从架构上还清了。</li>
+<li><strong>冷启动和内存</strong>:AOT 出来是一个 per-RID 的原生二进制(osx-arm64、win-x64……),没有 JIT 预热,<code>IlcOptimizationPreference=Speed</code>,<code>JsonSerializerIsReflectionEnabledByDefault=false</code>(全 source-gen,零反射)。启动快、常驻内存低。</li>
+<li><strong>能独立升级、独立重启</strong>:worker 挂了可以悄悄换一个新进程,UI 完全无感。</li>
+<li><strong>loop 能活得比 UI 久</strong>:用户切走会话、甚至关掉窗口,run 还在 worker 里跑(这条后面单独展开,是我最喜欢的一段)。</li>
+</ul>
+<p>说句得罪人的话:<strong>很多 Agent 框架的可靠性天花板,就卡在"loop 和 UI 同生共死"这一条上。</strong> 进程一刷新,任务就没了。</p>
+<h3 id="2-主进程是运维这一层的代码才是真正的护城河">2. 主进程是"运维",这一层的代码才是真正的护城河</h3>
+<p><code>native-worker.ts</code> 是我最想让人读的一个文件,因为它一点都不性感,全是脏活,而这些脏活恰恰是 demo 和产品的分水岭。随手挑几个:</p>
+<ul>
+<li><strong>心跳,但要聪明</strong>:每 15s 一次 <code>worker/ping</code>,5s 超时,连丢 2 次就回收进程。但是——<strong>有请求在飞的时候不 ping</strong>。因为在途请求本身就是最好的存活证明,这时候去探反而可能误杀一个正忙的健康 worker。</li>
+<li><strong>重启带退避 + 抖动</strong>:base 300ms,封顶 30s,<code>backoff + backoff*0.25*random()</code>。一个彻底坏掉的 worker(比如二进制过期了、需要重新 <code>native:publish</code>)不会把你 CPU 打满,而一个真实用户请求进来仍然会立刻 <code>ensureStarted()</code> 拉起,退避只管后台自愈的节奏。</li>
+<li><strong>睡眠/唤醒</strong>:<code>powerMonitor</code> 一 <code>suspend</code> 就停心跳——因为系统睡着的时候定时器根本不 fire,不停的话醒来会数出一堆"幻觉丢失"。一 <code>resume</code> 立刻主动探一次,而不是傻等最坏 35s。</li>
+<li><strong>死了要发讣告</strong>:worker 意外退出,<code>disconnected</code> 事件一广播,上层就把它名下所有 run 判死刑并 fail 掉。更狠的是主进程会给每个 active run <strong>合成</strong> <code>error</code> + <code>loop_end{reason:'error'}</code> 事件——<strong>宁可给用户报个错,也绝不让 UI 挂在一条永远不会再有数据的流上</strong>。重连了则发 <code>reconnected</code>,让上层重跑 <code>initialize</code> 握手,因为新进程是一张白纸。</li>
+<li><strong>stop 和 recycle 是两回事</strong>:软 <code>sidecar:stop</code> 只是发个关闭 RPC,一个卡死在 native 代码里的进程根本不理你;<code>sidecar:recycle</code> 是真的杀掉 OS 进程再拉一个新的。初始化握手失败时走的就是 recycle。</li>
+<li><strong>还有一堆你想不到的坑</strong>:hard-kill 的主进程在 <code>/tmp</code> 里留下的僵尸 socket 文件,靠 PID 存活探测来清扫;SIGTERM 发出去 3s 不死就升级 SIGKILL;socket 分片只在攒够一个完整帧后才拼接,避免每来一个 chunk 就 concat 整个 backlog 的 O(n²);msgpack 把省略的字段编码成 <code>nil→null</code>,直接绕过 JS 的默认参数——一个 <code>setTimeout(cb, null)</code> 会在 ~1ms 就触发,把请求提前打死。</li>
+</ul>
+<p>这些代码没有一行是"AI 能力",但少了任何一行,产品用到第二个月就会在某个奇怪的边界上崩给用户看。<strong>我一直觉得,一个 agent 产品的真实工程量,80% 在这种地方。</strong></p>
+<h3 id="3-反向请求worker-不只是被调用它还能反过来调宿主">3. 反向请求:worker 不只是被调用,它还能反过来调宿主</h3>
+<p>这是整套架构里我觉得最漂亮的一招,也是"工具到底在哪跑"这个问题的正确答案。</p>
+<p>先纠正一个容易想当然的说法:"工具全在 worker 里跑"——大方向对,但更精确的真相是:<strong>工具在"谁拥有这个能力,就在谁那一层"执行。</strong></p>
+<p>机制是这样的:worker 需要一个它自己没有的能力时,发一个 <code>agent/reverse-request { id, method, params }</code> 反向请求,主进程的 <code>handleReverseRequest</code> 按 <code>method</code> 分诊:</p>
+<ul>
+<li>要<strong>操作系统 / 插件</strong>能力的(<code>plugin:exec</code>、<code>notify:desktop</code>、<code>fs/request-system-access</code>、<code>cron/*</code>)→ 路由回<strong>主进程</strong>执行;</li>
+<li>要<strong>UI</strong>能力的(<code>browser/tool-request</code>、<code>ask-user/request</code>、<code>plan/ui-update</code>、审批 <code>approval/request</code>)→ 转发回<strong>渲染进程</strong>;</li>
+<li>其余的默认留在 <strong>worker</strong> 里跑。</li>
+</ul>
+<p>一条反向通道,让原生 loop 能"够到"任意一层的能力,而不用把工具逻辑在三层里各抄一遍。<strong>审批</strong>就是这条通道上的一个特殊 method:worker 暂停工具、发 <code>approval/request</code>,主进程先跑一遍权限策略钩子(能自动放行就不烦用户),否则才弹 UI 给人拍板,<code>{ approved, reason }</code> 再顺着反向响应回到 worker,那个被 <code>await</code> 挂起的工具才继续。</p>
+<p>有一个特别见功力的顺序保证:<strong>每次发反向请求前,先 <code>flushAllStreamBatches()</code>。</strong> 因为审批弹窗绝对不能抢在"用户正在读的那段文字"前面冒出来——注释原话是 <em>"Reverse requests must not overtake stream events that were emitted before them."</em> 这种对"人的阅读顺序"的照顾,才是产品和 demo 的区别。</p>
+<h3 id="4-工具系统渲染进程只发菜单厨房在-worker-里">4. 工具系统:渲染进程只发菜单,厨房在 worker 里</h3>
+<p>顺着上面说。渲染进程里那个 <code>ToolRegistry</code>,<strong>根本不是执行引擎,而是一个纯目录 / 元数据层</strong>。每个工具的 <code>execute</code> 实现体只是一句 stub——比如 <code>fs-tool.ts</code> 里直接返回 <code>"&lt;Tool&gt; execution has migrated to .NET Native Worker."</code>。它在渲染进程只干三件事:</p>
+<ol>
+<li>给请求提供 <code>ToolDefinition[]</code>(名字、描述、JSON schema);</li>
+<li>驱动系统提示词生成;</li>
+<li>声明每个工具的<strong>审批策略</strong>(<code>requiresApproval</code>)。</li>
+</ol>
+<p>真正的执行,全在 worker 里(或者按上一节说的,反向路由到该去的那一层)。</p>
+<p>工具注册是分阶段的:核心工具(Read/Write/Bash/Task/Plan/Memory…)同步注册,<strong>技能 / 子 agent / 扩展</strong>这类用户可编辑的目录异步从磁盘刷新,WebSearch / Browser / 插件工具则按设置<strong>动态挂载卸载</strong>。审批策略也很讲究——<code>Read</code>/<code>LS</code> 永远免批,<code>Write</code>/<code>Edit</code> 永远要批,而 <code>Bash</code> 是<strong>看上下文</strong>的:<code>ctx.channelPermissions ? !allowShell : true</code>,即在一个消息渠道会话里,要不要批 shell 跟着渠道的权限走。</p>
+<p>一个能当反例讲的细节:cron / 后台路径<strong>不复用</strong>这个动态注册表,而是维护了一份<strong>冻结的、按安全收窄的静态白名单</strong>(<code>SUPPORTED_BACKGROUND_TOOLS</code>,只放 Read/Write/Edit/Bash/Notify 等 11 个)。交互态是动态目录,后台态是白名单——<strong>运行时要为不同信任边界提供不同的能力面</strong>,这件事被明确地设计了进去,而不是一套工具走天下。</p>
+<h3 id="5-会话不属于窗口">5. 会话不属于窗口</h3>
+<p>这是"loop 活得比 UI 久"的完整证据链,也是我个人最得意的一段。</p>
+<p>一次前台 run,它的生命根本不在 React 组件里,而在 worker 进程里,以一个 <code>runId</code> 为锚。所以"切走会话 / 关窗口"这些动作,改的<strong>只是事件流往哪个水槽灌</strong>,而不是"停不停":</p>
+<ul>
+<li><strong>切到别的会话</strong> → 该会话变"后台"而非"停止"。<code>session-runtime-router.ts</code> 是那个岔路口:每个 delta 先问 <code>isSessionForeground(sessionId)</code>。前台灌进 <code>chat-store</code>(并塞进一个 <code>requestAnimationFrame</code> 里,让 React 一帧只渲染一次);后台则灌进独立的 <code>background-session-store</code> 缓冲区,连未读角标都从 ~30 次/秒 降频防抖到 ~2 次/秒。</li>
+<li><strong>切回来</strong> → <code>flushBackgroundSessionToForeground</code> 把缓冲区<strong>原子地</strong>排干、按插入顺序合并回 <code>chat-store</code>,画面"追帧"补上你不在时发生的一切。(这个函数的 docblock 直接吐槽了上一版实现:老版本挨个 id <code>updateMessage</code>,窗口没加载到那条就<strong>静默丢消息</strong>——这个坑他们踩过并写进了注释,现在改成缺失的 id 直接当新消息插入,绝不丢。)</li>
+<li><strong>弹成独立窗口 / 多窗口</strong> → 每个 mutation 还会 <code>emitSessionRuntimeSync</code> 广播,主进程 <code>routeRuntimeSync</code> 把事件扇出给<strong>其他</strong>正在看这个会话的窗口。一个会话被拖到独立窗口后,哪怕主窗口藏起来,它照样在流。</li>
+<li><strong>可见性还会往下压到运行时</strong> → detached 页面会 <code>notifySessionVisibility</code> 一路传到 worker 的自适应批处理器,让 worker <strong>在源头</strong>就给后台会话粗化批处理。所以是"源头节流 + 渲染端缓冲"双保险。</li>
+</ul>
+<p>一句能钉进脑子的总结:<strong>渲染进程只是一个可拆卸、可重新挂载的"视图",挂在一个主进程 run 上;导航、弹窗、关窗,只是切换同一条 <code>runId</code> 流的落点而已。</strong> 前台 run 不是靠"特判关窗口"才活下来的——它从一开始就没绑在窗口上。</p>
+<h3 id="6-一套事件协议喂给所有入口">6. 一套事件协议,喂给所有入口</h3>
+<p>不管是前台交互、cron 定时任务、还是消息平台的插件自动回复,它们说的是<strong>同一种事件语言</strong>:<code>agent-loop-types.ts</code> 里那个 <code>InteractiveAgentEvent</code> 联合类型,和 <code>{ v, runId, sessionId, seq, events[] }</code> 的信封。<code>v</code> 是协议版本,<code>seq</code> 单调递增保证顺序、能检测丢帧,<code>events</code> 是数组好批量发。</p>
+<p>这件事的价值在于:<strong>我们没有为每个界面 fork 一份 loop。</strong> 前台会话和后台 cron 都是调 worker 的同一个 <code>agent/run</code>,只是消费事件的姿势不同——前台把事件灌进 UI store,后台把它落进 SQLite。飞书群里被 @ 的那个 bot,和你屏幕上正在打字的那个 agent,底层是同一条心跳。</p>
+<h3 id="7-运行时和-ui-之间背压是一等公民">7. 运行时和 UI 之间,背压是一等公民</h3>
+<p>流式事件如果原样透传给渲染进程,一个多工具并发的 run 能把 IPC 打爆。主进程做<strong>自适应批处理</strong>:按 <code>runId</code> 把帧攒进 <code>pendingStreamBatches</code>,遇到终止事件、超过字节上限、或者攒够一小段时间就 flush。前台大约 33ms 一 flush(≈30fps,肉眼觉得"实时"),后台压到 150ms,还会合并可聚合的事件(比如连续的 text delta)。前台丝滑,后台不吵——一个正在后台默默跑的会话,不该抢着刷新你正看着的这个。</p>
+<h3 id="8-provider-无关是靠能力协商不是靠-if-provider--">8. Provider 无关,是靠"能力协商",不是靠 <code>if (provider === ...)</code></h3>
+<p>renderer 不假设 worker 一定支持某个 provider,它<strong>问</strong>:<code>canSidecarHandle('agent.run')</code>、<code>canSidecarHandle('provider.anthropic')</code>,底层是一个 <code>capabilities/check</code> 的 RPC。不支持就优雅降级、给个明确的错(<code>${provider.type} requires the .NET Native Worker for execution.</code>),而不是抛异常炸给用户。worker 侧则是个干净的模块注册表——<code>WorkerModuleCatalog</code> 列了 20 个模块,<code>WorkerHostBuilder</code> 遍历着把它们注册进 <code>WorkerDispatcher</code>,新增一个能力就是加一个 module,<code>Program.cs</code> 的 <code>Main</code> 干净到只有几行。</p>
+<p>顺带一个我很喜欢的细节:子 agent(Task 工具)默认路由到配置里的 <strong>fast model</strong>(<code>subAgentProvider</code>,取自 <code>getFastProviderConfig()</code>),让被委派出去的活儿用更便宜更快的模型,没配就退回主模型。这种"省钱"是刻在运行时里的,不是让用户在 prompt 里自己念叨。</p>
+<h3 id="关于重试补一句">关于重试,补一句</h3>
+<p>整套系统有<strong>两条独立的重试链</strong>,别搞混:</p>
+<ul>
+<li>原生 loop 自己对 provider 请求的重试,通过 <code>request_retry { attempt, maxAttempts, delayMs, statusCode, reason }</code> 事件<strong>流回 UI</strong>,用户能看到"正在第几次重试";</li>
+<li>renderer 侧那些仍走 JS 的 provider,HTTP 重试在 <code>api-proxy.ts</code>:最多 10 次,只在 <strong>429 / ≥500</strong> 时重试,指数退避 + 25% 抖动,认 <code>Retry-After</code> 头,还顺手解析配额头推给 UI。</li>
+</ul>
+<p>没有经典的 circuit breaker——韧性是靠"进程监管 + 分层重试 + 事件级降级"这几层叠出来的,不是靠一个熔断器对象。</p>
+<hr>
+<h2 id="三那它跟一个-agent-framework-到底差在哪">三、那它跟一个 Agent Framework 到底差在哪?</h2>
+<p>这是我最想掰扯清楚的一段,因为现在"Agent 框架"这词被用烂了。</p>
+<p><strong>框架是你 import 进自己进程的一个库;运行时是你运维的一个服务。</strong> 这句是核心,剩下都是它的推论:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Agent Framework(LangChain / AutoGPT / 各种 SDK)</th>
+<th>OpenCoWork 的 Runtime</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>存在形式</td>
+<td>一个库,活在你的进程里,跟你同生共死</td>
+<td>一个独立 OS 进程,你的 UI 挂了它照跑</td>
+</tr>
+<tr>
+<td>优化目标</td>
+<td>表达力、可组合性——"怎么把一个 agent 拼出来"</td>
+<td>可运维性、隔离性、生命周期——"怎么让一堆 agent 跨越睡眠/崩溃/升级稳定跑几个月"</td>
+</tr>
+<tr>
+<td>loop 归属</td>
+<td>in-process,进程一刷新就没</td>
+<td>独立进程,能扛过 UI 导航、关窗、渲染进程 reload</td>
+</tr>
+<tr>
+<td>工具执行</td>
+<td>在你的进程里直接调</td>
+<td>默认在 worker,按能力反向路由到主进程 / 渲染进程</td>
+</tr>
+<tr>
+<td>provider 抽象</td>
+<td>类型层面的接口抽象</td>
+<td>传输 / 能力层面的协商 + 优雅降级</td>
+</tr>
+<tr>
+<td>崩溃语义</td>
+<td>它崩 = 你崩</td>
+<td>它崩,supervisor 收尸、重启、给在途 run 报丧</td>
+</tr>
+<tr>
+<td>产品性关注点</td>
+<td>大多留给你自己接</td>
+<td>审批、权限策略、前后台一致、多渠道、团队、子 agent、上下文压缩,全是运行时原语</td>
+</tr>
+</tbody>
+</table>
+<p>再具体一点,framework 通常给你的是"一个会调工具的循环";而作为一个真实产品,我们需要的是:工具执行前的<strong>人工审批</strong>握手、按会话快照下发的<strong>权限策略</strong>、cron 和交互<strong>同源</strong>的执行路径、上下文压缩作为运行时内建的一等能力(而不是你在 userland 里塞个 callback)、跨窗口的会话同步……这些东西你在框架里都得自己缝,而且缝得对不对,要等线上崩了才知道。</p>
+<p>一句话:<strong>框架帮你把 agent 想出来,运行时帮你把 agent 养活。</strong></p>
+<hr>
+<h2 id="四如果你也在造-agent-产品我觉得可以抄的几点">四、如果你也在造 Agent 产品,我觉得可以抄的几点</h2>
+<p>不吹了,给点能带走的:</p>
+<ol>
+<li><strong>把进程边界画在运行时上。</strong> 让 loop 住在一个能比 UI 活得久、能被单独监管的地方。这一条几乎决定了你的可靠性天花板。</li>
+<li><strong>把 agent loop 当长跑服务运维。</strong> 心跳、退避、崩溃日志、睡眠唤醒、崩溃时给在途 run 合成终止事件——你现在偷的每一个懒,都是第二个月线上要还的债。这部分代码不酷,但它才是护城河。</li>
+<li><strong>用反向请求解耦能力,别把工具在每一层各抄一遍。</strong> 让运行时"够到"宿主的能力,而不是把宿主能力塞进运行时。审批、UI 工具、OS 操作,都能走同一条反向通道。</li>
+<li><strong>会话别绑在窗口上。</strong> 把 run 锚在一个进程里、用 <code>runId</code> 寻址,UI 只是可拆卸的视图。切走 = 换水槽,不是停。</li>
+<li><strong>一套事件词汇,喂所有入口。</strong> 交互、定时、插件、团队,别给每个界面 fork 一份 loop。一份协议,N 个消费者。</li>
+<li><strong>运行时到 UI 之间的背压,别当事后优化。</strong> 前台 30fps、后台压到 150ms,源头节流 + 渲染端缓冲,一开始就该设计进去。</li>
+<li><strong>能力协商 &gt; provider 分支。</strong> 让调用方"问"而不是"猜",不支持就优雅降级。</li>
+<li><strong>运行时的技术选型,按运维属性选,别按你熟不熟选。</strong> 对一个桌面产品,一个 AOT 原生 sidecar 换来的 ABI 解耦、崩溃隔离、快冷启动,是非常划算的一笔买卖——哪怕这意味着你团队里得有人写 C#。</li>
+</ol>
+<hr>
+<p>写 OpenCoWork 这套东西,最深的一个体感是:<strong>做一个能跑起来的 agent,一个下午;做一个用户三个月不重装、跨睡眠跨崩溃跨升级都还在的 agent,是另一门手艺。</strong> 前者是算法,后者是工程。而运行时,就是那门工程活儿凝结的地方。</p>
+
+
+</div>
+<div class="clear"></div>
+
+        <div class="postDesc">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-10 23:41">2026-07-10 23:41</span>&nbsp;
+<a href="https://www.cnblogs.com/token-ai">239573049</a>&nbsp;
+阅读(<span id="post_view_count">98</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21347451);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Ftoken-ai%2Fp%2F21347451&amp;targetId=21347451&amp;targetType=0" target="_blank">举报</a>
+</div>
+    
