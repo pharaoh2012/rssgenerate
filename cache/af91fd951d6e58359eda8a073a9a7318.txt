@@ -1,0 +1,483 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yuxl01/p/21111216" title="发布于 2026-07-14 07:31">
+    
+
+    <span role="heading" aria-level="2">.NET CORE 动态扩展Options-配置运行时热更新</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h3 id="1前言">1.前言</h3>
+<blockquote>
+<p>玩了半年最近找了新工作，，新工作也是再一次接触到<code>Abp vNext</code> 框架，内部系统开发也是基于这个框架的，最近领导让研究学习框架身份认证权限这一套，然后为现有系统做一些扩展和维护，在研究的过程中发现一些很有趣的设计和代码，刚好有些总结，今天分享出来。</p>
+</blockquote>
+<p>做业务系统，配置这东西绕不开。小到一个 SMTP 邮件服务器地址，大到一整套限流规则、开关策略，我们都习惯放到 appsettings.json 里，代码定义一个 EmailOptions，在 Program.cs 里 Bind 一下。然后业务 Service 在代码里用 <code>IOptions&lt;T&gt;</code> 注入进来用，框架帮我们绑定好，而且强类型有智能提示，用起来很舒服。但用久了会发现一个尴尬的地方：<code>appsettings.json</code> 里的东西，改一次就得重新发布或者重启一次应用。开发阶段无所谓，可上了生产，这事就让人觉得很离谱。</p>
+<p>有小伙伴可能会说配置要改还不简单，<code>appsettings.json</code> 改一改，配合 <code>IOptionsMonitor&lt;T&gt;</code> 不就能热更新、不用重启了吗？没错，如果你的诉求只是改个配置文件不重启就生效，<code>IOptionsMonitor</code> 确实够用了，这篇你可以不用往下看。因为它能覆盖的仅仅是一份配置全局生效这种最简单的情况。真正让人头疼的是这种场景。假设我们在做一个多租户的 SaaS 系统，卖给N家公司用。有个再常见不过的功能——发邮件、发验证码、发通知。那么问题来了：</p>
+<p><strong>1.A公司想用自己的企业邮箱服务器发件，显示自己的发件人抬头。</strong></p>
+<p><strong>2.B公司没有邮件服务器，就用我们平台默认的。</strong></p>
+<p><strong>3.C公司是大客户，买了独立 SMTP 通道增值服务，配置又会不一样。</strong></p>
+<p>就是说，同样一段发邮件的代码，<code>EmailOptions </code> 该取哪个值，取决于当前这个请求是哪个租户进来的。 而且这些配置是租户自己在后台管理页面里改，存在数据库里随时可能变。这时候咱们再看 <code>IOptionsMonitor</code>，会发现它歇菜了因为它是全局单例，只有一份配置程序找他读取A租户的 SMTP 是什么，它根本没有当前是谁这个概念。因为它只针对配置文件，但是租户配置压根不在配置文件里，而在数据库里一个租户一行数。</p>
+<p>这就是原生 <code>IOptions</code> 的天花板，它能解决的是配置从哪来，但解决不了配置要不要随上下文租户 、 用户 、 请求变化。 不过这些恰恰是稍微复杂点的业务系统都会遇到的真实需求——多租户只是最典型的一个，我之前就遇到过，还有其它像按用户等级给不同的限流阈值，按当前组织读不同的审批流配置，本质是同一类问题。</p>
+<p>下面就来分享一下这个问题是怎么来的，顺便看看 ABP 框架里 <code>AbpDynamicOptionsManager</code> 的设计是怎么用很少的代码解决这个问题的，也是 ABP 做到同一个 <code>IOptions&lt;T&gt;</code>，不同租户拿到不同值的核心原理。然后我们不依赖 ABP，自己动手实现一套，大概不到 100 行代码。在开始之前，我们如果理解了下面2个问题后面会顺很多，这里不展开讲</p>
+<p>1.<code>Options </code>模式解决了什么问题？</p>
+<p>2.<code>IOptions</code>、<code>IOptionsSnapshot</code>、<code>IOptionsMonitor</code> 他们有啥区别？</p>
+<h3 id="2原生-options-是怎么工作的">2.原生 Options 是怎么工作的</h3>
+<p>我们平时在代码中这样写：</p>
+<pre><code class="language-csharp">services.AddOptions&lt;EmailOptions&gt;().Bind(configuration.GetSection("Email"));
+</code></pre>
+<p>代码背后NETCORE框架偷偷帮我们干了几件事：</p>
+<ol>
+<li>
+<p><strong>注册一个绑定器，负责把 <code>appsettings.json</code> 里 <code>Email</code> 这个节点的值，塞进 <code>EmailOptions</code> 对象。</strong></p>
+</li>
+<li>
+<p><strong>注册一个负责造对象的工厂 <code>IOptionsFactory&lt;EmailOptions&gt;</code>。</strong></p>
+</li>
+<li>
+<p><strong>把 <code>IOptions&lt;EmailOptions&gt;</code> 和 <code>IOptionsSnapshot&lt;EmailOptions&gt;</code> 的默认实现都指向同一个类：<code>OptionsManager&lt;EmailOptions&gt;</code>。</strong></p>
+</li>
+</ol>
+<p>第三步这个 <code>OptionsManager</code> 它内部的逻辑如下，这里我简化：</p>
+<pre><code class="language-csharp">public class OptionsManager&lt;TOptions&gt; : IOptions&lt;TOptions&gt;, IOptionsSnapshot&lt;TOptions&gt;
+    where TOptions : class
+{
+    private readonly IOptionsFactory&lt;TOptions&gt; _factory;
+    private TOptions? _cache;   // 注意这个缓存字段
+
+    public TOptions Value =&gt; Get(Options.DefaultName);
+
+    public TOptions Get(string name)
+    {
+        if (_cache is null)
+        {
+            _cache = _factory.Create(name);  // 第一次访问，才真正去构建
+        }
+        return _cache;   // 之后每次都返回这同一个对象
+    }
+}
+</code></pre>
+<p>看上面代码应该就明白了，<strong><code>EmailOptions</code> 这个对象，就在我们第一次访问 <code>.Value</code> 的时候才构建的，构建完就缓存进 <code>_cache</code>，之后再读拿到的都是同一个对象、同一批值。</strong><br>
+这就是在没开热重载的情况下，为啥我们改了 <code>appsettings.json</code>或者改了数据库，<code>IOptions&lt;T&gt;.Value</code> 没变的原因，因为缓存了压根就没再算第二次。</p>
+<p><strong>这里你可能会有疑问，通常缓存都是使用一个静态字典，或者其他静态的属性，_cache不就是个私有字段吗？怎么缓存的？其实他是依靠实例注入容器的生命周期来实现的，如果注入为单例，那么这个对象上的字段也会一直存在，如果是作用域那么没一次请求就会重新更新，如果你明白了，那恭喜你你对实例缓存和静态缓存有了更进一步的认识。</strong></p>
+<p>看下源码：</p>
+<pre><code class="language-csharp">public static IServiceCollection AddOptions(this IServiceCollection services)
+{
+    services.TryAdd(ServiceDescriptor.Singleton(typeof(IOptions&lt;&gt;), typeof(OptionsManager&lt;&gt;)));
+    services.TryAdd(ServiceDescriptor.Scoped(typeof(IOptionsSnapshot&lt;&gt;), typeof(OptionsManager&lt;&gt;)));
+    services.TryAdd(ServiceDescriptor.Singleton(typeof(IOptionsMonitor&lt;&gt;), typeof(OptionsMonitor&lt;&gt;))); // ← 单例
+    // ...
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>接口</th>
+<th>生命周期</th>
+<th>值什么时候变</th>
+<th>适合场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>IOptions&lt;T&gt;</code></td>
+<td>单例</td>
+<td>永不变，第一次算完用到进程结束</td>
+<td>启动后不变的配置</td>
+</tr>
+<tr>
+<td><code>IOptionsSnapshot&lt;T&gt;</code></td>
+<td>作用域（每请求一份）</td>
+<td>每个新请求重新算一次</td>
+<td>每个请求可能不同的配置</td>
+</tr>
+<tr>
+<td><code>IOptionsMonitor&lt;T&gt;</code></td>
+<td>单例</td>
+<td>配置文件变了会自动重新算</td>
+<td><code>appsettings.json</code> 热重载</td>
+</tr>
+</tbody>
+</table>
+<p>这里要注意的是<code>IOptionsMonitor</code>并不是能感知所有变化。它关注的是 <code>IConfiguration</code> 也就是配置文件、环境变量。至于数据库里的设置，根本不在<code>IConfiguration</code> 上，所以<code>IOptionsMonitor</code> 对它的变化不会有反应。所以结论就是：</p>
+<p>1.<strong>原生3种选项，都不能知道数据库里的配置变更。</strong></p>
+<p>2.<strong>单例的 <code>IOptions</code> / <code>IOptionsMonitor</code>，不能获取随请求上下文变化的值。</strong></p>
+<p><code>IOptionsSnapshot</code> 是每个请求一份，但它每次也只是老老实实走一遍 <code>IConfiguration</code> 的绑定，还是没地方根据当前租户去数据库取值。</p>
+<h3 id="3真实业务场景下的问题">3.真实业务场景下的问题</h3>
+<p>下面我们直接把多租户场景落到代码上。还是那个发邮件的功能，配置类长这样：</p>
+<pre><code class="language-csharp">public class EmailOptions
+{
+    public string SmtpHost { get; set; } = "localhost";
+    public int SmtpPort { get; set; } = 25;
+    public string SenderAddress { get; set; } = "yuxl@qq.com";
+    public bool EnableSsl { get; set; }
+}
+</code></pre>
+<p>我们的需求是：</p>
+<p>1.<code>appsettings.json</code> 里有一套平台默认邮件配置，租户没自己配的时候就用它兜底。</p>
+<p>2.每个租户能在自己的后台里配一套专属的SMTP，存在数据库里，改完立即生效，不需要重启。</p>
+<p>3.业务代码里发邮件的 <code>EmailService</code>，希望还是正常注入 <code>IOptions&lt;EmailOptions&gt;</code> 就能用，不用为了多租户到处改。</p>
+<p>就这个需求，如果用原生的方式就会有如下几个问题：</p>
+<h4 id="1ioptions-不能提供按租户区分的值">1.<code>IOptions</code> 不能提供按租户区分的值</h4>
+<blockquote>
+<p>A 租户的请求和 B 租户的请求，拿到的 <code>EmailOptions</code> 一模一样，全是启动时那份默认值。多租户的功能直接失效了。</p>
+</blockquote>
+<h4 id="2直接查库">2.直接查库</h4>
+<p>那干脆不用 <code>Options </code>了，每次发邮件都先查库拿到最新配置，总可以吧</p>
+<pre><code class="language-csharp">public class EmailService
+{
+    private readonly ISettingStore _store;
+    private readonly ICurrentTenant _currentTenant;   // 当前租户
+
+    public async Task SendAsync()
+    {
+        var tenantId = _currentTenant.Id;
+        var host = await _store.GetAsync(tenantId, "Email.SmtpHost");
+        var port = await _store.GetAsync(tenantId, "Email.SmtpPort");
+        var ssl  = await _store.GetAsync(tenantId, "Email.EnableSsl");
+        // 每个用到邮件配置的地方，都得带 tenantId 这么来查一遍……
+    }
+}
+</code></pre>
+<p>这代码问题稍微有点经验的小伙伴都知道：</p>
+<p>1.强类型没了，全是 <code>Email.SmtpHost</code> 这种魔法字符串，敲错一个字母都不报错。</p>
+<p>2.每个Service都要重复写一遍取当前租户然后读库再转类型的逻辑。</p>
+<p>3.缓存策略各搞各的，有人按租户缓存有人不缓存，逐渐屎山化。</p>
+<h4 id="3需要一个按当前上下文同步的开关">3.需要一个按当前上下文同步的开关</h4>
+<p>我们真正想要的，其实是这样的流程：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202607/1264751-20260704175623932-2001207933.png" alt="image" loading="lazy"></p>
+<p>请求进来带着租户身份，某个地方统一同步一下这个请求里所有用到配置的服务，都读到当前租户的值，关键就是中间那个统一同步，它得知道当前是谁，然后把对应的值刷进来。原生 Options 没给我们这个开关，因为<code>IOptions.Value</code> 第一次访问就定死了，我们需要的不是重启程序，而是在一次请求里，根据当前租户从数据库拿到它对应的配置值，把已经缓存好的 Options 对象覆盖掉，然后让请求里所有的服务使用到的配置全部更新。不过这个就是设计要解决的事。</p>
+<h3 id="4abp是怎么解决的">4.ABP是怎么解决的</h3>
+<p>它定义了一个类叫 <code>AbpDynamicOptionsManager&lt;T&gt;</code>，它的实现思路在我看了之后，不禁觉得他们开发者对原生NETCORE框架的了解程度，<strong>不另起炉灶，而是继承原生的 <code>OptionsManager</code>，然后在它缓存好的那个对象动手改。</strong> 核心就三个文件代码很少很少。</p>
+<h4 id="1继承-optionsmanager-的抽象基类">1.继承 <code>OptionsManager</code> 的抽象基类</h4>
+<pre><code class="language-csharp">public abstract class AbpDynamicOptionsManager&lt;T&gt; : OptionsManager&lt;T&gt;
+    where T : class
+{
+    protected AbpDynamicOptionsManager(IOptionsFactory&lt;T&gt; factory)
+        : base(factory)
+    {
+    }
+
+    public Task SetAsync() =&gt; SetAsync(Options.DefaultName);
+
+    public virtual Task SetAsync(string name)
+    {
+        return OverrideOptionsAsync(name, base.Get(name));
+    }
+
+    protected abstract Task OverrideOptionsAsync(string name, T options);
+}
+</code></pre>
+<p>牛x的地方是 <code>SetAsync</code> 这几行：</p>
+<p>1.<code>base.Get(name)</code>调父类的方法，把那个缓存好的 Options 对象拿出来，第一次会走 <code>appsettings</code> 的绑定，之后直接返回缓存。</p>
+<p>2.<code>OverrideOptionsAsync(name, 那个对象)</code> 把这<strong>同一个对象</strong>丢给子类，让子类从数据库读值，往这个对象身上覆盖。</p>
+<p>注意是原对象修改，不是new一个新的对象。因为业务代码中 <code>_options.Value</code> 已经拿到的就是这个对象的引用，在这个对象上改属性，引用的地方立马就看到了，要是 new 一个新的肯定就不对</p>
+<h4 id="2注册扩展">2.注册扩展</h4>
+<pre><code class="language-csharp">public static IServiceCollection AddAbpDynamicOptions&lt;TOptions, TManager&gt;(this IServiceCollection services)
+    where TOptions : class
+    where TManager : AbpDynamicOptionsManager&lt;TOptions&gt;
+{
+    services.Replace(ServiceDescriptor.Scoped(typeof(IOptions&lt;TOptions&gt;), typeof(TManager)));
+    services.Replace(ServiceDescriptor.Scoped(typeof(IOptionsSnapshot&lt;TOptions&gt;), typeof(TManager)));
+    return services;
+}
+</code></pre>
+<p>这一步非常重要，它直接替换了默认实现，从原生的 <code>OptionsManager</code> 换成我们自己的 Manager。换完之后，业务代码里注入的 <code>IOptions&lt;EmailOptions&gt;</code>，解析出来的是自定义 Manager，但因为它继承 <code>OptionsManager</code>并实现了 <code>IOptions</code> 接口，业务代码一个字都不用改。</p>
+<h4 id="3同步开关">3.同步开关</h4>
+<pre><code class="language-csharp">public static Task SetAsync&lt;T&gt;(this IOptions&lt;T&gt; options)
+    where T : class
+{
+    return ((AbpDynamicOptionsManager&lt;T&gt;)options).SetAsync();
+}
+</code></pre>
+<p>这就是我们前面说的需要一个按当前上下文同步的开关。用来管理员保存设置后，在一个地方 <code>await options.SetAsync()</code>，来触发了上面的 <code>OverrideOptionsAsync</code>，从数据库把最新值刷进 Options 对象，不需要重启重启程序而立即生效。恰好ABP自己也是这么用的，我在看<code>Identity Management</code> 模块的密码策略功能时发现，它就是靠这套机制，把数据库里的密码最小长度这类设置，同步进框架的 <code>IdentityOptions</code>：</p>
+<pre><code class="language-csharp">public class AbpIdentityOptionsManager : AbpDynamicOptionsManager&lt;IdentityOptions&gt;
+{
+    private readonly ISettingProvider _settingProvider;
+
+    protected override async Task OverrideOptionsAsync(string name, IdentityOptions options)
+    {
+        options.Password.RequiredLength = await _settingProvider.GetAsync(
+            IdentitySettingNames.Password.RequiredLength,
+            options.Password.RequiredLength);   // 数据库有值就用数据库的，没有就保留默认
+        // ……其他字段同理
+    }
+}
+</code></pre>
+<p>管理员在后台把密码策略从 6 位改成 8 位，保存后立即对全系统生效，不需要重启，就是这么实现来的。</p>
+<h3 id="5自己实现demo">5.自己实现Demo</h3>
+<p>我在看了之后觉得还是很巧妙的，不过看了几遍还是没能完全意会，然后自己就写了个Demo跑起来看看效果。Demo 里我用一个内存字典来模拟数据库，省去直接连实际数据库。</p>
+<blockquote>
+<p>先提前说明一下，为了理解动态覆盖机制本身，我这个Demo是只有一个租户的简化版，模拟的数据库只存一套值没带 <code>tenantId</code>。怎么支持多租户？其实只要在覆盖逻辑里多走一步逻辑确认当前是哪个租户就行。</p>
+</blockquote>
+<p>1.先准备静态默认配置 <code>appsettings.json</code>：</p>
+<pre><code class="language-json">{
+  "Email": {
+    "SmtpHost": "smtp.default.local",
+    "SmtpPort": 25,
+    "SenderAddress": "yuxl@qq.com",
+    "EnableSsl": false
+  }
+}
+</code></pre>
+<p>2.再写一个模拟是数据库的设置 <code>InMemorySettingStore</code></p>
+<pre><code class="language-csharp">namespace CodeSource.DynamicOptionsDemo;
+
+/// 模拟数据库、设置中心，生产环境可以换成 EF Core 查表、Redis 等
+public class InMemorySettingStore
+{
+    private readonly Dictionary&lt;string, string&gt; _settings = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Email.SmtpHost"] = "smtp.dynamic.local",
+        ["Email.SmtpPort"] = "587",
+        ["Email.SenderAddress"] = "admin@qq.com",
+        ["Email.EnableSsl"] = "true"
+    };
+
+    public string? GetOrNull(string key) =&gt; _settings.TryGetValue(key, out var value) ? value : null;
+
+    public void Set(string key, string value) =&gt; _settings[key] = value;
+}
+</code></pre>
+<p>先故意让它的值和 <code>appsettings.json</code> 都不一样，这样就能看出到底是哪套值在生效：</p>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>appsettings（静态）</th>
+<th>数据库（动态）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SmtpHost</td>
+<td>smtp.default.local</td>
+<td>smtp.dynamic.local</td>
+</tr>
+<tr>
+<td>SmtpPort</td>
+<td>25</td>
+<td>587</td>
+</tr>
+<tr>
+<td>SenderAddress</td>
+<td>yuxl@qq.com</td>
+<td>admin@qq.com</td>
+</tr>
+<tr>
+<td>EnableSsl</td>
+<td>false</td>
+<td>true</td>
+</tr>
+</tbody>
+</table>
+<p>3.开始写我们自己的 <code>EmailOptionsManager</code>实现覆盖逻辑</p>
+<pre><code class="language-csharp">using CodeSource.DynamicOptions;
+using Microsoft.Extensions.Options;
+
+namespace CodeSource.DynamicOptionsDemo;
+
+public class EmailOptionsManager : DynamicOptionsManager&lt;EmailOptions&gt;
+{
+    private readonly InMemorySettingStore _settingStore;
+
+    public EmailOptionsManager(
+        IOptionsFactory&lt;EmailOptions&gt; factory,
+        InMemorySettingStore settingStore)
+        : base(factory)
+    {
+        _settingStore = settingStore;
+    }
+
+    protected override Task OverrideOptionsAsync(string name, EmailOptions options)
+    {
+        // 数据库里有值就覆盖，没值就保留 appsettings 的默认值
+        if (TryGetString("Email.SmtpHost", out var smtpHost))
+            options.SmtpHost = smtpHost;
+
+        if (TryGetInt("Email.SmtpPort", out var smtpPort))
+            options.SmtpPort = smtpPort;
+
+        if (TryGetString("Email.SenderAddress", out var senderAddress))
+            options.SenderAddress = senderAddress;
+
+        if (TryGetBool("Email.EnableSsl", out var enableSsl))
+            options.EnableSsl = enableSsl;
+
+        return Task.CompletedTask;
+    }
+
+    private bool TryGetString(string key, out string value)
+    {
+        var stored = _settingStore.GetOrNull(key);
+        if (stored is null) { value = string.Empty; return false; }
+        value = stored;
+        return true;
+    }
+
+    private bool TryGetInt(string key, out int value)
+    {
+        var stored = _settingStore.GetOrNull(key);
+        if (stored is null || !int.TryParse(stored, out value)) { value = 0; return false; }
+        return true;
+    }
+
+    private bool TryGetBool(string key, out bool value)
+    {
+        var stored = _settingStore.GetOrNull(key);
+        if (stored is null || !bool.TryParse(stored, out value)) { value = false; return false; }
+        return true;
+    }
+}
+</code></pre>
+<p>这里判断了数据库有没有这个 key，有才覆盖没有就不动。这样 <code>appsettings.json</code> 就成了兜底的默认值，数据库只负责覆盖那些管理员真正改过的项。这种静态打底 + 动态覆盖的双层结构，比单纯查库多了一层降级的策略</p>
+<p>4.业务服务 <code>EmailService</code>调用，可以看到很干净</p>
+<pre><code class="language-csharp">// 业务服务只认 IOptions&lt;EmailOptions&gt;，根本不知道背后有动态这回事
+public class EmailService
+{
+    private readonly IOptions&lt;EmailOptions&gt; _options;
+
+    public EmailService(IOptions&lt;EmailOptions&gt; options)
+    {
+        _options = options;
+    }
+
+    public void PrintCurrentConfig(string label)
+    {
+        var email = _options.Value;
+        Console.WriteLine($"[{label}]");
+        Console.WriteLine($"  SmtpHost       : {email.SmtpHost}");
+        Console.WriteLine($"  SmtpPort       : {email.SmtpPort}");
+        Console.WriteLine($"  SenderAddress  : {email.SenderAddress}");
+        Console.WriteLine($"  EnableSsl      : {email.EnableSsl}");
+        Console.WriteLine();
+    }
+}
+</code></pre>
+<p><code>EmailService</code> 普通地注入 <code>IOptions&lt;EmailOptions&gt;</code>就可以了，跟平时写的一毛一样。这就是这套设计最巧妙和有价值的地方，动态能力是加在框架和扩展的连接处的，实际业务代码基本没有感知也不需要改动。</p>
+<p>5.我们再<code>Program.cs</code>，把上面这些串起来演示一下</p>
+<p>**</p>
+<pre><code class="language-csharp">
+internal static class Program
+{
+    private static async Task Main()
+    {
+        var configuration = new ConfigurationBuilder().SetBasePath(AppContext.BaseDirectory) .AddJsonFile("appsettings.json", optional: false) .Build();
+        var services = new ServiceCollection();
+
+        // 第 1 步绑定静态配置appsettings → EmailOptions
+        services.AddOptions&lt;EmailOptions&gt;().Bind(configuration.GetSection("Email"));
+
+        // 第 2 步动态设置存储（模拟数据库）
+        services.AddSingleton&lt;InMemorySettingStore&gt;();
+
+        // 第 3 步用我们的 Manager 替换 IOptions 默认实现
+        services.AddDynamicOptions&lt;EmailOptions, EmailOptionsManager&gt;();
+
+        // 第 4步 注入业务服务
+        services.AddScoped&lt;EmailService&gt;();
+
+        using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();   // 模拟一次 HTTP 请求的 Scope
+        var sp = scope.ServiceProvider;
+
+        var emailService = sp.GetRequiredService&lt;EmailService&gt;();
+        var options = sp.GetRequiredService&lt;IOptions&lt;EmailOptions&gt;&gt;();
+        var settingStore = sp.GetRequiredService&lt;InMemorySettingStore&gt;();
+
+        // 还没同步，读到的是 appsettings 的静态值
+        emailService.PrintCurrentConfig(" 仅 appsettings，未同步动态设置");
+
+        // 调一次 SetAsync，数据库的值覆盖上来
+        await options.SetAsync();
+        emailService.PrintCurrentConfig("调用 SetAsync() 后，动态设置已覆盖");
+
+        // 模拟管理员在后台改了配置，再同步一次
+        settingStore.Set("Email.SmtpHost", "smtp.updated.local");
+        await options.SetAsync();
+        emailService.PrintCurrentConfig(" 设置变更后再次 SetAsync()，不需要重启");
+
+        // 同一个 Scope 里再拿一个服务，值是一样的，共享同一实例
+        var anotherEmailService = sp.GetRequiredService&lt;EmailService&gt;();
+        anotherEmailService.PrintCurrentConfig("同 Scope 另一服务，值一样");
+    }
+}
+</code></pre>
+<p>感兴趣的小伙伴，可以看看</p>
+<h3 id="6在web-项目里怎么落地">6.在Web 项目里怎么落地</h3>
+<p>我们上面在控制台验证了下实现原理，真实项目里都是在 Web API 里用的。注册跟 Demo 一样，其实关键是什么时候调 <code>SetAsync</code>，这里有两种常见办法。</p>
+<p><strong>方法一</strong></p>
+<p>在保存设置的接口里调一次，管理员点保存的接口，存完库顺手同步一下：</p>
+<pre><code class="language-csharp">[ApiController]
+[Route("api/settings/email")]
+public class EmailSettingsController : ControllerBase
+{
+    private readonly InMemorySettingStore _store;
+    private readonly IOptions&lt;EmailOptions&gt; _options;
+
+    public EmailSettingsController(InMemorySettingStore store, IOptions&lt;EmailOptions&gt; options)
+    {
+        _store = store;
+        _options = options;
+    }
+
+    [HttpPut]
+    public async Task&lt;IActionResult&gt; Save([FromBody] EmailOptionsDto dto)
+    {
+        // 1. 先存库
+        _store.Set("Email.SmtpHost", dto.SmtpHost);
+        _store.Set("Email.SmtpPort", dto.SmtpPort.ToString());
+        _store.Set("Email.SenderAddress", dto.SenderAddress);
+        _store.Set("Email.EnableSsl", dto.EnableSsl.ToString());
+
+        // 2. 再同步，当前请求 Scope 里的 Options 立即更新
+        await _options.SetAsync();
+        return Ok(new { message = "设置已保存并生效" });
+    }
+}
+</code></pre>
+<p><strong>方法二</strong></p>
+<p>每个请求进来自动同步，因为我们把 <code>IOptions&lt;T&gt;</code> 注册成了 Scoped，每个请求一份，所以可以写个中间件，在每个请求一进来就同步一次，业务代码就完全不用操心同步时机：</p>
+<pre><code class="language-csharp">public class DynamicOptionsMiddleware
+{
+    private readonly RequestDelegate _next;
+    public DynamicOptionsMiddleware(RequestDelegate next) =&gt; _next = next;
+
+    public async Task InvokeAsync(HttpContext context, IOptions&lt;EmailOptions&gt; emailOptions)
+    {
+        await emailOptions.SetAsync();   // 每个请求开始时刷一次
+        await _next(context);
+    }
+}
+
+// Program.cs
+app.UseMiddleware&lt;DynamicOptionsMiddleware&gt;();
+</code></pre>
+<p>这样每个 HTTP 请求进来，<code>EmailOptions</code> 都会自动从数据库刷新到最新，业务里该怎么注入还怎么注入。</p>
+<h3 id="7总结">7.总结</h3>
+<p>回头看，这套设计巧就巧在它没有推翻原生 Options，而是对<code>OptionsManager</code> 精准地补了一刀：</p>
+<p>1.<strong>继承而不是另起炉灶</strong>——完全兼容原生的 <code>Bind</code>、<code>Configure</code> 那套机制。</p>
+<p>2.<strong>原地覆盖而不是重建对象</strong>，业务手里的引用不变，改属性就全都跟着变。</p>
+<p>3.<strong>一个 <code>SetAsync</code> 当同步开关</strong>，自己决定什么时候生效。</p>
+<p>4.<strong>用 <code>Replace</code> 替换</strong>，业务代码继续注入 <code>IOptions&lt;T&gt;</code>，一个字都不用改。</p>
+<p>跟之前写认证那篇一样的感受，这些框架背后的设计，不自己去抠源码动手撸一遍，光看文档很难体会到他的牛叉之处。感兴趣的小伙伴可以把这个 Demo 拉下来跑一跑试试</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.059027777777777776" data-date-updated="2026-07-14 08:56">2026-07-14 07:31</span>&nbsp;
+<a href="https://www.cnblogs.com/yuxl01">yuyuyui</a>&nbsp;
+阅读(<span id="post_view_count">509</span>)&nbsp;
+评论(<span id="post_comment_count">10</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21111216);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyuxl01%2Fp%2F21111216&amp;targetId=21111216&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
