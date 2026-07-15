@@ -1,0 +1,795 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sxq-blog/p/21487580" title="发布于 2026-07-15 11:22">
+    
+
+    <span role="heading" aria-level="2">MemER 方法原理讲解</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="memer-方法原理讲解">MemER 方法原理讲解</h1>
+<p><img src="https://img2024.cnblogs.com/blog/1785529/202607/1785529-20260715112140506-1889301254.png" alt="image" loading="lazy"></p>
+<h2 id="1-一句话理解-memer">1. 一句话理解 MemER</h2>
+<p>MemER 的核心思想是：</p>
+<blockquote>
+<p>不要把机器人从开头到现在看到的所有画面都塞给模型，而是让一个高层视觉语言模型不断判断“现在该做哪个子任务”和“最近看到的哪些帧以后可能还要用”，再把这些被挑出来的关键帧作为长期视觉记忆喂回模型。</p>
+</blockquote>
+<p>它解决的是长时程机器人任务里的“我刚才看见过，但现在画面里没有”的问题。例如：</p>
+<ul>
+<li>机器人之前看过某个物体在右边箱子里，现在要找它时不应该重新翻左边箱子。</li>
+<li>机器人已经舀了两勺花生，当前画面只看到勺子，不一定能知道已经舀了几勺。</li>
+<li>机器人把架子上的物体拿走、擦完架子以后，需要记住物体原本放在哪一层。</li>
+</ul>
+<p>普通策略如果只看当前帧，会缺记忆；如果直接看很长视频，会慢、贵、冗余，而且容易把无关历史当捷径。MemER 的做法是用“最近窗口 + 少量关键帧”代替完整历史。</p>
+<h2 id="2-方法整体架构">2. 方法整体架构</h2>
+<p>MemER 是一个分层策略：</p>
+<pre><code class="language-text">高层策略 pi_h:
+  输入: 总任务指令 + 长期关键帧记忆 K_t + 最近 N 帧 R_t
+  输出: 当前应执行的语言子任务 l'_t + 最近 N 帧中应保存的候选关键帧 J_t
+
+低层策略 pi_l:
+  输入: 当前图像 I_t + 机器人状态 q_t + 高层给出的子任务 l'_t
+  输出: 未来一小段机器人动作 A_t
+</code></pre>
+<p>论文把整体策略写成：</p>
+<pre><code class="language-text">pi(A_t | o_{0:t})
+  = pi_l(A_t | I_t, q_t, l'_t)
+    * pi_h(l'_t, J_t | I_{t-N+1:t}, K_t)
+</code></pre>
+<p>其中：</p>
+<ul>
+<li><code>A_t</code> 是未来动作 chunk。</li>
+<li><code>I_t</code> 是当前多相机图像。</li>
+<li><code>q_t</code> 是关节角、夹爪等 proprioception。</li>
+<li><code>l_t</code> 是用户给的总任务指令。</li>
+<li><code>l'_t</code> 是当前要交给低层策略执行的子任务。</li>
+<li><code>R_t = I_{t-N+1:t}</code> 是最近 <code>N</code> 帧。</li>
+<li><code>K_t</code> 是过去被选中的长期关键帧。</li>
+<li><code>J_t</code> 是高层模型从最近窗口里新提名的候选关键帧。</li>
+</ul>
+<p>当前公开代码主要覆盖高层策略：数据导出、Qwen3-VL 微调格式、结构化推理、记忆更新、离线 rollout 评估和在线部署封装。低层 pi0.5 的训练代码不在这个仓库里。</p>
+<h2 id="3-为什么需要高层记忆策略">3. 为什么需要“高层记忆策略”</h2>
+<p>直接把历史全喂给策略有三个问题：</p>
+<ol>
+<li><strong>太贵</strong>：视频帧是高维输入，长历史会让 VLM/VLA 的 token 和显存成本快速上涨。</li>
+<li><strong>太慢</strong>：机器人闭环控制需要低延迟。论文里 Long History baseline 用 32 帧大约 16 秒历史，推理延迟已经接近闭环可忍受上限。</li>
+<li><strong>太脆</strong>：长历史里包含大量无关动作，模型可能学到示范轨迹中的顺序捷径。一旦部署时低层策略卡顿、重试、失败恢复，历史分布就变了，模型更容易误判当前进度。</li>
+</ol>
+<p>MemER 的设计取舍是：</p>
+<ul>
+<li>最近窗口保留局部动作上下文。</li>
+<li>关键帧记忆保留长期必要信息。</li>
+<li>关键帧由高层模型自己根据任务语义提名，不额外训练一个图像检索模型。</li>
+<li>最后用一个很简单的时间聚类器去掉重复提名，让记忆稳定。</li>
+</ul>
+<h2 id="4-数据构建从一段视频到很多道训练题">4. 数据构建：从一段视频到很多道训练题</h2>
+<p>MemER 的高层数据构建，最简单的理解是：</p>
+<blockquote>
+<p>把一整段机器人演示视频，切成很多道给 VLM 做的训练题。每道题都问模型两件事：现在应该执行哪个子任务？最近看到的几帧里，有没有以后要记住的关键画面？</p>
+</blockquote>
+<p>完整流程是：</p>
+<pre><code class="language-text">原始机器人演示轨迹
+  -&gt; 每帧都有图像、总任务、当前子任务标签、机器人状态、动作
+  -&gt; 根据子任务标签和规则，找出整条轨迹里哪些帧值得记住
+  -&gt; 对每个时间步 t 单独构造一条高层训练样本
+  -&gt; 导出成 Qwen SFT 的 train.json + media/*.jpg
+</code></pre>
+<p>先把几个名字分清楚，后面就不会乱：</p>
+<table>
+<thead>
+<tr>
+<th>名字</th>
+<th>它是什么</th>
+<th>在训练样本里扮演什么角色</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GT keyframes</code></td>
+<td>整条演示轨迹里，规则认为应该记住的绝对帧号</td>
+<td>离线生成监督信号</td>
+</tr>
+<tr>
+<td><code>memory_indices</code></td>
+<td>当前时间步以前、已经离开最近窗口的 GT keyframes</td>
+<td>作为输入图片给模型看</td>
+</tr>
+<tr>
+<td><code>context_indices</code></td>
+<td>当前时间步附近的最近 <code>N</code> 个下采样帧</td>
+<td>作为最近视频输入给模型看</td>
+</tr>
+<tr>
+<td><code>keyframe_positions</code></td>
+<td><code>context_indices</code> 里哪些位置应该被提名为新 keyframe</td>
+<td>作为模型输出答案</td>
+</tr>
+</tbody>
+</table>
+<p>一句话说：</p>
+<pre><code class="language-text">memory_indices 是“过去已经该记住的帧”，放进输入；
+keyframe_positions 是“最近刚出现、以后应该记住的帧”，放进输出。
+</code></pre>
+<p>这个区别是数据构建里最关键的点。MemER 不是让模型直接输出一个历史帧号，而是训练模型在“最近窗口”里指出哪些帧值得保存；等这些帧未来离开最近窗口后，它们才会成为长期 memory。</p>
+<h3 id="41-原始演示数据">4.1 原始演示数据</h3>
+<p>论文里的每条机器人轨迹可以理解成一串时间步：</p>
+<pre><code class="language-text">(I_t, q_t, l_t, l'_t, a_t)
+</code></pre>
+<p>含义是：</p>
+<ul>
+<li><code>I_t</code>：多相机图像，论文实验使用 wrist camera 和 third-person/base camera。</li>
+<li><code>q_t</code>：机器人自身状态。</li>
+<li><code>l_t</code>：总任务指令，例如“把架子上的物品拿下来，擦架子，再放回原位”。</li>
+<li><code>l'_t</code>：当前子任务标签，例如“dust bottom shelf”。</li>
+<li><code>a_t</code>：机器人动作。</li>
+</ul>
+<p>子任务标签来自数据采集过程：操作者执行预先规定的子任务列表，完成一个子任务后按键切换到下一个子任务。因此每个时间步天然有当前子任务标签。</p>
+<h3 id="42-高层策略训练样本">4.2 高层策略训练样本</h3>
+<p>高层策略不直接预测机器人动作，只预测：</p>
+<pre><code class="language-json">{
+  "current_subtask": "...",
+  "keyframe_positions": [1, 5]
+}
+</code></pre>
+<p>其中：</p>
+<ul>
+<li><code>current_subtask</code> 是当前应该让低层策略执行的语言子任务。</li>
+<li><code>keyframe_positions</code> 是最近窗口中哪些帧值得保存，位置是 1-indexed，即 <code>1</code> 表示最近窗口第一帧，<code>8</code> 表示第八帧。</li>
+</ul>
+<p>公开代码导出的 Qwen SFT 样本大致长这样：</p>
+<pre><code class="language-json">{
+  "id": "episode_000000_t000120",
+  "image": [
+    "media/episode_000000/frame_000015.jpg",
+    "media/episode_000000/frame_000050.jpg",
+    "media/episode_000000/frame_000085.jpg",
+    "media/episode_000000/frame_000090.jpg",
+    "... recent frames ..."
+  ],
+  "conversations": [
+    {"from": "system", "value": "...输出 JSON ..."},
+    {"from": "human", "value": "Task: ... &lt;image&gt; ... &lt;image&gt; ..."},
+    {"from": "gpt", "value": "{\"current_subtask\": \"...\", \"keyframe_positions\": [7]}"}
+  ],
+  "metadata": {
+    "memory_indices": [15, 50],
+    "context_indices": [85, 90, 95, 100, 105, 110, 115, 120],
+    "answer": {
+      "current_subtask": "...",
+      "keyframe_positions": [7]
+    }
+  }
+}
+</code></pre>
+<p>注意这里的图片顺序是：</p>
+<pre><code class="language-text">先放 memory keyframes，再放 recent context frames
+</code></pre>
+<p>prompt 文本会告诉模型前几张是“从完整历史中选出的重要帧”，后几张是“最近动作视频”。</p>
+<h3 id="43-多相机图像怎样处理">4.3 多相机图像怎样处理</h3>
+<p>公开代码支持单相机或多相机。多相机时，每个时间步的多个相机视角会被竖直拼成一张图：</p>
+<pre><code class="language-text">stacked_frame_t =
+  [wrist image at t
+   exterior image at t]
+</code></pre>
+<p>默认 Panda/Franka 配置是：</p>
+<pre><code class="language-json">{
+  "camera_keys": [
+    "observation.images.wrist_left",
+    "observation.images.exterior_1_left"
+  ],
+  "view_width": 320,
+  "view_height": 180
+}
+</code></pre>
+<p>因此最终单帧输入宽度是 <code>320</code>，高度是 <code>180 * 相机数</code>。这个拼接方式保证训练、评估、部署看到的视角顺序一致。</p>
+<h2 id="5-关键帧标签怎样得到">5. 关键帧标签怎样得到</h2>
+<p>MemER 并不是让人工逐帧标所有关键帧。论文和代码采用的是半自动规则：</p>
+<ol>
+<li>先有每一帧的子任务标签。</li>
+<li>把连续相同子任务看成一个 segment。</li>
+<li>人工为每类 subtask 设定规则：取 segment 第一帧、最后一帧、两者都取，或不取。</li>
+<li>规则固定后自动应用到所有演示轨迹。</li>
+</ol>
+<p>比如：</p>
+<ul>
+<li>Object Search：<code>look inside the &lt;LOCATION&gt; bin</code> 取最后一帧，因为最后通常能看清箱子里有什么。</li>
+<li>Counting：<code>place a scoop of &lt;OBJECT&gt; in the &lt;COLOR&gt; bowl</code> 取最后一帧，因为这代表一次计数完成。</li>
+<li>Dust &amp; Replace：移走物体、擦完某层、放回物体等动作取最后一帧，因为这些帧记录了“完成后的状态”。</li>
+<li>reset 类动作通常不取，因为它们不是长期记忆所需信息。</li>
+</ul>
+<p>伪代码：</p>
+<pre><code class="language-python">def build_rule_based_keyframes(labels, rules, default="none"):
+    keyframes = []  # 存放最终选出的绝对帧索引
+    i = 0           # 当前扫描到的轨迹帧位置
+
+    while i &lt; len(labels):
+        label = labels[i]  # 当前 segment 的子任务名
+        j = i + 1
+
+        # 找到连续执行同一个子任务的区间 [i, j)
+        while j &lt; len(labels) and labels[j] == label:
+            j += 1
+
+        segment = [i, ..., j - 1]              # 这个子任务持续的帧区间
+        select = match_rule(label, rules, default)  # 查规则：该子任务要取首帧、尾帧、都取还是不取
+
+        if select == "first":
+            keyframes.append(i)       # 记录子任务刚开始时的状态
+        elif select == "last":
+            keyframes.append(j - 1)   # 记录子任务完成后的状态，MemER 最常用这种
+        elif select == "both":
+            keyframes.extend([i, j - 1])  # 同时保留开始和结束状态
+        elif select == "none":
+            pass  # 该子任务不贡献长期记忆
+
+        i = j  # 跳到下一个子任务 segment
+
+    return unique_preserve_order(keyframes)  # 去掉重复帧，同时保持时间顺序
+</code></pre>
+<p>这些 keyframes 是训练时的 ground truth。模型训练时并不知道规则本身，只看到由规则产生的监督答案。</p>
+<h2 id="6-训练样本怎样从轨迹切出来">6. 训练样本怎样从轨迹切出来</h2>
+<p>这一节是数据构建的核心。先不要急着看公式，先看一个具体例子。</p>
+<p>假设现在要为 <code>t = 120</code> 这一帧构造一条训练样本，配置是：</p>
+<pre><code class="language-text">frame_subsample = 5
+recent_frames_length = 8
+keyframes_length = 8
+prediction_horizon = 2
+</code></pre>
+<p>再假设整条轨迹里，规则生成的 GT keyframes 是：</p>
+<pre><code class="language-text">GT keyframes = [30, 60, 95, 140]
+</code></pre>
+<p>对 <code>t = 120</code> 这道训练题，MemER 会这样构造：</p>
+<pre><code class="language-text">recent window = [85, 90, 95, 100, 105, 110, 115, 120]
+
+memory_indices = [30, 60]
+  因为 30 和 60 已经早于 recent window，可以作为历史记忆输入。
+
+keyframe_positions = [3]
+  因为 GT keyframe 95 正好在 recent window 里，而且是 recent 的第 3 张。
+
+current_subtask = labels[130]
+  因为 prediction_horizon = 2，frame_subsample = 5，所以目标子任务向前看 10 帧。
+</code></pre>
+<p>最终这条样本可以白话理解成：</p>
+<pre><code class="language-text">输入给模型：
+  总任务指令
+  frame_30.jpg、frame_60.jpg               # 旧的长期记忆
+  frame_85.jpg ... frame_120.jpg           # 最近窗口
+
+要求模型输出：
+  {
+    "current_subtask": labels[130],
+    "keyframe_positions": [3]
+  }
+</code></pre>
+<p>所以，训练数据不是“整段视频 -&gt; 一个答案”，而是“一段视频里的每个时间步 -&gt; 一道小题”。模型通过大量这样的小题学会：哪些旧图应该参考，最近窗口里哪些新图应该保存，现在该给底层 VLA 什么语言指令。</p>
+<p>设：</p>
+<ul>
+<li>原始时间步是 <code>t</code>。</li>
+<li><code>frame_subsample = s</code>，公开示例默认 <code>5</code>。</li>
+<li><code>recent_frames_length = N</code>，公开示例默认 <code>8</code>。</li>
+<li><code>keyframes_length = M</code>，公开示例默认 <code>8</code>。</li>
+<li><code>prediction_horizon = h</code>，公开示例默认 <code>2</code>。</li>
+</ul>
+<h3 id="61-最近窗口">6.1 最近窗口</h3>
+<p>对每个时间步 <code>t</code>，代码先根据下采样步长构造到当前为止的候选上下文：</p>
+<pre><code class="language-python">start_offset = t % frame_subsample        # 让采样序列的最后一帧刚好落在当前 t
+all_context = range(start_offset, t + 1, frame_subsample)
+recent = last_N(all_context)              # 只保留最后 N 个下采样帧
+</code></pre>
+<p>这个 recent window 可以理解为“带当前帧的滑动采样窗口”。它不是永远取 <code>[0, 5, 10, ...]</code> 这种固定网格，而是会随着当前时间步平移，确保最后一张 recent image 就是当前帧。</p>
+<p>例如 <code>frame_subsample = 5, N = 8</code>：</p>
+<pre><code class="language-text">t = 120 -&gt; recent = [85, 90, 95, 100, 105, 110, 115, 120]
+t = 122 -&gt; recent = [87, 92, 97, 102, 107, 112, 117, 122]
+</code></pre>
+<p>模型因此总能看到“当前发生到哪里了”。这个窗口对应多少真实秒数取决于数据集原始帧率；论文实验描述为相机 15Hz、层级策略输入下采样到约 2Hz。</p>
+<h3 id="62-训练时的-memory-keyframes">6.2 训练时的 memory keyframes</h3>
+<p>训练时 memory 来自 ground-truth keyframes 中已经早于最近窗口的部分：</p>
+<pre><code class="language-python">memory_keyframes = keyframes in [start_offset, recent[0])
+memory_keyframes = align_to_subsample_grid(memory_keyframes)
+memory_keyframes = last_M(memory_keyframes)
+</code></pre>
+<p>也就是说，如果某个关键帧还在最近窗口里，它不会作为 memory 出现，而是应该通过 <code>keyframe_positions</code> 被模型提名；等它离开最近窗口后，才会作为长期记忆出现。</p>
+<h3 id="63-当前输出中的-keyframe_positions">6.3 当前输出中的 keyframe_positions</h3>
+<p>训练目标里的 <code>keyframe_positions</code> 只允许指向最近窗口中的帧：</p>
+<pre><code class="language-python">candidate_keyframes = keyframes in [recent[0], t + 1)
+candidate_keyframes = align_to_subsample_grid(candidate_keyframes)
+relative_positions = [recent.index(k) + 1 for k in candidate_keyframes]
+</code></pre>
+<p>因此模型学到的是：</p>
+<blockquote>
+<p>在最近 8 帧里，如果某些帧刚好包含以后需要记住的信息，就输出它们在最近窗口里的位置。</p>
+</blockquote>
+<h3 id="64-current_subtask-为什么预测未来一点">6.4 current_subtask 为什么预测未来一点</h3>
+<p>代码默认使用：</p>
+<pre><code class="language-python">target_idx = min(t + prediction_horizon * frame_subsample, total_steps - 1)
+current_subtask = labels[target_idx]
+</code></pre>
+<p>也就是说，高层策略在时间 <code>t</code> 不一定预测 <code>labels[t]</code>，而是预测稍微往前看的标签。这样做是为了弥补闭环系统中的反应延迟：高层模型推理、低层策略接收新语言指令、机器人实际动作执行之间都不是零延迟。提前一点预测可以让子任务切换更及时。</p>
+<h2 id="7-高层模型结构">7. 高层模型结构</h2>
+<p>高层策略本质上是一个视觉语言模型，被 SFT 成结构化输出器。</p>
+<p>论文实验中：</p>
+<ul>
+<li>高层策略：Qwen2.5-VL-7B-Instruct。</li>
+<li>低层策略：pi0.5。</li>
+<li>训练时冻结视觉编码器和视觉投影层，只训练 LLM backbone。</li>
+<li>还使用了 model merging，把预训练权重和微调权重线性插值。</li>
+</ul>
+<p>当前公开代码中：</p>
+<ul>
+<li>高层训练格式面向 Qwen3-VL。</li>
+<li>README 提供 dusting 任务的 Qwen3-VL-4B checkpoint。</li>
+<li>推理类使用 <code>transformers.AutoModelForImageTextToText</code> 和 <code>AutoProcessor</code> 加载 Qwen3-VL。</li>
+<li>视觉编码器冻结、优化器等训练细节由官方 Qwen finetune 仓库执行，不在本仓库训练代码里实现。</li>
+</ul>
+<h3 id="71-输入格式">7.1 输入格式</h3>
+<p>高层模型每次收到：</p>
+<pre><code class="language-text">system prompt:
+  你是机器人程序，输出 JSON：
+  - current_subtask
+  - keyframe_positions
+
+user prompt:
+  Task: &lt;总任务指令&gt;
+
+  Here are selected frames from the full video:
+  &lt;memory image 1&gt;
+  &lt;memory image 2&gt;
+  ...
+
+  Here is a video of the most recent actions:
+  &lt;recent image 1&gt;
+  ...
+  &lt;recent image N&gt;
+</code></pre>
+<p>如果没有 memory，memory 部分会省略。图片本身以 Qwen chat template 支持的 image content 传入。</p>
+<h3 id="72-输出格式">7.2 输出格式</h3>
+<p>模型输出必须能解析成 JSON：</p>
+<pre><code class="language-json">{
+  "current_subtask": "dust bottom shelf",
+  "keyframe_positions": [5]
+}
+</code></pre>
+<p>推理代码会比较宽容：</p>
+<ul>
+<li>可以从普通文本或 Markdown code fence 里提取第一个 JSON object。</li>
+<li><code>current_subtask</code> 也兼容旧字段名 <code>current_primitive</code>。</li>
+<li><code>keyframe_positions</code> 必须是 list，元素必须能转成整数。</li>
+<li>如果解析失败，本步不更新 memory。</li>
+</ul>
+<h2 id="8-高层训练-pipeline">8. 高层训练 pipeline</h2>
+<p>公开可复现的高层训练流程是：</p>
+<pre><code class="language-text">LeRobot v3 dataset with subtasks
+  -&gt; generate_sft_data.py
+  -&gt; train.json + media/*.jpg
+  -&gt; 注册到 Qwen3-VL finetune 数据集
+  -&gt; 用 Qwen 官方训练脚本 SFT
+  -&gt; 得到高层 MemER checkpoint
+</code></pre>
+<h3 id="81-数据导出">8.1 数据导出</h3>
+<p><code>generate_sft_data.py</code> 做这些事：</p>
+<ol>
+<li>读取 LeRobot dataset metadata，拿到任务、子任务、相机键。</li>
+<li>按 camera layout 导出每个时间步的 JPEG；多相机时先拼成 stacked image。</li>
+<li>根据 subtask label 和 keyframe rules 生成全轨迹 ground-truth keyframe indices。</li>
+<li>对每个时间步构造一个 Qwen SFT example。</li>
+<li>写出：</li>
+</ol>
+<pre><code class="language-text">output_dir/
+  train.json
+  media/
+    episode_000000/
+      frame_000000.jpg
+      frame_000001.jpg
+      ...
+</code></pre>
+<h3 id="82-qwen3-vl-训练命令要点">8.2 Qwen3-VL 训练命令要点</h3>
+<p>公开训练文档给出的 reference 设置包括：</p>
+<ul>
+<li>base model：<code>Qwen/Qwen3-VL-4B-Instruct</code></li>
+<li>训练 1500 steps</li>
+<li><code>tune_mm_vision False</code></li>
+<li><code>tune_mm_mlp False</code></li>
+<li><code>tune_mm_llm True</code></li>
+<li><code>bf16</code></li>
+<li><code>model_max_length 8192</code></li>
+<li>batch size per device 8，gradient accumulation 8</li>
+<li>学习率 <code>6e-5</code></li>
+<li>cosine scheduler，warmup ratio <code>0.05</code></li>
+<li><code>max_pixels 115200</code>，<code>min_pixels 50176</code></li>
+</ul>
+<p>这和论文附录中的原始实验设定不同：论文报告 Qwen2.5-VL-7B 高层策略训练 4500 gradient steps，batch size 256，冻结 vision encoder 和 projection layer。</p>
+<h2 id="9-loss-定义">9. Loss 定义</h2>
+<h3 id="91-高层策略-loss">9.1 高层策略 loss</h3>
+<p>高层策略训练是标准自回归 SFT。给定 prompt <code>x_t</code> 和目标 JSON token 序列 <code>y_t</code>，优化目标是最大化目标 token 的条件似然：</p>
+<pre><code class="language-text">L_high = - sum_i log p_theta(y_{t,i} | x_t, y_{t,&lt;i})
+</code></pre>
+<p>其中 <code>y_t</code> 是类似下面的字符串：</p>
+<pre><code class="language-json">{"current_subtask": "dust bottom shelf", "keyframe_positions": [5]}
+</code></pre>
+<p>关键点：</p>
+<ul>
+<li>代码里没有单独的分类 loss 来预测 subtask。</li>
+<li>代码里也没有单独的多标签 loss 来预测 keyframe positions。</li>
+<li>subtask 和 keyframe positions 都被序列化成 JSON 文本，统一通过 next-token cross entropy 学。</li>
+</ul>
+<p>换句话说，<code>current_subtask</code> 和 <code>keyframe_positions</code> 的监督都藏在同一个语言建模 loss 里。</p>
+<h3 id="92-低层策略-loss">9.2 低层策略 loss</h3>
+<p>论文层面，低层策略学习：</p>
+<pre><code class="language-text">pi_l(A_t | I_t, q_t, l'_t)
+</code></pre>
+<p>也就是给当前图像、机器人状态和子任务语言，预测未来动作 chunk。</p>
+<p>当前仓库没有 pi0.5 低层训练代码，因此不能从源码确认具体实现 loss。方法层面可以写成 imitation learning 的负对数似然：</p>
+<pre><code class="language-text">L_low = - log pi_phi(A_t^expert | I_t, q_t, l'_t)
+</code></pre>
+<p>如果某个具体低层 VLA 用连续动作回归、扩散、flow matching 或其他 action head，那么 <code>L_low</code> 会由该低层模型自己的训练框架定义。MemER 对低层策略的要求不是特定 loss，而是它能可靠执行语言子任务。</p>
+<h3 id="93-总体训练目标">9.3 总体训练目标</h3>
+<p>论文方法是分开训练高层和低层，而不是端到端联合训练：</p>
+<pre><code class="language-text">min_theta L_high(theta)
+min_phi   L_low(phi)
+</code></pre>
+<p>部署时两者组合：</p>
+<pre><code class="language-text">高层输出 l'_t -&gt; 低层用 l'_t 生成动作
+高层输出 J_t -&gt; 记忆模块更新 K_{t+1}
+</code></pre>
+<h2 id="10-视觉记忆怎样构建">10. 视觉记忆怎样构建</h2>
+<p>这是 MemER 最关键的机制。</p>
+<p>高层模型每一步只输出最近窗口里的相对位置，比如 <code>[7]</code>。这些位置会被映射成真实时间索引：</p>
+<pre><code class="language-python">absolute_index = context_indices[position - 1]
+</code></pre>
+<p>然后加入候选 keyframe 池。候选池保留重复票数，因为同一个帧或相邻帧被多次提名，说明模型反复认为这段时间重要。</p>
+<p>之后对所有候选帧索引做一维 single-linkage clustering：</p>
+<ol>
+<li>把所有候选索引排序，重复值不去掉。</li>
+<li>相邻候选索引距离 <code>&lt;= d</code> 就放进同一个 cluster。</li>
+<li>每个 cluster 取中位数索引作为代表帧。</li>
+<li>只暴露最近 <code>memory_length</code> 个代表帧给模型。</li>
+<li>如果代表帧仍在最近窗口里，则暂时不作为 memory 暴露，避免同一帧在 memory 和 recent 中重复出现。</li>
+</ol>
+<p>伪代码：</p>
+<pre><code class="language-python">def build_visual_memory(candidate_indices, merge_distance, memory_length, current_context):
+    # candidate_indices 是模型历次提名过的绝对帧号；重复值代表多次投票
+    indices = sorted(candidate_indices)  # 按时间排序，但保留重复投票
+    if not indices:
+        return []  # 还没有任何候选关键帧时，memory 为空
+
+    clusters = []              # 每个 cluster 表示一个被多次提名的“事件”
+    current = [indices[0]]     # 当前正在累积的时间簇
+
+    for idx in indices[1:]:
+        # 如果相邻候选帧距离足够近，就认为它们描述同一个事件
+        if idx - current[-1] &lt;= merge_distance:
+            current.append(idx)
+        else:
+            clusters.append(current)  # 距离太远，结束当前事件
+            current = [idx]           # 开启新的事件簇
+    clusters.append(current)          # 别忘了收尾最后一个簇
+
+    representatives = []
+    for cluster in clusters:
+        # 用中位数帧作为该事件的代表；重复投票会影响中位数位置
+        representatives.append(median_low(cluster))
+
+    selected = representatives[-memory_length:]  # 只保留最近的 M 个长期记忆
+
+    # 如果代表帧仍在 recent context 里，就暂时不作为 memory 重复展示
+    visible = [idx for idx in selected if idx not in current_context]
+    return visible[-memory_length:]  # 返回本次 prompt 真正可见的 memory 帧索引
+</code></pre>
+<h3 id="101-为什么要聚类而不是直接保存模型输出的帧">10.1 为什么要聚类，而不是直接保存模型输出的帧</h3>
+<p>模型在相邻时间步看到的最近窗口高度重叠。一个重要事件可能在多次推理中被提名：</p>
+<pre><code class="language-text">t=100: 模型提名 frame 90
+t=105: 模型提名 frame 90
+t=110: 模型提名 frame 95
+t=115: 模型提名 frame 95
+</code></pre>
+<p>如果直接保存，会得到很多重复或近重复图片。聚类后，它们会合并成一个事件，取中位数作为代表。这样 memory 更像“事件摘要”，而不是“模型每次投票的原始日志”。</p>
+<h3 id="102-merge_distance-的单位">10.2 merge_distance 的单位</h3>
+<p>论文里 <code>d=5</code> 是在下采样后的时间步意义上讲的。公开代码的 rollout/deploy 会把它换算成原始帧距离：</p>
+<pre><code class="language-python">raw_merge_distance = merge_distance * frame_subsample
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">merge_distance = 5
+frame_subsample = 5
+raw_merge_distance = 25 原始帧
+</code></pre>
+<p>这样无论内部候选索引用原始帧号表示，聚类距离仍然等价于“下采样后 5 步以内算同一事件”。</p>
+<h2 id="11-推理流程">11. 推理流程</h2>
+<h3 id="111-在线部署流程">11.1 在线部署流程</h3>
+<p>在线部署由一个 stateful policy 维护：</p>
+<ul>
+<li>所有已经收到的帧 <code>_frames</code></li>
+<li>episodic memory <code>_memory</code></li>
+<li>当前总任务 instruction</li>
+<li>相机拼接配置</li>
+</ul>
+<p>每次调用 <code>step(obs)</code>：</p>
+<pre><code class="language-python">def memer_step(obs):
+    frame = preprocess_and_stack_cameras(obs)  # 把单/多相机观测转成一张 PIL 图
+    frames.append(frame)                       # 在线部署时持续累积整段观测历史
+    t = len(frames) - 1                        # 当前时间步的绝对帧索引
+
+    # 从历史中取最近 N 个下采样帧，作为短期上下文
+    context_indices = build_recent_context_indices(
+        timestep=t,
+        frame_subsample=s,
+        recent_frames_length=N,
+    )
+
+    # 从长期记忆中取当前 prompt 可见的关键帧，避免和 recent context 重复
+    memory_indices = memory.visible_indices(context_indices)
+
+    # prompt 只写占位符数量；图片会按 memory + recent 的顺序传给 VLM
+    prompt = build_prompt(
+        instruction=instruction,
+        memory_count=len(memory_indices),
+        recent_count=len(context_indices),
+    )
+
+    images = [frames[i] for i in memory_indices + context_indices]  # 先长期记忆，再最近窗口
+
+    prediction = qwen.predict(prompt, images)  # 输出 current_subtask 和 keyframe_positions
+
+    if prediction.parse_ok:
+        # 模型输出的是 recent window 中的 1-indexed 位置，需要映射回绝对帧号
+        absolute_keyframes = map_relative_positions_to_absolute(
+            prediction.keyframe_positions,
+            context_indices,
+        )
+        memory.add_candidates(absolute_keyframes)  # 把候选帧加入投票池，供后续聚类
+
+    return prediction.current_subtask  # 交给低层策略执行的语言子任务
+</code></pre>
+<p>返回值中还包含调试信息：</p>
+<ul>
+<li>当前 timestep</li>
+<li>parse 是否成功</li>
+<li>模型输出的相对 keyframe positions</li>
+<li>映射后的绝对帧索引</li>
+<li>推理前后的 memory indices</li>
+<li>所有候选 keyframe votes</li>
+<li>raw model text</li>
+</ul>
+<h3 id="112-和低层策略怎样配合">11.2 和低层策略怎样配合</h3>
+<p>论文部署中：</p>
+<ul>
+<li>高层策略约 1Hz 运行。</li>
+<li>低层策略约 2Hz 运行。</li>
+<li>低层策略输出 15 个 15Hz 动作，执行前 8 个动作后重新规划。</li>
+<li>两个策略异步跑在不同 server 上。</li>
+</ul>
+<p>直观上：</p>
+<pre><code class="language-text">高层慢一点，但负责想清楚“现在做什么”
+低层快一点，持续执行最近一次高层给出的 subtask
+</code></pre>
+<p>当高层还在推理下一条 subtask 时，低层继续使用最近一次已经预测出的 subtask。这可以减少等待，提高机器人动作连贯性。</p>
+<h3 id="113-离线-rollout-评估">11.3 离线 rollout 评估</h3>
+<p>离线评估不是简单地对每个训练样本独立测试，而是模拟部署时的记忆更新：</p>
+<pre><code class="language-python">memory = EpisodicMemory(...)  # 每个 episode 单独维护一份滚动视觉记忆
+
+for timestep in episode:
+    context = recent frames up to timestep       # 当前时刻能看到的短期上下文
+    memory_before = memory.visible_indices(context)  # 当前时刻可见的长期关键帧
+    prediction = model(memory_before + context)  # 用“长期记忆 + 最近窗口”预测子任务和新候选帧
+
+    compare prediction.current_subtask with target label  # 统计 subtask 准确率
+
+    if parse_ok:
+        keyframes = map prediction.keyframe_positions to absolute indices  # 相对位置转绝对帧号
+        memory.add_candidates(keyframes)  # 用本步预测更新 memory，影响后续时间步
+</code></pre>
+<p>这很重要，因为 MemER 的预测会影响之后的 memory。如果早期乱提名很多无意义帧，后面模型看到的 memory 就会变差。因此 rollout 评估比静态 teacher-forcing 更接近真实部署。</p>
+<h2 id="12-三个任务分别需要记住什么">12. 三个任务分别需要记住什么</h2>
+<p>论文用三个真实机器人任务评估 MemER，每个任务考察一种不同的长期记忆。</p>
+<h3 id="121-object-search">12.1 Object Search</h3>
+<p>任务：三个不透明箱子里随机放 3-5 个物体，机器人依次收到三个目标物体，要找出并放到白色箱子。</p>
+<p>需要记住：</p>
+<ul>
+<li>已经看过哪些箱子。</li>
+<li>每个箱子里有哪些物体。</li>
+<li>如果目标已经见过，直接去对应箱子，不要重复搜索。</li>
+</ul>
+<p>关键帧规则：</p>
+<ul>
+<li>看箱子动作的最后一帧要记住。</li>
+<li>抓取并放置物体的动作不需要记住。</li>
+</ul>
+<h3 id="122-counting-scoops">12.2 Counting Scoops</h3>
+<p>任务：把指定数量的两种食材舀到指定颜色碗里。</p>
+<p>需要记住：</p>
+<ul>
+<li>每种食材已经舀了几勺。</li>
+<li>当前是否应该继续舀、reset scooper，还是结束。</li>
+</ul>
+<p>关键帧规则：</p>
+<ul>
+<li>每次成功放入一勺的最后一帧要记住。</li>
+<li>拿勺子、reset、放下勺子通常不记。</li>
+</ul>
+<h3 id="123-dust--replace">12.3 Dust &amp; Replace</h3>
+<p>任务：拿走上下层架子上的物体，擦架子，再把物体放回原位置。</p>
+<p>需要记住：</p>
+<ul>
+<li>每个物体原本在上层还是下层。</li>
+<li>哪一层已经擦过。</li>
+<li>放回时应该放到哪里。</li>
+</ul>
+<p>关键帧规则：</p>
+<ul>
+<li>移走物体、擦完某层、放回物体等完成状态要记住。</li>
+<li>reset duster、put down duster 这类动作不记。</li>
+</ul>
+<h2 id="13-model-merging">13. Model merging</h2>
+<p>论文还报告了一个实用技巧：高层模型微调很多步后，虽然更会说正确 subtask，但可能损失预训练 VLM 对非理想行为的鲁棒性。因为训练数据主要是专家演示，部署时低层策略可能出现卡顿、重试、失败恢复，分布会不一样。</p>
+<p>论文使用线性权重合并：</p>
+<pre><code class="language-text">theta = (1 - alpha) * theta_pre + alpha * theta_ft
+</code></pre>
+<p>其中：</p>
+<ul>
+<li><code>theta_pre</code> 是原始 Qwen2.5-VL-Instruct 权重。</li>
+<li><code>theta_ft</code> 是 MemER 数据微调后的权重。</li>
+<li>论文使用 <code>alpha = 0.8</code>。</li>
+</ul>
+<p>直觉是：大部分采用任务微调能力，同时保留一部分预训练模型的开放域视频理解鲁棒性。</p>
+<p>当前公开代码没有实现 model merging 脚本；它是论文方法中的训练后处理技巧。</p>
+<h2 id="14-为什么视觉记忆比文本记忆更好">14. 为什么视觉记忆比文本记忆更好</h2>
+<p>论文比较了三种记忆形式：</p>
+<ul>
+<li>只用短历史。</li>
+<li>短历史 + 文本 subtask 记忆。</li>
+<li>MemER 图像关键帧。</li>
+<li>MemER 图像关键帧 + 文本 subtask。</li>
+</ul>
+<p>结果是视觉关键帧更稳。原因很直观：</p>
+<ol>
+<li>文本 subtask 太粗。例如“look inside right bin”不能完整记录右箱子里所有物体。</li>
+<li>文本可能错。一旦某次 subtask 预测错，把错误文本存进 memory 后会误导后续推理。</li>
+<li>模型容易过度依赖文本 token，反而忽视视觉证据。</li>
+<li>图像关键帧保留环境真实状态，尤其适合物体位置、数量、完成状态这些难以用短文本完整表达的信息。</li>
+</ol>
+<p>所以 MemER 默认使用纯视觉 memory，而不是把历史 subtask 文本也一起塞进去。</p>
+<h2 id="15-一个完整例子">15. 一个完整例子</h2>
+<p>以 Dust &amp; Replace 为例：</p>
+<ol>
+<li>总任务指令是：</li>
+</ol>
+<pre><code class="language-text">remove the items from the shelves, dust the shelves, and place the items back
+</code></pre>
+<ol start="2">
+<li>刚开始没有 memory，模型只看最近 8 帧，预测：</li>
+</ol>
+<pre><code class="language-json">{"current_subtask": "remove the object on the bottom shelf", "keyframe_positions": []}
+</code></pre>
+<ol start="3">
+<li>
+<p>低层策略执行拿走下层物体。</p>
+</li>
+<li>
+<p>到动作完成附近，最近窗口里出现“下层物体被拿走后原位置可见”的画面。模型输出：</p>
+</li>
+</ol>
+<pre><code class="language-json">{"current_subtask": "remove the object on the top shelf", "keyframe_positions": [7]}
+</code></pre>
+<ol start="5">
+<li>
+<p><code>7</code> 被映射成某个绝对帧号，比如 <code>t=140</code>，加入候选池。</p>
+</li>
+<li>
+<p>后续几步模型可能又提名 <code>140, 145, 145</code>。聚类器发现它们都很近，合成一个 cluster，取中位数 <code>145</code> 作为代表 keyframe。</p>
+</li>
+<li>
+<p>当这些帧离开最近窗口后，代表帧 <code>145</code> 会作为 memory image 出现在之后的 prompt 里。</p>
+</li>
+<li>
+<p>擦完架子后，机器人需要放回物体。当前画面可能只看到空架子和手里的物体，但 memory 里有原位置关键帧，所以高层可以预测：</p>
+</li>
+</ol>
+<pre><code class="language-json">{"current_subtask": "place the panda plushie on the bottom shelf", "keyframe_positions": []}
+</code></pre>
+<p>这个流程体现了 MemER 的本质：把“曾经发生过的重要视觉状态”变成长期可见的少量图片，而不是让模型记住完整视频。</p>
+<h2 id="16-方法伪代码总览">16. 方法伪代码总览</h2>
+<h3 id="161-训练数据生成">16.1 训练数据生成</h3>
+<pre><code class="language-python">def generate_sft_examples(episode):
+    frames = export_stacked_camera_images(episode)  # 导出每个时间步的单图；多相机先竖直拼接
+    labels = get_subtask_labels(episode)            # 每帧对应的 ground-truth subtask
+    instructions = get_task_instructions(episode)   # 总任务指令，可来自数据集或命令行覆盖
+    gt_keyframes = build_rule_based_keyframes(labels, rules)  # 根据子任务规则生成 GT 关键帧
+
+    examples = []
+    for t in range(len(frames)):
+        # 最近窗口：截至 t 的最后 N 个下采样帧
+        recent = build_recent_context_indices(t, frame_subsample, N)
+
+        memory = gt_keyframes_before(recent[0])  # 已经离开 recent window 的 GT 关键帧
+        memory = align_to_subsample_grid(memory) # 对齐到下采样帧格点，和 recent 索引体系一致
+        memory = last_M(memory)                  # prompt 里最多放 M 张长期记忆图
+
+        candidates = gt_keyframes_inside(recent)     # 当前 recent window 内应被提名的 GT 关键帧
+        candidates = align_to_subsample_grid(candidates)
+        keyframe_positions = [recent.index(k) + 1 for k in candidates]  # 转成 1-indexed 位置
+
+        # 预测稍微未来一点的 subtask，用来补偿高层推理和低层执行延迟
+        target_t = min(t + horizon * frame_subsample, len(frames) - 1)
+        answer = {
+            "current_subtask": labels[target_t],
+            "keyframe_positions": keyframe_positions,
+        }
+
+        # Qwen SFT 样本：输入图片顺序是 memory + recent，输出是 JSON 字符串
+        examples.append(qwen_sft_record(
+            instruction=instructions[t],
+            images=memory + recent,
+            answer=answer,
+        ))
+
+    return examples  # 一个 episode 会产生 len(frames) 条高层 SFT 样本
+</code></pre>
+<h3 id="162-高层推理与记忆更新">16.2 高层推理与记忆更新</h3>
+<pre><code class="language-python">def rollout_high_level_policy(frames, instruction):
+    memory = EpisodicMemory(merge_distance=d, memory_length=M)  # 保存模型自己滚出来的视觉记忆
+
+    for t, frame in enumerate(frames):
+        context = build_recent_context_indices(t, frame_subsample, N)  # 本步 recent window
+        visible_memory = memory.visible_indices(context)               # 本步可见的长期关键帧
+
+        prediction = vlm_generate_json(
+            instruction=instruction,
+            images=frames[visible_memory] + frames[context],  # 图片顺序必须和 prompt 约定一致
+        )
+
+        subtask = prediction["current_subtask"]              # 给低层策略的语言命令
+        relative_positions = prediction["keyframe_positions"] # recent window 中的 1-indexed 候选位置
+
+        absolute_candidates = []
+        for pos in relative_positions:
+            # 丢弃越界位置；合法位置映射成轨迹中的绝对帧号
+            if 1 &lt;= pos &lt;= len(context):
+                absolute_candidates.append(context[pos - 1])
+
+        memory.add_candidates(absolute_candidates)  # 加入候选投票池，下一步可能变成可见 memory
+
+        yield subtask  # 当前时间步输出给低层控制器
+</code></pre>
+<h3 id="163-和低层策略组合">16.3 和低层策略组合</h3>
+<pre><code class="language-python">latest_subtask = None  # 低层策略会一直使用最近一次高层预测
+
+while robot_is_running:
+    obs = get_robot_observation()  # 当前相机图像和机器人状态
+
+    # 慢频率或异步线程中运行
+    if high_level_ready:
+        # 高层只负责更新语言子任务和内部 memory，不直接输出关节动作
+        latest_subtask = memer_high_level.step(obs).current_subtask
+
+    # 快频率运行
+    action_chunk = low_level_policy.predict(
+        image=obs.image,          # 当前视觉输入
+        robot_state=obs.q,        # 当前关节/夹爪状态
+        language=latest_subtask,  # 高层给出的当前子任务
+    )
+    execute_first_actions(action_chunk)  # 执行动作 chunk 的前几步，然后重新规划
+</code></pre>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/sxq-blog/" target="_blank">S-X-Q</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/sxq-blog/p/21487580" target="_blank">https://www.cnblogs.com/sxq-blog/p/21487580</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-15 11:23">2026-07-15 11:22</span>&nbsp;
+<a href="https://www.cnblogs.com/sxq-blog">S-X-Q</a>&nbsp;
+阅读(<span id="post_view_count">16</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21487580);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsxq-blog%2Fp%2F21487580&amp;targetId=21487580&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
