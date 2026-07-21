@@ -1,0 +1,531 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/doiito/p/21713942" title="发布于 2026-07-21 09:54">
+    
+
+    <span role="heading" aria-level="2">【RUST AI】把 TTS 搬进浏览器：kokoroi-rs 的 WASM 实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="把-tts-搬进浏览器kokoroi-rs-的-wasm-实践">把 TTS 搬进浏览器：kokoroi-rs 的 WASM 实践</h1>
+<blockquote>
+<p><strong>摘要</strong>：本文深入解析 kokoroi-rs 项目的 WASM 模块，展示如何将 Kokoro TTS 模型编译为 WebAssembly，在浏览器中实现纯前端、零服务器的高质量中文语音合成。文章涵盖整体架构（G2P 引擎 + ONNX 推理）、两种推理后端（ONNX Runtime Web 与纯 Rust oxionnx）的深度对比、JavaScript API 设计、构建与 Demo 演示，以及隐私安全、性能表现与未来方向。适合关注 Rust + WASM + AI 的前端开发者、隐私敏感应用及边缘计算场景。</p>
+<p><strong>关键词</strong>：TTS, WebAssembly, WASM, Rust, 语音合成, 浏览器, kokoroi-rs, ONNX, 隐私安全, 前端AI</p>
+</blockquote>
+<blockquote>
+<p>纯前端运行，隐私数据不出设备，一个 3MB 的 WASM 模块实现高质量中文语音合成</p>
+</blockquote>
+<h2 id="引子云-tts-的隐忧与-wasm-的机遇">引子：云 TTS 的隐忧与 WASM 的机遇</h2>
+<p>语音合成（TTS）服务已经非常普及，但大多数解决方案依赖云端 API：用户把文本传到服务器，服务器生成音频后返回。这个过程带来了几个绕不开的问题：</p>
+<ul>
+<li><strong>隐私风险</strong>：文本内容会经过第三方服务器，对于涉及个人隐私或商业机密的场景，这是一个硬伤。</li>
+<li><strong>网络依赖</strong>：需要稳定的互联网连接，弱网环境下体验打折扣。</li>
+<li><strong>成本</strong>：商用 API 按字符计费，大规模使用不是小数目。</li>
+</ul>
+<p>那么，有没有可能让 TTS 完全在浏览器本地运行？WebAssembly 的出现让这种想法成为可能。<strong>kokoroi-rs</strong> 的 WASM 模块正是这样一个尝试——将 Kokoro TTS 的核心能力编译为 WebAssembly，让高质量语音合成直接运行在用户的浏览器中，无需任何后端服务器。</p>
+<p>本文将深入拆解 kokoroi-rs 的 WASM 架构、两种推理后端、JavaScript API 设计以及实际使用中的性能表现。</p>
+<hr>
+<h2 id="一整体架构wasm-模块--推理后端">一、整体架构：WASM 模块 + 推理后端</h2>
+<p>kokoroi-rs 的 WASM 模块将 Rust 代码编译为 <code>wasm32-unknown-unknown</code> 目标，通过 <code>wasm-bindgen</code> 生成 JavaScript 胶水代码，最终交付一个约 <strong>3MB</strong> 的 WASM 二进制文件。</p>
+<p>整个系统的核心功能分两层：</p>
+<ol>
+<li><strong>G2P 引擎</strong>：将中文文本转换为 Bopomofo（注音符号）音素序列——这是模型输入的前置步骤，完全在 Rust 中实现。</li>
+<li><strong>ONNX 推理引擎</strong>：将音素序列 + 发音人风格嵌入 → PCM 音频采样。</li>
+</ol>
+<p>推理部分提供了两种后端选择，开发者可以根据需求灵活切换：</p>
+<div class="mermaid">graph TB
+    subgraph Browser["浏览器环境"]
+        JS["JavaScript 调用层"]
+        WASM["Rust WASM 模块&lt;br/&gt;(kokoros_bg.wasm)"]
+        
+        subgraph WASM["WASM 内部功能"]
+            G2P["ChineseG2P&lt;br/&gt;字素转音素"]
+            WAV["WAV 编码器"]
+            OX["oxionnx 推理&lt;br/&gt;(纯 Rust)"]
+        end
+        
+        ORT["ONNX Runtime Web&lt;br/&gt;(CDN 加载)"]
+    end
+    
+    subgraph Data["数据文件"]
+        MODEL["ONNX 模型文件&lt;br/&gt;(~80MB)"]
+        STYLE["发音人嵌入&lt;br/&gt;(*.bin)"]
+    end
+    
+    JS --&gt;|init| WASM
+    JS --&gt;|phonemize| G2P
+    JS --&gt;|synthesize| OX
+    JS --&gt;|InferenceSession| ORT
+    
+    G2P --&gt;|Bopomofo| OX
+    G2P --&gt;|Bopomofo| ORT
+    OX --&gt;|PCM| WAV
+    ORT --&gt;|PCM| WAV
+    WAV --&gt;|WAV Uint8| JS
+    
+    OX -.-&gt;|加载| MODEL
+    ORT -.-&gt;|加载| MODEL
+    JS -.-&gt;|fetch| STYLE
+</div><p>这两个后端各有侧重：ONNX Runtime Web 是微软官方方案，稳定性好、优化成熟；而 oxionnx 是纯 Rust 实现，与 WASM 集成更紧密，无需额外加载推理库。</p>
+<hr>
+<h2 id="二g2p-引擎中文处理的基石">二、G2P 引擎：中文处理的基石</h2>
+<p>文本到音素的转换是 TTS 的第一步，也是中文场景中最复杂的环节之一。WASM 模块中的 <code>ChineseG2P</code> 引擎与 Native 版本共享同一套代码，保证了处理逻辑的一致性和准确性。</p>
+<p>核心流程如下：</p>
+<div class="mermaid">flowchart TD
+    TEXT[输入中文文本] --&gt; NORM[文本规范化]
+    NORM --&gt; SEG[jieba-rs 分词 + POS 标注]
+    SEG --&gt; DISAMB[多音字消歧&lt;br/&gt;基于上下文规则]
+    DISAMB --&gt; SANDHI[变调处理&lt;br/&gt;三声变调 / 一不变调]
+    SANDHI --&gt; MAP[拼音 → Bopomofo 映射]
+    MAP --&gt; OUT[输出音素序列]
+</div><p><strong>几个关键点：</strong></p>
+<ul>
+<li><strong>jieba-rs 分词</strong>：WASM 版本同样使用 jieba-rs，词典数据以压缩形式嵌入 WASM 二进制中，首次调用时解压（约数百毫秒一次性开销），之后常驻内存。</li>
+<li><strong>多音字消歧</strong>：<code>PolyphonicDisambiguator</code> 维护了一套基于规则的上文消歧表，例如“了”在“了解”中读 <code>liǎo</code>，在“好了”中读 `le”。</li>
+<li><strong>变调处理</strong>：实现了经典的三声变调规则（两个三声相连，前变二声）以及“一”、“不”的变调规律。</li>
+</ul>
+<p>最终输出 Bopomofo（注音符号）序列，这是 Kokoro 模型原生训练使用的音素表示，准确度优于 IPA。</p>
+<hr>
+<h2 id="三javascript-api简洁易用">三、JavaScript API：简洁易用</h2>
+<p>WASM 模块通过 <code>wasm-bindgen</code> 导出清晰的 JavaScript 接口，开发者可以像使用普通 JS 库一样调用。</p>
+<h3 id="初始化">初始化</h3>
+<pre><code class="language-javascript">import init, { KokoroWASM, pcm_samples_to_wav_data } from './wasm-pkg/kokoros.js';
+
+// 加载 WASM 运行时
+await init();
+
+// 创建 TTS 实例
+const kokoro = new KokoroWASM({ usePolyphonic: true });
+</code></pre>
+<h3 id="实战示例从文本输入到音频播放下载">实战示例：从文本输入到音频播放/下载</h3>
+<p>下面是一个完整的 HTML 页面示例，展示如何将文本合成为语音并播放或下载，包含完善的错误处理和进度提示：</p>
+<pre><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html lang="zh-CN"&gt;
+&lt;head&gt;
+  &lt;meta charset="UTF-8" /&gt;
+  &lt;title&gt;kokoroi-rs TTS 演示&lt;/title&gt;
+  &lt;style&gt;
+    body { font-family: sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+    textarea { width: 100%; height: 100px; margin-bottom: 1rem; }
+    button { padding: 0.5rem 1rem; margin-right: 0.5rem; cursor: pointer; }
+    .status { margin-top: 1rem; padding: 0.5rem; border-radius: 4px; }
+    .status.loading { background: #fff3cd; color: #856404; }
+    .status.success { background: #d4edda; color: #155724; }
+    .status.error { background: #f8d7da; color: #721c24; }
+    progress { width: 100%; margin-top: 0.5rem; }
+  &lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;h1&gt;kokoroi-rs 浏览器 TTS&lt;/h1&gt;
+  &lt;textarea id="textInput" placeholder="请输入要合成语音的中文文本…"&gt;你好，欢迎体验浏览器端语音合成。&lt;/textarea&gt;
+  &lt;button id="playBtn"&gt;🔊 播放&lt;/button&gt;
+  &lt;button id="downloadBtn"&gt;⬇️ 下载 WAV&lt;/button&gt;
+  &lt;progress id="progressBar" value="0" max="100" style="display:none;"&gt;&lt;/progress&gt;
+  &lt;div id="status" class="status"&gt;就绪&lt;/div&gt;
+
+  &lt;script type="module"&gt;
+    import init, { KokoroWASM, pcm_samples_to_wav_data } from './wasm-pkg/kokoros.js';
+
+    const textInput = document.getElementById('textInput');
+    const playBtn = document.getElementById('playBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const progressBar = document.getElementById('progressBar');
+    const statusDiv = document.getElementById('status');
+
+    let kokoro = null;
+    let lastAudioBuffer = null; // 缓存最近一次合成的音频
+
+    function setStatus(msg, type = '') {
+      statusDiv.textContent = msg;
+      statusDiv.className = 'status' + (type ? ' ' + type : '');
+    }
+
+    function setProgress(pct) {
+      progressBar.style.display = pct &gt;= 0 ? 'block' : 'none';
+      progressBar.value = Math.max(0, Math.min(100, pct));
+    }
+
+    // 初始化 WASM 模块
+    async function initTTS() {
+      try {
+        setStatus('正在加载 WASM 模块…', 'loading');
+        setProgress(20);
+        await init();
+        setProgress(50);
+
+        setStatus('正在初始化 TTS 引擎…', 'loading');
+        kokoro = new KokoroWASM({ usePolyphonic: true });
+        setProgress(80);
+
+        // 加载 ONNX 模型（以 oxionnx 模式为例）
+        setStatus('正在加载语音模型（约 80MB）…', 'loading');
+        const modelResp = await fetch('/models/kokoro.onnx');
+        if (!modelResp.ok) throw new Error(`模型下载失败：HTTP ${modelResp.status}`);
+        const modelBytes = new Uint8Array(await modelResp.arrayBuffer());
+        await kokoro.loadModel(modelBytes);
+        setProgress(100);
+
+        setStatus('✅ 就绪，可以开始合成语音', 'success');
+        playBtn.disabled = false;
+        downloadBtn.disabled = false;
+      } catch (err) {
+        setStatus(`❌ 初始化失败：${err.message}`, 'error');
+        playBtn.disabled = true;
+        downloadBtn.disabled = true;
+        console.error('TTS init error:', err);
+      } finally {
+        setProgress(-1); // 隐藏进度条
+      }
+    }
+
+    // 合成语音
+    async function synthesize(text) {
+      if (!kokoro) throw new Error('TTS 引擎未初始化');
+      if (!text.trim()) throw new Error('请输入文本');
+
+      setStatus('正在合成语音…', 'loading');
+      setProgress(30);
+
+      // 获取默认发音人
+      const voices = await kokoro.getVoices();
+      if (!voices.length) throw new Error('未找到可用发音人');
+      const defaultVoice = voices[0];
+      setProgress(50);
+
+      // 执行合成
+      const result = await kokoro.synthesize(text, defaultVoice.id, 1.0);
+      setProgress(80);
+
+      // 转换为 WAV
+      const wavBytes = pcm_samples_to_wav_data(result.audio);
+      setProgress(100);
+
+      lastAudioBuffer = wavBytes;
+      setStatus(`✅ 合成完成（音素：${result.phonemesDisplay}）`, 'success');
+      setProgress(-1);
+
+      return { wavBytes, result };
+    }
+
+    // 播放音频
+    async function handlePlay() {
+      try {
+        const { wavBytes } = await synthesize(textInput.value);
+        const blob = new Blob([wavBytes], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        audio.onended = () =&gt; URL.revokeObjectURL(url);
+        await audio.play();
+      } catch (err) {
+        setStatus(`❌ 播放失败：${err.message}`, 'error');
+        setProgress(-1);
+      }
+    }
+
+    // 下载音频
+    async function handleDownload() {
+      try {
+        const { wavBytes } = await synthesize(textInput.value);
+        const blob = new Blob([wavBytes], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `tts-${Date.now()}.wav`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        setStatus('✅ 下载已开始', 'success');
+      } catch (err) {
+        setStatus(`❌ 下载失败：${err.message}`, 'error');
+        setProgress(-1);
+      }
+    }
+
+    // 绑定事件
+    playBtn.addEventListener('click', handlePlay);
+    downloadBtn.addEventListener('click', handleDownload);
+
+    // 启动初始化
+    playBtn.disabled = true;
+    downloadBtn.disabled = true;
+    initTTS();
+  &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p><strong>代码说明：</strong></p>
+<ul>
+<li><strong>初始化阶段</strong>：通过 <code>init()</code> 加载 WASM 运行时，创建 <code>KokoroWASM</code> 实例，然后 <code>fetch</code> 下载 ONNX 模型并调用 <code>loadModel()</code> 加载。每一步都有进度提示和错误捕获。</li>
+<li><strong>合成流程</strong>：<code>synthesize()</code> 函数先获取默认发音人，再调用 <code>synthesize(text, voiceId, speed)</code> 执行推理，最后用 <code>pcm_samples_to_wav_data()</code> 将 PCM 数据编码为 WAV 格式。</li>
+<li><strong>播放与下载</strong>：<code>handlePlay()</code> 将 WAV 转为 Blob URL 后通过 <code>Audio</code> 播放；<code>handleDownload()</code> 创建 <code>&lt;a&gt;</code> 标签触发下载。</li>
+<li><strong>错误处理</strong>：网络错误（<code>fetch</code> 失败）、模型加载失败、无可用发音人等场景均有 <code>try/catch</code> 捕获并显示友好提示。</li>
+<li><strong>进度提示</strong>：使用 <code>&lt;progress&gt;</code> 元素和状态栏实时反馈加载与合成进度。</li>
+</ul>
+<h3 id="核心方法一览">核心方法一览</h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>说明</th>
+<th>返回值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>phonemize(text)</code></td>
+<td>文本 → Bopomofo 音素</td>
+<td><code>Promise&lt;string&gt;</code></td>
+</tr>
+<tr>
+<td><code>phonemizeIPA(text)</code></td>
+<td>文本 → IPA 音素</td>
+<td><code>Promise&lt;string&gt;</code></td>
+</tr>
+<tr>
+<td><code>tokenize(phonemes)</code></td>
+<td>音素 → token ID 数组</td>
+<td><code>Promise&lt;Uint32Array&gt;</code></td>
+</tr>
+<tr>
+<td><code>loadModel(bytes)</code></td>
+<td>加载 ONNX 模型（oxionnx 模式）</td>
+<td><code>Promise&lt;void&gt;</code></td>
+</tr>
+<tr>
+<td><code>synthesize(text, style, speed)</code></td>
+<td>文本 → 语音（oxionnx 模式）</td>
+<td><code>Promise&lt;SynthesisResult&gt;</code></td>
+</tr>
+<tr>
+<td><code>getVoices()</code></td>
+<td>获取内置发音人列表</td>
+<td><code>Promise&lt;VoiceInfo[]&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="类型安全">类型安全</h3>
+<p>项目提供了完整的 TypeScript 类型声明（<code>kokoros.d.ts</code>），在 IDE 中可以获得智能提示：</p>
+<pre><code class="language-typescript">interface SynthesisResult {
+  phonemes: string;          // Bopomofo 音素序列
+  phonemesDisplay: string;   // 可读注音（带声调符号）
+  text: string;              // 原始文本
+  audio: Float32Array;       // PCM 音频数据（24000Hz 单声道）
+  sampleRate: number;        // 固定 24000
+}
+</code></pre>
+<p>辅助函数 <code>pcm_samples_to_wav_data(samples)</code> 将 Float32Array 转换为标准 WAV 格式的 <code>Uint8Array</code>，方便播放或下载。</p>
+<hr>
+<h2 id="四两种推理模式深度对比">四、两种推理模式深度对比</h2>
+<p>WASM 模块最有趣的设计是提供了两套推理路径，开发者可根据场景选择。</p>
+<h3 id="模式一onnx-runtime-web混合架构">模式一：ONNX Runtime Web（混合架构）</h3>
+<div class="mermaid">sequenceDiagram
+    participant JS
+    participant WASM as Rust WASM (G2P)
+    participant ORT as ONNX Runtime Web
+    
+    JS-&gt;&gt;WASM: phonemize(text)
+    WASM--&gt;&gt;JS: Bopomofo 音素
+    JS-&gt;&gt;JS: tokenize + 构造 Tensor
+    JS-&gt;&gt;ORT: InferenceSession.run(feeds)
+    ORT--&gt;&gt;JS: PCM Float32Array
+    JS-&gt;&gt;JS: 编码为 WAV
+</div><ul>
+<li><strong>G2P 部分</strong>由 Rust WASM 完成（高效、小巧）</li>
+<li><strong>模型推理</strong>使用微软官方的 <code>onnxruntime-web</code> 库，从 CDN 加载 <code>ort.min.js</code> 及其 WASM 后端</li>
+<li>发音人嵌入由 JavaScript 通过 <code>fetch</code> 加载后传入</li>
+</ul>
+<p><strong>适合场景</strong>：对推理稳定性和算子覆盖度要求较高的生产应用。</p>
+<h3 id="模式二纯-rust-wasm--oxionnx全栈-rust">模式二：纯 Rust WASM + oxionnx（全栈 Rust）</h3>
+<div class="mermaid">sequenceDiagram
+    participant JS
+    participant WASM as Rust WASM (G2P + oxionnx)
+    
+    JS-&gt;&gt;WASM: loadModel(modelBytes)
+    JS-&gt;&gt;WASM: synthesize(text, style, speed)
+    WASM-&gt;&gt;WASM: G2P → Tokenize → oxionnx 推理
+    WASM--&gt;&gt;JS: PCM Float32Array + 音素信息
+    JS-&gt;&gt;JS: 编码为 WAV
+</div><ul>
+<li><strong>全部逻辑</strong>（G2P、推理、WAV 编码）都在 Rust WASM 内部完成</li>
+<li>推理使用 <strong>oxionnx</strong>——一个纯 Rust 实现的 ONNX 推理库</li>
+<li>无需加载任何外部 JavaScript 推理库，<strong>零 CDN 依赖</strong></li>
+</ul>
+<p><strong>适合场景</strong>：离线应用、对隐私要求极高、希望最小化外部依赖的场景。</p>
+<table>
+<thead>
+<tr>
+<th>对比维度</th>
+<th>ONNX Runtime Web</th>
+<th>oxionnx（纯 Rust）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>推理库来源</td>
+<td>微软官方 CDN</td>
+<td>编译进 WASM</td>
+</tr>
+<tr>
+<td>WASM 体积</td>
+<td>~3MB（仅 G2P）</td>
+<td>~3MB（含推理）</td>
+</tr>
+<tr>
+<td>额外 JS 加载</td>
+<td><code>ort.min.js</code> (~200KB)</td>
+<td>无</td>
+</tr>
+<tr>
+<td>算子覆盖度</td>
+<td>广泛</td>
+<td>核心算子（持续完善中）</td>
+</tr>
+<tr>
+<td>优化选项</td>
+<td>丰富（图优化、量化等）</td>
+<td>基础</td>
+</tr>
+<tr>
+<td>硬件加速</td>
+<td>WebGL / WASM SIMD</td>
+<td>WASM SIMD</td>
+</tr>
+<tr>
+<td>离线使用</td>
+<td>需缓存 CDN 资源</td>
+<td>完全离线可用</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="五构建与-demo从源码到浏览器">五、构建与 Demo：从源码到浏览器</h2>
+<h3 id="构建-wasm-模块">构建 WASM 模块</h3>
+<pre><code class="language-bash"># 安装 WASM 目标
+rustup target add wasm32-unknown-unknown
+
+# 安装 wasm-pack
+cargo install wasm-pack
+
+# 一键构建（推荐）
+./scripts/build_wasm.sh
+
+# 或手动构建
+wasm-pack build crates/kokoros-core \
+    --target web \
+    --out-dir ../../static/wasm-pkg \
+    -- \
+    --features wasm \
+    --no-default-features
+</code></pre>
+<p>构建产物位于 <code>static/wasm-pkg/</code> 目录下：</p>
+<pre><code>static/wasm-pkg/
+├── kokoros_bg.wasm       # WASM 二进制 (~3MB)
+├── kokoros.js            # 胶水代码 (~28KB)
+├── kokoros.d.ts          # TypeScript 类型声明
+└── package.json
+</code></pre>
+<h3 id="demo-页面">Demo 页面</h3>
+<p>项目提供了三个可直接运行的演示页面，位于 <code>static/</code> 目录：</p>
+<ol>
+<li><strong><code>wasm_demo.html</code></strong> — 使用 ONNX Runtime Web 后端，展示完整的 G2P + 推理流程。</li>
+<li><strong><code>browser_demo.html</code></strong> — 流式合成体验，更接近实时对话场景。</li>
+<li><strong><code>rust_wasm_demo.html</code></strong> — 纯 Rust WASM（oxionnx）后端，展示零外部依赖的全离线方案。</li>
+</ol>
+<p>运行方式：</p>
+<pre><code class="language-bash">cd static
+python3 -m http.server 8080
+# 或
+npx serve .
+</code></pre>
+<p>打开浏览器访问 <code>http://localhost:8080/wasm_demo.html</code> 即可体验。</p>
+<hr>
+<h2 id="六隐私与安全数据不出设备">六、隐私与安全：数据不出设备</h2>
+<p>这是 WASM 版本最吸引人的特性之一。对比云 TTS 方案：</p>
+<pre><code>传统云 TTS：
+用户文本 ──(网络)──→ 云服务器 ──(网络)──→ 返回音频
+  文本离开用户设备，存在隐私泄露风险
+
+kokoroi-rs WASM：
+用户文本 ──(本地)──→ WASM 模块 ──(本地)──→ 播放音频
+  文本始终在浏览器沙箱内，永不离开用户设备
+</code></pre>
+<p>对于一些敏感场景（如医疗咨询、金融信息、个人日记等），本地 TTS 有着天然的优势。同时，由于无需网络请求，<strong>弱网环境下也能稳定工作</strong>。</p>
+<hr>
+<h2 id="七性能与局限">七、性能与局限</h2>
+<h3 id="性能表现">性能表现</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>数据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>G2P 处理速度</td>
+<td>&lt; 1ms / 字符</td>
+</tr>
+<tr>
+<td>模型加载（80MB）</td>
+<td>首次约 1-3 秒（取决于网络）</td>
+</tr>
+<tr>
+<td>推理实时率</td>
+<td>约 1-2 倍实时（受 WASM 引擎限制）</td>
+</tr>
+<tr>
+<td>内存占用</td>
+<td>约 100-200MB</td>
+</tr>
+<tr>
+<td>WASM 体积</td>
+<td>~3MB（含 G2P + oxionnx）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="当前局限">当前局限</h3>
+<ol>
+<li><strong>单线程推理</strong>：WASM 不支持 <code>std::thread</code>，无法利用多核并行处理长文本分片。对于超长文本，目前的方案是整体推理，可能会造成 UI 卡顿（可通过 Web Worker 缓解）。</li>
+<li><strong>模型下载体积</strong>：ONNX 模型约 80MB，发音人嵌入约 150MB，首次加载需要一定时间。后续可以利用浏览器缓存或 OPFS 减少重复下载。</li>
+<li><strong>仅 WAV 输出</strong>：受限于 WASM 下的音频编码库支持，目前只支持 WAV 格式（PCM 16-bit）。MP3/Opus 等压缩格式暂不支持。</li>
+<li><strong>浏览器兼容性</strong>：需要支持 WebAssembly 和 SharedArrayBuffer（部分旧浏览器不支持）。</li>
+</ol>
+<hr>
+<h2 id="八未来方向">八、未来方向</h2>
+<p>WASM 模块的潜力远不止于此，团队已经在规划几个有意思的方向：</p>
+<ul>
+<li><strong>Web Worker 并行</strong>：利用多个 Web Worker 各加载一个 WASM 实例，实现分片并行推理，弥补单线程的不足。</li>
+<li><strong>OPFS 模型缓存</strong>：利用 Origin Private File System 将下载的模型持久化在本地，第二次访问时几乎秒开。</li>
+<li><strong>流式合成</strong>：将 Native 版本的 SSE 流式机制移植到 WASM，实现“边合成边播放”的低延迟体验。</li>
+<li><strong>混合模式</strong>：G2P 在本地 WASM 执行，推理通过 WebSocket 连接私有推理服务器——兼顾隐私和性能。</li>
+</ul>
+<hr>
+<h2 id="结语">结语</h2>
+<p>kokoroi-rs 的 WASM 模块展示了如何将 AI 模型“搬进浏览器”——通过 Rust + WebAssembly，我们可以在不牺牲质量的前提下，让 TTS 服务脱离云端，真正属于用户自己。</p>
+<p>对于前端开发者、隐私敏感应用以及边缘计算场景，这套方案提供了一条全新的技术路径。如果你也关注 <strong>Rust + WASM + AI</strong> 这个方向，不妨去 GitHub 仓库看一看，跑一跑 Demo，甚至参与进来一起完善。</p>
+<blockquote>
+<p>项目地址：<a href="https://github.com/doiito/kokoroi-rs" target="_blank" rel="noopener nofollow">github.com/doiito/kokoroi-rs</a></p>
+</blockquote>
+<p><em>本文基于 kokoroi-rs 项目 WASM 模块的文档和源码整理，欢迎交流讨论。</em></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-21 09:54">2026-07-21 09:54</span>&nbsp;
+<a href="https://www.cnblogs.com/doiito">doiito</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21713942);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdoiito%2Fp%2F21713942&amp;targetId=21713942&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
