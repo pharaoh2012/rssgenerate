@@ -1,0 +1,186 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MrVolleyball/p/21737210" title="发布于 2026-07-22 10:38">
+    
+
+    <span role="heading" aria-level="2">RAG初探：让 AIOps Agent 学会查询历史故障</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        LLM 并不了解企业内部系统，更不知道刚刚发生过的历史故障。本文将使用 Python 从零实现一个最简 RAG，通过关键词检索、Top-K 筛选和 Prompt 拼装，把运维知识库接入 AIOps Agent；并进一步讲清楚文档切分、Chunk 和向量检索的基本原理，让 Agent 的故障分析有据可查，不再只靠通用知识猜答案
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>LLM 本身是个通才，它的知识截止到训练日期，也不知道你们系统的任何细节。系统前几天出了事故，并且有详细的事故报告，包含了根因分析以及解决方案，但是LLM根本不知道这些，他还在洋洋洒洒用他知道的知识来回答问题，这 时候恨不得拍拍LLM的脑袋：小伙子，天才有99%是汗水，你应该持续学习</p>
+<p>那如何让LLM持续学习，熟悉系统的各方面以及历史事故报告，就是本节要分享的内容</p>
+<h2 id="rag-是什么">RAG 是什么</h2>
+<p>RAG，全称 Retrieval-Augmented Generation，检索增强生成。先查询最新的知识，如果有合适，就基于这些知识回答；如果没有，再用历史的知识回答</p>
+<p>RAG 的思路是：用户提问的时候，先去知识库里捞几条相关文档，把这些文档和问题一起拼进 prompt，再让 LLM 基于这些"事实"来回答。相当于给LLM配置了一个内部资料包</p>
+<h2 id="先看代码结构">先看代码结构</h2>
+<p><a href="https://github.com/wilsonchai8/myblog/tree/main/rag" target="_blank" rel="noopener nofollow">代码</a></p>
+<pre><code class="language-text">blog/code/
+├── main.py            # 主流程：分词检索 + prompt 拼装 + LLM 调用
+└── knowledge_base.py  # 知识库：存放运维文档
+</code></pre>
+<ul>
+<li>knowledge_base.py</li>
+</ul>
+<p>这个文件很简单，就是一个 Python 列表，每个元素是一条运维文档，包含 <code>title</code> 和 <code>content</code> 两个字段：</p>
+<pre><code class="language-python">docs = [
+    {
+        "title": "Nginx 504 排查手册",
+        "content": "Nginx 504 通常表示网关等待上游服务响应超时，需要检查 upstream 服务耗时、业务服务日志、数据库慢查询和连接池。"
+    },
+    {
+        "title": "订单服务历史故障",
+        "content": "订单服务曾经因为数据库连接池耗尽，导致 /api/orders 接口大量超时，最终在 Nginx 中表现为 504。"
+    },
+    # ...
+]
+</code></pre>
+<p>在真实生产里，这里可以换成从 Confluence、内部 Wiki、Elasticsearch 里拉取的文档，甚至是历史故障复盘记录。这个 Demo 用硬编码列表，是为了让整个流程零依赖、能直接跑。</p>
+<ul>
+<li>
+<p>main.py</p>
+<ul>
+<li><code>_tokenize</code> 函数负责把文本拆成 token：</li>
+</ul>
+<pre><code class="language-python">def _tokenize(text: str):
+    text = text.lower()
+    tokens = re.findall(r"[a-z0-9]+", text)          # 英文/数字按词切分
+    chinese_parts = re.findall(r"[\u4e00-\u9fff]+", text)
+    for part in chinese_parts:
+        if len(part) == 1:
+            tokens.append(part)
+        else:
+            tokens.extend(part[i:i + 2] for i in range(len(part) - 1))  # 中文按 2 字片段切
+    return set(tokens)
+</code></pre>
+<ul>
+<li><code>retrieve</code> 函数用关键词命中次数给文档打分，取 top_k，用集合求交集来算相关度，简单粗暴但在小型知识库里够用</li>
+</ul>
+<pre><code class="language-python">def retrieve(query: str, top_k: int = 2):
+    query_tokens = _tokenize(query)
+    results = []
+    for doc in docs:
+        text = doc["title"] + " " + doc["content"]
+        doc_tokens = _tokenize(text)
+        score = len(query_tokens &amp; doc_tokens)   # 交集大小 = 相关度
+        if score &gt; 0:
+            results.append({...})
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+</code></pre>
+</li>
+</ul>
+<p>整条 RAG 链路在 <code>main</code> 里串起来：</p>
+<pre><code class="language-text">用户问题
+   ↓
+retrieve()       ← 关键词检索，拿 top_k 文档
+   ↓
+build_prompt()   ← 把文档 + 问题拼成 prompt
+   ↓
+call_llm()       ← 发给 LLM，拿回答
+   ↓
+打印结果
+</code></pre>
+<p>以 <code>"订单服务出现大量 504，应该怎么排查？"</code> 为例跑一遍，控制台输出大致如下：</p>
+<pre><code class="language-text">=== 检索到的文档 ===
+- Nginx 504 排查手册，score=4
+- 订单服务历史故障，score=3
+
+=== 构造出来的 Prompt ===
+你是一个 Kubernetes 运维分析 Agent。
+...
+文档标题：Nginx 504 排查手册
+文档内容：Nginx 504 通常表示...
+
+文档标题：订单服务历史故障
+文档内容：订单服务曾经因为数据库连接池耗尽...
+...
+
+=== LLM 最终回答 ===
+根据知识库，建议优先排查以下几点：
+1. 检查订单服务数据库连接池是否耗尽（历史上曾出现此问题）
+2. 查看 Nginx upstream 日志确认超时节点
+3. 确认 Pod 实例数和 CPU/内存状态
+...
+</code></pre>
+<p>LLM 的回答里会引用到"历史上连接池耗尽"这条，这就是 RAG 发挥作用的地方——纯靠通用知识是不会提这条的</p>
+<h2 id="如果匹配的文档有5000字那全部都要塞给llm吗">如果匹配的文档有5000字，那全部都要塞给llm吗？</h2>
+<p>假设有 100 个故障案例文档，每个文档 5000 字，那就是50w字的，全部发给llm，不但提高了回答成本，回答速度也会大大降低，造成了大量浪费</p>
+<p>如果内容太长，放进大模型上下文会浪费 token。并且里面主题太杂，内容检索可能不知道这篇文档到底主要讲什么</p>
+<p>所以文档选取的时候，一般选取最相关的top5，并且文档需要拆分成更小的chunk，类似这种：</p>
+<pre><code>标题：订单服务大量 504
+
+现象：
+- Nginx 出现大量 504
+- upstream_response_time 超过 60s
+- Pod CPU/内存正常
+- Redis、MySQL、Kafka 连接正常
+
+排查过程：
+1. 查询 Nginx 日志，确认是 upstream timeout
+2. 查询业务日志，发现调用三方接口耗时异常
+3. 查询 Prometheus，Pod 资源无明显瓶颈
+4. 查询链路追踪，确认耗时集中在 external-api span
+
+根因：
+三方接口响应慢，导致业务线程阻塞，Nginx 等待超时。
+
+处理：
+- 临时调大线程池
+- 降级三方接口
+- 增加超时控制
+- 增加熔断策略
+
+关键词：
+504, upstream timeout, external api, thread blocked, nginx
+</code></pre>
+<p>这已经是一个完整知识单元：<code>现象 → 排查过程 → 根因 → 处理方案</code></p>
+<h2 id="chunk和文档有什么关系">chunk和文档有什么关系</h2>
+<p>简单来说，完整的文档就相当于一本书，一个chunk就是某页或者某一小节，查资料时只摘抄相关小节，而不是读完整本书，和 RAG 用 chunk 逻辑完全一致</p>
+<h2 id="chunk向量化">chunk向量化</h2>
+<p>原始文档切割后的成为不同的chunk，通过embedding 模型转换成一段向量，而提出的问题也会被转换成一段向量，用户问题向量和所有 chunk 向量看哪个最相似，最终返回最相似的几个 chunk，提交给llm</p>
+<p>例如：</p>
+<p>chunk：<code>订单服务大量 504，Pod 正常，Redis MySQL 正常，最终是三方接口慢导致线程阻塞</code>，转换成向量：<code>[0.012, -0.233, 0.891, 0.056, ...]</code></p>
+<p>用户问题：<code>订单接口大量 504，但是 Pod 和数据库都正常，怎么排查？</code>，也转换成向量：<code>[  0.021564, -0.156489, 0.089451, ...]</code></p>
+<p>然后向量库会比较两者的向量，看哪个最相似，返回相似的chunk，提交给llm</p>
+<h2 id="总结">总结</h2>
+<ul>
+<li>一个最简 RAG 只需要三件事：知识库、检索函数、拼 prompt 的逻辑，RAG 的本质不是让 LLM 变聪明，而是内部资料及时喂给它，让它回答的更切近内部服务的内容，而不是通用的内容</li>
+<li>RAG需要在海量的文档中搜索出最佳匹配的chunk，来给llm提供依据回答问题</li>
+</ul>
+<h2 id="联系我">联系我</h2>
+<ul>
+<li>联系我，做深入交流</li>
+</ul>
+<p><img alt="" width="500" height="200" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1416773/202411/1416773-20241121135740959-1907948957.png#" class="lazyload"></p>
+<p>至此，本文结束。<br>
+在下才疏学浅，有撒汤漏水的，请各位不吝赐教。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/MrVolleyball/" target="_blank">it排球君</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/MrVolleyball/p/21737210" target="_blank">https://www.cnblogs.com/MrVolleyball/p/21737210</a></p>
+<div>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须在文章页面给出原文连接，否则保留追究法律责任的权利。 </div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.15347222222222223" data-date-updated="2026-07-22 14:19">2026-07-22 10:38</span>&nbsp;
+<a href="https://www.cnblogs.com/MrVolleyball">it排球君</a>&nbsp;
+阅读(<span id="post_view_count">62</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21737210);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FMrVolleyball%2Fp%2F21737210&amp;targetId=21737210&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
