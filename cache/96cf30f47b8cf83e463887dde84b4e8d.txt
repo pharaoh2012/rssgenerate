@@ -1,0 +1,1516 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sxq-blog/p/21814155" title="发布于 2026-07-23 10:23">
+    
+
+    <span role="heading" aria-level="2">LingBot-VLA 2.0 方法详解</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="lingbot-vla-20-方法详解从观察到连续动作">LingBot-VLA 2.0 方法详解：从观察到连续动作</h1>
+<hr>
+<h2 id="0-先用一张图看懂整个方法">0. 先用一张图看懂整个方法</h2>
+<p>LingBot-VLA 2.0 要学习的是一个条件生成问题：</p>
+<p></p><div class="math display">\[\text{多视角图像} + \text{语言指令} + \text{机器人当前状态}
+\longrightarrow
+\text{未来一段连续动作}
+\]</div><p></p><p>它的关键不是某一个新模块，而是四件事协同：</p>
+<div class="mermaid">flowchart LR
+    A["异构数据&lt;br/&gt;20 种机器人 + 第一视角人类视频"] --&gt; B["统一表示&lt;br/&gt;55 维状态/动作槽位"]
+    B --&gt; C["双专家 VLA&lt;br/&gt;Qwen3-VL 理解专家 + 动作专家"]
+    C --&gt; D["稀疏 MoE&lt;br/&gt;共享专家 + Top-K 路由专家"]
+    C --&gt; E["双查询蒸馏&lt;br/&gt;当前 + 未来"]
+    E --&gt; F["LingBot-Depth&lt;br/&gt;几何教师"]
+    E --&gt; G["DINO-Video&lt;br/&gt;时序语义教师"]
+    D --&gt; H["Flow Matching&lt;br/&gt;从噪声生成动作块"]
+    F --&gt; H
+    G --&gt; H
+</div><p>一句话概括：</p>
+<blockquote>
+<p>先把不同机器人和人手轨迹翻译成同一种“身体语言”，再让视觉语言模型负责理解场景，让稀疏 MoE 动作专家通过 Flow Matching 生成连续动作；训练时额外要求模型理解当前几何并预测未来的几何与语义变化。</p>
+</blockquote>
+<h3 id="01-输入和输出">0.1 输入和输出</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+<th>典型形状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>图像</td>
+<td>头顶/主视角、左右腕部等多相机画面</td>
+<td><code>[B, N_cam, ...]</code></td>
+</tr>
+<tr>
+<td>指令</td>
+<td>全局任务或子任务文本</td>
+<td><code>[B, L_text]</code></td>
+</tr>
+<tr>
+<td>状态</td>
+<td>当前关节、末端、夹爪、腰、头、底盘、灵巧手状态</td>
+<td><code>[B, 55]</code></td>
+</tr>
+<tr>
+<td>动作目标</td>
+<td>从当前时刻开始的动作块</td>
+<td><code>[B, H, 55]</code></td>
+</tr>
+<tr>
+<td>模型输出</td>
+<td>同样长度的连续动作块</td>
+<td><code>[B, H, 55]</code></td>
+</tr>
+</tbody>
+</table>
+<p>公开配置中，动作块长度默认是 <span class="math inline">\(H=50\)</span>；推理时默认用 10 次去噪更新生成整块动作。</p>
+<h3 id="02-方法解决的三个现实问题">0.2 方法解决的三个现实问题</h3>
+<div class="mermaid">flowchart TD
+    P["真实机器人部署的三类困难"]
+    P --&gt; P1["数据异构&lt;br/&gt;不同机器人、相机、频率、动作定义"]
+    P --&gt; P2["动作空间不完整&lt;br/&gt;不只是双臂和夹爪"]
+    P --&gt; P3["只看当前不够&lt;br/&gt;动作必须考虑未来后果"]
+
+    P1 --&gt; S1["大规模清洗 + 自动标注 + 统一坐标"]
+    P2 --&gt; S2["55 维全身动作接口 + 维度掩码"]
+    P3 --&gt; S3["当前/未来双查询 + 深度/视频教师蒸馏"]
+
+    S1 --&gt; R["更强的跨任务、跨本体泛化"]
+    S2 --&gt; R
+    S3 --&gt; R
+</div><hr>
+<h2 id="1-数据先把能学的数据造出来">1. 数据：先把“能学的数据”造出来</h2>
+<h2 id="11-数据全景">1.1 数据全景</h2>
+<p>论文中的预训练数据约 60,000 小时：</p>
+<ul>
+<li>约 50,000 小时机器人轨迹，来自 20 种机器人配置；原始池约 90,000 小时。</li>
+<li>约 10,000 小时第一视角人类视频；原始池约 20,000 小时。</li>
+<li>机器人覆盖单臂、双臂、半人形、人形、移动操作平台，以及夹爪和灵巧手。</li>
+<li>控制频率主要为 15 Hz 或 30 Hz，人类第一视角数据约 30--60 Hz。</li>
+</ul>
+<p>20 种机器人本体的覆盖范围如下。<code>Body DoF</code> 指实际用于训练的头、腰、底盘等身体自由度：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>本体</th>
+<th>末端</th>
+<th style="text-align: right">手/夹爪 DoF</th>
+<th style="text-align: right">臂 DoF</th>
+<th style="text-align: right">Body DoF</th>
+<th style="text-align: right">总 DoF</th>
+<th style="text-align: right">Hz</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单臂</td>
+<td>Franka</td>
+<td>夹爪</td>
+<td style="text-align: right">1</td>
+<td style="text-align: right">7</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">8</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>单臂</td>
+<td>Flexiv Rizon 4</td>
+<td>夹爪</td>
+<td style="text-align: right">1</td>
+<td style="text-align: right">7</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">8</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>双臂</td>
+<td>AgileX</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">12</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>双臂</td>
+<td>ARX Lift2</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">12</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>双臂</td>
+<td>UR7e</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">12</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>AgiBot G1</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">4</td>
+<td style="text-align: right">20</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>Galbot G1</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">6</td>
+<td style="text-align: right">22</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>Moz1</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">16</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>Realman Rs-02</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">1</td>
+<td style="text-align: right">17</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>Galaxea R1Pro</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">7</td>
+<td style="text-align: right">23</td>
+<td style="text-align: right">15</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>Galaxea R1Lite</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">12</td>
+<td style="text-align: right">3</td>
+<td style="text-align: right">17</td>
+<td style="text-align: right">15</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>Astribot S1</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">9</td>
+<td style="text-align: right">25</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>半人形</td>
+<td>Zerith H1</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">7</td>
+<td style="text-align: right">23</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>人形</td>
+<td>Leju KUAVO 4 Pro</td>
+<td>夹爪/手</td>
+<td style="text-align: right">2/12</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">5</td>
+<td style="text-align: right">21/31</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>人形</td>
+<td>Tienkung</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">16</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>人形</td>
+<td>QingLong</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">16</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>人形</td>
+<td>MagicBot Gen1</td>
+<td>夹爪</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">4</td>
+<td style="text-align: right">20</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>人形</td>
+<td>Unitree G1</td>
+<td>手</td>
+<td style="text-align: right">12</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">0</td>
+<td style="text-align: right">26</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>人形</td>
+<td>Fourier GR-2</td>
+<td>手</td>
+<td style="text-align: right">12</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">6</td>
+<td style="text-align: right">32</td>
+<td style="text-align: right">30</td>
+</tr>
+<tr>
+<td>人形</td>
+<td>AgiBot A2</td>
+<td>手</td>
+<td style="text-align: right">12</td>
+<td style="text-align: right">14</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">28</td>
+<td style="text-align: right">30</td>
+</tr>
+</tbody>
+</table>
+<p>此外还有 Ego 人类第一视角流，以 14 维双手轨迹作为动作监督，频率约 30--60 Hz。</p>
+<div class="mermaid">flowchart LR
+    subgraph Raw["原始数据池"]
+        R1["机器人轨迹&lt;br/&gt;约 90,000 小时"]
+        R2["第一视角人类视频&lt;br/&gt;约 20,000 小时"]
+    end
+
+    R1 --&gt; C1["信号平滑性检查"]
+    R1 --&gt; C2["视频-状态对齐检查"]
+    R1 --&gt; C3["画面质量检查"]
+
+    R2 --&gt; E1["VLM 视频预筛选"]
+    R2 --&gt; E2["SLAM + MANO 手姿估计"]
+    R2 --&gt; E3["轨迹与生理约束检查"]
+
+    C1 --&gt; O1["高质量机器人数据&lt;br/&gt;约 50,000 小时"]
+    C2 --&gt; O1
+    C3 --&gt; O1
+    E1 --&gt; O2["高质量人类数据&lt;br/&gt;约 10,000 小时"]
+    E2 --&gt; O2
+    E3 --&gt; O2
+
+    O1 --&gt; U["统一状态、动作、语言格式"]
+    O2 --&gt; U
+</div><h2 id="12-机器人数据怎样清洗">1.2 机器人数据怎样清洗</h2>
+<h3 id="a-用运动学差分排除异常轨迹">A. 用运动学差分排除异常轨迹</h3>
+<p>对状态和动作序列 <span class="math inline">\(x_t\)</span> 计算：</p>
+<p></p><div class="math display">\[v_t = \Delta x_t,\qquad
+a_t = \Delta^2 x_t,\qquad
+j_t = \Delta^3 x_t
+\]</div><p></p><ul>
+<li><span class="math inline">\(v_t\)</span>：速度。</li>
+<li><span class="math inline">\(a_t\)</span>：加速度。</li>
+<li><span class="math inline">\(j_t\)</span>：jerk，加速度变化率，能暴露突然跳变、通信错误或控制异常。</li>
+<li>速度和加速度还会计算 Z-score。</li>
+<li>jerk 或任一导数 Z-score 超过阈值，就丢弃整条 episode。</li>
+<li>阈值按机器人本体分别设置，因为不同机器人量程和动力学不同。</li>
+</ul>
+<h3 id="b-排除几乎没动的无效数据">B. 排除“几乎没动”的无效数据</h3>
+<p>如果一条 episode 中，所有状态和动作都只发生极小变化的时间占比超过 95%，整条数据被丢弃。</p>
+<h3 id="c-检查视频与状态是否真的同步">C. 检查视频与状态是否真的同步</h3>
+<div class="mermaid">sequenceDiagram
+    participant S as 记录的机器人状态
+    participant U as 机器人 URDF
+    participant P as 图像平面投影
+    participant V as 真实录制视频
+    participant H as 人工质检
+
+    S-&gt;&gt;U: 回放各关节状态
+    U-&gt;&gt;P: 投影机器人几何
+    V-&gt;&gt;H: 提供真实画面
+    P-&gt;&gt;H: 提供理论轮廓/姿态
+    H-&gt;&gt;H: 检查是否重合
+    alt 不重合
+        H--&gt;&gt;S: 删除视频-状态错位样本
+    else 重合
+        H--&gt;&gt;S: 保留
+    end
+</div><p>人工还会过滤：模糊、严重遮挡、掉帧、多视角不同步等问题。</p>
+<h2 id="13-第一视角人类视频怎样变成动作数据">1.3 第一视角人类视频怎样变成“动作数据”</h2>
+<p>第一视角视频通常没有机器人 action，因此要把人手运动重建为可监督的轨迹。</p>
+<div class="mermaid">flowchart TD
+    V["候选第一视角视频"] --&gt; F["VLM 预筛选"]
+    F --&gt;|删除| X["第三视角、只走路、无手物交互、&lt;br/&gt;无可操作物体、他人手明显出现"]
+    F --&gt;|保留| L{"已有动作/手轨迹标签？"}
+
+    L --&gt;|是| A["整理元数据&lt;br/&gt;时间戳对齐&lt;br/&gt;坐标变换&lt;br/&gt;完整性检查"]
+    L --&gt;|否| S["第一视角 SLAM&lt;br/&gt;估计内参和逐帧相机外参"]
+    S --&gt; M["MANO 手姿估计&lt;br/&gt;相机坐标系中的手参数"]
+    M --&gt; W["结合相机位姿&lt;br/&gt;提升到世界坐标系"]
+    A --&gt; Q["轨迹质量控制"]
+    W --&gt; Q
+
+    Q --&gt; Q1["有效手姿帧比例 &gt;= 20%"]
+    Q --&gt; Q2["相机运动稳定"]
+    Q --&gt; Q3["位移/速度/加速度/jerk 合理"]
+    Q --&gt; Q4["手位置、双手距离、活动范围符合生理约束"]
+    Q1 --&gt; O["世界坐标系中的连续手轨迹"]
+    Q2 --&gt; O
+    Q3 --&gt; O
+    Q4 --&gt; O
+</div><h3 id="为什么存世界坐标训练时再转到当前相机坐标">为什么存世界坐标，训练时再转到当前相机坐标</h3>
+<p>所有有效手轨迹统一存为世界坐标 <span class="math inline">\(W\)</span>。当采样当前帧 <span class="math inline">\(t\)</span> 时，把未来时刻 <span class="math inline">\(\tau\)</span> 的手位置转到当前相机坐标 <span class="math inline">\(C_t\)</span>：</p>
+<p></p><div class="math display">\[\mathbf p_{\tau}^{C_t}
+=
+\mathbf T_{C_t \leftarrow W}\mathbf p_{\tau}^{W}
+\]</div><p></p><div class="mermaid">flowchart LR
+    H1["未来手轨迹 p_tau^W&lt;br/&gt;稳定存储在世界坐标"] --&gt; T["乘当前帧外参&lt;br/&gt;T_Ct&lt;-W"]
+    C["当前相机姿态"] --&gt; T
+    T --&gt; H2["训练动作 p_tau^Ct&lt;br/&gt;相对当前观察者表达"]
+
+    H2 --&gt; B1["消除佩戴者走动造成的相机运动"]
+    H2 --&gt; B2["与机器人视觉条件更一致"]
+</div><p>直觉：模型真正需要学习的是“手相对当前看到的场景应该怎么移动”，而不是“相机佩戴者在世界里走了多远”。</p>
+<h2 id="14-自动语言标注">1.4 自动语言标注</h2>
+<p>模型同时使用任务级和子任务级语言。论文使用 Qwen3.6-27B 自动处理整段视频：</p>
+<ol>
+<li>多相机机器人数据联合输入头顶和腕部视角。</li>
+<li>把视频切成时间连续的子任务。</li>
+<li>每个子任务标注原子动作、交互物体和简短指令。</li>
+<li>整段视频再生成一个全局任务指令。</li>
+</ol>
+<div class="mermaid">flowchart LR
+    V["多视角操作视频"] --&gt; Q["Qwen3.6-27B"]
+    Q --&gt; G["全局指令&lt;br/&gt;例如：把花插进花瓶"]
+    Q --&gt; S1["子任务 1&lt;br/&gt;transit + 花"]
+    Q --&gt; S2["子任务 2&lt;br/&gt;move + 花"]
+    Q --&gt; S3["子任务 3&lt;br/&gt;attach + 花瓶"]
+</div><p>闭集动作词表共 18 类：</p>
+<ul>
+<li>15 个操作动作：<code>move, pour, push, pull, rotate, open, close, detach, fold, unfold, wipe, stir, cut, press, attach</code>。</li>
+<li>3 个辅助类别：<code>transit</code> 空手移动、<code>idle</code> 静止、<code>other</code> 词表外动作。</li>
+<li><code>idle</code> 最终从训练数据中去除。</li>
+</ul>
+<p>切分边界只在以下情况出现：交互物体变化、动作类型变化、或持续停顿代表新子目标。一次抓取、搬运、释放通常合并为一个子任务，避免切得过碎。</p>
+<p>论文预训练配对了任务级和子任务级语言；数据加载器支持 <code>global</code>、<code>subtask</code>、<code>both</code> 三种 prompt 策略。当前公开 RoboTwin 和真实机器人后训练 YAML 使用 <code>global</code>，即每条样本只把全局任务文本送入策略。</p>
+<h2 id="15-55-维统一状态动作表示">1.5 55 维统一状态/动作表示</h2>
+<p>不同机器人控制量不同。LingBot-VLA 2.0 给所有本体准备同一个 55 维“插槽表”：</p>
+<table>
+<thead>
+<tr>
+<th>槽位</th>
+<th style="text-align: right">维度</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>双臂关节位置</td>
+<td style="text-align: right">14</td>
+<td>每臂最多 7 维</td>
+</tr>
+<tr>
+<td>双臂末端位姿</td>
+<td style="text-align: right">14</td>
+<td>每臂 XYZ 3 维 + 四元数 4 维</td>
+</tr>
+<tr>
+<td>双夹爪</td>
+<td style="text-align: right">2</td>
+<td>每侧 1 维</td>
+</tr>
+<tr>
+<td>双灵巧手</td>
+<td style="text-align: right">12</td>
+<td>每侧 6 维</td>
+</tr>
+<tr>
+<td>腰部</td>
+<td style="text-align: right">4</td>
+<td>躯干/腰部自由度</td>
+</tr>
+<tr>
+<td>头部</td>
+<td style="text-align: right">2</td>
+<td>头部自由度</td>
+</tr>
+<tr>
+<td>移动底盘</td>
+<td style="text-align: right">3</td>
+<td>通常为平面移动信号</td>
+</tr>
+<tr>
+<td>预留</td>
+<td style="text-align: right">4</td>
+<td>未来扩展</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td style="text-align: right"><strong>55</strong></td>
+<td>状态和动作使用同一布局</td>
+</tr>
+</tbody>
+</table>
+<div class="mermaid">flowchart LR
+    V55["55 维规范向量"]
+    V55 --&gt; A["手臂 14"]
+    V55 --&gt; E["末端位姿 14"]
+    V55 --&gt; G["夹爪 2"]
+    V55 --&gt; H["灵巧手 12"]
+    V55 --&gt; W["腰 4"]
+    V55 --&gt; N["头 2"]
+    V55 --&gt; M["底盘 3"]
+    V55 --&gt; R["预留 4"]
+</div><p>这不是要求每个机器人都有 55 个真实自由度，而是“所有可能字段的并集”。缺失字段补零，并配套布尔掩码：</p>
+<p></p><div class="math display">\[\mathbf m \in \{0,1\}^{H\times55}
+\]</div><p></p><ul>
+<li>真实维度：<span class="math inline">\(m_{h,d}=1\)</span>，参与 action loss。</li>
+<li>不存在或补齐的维度：<span class="math inline">\(m_{h,d}=0\)</span>，不参与 action loss。</li>
+</ul>
+<p>因此单臂机器人、双臂夹爪机器人、移动人形机器人可以进入同一个模型。</p>
+<h3 id="一个具体映射例子">一个具体映射例子</h3>
+<p>RoboTwin 原始动作是 14 维：左臂 6 + 左夹爪 1 + 右臂 6 + 右夹爪 1。公开配置把它重排为：</p>
+<pre><code class="language-text">arm.position      = 原始 [0:6] + [7:13]   -&gt; 12 个有效维度，补到 14
+effector.position = 原始 [6:7] + [13:14]  -&gt;  2 个有效维度
+其余规范字段                               -&gt;  补零并 mask 掉
+最终                                           [55]
+</code></pre>
+<h2 id="16-绝对动作相对动作与动作空间">1.6 绝对动作、相对动作与动作空间</h2>
+<p>统一槽位只规定“字段放在哪里”，不强制字段必须是绝对量还是相对量。机器人配置可以选择：</p>
+<p></p><div class="math display">\[\Delta q_{t:t+H-1}=q_{t:t+H-1}-q_t
+\]</div><p></p><p>或直接预测绝对关节位置 <span class="math inline">\(q_{t:t+H-1}\)</span>。末端位姿的相对旋转使用四元数局部变换，不能简单逐元素相减。</p>
+<p>论文消融给出两个重要结论：</p>
+<ul>
+<li>相对关节动作将平均成功率从 33.7% 提高到 55.0%。它把“预测全局姿态”变成“预测局部修正”，方差更小。</li>
+<li>关节空间与末端空间平均成功率接近，分别约 55.0% 和 56.0%，但任务偏好不同。接触密集、端点轨迹规律的任务可能更适合末端空间；受姿态和可达性约束的任务可能更适合关节空间。</li>
+</ul>
+<p>所以正确理解是：<strong>55 维接口统一了容器，但每种机器人仍需合理选择容器里的动作语义。</strong></p>
+<h2 id="17-归一化">1.7 归一化</h2>
+<p>每种数据/本体使用自己的统计量。代码支持：</p>
+<p></p><div class="math display">\[\text{MeanStd}(x)=\frac{x-\mu}{\sigma+10^{-6}}
+\]</div><p></p><p></p><div class="math display">\[\text{Q01--Q99}(x)=2\frac{x-q_{01}}{q_{99}-q_{01}+10^{-6}}-1
+\]</div><p></p><p>以及 MinMax、Q02--Q98、仅除标准差等变体，可选择裁剪或不裁剪。</p>
+<div class="mermaid">flowchart TD
+    X["真实物理量"] --&gt; N{"归一化方案"}
+    N --&gt; M["MeanStd&lt;br/&gt;保留较大修正动作"]
+    N --&gt; Q["Q01-Q99&lt;br/&gt;对异常值更稳健"]
+    N --&gt; MM["MinMax&lt;br/&gt;容易压缩中心区域"]
+    M --&gt; Z["模型空间中的状态/动作"]
+    Q --&gt; Z
+    MM --&gt; Z
+    Z --&gt; U["推理后逆归一化"]
+    U --&gt; C["机器人真实控制量"]
+</div><p>论文四个真实机器人任务的消融中，MeanStd 平均成功率 55.0%，优于 MinMax 的 47.5% 和不裁剪 Q01--Q99 的 47.4%。但公开 RoboTwin 示例使用不裁剪 Q01--Q99；公开真实机器人示例使用 MeanStd。归一化是下游可配置项，不是所有实验共享的常量。</p>
+<h2 id="18-一条训练样本最终长什么样">1.8 一条训练样本最终长什么样</h2>
+<p>以当前时刻 <span class="math inline">\(t\)</span> 为锚点：</p>
+<div class="mermaid">flowchart LR
+    T0["当前帧 t"] --&gt; I["多视角当前图像"]
+    T0 --&gt; S["当前状态 s_t"]
+    T0 --&gt; L["任务/子任务文本"]
+    T0 --&gt; A["动作块 a_t ... a_t+H-1"]
+    T0 --&gt; F["未来帧 t+H-1"]
+
+    I --&gt; B["训练 batch"]
+    S --&gt; B
+    L --&gt; B
+    A --&gt; B
+    F --&gt; B
+</div><p>代码中未来图像偏移是 <span class="math inline">\((H-1)/\text{fps}\)</span>，即动作块最后一个索引对应的帧。论文把它简写为 <span class="math inline">\(t+T\)</span> 且 <span class="math inline">\(T\)</span> 为 action chunk size；这是记号与数组下标的差异。</p>
+<p>图像侧还有四个实现细节：</p>
+<ul>
+<li>相机按配置中的固定顺序排列；缺失视角用空图补齐，并由 <code>img_masks</code> 标记无效。</li>
+<li>Qwen3-VL image processor 产生视觉 patch 和 <code>image_grid_thw</code>，模型用 M-RoPE 保留图像网格位置。</li>
+<li>每幅图像 patch 前后加入 vision start/end token；视觉主干的 DeepStack 中间特征会继续注入语言 Transformer 的浅层。</li>
+<li>如启用图像增强，同一组亮度、对比度、饱和度参数会同步用于所有相机以及当前/未来帧，避免辅助教师与策略看到不一致的颜色扰动。</li>
+</ul>
+<hr>
+<h2 id="2-模型结构理解专家与动作专家协同">2. 模型结构：理解专家与动作专家协同</h2>
+<h2 id="21-顶层结构">2.1 顶层结构</h2>
+<div class="mermaid">flowchart LR
+    subgraph Prefix["条件前缀"]
+        IMG["多视角图像 token"]
+        TXT["语言 token"]
+        CQ["当前感知查询 token"]
+        FQ["未来感知查询 token"]
+    end
+
+    subgraph VLM["理解专家：Qwen3-VL-4B"]
+        VV["视觉编码器"]
+        VT["36 层语言 Transformer"]
+    end
+
+    subgraph AE["动作专家"]
+        ST["状态 token"]
+        AT["H 个带噪动作 token"]
+        TR["36 层动作 Transformer"]
+        MOE["每层稀疏 MoE FFN"]
+    end
+
+    IMG --&gt; VV --&gt; VT
+    TXT --&gt; VT
+    CQ --&gt; VT
+    FQ --&gt; VT
+    ST --&gt; TR
+    AT --&gt; TR
+    VT &lt;--&gt;|每层共享一次联合注意力| TR
+    TR --&gt; MOE
+    MOE --&gt; OUT["动作速度场 v_theta"]
+</div><p>发布权重名为 6B。其主体可理解为：</p>
+<ul>
+<li><strong>理解专家</strong>：Qwen3-VL-4B，负责图像、文本和感知查询。</li>
+<li><strong>动作专家</strong>：独立的 36 层 Qwen2 风格 Transformer，隐藏维度 768。</li>
+<li>两个专家层数相同，每一层都进行联合注意力，但保留各自的输入投影、输出投影、归一化和 FFN/MoE。</li>
+</ul>
+<p>动作专家公开配置的关键维度：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th style="text-align: right">值</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transformer 层数</td>
+<td style="text-align: right">36</td>
+<td>与 Qwen3-VL 文本层逐层对齐</td>
+</tr>
+<tr>
+<td>token hidden size</td>
+<td style="text-align: right">768</td>
+<td>状态与动作 token 的内部宽度</td>
+</tr>
+<tr>
+<td>query heads</td>
+<td style="text-align: right">32</td>
+<td>与 VLM 联合注意力的 query 头数</td>
+</tr>
+<tr>
+<td>key/value heads</td>
+<td style="text-align: right">8</td>
+<td>GQA 的 KV 头数</td>
+</tr>
+<tr>
+<td>head dimension</td>
+<td style="text-align: right">128</td>
+<td>每个注意力头的维度</td>
+</tr>
+<tr>
+<td>动作块长度</td>
+<td style="text-align: right">50</td>
+<td>默认未来动作 token 数</td>
+</tr>
+<tr>
+<td>最大状态/动作维度</td>
+<td style="text-align: right">55</td>
+<td>统一全身接口</td>
+</tr>
+</tbody>
+</table>
+<h2 id="22-为什么不是vlm-输出一个向量再交给动作网络">2.2 为什么不是“VLM 输出一个向量，再交给动作网络”</h2>
+<p>代码实现得更紧密。第 <span class="math inline">\(\ell\)</span> 层中：</p>
+<ol>
+<li>VLM token 用 VLM 自己的投影产生 <span class="math inline">\(Q_v,K_v,V_v\)</span>。</li>
+<li>状态/动作 token 用动作专家自己的投影产生 <span class="math inline">\(Q_a,K_a,V_a\)</span>。</li>
+<li>沿 token 维拼接两组 Q/K/V。</li>
+<li>做一次联合注意力。</li>
+<li>再把注意力输出切回两个分支，各自完成残差和 FFN。</li>
+</ol>
+<div class="mermaid">flowchart TD
+    V["第 l 层 VLM hidden"] --&gt; VQ["VLM Q/K/V 投影"]
+    A["第 l 层动作 hidden"] --&gt; AQ["动作专家 Q/K/V 投影"]
+    VQ --&gt; CAT["沿序列维拼接 Q/K/V"]
+    AQ --&gt; CAT
+    CAT --&gt; ATT["联合注意力 + M-RoPE"]
+    ATT --&gt; SPLIT{"按原 token 区间切分"}
+    SPLIT --&gt; VO["VLM 输出投影&lt;br/&gt;残差 + Dense FFN"]
+    SPLIT --&gt; AO["动作输出投影&lt;br/&gt;残差 + 稀疏 MoE FFN"]
+    VO --&gt; VN["第 l+1 层 VLM hidden"]
+    AO --&gt; AN["第 l+1 层动作 hidden"]
+</div><p>好处：动作 token 在每一层都能读取不同抽象层次的视觉语言信息，而不是只接收 VLM 最后一层的压缩结果。</p>
+<h2 id="23-prefix-和-suffix">2.3 Prefix 和 Suffix</h2>
+<p>整个序列分两部分：</p>
+<ul>
+<li><strong>Prefix 条件部分</strong>：图像、文本、当前查询、未来查询。</li>
+<li><strong>Suffix 生成部分</strong>：一个状态 token + <span class="math inline">\(H\)</span> 个带噪动作 token。</li>
+</ul>
+<p>公开 V2 配置启用因果 VLM。概念上的顺序为：</p>
+<pre><code class="language-text">[多视角图像] [语言] [当前查询组] [未来查询组]
+[当前状态] [动作_1] ... [动作_H]
+</code></pre>
+<p>状态和动作先投影到动作专家隐藏维度：</p>
+<p></p><div class="math display">\[h_s=W_s s_t
+\]</div><p></p><p></p><div class="math display">\[h_{a,i}=\operatorname{MLP}\left([W_a x_{t,i};\operatorname{TimeEmb}(\tau)]\right)
+\]</div><p></p><p>其中 <span class="math inline">\(x_{t,i}\)</span> 是第 <span class="math inline">\(i\)</span> 个带噪动作，<span class="math inline">\(\tau\in[0,1]\)</span> 是 Flow Matching 时间。</p>
+<p>时间还通过 AdaRMSNorm 调制动作专家，使每层都知道当前噪声强度。</p>
+<h2 id="24-注意力可见性既共享信息又阻止未来标签泄漏">2.4 注意力可见性：既共享信息，又阻止未来标签泄漏</h2>
+<div class="mermaid">flowchart TD
+    I["图像"] --&gt; L["语言"]
+    L --&gt; C["当前查询"]
+    C --&gt; F["未来查询"]
+    I --&gt; S["状态/动作 suffix"]
+    L --&gt; S
+    C --&gt; S
+    F -.-&gt;|公开配置中屏蔽| S
+
+    T["未来真实图像"] --&gt;|只用于构造教师 target| F
+    T -.-&gt;|从不作为策略输入| S
+</div><p>关键点：</p>
+<ul>
+<li>未来真实图像只进入冻结教师，绝不作为策略条件。</li>
+<li>未来查询可以读取当前图像和语言，从当前信息中学习预测未来。</li>
+<li>公开配置用 attention mask 阻止动作 suffix 直接读取未来深度/视频查询。</li>
+<li>当前查询可被动作分支读取，为动作提供当前几何和语义线索。</li>
+<li>即使未来查询不被动作直接读取，其蒸馏梯度仍会塑造共享 VLM 表征，使视觉语言主干学到预测性信息。</li>
+</ul>
+<p>因此它不是“偷看未来”，也不是在推理时把未来帧喂给模型。</p>
+<h2 id="25-稀疏-moe-动作专家">2.5 稀疏 MoE 动作专家</h2>
+<p>跨本体数据混合了不同运动学、控制语义和任务分布。单个 Dense FFN 容易让这些模式互相干扰。LingBot-VLA 2.0 把动作专家每一层的 FFN 换成：</p>
+<ul>
+<li>一个对所有 token 都执行的共享专家。</li>
+<li><span class="math inline">\(N_r\)</span> 个路由专家，每个 token 只选 Top-<span class="math inline">\(K\)</span>。</li>
+</ul>
+<p>公开配置：36 层全部使用 MoE，<span class="math inline">\(N_r=32\)</span>，<span class="math inline">\(K=4\)</span>；路由专家中间宽度 512，共享专家宽度 704。</p>
+<h3 id="moe-计算">MoE 计算</h3>
+<p>对第 <span class="math inline">\(\ell\)</span> 层 token <span class="math inline">\(u_{\ell,t}\)</span>：</p>
+<p></p><div class="math display">\[m_\ell(u)=E_\ell^{(s)}(u)+
+\lambda\sum_{j\in\mathcal R(u)}g_{\ell,j}(u)E_{\ell,j}^{(r)}(u)
+\]</div><p></p><p>每个专家都是 SwiGLU：</p>
+<p></p><div class="math display">\[E(u)=W_{down}\left(\operatorname{SiLU}(W_{gate}u)\odot W_{up}u\right)
+\]</div><p></p><p>公开配置的 routed scaling factor 为 <span class="math inline">\(\lambda=4\)</span>，共享专家不再使用额外 gate。</p>
+<h3 id="路由">路由</h3>
+<p></p><div class="math display">\[z_j=u^\top e_j,\qquad s_j=\sigma(z_j)
+\]</div><p></p><p>选择专家时加入负载修正偏置：</p>
+<p></p><div class="math display">\[\mathcal R(u)=\operatorname{TopK}_j(s_j+b_j,K)
+\]</div><p></p><p>真正混合输出时不用偏置，只归一化原始置信度：</p>
+<p></p><div class="math display">\[g_j=\frac{s_j}{\sum_{k\in\mathcal R(u)}s_k}
+\]</div><p></p><div class="mermaid">flowchart LR
+    U["动作 token u"] --&gt; R["FP32 Router"]
+    R --&gt; S["Sigmoid 分数 s"]
+    B["负载修正偏置 b"] --&gt; K["按 s+b 选 Top-K"]
+    S --&gt; K
+    K --&gt; E1["路由专家 j1"]
+    K --&gt; E2["路由专家 j2"]
+    K --&gt; EK["... 共 K 个"]
+    S --&gt; W["按原始 s 归一化权重"]
+    E1 --&gt; SUM["加权求和 × lambda"]
+    E2 --&gt; SUM
+    EK --&gt; SUM
+    W --&gt; SUM
+    U --&gt; SE["共享专家"]
+    SUM --&gt; O["相加得到 MoE 输出"]
+    SE --&gt; O
+</div><h3 id="无辅助损失负载均衡">无辅助损失负载均衡</h3>
+<p>论文主方法使用修正偏置而不污染 action objective：</p>
+<p></p><div class="math display">\[b_j\leftarrow b_j-
+\gamma\operatorname{sign}\left(n_j-\frac{1}{N_r}\sum_k n_k\right)
+\]</div><p></p><ul>
+<li>专家过载：<span class="math inline">\(b_j\)</span> 减小，之后较难被选中。</li>
+<li>专家欠载：<span class="math inline">\(b_j\)</span> 增大，之后更容易被选中。</li>
+<li>偏置只改变“选谁”，不改变已选专家的真实混合置信度。</li>
+</ul>
+<h3 id="一个-4-专家玩具例子">一个 4 专家玩具例子</h3>
+<p>假设 <span class="math inline">\(K=2\)</span>：</p>
+<pre><code class="language-text">原始 Sigmoid 分数 s = [0.80, 0.70, 0.60, 0.20]
+修正偏置 b          = [-0.30, 0.00, +0.20, 0.00]
+选择分数 s+b         = [0.50, 0.70, 0.80, 0.20]
+Top-2                = 专家 3、专家 2
+实际混合权重          = [0.60/(0.60+0.70), 0.70/(0.60+0.70)]
+</code></pre>
+<p>专家 1 原本分数最高，但因为长期过载而暂时让位；最终权重仍来自未加偏置的 0.60 和 0.70。</p>
+<h3 id="论文设计与公开后训练配置的差异">论文设计与公开后训练配置的差异</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>论文主方法</th>
+<th>公开 RoboTwin/真实机器人示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>路由激活</td>
+<td>Sigmoid</td>
+<td>Sigmoid</td>
+</tr>
+<tr>
+<td>修正偏置更新</td>
+<td>启用，强调 loss-free</td>
+<td><code>bias_update_speed: 0</code>，不更新</td>
+</tr>
+<tr>
+<td>sequence-wise balance loss</td>
+<td>主方法不需要</td>
+<td>系数 <span class="math inline">\(10^{-3}\)</span></td>
+</tr>
+<tr>
+<td>router z-loss</td>
+<td>主方法不需要</td>
+<td>系数 <span class="math inline">\(10^{-4}\)</span></td>
+</tr>
+</tbody>
+</table>
+<p>README 明确说明：如需复现 loss-free 路由，可关闭后两项，并把 <code>bias_update_speed</code> 设为约 0.00025。换言之，公开 YAML 是下游后训练稳定性配方，不应反向定义论文算法。</p>
+<h2 id="26-双查询蒸馏让模型理解现在并预测未来">2.6 双查询蒸馏：让模型理解现在，并预测未来</h2>
+<p>论文把它称为 Dual-Query。这里的“两个查询”是两组功能查询：</p>
+<ul>
+<li><span class="math inline">\(Q_t\)</span>：当前查询组。</li>
+<li><span class="math inline">\(Q_{t+T}\)</span>：未来查询组。</li>
+</ul>
+<p>代码中每组不是单个 token，而是公开配置里的 8 个 task tokens。投影头再用 256 个可学习输出 query，通过交叉注意力恢复 256 个教师 patch tokens。</p>
+<div class="mermaid">flowchart TD
+    CUR["当前图像 I_t"] --&gt; VLM["Qwen3-VL 因果主干"]
+    TXT["任务文本"] --&gt; VLM
+    VLM --&gt; QT["当前查询组 Q_t"]
+    VLM --&gt; QF["未来查询组 Q_t+T"]
+
+    QT --&gt; HD1["Cross-Attention 投影头"]
+    QT --&gt; HV1["Cross-Attention 投影头"]
+    QF --&gt; HD2["Cross-Attention 投影头"]
+    QF --&gt; HV2["Cross-Attention 投影头"]
+
+    IT["当前真实帧"] --&gt; DT["冻结 LingBot-Depth"]
+    IF["未来真实帧"] --&gt; DF["冻结 LingBot-Depth"]
+    IT --&gt; DV["冻结因果 DINO-Video"]
+    IF --&gt; DV
+
+    DT --&gt; LD1["当前深度特征 loss"]
+    HD1 --&gt; LD1
+    DF --&gt; LD2["未来深度特征 loss"]
+    HD2 --&gt; LD2
+    DV --&gt; LV1["当前视频特征 loss"]
+    HV1 --&gt; LV1
+    DV --&gt; LV2["未来视频特征 loss"]
+    HV2 --&gt; LV2
+</div><h3 id="lingbot-depth提供几何监督">LingBot-Depth：提供几何监督</h3>
+<p>论文写作：</p>
+<p></p><div class="math display">\[\mathcal L_{depth}=
+\left\|\operatorname{Proj}_{depth}(Q_t)-D_t\right\|_1+
+\left\|\operatorname{Proj}_{depth}(Q_{t+T})-D_{t+T}\right\|_1
+\]</div><p></p><p>代码实际流程：</p>
+<ol>
+<li>MoGe-2 从 RGB 估计深度。</li>
+<li>LingBot-Depth 的 MoRGBD 模型结合 RGB 与估计深度，输出 256 个 1024 维特征 token。</li>
+<li>VLA 的当前/未来查询经 Perceiver 风格 cross-attention resampler，也输出 <code>[B, 256, 1024]</code>。</li>
+<li>使用 Smooth L1，而不是严格的绝对值 L1；target 会 <code>detach</code>，教师冻结。</li>
+</ol>
+<p>当前公开实现只用<strong>配置中的第一个相机视角</strong>生成深度 target，并用 VLM 中第一幅图像的 token 作为投影头上下文；默认相机顺序下通常是头顶/主视角。其余相机仍参与 VLA 动作条件，只是不单独生成蒸馏 target。</p>
+<h3 id="dino-video提供因果时序语义">DINO-Video：提供因果时序语义</h3>
+<p></p><div class="math display">\[\mathcal L_{video}=
+\left\|\operatorname{Proj}_{video}(Q_t)-Z_t\right\|_F^2+
+\left\|\operatorname{Proj}_{video}(Q_{t+T})-Z_{t+T}\right\|_F^2
+\]</div><p></p><p>DINO-Video 的特点：</p>
+<ul>
+<li>从 DINOv3 图像模型初始化。</li>
+<li>加入 block-wise causal temporal attention。</li>
+<li>使用 3D-RoPE 表达空间和时间位置。</li>
+<li>在 500 万视频片段上训练，数据包含互联网、人类第一视角和机器人视频。</li>
+<li>教师训练时每个样本均匀取 16 帧，并用有效帧率编码真实时间跨度。</li>
+</ul>
+<p>VLA 训练中，公开配置只取当前和一个未来帧，并复制当前帧作 warmup：</p>
+<pre><code class="language-text">DINO-Video 输入 = [当前帧副本, 当前帧, 未来帧]
+                       warmup      t       t+T
+</code></pre>
+<p>教师进行一次因果前向，得到当前和未来 patch 特征。公开配置对两者使用 MSE，并各由当前/未来查询预测。</p>
+<p>DINO-Video target 同样取第一个配置相机。<code>effective_fps</code> 由数据原始 fps 和动作 horizon 换算，使教师知道当前帧到未来帧之间代表多少真实时间，而不只是“相隔一个数组位置”。</p>
+<h3 id="查询如何共享">查询如何共享</h3>
+<p>公开配置让深度和视频任务共享“当前”及“未来”的功能查询，但先保留各自可学习种子，再拼接后线性融合：</p>
+<div class="mermaid">flowchart LR
+    CD["当前深度 query seed"] --&gt; CP["拼接 + Linear"]
+    CV["当前视频 query seed"] --&gt; CP
+    CP --&gt; CQ["共享当前查询 token"]
+
+    FD["未来深度 query seed"] --&gt; FP["拼接 + Linear"]
+    FV["未来视频 query seed"] --&gt; FP
+    FP --&gt; FQ["共享未来查询 token"]
+
+    CQ --&gt; D1["深度头"]
+    CQ --&gt; V1["视频头"]
+    FQ --&gt; D2["未来深度头"]
+    FQ --&gt; V2["未来视频头"]
+</div><p>这迫使同一组查询同时保留“在哪里”的几何和“接下来会怎样”的语义动态。</p>
+<hr>
+<h2 id="3-训练-pipeline">3. 训练 Pipeline</h2>
+<h2 id="31-flow-matching从动作到噪声之间学一个速度场">3.1 Flow Matching：从动作到噪声之间学一个速度场</h2>
+<p>设真实动作块为 <span class="math inline">\(a\in\mathbb R^{H\times55}\)</span>，高斯噪声为 <span class="math inline">\(\epsilon\sim\mathcal N(0,I)\)</span>。</p>
+<p>从 <span class="math inline">\(\operatorname{Beta}(1.5,1.0)\)</span> 采样时间，再缩放到 <span class="math inline">\([0.001,1]\)</span>：</p>
+<p></p><div class="math display">\[\tau\sim\operatorname{Beta}(1.5,1.0)
+\]</div><p></p><p>构造直线路径：</p>
+<p></p><div class="math display">\[x_\tau=\tau\epsilon+(1-\tau)a
+\]</div><p></p><ul>
+<li><span class="math inline">\(\tau\approx0\)</span>：几乎是真实动作。</li>
+<li><span class="math inline">\(\tau\approx1\)</span>：几乎是纯噪声。</li>
+</ul>
+<p>这条路径的真实速度恒定：</p>
+<p></p><div class="math display">\[u_\tau=\frac{d x_\tau}{d\tau}=\epsilon-a
+\]</div><p></p><p>模型学习：</p>
+<p></p><div class="math display">\[v_\theta(x_\tau,\tau\mid I_t,l,s_t)\approx\epsilon-a
+\]</div><p></p><p>推理时反过来从 <span class="math inline">\(\tau=1\)</span> 积分到 <span class="math inline">\(0\)</span>，就能把噪声搬运成动作。</p>
+<div class="mermaid">flowchart LR
+    A["真实动作 a&lt;br/&gt;tau=0"] --- X1["少量噪声"] --- X2["混合状态 x_tau"] --- X3["大量噪声"] --- N["高斯噪声 epsilon&lt;br/&gt;tau=1"]
+    X2 --&gt; V["模型预测速度 v_theta"]
+    V --&gt; U["监督目标 epsilon-a"]
+</div><h2 id="32-单步训练完整流程">3.2 单步训练完整流程</h2>
+<div class="mermaid">flowchart TD
+    D["采样当前帧、未来帧、文本、状态、动作块"] --&gt; P["字段映射、相对化、归一化、55 维补齐"]
+    P --&gt; T["随机采样 tau 和高斯噪声 epsilon"]
+    T --&gt; X["构造 x_tau = tau*epsilon + 1-tau*a"]
+
+    P --&gt; TD["冻结 LingBot-Depth&lt;br/&gt;生成当前/未来几何 target"]
+    P --&gt; TV["冻结 DINO-Video&lt;br/&gt;生成当前/未来语义 target"]
+
+    X --&gt; M["VLA 前向&lt;br/&gt;图像+文本+查询+状态+带噪动作"]
+    M --&gt; VA["动作速度预测"]
+    M --&gt; PD["深度特征预测"]
+    M --&gt; PV["视频特征预测"]
+    M --&gt; RR["MoE router logits"]
+
+    VA --&gt; LA["Action Flow Loss"]
+    TD --&gt; LD["Depth Loss"]
+    PD --&gt; LD
+    TV --&gt; LV["Video Loss"]
+    PV --&gt; LV
+    RR --&gt; LM["可选 MoE 辅助项"]
+
+    LA --&gt; SUM["总损失"]
+    LD --&gt; SUM
+    LV --&gt; SUM
+    LM --&gt; SUM
+    SUM --&gt; BP["反向传播 + 梯度裁剪 + Optimizer"]
+    BP --&gt; LB["可选：按专家负载更新修正偏置"]
+</div><h2 id="33-中文伪代码训练">3.3 中文伪代码：训练</h2>
+<pre><code class="language-python">def train_step(batch, policy, depth_teacher, video_teacher):
+    # 1. batch 已完成：本体字段映射、归一化、55 维补齐和有效维度 mask
+    images = batch.current_images
+    future_images = batch.future_images
+    text = batch.language
+    state = batch.state                 # [B, 55]
+    action = batch.action_chunk         # [B, H, 55]
+    valid = batch.joint_mask            # [B, H, 55]
+
+    # 2. Flow Matching 插值；tau 越大，x_tau 越接近纯噪声
+    epsilon = randn_like(action)
+    tau = sample_beta(alpha=1.5, beta=1.0)  # [B]
+    tau = 0.999 * tau + 0.001
+    x_tau = tau[:, None, None] * epsilon + (1 - tau[:, None, None]) * action
+    target_velocity = epsilon - action
+
+    # 3. 冻结教师只产生监督 target，不接收梯度
+    with no_grad():
+        depth_now = depth_teacher(images[:, :1])
+        depth_future = depth_teacher(future_images[:, :1])
+        video_now, video_future = video_teacher.causal_forward(
+            [images[:, :1], future_images[:, :1]]
+        )
+
+    # 4. 学生一次前向，同时预测动作速度、当前/未来感知特征
+    pred = policy(
+        images=images,
+        text=text,
+        state=state,
+        noisy_action=x_tau,
+        flow_time=tau,
+    )
+
+    # 5. 只在本体真实存在的动作维度上计算 action loss
+    action_error = l1_or_l2(pred.velocity, target_velocity)
+    loss_action = (action_error * valid).sum() / valid.sum().clamp(min=1)
+
+    # 6. 当前与未来的几何/语义蒸馏
+    loss_depth = smooth_l1(pred.depth_now, depth_now)
+    loss_depth_future = smooth_l1(pred.depth_future, depth_future)
+    loss_video = mse(pred.video_now, video_now) + mse(pred.video_future, video_future)
+
+    # 7. 公开后训练配置还可加入 sequence-wise balance 和 router z-loss
+    loss = (
+        loss_action
+        + 0.004 * loss_depth
+        + 0.004 * loss_depth_future
+        + 0.004 * loss_video
+        + loss_moe_optional
+    )
+
+    loss.backward()
+    clip_grad_norm(policy.parameters())
+    optimizer.step()
+    optimizer.zero_grad()
+</code></pre>
+<h2 id="34-loss-的完整定义">3.4 Loss 的完整定义</h2>
+<h3 id="a-动作-flow-matching-loss">A. 动作 Flow Matching loss</h3>
+<p>代码支持 L2 和 L1：</p>
+<p></p><div class="math display">\[\mathcal L_{action}^{L2}
+=\frac{\sum_{h,d}m_{h,d}(v_{\theta,h,d}-u_{h,d})^2}
+{\sum_{h,d}m_{h,d}}
+\]</div><p></p><p></p><div class="math display">\[\mathcal L_{action}^{L1}
+=\frac{\sum_{h,d}m_{h,d}|v_{\theta,h,d}-u_{h,d}|}
+{\sum_{h,d}m_{h,d}}
+\]</div><p></p><p>论文消融中 L2 平均成功率 55.0%，优于 L1 的 46.4%；但公开后训练 YAML 使用 <code>L1_fm</code>。这是任务相关选择：</p>
+<ul>
+<li>L2 更强调高密度的小修正和精确回归。</li>
+<li>L1 对接触冲击和长尾动作更稳健；论文中挤番茄酱任务反而更适合 L1。</li>
+</ul>
+<h3 id="b-深度蒸馏-loss">B. 深度蒸馏 loss</h3>
+<p>代码将当前和未来分别加权：</p>
+<p></p><div class="math display">\[\mathcal L_{D}
+=\alpha_D\operatorname{SmoothL1}(\hat D_t,D_t)
++\alpha_{FD}\operatorname{SmoothL1}(\hat D_{t+T},D_{t+T})
+\]</div><p></p><p>公开配置 <span class="math inline">\(\alpha_D=\alpha_{FD}=0.004\)</span>。</p>
+<h3 id="c-视频蒸馏-loss">C. 视频蒸馏 loss</h3>
+<p>公开配置启用当前和未来 patch MSE：</p>
+<p></p><div class="math display">\[\mathcal L_V=\alpha_V\left[
+\operatorname{MSE}(\hat Z_t,Z_t)
++\operatorname{MSE}(\hat Z_{t+T},Z_{t+T})
+\right]
+\]</div><p></p><p>其中 <span class="math inline">\(\alpha_V=0.004\)</span>。代码也支持 Smooth L1、cosine loss 和 CLS token loss，但公开配置关闭这些变体。</p>
+<h3 id="d-可选-sequence-wise-moe-balance-loss">D. 可选 sequence-wise MoE balance loss</h3>
+<p>对每条序列、每层统计专家实际命中频率 <span class="math inline">\(f_j\)</span> 和平均路由概率 <span class="math inline">\(P_j\)</span>：</p>
+<p></p><div class="math display">\[f_j=\frac{N_r}{K}\cdot\frac{\#\{\text{token 选择专家 }j\}}{N_{token}}
+\]</div><p></p><p></p><div class="math display">\[P_j=\frac{1}{N_{token}}\sum_t
+\frac{\sigma(z_{t,j})}{\sum_k\sigma(z_{t,k})}
+\]</div><p></p><p></p><div class="math display">\[\mathcal L_{seq}=\alpha_{seq}\sum_j f_jP_j
+\]</div><p></p><p>公开后训练配置 <span class="math inline">\(\alpha_{seq}=10^{-3}\)</span>。</p>
+<h3 id="e-可选-router-z-loss">E. 可选 router z-loss</h3>
+<p></p><div class="math display">\[\mathcal L_z=alpha_z\cdot
+\mathbb E\left[\log\sum_j e^{z_j}\right]^2
+\]</div><p></p><p>用于抑制 router logits 数值爆炸。公开配置 <span class="math inline">\(\alpha_z=10^{-4}\)</span>。</p>
+<h3 id="f-总损失">F. 总损失</h3>
+<p></p><div class="math display">\[\boxed{
+\mathcal L_{total}=
+\mathcal L_{action}
++\mathcal L_D
++\mathcal L_V
++\mathcal L_{seq}
++\mathcal L_z
+}
+\]</div><p></p><p>loss-free 论文设定中，最后两项可为 0，专家均衡改由修正偏置完成。</p>
+<h2 id="35-梯度到底流向哪里">3.5 梯度到底流向哪里</h2>
+<div class="mermaid">flowchart LR
+    ALOSS["动作 loss"] --&gt; AE["动作专家 + MoE"]
+    ALOSS --&gt; VLM["共享注意力中的 VLM 参数"]
+
+    DLOSS["深度 loss"] --&gt; DH["深度投影头"]
+    DLOSS --&gt; VLM
+    VLOSS["视频 loss"] --&gt; VH["视频投影头"]
+    VLOSS --&gt; VLM
+
+    DT["LingBot-Depth"] -.-&gt;|冻结，无梯度| DLOSS
+    VT["DINO-Video"] -.-&gt;|冻结，无梯度| VLOSS
+
+    FQ["未来查询"] -.-&gt;|attention mask 阻止直接泄漏给动作| AE
+</div><p>公开配置还会 detach 未来深度/视频分支使用的当前图像特征，减少辅助任务通过捷径干扰动作主干。</p>
+<h2 id="36-优化与大规模训练工程">3.6 优化与大规模训练工程</h2>
+<p>这些不是方法创新核心，但决定代码怎样跑：</p>
+<ul>
+<li>FSDP2 对模型分片；MoE 专家可进一步做 expert parallel。</li>
+<li>36 层动作专家支持 gradient checkpointing。</li>
+<li><code>torch.compile</code>、Flex Attention、融合 MoE kernel 用于提速。</li>
+<li>公共真实机器人示例：Muon optimizer，学习率 <span class="math inline">\(5\times10^{-5}\)</span>，全局 batch 4，最多 40,000 steps。</li>
+<li>公共 RoboTwin 示例：Muon，学习率 <span class="math inline">\(10^{-4}\)</span>，全局 batch 3，最多 30,000 steps。</li>
+<li>MoE 路由专家可用 <span class="math inline">\(\sqrt{N_r/K}\)</span> 比例的独立学习率缩放。</li>
+<li>梯度裁剪后执行 optimizer step；loss-free 模式在 step 前按跨 rank 汇总负载更新路由偏置。</li>
+</ul>
+<hr>
+<h2 id="4-推理从随机噪声得到可执行动作">4. 推理：从随机噪声得到可执行动作</h2>
+<h2 id="41-推理时不需要两个教师">4.1 推理时不需要两个教师</h2>
+<p>LingBot-Depth 和 DINO-Video 只在训练时生成 target。部署时需要：</p>
+<ul>
+<li>Qwen3-VL 理解专家。</li>
+<li>动作专家与 MoE。</li>
+<li>当前/未来查询 token 本身。</li>
+<li>Flow Matching 速度预测头。</li>
+</ul>
+<p>不需要运行深度模型、DINO-Video 或蒸馏投影头，因此辅助监督不会直接增加控制环中的教师推理成本。</p>
+<h2 id="42-完整推理流程">4.2 完整推理流程</h2>
+<div class="mermaid">sequenceDiagram
+    participant R as 机器人
+    participant P as 预处理
+    participant V as Qwen3-VL Prefix
+    participant A as 动作专家
+    participant D as 控制端
+
+    R-&gt;&gt;P: 当前多视角图像、状态、语言指令
+    P-&gt;&gt;P: 重排字段、归一化、补齐到 55 维
+    P-&gt;&gt;V: 图像/文本/查询 token
+    V-&gt;&gt;V: Prefix 前向一次，缓存每层 K/V
+    P-&gt;&gt;A: 当前状态 + 高斯噪声动作块
+
+    loop 10 次 Euler 更新，tau 从 1 到 0
+        A-&gt;&gt;V: 读取缓存的 Prefix K/V
+        A-&gt;&gt;A: 预测速度 v_theta
+        A-&gt;&gt;A: x &lt;- x - 0.1 * v_theta
+    end
+
+    A-&gt;&gt;P: 归一化空间动作块 [H,55]
+    P-&gt;&gt;P: 去除 padding、逆归一化、恢复原始字段
+    P-&gt;&gt;D: 前若干步动作或整个动作块
+    D-&gt;&gt;R: 执行动作
+</div><h3 id="为什么-prefix-只算一次">为什么 Prefix 只算一次</h3>
+<p>图像、文本和查询在 10 次去噪中不变。代码第一次前向缓存其每层 key/value；后续只重新计算状态、当前带噪动作和时间 embedding，并拼接缓存。这显著降低 10 步采样的重复计算。</p>
+<h2 id="43-euler-去噪">4.3 Euler 去噪</h2>
+<p>初始化：</p>
+<p></p><div class="math display">\[x_1\sim\mathcal N(0,I),\qquad \Delta\tau=-\frac{1}{10}=-0.1
+\]</div><p></p><p>循环：</p>
+<p></p><div class="math display">\[x_{\tau+\Delta\tau}=x_\tau+\Delta\tau\cdot
+v_\theta(x_\tau,\tau\mid I,l,s)
+\]</div><p></p><p>从 <span class="math inline">\(\tau=1\)</span> 更新到 <span class="math inline">\(0\)</span> 后，<span class="math inline">\(x_0\)</span> 就是动作块。</p>
+<h2 id="44-中文伪代码推理">4.4 中文伪代码：推理</h2>
+<pre><code class="language-python">def infer_action_chunk(observation, policy, robot_adapter, num_steps=10):
+    # 1. 把机器人原始输入变成模型的统一格式
+    x = robot_adapter.map_fields(observation)
+    x.state = robot_adapter.normalize_state(x.state)
+    x.state, masks = pad_to_55(x.state)
+    images = preprocess_qwen_images(x.images)
+    text_tokens = tokenize(x.instruction)
+
+    # 2. 图像、文本、当前/未来查询固定，先算一次并缓存 K/V
+    prefix_cache = policy.encode_prefix_once(images, text_tokens)
+
+    # 3. 从整块高斯噪声开始
+    action = randn(shape=[1, policy.chunk_size, 55])
+    dt = -1.0 / num_steps
+    tau = 1.0
+
+    # 4. 沿学到的速度场从噪声积分到动作
+    for _ in range(num_steps):
+        velocity = policy.predict_velocity(
+            state=x.state,
+            noisy_action=action,
+            flow_time=tau,
+            prefix_kv=prefix_cache,
+        )
+        action = action + dt * velocity
+        tau = tau + dt
+
+    # 5. 回到机器人自己的控制接口
+    action = select_valid_dimensions(action, masks)
+    action = robot_adapter.unnormalize_action(action)
+    action = robot_adapter.relative_to_absolute_if_needed(action, observation.state)
+    return robot_adapter.restore_raw_fields(action)
+</code></pre>
+<h2 id="45-动作块怎样执行">4.5 动作块怎样执行</h2>
+<p>模型一次产生 <span class="math inline">\(H\)</span> 步，但控制端不一定全部盲执行。部署 wrapper 支持：</p>
+<ul>
+<li><code>chunk_ret=True</code>：直接返回整块，交给外部控制器处理。</li>
+<li><code>use_length=k</code>：每次推理只保留前 <span class="math inline">\(k\)</span> 步，逐步执行；第 <span class="math inline">\(k\)</span> 步后重新观察并规划。</li>
+<li><code>use_length=1</code>：每执行一步就重新推理，反馈最及时但算力开销最大。</li>
+<li>README 的真实机器人示例使用 <code>use_length=25</code>；一次前向约 130 ms，含 10 次去噪，测试硬件为 RTX 4090D。</li>
+</ul>
+<div class="mermaid">flowchart LR
+    O1["观察 1"] --&gt; P1["预测 H 步"]
+    P1 --&gt; E1["只执行前 k 步"]
+    E1 --&gt; O2["新观察"]
+    O2 --&gt; P2["重新预测 H 步"]
+    P2 --&gt; E2["再执行前 k 步"]
+</div><p><span class="math inline">\(k\)</span> 是开环效率与闭环纠错能力之间的折中。</p>
+<hr>
+<h2 id="5-一个贯穿全流程的例子">5. 一个贯穿全流程的例子</h2>
+<p>任务：双臂移动机器人执行“把桌上的水瓶放进冰箱”。设 <span class="math inline">\(H=50\)</span>。</p>
+<h2 id="51-数据与表示">5.1 数据与表示</h2>
+<div class="mermaid">flowchart TD
+    OBS["当前观察"] --&gt; I1["头部相机"]
+    OBS --&gt; I2["左腕相机"]
+    OBS --&gt; I3["右腕相机"]
+    OBS --&gt; TXT["把水瓶放进冰箱"]
+    OBS --&gt; ST["双臂、夹爪、腰、头、底盘状态"]
+
+    ST --&gt; MAP["映射到 55 维"]
+    MAP --&gt; MASK["不存在灵巧手等字段置 0 并 mask"]
+    MAP --&gt; NORM["按本体统计量归一化"]
+</div><p>动作块可能同时包含：</p>
+<ol>
+<li>底盘向桌子移动。</li>
+<li>腰/头调整以保持目标可见。</li>
+<li>双臂接近水瓶。</li>
+<li>夹爪闭合。</li>
+<li>底盘移动到冰箱。</li>
+</ol>
+<p>统一接口允许这些自由度在同一个 <span class="math inline">\([50,55]\)</span> 张量中协同出现。</p>
+<h2 id="52-模型内部">5.2 模型内部</h2>
+<ul>
+<li>Qwen3-VL 从多视角画面和语言中定位水瓶、冰箱和机器人手臂。</li>
+<li>当前查询学习桌面、水瓶、夹爪之间的几何关系。</li>
+<li>未来查询学习“成功动作后水瓶应靠近冰箱内部”的未来表征。</li>
+<li>动作 token 在每层联合注意力中读取视觉语言信息。</li>
+<li>不同动作 token 可路由到不同专家，例如底盘移动模式、抓取接触模式、双臂协调模式；这些语义不是人工指定，而是训练中自动形成。</li>
+</ul>
+<h2 id="53-一个标量上的-flow-matching-数值例子">5.3 一个标量上的 Flow Matching 数值例子</h2>
+<p>只看某个动作维度：真实归一化动作 <span class="math inline">\(a=0.3\)</span>，噪声 <span class="math inline">\(\epsilon=-0.7\)</span>，采样 <span class="math inline">\(\tau=0.8\)</span>。</p>
+<p></p><div class="math display">\[x_{0.8}=0.8\times(-0.7)+0.2\times0.3=-0.5
+\]</div><p></p><p>真实速度：</p>
+<p></p><div class="math display">\[u=\epsilon-a=-0.7-0.3=-1.0
+\]</div><p></p><p>若模型预测 <span class="math inline">\(v_\theta=-1.05\)</span>：</p>
+<p></p><div class="math display">\[L2=(-1.05+1.0)^2=0.0025
+\]</div><p></p><p>推理时从 <span class="math inline">\(-0.7\)</span> 出发，按负时间方向积分。因为 <span class="math inline">\(\Delta\tau&lt;0\)</span>，减去负速度会逐步把值推向 <span class="math inline">\(0.3\)</span>。</p>
+<h2 id="54-部署闭环">5.4 部署闭环</h2>
+<p>模型生成 50 步，但机器人只执行前 10 步，然后重新拍照。若水瓶滑动，新观察会改变下一动作块；这就是 action chunking 与闭环控制的结合。</p>
+<hr>
+<h2 id="6-为什么这些设计有效">6. 为什么这些设计有效</h2>
+<div class="mermaid">flowchart TD
+    D["更多且更干净的数据"] --&gt; G1["覆盖更多物体、任务、视角"]
+    U["统一 55 维表示"] --&gt; G2["共享跨本体动作规律"]
+    M["稀疏 MoE"] --&gt; G3["共享规律与专门模式共存"]
+    Q["当前/未来蒸馏"] --&gt; G4["几何感知 + 预测性表征"]
+    F["Flow Matching"] --&gt; G5["连续、多峰动作块生成"]
+
+    G1 --&gt; R["更强的泛化和真实部署能力"]
+    G2 --&gt; R
+    G3 --&gt; R
+    G4 --&gt; R
+    G5 --&gt; R
+</div><h3 id="61-数据与表示解决能否共同训练">6.1 数据与表示解决“能否共同训练”</h3>
+<p>没有统一动作空间时，每个本体都像一个独立任务。55 维插槽和 mask 让相同身体部位对齐，同时不强迫不存在的自由度产生损失。</p>
+<h3 id="62-moe-解决容量够不够模式会不会冲突">6.2 MoE 解决“容量够不够、模式会不会冲突”</h3>
+<p>共享专家学习普遍规律，路由专家提供额外容量。每个 token 只激活少数专家，因此总参数量增加而活跃计算量受控。论文在相同活跃参数预算下，MoE 的训练 loss 和 GM-100 验证 action error 都优于 Dense 模型。</p>
+<h3 id="63-双查询解决表征是否只会识别不会预测">6.3 双查询解决“表征是否只会识别，不会预测”</h3>
+<p>VLM 预训练擅长回答“画面里有什么”，机器人还需要知道“动作之后会变成什么”。未来查询把这个要求变成可监督代理任务；深度教师约束几何，视频教师约束运动与语义，两者互补。</p>
+<h3 id="64-flow-matching-解决动作不是一个离散答案">6.4 Flow Matching 解决“动作不是一个离散答案”</h3>
+<p>同一场景可能有多条合理轨迹。Flow Matching 学习条件速度场，从随机噪声生成整段连续动作，比逐维单点回归更适合表达多模态动作分布，也避免把连续控制离散成大量 action tokens。</p>
+<hr>
+<h2 id="7-实验告诉了我们什么">7. 实验告诉了我们什么</h2>
+<h2 id="71-generalist-双臂操作">7.1 Generalist 双臂操作</h2>
+<p>同一策略混合训练九个 GM-100 任务：</p>
+<table>
+<thead>
+<tr>
+<th>平台</th>
+<th style="text-align: right">指标：进度 / 成功率</th>
+<th style="text-align: right">GR00T N1.7</th>
+<th style="text-align: right"><span class="math inline">\(\pi_{0.5}\)</span></th>
+<th style="text-align: right">LingBot-VLA 1.0</th>
+<th style="text-align: right">LingBot-VLA 2.0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AgileX Cobot Magic</td>
+<td style="text-align: right">%</td>
+<td style="text-align: right">36.3 / 17.8</td>
+<td style="text-align: right">59.1 / 32.2</td>
+<td style="text-align: right">58.2 / 30.0</td>
+<td style="text-align: right"><strong>66.2 / 34.4</strong></td>
+</tr>
+<tr>
+<td>Galaxea R1 Pro</td>
+<td style="text-align: right">%</td>
+<td style="text-align: right">16.4 / 5.6</td>
+<td style="text-align: right">27.4 / 8.9</td>
+<td style="text-align: right">32.7 / <strong>15.6</strong></td>
+<td style="text-align: right"><strong>34.6 / 15.6</strong></td>
+</tr>
+</tbody>
+</table>
+<p>提升在目标定位和目标导向动作明显的任务上更突出，但不是所有任务都提升。论文也指出精确放置、释放和最后一步完成仍是弱点，且不同平台之间仍存在较大差距。</p>
+<h2 id="72-长时移动操作">7.2 长时移动操作</h2>
+<table>
+<thead>
+<tr>
+<th>本体与任务</th>
+<th>设置</th>
+<th style="text-align: right">LingBot-VLA 2.0</th>
+<th style="text-align: right"><span class="math inline">\(\pi_{0.5}\)</span></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Astribot S1：物品放入冰箱</td>
+<td>ID</td>
+<td style="text-align: right"><strong>77.1 / 60.0</strong></td>
+<td style="text-align: right">65.3 / 46.7</td>
+</tr>
+<tr>
+<td>Astribot S1：物品放入冰箱</td>
+<td>OOD</td>
+<td style="text-align: right"><strong>37.0 / 13.3</strong></td>
+<td style="text-align: right">30.3 / 6.7</td>
+</tr>
+<tr>
+<td>Cobot Magic-ARX X5：清洁炉灶</td>
+<td>ID</td>
+<td style="text-align: right"><strong>84.3 / 66.7</strong></td>
+<td style="text-align: right">79.9 / 60.0</td>
+</tr>
+<tr>
+<td>Cobot Magic-ARX X5：清洁炉灶</td>
+<td>OOD</td>
+<td style="text-align: right"><strong>67.5 / 40.0</strong></td>
+<td style="text-align: right">62.5 / 33.3</td>
+</tr>
+</tbody>
+</table>
+<p>这里指标仍是进度 / 成功率。OOD 包括初始位置在前后左右扰动 <span class="math inline">\(\pm10\)</span> cm；冰箱任务还替换成未见物体类别。</p>
+<h2 id="73-应怎样解读证据">7.3 应怎样解读证据</h2>
+<ul>
+<li>结果支持“系统组合有效”，但没有对每个新增组件给出同等完整的成功率消融。</li>
+<li>MoE 有同活跃参数预算下的训练 loss 和验证 action error 对比。</li>
+<li>动作目标、动作空间、归一化和 L1/L2 有真实机器人消融。</li>
+<li>双查询蒸馏展示了当前/未来深度及 DINO 特征的预测可视化；论文没有提供同规模的关闭蒸馏成功率表。</li>
+<li>因此不能把全部性能增益精确归因到某一个模块。</li>
+</ul>
+<hr>
+<h2 id="8-它不是什么">8. 它不是什么</h2>
+<h3 id="81-不是显式像素世界模型">8.1 不是显式像素世界模型</h3>
+<p>它不生成未来 RGB 视频，也不做长时 roll-out。它预测的是教师特征空间中的未来几何和语义表示，所以更准确的称呼是“预测性表征学习”。</p>
+<h3 id="82-不是人工定义专家语义的-moe">8.2 不是人工定义专家语义的 MoE</h3>
+<p>没有规定某个专家专门负责某机器人、某身体部位或某任务。路由是逐 token 学出来的，专家语义可能混合本体、阶段、动作类型等因素。</p>
+<h3 id="83-不是把-55-维全部发给每个机器人">8.3 不是把 55 维全部发给每个机器人</h3>
+<p>模型输出 55 维后，适配器用 mask 取回该本体的真实字段，再逆归一化和反向字段映射。补齐维度不会进入硬件控制接口。</p>
+<h3 id="84-不是一次预测后永久开环">8.4 不是一次预测后永久开环</h3>
+<p>动作块可以只执行前 <span class="math inline">\(k\)</span> 步，然后重新观察和规划。模型本身提供 action chunk，闭环频率由部署策略决定。</p>
+<hr>
+<h2 id="9-论文公式与代码实现对照">9. 论文公式与代码实现对照</h2>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>论文表达</th>
+<th>代码中的关键实现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>统一动作空间</td>
+<td>55 维 canonical vector</td>
+<td><code>FeatureTransform.pad_and_concat</code> + <code>joint_mask</code></td>
+</tr>
+<tr>
+<td>人类轨迹坐标</td>
+<td>世界坐标存储，当前相机坐标训练</td>
+<td>数据预处理方法，公开训练代码消费标准化后的 LeRobot 数据</td>
+</tr>
+<tr>
+<td>动作生成</td>
+<td>连续动作模型</td>
+<td><code>FlowMatchingV2.forward</code> / <code>sample_actions</code></td>
+</tr>
+<tr>
+<td>时间采样</td>
+<td>Flow Matching 时间</td>
+<td><code>Beta(1.5,1.0)</code>，缩放到 <code>[0.001,1]</code></td>
+</tr>
+<tr>
+<td>理解专家</td>
+<td>VLM</td>
+<td>Qwen3-VL-4B</td>
+</tr>
+<tr>
+<td>动作专家</td>
+<td>与 VLM 协同</td>
+<td>36 层、hidden 768，逐层联合注意力</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>共享 + Top-K routed experts</td>
+<td>32 个路由专家、Top-4、全 36 层</td>
+</tr>
+<tr>
+<td>loss-free 均衡</td>
+<td>路由修正偏置</td>
+<td>optimizer pre-hook 汇总专家负载并更新 bias</td>
+</tr>
+<tr>
+<td>当前/未来查询</td>
+<td><span class="math inline">\(Q_t,Q_{t+T}\)</span></td>
+<td>每组 8 个 task tokens；输出 256 个教师 token</td>
+</tr>
+<tr>
+<td>深度教师</td>
+<td>LingBot-Depth</td>
+<td>MoGe-2 深度 + MoRGBD/LingBot-Depth feature</td>
+</tr>
+<tr>
+<td>视频教师</td>
+<td>DINO-Video</td>
+<td>因果 DINOv3 video teacher</td>
+</tr>
+<tr>
+<td>深度 loss</td>
+<td>论文写 L1</td>
+<td>代码用 Smooth L1</td>
+</tr>
+<tr>
+<td>视频 loss</td>
+<td>Frobenius squared</td>
+<td>公开配置用 patch MSE</td>
+</tr>
+<tr>
+<td>推理积分</td>
+<td>从噪声到动作</td>
+<td>10 步 Euler，<span class="math inline">\(\Delta t=-0.1\)</span></td>
+</tr>
+<tr>
+<td>部署</td>
+<td>action chunk</td>
+<td>整块返回或只执行前 <code>use_length</code> 步</td>
+</tr>
+</tbody>
+</table>
+<h2 id="91-主要源码证据位置">9.1 主要源码证据位置</h2>
+<p>这部分只用于核查，不影响正文独立阅读：</p>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>文件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>论文方法与公式</td>
+<td><code>arXiv-2607.06403v1/sections/3_method.tex</code></td>
+</tr>
+<tr>
+<td>论文实验与消融</td>
+<td><code>arXiv-2607.06403v1/sections/4_experiments.tex</code></td>
+</tr>
+<tr>
+<td>V2 主模型、联合注意力、Flow Matching</td>
+<td><code>lingbot-vla-v2/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py</code></td>
+</tr>
+<tr>
+<td>动作专家与 MoE 路由</td>
+<td><code>lingbot-vla-v2/lingbotvla/models/vla/lingbot_vla/qwen2_action_expert.py</code></td>
+</tr>
+<tr>
+<td>深度/视频投影头</td>
+<td><code>lingbot-vla-v2/lingbotvla/models/vla/vision_models/align_heads/</code></td>
+</tr>
+<tr>
+<td>教师构建与 target 生成</td>
+<td><code>lingbot-vla-v2/lingbotvla/models/vla/vision_models/module_utils.py</code></td>
+</tr>
+<tr>
+<td>DINO-Video 教师封装</td>
+<td><code>lingbot-vla-v2/lingbotvla/models/vla/vision_models/dino_video/teacher.py</code></td>
+</tr>
+<tr>
+<td>数据字段映射、补齐和反变换</td>
+<td><code>lingbot-vla-v2/lingbotvla/data/vla_data/utils.py</code></td>
+</tr>
+<tr>
+<td>归一化与图像处理</td>
+<td><code>lingbot-vla-v2/lingbotvla/data/vla_data/transform.py</code></td>
+</tr>
+<tr>
+<td>训练主循环</td>
+<td><code>lingbot-vla-v2/tasks/vla/train_lingbotvla.py</code></td>
+</tr>
+<tr>
+<td>部署和动作块执行</td>
+<td><code>lingbot-vla-v2/deploy/lingbot_vla_v2_policy.py</code></td>
+</tr>
+<tr>
+<td>公开真实机器人配置</td>
+<td><code>lingbot-vla-v2/configs/vla/real_robot/real_robot.yaml</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="10-常见问题">10. 常见问题</h2>
+<h3 id="q1未来查询在推理时从哪里得到未来信息">Q1：未来查询在推理时从哪里得到未来信息？</h3>
+<p>得不到真实未来帧。它只读取当前图像和语言，并依靠训练时的未来教师监督学会预测。推理时未来帧不存在，也不会运行教师。</p>
+<h3 id="q2既然动作分支被禁止读取未来查询未来蒸馏怎样帮助动作">Q2：既然动作分支被禁止读取未来查询，未来蒸馏怎样帮助动作？</h3>
+<p>它通过共享 VLM 和逐层联合注意力的训练梯度改善底层表征，让主干从当前观察中提取更具预测性的特征；当前查询仍可直接为动作提供感知信息。屏蔽未来查询是为了避免辅助分支成为动作的捷径。</p>
+<h3 id="q3moe-专家是否等于一种机器人一个专家">Q3：MoE 专家是否等于“一种机器人一个专家”？</h3>
+<p>不是。路由粒度是 token，且没有本体专家标签。一个序列中的不同动作时刻可以选不同专家，同一专家也可以服务多个本体。</p>
+<h3 id="q455-维中的-padding-会不会学出随机动作">Q4：55 维中的 padding 会不会学出随机动作？</h3>
+<p>模型可能在 padding 位置产生数值，但训练 loss 用 joint mask 忽略这些维度，部署反映射也不会把它们发给机器人。</p>
+<h3 id="q5为什么同时保留关节和末端位姿槽位">Q5：为什么同时保留关节和末端位姿槽位？</h3>
+<p>不同数据源和任务的最佳控制空间不同。统一表示允许某个本体使用关节、另一个使用末端，或按配置组合；未使用字段由 mask 关闭。</p>
+<h3 id="q6为什么预测整个动作块而不是下一步">Q6：为什么预测整个动作块而不是下一步？</h3>
+<p>动作块能表达时间连贯性，减少逐步调用开销，并让未来预测 horizon 与控制 horizon 对齐。部署仍可只执行前几步以保持闭环。</p>
+<h3 id="q7l1-和-l2-到底选哪个">Q7：L1 和 L2 到底选哪个？</h3>
+<p>论文消融总体偏向 L2，公开后训练配置使用 L1。小而密集的精确修正通常适合 L2；接触冲击和长尾动作可能适合 L1。应按目标数据验证，而不是把任一配置当成普遍结论。</p>
+<h3 id="q8dino-video-自己怎样训练">Q8：DINO-Video 自己怎样训练？</h3>
+<p>它从 DINOv3 初始化，加入因果时间注意力和 3D-RoPE，在 500 万混合视频片段上用视频版 DINO/iBOT 自蒸馏目标训练。VLA 训练时它已经冻结，只提供特征 target。</p>
+<hr>
+<h2 id="11-最小记忆版">11. 最小记忆版</h2>
+<div class="mermaid">mindmap
+  root((LingBot-VLA 2.0))
+    数据
+      50k 小时机器人
+      10k 小时第一视角人类
+      自动任务/子任务标注
+      严格轨迹与视频质检
+    表示
+      55 维全身状态动作
+      缺失维度补零加 mask
+      本体级归一化
+      可选绝对或相对动作
+    模型
+      Qwen3-VL 理解专家
+      36 层动作专家
+      每层联合注意力
+      32 专家 Top-4 MoE
+    辅助监督
+      当前和未来查询
+      LingBot-Depth 几何
+      DINO-Video 时序语义
+    生成
+      Flow Matching
+      动作块 H 默认 50
+      10 步 Euler 去噪
+      KV Cache 加速
+    部署
+      逆归一化与字段反映射
+      整块返回或执行前 k 步
+      新观察后重规划
+</div><p>最终只需记住这条主线：</p>
+<blockquote>
+<p><strong>异构轨迹先统一成 55 维动作语言；Qwen3-VL 理解图像和指令；MoE 动作专家用 Flow Matching 生成动作块；当前/未来的深度与视频蒸馏让共享表征同时具备几何感知和预测能力；部署端再把统一动作翻译回具体机器人并闭环执行。</strong></p>
+</blockquote>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/sxq-blog/" target="_blank">S-X-Q</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/sxq-blog/p/21814155" target="_blank">https://www.cnblogs.com/sxq-blog/p/21814155</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-23 10:24">2026-07-23 10:23</span>&nbsp;
+<a href="https://www.cnblogs.com/sxq-blog">S-X-Q</a>&nbsp;
+阅读(<span id="post_view_count">44</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21814155);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsxq-blog%2Fp%2F21814155&amp;targetId=21814155&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

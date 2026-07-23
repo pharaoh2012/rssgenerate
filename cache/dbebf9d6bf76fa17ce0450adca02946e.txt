@@ -1,0 +1,209 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xianxh/p/21822213" title="发布于 2026-07-23 12:30">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">从单向流到双向 RPC：Agent 通信协议的范式分叉与 ACP 协议实战拆解</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        Agent 生态存在两种通信范式：单向流（Claude Code 等，spawn 进程、stdout 流式吐 JSONL）与双向 RPC（Hermes/ACP，长驻 JSON-RPC server、Agent 主动推 notification）。作者主张在传输层分叉而非解析层打补丁，拆解 ACP 四方法，分享"协议探测"方法论（schema≠行为）与长驻 Agent 可靠性工程，强调不变式优先于过度抽象。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>把一个长驻型 AI Agent 接入了自己的桌面应用，过程中发现<strong>当前 Agent 生态里存在两种根本不同的通信范式</strong>，而大多数文章只讲 Agent 的 Prompt 工程、Context 工程，几乎没人系统讲过传输层。这篇就来填这个坑。</p>
+</blockquote>
+<h2 id="一agent-不只是一问一答">一、Agent 不只是"一问一答"</h2>
+<p>大多数人对 AI Agent 的认知停留在一个画面：打开对话框，输入问题，等回答，结束。</p>
+<p>但 2026 年的 Agent 早就不是这样了。Claude Code 能自主跑完一个完整的代码重构任务；OpenClaw 能 7×24 小时挂在服务器上帮你盯邮件、跑定时任务；Nous Research 的 Hermes Agent 更进一步——它是个"自进化"Agent，运行时间越长，能力越强（关于 Hermes 的自进化机制，我们之前写过一篇五万字的源码级拆解，这里不展开）。</p>
+<p>这些 Agent 有一个共同特征：<strong>它们不是一问一答的</strong>。它们有会话、有状态、有多轮交互、有主动推送。</p>
+<p>问题来了：如果你的应用（IDE 插件、桌面客户端、CLI 工具）想接入这些 Agent，<strong>你怎么跟它通信？</strong></p>
+<p>这不是一个"调个 API"就能回答的问题。我们实际接入了五个不同的 AI Agent 运行时，发现它们的通信模型存在一个根本性的分叉——而这个分叉，决定了你整个集成架构的走向。</p>
+<h2 id="二两种传输范式不止接口差异更是架构区别">二、两种传输范式：不止接口差异，更是架构区别</h2>
+<h3 id="范式-a单向流unidirectional-stream">范式 A：单向流（Unidirectional Stream）</h3>
+<p>我们接入的前四个 Agent——Claude Code、Codex、Qwen Code、Gemini CLI——进程模型惊人地一致：</p>
+<pre><code>spawn 进程 → stdin 投 prompt → stdout 流式吐 JSONL → 干完活进程退出
+</code></pre>
+<p>多轮对话怎么办？两条路：要么每轮重新 spawn 一个进程；要么用类似 Claude Code 的 <code>stream-json</code> 模式，让进程别退出，继续往 stdin 写下一轮 prompt。</p>
+<p>这种模型的特征是：<strong>数据只往一个方向流</strong>。Client 往 stdin 写，Agent 往 stdout 吐，没有 Agent 主动向 Client 发起调用的概念。所有输出都是"流"——一串 newline-delimited 的 JSON 事件，Client 逐行解析。</p>
+<p>我们内部把解析入口叫 <code>selectParser</code>——根据 Agent 类型分发到不同的 stream handler，逻辑闭合，四个 Agent 共用一套管线，干净利落。</p>
+<h3 id="范式-b双向-rpcbidirectional-json-rpc">范式 B：双向 RPC（Bidirectional JSON-RPC）</h3>
+<p>然后 Hermes 来了。</p>
+<p>Hermes 的进程模型完全不同：<strong>它是一个长驻的 JSON-RPC server</strong>。你 spawn 它之后，进程不退出。多轮对话不是"继续往 stdin 写一段文本"，而是发一个 JSON-RPC request（<code>session/prompt</code>），等一个 response。更关键的是——<strong>Agent 会主动向 Client 推送事件</strong>（<code>session/update</code> notification），不需要 Client 先问。</p>
+<pre><code>spawn 进程（长驻）
+  → Client 发 initialize request，Agent 回 response
+  → Client 发 session/new request，Agent 回 response（带 sessionId）
+  → Client 发 session/prompt request
+      ← Agent 推送 session/update notification（文本 chunk、工具进度……）
+      ← Agent 推送更多 notification……
+  → Agent 回 session/prompt response（带 stopReason，turn 结束）
+  → 下一轮……
+</code></pre>
+<p>看出区别了吗？这不是"接口格式不同"——JSON 还是 JSONL，字段名不一样——这是<strong>两种根本不同的两种架构</strong>：</p>
+<p><img alt="架构图" loading="lazy" data-src="https://img2024.cnblogs.com/blog/658083/202607/658083-20260723122831134-1574511791.png" class="lazyload"></p>
+<p><strong>硬把这两种范式塞进同一套抽象，会非常拧巴。</strong></p>
+<p>单向流的核心操作是"解析"——读 stdout，切行，反序列化，分发事件。双向 RPC 的核心操作是"请求-响应配对 + 事件订阅"——写 stdin 发 request，按 <code>id</code> 字段匹配 response，同时处理 Agent 主动推来的 notification。</p>
+<p>我们的做法是：<strong>在传输层分叉，而不是在解析层打补丁</strong>。新建一个专门处理双向 RPC 的传输层抽象，和原有的单向流解析管线并行存在，互不干扰。分叉的依据是一个字段——<code>transport: 'acp-jsonrpc'</code>——数据驱动，配置里标了走 RPC，没标的走原来的流解析。</p>
+<p>最终浓缩成一句不变式：<strong>1 次用户会话 = 1 个 RPC session = 1 个 Agent 进程</strong>。</p>
+<p>这句话不是架构层，是注释。但它钉死了所有实现决策。</p>
+<h3 id="turn-边界一个意外的简化">Turn 边界：一个意外的简化</h3>
+<p>单向流模式下判断"一轮对话结束了"其实挺脆的。以 Claude Code 的 stream-json 为例，你得在事件流里找 <code>type: 'result'</code> + <code>stop_reason</code>，如果流格式稍有变化，判断逻辑就得跟着改。</p>
+<p>双向 RPC 天然解决了这个问题：<code>session/prompt</code> 是一个 request——<strong>这个 request 的 Promise resolve 的那一刻，就是 turn 结束的那一刻</strong>。<code>stopReason</code> 直接在 response payload 里。在 await 期间，Agent 通过 <code>session/update</code> 推送的所有中间事件（文本 chunk、工具调用进度），走另一条路径流入事件管线。</p>
+<p>request/response 边界就是 turn 边界。不需要推断，不需要在流里找 pattern。这种"结构天然携带语义"的感觉，做过流式解析的人都懂有多爽。</p>
+<h2 id="三acp-协议拆解四个方法一个生态">三、ACP 协议拆解：四个方法、一个生态</h2>
+<p>Hermes 之所以能被干净地接入，不是因为它自己发明了一套私有协议，而是因为它实现了一个正在成形的标准——<strong>ACP（Agent Client Protocol）</strong>。</p>
+<h3 id="acp-是什么">ACP 是什么</h3>
+<p>ACP 是 <a href="https://zed.dev" target="_blank" rel="noopener nofollow">Zed</a> 编辑器团队主推的 Agent 通信协议。本质是 <strong>JSON-RPC 2.0 over stdio</strong>，newline-delimited 帧。设计目标很明确：让外部客户端（IDE、桌面应用、CLI wrapper）用<strong>统一协议</strong>接入任意兼容的 AI Agent，不必为每个 Agent 单独写解析器。</p>
+<p>注意和 MCP 的区别：<strong>MCP（Model Context Protocol）是 Agent 调工具的协议</strong>（Agent→Tool），<strong>ACP 是 Client 调 Agent 的协议</strong>（Client→Agent）。两者正交互补——一个 Agent 可以同时是 ACP 的 server（对外提供会话能力）和 MCP 的 client（对内调用工具）。</p>
+<h3 id="四个核心方法">四个核心方法</h3>
+<p>ACP 的核心交互就四个方法，两个 request、一个 notification、一个握手：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>类型</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>initialize</code></td>
+<td>request</td>
+<td>Client→Agent</td>
+<td>握手。必须传 <code>protocolVersion</code>，协商能力</td>
+</tr>
+<tr>
+<td><code>session/new</code></td>
+<td>request</td>
+<td>Client→Agent</td>
+<td>创建会话。Agent 返回 <code>sessionId</code> + 可用模型列表</td>
+</tr>
+<tr>
+<td><code>session/prompt</code></td>
+<td>request</td>
+<td>Client→Agent</td>
+<td>发一轮对话。Agent 处理完后回 response，带 <code>stopReason</code></td>
+</tr>
+<tr>
+<td><code>session/update</code></td>
+<td>notification</td>
+<td>Agent→Client</td>
+<td>Agent 主动推送的事件：文本 chunk、工具调用进度、状态变更等</td>
+</tr>
+</tbody>
+</table>
+<p>一个完整的单轮交互时序：</p>
+<p><img alt="时序图" loading="lazy" data-src="https://img2024.cnblogs.com/blog/658083/202607/658083-20260723122918214-1277409141.png" class="lazyload"></p>
+<p>几个设计细节值得注意：</p>
+<ul>
+<li><strong>stdout 只跑 RPC，日志全走 stderr</strong>。这是 Client 能干净切帧的前提——不会有一行日志混进 JSON-RPC 帧流里。</li>
+<li><strong><code>session/update</code> 是 notification，不是 request</strong>。Agent 推完不等回复，Client 只负责消费。这意味着 Client 不能通过 notification 做流控——如果 Agent 推得太快，Client 得自己缓冲。</li>
+<li><strong><code>sessionId</code> 由 Agent 生成</strong>。Client 在 <code>session/new</code> 里不传 sessionId，Agent 分配一个 UUID 回来。这是一个容易被忽略的设计决策——它意味着 Client 不能"恢复"一个旧 session，session 的生命周期完全由 Agent 控制。</li>
+</ul>
+<h3 id="为什么-acp-值得关注生态化">为什么 ACP 值得关注——生态化</h3>
+<p>ACP 目前还不像 MCP 那样人尽皆知，但它解决的问题是真实的：<strong>Agent 生态正在碎片化</strong>。每出一个新 Agent，IDE 和桌面应用就得写一套新的解析器。Claude Code 一套、Codex 一套、Gemini CLI 一套、OpenClaw 一套——我们接了五个 Agent，前四个的解析逻辑大同小异但就是不能复用，因为帧格式、事件类型、turn 边界判断全不一样。</p>
+<p>ACP 试图终结这种碎片化。如果 Agent 都实现 ACP，那 Client 只需要写一次传输层，新接一个 Agent 就是加一条配置的事。Hermes 是目前实现 ACP 最完整的开源 Agent 之一——它的 <code>acp_adapter/</code> 目录专门把 TUI 逻辑剥离，暴露一个无 TUI 的 JSON-RPC server 入口 <code>hermes-acp</code>。<strong>这就是给外部客户端准备的官方接入点</strong>。</p>
+<p>我们这次接入，相当于提前验证了 ACP 传输层的可行性。以后再接其他 ACP 兼容的 Agent，传输层零改动，只写一个几十行的运行时配置。</p>
+<h2 id="四协议探测方法论schema-不等于行为">四、协议探测方法论：schema 不等于行为</h2>
+<p>这一节是实操部分，也是我们认为最有普适价值的部分。</p>
+<h3 id="一个教训">一个教训</h3>
+<p>设计阶段，我们读了 ACP 的协议文档和 Hermes 的 schema 源码，列了一堆"应该是这样"的假设。然后写了个探测脚本，本地 spawn <code>hermes-acp</code>，做真实 RPC 往返。</p>
+<p>结果：<strong>一半的假设是错的</strong>。</p>
+<h3 id="六条实测发现">六条实测发现</h3>
+<p>以下是光看 schema / 文档<strong>看不出来</strong>，必须真实跑一遍才知道的细节：</p>
+<p><strong>1. <code>initialize</code> 必须传 <code>protocolVersion: 1</code></strong></p>
+<p>schema 里这个字段标的是 optional。不传？直接 <code>-32602 Invalid params</code>，连接建立失败。</p>
+<p><strong>2. <code>session/new</code> 的 <code>mcpServers</code> 是 list，不是 object</strong></p>
+<p>传 <code>{}</code> 报 <code>list_type</code> 校验错。必须传 <code>[]</code>。一个空花括号和一个空方括号的距离，就是"能跑"和"不能跑"的距离。</p>
+<p><strong>3. <code>sessionId</code> 由 Agent 生成</strong></p>
+<p>我们最初以为 Client 可以指定 sessionId（很多 RPC 协议都这样）。不是。Client 在 <code>session/new</code> 里不传 sessionId，Agent 在 response 里返回一个 UUID。Client 必须持有这个 UUID，后续所有 <code>session/prompt</code> 都带着它。</p>
+<p><strong>4. <code>session/new</code> 是慢调用</strong></p>
+<p>3.5 秒以上。因为 Agent 要在这个调用里加载 51 个内置插件、连接 LLM provider。如果你用 <code>initialize</code> 的超时来套 <code>session/new</code>，大概率超时失败。<strong>不同的 RPC 方法需要不同的超时策略</strong>——这种信息在 schema 里永远不会出现。</p>
+<p><strong>5. 未知 sessionId 不报 error，返回 <code>stopReason: 'refusal'</code></strong></p>
+<p>用不存在的 sessionId 调 <code>session/prompt</code>，Agent 不返回 JSON-RPC error（你预期的 <code>-32602</code> 或自定义 error code），而是正常返回一个 response，<code>stopReason</code> 是 <code>'refusal'</code>。</p>
+<p>这意味着什么？<strong>Client 不能只靠 RPC error 兜底</strong>。你必须自己保证 sessionId 的持有和传递是正确的，并且在业务层检查 <code>stopReason</code>。如果你只 catch RPC error，这种"静默拒绝"会让你以为 Agent 回了个空消息。</p>
+<p><strong>6. <code>session/new</code> 的 response 自带模型列表</strong></p>
+<p><code>models.availableModels</code>（20+ 个模型）+ <code>currentModelId</code>，直接在 response 里。这意味着 Client 可以在第一次会话建立后就拿到真实可用模型列表，动态填充 UI，而不是维护一份静态的模型下拉框。</p>
+<h3 id="抽象成方法论">抽象成方法论</h3>
+<p>这六条发现背后是一条通用原则：</p>
+<blockquote>
+<p><strong>Schema 告诉你"可以传什么"，不告诉你"必须传什么"、"实际会怎样"、"多快会回"。协议的行为边界，只有真实往返才能确认。</strong></p>
+</blockquote>
+<p>我们把这个过程叫<strong>协议探测（Protocol Probing）</strong>，步骤很简单：</p>
+<ol>
+<li><strong>写一个独立的探测脚本</strong>（不是正式代码），spawn 目标 Agent 进程</li>
+<li><strong>逐方法做真实 RPC 往返</strong>：<code>initialize</code> → <code>session/new</code> → <code>session/prompt</code>，每步打印完整的 request 和 response</li>
+<li><strong>故意传错参数</strong>：缺字段、类型错、值非法——记录 Agent 的实际反应（是 RPC error？是静默忽略？是业务层拒绝？）</li>
+<li><strong>测边界</strong>：超时行为、大 payload、并发调用、进程中途退出</li>
+<li><strong>把实测结论写进设计文档</strong>，标注"schema 说的 vs 实际跑的"</li>
+</ol>
+<p>这套方法不只适用于 ACP。MCP、LSP、任何 JSON-RPC / JSON-over-stdio 协议，都适用。<strong>读十遍 schema，不如跑一遍往返。</strong></p>
+<h2 id="五长驻-agent-的可靠性工程">五、长驻 Agent 的可靠性工程</h2>
+<p>单向流模型下，Agent 干完活就退出，可靠性问题相对简单——进程退了，这轮就结束了。</p>
+<p>长驻 Agent 完全不同。进程一直活着，意味着你要处理一系列单向流模型下不存在的可靠性问题。以下是我们实际踩过的几个：</p>
+<h3 id="51-超时策略基于活动而非绝对时间">5.1 超时策略：基于活动，而非绝对时间</h3>
+<p>我们最初给 Agent 进程设了 60 秒 idle timeout——60 秒没有 stdout 输出就判定进程挂了，杀掉。</p>
+<p>然后 Hermes 跑了一次 OCR。OCR 是 Agent 调的一个子工具，作为 subprocess 运行，输出走的是子进程自己的 stdout/stderr——<strong>Hermes 主进程在工具执行期间零输出</strong>。50 页 OCR 要 2-3 分钟。60 秒一到，idle timer 直接把整个会话杀在半路。</p>
+<p>修法不是简单地把超时从 60 秒改成 5 分钟。更本质的修法是<strong>把超时基准从"绝对时间"换成"输出活动"</strong>：只要 Agent 还在产生输出（stdout 或 stderr），就重置计时器。冷启动慢（加载 51 个插件要 3.5 秒）？没关系，只要还在打日志就续命。真正该触发超时的，是"Agent 彻底沉默了 N 秒"——那才可能是挂了。</p>
+<p>这个模式我们叫 <strong>Activity-Driven Idle Timer</strong>，对所有需要管理长驻子进程的场景都适用。</p>
+<h3 id="52-进程退出的语义歧义">5.2 进程退出的语义歧义</h3>
+<p>单向流模型下，进程退出码 0 = 成功，非 0 = 失败，简单明了。</p>
+<p>长驻 Agent 不是这样。如果有 prompt 正在 in-flight（request 发出去了，response 还没回来），这时进程退出了——哪怕退出码是 0——也意味着那个 prompt 永远不会被处理。<strong>退出码 0 不等于任务成功。</strong></p>
+<p>我们的处理是在 close handler 里加一层检查：有没有 pending 的 RPC request？有没有被用户取消的 session？有 pending → 标记 failed；被取消 → 标记 canceled；都没有 → 才看退出码。</p>
+<h3 id="53-stderr-噪声风暴">5.3 stderr 噪声风暴</h3>
+<p>长驻进程的 stderr 是个被严重低估的问题。Hermes 的 stderr 会持续刷大量 <code>INFO</code> / <code>WARNING</code> / <code>DEBUG</code> 日志——插件注册、provider 连接、MCP 工具发现、健康检查……正常运行时也在刷。</p>
+<p>如果我们把所有 stderr 都当成 error 事件抛给 UI，用户会看到满屏的"错误"日志，实际上系统运行完全正常。</p>
+<p>修法是给 stderr 做<strong>分级过滤</strong>：行首匹配<br>
+<code>^\d{4}-\d{2}-\d{2}-\d{2}:\d{2}:\d{2}[(INFO|WARNING|DEBUG)\]</code></p>
+<p>的，丢弃；只保留 <code>[ERROR]</code> 级别和 Python traceback。</p>
+<p>这个问题的本质是：<strong>长驻进程的"正常噪声"和"真正错误"混在同一个 fd 里</strong>，你必须自己做信噪分离。单向流模型下进程活不过几秒，这个问题根本不会暴露。</p>
+<h3 id="54-子-agent-的隔离边界">5.4 子 Agent 的隔离边界</h3>
+<p>Hermes 支持子 Agent 并行执行——主 Agent 可以 fork 出子 Agent 同时跑多个任务。但子 Agent 有严格的隔离约束：不能再创建子 Agent（防递归爆炸），不能反向询问主 Agent（单向线性并行）。</p>
+<p>对宿主应用来说，这意味着你收到的 <code>session/update</code> 事件流里，可能交错着主 Agent 和多个子 Agent 的输出。你需要在事件里携带 Agent 层级信息，否则 UI 会把子 Agent 的工具调用进度和主 Agent 的文本输出混在一起。</p>
+<h2 id="六工程哲学不变式优先于抽象">六、工程哲学：不变式优先于抽象</h2>
+<p>最后聊一个工程决策上的取舍。</p>
+<p>做这种"新范式接入"时，最自然的冲动是"建一个大的抽象层"——统一事件类型、统一进程管理、统一健康检查、统一多协议路由。AI code review 也特别爱建议这些："你应该加一个 NormalizedAgentEvent 类型"、"你需要一个 ProcessManager 做 health check 和 zombie cleanup"、"考虑一下 multi-protocol runtime mesh"。</p>
+<p>我们回推了大部分。</p>
+<p>理由很简单：<strong>Phase 1 只有一种双向 RPC Agent。</strong> 为一种实现建抽象层，不叫架构设计，叫过度设计。</p>
+<p>我们选择的做法是：</p>
+<ul>
+<li><strong>不新建事件类型</strong>。已有的事件管线够用，加几个 variant 就行。</li>
+<li><strong>不建进程管理器</strong>。<code>child.on('exit')</code> + 已有的 shutdown 钩子，够了。</li>
+<li><strong>不做 framing 探测器</strong>。已经验证了就是 newline-delimited JSON，不需要"自动嗅探帧格式"。加一个 smoke test 就行。</li>
+<li><strong>不建"状态一致性层"</strong>。不变式就一句话——1 次会话 = 1 个 session = 1 个进程——这是注释，不是架构。</li>
+</ul>
+<p><strong>先把不变式实现到极致，等真正出现第二个 ACP Agent、或者多 session 共享进程的需求时，再抽象。</strong></p>
+<p>很多人会说你这不是在偷懒嘛。这可真不是，这是在"建错了拆掉"和"等需求来了再建"之间，选择后者。前者是确定性浪费，后者是概率性投入。</p>
+<h2 id="七结语传输层是-agent-生态的下一个瓶颈">七、结语：传输层是 Agent 生态的下一个瓶颈</h2>
+<p>Agent 领域过去两年的注意力几乎全在模型侧——更大的上下文窗口、更好的工具调用、更强的推理能力。Prompt Engineering、Context Engineering，最近是Loop Engineering, 诸如此类的文章汗牛充栋。</p>
+<p>但当你真的要把多个 Agent 接进一个应用，你会发现<strong>传输层才是真正的瓶颈</strong>。每个 Agent 一套帧格式、一套事件语义、一套 turn 边界判断、一套错误处理——这些"管道"层面的差异，消耗的工程精力远超预期。</p>
+<p>ACP 是这个方向上第一个认真尝试标准化的协议。它还很年轻，实现者还不多，但方向是对的：<strong>把 Agent 的能力通过标准协议暴露出来，让 Client 只写一次传输层</strong>。</p>
+<p>Hermes 的自进化能力（Skill 动态生成 + RL 训练闭环）让它成为一个独特的 Agent——关于这部分的技术拆解，可以读我们之前的<a href="./%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%20Hermes%20Agent%20%E5%A6%82%E4%BD%95%E5%AE%9E%E7%8E%B0%22%E8%87%AA%E8%BF%9B%E5%8C%96%22%E5%8F%8A%E5%85%B6%20Prompt%20%20Context%20%20Harness%20%E7%9A%84%E8%AE%BE%E8%AE%A1%E5%AE%9E%E8%B7%B5.md" target="_blank" rel="noopener nofollow">深度解析文章</a>。但今天这篇想说的不是 Hermes 有多强，而是一个更基础的工程判断：</p>
+<p><strong>从"自主"到"自进化"，不只是 Agent 内部的事。宿主应用的传输层，也得跟着进化。</strong></p>
+<p>单向流的时代，我们写解析器。双向 RPC 的时代，我们写传输层。下一个时代是什么？也许是 Agent 之间的通信协议——Agent 调 Agent，不再是主从 fork，而是对等协商。但那是另一个故事了。</p>
+<hr>
+<p><em>本文由Molio生成发布。想了解文中的真实的 Agent 集成工程实践，欢迎github关注zhuzhaoyun获取。技术咨询与合作，可以添加微信：Damondut</em></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-23 12:30">2026-07-23 12:30</span>&nbsp;
+<a href="https://www.cnblogs.com/xianxh">AI闲人</a>&nbsp;
+阅读(<span id="post_view_count">29</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21822213);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxianxh%2Fp%2F21822213&amp;targetId=21822213&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
