@@ -1,0 +1,143 @@
+
+    <a name="top"></a>
+    <h2><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zengzuo613/p/21858822" title="发布于 2026-07-24 09:01">
+    
+
+    <span role="heading" aria-level="2">MySQL 事务隔离 - 从设计由来到解决方案</span>
+    
+
+</a>
+</h2>
+    <small>
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-24 09:01">2026-07-24 09:01</span>&nbsp;
+<a href="https://www.cnblogs.com/zengzuo613">曾左</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21858822);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzengzuo613%2Fp%2F21858822&amp;targetId=21858822&amp;targetType=0" target="_blank">举报</a>
+</small>
+    <div class="entry">
+        <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>在并发场景下，数据库要同时处理成百上千个事务。如果放任它们随意交错执行，就会出现各种数据不一致的问题：你读到的余额可能是别人还没提交、随后又撤销的"假数据"；同一行记录前后两次查询的结果对不上；甚至按同样条件查两次，行数都变了。为了解决这些问题，数据库定义了事务的"隔离级别"，在 MySQL 中，则通过 MVCC、行锁、间隙锁等机制来实现不同级别的事务隔离。本文就从脏读、不可重复读、幻读这三种经典并发问题入手，讲清楚 MySQL（InnoDB）是如何一级一级把它们解决掉的。</p>
+<h2 id="一三种问题">一、三种问题</h2>
+<p>在并发场景下，数据操作可能会遇到如下三类问题：</p>
+<h3 id="1-脏读dirty-read-读到了别人没提交的数据">1. 脏读（Dirty Read）—— 读到了别人没提交的数据</h3>
+<p>事务 A 读到了事务 B 修改了但还没提交的数据，结果 B 又回滚了，那 A 读到的就是一笔"根本不存在"的脏数据。</p>
+<p>举例：B 把你的余额从 100 改成 1000（未提交），A 这时读到 1000，然后 B 回滚了，A 拿着这个 1000 去做后续计算，全错了。</p>
+<img width="800" alt="img" data-src="https://img2024.cnblogs.com/blog/2292062/202607/2292062-20260724085814497-1525180444.png" class="lazyload">
+<h3 id="2-不可重复读non-repeatable-read-同一行前后读到的值不一样">2. 不可重复读（Non-Repeatable Read）—— 同一行，前后读到的值不一样</h3>
+<p>事务 A 同一笔数据读了两次，两次之间事务 B 修改并提交了这行，导致 A 两次读到的结果对不上。重点是 update，针对的是"同一行数据被改了"。</p>
+<p>举例：A 第一次查余额是 100，中间 B 把它改成 50 并提交，A 第二次再查变成了 50。在 A 这一个事务里，同一个值却变了，不可重复。</p>
+<img width="800" alt="img" data-src="https://img2024.cnblogs.com/blog/2292062/202607/2292062-20260724090041039-1366629290.png" class="lazyload">
+<h3 id="3-幻读phantom-read-同样的查询条件前后读到的行数不一样">3. 幻读（Phantom Read）—— 同样的查询条件，前后读到的行数不一样</h3>
+<p>事务 A 用同样的条件查询了两次，两次之间事务 B 插入或删除了符合条件的行并提交，导致 A 第二次查询多出来或少掉了一些"幻影"行。重点是 insert/delete，针对的是"行的数量变了"。</p>
+<p>举例：A 查"余额 &gt; 100 的账户"，第一次返回 5 条；中间 B 新增了一个余额 200 的账户并提交；A 再查同样的条件，变成了 6 条，凭空多出一行。</p>
+<img width="800" alt="img" data-src="https://img2024.cnblogs.com/blog/2292062/202607/2292062-20260724085853971-857685468.png" class="lazyload">
+<p>不可重复读 vs 幻读的核心区别：</p>
+<p>（1）不可重复读关注的是某一行的内容变了（update 造成）。</p>
+<p>（2）幻读关注的是满足条件的行数变了（insert/delete 造成）。</p>
+<h2 id="二解决方案">二、解决方案</h2>
+<p>针对上述并发时遇到的三大问题，MySQL 主要通过锁和 MVCC 来解决。</p>
+<h3 id="1-关键技术-mvcc">1. 关键技术 MVCC</h3>
+<p>MVCC（Multi-Version Concurrency Control，多版本并发控制）是 InnoDB 实现高并发的核心机制。它的核心思想一句话概括就是：读不加锁，写不阻塞读，通过给数据保存多个历史版本，让读操作直接读某个时间点的"快照"，而不必等待写操作释放锁。该机制包含以下三个模块：</p>
+<p>（1）隐藏字段。InnoDB 给每行偷偷加了两个字段：trx_id（最后修改这行的事务 ID）和 roll_pointer（回滚指针，指向上一个历史版本）。</p>
+<p>（2）undo log 版本链。每次修改一行，旧值不会被直接覆盖，而是存进 undo log，新记录的 roll_pointer 指向旧记录。这样一行数据就形成了一条从新到旧的版本链。</p>
+<p>（3）Read View（一致性视图，通常简称为快照）。事务发起快照读时，会生成一个 Read View，里面记录了当前哪些事务还活跃、哪些已提交。读的时候沿版本链从新往旧找，拿每个版本的 trx_id 去和 Read View 比对，找到第一个对自己可见的版本就停下。所谓"可见"，大致规则是：这个版本是视图创建前就已提交的才可见；如果是未提交的、或视图创建后才开启的事务改的，就跳过，继续往下找老版本。</p>
+<p>执行过程：</p>
+<img width="800" alt="img" data-src="https://img2024.cnblogs.com/blog/2292062/202607/2292062-20260724085925060-989081612.png" class="lazyload">
+<h2 id="三具体办法">三、具体办法</h2>
+<h3 id="1-解决脏读读级-mvcc-快照和写加排他锁">1. 解决脏读：读级 MVCC 快照和写加排他锁</h3>
+<p>脏读的根源是"读到了未提交的修改"。解决办法很直接：</p>
+<p>（1）读级 MVCC 快照：每次 SELECT 都重新生成一个读级 MVCC 快照，只能看到已提交版本，所以读不到未提交的修改。</p>
+<p>（2）写加排他锁：写操作（update/delete/insert）会加排他锁（X 锁），在事务提交或回滚前一直持有，别的事务无法读到这个未提交的中间状态，解决写写冲突（丢失更新），保证修改的正确性。</p>
+<p>MySQL 的 READ COMMITTED（读已提交）事务隔离级别通过上述机制避免了脏读。</p>
+<h3 id="2-解决不可重复读事务级-mvcc-快照">2. 解决不可重复读：事务级 MVCC 快照</h3>
+<p>要保证"同一行两次读到的值一致"，有两条路：一是对读到的行加共享锁并持有到事务结束，二是用事务级 MVCC 快照。InnoDB 默认使用后者，因为它读不加锁，并发性能更好，具体做法为：事务第一次快照读时确定一个版本，整个事务都读这个版本，B 改了也看不到，根本不用加锁。</p>
+<h3 id="3-解决幻读next-key-lock">3. 解决幻读：Next-Key Lock</h3>
+<p>幻读是最麻烦的，因为新插入的行事先根本锁不住。光靠行锁锁住已有的行没用，必须把"满足条件的范围区间"整个锁起来。</p>
+<p>InnoDB 的解决办法是 Next-Key Lock，它等于行锁（Record Lock）加间隙锁（Gap Lock）：</p>
+<p>（1）行锁锁住已存在的记录本身。</p>
+<p>（2）间隙锁锁住记录之间的"间隙"，阻止别的事务往这个区间里插入新行。</p>
+<h3 id="4-小结">4. 小结</h3>
+<p>MySQL 通过以下机制解决上述三个问题：</p>
+<p>（1）读级 MVCC 快照和写加排他锁防脏读：读只依赖于 MVCC 快照，保证读一致性；写操作加锁，保证写的正确性。</p>
+<p>（2）事务级 MVCC 快照防不可重复读：事务级一致性视图，保证同一行多次读一致。</p>
+<p>（3）Next-Key Lock 防幻读：锁住范围区间，阻止新行插入。</p>
+<h2 id="四事务隔离级别">四、事务隔离级别</h2>
+<p>针对上述三大问题及其解决方案，MySQL 数据库提供了一种快速配置的机制，即设置事务隔离级别。</p>
+<img width="800" alt="img" data-src="https://img2024.cnblogs.com/blog/2292062/202607/2292062-20260724085950427-1745280879.png" class="lazyload">
+<h3 id="1-隔离级别">1. 隔离级别</h3>
+<table>
+<thead>
+<tr>
+<th>隔离级别</th>
+<th>关键点</th>
+<th>脏读</th>
+<th>不可重复读</th>
+<th>幻读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>READ UNCOMMITTED（读未提交）</td>
+<td>不生成 MVCC 快照</td>
+<td>可能</td>
+<td>可能</td>
+<td>可能</td>
+</tr>
+<tr>
+<td>READ COMMITTED（读已提交）</td>
+<td>X 锁和读级 MVCC 快照</td>
+<td>不会</td>
+<td>可能</td>
+<td>可能</td>
+</tr>
+<tr>
+<td>REPEATABLE READ（可重复读）</td>
+<td>事务级 MVCC 快照 和 Next-Key Lock</td>
+<td>不会</td>
+<td>不会</td>
+<td>InnoDB 下基本不会</td>
+</tr>
+<tr>
+<td>SERIALIZABLE（串行化）</td>
+<td>读操作 S 锁</td>
+<td>不会</td>
+<td>不会</td>
+<td>不会</td>
+</tr>
+</tbody>
+</table>
+<p><strong>特别说明：</strong></p>
+<p>（1）MySQL（InnoDB 引擎）的默认事务隔离级别是 REPEATABLE READ（可重复读）。</p>
+<p>（2）READ COMMITTED 是每次 select 都重新生成一个读级快照，所以能读到别的事务最新提交的数据，这就导致了不可重复读。</p>
+<p>（3）REPEATABLE READ 是事务第一次快照读时生成一次事务级快照，整个事务复用，所以反复读都是同一个版本，天然可重复，不可重复读问题被消除。</p>
+<p>（4）隔离级别设置为 SERIALIZABLE 时，普通 select 都会加共享锁，事务被强制串行执行，三大问题全部消除。</p>
+<h3 id="2-相关配置">2. 相关配置</h3>
+<pre><code class="language-sql">-- 查看全局隔离级别
+SELECT @@global.transaction_isolation;
+
+-- 查看当前会话隔离级别
+SELECT @@transaction_isolation;       -- MySQL 5.7.20+
+SELECT @@tx_isolation;                -- MySQL 5.7.20 以下
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;   -- 修改当前会话隔离级别
+SET GLOBAL  TRANSACTION ISOLATION LEVEL READ COMMITTED;   -- 修改全局隔离级别
+</code></pre>
+<h3 id="3-其他说明">3. 其他说明</h3>
+<p>不少企业的内部规约里建议把 MySQL 改成 READ COMMITTED，主要原因是：</p>
+<p>（1）REPEATABLE READ 下的间隙锁会增加锁冲突，降低并发性能；</p>
+<p>（2）主从复制如果用 statement-based binlog，REPEATABLE READ 可以保证主从一致，但现在大家普遍用 row-based binlog，这个理由也不成立了；</p>
+<p>（3）Oracle、PostgreSQL 的默认级别都是 READ COMMITTED，团队迁移/混用时一致性更好。</p>
+
+
+</div>
+<div class="clear"></div>
+
+        <div class="clear"></div>
+        
+</div>
+    <ul class="postmetadata">
+        <vc:categories-tags blog-app="zengzuo613" blog-id="714768" post-id="21858822"></vc:categories-tags>
+    </ul>
