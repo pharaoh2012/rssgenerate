@@ -1,0 +1,418 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/12lisu/p/21882110" title="发布于 2026-07-24 15:44">
+    
+
+    <span role="heading" aria-level="2">抖音二面：如何设计一个高并发点赞系统？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>前几天有个小伙伴找我诉苦，说他在抖音二面被问到了一个场景题——“<strong>如何设计一个高并发点赞系统？</strong> ”</p>
+<p>他说他当时脑子一片空白，支支吾吾说了几句“用Redis”、“用消息队列”，然后就没然后了。</p>
+<p>这个问题其实是个经典的架构设计题。</p>
+<p><strong>面试官真正想考察的，不是你会不会用Redis，而是你面对一个高并发场景时，能不能跳出CRUD的思维定式，从整体架构的角度去思考问题</strong>。</p>
+<p>今天这篇文章专门跟大家一起聊聊这个话题，希望看完后，你也能跟面试官聊上半小时。</p>
+<p>更多项目实战在Java突击队网：susan.net.cn/project</p>
+<h2 id="一点赞系统的核心挑战是什么">一、点赞系统的核心挑战是什么？</h2>
+<blockquote>
+<p>有些小伙伴可能会说：“点赞不就是update一下数据库的计数吗？有什么难的？”</p>
+</blockquote>
+<p>如果你这么想，那说明你还没被高并发毒打过。</p>
+<p>想象一下这个场景：<strong>某个明星官宣恋情，瞬间几百万用户冲进来点赞</strong>。</p>
+<p>单条内容的点赞请求可能在几秒内冲到<strong>百万级QPS</strong>。</p>
+<p>后台数据库的连接池瞬间被打满，响应时间从毫秒级飙升到十几秒。</p>
+<p>每次点赞，你至少需要做三件事：</p>
+<ol>
+<li>查询当前用户是否已点赞（防止重复）</li>
+<li>更新帖子的点赞计数</li>
+<li>记录点赞关系</li>
+</ol>
+<p>在千万级并发下，<strong>大量的磁盘写入和行锁竞争</strong>会让数据库迅速成为瓶颈。</p>
+<p>这就是为什么高并发点赞系统不能用“数据库硬扛”的思维来设计。</p>
+<p><strong>核心设计目标有四个</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>目标</th>
+<th>具体要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>高并发</strong></td>
+<td>热点内容瞬时QPS可达百万级</td>
+</tr>
+<tr>
+<td><strong>低延迟</strong></td>
+<td>用户点击后必须<strong>500ms内</strong>完成反馈</td>
+</tr>
+<tr>
+<td><strong>高可用</strong></td>
+<td>99.99%可用性，不能因为一个功能挂了整站</td>
+</tr>
+<tr>
+<td><strong>数据准确</strong></td>
+<td>防止重复点赞、数据不丢失</td>
+</tr>
+</tbody>
+</table>
+<h2 id="二整体架构">二、整体架构</h2>
+<p>先上一张全局架构图，让你对整个系统有个整体认知：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202607/2238006-20260724154304966-48698807.png" class="lazyload"></p>
+<p>点赞系统的核心架构采用“<strong>客户端-网关-服务-缓存-数据库</strong>”分层设计，各层职责明确。下面我逐一拆解每一层。</p>
+<h2 id="三数据结构选型">三、数据结构选型</h2>
+<p>点赞系统的核心数据有两类：</p>
+<p><strong>第一类：点赞关系</strong> —— “谁赞了谁”</p>
+<p><strong>第二类：点赞计数</strong> —— “内容有多少赞”</p>
+<p>这两类数据的特点完全不同，存储方案也完全不同。</p>
+<h3 id="31-点赞关系用redis-set还是hash">3.1 点赞关系：用Redis Set还是Hash？</h3>
+<p>点赞关系需要解决的核心问题是：<strong>如何快速判断一个用户是否已经点过赞</strong>，同时要<strong>防止重复点赞</strong>。</p>
+<p>在Redis里，主要有两种方案：</p>
+<p><strong>方案一：Set集合</strong></p>
+<pre><code class="language-bash"># 点赞：把用户ID加入集合
+SADD like:post:1001 user:123
+
+# 取消点赞：从集合移除
+SREM like:post:1001 user:123
+
+# 检查是否已赞：O(1)时间复杂度
+SISMEMBER like:post:1001 user:123
+
+# 获取点赞总数
+SCARD like:post:1001
+
+# 获取点赞列表（小心数据量！）
+SMEMBERS like:post:1001
+</code></pre>
+<p>代码写起来非常清爽。但是，当某个明星发帖，点赞量直奔百万而去时，问题来了——<strong>Set在元素超过512个后会用哈希表存储，一个百万级点赞的Set可能占用几十MB内存</strong>。</p>
+<p><strong>方案二：Hash结构</strong></p>
+<pre><code class="language-bash"># 用Hash存储，field是用户ID，value是时间戳
+HSET like:post:1001 user:123 1620000000
+
+# 检查是否已赞
+HEXISTS like:post:1001 user:123
+
+# 获取点赞总数
+HLEN like:post:1001
+</code></pre>
+<p>Hash方案的内存效率比Set更好，特别是当用户ID是数字时。</p>
+<p><strong>我的建议</strong>：对于大多数场景，<strong>Hash是更优的选择</strong>，因为它的内存效率更高。</p>
+<p>但如果你需要获取完整的点赞用户列表，Set会更方便。</p>
+<h3 id="32-点赞计数原子操作是关键">3.2 点赞计数：原子操作是关键</h3>
+<p>点赞计数的核心要求是：<strong>高并发下计数不能出错</strong>。</p>
+<p>Redis的String类型提供了<strong>原子性的INCR和DECR操作</strong>：</p>
+<pre><code class="language-bash"># 点赞：计数+1
+INCR like_count:post:1001
+
+# 取消点赞：计数-1
+DECR like_count:post:1001
+
+# 获取点赞数
+GET like_count:post:1001
+</code></pre>
+<p>就算同时有1000个用户点赞，Redis的原子操作也能保证计数不会算错。</p>
+<h3 id="33-用户维度查询zset按时间排序">3.3 用户维度查询：ZSet按时间排序</h3>
+<p>有时候我们需要查询“某个用户点赞了哪些内容”，而且需要按时间排序。这时候可以用<strong>ZSet（有序集合）</strong> ：</p>
+<pre><code class="language-bash"># 用户点赞：score存时间戳
+ZADD user_like:user:123 1620000000 post:1001
+
+# 获取用户最近点赞的10条内容（按时间倒序）
+ZREVRANGE user_like:user:123 0 9
+</code></pre>
+<h2 id="四高并发写入">四、高并发写入</h2>
+<p>数据存哪里确定了，接下来是核心问题：<strong>怎么扛住高并发写入</strong>？</p>
+<h3 id="41-第一招lua脚本保证原子性">4.1 第一招：Lua脚本保证原子性</h3>
+<p>点赞和取消点赞涉及多个Redis操作（检查是否已赞 → 更新Set → 更新计数），如果分开执行，在高并发下会出现并发问题。</p>
+<p>解决方案：<strong>用Lua脚本把所有操作打包成一个原子操作</strong>。</p>
+<pre><code class="language-lua">-- 点赞Lua脚本
+-- KEYS[1]: like:post:{postId}
+-- KEYS[2]: like_count:post:{postId}
+-- ARGV[1]: userId
+-- ARGV[2]: timestamp
+
+local isLiked = redis.call('HEXISTS', KEYS[1], ARGV[1])
+if isLiked == 1 then
+    return 0  -- 已点赞，返回0
+end
+
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('INCR', KEYS[2])
+return 1  -- 点赞成功
+</code></pre>
+<pre><code class="language-java">// Java中调用Lua脚本
+@Component
+public class LikeService {
+    
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    private static final String LIKE_SCRIPT = 
+        "local isLiked = redis.call('HEXISTS', KEYS[1], ARGV[1]) " +
+        "if isLiked == 1 then return 0 end " +
+        "redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]) " +
+        "redis.call('INCR', KEYS[2]) " +
+        "return 1";
+    
+    public boolean like(Long postId, Long userId) {
+        String likeKey = "like:post:" + postId;
+        String countKey = "like_count:post:" + postId;
+        Long result = redisTemplate.execute(
+            LIKE_SCRIPT,
+            Arrays.asList(likeKey, countKey),
+            userId.toString(), 
+            String.valueOf(System.currentTimeMillis())
+        );
+        return result != null &amp;&amp; result == 1L;
+    }
+}
+</code></pre>
+<p><strong>Lua脚本让检查、写入、计数三步操作在Redis服务端一次性完成</strong>，彻底避免了并发问题。</p>
+<h3 id="42-第二招消息队列异步解耦">4.2 第二招：消息队列异步解耦</h3>
+<p>点赞数据最终要落到数据库里做持久化，但如果每次点赞都同步写数据库，数据库根本扛不住。</p>
+<p>解决方案：<strong>点赞操作只写Redis，然后异步发送消息到MQ，消费者批量写入数据库</strong>。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202607/2238006-20260724154327328-1515257371.png" class="lazyload"></p>
+<p>这样做的好处：</p>
+<ul>
+<li>用户<strong>毫秒级</strong>收到反馈</li>
+<li>数据库写入压力从峰值<strong>3000+ QPS</strong>降到平均<strong>200 QPS</strong></li>
+<li>系统吞吐量大幅提升</li>
+</ul>
+<pre><code class="language-java">@Component
+public class LikeConsumer {
+    
+    @PulsarListener(topics = "like-topic")
+    public void consume(List&lt;LikeMessage&gt; messages) {
+        // 批量处理，减少数据库连接开销
+        List&lt;LikeRecord&gt; records = messages.stream()
+            .map(msg -&gt; new LikeRecord(msg.getUserId(), msg.getPostId(), msg.getTime()))
+            .collect(Collectors.toList());
+        
+        // 批量插入，一次提交多条
+        likeRecordService.batchInsert(records);
+        
+        // 批量更新计数
+        Map&lt;Long, Long&gt; countMap = messages.stream()
+            .collect(Collectors.groupingBy(LikeMessage::getPostId, Collectors.counting()));
+        likeRecordService.batchUpdateCount(countMap);
+    }
+}
+</code></pre>
+<h3 id="43-第三招多级缓存应对热点key">4.3 第三招：多级缓存应对热点Key</h3>
+<p>热点内容（比如明星的爆款内容）的点赞请求会集中在<strong>同一个Redis Key</strong>上，这个Key就成了“<strong>热点Key</strong>”。</p>
+<p>解决方案：<strong>在Redis前面再加一层本地缓存</strong>（如Caffeine）。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202607/2238006-20260724154341954-150667897.png" class="lazyload"></p>
+<p>本地缓存相对于分布式缓存，<strong>数据不需要跨网络传输，性能更好</strong>。某电商系统引入Caffeine后，<strong>QPS从1万提升到5万，Redis负载下降了60%</strong> 。</p>
+<pre><code class="language-java">@Component
+public class LikeCountService {
+    
+    // 本地缓存：热点数据的点赞数
+    private final Cache&lt;String, Long&gt; localCache = Caffeine.newBuilder()
+        .maximumSize(10000)
+        .expireAfterWrite(Duration.ofSeconds(10))
+        .build();
+    
+    public Long getLikeCount(Long postId) {
+        String key = "like_count:post:" + postId;
+        // 先查本地缓存
+        Long count = localCache.getIfPresent(key);
+        if (count != null) {
+            return count;
+        }
+        // 本地缓存没有，查Redis
+        count = redisTemplate.opsForValue().get(key);
+        if (count != null) {
+            localCache.put(key, count);
+        }
+        return count;
+    }
+}
+</code></pre>
+<h3 id="44-第四招heavykeeper识别真正的热点">4.4 第四招：HeavyKeeper识别真正的热点</h3>
+<p>热点Key不是一成不变的——今天的热点是周杰伦的新歌，明天可能就是某个突发热点事件。</p>
+<p><strong>HeavyKeeper算法</strong>可以高效识别出真正的热点数据，让你<strong>动态决定哪些数据需要进本地缓存</strong>。</p>
+<p>配合<strong>HeavyKeeper热点检测</strong>，系统可以自动识别突发热点，动态调整缓存策略。</p>
+<h2 id="五数据一致性">五、数据一致性</h2>
+<blockquote>
+<p>有些小伙伴可能会问：“Redis写成功了，但MQ消费失败了怎么办？数据不就丢了吗？”</p>
+</blockquote>
+<p>这是个好问题。在高并发场景下，我们追求的是<strong>最终一致性</strong>，而不是强一致性。</p>
+<h3 id="51-先写redis再发mq">5.1 先写Redis，再发MQ</h3>
+<p>核心流程：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202607/2238006-20260724154403446-1048887812.png" class="lazyload"></p>
+<p><strong>关键设计</strong>：</p>
+<ol>
+<li><strong>Redis是主数据源</strong>，所有读写操作都走Redis</li>
+<li><strong>MQ异步刷DB</strong>，消费者批量写入</li>
+<li><strong>定时对账任务</strong>，定期比对Redis和DB的数据，发现不一致就补偿</li>
+</ol>
+<h3 id="52-数据库分表设计">5.2 数据库分表设计</h3>
+<p>当数据量达到千亿级别时，单表肯定扛不住。需要做<strong>分库分表</strong>：</p>
+<pre><code class="language-sql">-- 点赞记录分表（按用户ID取模）
+CREATE TABLE like_record_0000 (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    biz_type VARCHAR(32) NOT NULL,
+    item_id BIGINT NOT NULL,
+    status TINYINT DEFAULT 1,
+    create_time TIMESTAMP,
+    update_time TIMESTAMP,
+    UNIQUE KEY uk_user_item (user_id, biz_type, item_id),
+    INDEX idx_item (biz_type, item_id, status)
+) ENGINE=InnoDB;
+
+-- 共分64张表，按user_id % 64路由
+</code></pre>
+<h3 id="53-冷热数据分离">5.3 冷热数据分离</h3>
+<p>对于千亿级数据，全部放在MySQL里既不现实也不经济：</p>
+<table>
+<thead>
+<tr>
+<th>数据类型</th>
+<th>存储介质</th>
+<th>时间范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>热数据</strong></td>
+<td>Redis集群</td>
+<td>最近7天</td>
+</tr>
+<tr>
+<td><strong>温数据</strong></td>
+<td>TiDB/MySQL</td>
+<td>最近90天</td>
+</tr>
+<tr>
+<td><strong>冷数据</strong></td>
+<td>HBase/对象存储</td>
+<td>90天以上</td>
+</tr>
+</tbody>
+</table>
+<p>冷数据可以压缩归档到廉价存储，查询时走专门的离线分析系统。</p>
+<h2 id="六防刷与安全">六、防刷与安全</h2>
+<p>点赞系统还有一个容易被忽视的问题：<strong>刷赞</strong>。</p>
+<p>黑灰产会用自动化脚本疯狂点赞，不仅影响业务公平性，还会拖垮你的系统。</p>
+<h3 id="61-限流策略">6.1 限流策略</h3>
+<p>在API网关层做限流：</p>
+<ul>
+<li><strong>单用户限流</strong>：限制单个用户1分钟内的点赞次数</li>
+<li><strong>单IP限流</strong>：限制单个IP的请求频率</li>
+<li><strong>单内容限流</strong>：限制单个内容每秒新增点赞数</li>
+</ul>
+<h3 id="62-防重复提交">6.2 防重复提交</h3>
+<p>基于<strong>AOP + Redis</strong>实现接口防重复提交：</p>
+<pre><code class="language-java">@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface NoRepeatSubmit {
+    long lockTime() default 3000;  // 锁定时间，默认3秒
+}
+
+@Aspect
+@Component
+public class NoRepeatSubmitAspect {
+    
+    @Around("@annotation(noRepeatSubmit)")
+    public Object around(ProceedingJoinPoint point, NoRepeatSubmit noRepeatSubmit) 
+            throws Throwable {
+        // 用userId + 请求路径 作为Key
+        String key = "repeat:" + userId + ":" + requestPath;
+        Boolean success = redisTemplate.opsForValue()
+            .setIfAbsent(key, "1", Duration.ofMillis(noRepeatSubmit.lockTime()));
+        if (!success) {
+            throw new BusinessException("操作过于频繁，请稍后再试");
+        }
+        return point.proceed();
+    }
+}
+</code></pre>
+<p>这样用户<strong>3秒内重复点击点赞按钮</strong>，会被直接拦截。</p>
+<h2 id="七优缺点与适用场景">七、优缺点与适用场景</h2>
+<h3 id="这套方案的优点">这套方案的优点</h3>
+<p><strong>1. 超高吞吐量</strong><br>
+Redis单机可达数万到十万级QPS，配合多级缓存和MQ削峰，能轻松扛住百万级QPS。</p>
+<p><strong>2. 毫秒级响应</strong><br>
+所有读写在内存中完成，用户500ms内收到反馈。</p>
+<p><strong>3. 数据最终一致</strong><br>
+即使MQ或DB短暂故障，Redis中的数据依然可用，事后通过定时对账修复。</p>
+<p><strong>4. 弹性可扩展</strong><br>
+每一层都可以水平扩展——服务层加实例、缓存层加分片、存储层加节点。</p>
+<p><strong>5. 防刷机制完善</strong><br>
+限流 + 防重复提交 + 反作弊，三层防护。</p>
+<h3 id="这套方案的缺点">这套方案的缺点</h3>
+<p><strong>1. 系统复杂度高</strong><br>
+涉及Redis、MQ、本地缓存、分库分表等多个组件，运维成本高。</p>
+<p><strong>2. 最终一致性带来的问题</strong><br>
+Redis和DB之间可能存在短暂的不一致。比如用户点赞后立即查询，Redis里有了，但DB还没同步。</p>
+<p><strong>3. Redis内存压力</strong><br>
+热数据全部放Redis，内存成本不低。尤其是百万级点赞的Set/Hash，可能占用几十MB。</p>
+<p><strong>4. MQ故障风险</strong><br>
+如果MQ挂了，DB同步就会中断。需要有降级方案。</p>
+<h3 id="适用场景">适用场景</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐程度</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>社交平台点赞</strong></td>
+<td>✅✅✅ 强烈推荐</td>
+<td>高并发+实时性要求高</td>
+</tr>
+<tr>
+<td><strong>短视频/直播点赞</strong></td>
+<td>✅✅✅ 强烈推荐</td>
+<td>瞬时流量巨大</td>
+</tr>
+<tr>
+<td><strong>电商商品点赞</strong></td>
+<td>✅✅ 推荐</td>
+<td>并发量中等，可简化方案</td>
+</tr>
+<tr>
+<td><strong>小型社区</strong></td>
+<td>⚠️ 过度设计</td>
+<td>直接用数据库即可</td>
+</tr>
+</tbody>
+</table>
+<p>更多项目实战在Java突击队网：susan.net.cn/project</p>
+<h2 id="八写在最后">八、写在最后</h2>
+<p>回到最初的问题：<strong>如何设计一个高并发点赞系统？</strong></p>
+<p>我把完整的答案浓缩成一张脑图：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2238006/202607/2238006-20260724154424755-852949984.png" class="lazyload"></p>
+<p><strong>面试回答的核心逻辑</strong>：</p>
+<ol>
+<li><strong>先分析痛点</strong> —— 高并发、低延迟、数据准确、高可用</li>
+<li><strong>再给出方案</strong> —— Redis扛读写、MQ异步削峰、多级缓存应对热点</li>
+<li><strong>最后兜底</strong> —— 最终一致性、定时对账、冷热分离</li>
+</ol>
+<p>这个思路不仅适用于点赞系统，也适用于<strong>任何高并发读写的场景</strong>——购物车、收藏、关注、评论计数……套路都是一样的。</p>
+<p>如果觉得有帮助，欢迎<strong>点赞、在看、转发</strong>三连支持一波～</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-24 15:45">2026-07-24 15:44</span>&nbsp;
+<a href="https://www.cnblogs.com/12lisu">苏三说技术</a>&nbsp;
+阅读(<span id="post_view_count">250</span>)&nbsp;
+评论(<span id="post_comment_count">4</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21882110);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2F12lisu%2Fp%2F21882110&amp;targetId=21882110&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
