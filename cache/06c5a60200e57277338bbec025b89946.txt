@@ -1,0 +1,384 @@
+
+		<h1 class="postTitle">
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hailin-zheng/p/21884969" title="发布于 2026-07-24 16:37">
+    
+
+    <span role="heading" aria-level="2">一张 DataGrid 如何工作：从流畅渲染到连续录入</span>
+    
+
+</a>
+
+		</h1>
+		<div class="clear"></div>
+		<div class="postBody">
+			<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>做后台系统，基本绕不开表格。</p>
+<p>订单、库存、财务流水、项目台账、客户资料和操作日志，最后大多要用表格展示。只看最简单的例子，DataGrid 好像就是接收一组列和一个数组，然后画出表头、行和滚动条。</p>
+<p>业务页面当然没有这么简单。固定列、排序、筛选、分组、汇总、复制、键盘操作、单元格编辑、输入校验、Lookup 和大数据滚动经常出现在同一张表里。功能叠加以后，既要保证状态一致，也要控制滚动和输入时的开销。</p>
+<p>这里主要关心两件事。数据量增加后，首帧呈现、滚动和交互不能明显变慢；用户开始录入后，键盘导航、单元格编辑、Popup 选择和校验提交也不能互相打断。</p>
+<p>ds-ui 的 DataGrid 同时处理这两类问题。绘制部分面向较大的数据集，编辑部分则参考了 <a href="https://docs.devexpress.com/WindowsForms/3455/controls-and-libraries/data-grid" target="_blank" rel="noopener nofollow">DevExpress WinForms GridControl</a> 等成熟桌面端 DataGrid 的使用方式，尤其是连续录入、键盘导航和单元格编辑。</p>
+<p>上一篇文章讲了<a href="https://www.cnblogs.com/hailin-zheng/p/21796169#5419826" target="_blank">从 WinForms 到 Vue：我为什么决定在 Web 上重做一套完整的 GUI 框架</a>。这篇先只看 ds-ui 的 DataGrid：数据怎样进入视口，一次滚动怎样变成下一帧画面，鼠标怎样找到单元格，以及编辑会话怎样稳定地接管输入、焦点、Popup 和校验。</p>
+<p>文末使用十万行数据做了一次压力测试，目的是放大性能问题，观察每帧工作量。实际业务仍然要根据数据来源和查询方式选择分页或服务端查询。</p>
+<p>事件、绘制和图层合成会顺带提到，GUI Runtime 留到下一篇再展开。</p>
+<p>项目官网：<a href="https://hleditor.com/" target="_blank" rel="noopener nofollow">hleditor.com</a></p>
+<p>DataGrid 在线演示：<a href="https://hleditor.com/components/datagrid-gridview/#live-example" target="_blank" rel="noopener nofollow">打开 Live Example</a></p>
+<p><img alt="DataGrid 通用业务能力 Showcase" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724162956418-1701150386.png" class="lazyload"></p>
+<p><em>这个 Showcase 把固定列、筛选、范围选择、编辑、Lookup、分组汇总和大数据压力场景放在了同一张表里。</em></p>
+<hr>
+<h2 id="一业务代码只关心列数据和规则">一、业务代码只关心列、数据和规则</h2>
+<p>先看一个普通的业务数据模型：</p>
+<pre><code class="language-ts">interface BusinessRecord {
+	id: number;
+	name: string;
+	category: string;
+	status: "active" | "review" | "paused";
+	owner: string;
+	department: string;
+	amount: number;
+	progress: number;
+	updatedAt: string;
+}
+</code></pre>
+<p>创建 DataGrid 时，业务代码只需要说明数据、列和需要开启的功能：</p>
+<pre><code class="language-ts">const grid = new RenderDataGrid&lt;BusinessRecord&gt;({
+	rowKey: "id",
+	columns,
+	rows,
+	selectionMode: "range",
+	editable: true,
+	sortable: true,
+	resizableColumns: true,
+	reorderableColumns: true,
+	onCellChange: (row, key, value) =&gt; {
+		syncBusinessState(row.id, key, value);
+	},
+});
+</code></pre>
+<p>DataGrid 会先完成有效值的写回，再触发 <code>onCellChange</code>，因此这个回调更适合用来同步外部状态、记录待保存变更或驱动字段联动。后续筛选、选择、新增和编辑，都可以通过 <code>setFilters()</code>、<code>selectRange()</code>、<code>addRows()</code>、<code>beginEdit()</code> 等 API 完成。状态颜色和编辑权限则交给 <code>resolveCellStyle()</code>、<code>resolveCellEditPolicy()</code>。</p>
+<p>列配置还描述了操作规则：哪些单元格可编辑、哪些字段只读或禁用、Tab 应该停在哪里、输入何时有效，以及 Lookup 应该显示哪些候选项。DataGrid 在编辑和键盘导航时读取这些规则。</p>
+<p>至于下面这些事情，应该由 DataGrid 自己处理，而不是每个页面重新写一遍：</p>
+<ul>
+<li>当前单元格怎样进入编辑，提交后怎样继续移动到下一个业务字段；</li>
+<li><code>editable</code>、<code>readonly</code>、<code>disabled</code> 和 <code>tabStop</code> 怎样共同决定录入路径；</li>
+<li>文本、数字、Lookup、日期、树和树表编辑器怎样遵守同一套提交规则；</li>
+<li>排序、筛选和分组以后，当前记录究竟位于第几行；</li>
+<li>滚动到任意位置时，本帧应该处理哪些单元格；</li>
+<li>固定列和普通列怎样共享同一个纵向视口；</li>
+<li>鼠标坐标对应哪一行、哪一列；</li>
+<li>键盘焦点、当前单元格和选择范围怎样协同；</li>
+<li>一次 hover、滚动或输入，是需要重新布局，还是只重画一帧。</li>
+</ul>
+<hr>
+<h2 id="二一张表格内部有几套分工">二、一张表格，内部有几套分工</h2>
+<p>业务代码只会接触 <code>RenderDataGrid</code>，但组件内部并不是一个类包办所有事情。数据处理、视口、选择、编辑和绘制各有自己的模块：</p>
+<p><img alt="DataGrid 内部职责架构" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163046644-388577558.png" class="lazyload"></p>
+<p><em>对外只有一个 DataGrid，对内则按数据、视口、交互、编辑和绘制分工。</em></p>
+<p>拆开以后，各部分的边界更清楚。数据投影、键盘导航可以分别测试，绘制模块也能单独做性能优化。</p>
+<p>DataGrid 内部实际上同时运行着两条链路：</p>
+<ul>
+<li>渲染链路：源数据 → 数据投影 → 可视范围 → 单元格绘制；</li>
+<li>编辑链路：当前单元格 → 编辑会话 → 输入桥或 Popup → 校验 → 提交 → 下一个 Tab 停靠点。</li>
+</ul>
+<p>两条链路共享行身份、单元格几何、焦点状态和组件生命周期。从滚动切换到输入时，不需要在两套 UI 模型之间交接状态。</p>
+<p>比如滚动时，视口模块（Viewport）只更新偏移量，绘制模块（Painter）根据新的可视范围重画，交互模块（Interaction）继续保存当前选择。如果正在编辑，编辑模块还要检查编辑器是否仍在屏幕里。一次滚轮事件不需要把这些逻辑全塞进同一个函数。</p>
+<hr>
+<h2 id="三数组里的第-20-行不一定还是屏幕上的第-20-行">三、数组里的第 20 行，不一定还是屏幕上的第 20 行</h2>
+<p>表格内部至少要区分三种位置：</p>
+<ol>
+<li>源数据索引：记录在原始 <code>rows</code> 数组中的位置。</li>
+<li>可视数据索引：排序、筛选后的记录位置。</li>
+<li>可视项目索引：加入分组标题后的屏幕项目位置，分组标题本身不是业务记录。</li>
+</ol>
+<p><img alt="从源数据到本帧绘制的数据投影过程" loading="lazy" data-src="image-2b-data-projection.png" class="lazyload"></p>
+<p><em>排序、筛选等规则变化时更新投影；普通滚动只换一段可视范围。</em></p>
+<p>ds-ui 不会为了当前视图复制一遍所有业务对象。它保存的是原始记录和当前投影之间的索引关系，并缓存排序、筛选、分组和汇总结果。只有数据或规则改变时，相关缓存才会重算。</p>
+<p>所以选择和编辑不能只记住“第 20 行”。一旦用户重新排序，这条记录可能已经跑到别的位置。要想继续找到它，必须使用业务对象或稳定的 <code>rowKey</code>。</p>
+<p>虚拟化只减少屏幕附近的布局和绘制，不能让全量排序、筛选消失。十万条记录仍然在内存里，客户端排序也仍然要处理十万条。数据再大一些，还是要考虑分页、服务端查询和输入防抖。</p>
+<hr>
+<h2 id="四没有单元格-dom改变的不只是滚动">四、没有单元格 DOM，改变的不只是滚动</h2>
+<p>现在很多 Web 表格都有虚拟滚动，但“都只渲染可视区域”不代表它们的实现方式相同。</p>
+<p>下面比较的是常见的 DOM 虚拟列表或 DOM 虚拟表格。Canvas 和 WebGL 当然也属于 Web 技术，这里只是为了方便区分两种实现。</p>
+<p>成熟桌面 DataGrid 的共同思路，是由 Grid 统一管理当前单元格、键盘导航、in-place editor 与提交生命周期，而不是给每个单元格长期放置一个输入控件。ds-ui 在浏览器中采用了相近的控件思路：当前单元格首先由逻辑行列身份、状态与几何定义，而不是由一个单元格 DOM 节点定义。</p>
+<p><img alt="DOM 虚拟表格与 Canvas DataGrid 的虚拟化差异" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163556822-1640780931.png" class="lazyload"></p>
+<p><em>典型 DOM 方案以限制可视节点为主要边界；ds-ui 则直接从索引、几何、命中和绘制阶段控制本帧工作。</em></p>
+<h3 id="dom-虚拟表格保留少量行节点">DOM 虚拟表格：保留少量行节点</h3>
+<p>普通 DOM 表格直接渲染十万行，会产生大量行节点和单元格节点，创建、样式计算、布局和内存压力都会上升。</p>
+<p>典型虚拟滚动会使用占位层、位移层或分段滚动空间表达逻辑总高度，同时只挂载视口附近的一批行。滚动时，框架创建、复用或移动这些 DOM 节点。</p>
+<p>这样可以把 DOM 数量从与总数据量相关，压缩到主要与视口和 overscan 相关。可视行仍然是真实节点，所以更容易建立在浏览器的文本布局、CSS、原生滚动和可访问性基础设施之上。</p>
+<h3 id="ds-ui-datagrid没有行节点">ds-ui DataGrid：没有行节点</h3>
+<p>ds-ui 的 Canvas DataGrid 不会给每一行创建 DOM。不可见行没有节点，可见行也没有节点，屏幕上的单元格只是这一帧的绘制结果。</p>
+<p>完整内容高度只是一个数值：</p>
+<pre><code class="language-text">totalHeight = visibleItemCount × rowHeight
+</code></pre>
+<p>当前滚动位置也是 DataGrid 自己维护的视口状态。固定行高下，可视范围可以直接通过索引计算得到：</p>
+<pre><code class="language-text">visibleStart = floor(scrollY / rowHeight)
+visibleEnd   = ceil((scrollY + viewportHeight) / rowHeight) - 1
+</code></pre>
+<p>组件会在可视范围前后多留几行缓冲，然后只计算和绘制这一小段内容。行在屏幕上的位置也能直接算出来：</p>
+<pre><code class="language-text">rowY = bodyY + rowIndex × rowHeight - scrollY
+</code></pre>
+<p>在行和单元格层面，没有旧 DOM 节点需要搬动。DataGrid 只是在下一帧换一段索引，再把新内容画到既有的 Canvas 图层中。</p>
+<p>鼠标命中也靠计算：先用鼠标坐标、滚动偏移和行高算出行，再根据列宽算出列，不需要去 DOM 树里找单元格元素。</p>
+<h3 id="overscan-不是两者的主要区别">overscan 不是两者的主要区别</h3>
+<p>两种方案都可以使用固定行高、可视范围和 overscan，也都能把滚动工作限制在视口附近。典型 DOM 虚拟化以限制已挂载节点为主要手段，并由此缩小组件渲染、样式、布局与绘制范围；ds-ui 不创建行和单元格节点，直接控制本帧的数据解析、索引计算、命中测试和绘制工作。</p>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>典型 DOM 虚拟表格</th>
+<th>ds-ui Canvas DataGrid</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主要 UI 载体</td>
+<td>视口内的行、单元格 DOM 与组件实例</td>
+<td>既有 Canvas 图层中的绘制结果</td>
+</tr>
+<tr>
+<td>可视范围</td>
+<td>主要限制已挂载节点及相关组件工作</td>
+<td>直接限制索引、数据解析、命中与绘制指令</td>
+</tr>
+<tr>
+<td>总高度表达</td>
+<td>内部数值状态加浏览器滚动空间或占位层</td>
+<td>Runtime 数值状态加自绘滚动条</td>
+</tr>
+<tr>
+<td>行定位</td>
+<td>几何计算后写入节点位置或 <code>transform</code></td>
+<td>几何计算后直接生成绘制坐标</td>
+</tr>
+<tr>
+<td>单元格识别</td>
+<td>可利用事件目标或委托，也可结合坐标几何</td>
+<td>统一由坐标映射到行列索引</td>
+</tr>
+<tr>
+<td>编辑核心</td>
+<td>活动编辑组件与逻辑编辑状态协同</td>
+<td>逻辑编辑会话与共享输入、Popup 服务协同</td>
+</tr>
+<tr>
+<td>键盘焦点</td>
+<td>Grid 状态协调单元格和编辑器的 DOM 焦点</td>
+<td>Runtime 协调逻辑焦点与共享输入桥</td>
+</tr>
+<tr>
+<td>Popup 编辑</td>
+<td>Grid 或 Popup 服务协调 Portal、锚点、外部点击和滚动</td>
+<td>Popup 服务直接复用 Grid 几何和生命周期</td>
+</tr>
+<tr>
+<td>浏览器工作</td>
+<td>可视节点仍参与样式、布局和绘制</td>
+<td>Canvas 元素参与页面布局，内部单元格由框架绘制</td>
+</tr>
+<tr>
+<td>原生语义</td>
+<td>更容易利用文本、CSS 与可访问性基础设施</td>
+<td>需要框架额外承接输入、复制和可访问性</td>
+</tr>
+</tbody>
+</table>
+<p>ds-ui 在行和单元格层面没有 DOM 节点需要回收。本帧要处理哪些数据、命中哪些单元格、生成多少绘制指令，都由索引范围直接决定。</p>
+<p>进入编辑后，典型 DOM DataGrid 还要协调虚拟节点、活动编辑组件、浏览器焦点、Popup Portal 和滚动位置。ds-ui 的浏览、命中和编辑不依赖单元格 DOM 的生命周期，相关状态都由 Runtime 管理。</p>
+<p><a href="https://www.ag-grid.com/javascript-data-grid/cell-editors/" target="_blank" rel="noopener nofollow">AG Grid</a> 和 <a href="https://mui.com/x/react-data-grid/editing/" target="_blank" rel="noopener nofollow">MUI X</a> 都能在 DOM 架构下提供成熟的单元格编辑、键盘导航和自定义编辑能力。它们通过编辑组件、焦点规则和 Portal 协议处理这些关系；ds-ui 使用自己的 Runtime、逻辑焦点和单元格几何处理。</p>
+<p>Canvas 并不会自动带来更高性能。JavaScript、文本测量、Canvas 绘制和浏览器最终显示都要花时间；如果每一帧都重新排序或创建大量临时对象，照样会卡。</p>
+<p>DOM 表格也有很明显的优势。数据量不大、行高不固定、单元格里有复杂富文本，或者项目很重视原生可访问性时，成熟的 DOM 表格通常更省事。选哪一种，应该看页面需求，而不是只比一句“谁更快”。</p>
+<hr>
+<h2 id="五一次滚动如何变成屏幕上的下一帧">五、一次滚动如何变成屏幕上的下一帧</h2>
+<p>DataGrid 虽然自己管理滚动，但鼠标输入、事件分发和帧调度仍然由 GUI Runtime 统一处理。</p>
+<p>一次滚轮或触控板操作，大致会经过下面几步：</p>
+<p><img alt="DataGrid 单帧渲染链路" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163221708-734370702.png" class="lazyload"></p>
+<p><em>有输入并且状态发生变化时，运行时才安排新一帧。</em></p>
+<p>在 60 Hz 屏幕上，一帧预算约为 16.7 ms；到了 120 Hz，预算则只有约 8.3 ms。刷新率并不要求组件树持续重画。页面没有变化时不安排新帧；滚动、hover、输入或动画触发的多次绘制请求，也会合并到同一帧。</p>
+<p>滚动通常只修改视口偏移。表格尺寸、列宽、行高或父布局约束发生变化时，才重新计算布局。</p>
+<p>本文里的 <code>composite</code>，指 ds-ui 把主内容、Popup、Window、Overlay 等图层合到最终 Canvas 的过程。它不等于浏览器开发者工具里完整的 GPU 合成阶段。</p>
+<p>事件捕获、焦点路由、脏布局传播和输入法桥接，留到下一篇 GUI Runtime 再讲。</p>
+<hr>
+<h2 id="六只绘制可视行还不够">六、只绘制可视行还不够</h2>
+<p>可视范围是大表格性能的基础，但不是全部。</p>
+<h3 id="1-固定行高让计算更简单">1. 固定行高让计算更简单</h3>
+<p>当前 DataGrid 使用统一的 <code>rowHeight</code>。代价是不适合大量动态行高内容，好处是坐标关系简单而稳定。</p>
+<p>只要知道 <code>scrollY</code>、<code>rowHeight</code> 和 <code>viewportHeight</code>，就能直接算出可视行范围，也能把鼠标坐标换算成行索引。程序跳转到某条记录时，同样不需要逐行测量。</p>
+<h3 id="2-显示回调只处理可视单元格">2. 显示回调只处理可视单元格</h3>
+<p>金额格式、状态颜色、错误边框和只读样式，最后都要转换成单元格的显示结果。</p>
+<p><code>getCellDisplayText()</code>、<code>resolveRowStyle()</code>、<code>resolveCellStyle()</code> 和 <code>resolveCellEditPolicy()</code> 只对当前可视区及少量 overscan 单元格执行。业务回调要尽量轻量，不要在里面请求网络、遍历大对象或重建整份数据。</p>
+<p>这些回调会在滚动绘制时频繁调用。一次数组查找看起来很快，但乘上可视行数、列数和帧数后，成本就可能很明显。</p>
+<h3 id="3-固定列和普通列共用同一段可视行">3. 固定列和普通列共用同一段可视行</h3>
+<p>左固定列、普通列和右固定列使用不同的横向区域，但共享同一段可视行。固定列不会导致全量行绘制，只是同一行要在几个裁剪区域里分别画。</p>
+<p>横向滚动时，完全看不见的普通列不会参与单元格解析和绘制。实际工作量仍然跟当前视口有关，而不是“总行数 × 总列数”。</p>
+<h3 id="4-排序过滤分组和-lookup-都需要缓存">4. 排序、过滤、分组和 Lookup 都需要缓存</h3>
+<p>虚拟化解决的是绘制范围，数据模型还要避免每次 paint 都重新排序、过滤和分组。</p>
+<p>DataGrid 会缓存当前投影。数据或规则改变时才重算；普通 hover 和滚动不会重新处理十万条数据。</p>
+<p>Lookup 列也会建立值到候选记录的索引，避免显示、复制和筛选时反复扫描整个候选数组。</p>
+<h3 id="5-自动列宽不能扫描全部数据">5. 自动列宽不能扫描全部数据</h3>
+<p>如果为了计算“最合适”的列宽而测量十万行文本，虚拟化节省下来的成本很快会被抵消。</p>
+<p>大数据表格最好给出明确列宽。需要自动列宽时，应限制采样数量，并避免在滚动、输入或 hover 时反复测量。长文本可以用省略号和 Tooltip，不必为了少数内容无限拉宽列。</p>
+<h3 id="6-诊断不能只看平均-fps">6. 诊断不能只看平均 FPS</h3>
+<p>平均 FPS 很容易藏住偶发卡顿。一百帧里即使九十九帧都很快，只要有一帧卡住一百毫秒，用户就能感觉到。</p>
+<p>更有价值的指标包括：</p>
+<ul>
+<li>本帧实际绘制了多少行、多少单元格；</li>
+<li>可视范围和 overscan 范围是多少；</li>
+<li>当前 <code>scrollY</code> 和总内容高度是多少；</li>
+<li>本帧是否执行了 layout；</li>
+<li>layout、主内容 paint、临时图层 paint 和 composite 分别用了多久；</li>
+<li>排序、筛选或分组缓存为什么失效；</li>
+<li>长时间滚动和反复编辑后，编辑会话是否正确结束，临时对象是否被释放。</li>
+</ul>
+<p>这些数据比一句“看起来很流畅”更能说明问题出在哪里。</p>
+<hr>
+<h2 id="七流畅不只发生在滚动时">七、流畅不只发生在滚动时</h2>
+<p>高频录入会暴露浏览状态下看不到的问题：编辑器切换是否跳动，Tab 会不会中断，Popup 滚动后是否还对得上单元格，校验失败后能不能留在原处继续修改。</p>
+<p>ds-ui 参考了 DevExpress WinForms GridControl 等桌面 DataGrid 的操作方式，由 Grid 管理当前单元格、编辑会话、焦点路径、编辑器和提交规则。成熟 Web DataGrid 也能采用这种组织方式。ds-ui 的具体选择，是让这些功能与绘制、Popup、输入桥和 GUI Runtime 共用状态与几何。</p>
+<h3 id="1-编辑会话不依附于单元格-dom">1. 编辑会话不依附于单元格 DOM</h3>
+<p>普通单元格只保存数据和显示状态，不会各自持有一个输入控件或编辑器对象。每个 DataGrid 持有统一的编辑控制器，并按类别维护可复用的 Popup 宿主。</p>
+<p>用户双击单元格或按下编辑快捷键后，文本、数字和 Popup 类编辑器会建立逻辑编辑会话，关联当前行列身份、原始值和草稿；单元格几何与校验规则在提交时按需解析。复选框没有持续会话，切换后直接进入提交管线。编辑结束时清理临时状态，编辑控制器和 Popup 宿主留给下一个单元格使用。Lookup 等复杂 Popup 的内部子视图仍会按打开会话创建和释放。</p>
+<p>很多基于 DOM 或组件框架的表格，会在单元格进入编辑状态时挂载活动编辑组件，退出时再卸载。成熟实现会保存编辑状态、复用实例，并处理虚拟化后的重建。ds-ui 没有这层单元格 DOM 生命周期，编辑会话直接由 Runtime 持有。</p>
+<p>共享编辑器并非 Canvas 特有。以 Windows Forms <code>DataGridView</code> 为例，<a href="https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.datagridview.editingcontrolshowing?view=windowsdesktop-9.0" target="_blank" rel="noopener nofollow">微软官方文档</a>说明它一次只承载一个 editing control，并在连续编辑同类型单元格时复用。ds-ui 也使用共享编辑模型，并把它接入 Canvas 几何、逻辑焦点、输入桥和 Popup Runtime。</p>
+<h3 id="2-textarea-只负责输入编辑外观仍由-datagrid-绘制">2. textarea 只负责输入，编辑外观仍由 DataGrid 绘制</h3>
+<p>DataGrid 没有在 Canvas 上覆盖一个带样式的可见 DOM 输入框。Runtime 共享一个透明 <code>textarea</code>，用它接收浏览器键盘、剪贴板和中文 IME。为保证输入法候选框位置正确，<code>textarea</code> 会跟随自绘光标更新坐标，但不参与视觉呈现。</p>
+<p>编辑文本或数字时，单元格背景、边框、文字、选区、闪烁光标、IME 预编辑文本、数字步进按钮和校验状态都由 ds-ui 绘制。下拉框、Lookup、日期、树和树表选择器使用相同的组件绘制和 Popup 管理机制，进入编辑时不会切换到另一套 DOM 样式和盒模型。</p>
+<p>浏览态和编辑态使用同一份单元格几何。滚动、固定列或列宽变化时，文字、光标、命中区域和 Popup 锚点一起更新，不需要再同步一个可见 DOM 输入框的位置。</p>
+<h3 id="3-连续键盘录入由-grid-统一管理">3. 连续键盘录入由 Grid 统一管理</h3>
+<p>高频录入很依赖键盘路径。ds-ui 目前支持：</p>
+<ul>
+<li><code>Enter</code> 或 <code>F2</code> 进入当前单元格编辑，复选框可以用 <code>Space</code> 切换；</li>
+<li>编辑中按 <code>Enter</code> 提交，按 <code>Escape</code> 放弃草稿；</li>
+<li><code>Tab</code> / <code>Shift+Tab</code> 在校验和提交后移动到下一个或上一个有效停靠点；</li>
+<li><code>readonly</code> 单元格可以按业务规则参与 Tab 路径但不能修改，<code>disabled</code> 单元格默认跳过；</li>
+<li>数字编辑器可以用 <code>ArrowUp</code> / <code>ArrowDown</code> 按精度和边界步进；</li>
+<li>Popup 打开后，方向键、确认和取消优先交给当前 Popup。</li>
+</ul>
+<p>文本、数字和 Popup 类编辑器有持续会话及提交、取消过程，复选框则即时切换。它们都经过相同的权限、值标准化、校验和写回流程：</p>
+<ul>
+<li><code>text</code>：单行文本编辑；</li>
+<li><code>number</code>：带最小值、最大值、步长和小数精度的数字编辑；</li>
+<li><code>checkbox</code>：布尔值切换；</li>
+<li><code>select</code>：固定值域的下拉选择；</li>
+<li><code>lookup</code>：可搜索、多字段展示的表格查询选择；</li>
+<li><code>date</code>：日期选择；</li>
+<li><code>drop-tree</code>：树形数据选择；</li>
+<li><code>drop-tree-grid</code>：带层级和多列信息的树表选择。</li>
+</ul>
+<p>Lookup 查询还能读取当前外层单元格和业务行。同一列可以根据当前记录过滤候选项，而不需要为每一行创建不同的编辑器。</p>
+<p><img alt="DataGrid 文本列内嵌编辑器" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163302888-577080656.jpg" class="lazyload"></p>
+<p><em>当前编辑单元格的文字、光标、选区和边框同样由 Canvas 绘制，textarea 只负责接收文本输入。</em></p>
+<p><img alt="DataGrid 单选列编辑器" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163325815-1820553296.jpg" class="lazyload"></p>
+<p><em>固定值域直接使用简单的单选列表。</em></p>
+<p><img alt="DataGrid 表格 Lookup 编辑器" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163342854-315795194.jpg" class="lazyload"></p>
+<p><em>Lookup 可以同时显示姓名、团队和人员编码，并支持搜索。</em></p>
+<p><img alt="image-10-datagrid-date-editor" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163359951-1330397016.jpg" class="lazyload"></p>
+<p><em>日期选择器贴着当前单元格打开，确认后再写回数据。</em></p>
+<h3 id="4-草稿校验和提交">4. 草稿、校验和提交</h3>
+<p>文本和数字输入先写入编辑草稿，不会每敲一个字符就修改业务数据。用户按下 <code>Enter</code>、<code>Tab</code>、点击其他单元格或者显式调用 <code>commitEdit()</code> 时，DataGrid 执行值标准化、单元格校验和提交。</p>
+<p>校验失败时，当前编辑会话和草稿会被保留，焦点不会跳到下一个单元格，也不会触发 <code>onCellChange</code>；错误边框和原因提示由 DataGrid 绘制。校验通过后，值才写回当前记录。需要提交整张业务表单时，还可以显式调用 <code>validate()</code> 检查全部源数据行并执行跨字段的行级校验；校验不通过时，再调用 <code>focusFirstError()</code> 定位第一个可见错误。</p>
+<p><code>resolveCellEditPolicy()</code> 决定每个单元格是 <code>editable</code>、<code>readonly</code> 还是 <code>disabled</code>，是否参加 Tab 路径，以及为什么不可编辑。鼠标、键盘、复选框、Popup、粘贴和最终提交都会读取这份策略。</p>
+<h3 id="5-编辑会话跟随行身份和单元格几何">5. 编辑会话跟随行身份和单元格几何</h3>
+<p>一个很常见的业务动作是新增记录后直接编辑第一项：</p>
+<pre><code class="language-ts">grid.addRows([newRecord]);
+grid.beginEdit(newRecord, "itemName");
+</code></pre>
+<p>这时不能只是把 <code>editing</code> 改成 <code>true</code>。</p>
+<p>新记录可能在当前纵向视口之外，也可能因为排序出现在别的位置。DataGrid 要先在当前数据投影中找到它，再把目标行纵向滚入视口，最后才能定位编辑器：</p>
+<p><img alt="新增行后进入编辑的时序" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163419615-126813969.png" class="lazyload"></p>
+<p><em>新增行不在屏幕里时，先把目标行纵向滚入视口，再让对应编辑器接管该单元格。</em></p>
+<p>如果记录已经可见，<code>nearest</code> 不会多滚一下；如果记录被筛选条件隐藏，<code>beginEdit()</code> 会返回失败，而不是偷偷清掉用户的筛选条件。当前 API 只保证目标行纵向可见，不会主动改变横向滚动位置。</p>
+<p>排序、筛选或行投影变化后，只要目标记录仍在当前投影中，编辑会话就会根据行对象或稳定的 <code>rowKey</code> 重新定位，而不是继续依赖旧的可视行号；目标记录被筛选排除时，这次编辑会话会结束。滚动和布局变化时，文本编辑位置与 Popup 锚点使用同一份单元格几何更新；Popup 目标离开视口后，DataGrid 会按明确的生命周期结束这次 Popup 编辑，而不是留下一个已经失去目标的浮层。</p>
+<p>编辑结束后，输入状态和 Popup 会话都要正确结束，临时子视图、事件监听和定时器也要及时释放；可复用的控制器和 Popup 宿主则继续保留。反复编辑几千次后，如果临时对象越积越多，表格一样会慢下来。</p>
+<p>给单元格设置 <code>editable:true</code> 只打开了编辑入口。定位、输入、校验、提交、Popup 和下一个 Tab 停靠点都要接得上，用户才能沿着表格一直操作下去。</p>
+<hr>
+<h2 id="八压力验证把数据放大到十万行之后">八、压力验证：把数据放大到十万行之后</h2>
+<p>下面把数据放大到 100,000 行做压力测试。这个规模不代表常规项目的数据交付方式，主要用来观察滚动工作量、全量数据操作，以及编辑会话接管当前单元格时的启动开销。</p>
+<p>测试数据来自本文 Showcase 的生产构建。测试机器是 M1 Pro / 16 GB，浏览器为 Chromium 150，DPR 为 2，Canvas 尺寸是 1280 × 720。表格包含 100,000 行、10 列。</p>
+<p>每轮先滚动 12 帧预热，再采集 100 个滚动帧；连续测试 3 轮，共记录 300 帧。测试时关闭可视性能浮层，只保留后台计时，避免图表本身参与绘制和合成。触发测试动作后，探测器会先等待并记录被测帧，再读取诊断状态，避免提前计算表格汇总并预热缓存。</p>
+<p>表中的 P50 可以理解为中位数，P95 和 P99 用来观察较慢的那部分帧。</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>工厂创建至首帧可见</td>
+<td>P50 48.5 ms</td>
+</tr>
+<tr>
+<td>首帧总耗时</td>
+<td>P50 19.0 ms</td>
+</tr>
+<tr>
+<td>滚动整帧</td>
+<td>P50 2.8 ms / P95 3.2 ms / P99 3.9 ms</td>
+</tr>
+<tr>
+<td>主内容绘制</td>
+<td>P50 2.4 ms / P95 2.7 ms</td>
+</tr>
+<tr>
+<td>10 万行排序</td>
+<td>P50 18.8 ms</td>
+</tr>
+<tr>
+<td>开始编辑到画面稳定</td>
+<td>P50 7.9 ms</td>
+</tr>
+<tr>
+<td>全表快速筛选</td>
+<td>P50 833.8 ms</td>
+</tr>
+</tbody>
+</table>
+<p>首帧和滚动指标观察视口绘制，排序和快速筛选观察全量数据操作。“开始编辑到画面稳定”只测量一次编辑会话的启动成本；7.9 ms 不代表完整的连续录入过程。Tab 提交、Popup 打开和长时间反复编辑还需要单独采样。</p>
+<p>首帧总耗时是一次性的初始化样本，不代表稳定滚动帧。持续交互能否落入帧预算，应主要观察滚动整帧的 P95 和 P99。</p>
+<p>视口里大约能看到 15 行，加上边界情况和前后缓冲，本次采样每帧实际处理约 16～18 行，也就是约 160～180 个单元格。滚动一帧大约 2.8 ms，说明滚动时的工作量已经控制在视口附近。</p>
+<p>快速筛选则不同。它要检查十万条记录，所以仍然需要约 0.83 秒。虚拟滚动帮不了这部分工作。实际项目中应加输入防抖、缩小查询字段，数据再大时改用服务端查询。</p>
+<p>正式数据只包含隐藏浮层时的后台采样，不把性能图表本身的绘制成本算进 DataGrid 帧耗时。浮层用于开发阶段观察趋势，不能和业务内容一起参与正式基准。</p>
+<p><img alt="DataGrid 运行时性能浮层" loading="lazy" data-src="https://img2024.cnblogs.com/blog/391148/202607/391148-20260724163450642-2087704601.png" class="lazyload"></p>
+<p><em>性能浮层可以在开发时查看整帧、布局、主内容绘制和合成耗时。上面的正式数据使用后台采样，测试时没有显示这个浮层。</em></p>
+<p>这组结果用来观察框架的工作量边界。实际页面仍应根据查询模式选择分页、服务端筛选和输入防抖。</p>
+<hr>
+<h2 id="九哪些页面适合使用它">九、哪些页面适合使用它</h2>
+<p>ds-ui DataGrid 自己管理视口、命中测试、绘制、焦点和编辑器。这样做控制力更强，但也意味着框架要承担更多工作。</p>
+<p>比较适合的场景有：</p>
+<ul>
+<li>高信息密度、长时间驻留、接近 DevExpress WinForms GridControl 等成熟桌面 DataGrid 操作方式的业务工作台；</li>
+<li>医嘱、订单、费用明细、物料、字典和配置项等需要连续 Tab 录入、复杂 Lookup 与严格校验的页面；</li>
+<li>大量固定结构数据的连续浏览；</li>
+<li>强键盘导航、范围选择和复制；</li>
+<li>需要单元格编辑、校验和 Popup 选择器协同的页面；</li>
+<li>希望表格的输入、弹层和其他 GUI 组件保持一致的项目。</li>
+</ul>
+<p>它也有明确的使用边界：</p>
+<ul>
+<li>当前所有数据行共用统一的 <code>rowHeight</code>，不支持按行动态高度、合并单元格或跨行布局。需要自适应多行排版时，应选择更合适的表格或文档组件；</li>
+<li>单元格适合结构化文本、状态和字段编辑，不以承载任意 DOM 结构或复杂富文本为目标；</li>
+<li>当前编辑体系包含八类内置单元格编辑器和同步校验，暂不支持撤销重做、整行编辑事务、任意自定义编辑器和 Excel 式矩形粘贴；</li>
+<li>键盘输入、复制、粘贴和焦点已经由框架接管，但 Canvas 不能直接继承逐单元格的 DOM 语义。项目有严格的屏幕阅读器要求时，还需要单独评估可访问性适配；</li>
+<li>内置排序、筛选、分组和汇总在客户端执行。数据量很大或来自远程接口时，应由业务层分页、查询并向 DataGrid 提供当前结果集；</li>
+<li>少量静态数据当然也可以使用 DataGrid，只是虚拟滚动、复杂选择和编辑体系的价值不明显，此时轻量表格通常更省事。</li>
+</ul>
+<p>文中以 DevExpress WinForms GridControl 为参照，参照的是桌面 DataGrid 的交互原则，并不表示两者的功能已经对等。浏览、定位、输入、校验、选择器和键盘导航由一个控件统一协调，ds-ui 用 Canvas GUI Runtime 实现了类似的组织方式。</p>
+<p>数据投影、视口、焦点、Popup 和校验都放在 DataGrid 内部管理。数据量变大时控制每帧绘制范围，进入编辑后保持操作路径连续，这是当前实现的两个重点。</p>
+<hr>
+
+
+</div>
+<div class="clear"></div>
+
+		</div>
+		<div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-24 16:38">2026-07-24 16:37</span>&nbsp;
+<a href="https://www.cnblogs.com/hailin-zheng">delete19910520</a>&nbsp;
+阅读(<span id="post_view_count">110</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21884969);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhailin-zheng%2Fp%2F21884969&amp;targetId=21884969&amp;targetType=0" target="_blank">举报</a>
+</div>
+	
