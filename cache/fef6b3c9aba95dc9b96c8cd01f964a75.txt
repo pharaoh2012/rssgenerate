@@ -1,0 +1,437 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sun-10387834/p/21336189" title="发布于 2026-07-28 09:34">
+    
+
+    <span role="heading" aria-level="2">生产级别的SpringBoot整合RocketMQ死信队列（DLQ）的完整示例</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>下面是一个<strong>生产级别的 Spring Boot 整合 RocketMQ 死信队列（DLQ）的完整示例</strong>，涵盖：配置、生产者、正常消费者（模拟失败触发重试）、死信队列消费者、监控告警、幂等与补偿设计。</p>
+<hr>
+<h2 id="一死信队列核心概念速览">一、死信队列核心概念速览</h2>
+<p>在 RocketMQ 中，<strong>死信队列（Dead Letter Queue, DLQ）</strong> 用于存储那些<strong>消费失败且达到最大重试次数</strong>的消息。</p>
+<p><strong>关键特性</strong>：</p>
+<ul>
+<li>死信队列命名规则：<code>%DLQ%{consumerGroup}</code></li>
+<li>死信队列按<strong>消费者组</strong>创建，同一组内所有消费者产生的死信汇聚到同一个 DLQ</li>
+<li>死信消息<strong>不会</strong>被原消费者组再次消费，需要<strong>新建消费者组</strong>单独订阅 DLQ 才能处理</li>
+<li>死信消息默认保留 <strong>3 天</strong>，超时自动清理</li>
+</ul>
+<hr>
+<h2 id="二项目依赖与版本">二、项目依赖与版本</h2>
+<pre><code class="language-xml">&lt;parent&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-parent&lt;/artifactId&gt;
+    &lt;version&gt;3.2.0&lt;/version&gt;
+&lt;/parent&gt;
+
+&lt;dependencies&gt;
+    &lt;!-- RocketMQ Spring Boot Starter --&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.rocketmq&lt;/groupId&gt;
+        &lt;artifactId&gt;rocketmq-spring-boot-starter&lt;/artifactId&gt;
+        &lt;version&gt;2.2.3&lt;/version&gt;
+    &lt;/dependency&gt;
+
+    &lt;!-- 精确控制客户端版本（可选） --&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.rocketmq&lt;/groupId&gt;
+        &lt;artifactId&gt;rocketmq-client&lt;/artifactId&gt;
+        &lt;version&gt;5.1.0&lt;/version&gt;
+    &lt;/dependency&gt;
+
+    &lt;!-- 生产必备：Lombok + 日志 --&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+        &lt;artifactId&gt;lombok&lt;/artifactId&gt;
+        &lt;optional&gt;true&lt;/optional&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+        &lt;artifactId&gt;spring-boot-starter-logging&lt;/artifactId&gt;
+    &lt;/dependency&gt;
+&lt;/dependencies&gt;
+</code></pre>
+<hr>
+<h2 id="三配置文件applicationyml">三、配置文件（application.yml）</h2>
+<pre><code class="language-yaml">spring:
+  application:
+    name: rocketmq-dlq-demo
+
+rocketmq:
+  name-server: 127.0.0.1:9876  # 生产环境建议配置多个，分号分隔
+
+  # ========== 生产者配置 ==========
+  producer:
+    group: order-producer-group
+    send-message-timeout: 3000
+    retry-times-when-send-failed: 2
+    retry-next-server: true
+
+  # ========== 消费者配置（正常业务消费者） ==========
+  consumer:
+    group: order-consumer-group          # ⚠️ 这个 Group 将产生死信队列 %DLQ%order-consumer-group
+    consume-mode: CLUSTERING             # 集群模式（重试只对集群模式生效）
+    consume-thread-min: 5
+    consume-thread-max: 20
+    pull-batch-size: 32
+
+# ========== 死信队列的消费者组单独配置 ==========
+dlq:
+  rocketmq:
+    consumer:
+      group: dlq-handler-group           # 专门处理死信的消费者组，独立于原 Group
+</code></pre>
+<blockquote>
+<p>⚠️ <strong>关键点</strong>：死信队列的消费者组必须<strong>独立于</strong>原消费者组，否则无法消费 DLQ 中的消息。</p>
+</blockquote>
+<hr>
+<h2 id="四生产者代码">四、生产者代码</h2>
+<pre><code class="language-java">package com.example.rocketmq.producer;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.client.producer.SendResult;
+import org.apache.rocketmq.client.producer.SendStatus;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
+import org.apache.rocketmq.spring.support.RocketMQHeaders;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Service;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class OrderProducer {
+
+    private final RocketMQTemplate rocketMQTemplate;
+
+    /**
+     * 发送订单消息（同步发送，必须检查结果）
+     */
+    public void sendOrder(String orderId, String content) {
+        String destination = "order-topic:order-create";
+
+        Message&lt;String&gt; message = MessageBuilder
+                .withPayload(content)
+                .setHeader(RocketMQHeaders.KEYS, orderId)  // 业务 Key，用于查询和幂等
+                .build();
+
+        try {
+            SendResult result = rocketMQTemplate.syncSend(destination, message);
+
+            // ✅ 生产级别：必须检查发送状态
+            if (result.getSendStatus() != SendStatus.SEND_OK) {
+                log.error("消息发送失败：orderId={}, status={}, msgId={}",
+                        orderId, result.getSendStatus(), result.getMsgId());
+                // 走补偿逻辑（落本地消息表 or 告警）
+                return;
+            }
+
+            log.info("消息发送成功：orderId={}, msgId={}", orderId, result.getMsgId());
+        } catch (Exception e) {
+            log.error("消息发送异常：orderId={}", orderId, e);
+            // 走补偿逻辑
+        }
+    }
+}
+</code></pre>
+<hr>
+<h2 id="五正常消费者模拟失败触发重试与死信">五、正常消费者（模拟失败触发重试与死信）</h2>
+<pre><code class="language-java">package com.example.rocketmq.consumer;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.spring.annotation.ConsumeMode;
+import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
+import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@RocketMQMessageListener(
+        topic = "order-topic",
+        consumerGroup = "order-consumer-group",      // ⚠️ 这个 Group 会产生死信队列
+        selectorExpression = "order-create",
+        consumeMode = ConsumeMode.CONCURRENTLY,
+        maxReconsumeTimes = 3                        // 🔥 为了演示效果，重试3次就进DLQ（生产环境默认16次）
+)
+public class OrderConsumer implements RocketMQListener&lt;String&gt; {
+
+    private int retryCount = 0;
+
+    @Override
+    public void onMessage(String message) {
+        retryCount++;
+        log.info("收到消息（第{}次尝试）：{}", retryCount, message);
+
+        // 🔥 模拟业务处理失败 —— 触发重试，最终进入死信队列
+        // 生产环境中，这里可能是：调用下游失败、数据校验不通过等
+        throw new RuntimeException("模拟消费失败，触发重试！");
+    }
+}
+</code></pre>
+<blockquote>
+<p>💡 <strong>生产环境建议</strong>：<code>maxReconsumeTimes</code> 默认 16 次，可根据业务重要性调整。演示环境设为 3 次方便快速看到效果。</p>
+</blockquote>
+<hr>
+<h2 id="六死信队列消费者核心">六、死信队列消费者（核心）</h2>
+<pre><code class="language-java">package com.example.rocketmq.consumer.dlq;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.common.message.MessageExt;
+import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
+import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.stereotype.Component;
+
+/**
+ * 死信队列消费者
+ * &lt;p&gt;
+ * 专门订阅 %DLQ%order-consumer-group，处理所有进入死信的消息
+ */
+@Slf4j
+@Component
+@RocketMQMessageListener(
+        topic = "%DLQ%order-consumer-group",        // 🔥 死信队列 Topic 命名规则
+        consumerGroup = "dlq-handler-group",        // 🔥 必须使用独立的消费者组
+        selectorExpression = "*"                     // 消费所有 Tag
+)
+public class DeadLetterQueueConsumer implements RocketMQListener&lt;MessageExt&gt; {
+
+    private final DlqMessageService dlqMessageService;
+
+    public DeadLetterQueueConsumer(DlqMessageService dlqMessageService) {
+        this.dlqMessageService = dlqMessageService;
+    }
+
+    @Override
+    public void onMessage(MessageExt message) {
+        String msgId = message.getMsgId();
+        String body = new String(message.getBody());
+        String keys = message.getKeys();
+        String originalTopic = message.getProperty("RETRY_TOPIC");  // 获取原始 Topic
+        int reconsumeTimes = Integer.parseInt(
+                message.getProperty("RECONSUME_TIMES")  // 已经重试的次数
+        );
+
+        log.warn("========== 死信消息到达 ==========");
+        log.warn("MsgId: {}", msgId);
+        log.warn("Keys: {}", keys);
+        log.warn("原始 Topic: {}", originalTopic);
+        log.warn("已重试次数: {}", reconsumeTimes);
+        log.warn("消息体: {}", body);
+        log.warn("=================================");
+
+        // 🔥 生产级处理：根据业务场景选择策略
+        dlqMessageService.handleDeadLetter(message);
+    }
+}
+</code></pre>
+<hr>
+<h2 id="七死信处理服务核心业务逻辑">七、死信处理服务（核心业务逻辑）</h2>
+<pre><code class="language-java">package com.example.rocketmq.service;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.common.message.MessageExt;
+import org.springframework.stereotype.Service;
+
+import java.nio.charset.StandardCharsets;
+
+@Slf4j
+@Service
+public class DlqMessageService {
+
+    /**
+     * 处理死信消息 —— 生产级核心逻辑
+     * &lt;p&gt;
+     * 策略选择（根据业务场景）：
+     * 1. 自动重试：将消息重新发送到原 Topic
+     * 2. 落库补偿：存入数据库，人工审核后补偿
+     * 3. 直接告警：通知开发人工介入
+     * 4. 忽略跳过：非核心业务可跳过
+     */
+    public void handleDeadLetter(MessageExt message) {
+        String body = new String(message.getBody(), StandardCharsets.UTF_8);
+        String keys = message.getKeys();
+        String originalTopic = message.getProperty("RETRY_TOPIC");
+
+        // ---------- 策略一：存入数据库，等待人工补偿（推荐） ----------
+        // saveToCompensationTable(message);
+        // 发送告警通知
+
+        // ---------- 策略二：自动重新投递（需谨慎，防止死循环） ----------
+        // 只有明确知道问题已修复（如下游恢复）才可启用
+        // resendToOriginalTopic(message);
+
+        // ---------- 策略三：记录日志 + 告警（本 Demo 采用） ----------
+        log.error("【死信告警】消息进入死信队列，需人工介入！orderId={}, body={}", keys, body);
+
+        // 生产环境：发送钉钉/企业微信/邮件告警
+        // sendAlert("死信消息需要人工处理", keys, body);
+    }
+
+    /**
+     * 将死信消息重新发送到原始 Topic（谨慎使用）
+     */
+    private void resendToOriginalTopic(MessageExt message) {
+        // 实现重新发送逻辑
+        // ⚠️ 注意：需要防止无限循环，建议增加重投次数限制
+    }
+}
+</code></pre>
+<hr>
+<h2 id="八幂等消费设计防止重复消费">八、幂等消费设计（防止重复消费）</h2>
+<p>RocketMQ 保证 <strong>“至少一次（At Least Once）”</strong> 语义，消费端<strong>必须实现幂等</strong>。</p>
+<h3 id="方案一redis-setnx-快速去重">方案一：Redis SETNX 快速去重</h3>
+<pre><code class="language-java">@Component
+public class IdempotentHelper {
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    public boolean tryProcess(String msgId, String eventType) {
+        String key = "processed:" + eventType + ":" + msgId;
+        Boolean success = redisTemplate.opsForValue()
+                .setIfAbsent(key, "1", Duration.ofDays(7));
+        return Boolean.TRUE.equals(success);
+    }
+}
+</code></pre>
+<h3 id="方案二数据库唯一索引强一致">方案二：数据库唯一索引（强一致）</h3>
+<pre><code class="language-sql">CREATE TABLE order_process_record (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    msg_key VARCHAR(64) NOT NULL,
+    event_type VARCHAR(32) NOT NULL,
+    status TINYINT DEFAULT 0,
+    created_at DATETIME,
+    UNIQUE KEY uk_msg_key_event (msg_key, event_type)
+);
+</code></pre>
+<hr>
+<h2 id="九监控与告警生产必备">九、监控与告警（生产必备）</h2>
+<h3 id="91-查看死信队列">9.1 查看死信队列</h3>
+<pre><code class="language-bash"># 查看所有 Topic，筛选 DLQ
+./mqadmin topicList -n 127.0.0.1:9876 | grep "%DLQ%"
+
+# 查看死信队列的消费进度
+./mqadmin consumerProgress -n 127.0.0.1:9876 -g dlq-handler-group
+</code></pre>
+<h3 id="92-prometheus-告警规则">9.2 Prometheus 告警规则</h3>
+<pre><code class="language-yaml">groups:
+  - name: rocketmq_dlq
+    rules:
+      - alert: RocketMQDLQMessage
+        expr: sum(rocketmq_dlq_messages) &gt; 0
+        for: 5m
+        annotations:
+          summary: "RocketMQ 死信队列有消息，需要人工处理"
+</code></pre>
+<p>死信队列的监控可以通过 <code>rocketmq-exporter</code> 采集 DLQ 的 Offset 变化来实现告警。</p>
+<hr>
+<h2 id="十完整的消息流转图">十、完整的消息流转图</h2>
+<div class="mermaid">flowchart TB
+    subgraph Producer[生产者]
+        P[OrderProducer] --&gt;|发送| Topic[order-topic]
+    end
+
+    subgraph Normal[正常消费链路]
+        Topic --&gt; Consumer[OrderConsumer&lt;br&gt;order-consumer-group]
+        Consumer --&gt;|消费失败| Retry[自动重试&lt;br&gt;maxReconsumeTimes=3]
+        Retry --&gt;|3次均失败| DLQ[死信队列&lt;br&gt;%DLQ%order-consumer-group]
+    end
+
+    subgraph DLQHandler[死信处理链路]
+        DLQ --&gt; DLQConsumer[DeadLetterQueueConsumer&lt;br&gt;dlq-handler-group]
+        DLQConsumer --&gt; Handler[DlqMessageService]
+        Handler --&gt;|策略一| DB[(存入数据库&lt;br&gt;人工补偿)]
+        Handler --&gt;|策略二| Alert[📱 发送告警]
+        Handler --&gt;|策略三| RePush[重新投递&lt;br&gt;到原 Topic]
+    end
+
+    style DLQ fill:#ffcdd2
+    style Handler fill:#fff3e0
+</div><hr>
+<h2 id="十一生产环境最佳实践-checklist">十一、生产环境最佳实践 Checklist</h2>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>□ 正常消费者配置 <code>maxReconsumeTimes</code>（默认 16 次）</td>
+<td></td>
+</tr>
+<tr>
+<td>□ 死信队列消费者使用<strong>独立</strong>的 <code>consumerGroup</code></td>
+<td></td>
+</tr>
+<tr>
+<td>□ 死信队列 Topic 命名为 <code>%DLQ%{原消费者组名}</code></td>
+<td></td>
+</tr>
+<tr>
+<td>□ 消费端实现了<strong>幂等</strong>（Redis SETNX 或数据库唯一键）</td>
+<td></td>
+</tr>
+<tr>
+<td>□ 死信处理服务有<strong>告警</strong>机制（钉钉/邮件/企业微信）</td>
+<td></td>
+</tr>
+<tr>
+<td>□ 死信消息<strong>落库</strong>留存，便于人工排查和补偿</td>
+<td></td>
+</tr>
+<tr>
+<td>□ 配置了 DLQ 的 Prometheus 监控告警</td>
+<td></td>
+</tr>
+<tr>
+<td>□ 死信消息默认保留 <strong>3 天</strong>，超时自动清理</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="十二常见问题-faq">十二、常见问题 FAQ</h2>
+<p><strong>Q1：死信队列的 Topic 什么时候被创建？</strong></p>
+<p>A：只有当某个消费者组<strong>确实产生了死信消息</strong>时，RocketMQ 才会动态创建对应的 <code>%DLQ%{consumerGroup}</code> Topic。如果从未产生死信，控制台看不到该 Topic。</p>
+<p><strong>Q2：死信队列的消息能被原消费者组消费吗？</strong></p>
+<p>A：<strong>不能</strong>。死信消息不会再次进入原 Topic 的 ConsumeQueue，必须使用<strong>独立的消费者组</strong>订阅 <code>%DLQ%{consumerGroup}</code> 才能消费。</p>
+<p><strong>Q3：死信消息的 Message ID 会变吗？</strong></p>
+<p>A：<strong>不会变</strong>。无论重试多少次，Message ID 保持不变，这为幂等和追踪提供了便利。</p>
+<p><strong>Q4：广播消费模式支持重试和死信吗？</strong></p>
+<p>A：<strong>不支持</strong>。消息重试只针对<strong>集群消费模式</strong>生效，广播模式下消费失败后消息不会重试，直接丢弃。</p>
+<hr>
+<p>以上就是一套<strong>生产级别的 Spring Boot + RocketMQ 死信队列完整示例</strong>。你可以直接复制代码到项目中，调整 <code>maxReconsumeTimes</code> 和死信处理策略即可投入使用。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    
+<p>❤️ 如果你喜欢这篇文章，请点赞支持！ 👍 同时欢迎关注我的博客，获取更多精彩内容！</p>
+
+<p>本文来自博客园，作者：<a href="https://www.cnblogs.com/sun-10387834/" target="_blank">佛祖让我来巡山</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/sun-10387834/p/21336189" target="_blank">https://www.cnblogs.com/sun-10387834/p/21336189</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-28 09:34">2026-07-28 09:34</span>&nbsp;
+<a href="https://www.cnblogs.com/sun-10387834">佛祖让我来巡山</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(21336189);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsun-10387834%2Fp%2F21336189&amp;targetId=21336189&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
