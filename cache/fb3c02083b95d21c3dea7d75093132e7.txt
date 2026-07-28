@@ -1,0 +1,2487 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/aslanvon/p/22004320" title="发布于 2026-07-28 16:05">
+    
+
+    <span role="heading" aria-level="2"># PostgreSQL 18.3 查询优化器流程：`standard_planner()` 源码导读</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="postgresql-183-查询优化器流程standard_planner-源码导读">PostgreSQL 18.3 查询优化器流程：<code>standard_planner()</code> 源码导读</h1>
+<h2 id="1-文档目标">1. 文档目标</h2>
+<p>本文按照 PostgreSQL 18.3 中 <code>standard_planner()</code> 的执行顺序，讲解默认查询优化器从 <code>Query</code> 到 <code>PlannedStmt</code> 的完整流程：</p>
+<blockquote>
+<p><strong>版本说明：</strong> 本文以 PostgreSQL 官方源码标签<br>
+<a href="https://github.com/postgres/postgres/tree/REL_18_3" target="_blank" rel="noopener nofollow"><code>REL_18_3</code></a> 为准。<br>
+该版本的 <code>planner()</code> 和 <code>standard_planner()</code> 都是四参数形式。开发分支中的<br>
+函数签名、Hook 或辅助字段可能已经变化，阅读时不要把不同版本源码混在一起。</p>
+</blockquote>
+<pre><code class="language-text">1. 初始化 PlannerGlobal
+        ↓
+2. 判断是否允许并行规划
+        ↓
+3. 计算 tuple_fraction
+        ↓
+4. 调用 subquery_planner()
+        ↓
+5. 获得最终 RelOptInfo
+        ↓
+6. 选择最优 Path
+        ↓
+7. Path 转换为 Plan
+        ↓
+8. 处理游标和调试 Gather
+        ↓
+9. 完成 Param 和子计划处理
+        ↓
+10. 修正计划中的引用
+        ↓
+11. 构造 PlannedStmt
+        ↓
+12. 设置 JIT 标志
+        ↓
+13. 清理并返回
+</code></pre>
+<p>需要先明确：<code>standard_planner()</code> 是默认优化器的总调度函数，但它并不亲自实现所有算法。关系代数层面的逻辑变换、基表访问路径生成、连接顺序枚举、成本计算和上层操作规划，会继续委托给其他函数。</p>
+<p>本文重点回答以下问题：</p>
+<ul>
+<li><code>standard_planner()</code> 的输入为什么已经是 <code>Query</code>？</li>
+<li><code>PlannerGlobal</code> 和 <code>PlannerInfo</code> 有什么区别？</li>
+<li>关系代数等价变换发生在哪里？</li>
+<li><code>subquery_planner()</code> 做什么，返回什么？</li>
+<li><code>subquery_planner()</code> 返回时是否已经产生最优 Path？</li>
+<li><code>RelOptInfo</code> 是什么？</li>
+<li>为什么 <code>UPPERREL_FINAL</code> 是完整查询候选实现的最终容器？</li>
+<li>最优 Path 由哪个函数选择？</li>
+<li><code>Path</code> 转换成 <code>Plan</code> 到底转换了什么？</li>
+<li><code>Partial Path</code>、<code>Gather</code> 和 <code>Gather Merge</code> 在流程中的位置是什么？</li>
+<li>Param、SubPlan、<code>extParam</code> 和 <code>allParam</code> 为什么需要最后处理？</li>
+<li><code>set_plan_references()</code> 为什么在 <code>create_plan()</code> 之后？</li>
+<li><code>PlannedStmt</code> 为什么不能只用一个 <code>Plan *</code> 代替？</li>
+<li>JIT 为什么在计划选定后才决定？</li>
+</ul>
+<hr>
+<h2 id="2-standard_planner-位于整个-sql-流程的什么位置">2. <code>standard_planner()</code> 位于整个 SQL 流程的什么位置</h2>
+<p><code>standard_planner()</code> 并不是 SQL 进入 PostgreSQL 后调用的第一个函数。在进入优化器之前，SQL 已经完成词法分析、语法分析、语义分析和查询重写。</p>
+<p>简单查询协议的主调用链可以概括为：</p>
+<pre><code class="language-text">exec_simple_query()
+    ↓
+pg_parse_query()
+    ↓
+raw_parser()
+    ↓
+RawStmt / SelectStmt
+    ↓
+pg_analyze_and_rewrite_fixedparams()
+    ├── parse_analyze_fixedparams()
+    └── pg_rewrite_query()
+    ↓
+一个或多个 Query
+    ↓
+pg_plan_queries()
+    ↓
+pg_plan_query()
+    ↓
+planner()
+    ↓
+standard_planner()
+</code></pre>
+<p>主要源码位置：</p>
+<pre><code class="language-text">src/backend/tcop/postgres.c
+    exec_simple_query()
+    pg_parse_query()
+    pg_analyze_and_rewrite_fixedparams()
+    pg_plan_queries()
+
+src/backend/optimizer/plan/planner.c
+    planner()
+    standard_planner()
+    subquery_planner()
+    grouping_planner()
+</code></pre>
+<p>因此，<code>standard_planner()</code> 的参数：</p>
+<pre><code class="language-c">Query *parse
+</code></pre>
+<p>不是原始语法树，而是经过语义分析和规则重写的查询树。</p>
+<p>可以把主要数据转换记成：</p>
+<pre><code class="language-text">SQL 字符串
+    ↓
+RawStmt / SelectStmt       原始语法结构
+    ↓
+Query                      已解析表、列、函数和类型的语义查询树
+    ↓
+PlannerInfo / RelOptInfo   优化状态与逻辑关系
+    ↓
+Path                       候选物理实现
+    ↓
+Plan                       最终静态执行计划
+    ↓
+PlannedStmt                完整的语句级规划结果
+    ↓
+PlanState                  执行器运行时状态
+</code></pre>
+<hr>
+<h2 id="3-默认优化器入口">3. 默认优化器入口</h2>
+<p>优化器对外入口是：</p>
+<pre><code class="language-c">PlannedStmt *
+planner(Query *parse,
+        const char *query_string,
+        int cursorOptions,
+        ParamListInfo boundParams)
+</code></pre>
+<p><code>planner()</code> 首先检查扩展是否注册了 <code>planner_hook</code>：</p>
+<pre><code class="language-c">if (planner_hook)
+    result = planner_hook(parse,
+                          query_string,
+                          cursorOptions,
+                          boundParams);
+else
+    result = standard_planner(parse,
+                              query_string,
+                              cursorOptions,
+                              boundParams);
+</code></pre>
+<p>所以需要区分：</p>
+<pre><code class="language-text">planner()
+    优化器公开入口和扩展钩子入口
+
+standard_planner()
+    PostgreSQL 内置默认优化器的总入口
+</code></pre>
+<p>本文讨论的是 <code>standard_planner()</code>。</p>
+<hr>
+<h2 id="4-贯穿全文的示例-sql">4. 贯穿全文的示例 SQL</h2>
+<p>使用下面的查询贯穿整个优化过程：</p>
+<pre><code class="language-sql">SELECT c.region,
+       SUM(o.amount) AS total
+FROM customer AS c
+JOIN orders AS o
+  ON o.customer_id = c.id
+WHERE c.active = true
+  AND o.order_date &gt;= DATE '2026-01-01'
+GROUP BY c.region
+HAVING SUM(o.amount) &gt; 10000
+ORDER BY total DESC
+LIMIT 10;
+</code></pre>
+<p>假设存在：</p>
+<pre><code class="language-text">customer
+    主键索引 customer_pkey(id)
+    索引 customer_active_idx(active)
+
+orders
+    索引 orders_customer_id_idx(customer_id)
+    索引 orders_order_date_idx(order_date)
+</code></pre>
+<p>该查询包含：</p>
+<pre><code class="language-text">两个基本表
+两个过滤条件
+一个等值连接
+聚合
+HAVING
+排序
+LIMIT
+</code></pre>
+<p>因此可以观察优化器的主要阶段。</p>
+<p>它进入 <code>standard_planner()</code> 时，<code>Query</code> 大致表示：</p>
+<pre><code class="language-text">Query
+├── commandType = CMD_SELECT
+├── hasAggs = true
+├── rtable
+│   ├── customer
+│   ├── orders
+│   └── customer JOIN orders
+├── jointree
+│   ├── JoinExpr
+│   │   └── o.customer_id = c.id
+│   └── quals
+│       ├── c.active = true
+│       └── o.order_date &gt;= DATE '2026-01-01'
+├── targetList
+│   ├── c.region
+│   └── SUM(o.amount)
+├── groupClause
+│   └── c.region
+├── havingQual
+│   └── SUM(o.amount) &gt; 10000
+├── sortClause
+│   └── total DESC
+└── limitCount
+    └── 10
+</code></pre>
+<hr>
+<h2 id="5-阅读前必须掌握的六个数据结构">5. 阅读前必须掌握的六个数据结构</h2>
+<h2 id="51-query">5.1 <code>Query</code></h2>
+<p><code>Query</code> 描述查询的语义：</p>
+<pre><code class="language-text">访问哪些关系
+输出哪些表达式
+FROM 和 JOIN 是什么
+WHERE、HAVING 条件是什么
+是否有聚合、窗口函数或子查询
+是否有排序、DISTINCT 和 LIMIT
+</code></pre>
+<p>它回答的是：</p>
+<blockquote>
+<p>查询想得到什么结果？</p>
+</blockquote>
+<p>它不回答：</p>
+<blockquote>
+<p>应该使用 Seq Scan 还是 Index Scan？应该使用 Hash Join 还是 Nested Loop？</p>
+</blockquote>
+<hr>
+<h2 id="52-plannerglobal">5.2 <code>PlannerGlobal</code></h2>
+<p><code>PlannerGlobal</code> 表示一次完整 <code>planner()</code> 调用共享的全局状态。</p>
+<p>一条 SQL 可能包含多个 Query 层级：</p>
+<pre><code class="language-text">顶层 Query
+├── CTE Query
+├── FROM 子查询
+└── SubLink Query
+</code></pre>
+<p>每个 Query 层级有自己的 <code>PlannerInfo</code>，但它们共享同一个 <code>PlannerGlobal</code>。</p>
+<hr>
+<h2 id="53-plannerinfo">5.3 <code>PlannerInfo</code></h2>
+<p><code>PlannerInfo</code> 表示一个 Query 层级的规划上下文：</p>
+<pre><code class="language-text">当前 Query
+父 Query 的 PlannerInfo
+当前查询层级
+基本表 RelOptInfo 数组
+JOIN RelOptInfo
+EquivalenceClass
+RestrictInfo
+Upper RelOptInfo
+候选 Path
+</code></pre>
+<p>关系是：</p>
+<pre><code class="language-text">PlannerGlobal
+├── PlannerInfo：顶层 Query，query_level = 1
+├── PlannerInfo：一级子查询，query_level = 2
+└── PlannerInfo：二级子查询，query_level = 3
+</code></pre>
+<hr>
+<h2 id="54-reloptinfo">5.4 <code>RelOptInfo</code></h2>
+<p><code>RelOptInfo</code> 表示一个逻辑关系或逻辑结果。</p>
+<p>它可能代表：</p>
+<pre><code class="language-text">一张基本表
+多张表连接后的结果
+聚合后的结果
+窗口计算后的结果
+排序后的结果
+完整查询的最终结果
+</code></pre>
+<p>同一个 <code>RelOptInfo</code> 中保存能够产生相同逻辑结果的不同 Path。</p>
+<hr>
+<h2 id="55-path">5.5 <code>Path</code></h2>
+<p><code>Path</code> 表示一种候选物理实现：</p>
+<pre><code class="language-text">SeqScan Path
+IndexPath
+BitmapHeapPath
+NestPath
+HashPath
+MergePath
+AggPath
+SortPath
+GatherPath
+LimitPath
+</code></pre>
+<p>这里需要区分“图中的候选路径名称”和“源码中的独立 C 结构体”。例如，<br>
+顺序扫描候选通常是一个 <code>pathtype = T_SeqScan</code> 的通用 <code>Path</code>，并不存在<br>
+名为 <code>SeqScanPath</code> 的独立结构体；聚合通常使用 <code>AggPath</code>，再通过<br>
+<code>aggstrategy</code> 区分 <code>AGG_HASHED</code>、<code>AGG_SORTED</code> 等策略。本文的结构图会尽量<br>
+使用源码中的真实名称，并在必要时用空格分开的概念标签辅助阅读。</p>
+<p>Path 主要服务于优化器，保存：</p>
+<pre><code class="language-text">startup_cost
+total_cost
+rows
+pathkeys
+参数化信息
+并行属性
+子 Path
+</code></pre>
+<hr>
+<h2 id="56-plan-和-plannedstmt">5.6 <code>Plan</code> 和 <code>PlannedStmt</code></h2>
+<p><code>Plan</code> 是执行器能理解的静态计划节点：</p>
+<pre><code class="language-text">SeqScan
+IndexScan
+NestLoop
+HashJoin
+MergeJoin
+Agg
+Sort
+Gather
+Limit
+</code></pre>
+<p><code>PlannedStmt</code> 是语句级容器：</p>
+<pre><code class="language-text">PlannedStmt
+├── 主 Plan Tree
+├── SubPlan
+├── 最终 rtable
+├── 权限信息
+├── 行锁信息
+├── 分区裁剪信息
+├── 参数类型
+├── 计划缓存依赖
+├── 并行模式信息
+└── JIT 标志
+</code></pre>
+<hr>
+<h1 id="6-standard_planner-的-13-步流程">6. <code>standard_planner()</code> 的 13 步流程</h1>
+<h2 id="第-1-步初始化-plannerglobal">第 1 步：初始化 <code>PlannerGlobal</code></h2>
+<p>核心代码：</p>
+<pre><code class="language-c">glob = makeNode(PlannerGlobal);
+</code></pre>
+<p>随后初始化大量全局字段：</p>
+<pre><code class="language-c">glob-&gt;boundParams = boundParams;
+glob-&gt;subplans = NIL;
+glob-&gt;subpaths = NIL;
+glob-&gt;subroots = NIL;
+glob-&gt;rewindPlanIDs = NULL;
+glob-&gt;finalrtable = NIL;
+glob-&gt;partPruneInfos = NIL;
+glob-&gt;relationOids = NIL;
+glob-&gt;invalItems = NIL;
+glob-&gt;paramExecTypes = NIL;
+glob-&gt;parallelModeNeeded = false;
+glob-&gt;partition_directory = NULL;
+</code></pre>
+<h3 id="611-为什么要有全局对象">6.1.1 为什么要有全局对象</h3>
+<p>如果查询包含子查询：</p>
+<pre><code class="language-sql">SELECT *
+FROM orders
+WHERE amount &gt; (
+    SELECT AVG(amount)
+    FROM order_history
+);
+</code></pre>
+<p>可能形成：</p>
+<pre><code class="language-text">PlannerGlobal
+├── 顶层 PlannerInfo：orders
+└── 子查询 PlannerInfo：order_history
+</code></pre>
+<p>两个 Query 层级需要共同维护：</p>
+<pre><code class="language-text">subplans
+subroots
+PARAM_EXEC 类型
+最终范围表
+关系依赖
+分区裁剪信息
+</code></pre>
+<p>如果全部放进某个局部 <code>PlannerInfo</code>，跨 Query 层级的子计划和参数就难以统一管理。</p>
+<h3 id="612-重要字段分组">6.1.2 重要字段分组</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>boundParams</code></td>
+<td>已知的外部参数值</td>
+</tr>
+<tr>
+<td><code>subplans</code></td>
+<td>最终产生的子计划</td>
+</tr>
+<tr>
+<td><code>subpaths</code></td>
+<td>子计划对应的 Path</td>
+</tr>
+<tr>
+<td><code>subroots</code></td>
+<td>子计划对应的 <code>PlannerInfo</code></td>
+</tr>
+<tr>
+<td><code>finalrtable</code></td>
+<td>所有 Query 层级合并后的最终范围表</td>
+</tr>
+<tr>
+<td><code>paramExecTypes</code></td>
+<td>内部 <code>PARAM_EXEC</code> 参数类型</td>
+</tr>
+<tr>
+<td><code>partPruneInfos</code></td>
+<td>执行期分区裁剪信息</td>
+</tr>
+<tr>
+<td><code>relationOids</code></td>
+<td>计划依赖的关系 OID</td>
+</tr>
+<tr>
+<td><code>invalItems</code></td>
+<td>计划缓存失效依赖</td>
+</tr>
+<tr>
+<td><code>rewindPlanIDs</code></td>
+<td>需要支持 rewind 的子计划</td>
+</tr>
+<tr>
+<td><code>partition_directory</code></td>
+<td>规划期间的分区描述缓存</td>
+</tr>
+</tbody>
+</table>
+<h3 id="613-本步骤的输入和输出">6.1.3 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    boundParams
+
+输出：
+    一个初始化完成的 PlannerGlobal
+</code></pre>
+<p>本步骤没有生成 Path，也没有进行关系代数重写。</p>
+<hr>
+<h2 id="第-2-步判断是否允许并行规划">第 2 步：判断是否允许并行规划</h2>
+<p>首先执行低成本检查：</p>
+<pre><code class="language-c">if ((cursorOptions &amp; CURSOR_OPT_PARALLEL_OK) != 0 &amp;&amp;
+    IsUnderPostmaster &amp;&amp;
+    parse-&gt;commandType == CMD_SELECT &amp;&amp;
+    !parse-&gt;hasModifyingCTE &amp;&amp;
+    max_parallel_workers_per_gather &gt; 0 &amp;&amp;
+    !IsParallelWorker())
+</code></pre>
+<p>条件含义：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CURSOR_OPT_PARALLEL_OK</code></td>
+<td>调用方允许考虑并行计划</td>
+</tr>
+<tr>
+<td><code>IsUnderPostmaster</code></td>
+<td>当前是正常服务器后端进程</td>
+</tr>
+<tr>
+<td><code>CMD_SELECT</code></td>
+<td>当前是可并行考虑的查询命令</td>
+</tr>
+<tr>
+<td><code>!hasModifyingCTE</code></td>
+<td>没有修改数据的 CTE</td>
+</tr>
+<tr>
+<td><code>max_parallel_workers_per_gather &gt; 0</code></td>
+<td>配置允许使用 worker</td>
+</tr>
+<tr>
+<td><code>!IsParallelWorker()</code></td>
+<td>当前进程本身不是 worker</td>
+</tr>
+</tbody>
+</table>
+<p>低成本检查通过后，再遍历 Query 树：</p>
+<pre><code class="language-c">glob-&gt;maxParallelHazard =
+    max_parallel_hazard(parse);
+
+glob-&gt;parallelModeOK =
+    glob-&gt;maxParallelHazard != PROPARALLEL_UNSAFE;
+</code></pre>
+<p><code>max_parallel_hazard()</code> 会检查：</p>
+<pre><code class="language-text">targetList
+WHERE 和 JOIN 条件
+HAVING
+函数调用
+子查询
+CTE
+</code></pre>
+<p>函数和表达式可能是：</p>
+<pre><code class="language-text">PROPARALLEL_SAFE
+PROPARALLEL_RESTRICTED
+PROPARALLEL_UNSAFE
+</code></pre>
+<h3 id="621-parallelmodeok-不等于最终一定并行">6.2.1 <code>parallelModeOK</code> 不等于最终一定并行</h3>
+<pre><code class="language-c">glob-&gt;parallelModeOK = true;
+</code></pre>
+<p>只表示：</p>
+<blockquote>
+<p>后续允许生成和比较 Parallel Path。</p>
+</blockquote>
+<p>是否最终选择并行计划，还要取决于：</p>
+<pre><code class="language-text">Parallel Path 是否能够生成
+计划是否 parallel_safe
+worker 数量
+parallel_setup_cost
+parallel_tuple_cost
+并行方案总成本
+</code></pre>
+<h3 id="622-本步骤的输入和输出">6.2.2 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    Query *parse
+    cursorOptions
+    并行相关 GUC
+
+输出：
+    glob-&gt;maxParallelHazard
+    glob-&gt;parallelModeOK
+    glob-&gt;parallelModeNeeded 的初始值
+</code></pre>
+<p>本步骤只判断并行资格，不生成 Gather，也不选择并行计划。</p>
+<hr>
+<h2 id="第-3-步计算-tuple_fraction">第 3 步：计算 <code>tuple_fraction</code></h2>
+<p>核心代码：</p>
+<pre><code class="language-c">if (cursorOptions &amp; CURSOR_OPT_FAST_PLAN)
+{
+    tuple_fraction = cursor_tuple_fraction;
+
+    if (tuple_fraction &gt;= 1.0)
+        tuple_fraction = 0.0;
+    else if (tuple_fraction &lt;= 0.0)
+        tuple_fraction = 1e-10;
+}
+else
+{
+    tuple_fraction = 0.0;
+}
+</code></pre>
+<h3 id="631-tuple_fraction-的含义">6.3.1 <code>tuple_fraction</code> 的含义</h3>
+<p><code>tuple_fraction</code> 表示：</p>
+<blockquote>
+<p>调用方预计会消费最终结果中的多少元组。</p>
+</blockquote>
+<p>它不是：</p>
+<pre><code class="language-text">WHERE 条件选择率
+表过滤后剩余比例
+JOIN 选择率
+</code></pre>
+<p>一般含义：</p>
+<pre><code class="language-text">tuple_fraction = 0
+    预计读取全部结果
+
+0 &lt; tuple_fraction &lt; 1
+    预计读取结果的一部分，数值表示比例
+
+tuple_fraction &gt;= 1
+    在部分内部场景中表示预计读取的绝对行数
+</code></pre>
+<p>普通查询通常从：</p>
+<pre><code class="language-c">tuple_fraction = 0.0;
+</code></pre>
+<p>开始，也就是优先考虑完整执行的 <code>total_cost</code>。</p>
+<p><code>LIMIT</code> 会在后续规划过程中进一步影响结果消费目标。游标也可以通过 <code>CURSOR_OPT_FAST_PLAN</code> 使用 <code>cursor_tuple_fraction</code>，但游标不是本文重点。</p>
+<h3 id="632-为什么它会改变最优-path">6.3.2 为什么它会改变最优 Path</h3>
+<p>Path 同时具有：</p>
+<pre><code class="language-c">startup_cost;
+total_cost;
+</code></pre>
+<p>只读取部分结果时，近似成本为：</p>
+<pre><code class="language-text">fractional_cost
+    = startup_cost
+    + fraction × (total_cost - startup_cost)
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">Path A：启动快，但完整执行慢
+startup_cost = 5
+total_cost   = 1000
+
+Path B：启动慢，但完整执行快
+startup_cost = 100
+total_cost   = 500
+</code></pre>
+<p>读取全部结果时选择 B；只读取很少结果时可能选择 A。</p>
+<h3 id="633-贯穿示例">6.3.3 贯穿示例</h3>
+<p>示例查询包含：</p>
+<pre><code class="language-sql">LIMIT 10
+</code></pre>
+<p>虽然 <code>standard_planner()</code> 初始可能设置：</p>
+<pre><code class="language-c">tuple_fraction = 0.0;
+</code></pre>
+<p>但 <code>grouping_planner()</code> 处理 <code>LIMIT</code> 时，会利用预计总行数和 <code>limitCount</code> 调整规划目标，更重视能够快速得到前 10 行的有序 Path。</p>
+<h3 id="634-本步骤的输入和输出">6.3.4 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    cursorOptions
+    cursor_tuple_fraction
+
+输出：
+    tuple_fraction
+</code></pre>
+<p>本步骤不生成 Path，只确定后续成本选择的目标。</p>
+<hr>
+<h2 id="第-4-步调用-subquery_planner">第 4 步：调用 <code>subquery_planner()</code></h2>
+<p>核心代码：</p>
+<pre><code class="language-c">root = subquery_planner(glob,
+                        parse,
+                        NULL,
+                        false,
+                        tuple_fraction,
+                        NULL);
+</code></pre>
+<p>这是 <code>standard_planner()</code> 中最重要的一步。</p>
+<h3 id="641-subquery_planner-的作用">6.4.1 <code>subquery_planner()</code> 的作用</h3>
+<p>它负责：</p>
+<blockquote>
+<p>对一个完整 Query 层级进行逻辑预处理和物理优化，返回该层级的 <code>PlannerInfo</code>。</p>
+</blockquote>
+<p>返回值是：</p>
+<pre><code class="language-c">PlannerInfo *root;
+</code></pre>
+<p>它不是：</p>
+<pre><code class="language-text">Plan
+PlannedStmt
+最终 best_path
+</code></pre>
+<p>第一次调用时：</p>
+<pre><code class="language-c">parent_root == NULL
+</code></pre>
+<p>所以处理的是顶层 Query，而不是子查询。</p>
+<p>遇到真正的子 Query 时，规划器会再次调用 <code>subquery_planner()</code>，并设置：</p>
+<pre><code class="language-text">parent_root != NULL
+query_level = parent_root-&gt;query_level + 1
+</code></pre>
+<h3 id="642-第-4-步内部主调用链">6.4.2 第 4 步内部主调用链</h3>
+<p>可以将它概括为：</p>
+<pre><code class="language-text">subquery_planner()
+    │
+    ├── 创建 PlannerInfo
+    ├── 处理 CTE 和 SubLink
+    ├── 子查询提升
+    ├── 表达式预处理
+    ├── 外连接化简
+    ├── 继承和分区展开
+    │
+    ▼
+grouping_planner()
+    │
+    ├── 普通关系规划
+    ├── GROUP BY / Aggregate
+    ├── Window
+    ├── DISTINCT
+    ├── ORDER BY
+    └── LIMIT
+    │
+    ▼
+query_planner()
+    │
+    ├── 建立基本表 RelOptInfo
+    ├── 分解 WHERE 和 JOIN 条件
+    ├── 建立 RestrictInfo
+    ├── 建立 EquivalenceClass
+    ├── 生成基本表 Path
+    └── 枚举连接关系和 Join Path
+</code></pre>
+<h3 id="643-关系代数等价变换在哪里">6.4.3 关系代数等价变换在哪里</h3>
+<p>在 13 步流程中，关系代数相关逻辑主要集中在第 4 步。</p>
+<p>但还需要区分进入 <code>standard_planner()</code> 前的 Query Rewriter：</p>
+<pre><code class="language-text">进入 standard_planner() 之前：
+    pg_rewrite_query()
+    负责视图、Rule System 和 RLS 展开
+
+第 4 步 subquery_planner()：
+    子查询提升
+    SubLink 转 JOIN
+    表达式简化
+    简单 UNION ALL 展开
+    外连接化简
+
+第 4 步内部 query_planner()：
+    谓词分解
+    等价类构造
+    隐含条件推导
+
+第 4 步内部 Join Search：
+    利用连接交换律和结合律枚举合法连接顺序
+</code></pre>
+<p>典型逻辑变换包括：</p>
+<pre><code class="language-text">EXISTS SubLink
+    → Semi Join
+
+可以安全提升的 FROM 子查询
+    → 合并到父 Query
+
+LEFT JOIN + 拒绝 NULL 的 WHERE 条件
+    → Inner Join
+
+a.id = b.id，b.id = 10
+    → 推导 a.id = 10
+</code></pre>
+<p>PostgreSQL 并不会为每个连接顺序复制一棵 Query 树。不同连接顺序会在后续表示为同一个 JOIN <code>RelOptInfo</code> 中的不同 Path。</p>
+<h3 id="644-基本表-path-生成">6.4.4 基本表 Path 生成</h3>
+<p><code>query_planner()</code> 最终会进入：</p>
+<pre><code class="language-text">make_one_rel()
+    ↓
+set_base_rel_sizes()
+    ↓
+set_base_rel_pathlists()
+</code></pre>
+<p>对 <code>customer</code> 可能生成：</p>
+<pre><code class="language-text">RelOptInfo(customer)
+├── SeqScan Path
+├── IndexPath(customer_active_idx)
+└── BitmapHeapPath
+</code></pre>
+<p>对 <code>orders</code> 可能生成：</p>
+<pre><code class="language-text">RelOptInfo(orders)
+├── SeqScan Path
+├── IndexPath(orders_order_date_idx)
+├── IndexPath(orders_customer_id_idx)
+└── BitmapHeapPath
+</code></pre>
+<p>每个 Path 的成本由对应的 <code>cost_xxx()</code> 计算。</p>
+<h3 id="645-连接顺序和连接方法枚举">6.4.5 连接顺序和连接方法枚举</h3>
+<p>两个表时可能生成：</p>
+<pre><code class="language-text">RelOptInfo({customer, orders})
+├── HashPath
+├── NestPath
+└── MergePath
+</code></pre>
+<p>更多表时，标准动态规划搜索按关系集合大小逐层进行：</p>
+<pre><code class="language-text">Level 1
+{A} {B} {C}
+
+Level 2
+{A,B} {A,C} {B,C}
+
+Level 3
+{A,B,C}
+</code></pre>
+<p>主要调用链：</p>
+<pre><code class="language-text">make_one_rel()
+    ↓
+make_rel_from_joinlist()
+    ↓
+standard_join_search()
+    ↓
+join_search_one_level()
+    ↓
+add_paths_to_joinrel()
+</code></pre>
+<p>外连接、半连接、反连接和 LATERAL 依赖会通过 <code>SpecialJoinInfo</code> 等结构限制连接顺序，不能随意应用交换律和结合律。</p>
+<h3 id="646-partial-path-的位置">6.4.6 <code>Partial Path</code> 的位置</h3>
+<p>普通完整 Path 保存在：</p>
+<pre><code class="language-c">rel-&gt;pathlist;
+</code></pre>
+<p>并行 Partial Path 保存在：</p>
+<pre><code class="language-c">rel-&gt;partial_pathlist;
+</code></pre>
+<p>Partial Path 执行一次只产生关系结果的一部分，多个 worker 的结果通过：</p>
+<pre><code class="language-text">Gather
+Gather Merge
+</code></pre>
+<p>组合成完整结果。</p>
+<p>典型结构：</p>
+<pre><code class="language-text">GatherPath
+└── Partial SeqScan Path
+</code></pre>
+<p>需要区分三个属性：</p>
+<pre><code class="language-text">parallel_safe
+    允许在 worker 中执行
+
+parallel_aware
+    节点知道并行环境并协调工作划分
+
+partial_pathlist
+    每个执行者只产生部分结果的候选 Path
+</code></pre>
+<p><code>parallel_safe</code> 的 Path 不一定是 Partial Path。</p>
+<h3 id="647-聚合排序和-limit-的-upper-path">6.4.7 聚合、排序和 LIMIT 的 Upper Path</h3>
+<p>示例查询还会继续产生：</p>
+<pre><code class="language-text">UPPERREL_GROUP_AGG
+├── AggPath (AGG_HASHED)
+└── AggPath (AGG_SORTED)
+
+UPPERREL_ORDERED
+├── SortPath
+├── IncrementalSortPath
+└── 已经满足排序要求的 Path
+
+UPPERREL_FINAL
+└── LimitPath 或最终完成 Path
+</code></pre>
+<h3 id="648-subquery_planner-是否已经生成最优-path">6.4.8 <code>subquery_planner()</code> 是否已经生成最优 Path</h3>
+<p>准确答案是：</p>
+<blockquote>
+<p>它已经生成并剪枝候选 Path，也通常已经为各个 <code>RelOptInfo</code> 记录最便宜的启动 Path 和总成本 Path，但顶层最终使用的 <code>best_path</code> 在返回后才明确选出。</p>
+</blockquote>
+<p>返回时已经完成：</p>
+<pre><code class="language-text">Path 生成
+成本计算
+add_path() 剪枝
+set_cheapest() 记录 cheapest Path
+Upper RelOptInfo 构造
+</code></pre>
+<p>但 <code>standard_planner()</code> 仍要执行：</p>
+<pre><code class="language-c">get_cheapest_fractional_path()
+</code></pre>
+<p>根据最终 <code>tuple_fraction</code> 选出顶层 Path。</p>
+<h3 id="649-本步骤的输入和输出">6.4.9 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    PlannerGlobal
+    Query
+    tuple_fraction
+    父查询 PlannerInfo
+
+输出：
+    PlannerInfo *root
+
+root 内部已经包含：
+    基本表 RelOptInfo
+    JOIN RelOptInfo
+    Upper RelOptInfo
+    RestrictInfo
+    EquivalenceClass
+    剪枝后的候选 Path
+</code></pre>
+<hr>
+<h2 id="第-5-步获得最终-reloptinfo">第 5 步：获得最终 <code>RelOptInfo</code></h2>
+<p>核心代码：</p>
+<pre><code class="language-c">final_rel =
+    fetch_upper_rel(root,
+                    UPPERREL_FINAL,
+                    NULL);
+</code></pre>
+<h3 id="651-reloptinfo-是什么">6.5.1 <code>RelOptInfo</code> 是什么</h3>
+<p><code>RelOptInfo</code> 表示：</p>
+<blockquote>
+<p>一个逻辑结果，以及产生这个结果的候选物理实现和相关优化信息。</p>
+</blockquote>
+<p>核心字段可以简化为：</p>
+<pre><code class="language-c">RelOptKind  reloptkind;
+Relids      relids;
+double      rows;
+PathTarget *reltarget;
+
+List       *pathlist;
+List       *partial_pathlist;
+
+Path       *cheapest_startup_path;
+Path       *cheapest_total_path;
+List       *cheapest_parameterized_paths;
+</code></pre>
+<p>同一个 <code>RelOptInfo</code> 中的 Path 应当产生相同逻辑结果，但可以具有不同：</p>
+<pre><code class="language-text">成本
+排序属性
+参数化属性
+并行属性
+物理算法
+</code></pre>
+<h3 id="652-三类-reloptinfo">6.5.2 三类 <code>RelOptInfo</code></h3>
+<pre><code class="language-text">基本表 RelOptInfo
+    RelOptInfo(customer)
+
+JOIN RelOptInfo
+    RelOptInfo({customer, orders})
+
+Upper RelOptInfo
+    UPPERREL_GROUP_AGG
+    UPPERREL_ORDERED
+    UPPERREL_FINAL
+</code></pre>
+<h3 id="653-什么是-upperrel_final">6.5.3 什么是 <code>UPPERREL_FINAL</code></h3>
+<p>对于贯穿示例，逻辑阶段大致是：</p>
+<pre><code class="language-text">customer 和 orders 基本关系
+        ↓
+customer JOIN orders
+        ↓
+WHERE 过滤完成
+        ↓
+GROUP BY / Aggregate
+        ↓
+HAVING
+        ↓
+ORDER BY
+        ↓
+LIMIT
+        ↓
+UPPERREL_FINAL
+</code></pre>
+<p><code>UPPERREL_FINAL</code> 表示：</p>
+<blockquote>
+<p>已经满足整条 SQL 最终语义要求的逻辑结果。</p>
+</blockquote>
+<p>它不是物理表，也不是最终 Plan。</p>
+<h3 id="654-完整查询候选执行方式的最终容器怎么理解">6.5.4 “完整查询候选执行方式的最终容器”怎么理解</h3>
+<p>假设 <code>final_rel-&gt;pathlist</code> 中保留两个顶层 Path：</p>
+<pre><code class="language-text">候选 A
+LimitPath
+└── SortPath
+    └── AggPath (AGG_HASHED)
+        └── HashPath
+            ├── SeqScan Path (customer)
+            └── SeqScan Path (orders)
+</code></pre>
+<pre><code class="language-text">候选 B
+LimitPath
+└── IncrementalSortPath
+    └── AggPath (AGG_SORTED)
+        └── NestPath
+            ├── IndexPath(customer)
+            └── IndexPath(orders)
+</code></pre>
+<p>每个顶层 Path 都通过子 Path 指针形成一棵完整 Path Tree。沿着其中任何一个顶层 Path 向下遍历，都能得到从最终输出到底层扫描的端到端实现。</p>
+<p>因此：</p>
+<pre><code class="language-text">final_rel
+    是完整查询逻辑结果的 RelOptInfo
+
+final_rel-&gt;pathlist
+    保存经过剪枝后仍然有价值的完整候选 Path 根节点
+</code></pre>
+<p>这里的“所有候选”不是历史上生成过的每一个 Path。<code>add_path()</code> 已经删除被完全支配的方案。</p>
+<h3 id="655-fetch_upper_rel-做了什么">6.5.5 <code>fetch_upper_rel()</code> 做了什么</h3>
+<p>概念上：</p>
+<pre><code class="language-text">在 root 的 Upper Relation 集合中，
+查找 kind = UPPERREL_FINAL 的 RelOptInfo。
+</code></pre>
+<p><code>fetch_upper_rel()</code> 具有获取或创建 Upper RelOptInfo 的能力，但在这里，<code>grouping_planner()</code> 已经创建并填充了最终关系，所以主要是在取回它。</p>
+<p>第三个参数为：</p>
+<pre><code class="language-c">NULL
+</code></pre>
+<p>表示这个最终 Upper Relation 不再按某个具体基本表集合区分；当前 Query 层级通常只有一个最终输出关系。</p>
+<h3 id="656-本步骤的输入和输出">6.5.6 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    PlannerInfo *root
+
+输出：
+    RelOptInfo *final_rel
+
+final_rel 中包含：
+    最终输出 PathTarget
+    最终结果行数估计
+    完整查询候选 Path 根节点
+</code></pre>
+<p>本步骤只是取得最终关系，不重新执行 Path 搜索。</p>
+<hr>
+<h2 id="第-6-步选择最优-path">第 6 步：选择最优 Path</h2>
+<p>核心代码：</p>
+<pre><code class="language-c">best_path =
+    get_cheapest_fractional_path(final_rel,
+                                 tuple_fraction);
+</code></pre>
+<p>最终顶层选择函数是：</p>
+<pre><code class="language-c">get_cheapest_fractional_path()
+</code></pre>
+<p>但最优 Path 的形成经历四个阶段：</p>
+<pre><code class="language-text">cost_xxx()
+    计算候选成本
+        ↓
+add_path()
+    删除被支配候选
+        ↓
+set_cheapest()
+    记录每个 RelOptInfo 的 cheapest Path
+        ↓
+get_cheapest_fractional_path()
+    选择完整查询最终 Path
+</code></pre>
+<h3 id="661-成本如何产生">6.6.1 成本如何产生</h3>
+<p>典型成本函数：</p>
+<pre><code class="language-text">cost_seqscan()
+cost_index()
+cost_bitmap_heap_scan()
+
+initial_cost_nestloop()
+final_cost_nestloop()
+
+initial_cost_hashjoin()
+final_cost_hashjoin()
+
+initial_cost_mergejoin()
+final_cost_mergejoin()
+
+cost_sort()
+cost_incremental_sort()
+cost_agg()
+cost_gather()
+cost_gather_merge()
+</code></pre>
+<p>每个 Path 保存：</p>
+<pre><code class="language-c">path-&gt;startup_cost;
+path-&gt;total_cost;
+path-&gt;rows;
+</code></pre>
+<p>这些是估算成本，不是实际毫秒数。</p>
+<h3 id="662-add_path-如何剪枝">6.6.2 <code>add_path()</code> 如何剪枝</h3>
+<p>新 Path 通过：</p>
+<pre><code class="language-c">add_path(rel, new_path);
+</code></pre>
+<p>尝试加入：</p>
+<pre><code class="language-c">rel-&gt;pathlist;
+</code></pre>
+<p>核心源码位置：</p>
+<pre><code class="language-text">src/backend/optimizer/util/pathnode.c
+    compare_path_costs_fuzzily()
+    add_path_precheck()
+    add_path()
+    add_partial_path_precheck()
+    add_partial_path()
+    set_cheapest()
+</code></pre>
+<p>这里的剪枝不是“只留下 <code>total_cost</code> 最低的 Path”，而是维护一组：</p>
+<blockquote>
+<p>在成本、排序、参数化、行数和并行安全性等维度上互不支配的 Path。</p>
+</blockquote>
+<p>这组候选可以理解为 Path 的 Pareto Frontier（帕累托前沿）。</p>
+<p>每次加入新 Path 时，<code>add_path()</code> 会把它和 <code>rel-&gt;pathlist</code> 中已经存在的<br>
+Path 逐个比较：</p>
+<pre><code class="language-text">新 Path 被旧 Path 支配
+    ↓
+丢弃 new_path
+
+新 Path 支配旧 Path
+    ↓
+删除 old_path，保留 new_path
+
+双方各有优势
+    ↓
+两个 Path 都保留
+</code></pre>
+<p>函数内部使用两个关键标志：</p>
+<pre><code class="language-c">bool accept_new = true;
+bool remove_old = false;
+</code></pre>
+<p>其中：</p>
+<pre><code class="language-text">accept_new = false
+    已经找到一个能够支配 new_path 的旧 Path
+
+remove_old = true
+    new_path 能够支配当前 old_path
+</code></pre>
+<p>一个新 Path 可能同时支配并删除多个旧 Path。</p>
+<h3 id="663-剪枝比较哪些维度">6.6.3 剪枝比较哪些维度</h3>
+<p><code>add_path()</code> 综合比较：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Path 中的信息</th>
+<th>哪一方更有优势</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>被禁用节点数</td>
+<td><code>disabled_nodes</code></td>
+<td>越少越好</td>
+</tr>
+<tr>
+<td>启动成本</td>
+<td><code>startup_cost</code></td>
+<td>越小越好</td>
+</tr>
+<tr>
+<td>总成本</td>
+<td><code>total_cost</code></td>
+<td>越小越好</td>
+</tr>
+<tr>
+<td>排序能力</td>
+<td><code>pathkeys</code></td>
+<td>能满足更多有用顺序更好</td>
+</tr>
+<tr>
+<td>外部参数依赖</td>
+<td><code>PATH_REQ_OUTER(path)</code></td>
+<td>依赖集合越小，适用范围越广</td>
+</tr>
+<tr>
+<td>输出行数</td>
+<td><code>rows</code></td>
+<td>在其他条件不差时越少越好</td>
+</tr>
+<tr>
+<td>并行安全性</td>
+<td><code>parallel_safe</code></td>
+<td><code>true</code> 比 <code>false</code> 更有价值</td>
+</tr>
+</tbody>
+</table>
+<p><code>disabled_nodes</code> 是高优先级比较维度。例如用户设置：</p>
+<pre><code class="language-sql">SET enable_seqscan = off;
+</code></pre>
+<p>并不意味着优化器完全不能生成顺序扫描，而是使用被禁用节点的 Path 会带有<br>
+更高的 <code>disabled_nodes</code>。只要存在不使用被禁用节点的可行 Path，它就会优先。</p>
+<h3 id="664-成本采用模糊比较">6.6.4 成本采用模糊比较</h3>
+<p>成本比较主要通过：</p>
+<pre><code class="language-c">compare_path_costs_fuzzily(new_path,
+                           old_path,
+                           STD_FUZZ_FACTOR);
+</code></pre>
+<p>其中：</p>
+<pre><code class="language-c">#define STD_FUZZ_FACTOR 1.01
+</code></pre>
+<p>这表示约 1% 以内的成本差异可以被视为“模糊相等”。这样做能够：</p>
+<pre><code class="language-text">避免浮点误差导致计划不稳定
+避免为没有实际意义的微小成本差异保留大量 Path
+降低优化器的时间和内存开销
+</code></pre>
+<p>返回值有四种：</p>
+<pre><code class="language-text">COSTS_EQUAL
+    启动成本和总成本都近似相同
+
+COSTS_BETTER1
+    第一个 Path 在成本上支配第二个
+
+COSTS_BETTER2
+    第二个 Path 在成本上支配第一个
+
+COSTS_DIFFERENT
+    一个启动成本更好，另一个总成本更好
+</code></pre>
+<p>例如：</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th style="text-align: right"><code>startup_cost</code></th>
+<th style="text-align: right"><code>total_cost</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Index Path</td>
+<td style="text-align: right">2</td>
+<td style="text-align: right">130</td>
+</tr>
+<tr>
+<td>SeqScan Path</td>
+<td style="text-align: right">20</td>
+<td style="text-align: right">100</td>
+</tr>
+</tbody>
+</table>
+<p>Index Path 更快产生第一批元组，SeqScan Path 读取全部结果的成本更低。<br>
+双方不能互相支配，所以都会保留：</p>
+<pre><code class="language-text">Index Path
+    适合 LIMIT、游标或只消费少量结果
+
+SeqScan Path
+    适合读取完整结果
+</code></pre>
+<p>这也是为什么剪枝阶段不能只保留 <code>cheapest_total_path</code>。</p>
+<h3 id="665-排序能力为什么会阻止剪枝">6.6.5 排序能力为什么会阻止剪枝</h3>
+<p>成本比较之后，<code>add_path()</code> 通过：</p>
+<pre><code class="language-c">compare_pathkeys(new_path_pathkeys,
+                 old_path_pathkeys);
+</code></pre>
+<p>比较两个 Path 的排序能力，可能得到：</p>
+<pre><code class="language-text">PATHKEYS_EQUAL
+PATHKEYS_BETTER1
+PATHKEYS_BETTER2
+PATHKEYS_DIFFERENT
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">Path A
+    total_cost = 100
+    无序
+
+Path B
+    total_cost = 105
+    已按 total DESC 排序
+</code></pre>
+<p>虽然 Path B 略贵，但它可能直接满足示例查询：</p>
+<pre><code class="language-sql">ORDER BY total DESC
+LIMIT 10;
+</code></pre>
+<p>如果删除 Path B，后续可能必须在 Path A 上增加：</p>
+<pre><code class="language-text">SortPath
+└── Path A
+</code></pre>
+<p>因此，只要 Path B 的排序能力有后续价值，它就可能继续保留。</p>
+<p>如果一个 Path 按 <code>(a)</code> 排序，另一个按 <code>(b)</code> 排序，两种顺序互不包含，<br>
+<code>compare_pathkeys()</code> 会返回 <code>PATHKEYS_DIFFERENT</code>，通常两个 Path 都会保留。</p>
+<h3 id="666-参数化-path-怎么比较">6.6.6 参数化 Path 怎么比较</h3>
+<p>参数化 Path 通过：</p>
+<pre><code class="language-c">PATH_REQ_OUTER(path)
+</code></pre>
+<p>记录执行它之前必须由哪些外部关系提供参数。</p>
+<p>例如：</p>
+<pre><code class="language-text">普通 SeqScan Path
+    required_outer = {}
+
+参数化 orders IndexPath
+    required_outer = {customer}
+</code></pre>
+<p>参数化 <code>orders</code> IndexPath 只有获得当前 <code>customer.id</code> 后才能执行：</p>
+<pre><code class="language-text">NestPath
+├── customer Path
+└── parameterized orders IndexPath
+    Index Cond: orders.customer_id = customer.id
+</code></pre>
+<p>参数依赖集合越小，通常代表适用范围越广。但参数化更强的 Path 可能已经应用<br>
+更多连接条件，因此会产生更少的行。<code>add_path()</code> 需要同时比较：</p>
+<pre><code class="language-text">required_outer 的包含关系
+rows
+成本
+并行安全性
+</code></pre>
+<p>参数集合的比较使用：</p>
+<pre><code class="language-c">bms_subset_compare(PATH_REQ_OUTER(new_path),
+                   PATH_REQ_OUTER(old_path));
+</code></pre>
+<p>可能得到：</p>
+<pre><code class="language-text">BMS_EQUAL
+BMS_SUBSET1
+BMS_SUBSET2
+BMS_DIFFERENT
+</code></pre>
+<p>为了限制参数化 Path 数量，PostgreSQL 在 <code>add_path()</code> 中把参数化 Path<br>
+的 <code>pathkeys</code> 当成 <code>NIL</code>：</p>
+<pre><code class="language-c">new_path_pathkeys =
+    new_path-&gt;param_info ? NIL : new_path-&gt;pathkeys;
+</code></pre>
+<p>也就是说，参数化 Path 不能只依靠排序优势战胜其他参数化 Path。</p>
+<h3 id="667-一个-path-何时能够支配另一个">6.6.7 一个 Path 何时能够支配另一个</h3>
+<p>忽略源码中的特殊分支后，可以近似理解为：</p>
+<pre><code class="language-c">if (new_cost &lt;= old_cost &amp;&amp;
+    new_pathkeys &gt;= old_pathkeys &amp;&amp;
+    new_required_outer ⊆ old_required_outer &amp;&amp;
+    new_rows &lt;= old_rows &amp;&amp;
+    new_parallel_safe &gt;= old_parallel_safe)
+{
+    remove(old_path);
+}
+</code></pre>
+<p>这里的 <code>&lt;=</code> 和 <code>&gt;=</code> 是“在对应维度上不差”，不是简单的数值比较。</p>
+<p>假设已有：</p>
+<pre><code class="language-text">Old Path
+    startup_cost   = 10
+    total_cost     = 100
+    pathkeys       = (a)
+    required_outer = {}
+    rows           = 1000
+    parallel_safe  = true
+</code></pre>
+<p>新生成：</p>
+<pre><code class="language-text">New Path
+    startup_cost   = 8
+    total_cost     = 90
+    pathkeys       = (a)
+    required_outer = {}
+    rows           = 900
+    parallel_safe  = true
+</code></pre>
+<p>新 Path：</p>
+<pre><code class="language-text">启动成本更低
+总成本更低
+排序相同
+外部依赖相同
+输出行数更少
+并行安全性相同
+</code></pre>
+<p>所以 <code>New Path</code> 支配 <code>Old Path</code>，旧 Path 会被删除。</p>
+<p>如果新 Path 改为按 <code>(b)</code> 排序，那么两个排序可能互不包含。即使新 Path<br>
+成本更低，也不能保证它对所有后续操作都更好，两个 Path 可能都要保留。</p>
+<h3 id="668-add_path_precheck构造-path-前的预剪枝">6.6.8 <code>add_path_precheck()</code>：构造 Path 前的预剪枝</h3>
+<p>某些候选 Path 的完整创建和成本计算本身就比较昂贵。PostgreSQL 可以先调用：</p>
+<pre><code class="language-c">add_path_precheck(parent_rel,
+                  disabled_nodes,
+                  startup_cost,
+                  total_cost,
+                  pathkeys,
+                  required_outer);
+</code></pre>
+<p>此时甚至还没有完整的 Path 对象，只使用：</p>
+<pre><code class="language-text">成本下界
+排序信息
+参数化信息
+disabled_nodes
+</code></pre>
+<p>进行快速判断：</p>
+<pre><code class="language-text">已有 Path 显然在成本、排序和参数化上支配该候选
+        ↓
+add_path_precheck() 返回 false
+        ↓
+不再构造完整 Path
+        ↓
+节省成本计算、内存和比较时间
+</code></pre>
+<p>预检查不能证明候选一定胜出，只能尽早排除明显不可能胜出的候选。</p>
+<p><code>rel-&gt;pathlist</code> 会按：</p>
+<pre><code class="language-text">disabled_nodes
+    ↓
+total_cost
+</code></pre>
+<p>排序，低成本 Path 靠前。这样 <code>add_path_precheck()</code> 和 <code>add_path()</code> 更容易<br>
+尽早找到支配者并退出比较。</p>
+<h3 id="669-partial-path-如何剪枝">6.6.9 Partial Path 如何剪枝</h3>
+<p>并行 Partial Path 保存在：</p>
+<pre><code class="language-c">rel-&gt;partial_pathlist;
+</code></pre>
+<p>使用：</p>
+<pre><code class="language-c">add_partial_path(rel, new_path);
+</code></pre>
+<p>进行剪枝。</p>
+<p>与普通 <code>add_path()</code> 相比，它主要比较：</p>
+<pre><code class="language-text">disabled_nodes
+total_cost
+pathkeys
+</code></pre>
+<p>通常不需要比较：</p>
+<pre><code class="language-text">startup_cost
+参数化
+rows
+</code></pre>
+<p>原因是 PostgreSQL 18.3 不生成参数化 Partial Path；并行候选通常预计执行<br>
+到完成，而且同一关系的 Partial Path 应产生相同的完整结果行数。</p>
+<p>Partial Path 必须满足：</p>
+<pre><code class="language-c">new_path-&gt;parallel_safe == true;
+parent_rel-&gt;consider_parallel == true;
+</code></pre>
+<p>相应的快速预检查函数是：</p>
+<pre><code class="language-c">add_partial_path_precheck();
+</code></pre>
+<h3 id="6610-被淘汰的-path-怎么处理">6.6.10 被淘汰的 Path 怎么处理</h3>
+<p>如果新 Path 被旧 Path 支配：</p>
+<pre><code class="language-text">accept_new = false
+    ↓
+不加入 rel-&gt;pathlist
+    ↓
+释放 new_path
+</code></pre>
+<p>如果新 Path 支配旧 Path：</p>
+<pre><code class="language-text">remove_old = true
+    ↓
+从 rel-&gt;pathlist 删除 old_path
+    ↓
+释放 old_path
+</code></pre>
+<p>源码通常只释放 Path 节点本身，不递归释放共享的子结构，因为表达式、<br>
+PathTarget、子 Path 或 Query 树节点可能被其他候选共同引用。</p>
+<p><code>IndexPath</code> 还有特殊处理：它可能被 <code>BitmapHeapPath</code> 引用，因此被淘汰时<br>
+不能像普通 Path 一样立即 <code>pfree()</code>。</p>
+<h3 id="6611-set_cheapest-做什么">6.6.11 <code>set_cheapest()</code> 做什么</h3>
+<p>完成候选生成后：</p>
+<pre><code class="language-c">set_cheapest(rel);
+</code></pre>
+<p>设置：</p>
+<pre><code class="language-c">rel-&gt;cheapest_startup_path;
+rel-&gt;cheapest_total_path;
+rel-&gt;cheapest_parameterized_paths;
+</code></pre>
+<p>含义：</p>
+<pre><code class="language-text">cheapest_startup_path
+    最快返回第一批元组
+
+cheapest_total_path
+    返回全部元组的总成本最低
+
+cheapest_parameterized_paths
+    不同外部参数依赖下值得保留的 Path
+</code></pre>
+<p>需要特别区分：</p>
+<pre><code class="language-text">add_path()
+    剪掉被支配的候选，维护互不支配的 pathlist
+
+set_cheapest()
+    不负责主要剪枝，从幸存 Path 中记录几个代表性最优 Path
+</code></pre>
+<h3 id="6612-最终分数成本选择">6.6.12 最终分数成本选择</h3>
+<p>如果：</p>
+<pre><code class="language-c">tuple_fraction &lt;= 0.0
+</code></pre>
+<p>通常直接使用：</p>
+<pre><code class="language-c">final_rel-&gt;cheapest_total_path;
+</code></pre>
+<p>如果只预计读取部分结果，则近似比较：</p>
+<pre><code class="language-text">fractional_cost
+    = startup_cost
+    + tuple_fraction × (total_cost - startup_cost)
+</code></pre>
+<p>绝对行数形式会先根据预计总行数换算成比例。</p>
+<h3 id="6613-贯穿示例">6.6.13 贯穿示例</h3>
+<p>示例中有：</p>
+<pre><code class="language-sql">ORDER BY total DESC
+LIMIT 10
+</code></pre>
+<p>可能存在：</p>
+<pre><code class="language-text">Path A
+    HashAggregate 后全局 Sort
+    startup_cost 较高
+    total_cost 较低
+
+Path B
+    利用已有顺序或 Incremental Sort
+    startup_cost 较低
+    total_cost 略高
+</code></pre>
+<p>如果只需要前 10 行，B 可能胜出；如果需要全部结果，A 可能胜出。</p>
+<p>把整个候选生成和剪枝过程串起来：</p>
+<pre><code class="language-text">cost_xxx()
+    估算候选成本
+        ↓
+add_path_precheck()
+    构造前排除明显失败者
+        ↓
+create_xxx_path()
+    创建完整候选 Path
+        ↓
+add_path()
+    维护互不支配的 rel-&gt;pathlist
+        ↓
+set_cheapest()
+    记录最低启动成本、最低总成本和参数化代表 Path
+        ↓
+get_cheapest_fractional_path()
+    根据 tuple_fraction 选择顶层 best_path
+</code></pre>
+<p>最重要的结论是：</p>
+<blockquote>
+<p>PostgreSQL 剪掉的是“无论后续如何使用都不可能更优”的 Path，而不是<br>
+简单剪掉当前 <code>total_cost</code> 不是最低的 Path。</p>
+</blockquote>
+<h3 id="6614-本步骤的输入和输出">6.6.14 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    final_rel-&gt;pathlist
+    final_rel-&gt;cheapest_total_path
+    tuple_fraction
+
+输出：
+    Path *best_path
+</code></pre>
+<p>此时仍然是 Path，不是执行器 Plan。</p>
+<hr>
+<h2 id="第-7-步将-path-转换为-plan">第 7 步：将 Path 转换为 Plan</h2>
+<p>核心代码：</p>
+<pre><code class="language-c">top_plan = create_plan(root, best_path);
+</code></pre>
+<h3 id="671-为什么-path-不能直接执行">6.7.1 为什么 Path 不能直接执行</h3>
+<p>Path 主要包含优化器信息：</p>
+<pre><code class="language-text">RelOptInfo
+成本
+PathKey
+参数化关系集合
+候选子 Path
+</code></pre>
+<p>执行器需要更具体的信息：</p>
+<pre><code class="language-text">输出 targetlist
+过滤 qual
+扫描哪个关系
+使用哪个索引
+JOIN 条件
+Hash 条件
+排序列编号和操作符
+左右子 Plan
+</code></pre>
+<p>因此转换不是强制类型转换，而是重新递归构造 Plan Tree。</p>
+<h3 id="672-常见映射">6.7.2 常见映射</h3>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Plan</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SeqScan Path（<code>Path</code>，<code>pathtype = T_SeqScan</code>）</td>
+<td><code>SeqScan</code></td>
+</tr>
+<tr>
+<td><code>IndexPath</code></td>
+<td><code>IndexScan</code> 或 <code>IndexOnlyScan</code></td>
+</tr>
+<tr>
+<td><code>BitmapHeapPath</code></td>
+<td><code>BitmapHeapScan</code></td>
+</tr>
+<tr>
+<td><code>NestPath</code></td>
+<td><code>NestLoop</code></td>
+</tr>
+<tr>
+<td><code>HashPath</code></td>
+<td><code>HashJoin</code></td>
+</tr>
+<tr>
+<td><code>MergePath</code></td>
+<td><code>MergeJoin</code></td>
+</tr>
+<tr>
+<td><code>AggPath</code></td>
+<td><code>Agg</code></td>
+</tr>
+<tr>
+<td><code>SortPath</code></td>
+<td><code>Sort</code></td>
+</tr>
+<tr>
+<td><code>IncrementalSortPath</code></td>
+<td><code>IncrementalSort</code></td>
+</tr>
+<tr>
+<td><code>MemoizePath</code></td>
+<td><code>Memoize</code></td>
+</tr>
+<tr>
+<td><code>GatherPath</code></td>
+<td><code>Gather</code></td>
+</tr>
+<tr>
+<td><code>GatherMergePath</code></td>
+<td><code>GatherMerge</code></td>
+</tr>
+<tr>
+<td><code>AppendPath</code></td>
+<td><code>Append</code></td>
+</tr>
+<tr>
+<td><code>MaterialPath</code></td>
+<td><code>Material</code></td>
+</tr>
+<tr>
+<td><code>LimitPath</code></td>
+<td><code>Limit</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="673-贯穿示例的转换">6.7.3 贯穿示例的转换</h3>
+<p>假设胜出的 Path Tree 是：</p>
+<pre><code class="language-text">LimitPath
+└── SortPath
+    └── AggPath (AGG_HASHED)
+        └── HashPath
+            ├── IndexPath(customer_active_idx)
+            └── SeqScan Path (orders)
+</code></pre>
+<p><code>create_plan()</code> 可能转换为：</p>
+<pre><code class="language-text">Limit
+└── Sort
+    └── HashAggregate
+        └── HashJoin
+            ├── IndexScan(customer_active_idx)
+            └── Hash
+                └── SeqScan(orders)
+</code></pre>
+<p>Hash Join 的内侧会增加执行器需要的 <code>Hash</code> 节点。</p>
+<h3 id="674-转换过程中补充的信息">6.7.4 转换过程中补充的信息</h3>
+<p><code>create_plan()</code> 会：</p>
+<pre><code class="language-text">把 PathTarget 转成 Plan.targetlist
+把 RestrictInfo 中的表达式取出并分配到 qual
+区分 joinqual、hashclauses 和 mergeclauses
+建立 lefttree 和 righttree
+确定 scanrelid 和 indexid
+建立 Index Cond
+建立 NestLoopParam
+将 PathKey 转成 Sort 的列编号、操作符和 NULL 顺序
+复制成本、行数、宽度和并行属性
+</code></pre>
+<h3 id="675-只转换胜出的-path">6.7.5 只转换胜出的 Path</h3>
+<p>如果：</p>
+<pre><code class="language-text">final_rel-&gt;pathlist
+├── Path A
+├── Path B
+└── Path C
+</code></pre>
+<p>最终：</p>
+<pre><code class="language-c">best_path = Path B;
+</code></pre>
+<p>通常只将 Path B 及其子 Path 转换为 Plan，其他候选不会转换。</p>
+<h3 id="676-pathplan-和-planstate">6.7.6 Path、Plan 和 PlanState</h3>
+<pre><code class="language-text">Path
+    优化器候选物理实现
+
+Plan
+    最终静态执行计划
+
+PlanState
+    执行器运行时状态
+</code></pre>
+<p>完整转换：</p>
+<pre><code class="language-text">Path
+    ↓ create_plan()
+Plan
+    ↓ ExecutorStart() / ExecInitNode()
+PlanState
+    ↓ ExecutorRun()
+实际执行
+</code></pre>
+<h3 id="677-本步骤的输入和输出">6.7.7 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    PlannerInfo *root
+    Path *best_path
+
+输出：
+    Plan *top_plan
+</code></pre>
+<hr>
+<h2 id="第-8-步处理游标和调试-gather">第 8 步：处理游标和调试 Gather</h2>
+<p>这一部分发生在最优 Path 已经转换为 Plan 之后，主要是额外执行包装，不是主优化流程。</p>
+<h3 id="681-可滚动游标">6.8.1 可滚动游标</h3>
+<pre><code class="language-c">if (cursorOptions &amp; CURSOR_OPT_SCROLL)
+{
+    if (!ExecSupportsBackwardScan(top_plan))
+        top_plan =
+            materialize_finished_plan(top_plan);
+}
+</code></pre>
+<p>如果 <code>SCROLL</code> 游标要求反向读取，而 Plan Tree 不支持 backward scan，则增加：</p>
+<pre><code class="language-text">Material
+└── 原 top_plan
+</code></pre>
+<p><code>Material</code> 将结果保存到 tuplestore，使游标可以向前、向后和重新读取。</p>
+<h3 id="682-调试-gather">6.8.2 调试 Gather</h3>
+<p><code>debug_parallel_query</code> 开启时，如果最终 Plan：</p>
+<pre><code class="language-c">top_plan-&gt;parallel_safe
+</code></pre>
+<p>PostgreSQL 可以强制包装：</p>
+<pre><code class="language-text">Gather
+└── 原 top_plan
+</code></pre>
+<p>这个 Gather：</p>
+<pre><code class="language-text">不参与正常 Path 成本竞争
+不以性能优化为目标
+主要用于验证 parallel_safe 标记是否正确
+</code></pre>
+<p>为什么在选出最优计划后才添加：</p>
+<pre><code class="language-text">避免改变正常 Path 搜索
+避免调试 Gather 因成本高而被淘汰
+只测试正常情况下真正胜出的完整 Plan
+此时才能访问 targetlist、initPlan 等具体 Plan 信息
+</code></pre>
+<p>需要区分：</p>
+<pre><code class="language-text">正常 Gather
+    来源于 GatherPath
+    在 Path 阶段参与成本比较
+
+调试 Gather
+    在 Plan 生成后强制包装
+    仅用于测试
+</code></pre>
+<h3 id="683-gather-和-gather-merge">6.8.3 Gather 和 Gather Merge</h3>
+<pre><code class="language-text">Gather
+    收集 worker 输出，不保证顺序
+
+Gather Merge
+    对多个按同一 PathKey 排序的 worker 输出做多路归并，
+    保持全局顺序
+</code></pre>
+<p>这部分只需要知道其存在即可，主查询优化仍然发生在前面的 Path 阶段。</p>
+<hr>
+<h2 id="第-9-步完成-param-和子计划处理">第 9 步：完成 Param 和子计划处理</h2>
+<p>核心代码：</p>
+<pre><code class="language-c">if (glob-&gt;paramExecTypes != NIL)
+{
+    forboth(lp, glob-&gt;subplans,
+            lr, glob-&gt;subroots)
+    {
+        Plan *subplan = (Plan *) lfirst(lp);
+        PlannerInfo *subroot =
+            lfirst_node(PlannerInfo, lr);
+
+        SS_finalize_plan(subroot, subplan);
+    }
+
+    SS_finalize_plan(root, top_plan);
+}
+</code></pre>
+<p>核心函数：</p>
+<pre><code class="language-c">SS_finalize_plan()
+</code></pre>
+<h3 id="691-两类主要-param">6.9.1 两类主要 Param</h3>
+<pre><code class="language-text">PARAM_EXTERN
+    客户端提供的参数，例如 SQL 中的 $1
+
+PARAM_EXEC
+    计划内部在节点之间传递的执行参数
+</code></pre>
+<p><code>glob-&gt;paramExecTypes</code> 记录内部参数类型：</p>
+<pre><code class="language-text">PARAM_EXEC 0：integer
+PARAM_EXEC 1：numeric
+PARAM_EXEC 2：date
+</code></pre>
+<p>执行器使用：</p>
+<pre><code class="language-c">ParamExecData[]
+</code></pre>
+<p>保存这些值。</p>
+<h3 id="692-initplan-示例">6.9.2 InitPlan 示例</h3>
+<pre><code class="language-sql">SELECT *
+FROM orders
+WHERE amount &gt; (
+    SELECT AVG(amount)
+    FROM order_history
+);
+</code></pre>
+<p>不相关子查询可能成为 InitPlan：</p>
+<pre><code class="language-text">InitPlan
+└── Aggregate
+    └── SeqScan(order_history)
+</code></pre>
+<p>它先计算：</p>
+<pre><code class="language-text">PARAM_EXEC 0 = AVG(amount)
+</code></pre>
+<p>主计划使用：</p>
+<pre><code class="language-text">SeqScan(orders)
+└── Filter: amount &gt; PARAM_EXEC 0
+</code></pre>
+<h3 id="693-参数化-nested-loop-示例">6.9.3 参数化 Nested Loop 示例</h3>
+<pre><code class="language-text">Nested Loop
+├── SeqScan(customer)
+└── IndexScan(orders_customer_id_idx)
+</code></pre>
+<p>每个外表元组将：</p>
+<pre><code class="language-text">customer.id
+    ↓
+NestLoopParam
+    ↓
+PARAM_EXEC 0
+    ↓
+orders.customer_id = PARAM_EXEC 0
+</code></pre>
+<p>参数变化后，内侧 IndexScan 需要重新扫描。</p>
+<h3 id="694-extparam-和-allparam">6.9.4 <code>extParam</code> 和 <code>allParam</code></h3>
+<p>每个 Plan 节点包含：</p>
+<pre><code class="language-c">Bitmapset *extParam;
+Bitmapset *allParam;
+</code></pre>
+<p>概念上：</p>
+<pre><code class="language-text">extParam
+    当前 Plan 子树依赖、但由子树外部提供的 PARAM_EXEC
+
+allParam
+    影响当前节点或其子树的全部执行参数集合
+</code></pre>
+<p>执行器根据这些集合判断：</p>
+<pre><code class="language-text">参数变化后哪些节点需要 ExecReScan()
+</code></pre>
+<h3 id="695-为什么先处理子计划">6.9.5 为什么先处理子计划</h3>
+<p>执行顺序是：</p>
+<pre><code class="language-text">先 SS_finalize_plan(subplan)
+再 SS_finalize_plan(main plan)
+</code></pre>
+<p>因为主计划可能引用子计划产生或依赖的参数。只有先完成子计划的参数集合，才能正确计算主计划的 <code>extParam</code> 和 <code>allParam</code>。</p>
+<h3 id="696-本步骤的输入和输出">6.9.6 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    主 Plan Tree
+    glob-&gt;subplans
+    glob-&gt;subroots
+    glob-&gt;paramExecTypes
+
+输出：
+    每个 Plan 节点正确的 extParam 和 allParam
+    完成的 InitPlan/SubPlan 参数依赖
+</code></pre>
+<p>本步骤不改变连接顺序，也不重新选择 Path。</p>
+<hr>
+<h2 id="第-10-步修正计划中的引用">第 10 步：修正计划中的引用</h2>
+<p>核心代码：</p>
+<pre><code class="language-c">top_plan =
+    set_plan_references(root, top_plan);
+</code></pre>
+<p>子计划也需要调用：</p>
+<pre><code class="language-c">lfirst(lp) =
+    set_plan_references(subroot, subplan);
+</code></pre>
+<p>核心源码：</p>
+<pre><code class="language-text">src/backend/optimizer/plan/setrefs.c
+</code></pre>
+<h3 id="6101-为什么需要修正-var">6.10.1 为什么需要修正 Var</h3>
+<p>优化器阶段的 <code>Var</code> 可能表示：</p>
+<pre><code class="language-text">Var(varno = 1, varattno = 2)
+    customer 的第 2 列
+
+Var(varno = 2, varattno = 4)
+    orders 的第 4 列
+</code></pre>
+<p>但执行 JOIN 时，父节点面对的是：</p>
+<pre><code class="language-text">左子计划的 tuple slot
+右子计划的 tuple slot
+</code></pre>
+<p>所以需要转换为：</p>
+<pre><code class="language-text">OUTER_VAR
+    从左侧子计划输出槽读取
+
+INNER_VAR
+    从右侧子计划输出槽读取
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">customer.region
+    ↓
+Var(OUTER_VAR, 左子计划输出列位置)
+
+orders.amount
+    ↓
+Var(INNER_VAR, 右子计划输出列位置)
+</code></pre>
+<p>执行器不需要重新根据表名或关系集合查找列，只需要按 tuple slot 位置读取。</p>
+<h3 id="6102-合并多个-query-层级的-rtable">6.10.2 合并多个 Query 层级的 rtable</h3>
+<p>每个 Query 都有自己的 <code>rtable</code>，且下标从 1 开始：</p>
+<pre><code class="language-text">顶层 Query.rtable
+    1 = customer
+    2 = orders
+
+子 Query.rtable
+    1 = order_history
+</code></pre>
+<p>最终 <code>PlannedStmt</code> 只有一个统一 <code>rtable</code>：</p>
+<pre><code class="language-text">finalrtable
+    1 = customer
+    2 = orders
+    3 = order_history
+</code></pre>
+<p>子计划原来的：</p>
+<pre><code class="language-text">scanrelid = 1
+</code></pre>
+<p>需要调整为：</p>
+<pre><code class="language-text">scanrelid = 3
+</code></pre>
+<p><code>set_plan_references()</code> 会完成这类编号偏移。</p>
+<h3 id="6103-收集最终语句级信息">6.10.3 收集最终语句级信息</h3>
+<p>遍历 Plan Tree 时，会填充：</p>
+<pre><code class="language-c">glob-&gt;finalrtable;
+glob-&gt;finalrteperminfos;
+glob-&gt;finalrowmarks;
+glob-&gt;resultRelations;
+glob-&gt;appendRelations;
+</code></pre>
+<p>这些信息随后进入 <code>PlannedStmt</code>。</p>
+<h3 id="6104-为什么必须在-create_plan-后进行">6.10.4 为什么必须在 <code>create_plan()</code> 后进行</h3>
+<p>在 Path 阶段还没有具体：</p>
+<pre><code class="language-text">Plan targetlist
+lefttree
+righttree
+scanrelid
+JOIN 子节点输出列位置
+</code></pre>
+<p>只有生成 Plan Tree 后，才能确定每个表达式应该从哪个运行时 tuple slot 读取。</p>
+<h3 id="6105-本步骤的输入和输出">6.10.5 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    仍带有规划器引用形式的 Plan Tree
+    当前 Query 层级的 PlannerInfo
+
+输出：
+    执行器可直接使用列引用的 Plan Tree
+    合并后的 finalrtable
+    最终权限、行锁和目标关系信息
+</code></pre>
+<p><code>SS_finalize_plan()</code> 和 <code>set_plan_references()</code> 的区别：</p>
+<pre><code class="language-text">SS_finalize_plan()
+    解决参数由谁产生、谁使用、变化后谁需要重扫
+
+set_plan_references()
+    解决列值从哪个 tuple slot、哪个输出位置读取
+</code></pre>
+<hr>
+<h2 id="第-11-步构造-plannedstmt">第 11 步：构造 <code>PlannedStmt</code></h2>
+<p>核心代码：</p>
+<pre><code class="language-c">result = makeNode(PlannedStmt);
+</code></pre>
+<p>随后将规划结果封装到语句级容器：</p>
+<pre><code class="language-c">result-&gt;commandType = parse-&gt;commandType;
+result-&gt;queryId = parse-&gt;queryId;
+result-&gt;planTree = top_plan;
+result-&gt;subplans = glob-&gt;subplans;
+result-&gt;rtable = glob-&gt;finalrtable;
+result-&gt;partPruneInfos = glob-&gt;partPruneInfos;
+result-&gt;paramExecTypes = glob-&gt;paramExecTypes;
+</code></pre>
+<h3 id="6111-为什么不能只返回-plan-">6.11.1 为什么不能只返回 <code>Plan *</code></h3>
+<p><code>Plan *top_plan</code> 只表示主 Plan Tree。</p>
+<p>执行器还需要：</p>
+<pre><code class="language-text">语句类型
+SubPlan
+最终范围表
+权限信息
+目标关系
+行锁
+分区裁剪
+内部参数类型
+计划缓存依赖
+并行模式
+JIT 标志
+</code></pre>
+<p>所以需要 <code>PlannedStmt</code>。</p>
+<h3 id="6112-主要字段">6.11.2 主要字段</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>commandType</code></td>
+<td>SELECT、INSERT、UPDATE、DELETE 或 MERGE</td>
+</tr>
+<tr>
+<td><code>queryId</code></td>
+<td>查询标识</td>
+</tr>
+<tr>
+<td><code>planTree</code></td>
+<td>主 Plan Tree</td>
+</tr>
+<tr>
+<td><code>subplans</code></td>
+<td>SubPlan 和 InitPlan 对应的计划</td>
+</tr>
+<tr>
+<td><code>rtable</code></td>
+<td>合并后的最终范围表</td>
+</tr>
+<tr>
+<td><code>permInfos</code></td>
+<td>权限检查信息</td>
+</tr>
+<tr>
+<td><code>resultRelations</code></td>
+<td>数据修改目标关系</td>
+</tr>
+<tr>
+<td><code>appendRelations</code></td>
+<td>继承和分区列映射</td>
+</tr>
+<tr>
+<td><code>partPruneInfos</code></td>
+<td>运行时分区裁剪步骤</td>
+</tr>
+<tr>
+<td><code>rowMarks</code></td>
+<td><code>FOR UPDATE</code> 等行锁信息</td>
+</tr>
+<tr>
+<td><code>paramExecTypes</code></td>
+<td><code>PARAM_EXEC</code> 类型</td>
+</tr>
+<tr>
+<td><code>rewindPlanIDs</code></td>
+<td>需要 rewind 的子计划编号</td>
+</tr>
+<tr>
+<td><code>relationOids</code></td>
+<td>计划依赖的关系 OID</td>
+</tr>
+<tr>
+<td><code>invalItems</code></td>
+<td>计划缓存失效依赖</td>
+</tr>
+<tr>
+<td><code>parallelModeNeeded</code></td>
+<td>执行时是否进入并行模式</td>
+</tr>
+<tr>
+<td><code>jitFlags</code></td>
+<td>JIT 执行选项</td>
+</tr>
+</tbody>
+</table>
+<h3 id="6113-计划缓存依赖">6.11.3 计划缓存依赖</h3>
+<p>如果计划使用：</p>
+<pre><code class="language-text">orders_customer_id_idx
+</code></pre>
+<p>随后索引被删除或相关目录对象发生变化，缓存计划必须失效并重新规划。</p>
+<pre><code class="language-c">relationOids;
+invalItems;
+</code></pre>
+<p>帮助计划缓存判断何时需要重新规划。</p>
+<h3 id="6114-本步骤的输入和输出">6.11.4 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    top_plan
+    PlannerGlobal 中收集的全局结果
+    Query 中的命令信息
+
+输出：
+    PlannedStmt *result
+</code></pre>
+<p>本步骤主要是收集、整理和封装，不继续枚举 Path。</p>
+<hr>
+<h2 id="第-12-步设置-jit-标志">第 12 步：设置 JIT 标志</h2>
+<p>首先：</p>
+<pre><code class="language-c">result-&gt;jitFlags = PGJIT_NONE;
+</code></pre>
+<p>满足成本条件后：</p>
+<pre><code class="language-c">if (jit_enabled &amp;&amp;
+    jit_above_cost &gt;= 0 &amp;&amp;
+    top_plan-&gt;total_cost &gt; jit_above_cost)
+{
+    result-&gt;jitFlags |= PGJIT_PERFORM;
+    ...
+}
+</code></pre>
+<h3 id="6121-本步骤没有立即编译机器码">6.12.1 本步骤没有立即编译机器码</h3>
+<p><code>standard_planner()</code> 只设置：</p>
+<pre><code class="language-c">PlannedStmt.jitFlags
+</code></pre>
+<p>真正的 LLVM IR 生成、优化和机器码生成发生在执行阶段。</p>
+<h3 id="6122-主要标志">6.12.2 主要标志</h3>
+<table>
+<thead>
+<tr>
+<th>标志</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PGJIT_PERFORM</code></td>
+<td>启用 JIT 总开关</td>
+</tr>
+<tr>
+<td><code>PGJIT_EXPR</code></td>
+<td>JIT 编译表达式求值</td>
+</tr>
+<tr>
+<td><code>PGJIT_DEFORM</code></td>
+<td>JIT 编译 tuple deforming</td>
+</tr>
+<tr>
+<td><code>PGJIT_INLINE</code></td>
+<td>执行函数内联</td>
+</tr>
+<tr>
+<td><code>PGJIT_OPT3</code></td>
+<td>执行更昂贵的 LLVM 优化</td>
+</tr>
+</tbody>
+</table>
+<h3 id="6123-为什么根据成本决定">6.12.3 为什么根据成本决定</h3>
+<p>JIT 有额外启动开销：</p>
+<pre><code class="language-text">生成 LLVM IR
+执行优化 Pass
+生成机器码
+装载机器码
+</code></pre>
+<p>短 OLTP 查询可能因为编译开销变慢；扫描大量行、执行复杂表达式和聚合的分析查询更可能受益。</p>
+<h3 id="6124-为什么在计划选定后设置">6.12.4 为什么在计划选定后设置</h3>
+<p>判断依据是：</p>
+<pre><code class="language-c">top_plan-&gt;total_cost;
+</code></pre>
+<p>只有完成 Path 搜索、选出 <code>best_path</code> 并创建 Plan 后，才有最终完整计划成本。</p>
+<p>因此：</p>
+<pre><code class="language-text">先选择最优 Path
+再决定如何执行这个 Plan
+</code></pre>
+<p>JIT 标志通常不会触发重新进行连接顺序和访问路径搜索。</p>
+<h3 id="6125-本步骤的输入和输出">6.12.5 本步骤的输入和输出</h3>
+<pre><code class="language-text">输入：
+    top_plan-&gt;total_cost
+    JIT 相关 GUC
+
+输出：
+    result-&gt;jitFlags
+</code></pre>
+<hr>
+<h2 id="第-13-步清理并返回">第 13 步：清理并返回</h2>
+<p>最后：</p>
+<pre><code class="language-c">if (glob-&gt;partition_directory != NULL)
+    DestroyPartitionDirectory(
+        glob-&gt;partition_directory);
+
+return result;
+</code></pre>
+<h3 id="6131-清理分区目录">6.13.1 清理分区目录</h3>
+<p><code>partition_directory</code> 是本次规划期间使用的分区描述缓存：</p>
+<pre><code class="language-text">分区边界
+分区层次
+分区描述
+规划期间重复使用的分区元数据
+</code></pre>
+<p>最终执行器需要的信息已经转换为：</p>
+<pre><code class="language-c">result-&gt;partPruneInfos;
+result-&gt;appendRelations;
+result-&gt;rtable;
+result-&gt;planTree;
+</code></pre>
+<p>所以规划器临时使用的 <code>PartitionDirectory</code> 可以销毁。</p>
+<p>这不会：</p>
+<pre><code class="language-text">删除分区表
+删除 PlannedStmt 的运行时裁剪信息
+破坏最终 Plan Tree
+</code></pre>
+<h3 id="6132-为什么不逐个释放-path-和-reloptinfo">6.13.2 为什么不逐个释放 Path 和 RelOptInfo</h3>
+<p>PostgreSQL 使用 <code>MemoryContext</code> 批量管理内存。</p>
+<p>规划期间产生的大量：</p>
+<pre><code class="language-text">PlannerInfo
+RelOptInfo
+Path
+RestrictInfo
+EquivalenceClass
+</code></pre>
+<p>通常不在这里逐一 <code>pfree()</code>，而是在对应内存上下文生命周期结束时整体释放。</p>
+<p>必须保留：</p>
+<pre><code class="language-text">result
+result-&gt;planTree
+result-&gt;subplans
+result-&gt;rtable
+result-&gt;partPruneInfos
+</code></pre>
+<p>因为它们是最终规划结果的一部分。</p>
+<h3 id="6133-返回后去哪里">6.13.3 返回后去哪里</h3>
+<pre><code class="language-text">standard_planner()
+    ↓
+planner()
+    ↓
+pg_plan_query()
+    ↓
+pg_plan_queries()
+    ↓
+Portal 或 Plan Cache
+    ↓
+QueryDesc
+    ↓
+ExecutorStart()
+    ↓
+ExecInitNode()
+    ↓
+PlanState
+    ↓
+ExecutorRun()
+</code></pre>
+<hr>
+<h1 id="7-贯穿示例的完整数据流">7. 贯穿示例的完整数据流</h1>
+<p>再次观察示例：</p>
+<pre><code class="language-sql">SELECT c.region,
+       SUM(o.amount) AS total
+FROM customer AS c
+JOIN orders AS o
+  ON o.customer_id = c.id
+WHERE c.active = true
+  AND o.order_date &gt;= DATE '2026-01-01'
+GROUP BY c.region
+HAVING SUM(o.amount) &gt; 10000
+ORDER BY total DESC
+LIMIT 10;
+</code></pre>
+<h2 id="71-进入优化器">7.1 进入优化器</h2>
+<pre><code class="language-text">Query
+├── rtable：customer、orders、JOIN
+├── jointree：JOIN + WHERE
+├── targetList：region、SUM(amount)
+├── groupClause：region
+├── havingQual：SUM(amount) &gt; 10000
+├── sortClause：total DESC
+└── limitCount：10
+</code></pre>
+<h2 id="72-基本表优化">7.2 基本表优化</h2>
+<pre><code class="language-text">RelOptInfo(customer)
+├── SeqScan Path
+├── IndexPath(customer_active_idx)
+└── BitmapHeapPath
+</code></pre>
+<pre><code class="language-text">RelOptInfo(orders)
+├── SeqScan Path
+├── IndexPath(orders_order_date_idx)
+├── IndexPath(orders_customer_id_idx)
+└── BitmapHeapPath
+</code></pre>
+<h2 id="73-join-优化">7.3 JOIN 优化</h2>
+<pre><code class="language-text">RelOptInfo({customer, orders})
+├── HashPath
+│   ├── customer Path
+│   └── orders Path
+├── NestPath
+│   ├── customer outer Path
+│   └── parameterized orders IndexPath
+└── MergePath
+    ├── ordered customer Path
+    └── ordered orders Path
+</code></pre>
+<p><code>add_path()</code> 删除被完全支配的方案，<code>set_cheapest()</code> 记录最低启动和最低总成本 Path。</p>
+<h2 id="74-聚合和上层操作">7.4 聚合和上层操作</h2>
+<pre><code class="language-text">UPPERREL_GROUP_AGG
+├── AggPath (AGG_HASHED)
+└── AggPath (AGG_SORTED)
+</code></pre>
+<pre><code class="language-text">UPPERREL_ORDERED
+├── SortPath
+├── IncrementalSortPath
+└── 已有序 Path
+</code></pre>
+<pre><code class="language-text">UPPERREL_FINAL
+└── 完成 LIMIT 和最终投影的 Path
+</code></pre>
+<h2 id="75-最终选择">7.5 最终选择</h2>
+<pre><code class="language-c">final_rel =
+    fetch_upper_rel(root,
+                    UPPERREL_FINAL,
+                    NULL);
+
+best_path =
+    get_cheapest_fractional_path(
+        final_rel,
+        tuple_fraction);
+</code></pre>
+<h2 id="76-转换为-plan">7.6 转换为 Plan</h2>
+<p>假设选择：</p>
+<pre><code class="language-text">LimitPath
+└── SortPath
+    └── AggPath (AGG_HASHED)
+        └── HashPath
+</code></pre>
+<p>转换为：</p>
+<pre><code class="language-text">Limit
+└── Sort
+    └── HashAggregate
+        └── HashJoin
+            ├── IndexScan(customer_active_idx)
+            └── Hash
+                └── SeqScan(orders)
+</code></pre>
+<h2 id="77-最终封装">7.7 最终封装</h2>
+<pre><code class="language-text">PlannedStmt
+├── planTree
+│   └── Limit → Sort → HashAggregate → HashJoin
+├── rtable
+│   ├── customer
+│   └── orders
+├── permInfos
+├── paramExecTypes
+├── relationOids
+├── invalItems
+├── parallelModeNeeded
+└── jitFlags
+</code></pre>
+<hr>
+<h1 id="8-最容易混淆的问题">8. 最容易混淆的问题</h1>
+<h2 id="81-query-是原始语法树吗">8.1 <code>Query</code> 是原始语法树吗</h2>
+<p>不是。</p>
+<pre><code class="language-text">SelectStmt
+    原始语法树
+
+Query
+    经过语义分析后的查询树
+</code></pre>
+<p>进入 <code>standard_planner()</code> 的 <code>Query</code> 通常还已经经过 <code>pg_rewrite_query()</code>。</p>
+<h2 id="82-subquery_planner-只处理子查询吗">8.2 <code>subquery_planner()</code> 只处理子查询吗</h2>
+<p>不是。</p>
+<p>第一次调用处理顶层 Query，遇到子 Query 后再递归处理子查询层级。</p>
+<h2 id="83-subquery_planner-返回最优-path-吗">8.3 <code>subquery_planner()</code> 返回最优 Path 吗</h2>
+<p>它返回：</p>
+<pre><code class="language-c">PlannerInfo *
+</code></pre>
+<p>它已经生成并筛选候选 Path，但最终顶层：</p>
+<pre><code class="language-c">Path *best_path
+</code></pre>
+<p>由 <code>get_cheapest_fractional_path()</code> 在它返回后选出。</p>
+<h2 id="84-reloptinfo-是-path-吗">8.4 <code>RelOptInfo</code> 是 Path 吗</h2>
+<p>不是。</p>
+<pre><code class="language-text">RelOptInfo
+    表示一个逻辑结果，包含多个候选 Path
+
+Path
+    表示产生该逻辑结果的一种物理实现
+</code></pre>
+<h2 id="85-upperrel_final-是最终-plan-吗">8.5 <code>UPPERREL_FINAL</code> 是最终 Plan 吗</h2>
+<p>不是。</p>
+<p>它是最终逻辑结果对应的 <code>RelOptInfo</code>，其中仍然保存候选 Path。</p>
+<h2 id="86-cheapest_total_path-一定是最终-best_path-吗">8.6 <code>cheapest_total_path</code> 一定是最终 <code>best_path</code> 吗</h2>
+<p>不一定。</p>
+<p>如果 <code>tuple_fraction &gt; 0</code>，启动更快的 Path 可能在部分结果成本上更优。</p>
+<h2 id="87-path-tree-和-plan-tree-有什么区别">8.7 Path Tree 和 Plan Tree 有什么区别</h2>
+<pre><code class="language-text">Path Tree
+    用于搜索和成本比较
+
+Plan Tree
+    用于执行器初始化
+</code></pre>
+<p>只有胜出的 Path Tree 会被转换。</p>
+<h2 id="88-partial-path-是否只用于并行">8.8 Partial Path 是否只用于并行</h2>
+<p>在 PostgreSQL 优化器术语中，<code>partial_pathlist</code> 是并行规划专用概念。</p>
+<p>一个 Partial Path 只产生部分结果，需要 Gather 或 Gather Merge 组合。</p>
+<p>但：</p>
+<pre><code class="language-text">parallel_safe Path
+</code></pre>
+<p>不一定是 Partial Path。</p>
+<h2 id="89-正常-gather-和调试-gather-是否相同">8.9 正常 Gather 和调试 Gather 是否相同</h2>
+<p>不同。</p>
+<pre><code class="language-text">正常 Gather
+    来自 GatherPath，参与成本比较
+
+调试 Gather
+    在 Plan 生成后强制包装，只用于 parallel safety 测试
+</code></pre>
+<h2 id="810-set_plan_references-是否还在优化">8.10 <code>set_plan_references()</code> 是否还在优化</h2>
+<p>不是。</p>
+<p>它将规划器形式的引用转换成执行器形式：</p>
+<pre><code class="language-text">表列 Var
+    → OUTER_VAR / INNER_VAR / tuple slot 位置
+
+每个 Query 独立 rtable
+    → PlannedStmt 统一 finalrtable
+</code></pre>
+<h2 id="811-设置-jit-标志是否已经执行-jit">8.11 设置 JIT 标志是否已经执行 JIT</h2>
+<p>没有。</p>
+<p>优化器只设置 <code>jitFlags</code>，真正的 LLVM 编译在执行阶段按需发生。</p>
+<hr>
+<h1 id="9-适合源码跟踪的断点顺序">9. 适合源码跟踪的断点顺序</h1>
+<p>第一轮只观察主流程：</p>
+<pre><code class="language-gdb">break planner
+break standard_planner
+break subquery_planner
+break grouping_planner
+break query_planner
+break make_one_rel
+break create_plan
+</code></pre>
+<p>第二轮观察 Path 生成和选择：</p>
+<pre><code class="language-gdb">break set_base_rel_sizes
+break set_base_rel_pathlists
+break add_path
+break set_cheapest
+break standard_join_search
+break join_search_one_level
+break get_cheapest_fractional_path
+break compare_fractional_path_costs
+</code></pre>
+<p>第三轮观察 Plan 最终化：</p>
+<pre><code class="language-gdb">break SS_finalize_plan
+break set_plan_references
+break DestroyPartitionDirectory
+</code></pre>
+<p>在 <code>get_cheapest_fractional_path()</code> 中重点观察：</p>
+<pre><code class="language-gdb">print tuple_fraction
+print rel-&gt;rows
+print rel-&gt;pathlist
+print rel-&gt;cheapest_startup_path
+print rel-&gt;cheapest_total_path
+</code></pre>
+<p>在 <code>standard_planner()</code> 中重点观察：</p>
+<pre><code class="language-gdb">print parse-&gt;commandType
+print parse-&gt;hasAggs
+print parse-&gt;hasSubLinks
+print glob-&gt;parallelModeOK
+print root-&gt;query_level
+print final_rel-&gt;rows
+print best_path-&gt;startup_cost
+print best_path-&gt;total_cost
+print top_plan-&gt;type
+print result-&gt;jitFlags
+</code></pre>
+<p><code>add_path()</code> 调用次数可能很多，第一次跟踪时可以先禁用，理解基本流程后再单独研究。</p>
+<hr>
+<h1 id="10-推荐源码阅读路线">10. 推荐源码阅读路线</h1>
+<h2 id="第一遍控制流程">第一遍：控制流程</h2>
+<pre><code class="language-text">src/backend/tcop/postgres.c
+    pg_plan_queries()
+    pg_plan_query()
+
+src/backend/optimizer/plan/planner.c
+    planner()
+    standard_planner()
+    subquery_planner()
+    grouping_planner()
+</code></pre>
+<p>目标：</p>
+<pre><code class="language-text">知道 Query 如何进入优化器
+知道每个 Query 层级如何建立 PlannerInfo
+知道最终如何得到 PlannedStmt
+</code></pre>
+<h2 id="第二遍关系与-path-搜索">第二遍：关系与 Path 搜索</h2>
+<pre><code class="language-text">src/backend/optimizer/plan/planmain.c
+    query_planner()
+
+src/backend/optimizer/path/allpaths.c
+    make_one_rel()
+    set_base_rel_sizes()
+    set_base_rel_pathlists()
+    standard_join_search()
+
+src/backend/optimizer/path/joinrels.c
+    join_search_one_level()
+
+src/backend/optimizer/path/joinpath.c
+    add_paths_to_joinrel()
+
+src/backend/optimizer/util/pathnode.c
+    add_path()
+    set_cheapest()
+    create_xxx_path()
+
+src/backend/optimizer/path/costsize.c
+    cost_xxx()
+</code></pre>
+<p>目标：</p>
+<pre><code class="language-text">理解 RelOptInfo
+理解候选 Path 如何生成
+理解连接顺序如何枚举
+理解 Path 如何剪枝和比较
+</code></pre>
+<h2 id="第三遍plan-和执行器交接">第三遍：Plan 和执行器交接</h2>
+<pre><code class="language-text">src/backend/optimizer/plan/createplan.c
+    create_plan()
+
+src/backend/optimizer/plan/subselect.c
+    SS_finalize_plan()
+
+src/backend/optimizer/plan/setrefs.c
+    set_plan_references()
+
+src/backend/executor/execMain.c
+    ExecutorStart()
+    ExecutorRun()
+</code></pre>
+<p>目标：</p>
+<pre><code class="language-text">理解 Path 如何变成 Plan
+理解 Param 和 SubPlan
+理解 Var 如何变成 tuple slot 引用
+理解 Plan 如何初始化为 PlanState
+</code></pre>
+<hr>
+<h1 id="11-最终总结">11. 最终总结</h1>
+<p><code>standard_planner()</code> 本身可以压缩成四次关键数据转换：</p>
+<pre><code class="language-text">Query
+    ↓ subquery_planner()
+PlannerInfo + RelOptInfo + Path
+    ↓ get_cheapest_fractional_path()
+best Path
+    ↓ create_plan()
+Plan Tree
+    ↓ finalize + setrefs + package
+PlannedStmt
+</code></pre>
+<p>13 步的职责可以进一步归纳为：</p>
+<pre><code class="language-text">第 1～3 步
+    建立优化环境和优化目标
+
+第 4 步
+    完成逻辑预处理、关系构造、Path 生成和成本搜索
+
+第 5～6 步
+    取得最终逻辑关系并选出顶层最优 Path
+
+第 7 步
+    把胜出的 Path Tree 转换成 Plan Tree
+
+第 8～10 步
+    补充执行要求、参数依赖和运行时列引用
+
+第 11～13 步
+    封装 PlannedStmt、设置 JIT，并清理规划临时资源
+</code></pre>
+<p>最重要的概念关系是：</p>
+<pre><code class="language-text">Query
+    描述查询要什么
+
+RelOptInfo
+    描述正在优化哪个逻辑结果
+
+Path
+    描述有哪些物理方法可以得到该结果
+
+best_path
+    表示成本模型最终选中的方法
+
+Plan
+    表示执行器可以初始化的静态计划
+
+PlannedStmt
+    表示整条语句完整、可执行、可缓存的规划结果
+</code></pre>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>未经作者同意请勿转载</p>
+<p>本文来自博客园作者：<a href="https://www.cnblogs.com/aslanvon/" target="_blank">aixueforever</a>，原文链接：<a href="https://www.cnblogs.com/aslanvon/p/22004320" target="_blank">https://www.cnblogs.com/aslanvon/p/22004320</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-28 16:05">2026-07-28 16:05</span>&nbsp;
+<a href="https://www.cnblogs.com/aslanvon">aixueforever</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22004320);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Faslanvon%2Fp%2F22004320&amp;targetId=22004320&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
