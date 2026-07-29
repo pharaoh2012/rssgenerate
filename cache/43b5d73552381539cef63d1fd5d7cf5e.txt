@@ -1,0 +1,485 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Qiniu-developer/p/22040565" title="发布于 2026-07-29 15:24">
+    
+
+    <span role="heading" aria-level="2">从 GPT-2 到 Kimi K3：22580 倍规模增长背后的架构演进</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152408217-1782441496.png" alt="从 GPT-2 到 Kimi K3：22580 倍规模增长背后的架构演进" class="desc_img">
+        本文深度解析Kimi K3技术演进路径：从GPT-2出发，历经Linear Attention、DeltaNet、Gated DeltaNet、Kimi Linear，最终抵达2.8万亿参数的Kimi K3。全文以“状态管理”为主线，揭示架构迭代本质
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>这篇内容成本（和 Kimi K3 的建模代码相处了 48 小时）：</p>
+<ul>
+<li>
+<p>40 罐 LaCroix 气泡水；</p>
+</li>
+<li>
+<p>650 毫克咖啡因 ；</p>
+</li>
+<li>
+<p>8 篇论文；</p>
+</li>
+</ul>
+<p>作者 @ali 称可能“折寿 6 个月”才算把 Kimi K3 的整条技术谱系以及每一步是怎么来的彻底吃透。请各位看官谨慎阅读：</p>
+<p><img alt="花絮配图" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729151654796-1943170052.gif" class="lazyload"></p>
+<p>7 月 27 日晚，月之暗面开源了 Kimi K3 的完整权重与技术报告：2.8 万亿参数，四分之三的注意力层由 KDA（Kimi Delta Attention）取代，每 12 层插入一次 Attention Residuals。这几项改动单独看都有论文可循，但要理解它们为什么被组合在一起，得回到更早的地方。</p>
+<p>开发者 @ali 的《22580: From GPT2 to Kimi3, Explained》正是从 GPT-2 出发，沿着 Linear Attention、DeltaNet、Gated DeltaNet、Kimi Linear 一路走到 Kimi K3，回答的是同一个问题：</p>
+<p><strong>从 19 年的 GPT-2 到如今的 Kimi K3，<strong><strong>大模型</strong></strong>架构到底发生了什么变化？</strong></p>
+<p><img alt="1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729151606363-2061314398.jpg" class="lazyload"></p>
+<p>22580——这是 KimiK3（2026）里能装得下的 GPT-2（2019）数量。7 年时间，规模放大了 22580 倍。但这仅仅是……规模的堆叠吗？接下来的内容中，@ali 会沿着通向 KimiK3 的主线，把几个关键的架构演进串起来。</p>
+<p><img alt="2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729151934454-1930263149.jpg" class="lazyload"></p>
+<p>图注：6 种架构总览对比，MHA Transformer / DeltaNet Transformer / Gated DeltaNet Transformer / Gated DeltaNet Transformer (Mamba Hybrid) / Kimi Linear / Kimi K3</p>
+<h3 id="gpt-2这条演进线的起点">GPT-2：这条演进线的起点</h3>
+<p>GPT-2 是一个 decoder-only（仅解码器）架构：</p>
+<pre><code class="language-Python">tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+x = self.transformer.drop(tok_emb + pos_emb)
+for block in self.transformer.h:
+    x = block(x)
+x = self.transformer.ln_f(x)
+logits = self.lm_head(x)
+return logits
+</code></pre>
+<p>输入端会叠加 token embedding 与 positional embedding（位置嵌入）：</p>
+<p><img alt="3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729151944953-1980678631.jpg" class="lazyload"></p>
+<p>图注：输入 "waterloo is the best university in the world. the interns are" 的 tokenize 与 tok_emb + pos_emb 相加过程</p>
+<p>把单个 transformer block 放大来看，是这样的：</p>
+<pre><code class="language-Python">class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+</code></pre>
+<p><img alt="4" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729151955275-1426866699.jpg" class="lazyload"></p>
+<p>图注：GPT-2 block 结构图，含 Self Attention per Head 展开，×12 times</p>
+<p>注意力的计算过程如下：</p>
+<pre><code class="language-Python">B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+# calculate query, key, values for all heads in batch and move head forward to be the batch dim
+q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+# manual implementation of attention
+att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+att = F.softmax(att, dim=-1)
+att = self.attn_dropout(att)
+y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -&gt; (B, nh, T, hs)
+y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+# output projection
+y = self.resid_dropout(self.c_proj(y))
+return y
+</code></pre>
+<p>当最终的 hidden state 矩阵算出来之后，language model head 会把它映射成词表上的 logits。在自回归解码时，选出下一个 token 只需要最后一个位置上的 logits。</p>
+<p>这是 decoder-only 生成方式固有的一处低效：模型为每一个输入位置都算了表示，但每一步解码只用得上最后一个位置的 logits。如果不做缓存，这些计算在生成下一个 token 时还得重来一遍。</p>
+<p><img alt="5" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152007336-1113861737.png" class="lazyload"></p>
+<p>图注：LM Head 将 last_token_vector 映射到词表并采样出 token 的过程</p>
+<p>KV cache 来自一个很直接的观察：把刚生成的 token 拼回输入之后，模型本来要为此前所有 token 重新计算一遍 K、V 投影。把这些向量存下来，就能省掉这份重复劳动。这份存储就是 KV cache。它保留了前 N-1 个 token 的向量，而且大到一定程度就会构成显存带宽（memory bandwidth）瓶颈。</p>
+<p>整体上看，词表约 5 万、12 个 block、12 个 head、embedding 维度 768，作为基线的这个模型大约是 124M 参数。</p>
+<pre><code class="language-Python">vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+n_layer: int = 12
+n_head: int = 12
+n_embd: int = 768
+</code></pre>
+<p>而 2.8 万亿参数的 KimiK3，其参数量大致相当于 22580 个 GPT-2 加在一起。</p>
+<h3 id="linear-attention把完整注意力压缩成状态">Linear Attention：把完整注意力压缩成状态</h3>
+<p>如果说 GPT-2 时代的 Transformer 依靠 attention 保存完整的历史关系，那么 Linear Attention 的核心思路就是：不再保存所有历史 token，而是把历史信息压缩成一个固定大小的状态（state）。</p>
+<p>Softmax attention 的非线性施加在 q·k 乘积之后，这就把每一个 query 和每一个 key 都耦合在了一起。线性注意力换了个做法：对 q 和 k 分别施加一个 feature map（特征映射），比如 ELU+1。这样一来乘法的结合律就重新可用了，不断增长的 K、V 向量集合可以被折叠进一个固定的 D×D 状态里。</p>
+<p>论文里关于 O(N²) 的那套说法，一度让作者犯迷糊。“transformer 每个时间步的开销随当前序列长度的平方增长”这个说法并不成立，而这正是 Flash Attention 解决掉的问题……作者随后才注意到，这篇论文是 2020 年发的。</p>
+<blockquote>
+<p><strong>注</strong>：FlashAttention 优化的是显存 IO 与激活显存占用，并不改变注意力本身 O(N²) 的计算复杂度；末句“这篇论文是 2020 年发的”指的是线性注意力论文（Katharopoulos et al., ICML 2020），而非 FlashAttention（2022）。</p>
+</blockquote>
+<p>在那个时间点上，训练时普遍要把完整的 N×N 注意力矩阵显式构造出来，FlashAttention 还不存在，而作为参考实现的自回归代码往往不带 KV cache，每步都把历史 token 重算一遍。</p>
+<pre><code class="language-Python">def forward(self, x, mask=None, past_kv=None):
+    # x is b,t,d
+    b,t,d=x.shape
+    d_head=d//self.num_heads
+    h=self.num_heads
+    qkv=self.qkv_proj(x)
+    q=qkv[:, :, :d].view(b,t,h,d_head).transpose(1,2)
+    k=qkv[:, :, d:2*d].view(b,t,h,d_head).transpose(1,2)
+    v=qkv[:, :, 2*d:].view(b,t,h,d_head).transpose(1,2)
+    # at prefill, q,k,v have shapes b,h,t,d
+    # at decode, shape is b, h, 1, d
+    # so i cat at the t dimension, dim(2)
+    if past_kv is not None:
+        k_past=past_kv[0]
+        v_past=past_kv[1]
+        k=torch.cat((k_past, k), dim=2)
+        v=torch.cat((v_past, v), dim=2)
+    scores=(q@k.transpose(-1,-2))/math.sqrt(d_head)
+    if past_kv is None: #we're in prefill and need to mask
+        causal_mask=torch.ones(t,t,dtype=bool, device=q.device)
+        causal_mask=torch.triu(causal_mask, diagonal=1)
+        scores=scores.masked_fill(causal_mask, float('-inf'))
+    if mask is not None:
+        scores=scores.masked_fill(~mask, float('-inf'))
+    #get attn (bhtt x bhtd)
+    attn=scores.softmax(-1)#bhtt
+    o=attn@v #bhtd
+    o=o.transpose(1,2).contiguous().view(b,t,d) #b,t,d
+    # use x to get qkv
+    o_proj=self.o_proj(o)
+    past_kv=(k, v)
+    return o_proj, past_kv
+</code></pre>
+<p>配图更容易看清这个过程。每一步解码都要对 HBM 做两次 N×D 的读和两次 1×D 的写，而 KV cache 会随序列长度线性增长，即 O(N)。</p>
+<p><img alt="6" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152019239-719627800.png" class="lazyload"></p>
+<p>图注：With KV Cache —— q/k/v 与 HBM Memory 之间的读写路径</p>
+<p>注意这里读写量之大——而这篇内容把它替换成了：</p>
+<pre><code class="language-Python">def forward(self, x, mask=None, cache=None):
+    # x is b,t,d
+    b,t,d=x.shape
+    d_head=d//self.num_heads
+    h=self.num_heads
+    qkv=self.qkv_proj(x)
+    q=qkv[:, :, :d].view(b,t,h,d_head).transpose(1,2)
+    k=qkv[:, :, d:2*d].view(b,t,h,d_head).transpose(1,2)
+    v=qkv[:, :, 2*d:].view(b,t,h,d_head).transpose(1,2)
+    k=F.elu(k)+1
+    k=k.transpose(-1,-2)
+    q=F.elu(q)+1
+    S,z=cache if cache is not None else (0.0, 0.0)
+    S=S+k@v
+    z=z+k
+    o=q@S #bhtd
+    denom=q@z
+    o_scaled=o/denom
+    o_scaled=o_scaled.transpose(1,2).contiguous().view(b,t,d)
+    o_proj=self.o_proj(o_scaled)
+    cache=(S,z)
+    return o_proj, cache
+</code></pre>
+<p>这里存在一个取舍。具体做法是用 ELU+1 替掉 softmax 里的指数运算，并且在 q 和 k 发生交互之前就分别作用到它们身上。</p>
+<p>两种做法都会对得到的分数做归一化，但线性注意力所用的 feature map 是对 softmax kernel 表达力更弱的一种近似。这种近似会损失保真度，不过实际精度损失有多大，取决于具体架构和负载。</p>
+<p>注意这里仍然要除以 qk 的和，图中为了简洁省略了这一步。从高层看，注意力由三步构成：</p>
+<ol>
+<li>
+<p>把 qk 分数变成非负。线性注意力用 ELU+1，softmax 用指数运算。</p>
+</li>
+<li>
+<p>除以总和做归一化。</p>
+</li>
+<li>
+<p>对 value 做加权平均。</p>
+</li>
+</ol>
+<p>这保留了注意力最基本的契约，只是换用了一个表达力更弱的 feature map 来保证 QK 分数非负。</p>
+<h3 id="deltanet让模型学会更新记忆">DeltaNet：让模型学会更新记忆</h3>
+<p>Linear Attention 解决了长序列的计算成本问题，但也带来了新的挑战：当大量历史信息被压缩进有限的状态中时，模型如何避免不同信息之间互相干扰？</p>
+<blockquote>
+<p><strong>注</strong>：作者从本节起用 cache 指代那个固定大小的 D×D 状态 S，与前文 GPT-2 部分的 KV cache 不是一回事——后者是随序列线性增长的工程缓存，前者是容量恒定的状态。下文出现的 cache 均指后者。</p>
+</blockquote>
+<p>容量有限的 cache 必然要覆盖或融合已经存进去的信息。来自第 i-1 个 token 的状态并没有属于自己的槽位，而是被加到同一个 D×D 矩阵上。于是新的 query 再也无法取回每个历史 token 完全隔离的表示。</p>
+<p>但这个“加法”同时也是效率增益的来源。用累加而不是拼接来更新 cache，避免了它按 O(N) 增长；可正是同一个操作导致了信息互相干扰。DeltaNet 要解决的，就是这种可恢复性的丧失。</p>
+<p><img alt="7" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152033903-2142829134.png" class="lazyload"></p>
+<p>图注：序列长度 2 / 4 / 8 时，状态被反复叠加进同一个 d×d 矩阵</p>
+<p>Schlag 的论文（Fast Weight Programmers）里提到：“当序列长度超出存储容量时，模型可能进入一种超容量（overcapacity）状态。要在这种状态下正常工作，模型应当学会动态地与记忆内容交互，有选择地决定保留哪些 key-value 关联、删除哪些。纯加法式的写入指令可能并不适合这个目的……像式 17 那样，往一个容量有限的记忆里无休止地添加新关联，终究会撞到上限。”</p>
+<p>让线性注意力显得有吸引力的那个场景——N 远大于 D——恰恰也暴露了它最主要的局限。一旦状态超出有效容量，各个关联就开始互相干扰，因为更新是纯加法的，而且没有任何东西会离开 cache。</p>
+<pre><code class="language-Python">def forward(self, x, mask=None, cache=None):
+    # x is b,t,d
+    b,t,d=x.shape
+    d_head=d//self.num_heads
+    h=self.num_heads
+    qkv=self.qkv_proj(x)
+    q=qkv[:, :, :d].view(b,t,h,d_head).transpose(1,2)
+    k=qkv[:, :, d:2*d].view(b,t,h,d_head).transpose(1,2)
+    v=qkv[:, :, 2*d:].view(b,t,h,d_head).transpose(1,2)
+    q = F.normalize(F.silu(q), dim=-1)
+    k = F.normalize(F.silu(k), dim=-1)
+    beta = torch.sigmoid(self.w_beta(x)).view(b, 1, t, 1)
+    # new: per-token write strength
+    S = cache if cache is not None else 0.0
+    v_old = k @ S # read the board at this key
+    u = beta * (v - v_old) # the delta: only what's actually new
+    S = S + k.transpose(-1, -2) @ u # same outer-product write as before
+    o = q @ S # read, no denominator
+    o = o.transpose(1, 2).contiguous().view(b, t, d)
+    return self.o_proj(o), S
+</code></pre>
+<p>配一个具体的数值例子会更容易跟上。</p>
+<p><img alt="8" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152044388-1041703332.jpg" class="lazyload"></p>
+<p>图注：Linear Attention 与 Delta Networks 的逐步数值对比（含 Contamination 与三步修正过程）</p>
+<p>考虑用 S = k.T @ v 写入的一条关联。如果用同一个 key 读回来，得到的是 k @ (k.T @ v)，也就是 (k @ k.T) v，即 k 的模长平方乘以 v。所以读出的结果被 key 的模长平方缩放了；只要把 k 归一化成单位长度，或者干脆把结果除以这个模长，就能精确地还原出 v。</p>
+<p>Q 同样是一个被学出来的指针。Wq 和 Wk 读的是同一条 residual stream（残差流），因此某个事实所对应的 query，会指向当初写入这个事实的那个 key 方向。更新时首先问：当前这个 key 能从 cache 里取回什么信息。然后把这份已有信息从想要存入的 value 中减掉，用 key 乘以这个差值，再把结果加回去。旧信息被抹掉，新信息写在原处。</p>
+<h3 id="deltanet-并行化如何让线性模型跑满-gpu">DeltaNet 并行化：如何让线性模型跑满 GPU</h3>
+<p>这里比较难理解，作者也是花了大约 7 个小时才把它理解到能用的程度，因此选择从实现出发来讲。简单说，DeltaNet 实现的是一个带广义 Householder 转移矩阵的一阶线性递推，从而支持分块（chunk-wise）并行的前向计算，得到硬件友好的线性时间训练。它把输入和输出切成若干个大小为 C 的 chunk，每个 chunk 的输出由上一个 chunk 的末态和当前 chunk 的 query/key/value 块共同算出。</p>
+<p>实际的麻烦出在 prefill 上。在长度为 T 的序列上直接实现 Delta 规则，代码大概长这样：</p>
+<pre><code class="language-Python">S = torch.zeros(b, h, dh, dh) if cache is None else cache
+outs = []
+for i in range(t):
+    k_i = k[:, :, i:i+1]
+    v_i = v[:, :, i:i+1]
+    b_i = beta[:, :, i:i+1]
+    v_old = k_i @ S
+    u_i = b_i * (v_i - v_old)
+    S = S + k_i.transpose(-1, -2) @ u_i # write
+    outs.append(q[:, :, i:i+1] @ S)
+o = torch.cat(outs, dim=2)
+</code></pre>
+<p>和标准注意力不同，这套公式在每一个 key 向量上都要做一次修正，所以怎么把它改写成并行的矩阵乘法并不显然。即便不用 Delta 规则，直接写出来的线性注意力 prefill 也依然是串行的：</p>
+<pre><code class="language-Python">S = torch.zeros(b, h, dh, dh) if cache is None else cache
+outs = []
+for i in range(t):
+    q = q[:, :, i:i+1]
+    k = k[:, :, i:i+1]
+    v = v[:, :, i:i+1]
+    S=S_old+k@v
+    o=q@S #bhtd
+    o=self.norm(o)
+    o=o.transpose(1, 2).contiguous().view(b, t, d)
+    out=self.o_proj(o)
+    cache=S
+    outs.append(out)
+o = torch.cat(outs, dim=2)
+</code></pre>
+<blockquote>
+<p><strong>注</strong>：该代码主要用于展示算法流程，部分变量定义有所省略（如 <code>S_old</code> 未定义、<code>q</code> 在循环内被覆盖），不建议直接运行。</p>
+</blockquote>
+<p>分块（chunked）形式提供了更高效的路子。结合例子更容易理解它的机制：</p>
+<p><img alt="9" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152055990-1851293532.jpg" class="lazyload"></p>
+<p>图注：分块并行的整体数据流（batch of N inputs → 逐 chunk 迭代 → Output）</p>
+<p>令 C=N，就退回到标准的 O(N²) 注意力；令 C=1，就是普通的线性注意力。取中间值则是在两者之间插值：用块内额外的计算量，换更高的硬件利用率。</p>
+<p>实践中 C 通常取 64 或 128，因为 tensor core 指令在这个粒度上执行效率最高，UMMA 就是一个例子。中间的这些 tile 会作为状态更新的一部分被折叠进 S：</p>
+<p><img alt="10" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152105552-1405405089.jpg" class="lazyload"></p>
+<p>图注：Linear+Normal 与 Normal Attention 的等价性拆解</p>
+<pre><code class="language-Python">S = torch.zeros(b, h, dh, dh) if cache is None else cache
+outs = []
+for i in range(t//C):
+    q_c = q[:, :, i*C:(i+1)*C]
+    k_c = k[:, :, i*C:(i+1)*C]
+    v_c = v[:, :, i*C:(i+1)*C]
+    o_prev=q_c@S #this is everything up to this block
+    attn=(q_c@k_c.transpose(-1,-2)).tril() #masked attention
+    o_curr=attn@v_c
+    o=o_prev+o_curr
+    S_new=k_c.transpose(-1,-2)@v_c #recurrent attention
+    S=S+S_new
+    outs.append(o)
+o = torch.cat(outs, dim=2)
+</code></pre>
+<p>块内做的是 q(kᵀv)，这是分数优先（score first），也就是带掩码的常规注意力顺序；跨块走的是 (kᵀv)q，即递推顺序、状态优先（state first）。注意力的开销按 O(N²) 增长，而这个方案不会。块内是真正的注意力（带掩码的 QKᵀ 再乘 V），跨块则把一切折叠进状态，用一次矩阵乘法读回来。于是开销被拆成了两部分：一部分是固定的 2Ld²，对应状态相关的计算，完全不受 C 影响；另一部分是随之增长的 2LCd，对应对角线上那些分数矩阵。完整注意力不过是 C 等于 L 的特例，此时第二项变成 2L²d，即平方级。所以 C 取得越小，FLOPs 越少。</p>
+<blockquote>
+<p><strong>注</strong>：块内的公式与其文字标注不符，应为原文笔误——分数优先的正确写法是 (qkᵀ)v，原文误作 q(kᵀv)；跨块的标注无误。判定依据是原文自身的代码：块内先算带掩码的 qkᵀ、再乘 v，正是分数优先。</p>
+</blockquote>
+<p>单看 FLOPs，C=1 最省，但换算成实际墙钟时间（wall-clock time）未必最快。当计算能高效映射到 GPU 的矩阵乘法硬件上时，GPU 反而可以在更短时间内完成更多算术运算。</p>
+<p>下一步，是把同样的思路推广到 DeltaNet 上。</p>
+<p><img alt="11" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152115445-695813397.jpg" class="lazyload"></p>
+<p>图注：DeltaNet 代码与《Parallelizing Linear Transformers with the Delta Rule》论文第 3 节公式的对照</p>
+<p>底层的问题很简单：适用于纯加法注意力的分块方法，没法直接套到 delta 更新上：</p>
+<pre><code class="language-Python">v_old = k_i @ S
+u_i  = b_i * (v_i - v_old)
+</code></pre>
+<p>要算出需要被减掉的那部分信息，就得有每一个中间状态。不做一些数学上的重参数化，就没办法用同样的方式并行。因此作者把 delta 更新从这种形式：</p>
+<pre><code class="language-Python">u=v_new-v_old
+S_t= S_(t-1)+K.T@u
+o=q@S_T
+</code></pre>
+<p>这里是一个串行循环，每次迭代算一个 delta。重参数化之后的形式是：</p>
+<pre><code class="language-Python">S_t = S_{t-1}(I − β_t k_t k_tᵀ)  +  β_t v_t k_tᵀ
+o_t = S_t q_t
+</code></pre>
+<p>有了这个形式，分块代码就能一次性算出一个 chunk 内全部 C 个 delta：</p>
+<pre><code class="language-Python">def chunk_delta_rule_forward(Q, K, V, beta, C):
+    # L: sequence length, d: head dimension
+    L, d = Q.shape
+    # chunking
+    Q, K, V = map(lambda x: x.reshape(-1,C,d), [Q, K, V])
+    beta = beta.reshape(-1, C)
+    K_beta = K * beta.unsqueeze(-1)
+    V_beta = V * beta.unsqueeze(-1)
+    # compute eq. 10 with vectorized forward substitution for fast inverse
+    T = -(K_beta @ K.t()).tril(-1)
+    for i in range(1, C):
+        T[i, :i] = T[i, :i] + (T[i, :, None] * T[:, :i]).sum(-2)
+    T += torch.eye(C)
+    W = T @ K_beta
+    U = T @ V_beta
+    # chunkwise parallel. Eq. 8-9
+    S = torch.zeros(d, d)
+    O = torch.empty_like(V)
+    for i in range(L//C):
+        q_i, k_i, w_i = Q[i], K[i], W[i]
+        u_i = U[i] - w_i @ S # the corrections, all of one chunk
+        o_inter = q_i @ S
+        A_i = (q_i @ k_i.t()).tril() #qk.t
+        o_intra = A_i @ u_i # attention @ v (with corrections, so u)
+        S += k_i.t() @ u_i # update state with addition
+        O[i] = o_intra + o_inter #update output with flash + recurrent
+    return O.reshape(L, d)
+</code></pre>
+<p>至此得到了第一个对照点：MHA Transformer 与 DeltaNet Transformer。</p>
+<p><img alt="12" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152126643-672923828.jpg" class="lazyload"></p>
+<p>图注：MHA Transformer (GPT2) 与 DeltaNet Transformer 架构并排对比</p>
+<h3 id="gated-deltanet加入主动遗忘机制">Gated DeltaNet：加入主动遗忘机制</h3>
+<p>如果说 DeltaNet 解决的是“精准修改某一条记忆”，那么 Gated DeltaNet 进一步解决的是“主动管理整个记忆空间”。</p>
+<p>至此，已经有了一套精确修改 cache 的方法。每来一个新事实（也就是每来一个新的 key 向量），都能准确找出存在那个位置上的旧信息，并把它替换成希望被注意到的新信息。</p>
+<p>但这套机制只能遗忘那些“有明确替代品”的关联。它没法在上下文切换时高效地清掉一批关联，也没法让记忆整体衰减以腾出容量。</p>
+<p>如果做的是纯加法的线性注意力，那么加上遗忘能力会很简单，只需要一个控制状态遗忘程度的参数：</p>
+<pre><code class="language-Python">S_old=cache
+S_new=k@v
+# cache=S_old+S_new
+cache=alpha * S_old + S_new
+</code></pre>
+<p><img alt="13" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152137040-1811886906.png" class="lazyload"></p>
+<p>图注：纯累加 vs 带 α 衰减的状态更新对比</p>
+<p>这正是 Mamba-2 的贡献：先让旧状态衰减，再把新写入的信息以全强度加进去，从而防止状态无界增长。</p>
+<p>在每个时间步上用一个动态比例对所有 key-value 关联做统一衰减，是可行的做法，Mamba 就是这么干的。但它没有考虑不同 key-value 关联之间的重要性差异。</p>
+<p>也就是说，模型若想遗忘某一条特定关联，所有关联都会被同等程度地遗忘。反过来，Delta 规则能精确更新单条事实，却没有办法让其余事实衰减。</p>
+<p>于是 Gated Delta 规则把 Mamba 的门控更新规则与 Delta 规则结合了起来。它引入一个参数 alpha：取 1 时退化为纯 Delta 规则，取 0 时清空记忆。难点在于，如何用同一套并行分块方法把它实现出来。</p>
+<p>实现上沿用了上一节讲的 DeltaNet 重参数化。数学形式几乎一模一样，只多了一样东西：一个取值在 0 到 1 之间、依赖数据的标量，用来控制前一状态的衰减。这样就把有效的 key-value 关联学习，与自适应的记忆管理结合到了一起。</p>
+<p>对应的代码改动如下：</p>
+<p><img alt="14" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152149569-688655043.jpg" class="lazyload"></p>
+<p>图注：Delta Rule 与 Gated Delta Rule 的代码 diff（红框标出新增部分）</p>
+<p>γʳ/γⁱ 这一项处理的是累积衰减。一个在时间步 x 写入、在 x+t 被读出的 token，累计被乘上了 αₓαₓ₊₁αₓ₊₂…αₓ₊ₜ。这相当于前缀和（prefix-sum）在乘法意义下的对应物。</p>
+<p>最终得到的架构长这样：</p>
+<p><img alt="15" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152159452-1592764285.jpg" class="lazyload"></p>
+<p>图注：Gated DeltaNet Transformer 架构图</p>
+<h3 id="kimi-linear--kda细粒度管理模型记忆">Kimi Linear / KDA：细粒度管理模型记忆</h3>
+<p>到这个阶段，研究者开始尝试混合模型：在同一个架构里组合多种形式的注意力，比如把 Gated DeltaNet 与 Mamba 放在一起。</p>
+<p>Kimi Linear 之所以引人注目，核心是一个论断：在受控对比下，它的表现超过了 full attention。作者把它定位成一个可以直接替换（drop-in）的架构方案，质量更好，解码吞吐最高提升到 6 倍。</p>
+<p>Kimi Linear 在 Gated DeltaNet 之上引入了细粒度门控（fine-grained gating）：不再使用单一的标量衰减，而是为每个通道（channel）分别学一个衰减值。</p>
+<p><img alt="16" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152209936-1580388842.jpg" class="lazyload"></p>
+<p>图注：三篇论文的公式演进对照——Parallelizing Linear Transformers with the Delta Rule (2025) → Gated Delta Networks (2025) → Kimi Linear (2025)</p>
+<p>KDA 的更新规则与之前相近，但代码变成了这样：</p>
+<p><img alt="17" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152219154-383016870.jpg" class="lazyload"></p>
+<p>图注：Delta Rule / Gated Delta Rule / Chunk KDA Forward 三段代码对照</p>
+<p>其中 <code>alpha.reshape(nb, C, d)</code> 这一行，正是这篇论文最重要的贡献所在：对记忆衰减的细粒度控制。</p>
+<p>把 Kimi Linear 架构与 DeltaNet Transformer 并排放，能看出三处主要改动：</p>
+<ol>
+<li>
+<p>采用混合结构，间隔插入 Multi-head Latent Attention（MLA，多头潜在注意力）层。</p>
+</li>
+<li>
+<p>用 Mixture-of-Experts（MoE，混合专家）层替换掉 MLP。</p>
+</li>
+<li>
+<p>通过 alpha 投影为 DeltaNet 增加容量。</p>
+</li>
+</ol>
+<p><img alt="18" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152230153-586604503.jpg" class="lazyload"></p>
+<p>图注：Gated DeltaNet Transformer 与 Kimi Linear Model Architecture 并排对比</p>
+<p>MLA 和 MoE 会在后面的章节展开。眼下要点在于：这不是盲目地堆规模。多出来的容量有明确的数学目的——逐通道的缩放，让模型对记忆衰减有了更精细的控制。</p>
+<p>Scaling law 依然成立，但容量必须加在对的位置上，并且要以系统真正用得上的形式加进去。这条演进路线上的每一代架构，增加容量都是为了解决前一代系统中某个具体的局限。</p>
+<h3 id="kimi-k3架构组合与规模化">Kimi K3：架构组合与规模化</h3>
+<p>最终，KimiK3 的语言主干与上面的 Kimi Linear 看起来相当接近。它包含 23 个四层的宏循环（macrocycle）。每个宏循环里，三层使用 Kimi Delta Attention，第四层使用 Multi-head Latent Attention。第一层用的是稠密前馈网络，其余各层都使用 latent MoE。</p>
+<blockquote>
+<p><strong>注</strong>：原文此处漏了一层。官方技术报告记为 93 层（69 KDA + 24 MLA），比“23 个宏循环 × 4 层”多出的一层，是主干末尾额外放置的 Gated MLA，用于确保最后一层始终执行全局注意力。</p>
+</blockquote>
+<p>如果把前面的架构演进看作一次次针对具体瓶颈的修补，那么 Kimi K3 做的事情更像是一次系统级组合：把这条线上的各个模块放到最合适的位置，再把规模推上去。</p>
+<p>乍看之下，相比 Kimi Linear 的改动并不算大：</p>
+<ul>
+<li>
+<p>规模大幅提升</p>
+</li>
+<li>
+<p>每 12 层做一次分块 AttnRes</p>
+</li>
+<li>
+<p>MLA 的 query LoRA 与输出门控</p>
+</li>
+<li>
+<p>潜空间 MoE</p>
+</li>
+<li>
+<p>SiTU 激活函数</p>
+</li>
+<li>
+<p>门控 MLA（Gated MLA）</p>
+</li>
+</ul>
+<p>KDA 提供的是常数大小状态的循环记忆，而周期性出现的 MLA 层，保留了对整个上下文的完整 softmax 检索能力。下面这张简化示意图，可以作为理解后续改动的参考。</p>
+<p><img alt="19" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152240811-573600993.jpg" class="lazyload"></p>
+<p>图注：Kimi K3 完整架构、去掉残差连接的简化版、以及 AttnRes 版本三图对照</p>
+<p>先从比较直接的几处改动讲起：Gated MLA、潜空间 MoE 和 SiTU 激活。</p>
+<p>Gated MLA 决定了 MLA 检索到的每个特征，有多少能进入 residual stream。具体做法是与一个由输入投影得到的门控向量做逐元素相乘。</p>
+<p>在常规 MoE 中，一个学出来的 router 用点积相似度，把每个 token 分发给一部分专家网络。KimiK3 一共有 898 个专家：其中 2 个是共享专家，处理所有 token；剩下的 896 个里，router 为每个 token 选出 16 个。</p>
+<blockquote>
+<p><strong>注</strong>：这个数字与官方一致，只是口径不同——技术报告记 896 个路由专家加 2 个共享专家，合计 898。国内报道普遍只说“896 选 16”，是未将共享专家计入总数。</p>
+</blockquote>
+<p>KimiK3 还改了专家里的激活函数。原本的做法是对 up 投影施加 SiLU、与 gate 逐元素相乘、再过 down 投影；现在换成了 SiTU：</p>
+<blockquote>
+<p><strong>注</strong>：该激活函数在技术报告中的全称为 SiTU-GLU（Sigmoid Tanh Unit GLU），设计目的是在原点附近贴近 SwiGLU、在大幅值处有界，以抑制极端稀疏下的激活爆炸。</p>
+</blockquote>
+<pre><code class="language-Python">d = x.shape[-1] // 2
+gate = x[..., :d].to(torch.float32)
+up = x[..., d:].to(torch.float32)
+situ_a = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+if self.linear_beta is not None:
+    up = self.linear_beta * torch.tanh(up / self.linear_beta)
+return (situ_a * up).to(x.dtype)
+</code></pre>
+<p>模型还会把送入共享专家的输入做降维投影，再把它们的最终求和结果升维投影回去：</p>
+<p><img alt="20-1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152302826-1334069161.png" class="lazyload"></p>
+<p><img alt="20-2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152315015-342842176.png" class="lazyload"></p>
+<p>图：MoE 结构，以及 Kimi Linear Expert 与 Kimi K3 Expert 的算子对比（111 ps vs 297 ps）</p>
+<p>这体现了模型推理中反复出现的一个难题。在没有 fused kernel 的情况下，新激活函数几乎比原路径慢 3 倍。作为抵消，一处优化是让专家在压缩后的潜空间中计算，这让它们的前向快了很多，FLOPs 也几乎减半。</p>
+<p>剩下的改动是 MLA query LoRA、输出门控，以及每 12 层一次的分块 Attention Residuals。AttnRes 会带来约 2% 的推理延迟，但换来两点重要收益：</p>
+<ul>
+<li>
+<p>可以有选择地检索更早的表示，从而缓解残差稀释（residual dilution）与 hidden state 膨胀</p>
+</li>
+<li>
+<p>1.25 倍的算力优势</p>
+</li>
+</ul>
+<p>AttnRes 和 MLA 是从两个方向去解决同一个底层局限。KDA 层的状态大小是常数，必然要丢弃信息。MLA 从 token 维度的上下文里检索，AttnRes 则从深度维度上更早的表示里检索。</p>
+<h3 id="attnres">AttnRes</h3>
+<p>Transformer 中每一层都会通过 residual connection（残差连接）把此前的信息累加下来。但这种无差别的累加本身就是瓶颈：不同类型的层拿到的是同一份聚合状态，而越靠后的层必须学出越大的输出才能影响它。Attention Residuals 的思路，是让模型通过 attention 决定不同层的输出该如何融合。</p>
+<p>每一次前向传播中，输入会依次穿过一叠层。这里每一层由一个注意力块（KDA 或 MLA）和一个 MLP 或 MoE 块组成。通常，每一层的输入是原始 embedding 与此前所有层输出之和，各项权重相同。</p>
+<p>$$h_l = h_1 + \sum_{i=1}^{l-1} f_i(h_i)$$</p>
+<p>式中 h_i 是第 i 层的输入，h_1 是当前 token（也就是目前序列中最后一个 token）的 embedding，f_i(h_i) 是第 i 层（注意力块或 MLP 块）的输出。</p>
+<p>问题在于缺乏选择性访问。不同类型的层拿到的是同一份聚合后的状态，尽管它们各自可能更适合不同的权重分配。又因为这个递推是纯加法的，越靠后的层必须学出越大的输出，才能影响到已经累积起来的残差，这会让训练变得不稳定。AttnRes 不再一视同仁，而是给求和式中的每一项乘上一个专门的权重，让模型可以根据上下文，把更多重要性分配给最有用的那些层。</p>
+<p>$$h_l = \alpha_0 \cdot h_1 + \sum_{i=1}^{l-1} \alpha_i \cdot f_i(h_i)$$</p>
+<p>每个权重 alpha_i 由一次 query-key 点积算出。query 是每一层各自学出来的，而 key 和 value 来自更早的 residual stream 状态。分数归一化到和为 1，再用来对这些状态做加权组合。</p>
+<p><img alt="21" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202607/3796273-20260729152328374-552312677.jpg" class="lazyload"></p>
+<p>图注：Kimi K3 (Residual Conn.) 与 Kimi K3 (ResAttn) 架构对比，右侧展开 K1/K2/K3 与 V1/V2/V3 的检索过程</p>
+<p>于是模型不必只依赖紧邻的前一层。AttnRes 让每一层都能有选择地访问更早的层输出，用自己学到的 query 去取回对当前计算最有用的表示。</p>
+<p>下面的伪代码把同样的思路应用在 block 粒度上。这里的一个 block，是 12 个 decoder 层中注意力输出与 MLP 输出逐元素累加的结果，作为单一的深度表示存下来，供后续 AttnRes 混合时使用。</p>
+<p>在每一层都做残差注意力，训练和推理开销都太大。只在固定的 block 边界上做，能以低得多的代价拿到大部分收益。在 KimiK3 中，每 12 个 decoder 层出现一次边界。23 个四层宏循环下来，一共产生 8 个 AttnRes block，这提升了推理速度。</p>
+<blockquote>
+<p><strong>注</strong>：这句“提升推理速度”的参照系是 Full AttnRes，而非“不使用 AttnRes”，与前文“增加约 2% 推理延迟”并不冲突——按块划分把内存与跨阶段通信开销从 O(Ld) 降到 O(Nd)，推理期的状态大小也被限定。</p>
+</blockquote>
+<p>作者认为，下面这段大概是 <code>block_attn_res</code> 函数里最关键的部分：</p>
+<pre><code class="language-Python">V = torch.stack(blocks + [partial_block]) # [N+1, B, T, D]
+K = norm(V)
+logits = torch.einsum('d, n b t d -&gt; n b t', proj.weight.squeeze(), K)
+h = torch.einsum('n b t, n b t d -&gt; b t d', logits.softmax(0), V)
+return h
+</code></pre>
+<p>至此，从 GPT-2 到 Kimi K3 的演进就走完了。</p>
+<p>核心的变化并不只是规模。这条路上的每一步架构改动，改的都是：模型存什么、如何更新这份状态，或者如何取回固定大小的状态保不住的那些信息。Kimi K3 把常数状态的循环记忆、周期性的 softmax 检索、稀疏的专家容量，以及深度方向上的选择性残差访问组合在了一起。结果是一个把额外容量花在明确功能位置上的系统。</p>
+<p>归根结底，容量固定（维度固定）的联想记忆需要一套淘汰策略——因为纯加法的线性操作一旦写满，再往里写就只会叠加干扰。为此，被学习出来的选择机制是必需的，无论它以门控、路由还是衰减的形式出现；而注意力，是目前最有效的选择性读取机制。</p>
+<h3 id="结语">结语</h3>
+<p>从 GPT-2 到 Kimi K3，7 年时间里模型规模增长了 22580 倍。但推动大模型持续发展的，并不只是参数数量的增加，而是模型在信息存储、状态更新和上下文管理方式上的不断改进。Linear Attention 尝试解决长序列的计算成本问题，DeltaNet 重新设计了记忆的更新方式，Gated DeltaNet 引入主动遗忘机制，Kimi Linear 把衰减细化到每个通道，而 Kimi K3 则进一步把这些架构设计组合进一个大规模模型中。</p>
+<p>对于开发者而言，未来大模型竞争的关键，不只是“更大的模型”，而是如何让模型更高效地理解、记忆和执行复杂任务。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-07-29 15:24">2026-07-29 15:24</span>&nbsp;
+<a href="https://www.cnblogs.com/Qiniu-developer">小七-七牛开发者</a>&nbsp;
+阅读(<span id="post_view_count">102</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22040565);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FQiniu-developer%2Fp%2F22040565&amp;targetId=22040565&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
