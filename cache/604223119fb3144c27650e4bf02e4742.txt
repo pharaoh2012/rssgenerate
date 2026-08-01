@@ -1,0 +1,268 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/znlgis/p/22118023" title="发布于 2026-08-01 00:18">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">OpenCSG.NET：一个 .NET CSG 几何建模库的技术剖析</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="项目源起">项目源起</h2>
+<p>OpenCSG.NET 并非从零开始，而是一次"站在前人肩膀上"的整合优化。它的技术血统可以追溯到 JavaScript 社区的一行经典代码：</p>
+<pre><code>OpenJsCad csg.js（JavaScript 原始实现）
+  └── praeclarum/Csg（手工 C# 移植）
+        └── hypar-io/Csg（BSP 精度修复）
+              ├── Csg ──────── Union 原点居中、NaN 校验
+              └── DotNetCsg ── 二进制 STL、迭代 BSP、Rotate 变换
+                    └── OpenCSG.NET（本项目）
+</code></pre>
+<p><strong>关键借鉴与改良：</strong></p>
+<ul>
+<li>
+<p><strong>Csg</strong> 贡献了 <code>Union</code> 原点居中算法——这是从 hypar-io 社区 PR 来的核心改进。大坐标下 BSP 树浮点精度衰减是经典问题，Csg 的解法是：运算前将所有形体平移到包围盒中心，在原点附近完成裁剪，再平移回去。这一思路直接沿用在 OpenCSG.NET 中。</p>
+</li>
+<li>
+<p><strong>DotNetCsg</strong> 贡献了三项工程化改进：(1) <code>Formats.cs</code> 增加了二进制 STL 写出（原版仅支持 ASCII），文件体积缩小约 2/3；(2) <code>Tree.cs</code> 将 BSP 递归遍历改写为显式 <code>Queue</code>/<code>Stack</code> 迭代，消除了栈溢出风险；(3) <code>Solid.cs</code> 新增 <code>RotateX/Y/Z</code> 便捷方法。此外还有实际工程示例 <code>Runner.CPurlin</code>（钢构 C 型檩条开孔建模），可作为 API 调用参考。</p>
+</li>
+<li>
+<p><strong>跨平台兼容</strong>是整合过程中遇到的最大技术挑战（见下文），最终通过几何等价性检查而非逐顶点比对来保证测试可重复性。</p>
+</li>
+</ul>
+<hr>
+<h2 id="1-核心算法bsp-树的布尔运算">1. 核心算法：BSP 树的布尔运算</h2>
+<p>CSG 的本质是在三维空间中做集合运算。给定两个形体 A 和 B：</p>
+<ul>
+<li><strong>并集 (Union)</strong>：A 在 B 外的部分 + B 在 A 外的部分</li>
+<li><strong>差集 (Subtract)</strong>：A 在 B 外的部分 + B 在 A 内的部分（翻转法线）</li>
+<li><strong>交集 (Intersect)</strong>：A 在 B 内的部分 + B 在 A 内的部分</li>
+</ul>
+<p>这些运算的数学定义简洁，但工程实现的核心挑战只有一个：<strong>如何判断一个多边形在另一个形体的内部还是外部？</strong></p>
+<p>BSP（Binary Space Partitioning，二叉空间分割）树给出了答案。它是计算机图形学中的经典数据结构，最早用于 Doom 等游戏的可见面渲染。</p>
+<h3 id="bsp-树构建">BSP 树构建</h3>
+<p>以形体 A 的所有多边形作为输入，算法流程如下：</p>
+<ol>
+<li>选择一个多边形，用它的所在平面作为分割平面</li>
+<li>将剩余多边形按分割平面分类：在前面的归入 <code>front</code> 子树，后面的归入 <code>back</code> 子树</li>
+<li>被平面穿过的多边形一分为二，分别归入前后</li>
+<li>在 <code>front</code> 和 <code>back</code> 子树上递归执行步骤 1-3</li>
+</ol>
+<p>最终得到的二叉树，每一层的平面将空间分为"内部"和"外部"两个半空间。</p>
+<h3 id="裁剪运算">裁剪运算</h3>
+<p>这是 BSP 树的核心操作。当形体 A 相对于 B 做裁剪时：</p>
+<ul>
+<li>A 的每个多边形递归穿过 B 的 BSP 树</li>
+<li>到达叶节点时，判断多边形在该节点平面之前还是之后</li>
+<li>在前：继续裁剪 <code>front</code> 子树</li>
+<li>在后：继续裁剪 <code>back</code> 子树</li>
+<li>被分割：分两半分别处理</li>
+<li>结果为"内部"（在 B 内）：丢弃该片段</li>
+<li>结果为"外部"（在 B 外）：保留</li>
+</ul>
+<pre><code class="language-csharp">// 裁剪的核心：递归遍历 BSP 树
+void ClipPolygons(List&lt;Polygon&gt; polygons, Node node)
+{
+    var front = new List&lt;Polygon&gt;();
+    var back = new List&lt;Polygon&gt;();
+
+    foreach (var poly in polygons)
+        node.Plane.SplitPolygon(poly, ref front, ref back, ref onFront, ref onBack);
+
+    if (node.Front != null) ClipPolygons(front, node.Front);
+    if (node.Back != null) ClipPolygons(back, node.Back);
+    // 在 back 叶节点保留多边形（外部），在 front 叶节点丢弃（内部）
+}
+</code></pre>
+<p>实际实现中，Tree.cs 使用了显式 <code>Stack&lt;Args&gt;</code> 迭代而非递归，避免深度形体导致的栈溢出：</p>
+<pre><code class="language-csharp">// DotNetCsg 的迭代优化：用显式栈替代递归
+struct Args { public List&lt;Polygon&gt; Polygons; public Node Node; }
+
+void ClipPolygons(List&lt;Polygon&gt; polygons, Node node)
+{
+    var stack = new Stack&lt;Args&gt;();
+    stack.Push(new Args { Polygons = polygons, Node = node });
+    while (stack.Count &gt; 0)
+    {
+        var args = stack.Pop();
+        // 裁剪逻辑...
+    }
+}
+</code></pre>
+<h3 id="并集运算的精度优化">并集运算的精度优化</h3>
+<p>经典 BSP 并集有一个隐蔽问题：在大坐标下，浮点数的有限精度导致平面分类出现微小偏差，最终形体表面出现"裂缝"（缺失三角形）。Csg 项目的 PR 贡献了一个优雅解法：</p>
+<pre><code class="language-csharp">// OpenCSG.NET/Solid.cs — 带原点居中的 Union
+public Solid Union(params Solid[] others)
+{
+    var all = new List&lt;Solid&gt; { this };
+    all.AddRange(others);
+
+    // 计算所有形体的联合包围盒
+    var bounds = CombinedBoundsAll(all);
+    var center = bounds.Center;
+    var halfSize = bounds.Size * 0.5;
+
+    // 将全部形体平移到包围盒中心，确保裁剪在原点附近进行
+    for (var i = 0; i &lt; all.Count; i++)
+        all[i] = all[i].TranslateBy(-center);
+
+    // 在原点附近裁剪（浮点精度最佳）
+    var result = all[0];
+    for (var i = 1; i &lt; all.Count; i++)
+        result = UnionSubLocal(result, all[i]);
+
+    // 平移回原始位置
+    return result.TranslateBy(center);
+}
+</code></pre>
+<p><strong>为什么有效？</strong> 双精度浮点数在 0 附近的分辨率最高（约 2.2e-16），而在数万单位的坐标下分辨率衰减。将形体移至原点裁剪，等于将所有关键计算放在浮点数的最优精度区间。这一思路不仅适用于 CSG，任何涉及空间计算的工程场景都可以借鉴。</p>
+<hr>
+<h2 id="2-多边形重三角化从-bsp-碎片到优化输出">2. 多边形重三角化：从 BSP 碎片到优化输出</h2>
+<p>BSP 裁剪会产生大量共面碎片——原本一个完整的面被分割平面切成了多个小三角形。San 最终输出优化且可渲染的网格，需要将这些共面碎片重新合并三角化。</p>
+<p>OpenCSG.NET 采用的算法是 <strong>Coplanar Retesselation（共面重三角化）</strong>，这是 OpenJsCad csg.js 原版的核心贡献之一。</p>
+<p><strong>算法原理：</strong></p>
+<ol>
+<li>收集所有共面的多边形，投影到 2D 平面上</li>
+<li>使用扫描线算法——按 Y 坐标逐行扫描，维护活跃边列表</li>
+<li>在扫描线之间用梯形填充多边形轮廓</li>
+<li>将 2D 三角形投影回 3D 空间，插值纹理坐标</li>
+</ol>
+<p><strong>关键细节：</strong> 由于浮点容差，相邻多边形的共享边可能"几乎但不完全"重合。解决方案是使用 <code>FuzzyCsgFactory</code>（容差 1e-5）进行顶点去重——空间距离在容差范围内的顶点被视为同一点：</p>
+<pre><code class="language-csharp">// 顶点去重工厂 — 1e-5 空间容差
+class VertexFactory
+{
+    Dictionary&lt;Vector3DRounded, Vertex&gt; _vertices;
+
+    Vertex GetVertex(Vector3D pos)
+    {
+        var key = new Vector3DRounded(pos); // 四舍五入到 1e-5
+        if (_vertices.TryGetValue(key, out var v))
+            return v;              // 复用已有顶点
+        var newVertex = new Vertex(pos);
+        _vertices[key] = newVertex;
+        return newVertex;
+    }
+}
+</code></pre>
+<p>这一步虽然增加了运算开销，但对于形体的"水密性"（Watertightness）——即网格没有裂缝、是一个封闭流形——至关重要。</p>
+<hr>
+<h2 id="3-基础形体生成">3. 基础形体生成</h2>
+<p>OpenCSG.NET 提供三种基础形体，全部通过 <code>static class Solids</code> 的工厂方法创建：</p>
+<h3 id="sphere球体">Sphere（球体）</h3>
+<p>经典的经纬网格——双循环生成顶点和三角形带：</p>
+<pre><code class="language-csharp">public static Solid Sphere(double r = 1, int resolution = 12, bool center = true)
+</code></pre>
+<ul>
+<li>分辨率控制平滑度：<code>resolution=12</code> 对应横向 24 列、纵向 12 行</li>
+<li>默认圆心在原点，可通过 <code>SphereOptions</code> 自定义轴向（支持椭球体）</li>
+</ul>
+<h3 id="cylinder圆柱体">Cylinder（圆柱体）</h3>
+<p>支持 <code>Start</code> 和 <code>End</code> 端点定义任意方向的柱体，以及两端不同半径（截锥）：</p>
+<pre><code class="language-csharp">public static Solid Cylinder(
+    double r = 1, double h = 1,
+    Vector3D? start = null, Vector3D? end = null,
+    int resolution = 12, double sectorAngle = 360, bool center = true)
+</code></pre>
+<ul>
+<li>支持 <code>SectorAngle</code> 控制扇形角度（非 360° 即部分圆柱）</li>
+<li><code>RadiusStart</code> / <code>RadiusEnd</code> 可生成锥台（Frustum）</li>
+</ul>
+<h3 id="cube立方体">Cube（立方体）</h3>
+<p>通过位运算生成 8 个顶点、6 个面的索引表——简单但高效：</p>
+<pre><code class="language-csharp">public static Solid Cube(
+    double size = 1, bool center = true,
+    Vector3D? sizeXYZ = null)
+</code></pre>
+<hr>
+<h2 id="4-跨平台浮点差异的终极解法">4. 跨平台浮点差异的终极解法</h2>
+<p>这是项目中遇到的最深刻的工程问题。</p>
+<h3 id="问题本质">问题本质</h3>
+<p>同一段 C# 代码，在 Windows 和 Linux 上运行，产生<strong>不同结构</strong>的 STL 输出。差异不是浮点末位舍入问题，而是 BSP 树的<strong>拓扑结构</strong>发生了改变——生成的三角形数量和连接方式不同。</p>
+<h3 id="根因">根因</h3>
+<p>根源在于 .NET Runtime 的 <code>Math.Cos</code>、<code>Math.Sin</code> 等超越函数在两个平台上返回的值存在 1 ULP 级别的差异。这看似微不足道，但在 CSG 算法链中被逐级放大：</p>
+<pre><code>Math.Cos 1 ULP 差异
+  → 形体顶点坐标微小偏移
+    → Plane.SplitPolygon 平面分类摇摆（点在平面"之前"还是"之后"）
+      → BSP 树结构不同（哪个多边形成为分割平面？前/后分支不同）
+        → 裁剪结果不同（不同的三角形划分）
+</code></pre>
+<p><strong>关键洞察：</strong> Plane 分类是一个二值决策——<code>distance &gt; 0</code> 还是 <code>distance &lt; 0</code>。距离恰好在零附近的点，1 ULP 的差异足以翻转分类结果。这导致整个 BSP 树结构变成了"薛定谔的树"——在不同平台上坍缩为不同的形态。</p>
+<h3 id="解法">解法</h3>
+<p>放弃逐顶点精确比对，改用<strong>几何不变量</strong>进行等价性验证：</p>
+<pre><code class="language-csharp">bool StlStringEquals(string a, string b, double tolerance, out string message)
+{
+    var aTriangles = ParseTriangles(a);
+    var bTriangles = ParseTriangles(b);
+
+    // 检查 1：三角形数量
+    if (aTriangles.Length != bTriangles.Length)
+        return false;
+
+    // 检查 2：总表面积（容忍 1e-10 相对误差）
+    var aArea = ComputeTotalArea(aTriangles);
+    var bArea = ComputeTotalArea(bTriangles);
+    if (Math.Abs(aArea - bArea) &gt; tolerance &amp;&amp;
+        Math.Abs(aArea - bArea) &gt; tolerance * Math.Max(aArea, bArea))
+        return false;
+
+    // 检查 3：包围盒
+    var aBB = ComputeBounds(aTriangles);
+    var bBB = ComputeBounds(bTriangles);
+    // 六个边界值逐一比较...
+
+    return true;
+}
+</code></pre>
+<p>三项检查——三角形数量、总表面积、包围盒——都是 BSP 树计算的<strong>不变量</strong>。无论平面分类如何摇摆，只要算法正确，两个楔入同一位置的单位球，其并集的表面积一定是相同的，体积占用的空间也一定是相同的。</p>
+<p><strong>方法论启示：</strong> 浮点数的不确定性不应被"修复"（这违反物理定律），而应被<strong>契约重新定义</strong>——将"精确输出"的契约放宽为"几何等价"，在更抽象的层面上验证正确性。</p>
+<hr>
+<h2 id="5-stl-格式输出">5. STL 格式输出</h2>
+<p>STL（Stereolithography）是 3D 打印和 CAD 领域的通用格式，本质是将形体表示为三角形面片列表。</p>
+<p>OpenCSG.NET 支持两种输出模式：</p>
+<p><strong>ASCII 格式</strong>（人类可读）：</p>
+<pre><code>solid myshape
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex 1.0 2.0 3.0
+      vertex 4.0 5.0 6.0
+      vertex 7.0 8.0 9.0
+    endloop
+  endfacet
+  ...
+endsolid myshape
+</code></pre>
+<p><strong>二进制格式</strong>（高效紧凑）：</p>
+<pre><code>80-byte header + 4-byte triangle count + N × (12 floats + 2 bytes)
+</code></pre>
+<p>ASCII 适合调试和简单工具链，二进制适合生产环境——对于含有数万三角形的形体，二进制 STL 体积通常只有 ASCII 的 1/3。</p>
+<pre><code class="language-csharp">// 两行代码写出 STL
+using (var fs = File.Create("output.stl"))
+using (var writer = new BinaryWriter(fs))
+    mySolid.WriteStl("mySolid", writer);
+</code></pre>
+<hr>
+<h2 id="结语">结语</h2>
+<p>OpenCSG.NET 是一个小而精的几何计算库——核心算法不到 3000 行代码，但每一个函数背后都凝聚了计算机图形学数十年的研究成果。BSP 树的裁剪精度、共面重三角化的扫描线算法、超越函数的跨平台不确定性——这些都是典型的几何计算工程挑战。</p>
+<p>如果你对 CSG 或计算几何感兴趣，欢迎浏览源码。STL 导出到切片软件即可 3D 打印——理论离物理世界只有一行代码的距离。</p>
+<p>GitHub: <a href="https://github.com/znlgis/OpenCSG.NET" target="_blank" rel="noopener nofollow">https://github.com/znlgis/OpenCSG.NET</a></p>
+<p>NuGet: <a href="https://www.nuget.org/packages/OpenCSG.NET" target="_blank" rel="noopener nofollow">https://www.nuget.org/packages/OpenCSG.NET</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-01 00:18">2026-08-01 00:18</span>&nbsp;
+<a href="https://www.cnblogs.com/znlgis">我才是银古</a>&nbsp;
+阅读(<span id="post_view_count">122</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22118023);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fznlgis%2Fp%2F22118023&amp;targetId=22118023&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
