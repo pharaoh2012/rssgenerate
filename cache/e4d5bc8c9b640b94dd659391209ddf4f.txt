@@ -1,0 +1,162 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/denglei1024/p/22138415" title="发布于 2026-08-01 21:11">
+    
+
+    <span role="heading" aria-level="2">ABP 模块系统源码学习：启动时模块是如何加载和排序的</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="从入口看起abpapplicationfactorycreate">从入口看起：AbpApplicationFactory.Create</h2>
+<pre><code class="language-csharp">using var app = AbpApplicationFactory.Create&lt;BusinessModule&gt;(options =&gt;
+{
+    options.UseAutofac();
+});
+app.Initialize();
+</code></pre>
+<p>这行代码的背后发生了什么？直接看源码 <code>AbpApplicationFactory.cs</code>：</p>
+<pre><code class="language-csharp">public static IAbpApplicationWithInternalServiceProvider Create&lt;TStartupModule&gt;(
+    Action&lt;AbpApplicationCreationOptions&gt;? optionsAction = null)
+{
+    return new AbpApplicationWithInternalServiceProvider(typeof(TStartupModule), optionsAction);
+}
+</code></pre>
+<p>它创建了 <code>AbpApplicationWithInternalServiceProvider</code>，这个类在构造时做了两件关键的事：</p>
+<ol>
+<li>创建 <code>ModuleLoader</code> 并调用 <code>LoadModules</code> 加载所有模块</li>
+<li>按拓扑排序确定模块初始化顺序</li>
+</ol>
+<h2 id="深度解析-moduleloaderloadmodules">深度解析 ModuleLoader.LoadModules</h2>
+<p>源码位于 <code>framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs</code>，核心逻辑只有三行：</p>
+<pre><code class="language-csharp">public IAbpModuleDescriptor[] LoadModules(IServiceCollection services, Type startupModuleType, PlugInSourceList plugInSources)
+{
+    var modules = GetDescriptors(services, startupModuleType, plugInSources);  // 1. 发现所有模块
+    modules = SortByDependency(modules, startupModuleType);                     // 2. 拓扑排序
+    return modules.ToArray();                                                    // 3. 返回有序列表
+}
+</code></pre>
+<h3 id="第一步递归发现">第一步：递归发现</h3>
+<p><code>GetDescriptors</code> 内部分两步：</p>
+<p><strong>FillModules</strong>——从入口模块开始，递归查找所有 <code>[DependsOn]</code> 依赖：</p>
+<pre><code class="language-csharp">// AbpModuleHelper.cs
+private static void AddModuleAndDependenciesRecursively(List&lt;Type&gt; moduleTypes, Type moduleType, ...)
+{
+    moduleTypes.Add(moduleType);
+    foreach (var dependedModuleType in FindDependedModuleTypes(moduleType))
+    {
+        AddModuleAndDependenciesRecursively(moduleTypes, dependedModuleType, ...);
+    }
+}
+</code></pre>
+<p><code>FindDependedModuleTypes</code> 通过反射读取当前类上的所有 <code>[DependsOn]</code> 属性：</p>
+<pre><code class="language-csharp">public static List&lt;Type&gt; FindDependedModuleTypes(Type moduleType)
+{
+    var dependencyDescriptors = moduleType.GetCustomAttributes().OfType&lt;IDependedTypesProvider&gt;();
+    foreach (var descriptor in dependencyDescriptors)
+    {
+        dependencies.AddIfNotContains(descriptor.GetDependedTypes());
+    }
+}
+</code></pre>
+<p>这意味着不仅 <code>[DependsOn]</code> 会被识别，任何实现了 <code>IDependedTypesProvider</code> 的自定义属性都能用来声明依赖。</p>
+<h3 id="第二步拓扑排序">第二步：拓扑排序</h3>
+<pre><code class="language-csharp">protected virtual List&lt;IAbpModuleDescriptor&gt; SortByDependency(List&lt;IAbpModuleDescriptor&gt; modules, Type startupModuleType)
+{
+    var sortedModules = modules.SortByDependencies(m =&gt; m.Dependencies);
+    sortedModules.MoveItem(m =&gt; m.Type == startupModuleType, modules.Count - 1);
+    return sortedModules;
+}
+</code></pre>
+<p>这里使用了 <code>SortByDependencies</code> 扩展方法（来自 Volo.Abp.Core 的工具类），是一个标准的拓扑排序实现。排序后，入口模块被移到最后一位，保证它最后初始化。</p>
+<p>如果在模块依赖图中存在循环依赖，拓扑排序会抛出异常——这在启动时就能发现，不会让问题带到运行时。</p>
+<h3 id="第三步创建模块实例">第三步：创建模块实例</h3>
+<pre><code class="language-csharp">protected virtual IAbpModule CreateAndRegisterModule(IServiceCollection services, Type moduleType)
+{
+    var module = (IAbpModule)Activator.CreateInstance(moduleType)!;
+    services.AddSingleton(moduleType, module);  // 每个模块以 Singleton 注册到 DI
+    return module;
+}
+</code></pre>
+<p>每个模块实例被注册为 Singleton，这意味着模块在整个应用生命周期中只创建一次。</p>
+<h2 id="生命周期钩子的调用顺序">生命周期钩子的调用顺序</h2>
+<p>模块加载完毕后调用 <code>Initialize</code>，进入生命周期阶段。在 <code>AbpApplicationBase.cs</code> 中：</p>
+<pre><code>阶段 1：ConfigureServices
+  for each module in sortedModules:
+    module.Instance.PreConfigureServices(context)
+  for each module in sortedModules:
+    module.Instance.ConfigureServices(context)  
+  for each module in sortedModules:
+    module.Instance.PostConfigureServices(context)
+
+阶段 2：构建 IServiceProvider
+
+阶段 3：OnApplicationInitialization  
+  for each module in sortedModules:
+    module.Instance.OnPreApplicationInitialization(context)
+    module.Instance.OnApplicationInitialization(context)
+    module.Instance.OnPostApplicationInitialization(context)
+</code></pre>
+<p>注意：三个阶段都按排序后的顺序执行，入口模块永远在最后。</p>
+<h2 id="实战要点">实战要点</h2>
+<h3 id="1-模块不可循环依赖">1. 模块不可循环依赖</h3>
+<p>如果模块 A 依赖 B，B 又依赖 A，启动时直接抛出 <code>AbpException</code>。这比运行时发现要好得多。</p>
+<h3 id="2-additionalassembly-的用途">2. AdditionalAssembly 的用途</h3>
+<p>除了 <code>[DependsOn]</code>，还有 <code>[AdditionalAssembly]</code> 属性。它不声明依赖，只是告诉框架"这个模块的程序集也加载进来"。用于解决模块类在另一个程序集中的场景。</p>
+<h3 id="3-模块实例是-singleton">3. 模块实例是 Singleton</h3>
+<p>模块中定义的状态在应用生命周期内保持。不要在模块中存储请求级别的数据。</p>
+<h3 id="4-preconfigureservices-的应用">4. PreConfigureServices 的应用</h3>
+<p><code>PreConfigureServices</code> 可以用于设置默认选项，让其他模块在 <code>ConfigureServices</code> 中可以覆盖：</p>
+<pre><code class="language-csharp">public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    // 设置默认值，允许下游模块覆盖
+    context.Services.AddSingleton(new DefaultOptions { ... });
+}
+</code></pre>
+<h2 id="验证结果">验证结果</h2>
+<p>运行练习示例，输出清晰展示了顺序：</p>
+<pre><code>[LoggingModule] ConfigureServices          ← 被依赖的模块先执行
+[DataAccessModule] ConfigureServices
+[BusinessModule] ConfigureServices         ← 入口模块最后执行
+</code></pre>
+<p>即使打乱 <code>[DependsOn]</code> 的书写顺序，输出顺序不变。原因就是 <code>SortByDependencies</code> 的拓扑排序保证了依赖顺序，和代码中的书写顺序无关。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <hr>
+
+<p>
+<strong>本文作者：<a href="https://www.cnblogs.com/denglei1024/" target="_blank">DLForge</a></strong><br>
+<strong>原文链接：</strong>
+<a href="https://www.cnblogs.com/denglei1024/p/22138415" target="_blank">https://www.cnblogs.com/denglei1024/p/22138415</a>
+</p>
+
+<p>
+⚠️ 本文采用 CC BY-NC-SA 4.0 协议，转载请注明出处
+</p>
+
+<p>
+📢 <strong>本文首发于公众号</strong>，更多高质量技术文章，欢迎关注：<br>
+<img src="https://img2024.cnblogs.com/blog/1033627/202604/1033627-20260405184333155-127086238.jpg" width="200">
+</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-08-01 21:12">2026-08-01 21:11</span>&nbsp;
+<a href="https://www.cnblogs.com/denglei1024">DLForge</a>&nbsp;
+阅读(<span id="post_view_count">56</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22138415);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdenglei1024%2Fp%2F22138415&amp;targetId=22138415&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
