@@ -1,0 +1,371 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/KubeExplorer/p/22207803" title="发布于 2026-08-04 14:25">
+    
+
+    <span role="heading" aria-level="2">Kueue 如何管理 DRA 模式下的 GPU 配额</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="kueue-p3-dra.jpg" loading="lazy" data-src="https://img.lixueduan.com/kubernetes/cover/kueue-p3-dra.jpg" class="lazyload"></p>
+<p>前面两篇：<a href="https://www.lixueduan.com/posts/kubernetes/62-kueue-p1-intro/" target="_blank" rel="noopener nofollow">Kubernetes 官方出品：一个 Controller 搞定 Job 排队和资源配额</a> 和 <a href="https://www.lixueduan.com/posts/kubernetes/63-kueue-p2-core-crd/" target="_blank" rel="noopener nofollow">终于搞懂 Kueue：5 个核心对象一次讲透</a> 把 Kueue 的基本玩法和核心对象走了一遍，不过 Demo 都跑在 CPU 上。</p>
+<p>真到 GPU 集群里，大家更关心的是另一个问题：</p>
+<p><strong>Kueue 能不能管理 DRA 模式下的 GPU？</strong></p>
+<p>这一篇就把它跑通。NVIDIA DRA Driver 负责把整卡 GPU 发布成 <code>DeviceClass</code> / <code>ResourceSlice</code>，Kueue 在 Job 准入阶段读取 DRA 设备申请，判断这个 Job 能不能进入队列。</p>
+<blockquote>
+<p>对 DRA 不熟悉的同学，可以先看这篇：<a href="https://www.lixueduan.com/posts/kubernetes/54-dra-p1-quickstart/" target="_blank" rel="noopener nofollow">DRA P1：DRA 能解决什么问题？从部署到使用的完整体验</a></p>
+</blockquote>
+
+<h2 id="1-环境准备">1. 环境准备</h2>
+<p>环境准备分几段走：先创建 K8s 集群，再用 GPU Operator 把 GPU Driver / Container Runtime 准备好，最后装 Kueue 和 NVIDIA DRA Driver。</p>
+<h3 id="11-创建-kubernetes-集群">1.1 创建 Kubernetes 集群</h3>
+<p>集群使用 KubeClipper 创建。KubeClipper 1.6.0 默认支持 Kubernetes 1.36.1、containerd 2.2.4，和本文环境一致，详细步骤可以参考：<a href="https://www.lixueduan.com/posts/kubernetes/59-kubeclipper-release-1.6.0/" target="_blank" rel="noopener nofollow">KubeClipper 1.6.0 发布：kcctl 优化与 K8s 1.36 支持</a>。</p>
+<p>快速创建单节点集群的命令如下：</p>
+<pre><code class="language-bash">curl -sfL https://oss.kubeclipper.io/get-kubeclipper.sh | KC_REGION=cn bash -
+kcctl deploy
+kcctl create cluster --name demo --master &lt;NODE_IP&gt; --untaint-master
+</code></pre>
+<p>集群起来后确认版本：</p>
+<pre><code class="language-bash">$ kubectl get node -owide
+NAME            STATUS   ROLES           VERSION   CONTAINER-RUNTIME
+lixd-test-gpu   Ready    control-plane   v1.36.1   containerd://2.2.4
+</code></pre>
+<h3 id="12-gpu-环境准备gpu-operator">1.2 GPU 环境准备（GPU Operator）</h3>
+<p>GPU Driver、NVIDIA Container Toolkit 等基础组件使用 GPU Operator 安装。完整说明可以参考之前这篇：<a href="https://www.lixueduan.com/posts/ai/02-gpu-operator/" target="_blank" rel="noopener nofollow">GPU 环境搭建指南：使用 GPU Operator 加速 Kubernetes GPU 环境搭建</a>。</p>
+<p>本文后面会安装 NVIDIA DRA Driver，所以安装 GPU Operator 时需要关闭 DevicePlugin：</p>
+<pre><code class="language-bash">helm repo add nvidia https://helm.ngc.nvidia.com/nvidia &amp;&amp; helm repo update
+
+helm upgrade --install --wait gpu-operator \
+  -n gpu-operator --create-namespace \
+  nvidia/gpu-operator \
+  --version=v26.3.1 \
+  --set driver.enabled=true \
+  --set devicePlugin.enabled=false
+</code></pre>
+<blockquote>
+<p><code>--set devicePlugin.enabled=false</code>：关闭 DevicePlugin，避免与后续安装的 DRA Driver 冲突。</p>
+</blockquote>
+<p>安装完成后，确认 GPU Operator 组件正常运行：</p>
+<pre><code class="language-bash">$ kubectl get pods -n gpu-operator
+NAME                                           READY   STATUS
+gpu-operator-7bcbd487f5-h8dsd                 1/1     Running
+nvidia-container-toolkit-daemonset-zbpbv      1/1     Running
+nvidia-operator-validator-8l2r5               1/1     Running
+</code></pre>
+<p>再确认节点能看到 GPU：</p>
+<pre><code class="language-bash">$ kubectl get node lixd-test-gpu -o jsonpath='{.metadata.labels.nvidia\.com/gpu\.product}{"\n"}'
+Tesla-T4
+</code></pre>
+<h3 id="13-安装-kueue">1.3 安装 Kueue</h3>
+<p>Kueue 使用 0.18.1，安装方式和前两篇一样：</p>
+<pre><code class="language-bash">helm install kueue oci://registry.k8s.io/kueue/charts/kueue \
+  --version=0.18.1 \
+  --namespace kueue-system \
+  --create-namespace \
+  --wait --timeout 300s
+</code></pre>
+<p>如果测试环境访问 <code>registry.k8s.io</code> 不稳定，也可以用 GitHub Release 里的 chart 包：</p>
+<pre><code class="language-bash">helm install kueue \
+  https://github.com/kubernetes-sigs/kueue/releases/download/v0.18.1/kueue-0.18.1.tgz \
+  --namespace kueue-system \
+  --create-namespace \
+  --wait --timeout 300s
+</code></pre>
+<h3 id="14-接入-nvidia-dra-driver">1.4 接入 NVIDIA DRA Driver</h3>
+<p>最后安装 NVIDIA DRA Driver 25.12.0：</p>
+<pre><code class="language-bash">helm upgrade --install nvidia-dra-driver-gpu \
+  nvidia/nvidia-dra-driver-gpu \
+  --version 25.12.0 \
+  -n nvidia-dra-driver-gpu \
+  --set gpuResourcesEnabledOverride=true \
+  --create-namespace \
+  --wait --timeout 300s
+</code></pre>
+<p>安装完成后，先看 DRA Driver 组件：</p>
+<pre><code class="language-bash">$ kubectl get pods -n nvidia-dra-driver-gpu
+NAME                                                READY   STATUS
+nvidia-dra-driver-gpu-controller-76864c66cb-s8tch   1/1     Running
+nvidia-dra-driver-gpu-kubelet-plugin-grkbg          2/2     Running
+</code></pre>
+<p>再看 DeviceClass：</p>
+<pre><code class="language-bash">$ kubectl get deviceclass
+NAME                                           AGE
+compute-domain-daemon.nvidia.com              2m47s
+compute-domain-default-channel.nvidia.com     2m47s
+gpu.nvidia.com                                2m47s
+mig.nvidia.com                                2m47s
+vfio.gpu.nvidia.com                           2m47s
+</code></pre>
+<p>整卡调度用的是 <code>gpu.nvidia.com</code>。对应的 ResourceSlice 里能看到节点上的 T4：</p>
+<pre><code class="language-bash">$ kubectl get resourceslice
+NAME                                 NODE            DRIVER           POOL
+lixd-test-gpu-gpu.nvidia.com-p8cdq   lixd-test-gpu   gpu.nvidia.com   lixd-test-gpu
+</code></pre>
+<p>后面的 Job 会直接引用 <code>gpu.nvidia.com</code> 这个 DeviceClass，实际可分配设备则来自这些 ResourceSlice。</p>
+<h2 id="2-demo使用-kueue-调度-dra-模式下的-gpu">2. Demo：使用 Kueue 调度 DRA 模式下的 GPU</h2>
+<h3 id="21-修改-kueue-dra-配置">2.1 修改 Kueue DRA 配置</h3>
+<p>DRA 和 Kueue 使用的资源名称并不是同一个。<code>ResourceClaimTemplate</code> 里写的是 <code>deviceClassName: gpu.nvidia.com</code>，而 <code>ClusterQueue</code> 里扣配额用的是资源名，所以这里需要做一次映射：</p>
+<pre><code class="language-yaml">apiVersion: config.kueue.x-k8s.io/v1beta2
+kind: Configuration
+integrations:
+  frameworks:
+  - batch/job
+resources:
+  deviceClassMappings:
+  - name: nvidia.com/gpu
+    deviceClassNames:
+    - gpu.nvidia.com
+</code></pre>
+<p>这段配置的意思是：只要 Workload 通过 <code>ResourceClaimTemplate</code> 申请 <code>gpu.nvidia.com</code> 这个 <code>DeviceClass</code>，Kueue 就把它折算成 <code>nvidia.com/gpu</code> 这个逻辑资源来扣配额。</p>
+<p><img alt="deviceClassMappings 将 DRA DeviceClass 映射为 Kueue 配额资源" loading="lazy" data-src="https://img.lixueduan.com/kubernetes/kueue/kueue-deviceclass-mapping.jpg" class="lazyload"></p>
+<p>修改 Kueue manager config 后，需要重启 <code>kueue-controller-manager</code> 让新配置生效。</p>
+<h3 id="22-创建队列">2.2 创建队列</h3>
+<p>这次只用一个队列，GPU 配额只给 1 张 T4。这样后面再提交第二个 Job 时，Pending 状态会看得很清楚。</p>
+<pre><code class="language-yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: p3-dra-demo
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: p3-t4
+spec:
+  nodeLabels:
+    nvidia.com/gpu.product: Tesla-T4
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: p3-dra-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources:
+    - cpu
+    - memory
+    - nvidia.com/gpu
+    flavors:
+    - name: p3-t4
+      resources:
+      - name: cpu
+        nominalQuota: "8"
+      - name: memory
+        nominalQuota: 16Gi
+      - name: nvidia.com/gpu
+        nominalQuota: 1
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: p3-dra-queue
+  namespace: p3-dra-demo
+spec:
+  clusterQueue: p3-dra-cq
+</code></pre>
+<p>注意这里的 <code>coveredResources</code> 里包含 <code>nvidia.com/gpu</code>。这是映射后的逻辑资源名，不是 Pod 里直接写的扩展资源。</p>
+<h3 id="23-用-resourceclaimtemplate-申请整卡">2.3 用 ResourceClaimTemplate 申请整卡</h3>
+<p>使用 DRA 之后，Job 不再写 <code>resources.limits.nvidia.com/gpu: 1</code>，而是引用一个独立的 <code>ResourceClaimTemplate</code>。</p>
+<p>这里 Kueue 做的事情很直接：读取 Workload 引用的 <code>ResourceClaimTemplate</code>，识别里面的 <code>deviceClassName</code> 和 <code>count</code>，再通过 <code>deviceClassMappings</code> 折算成 <code>ClusterQueue</code> 里的配额资源。</p>
+<blockquote>
+<p>本文不展开 extended resource 路径，避免把两种 DRA 接入方式混在一起。</p>
+</blockquote>
+<p>先创建 ResourceClaimTemplate：</p>
+<pre><code class="language-yaml">apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: single-gpu
+  namespace: p3-dra-demo
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          allocationMode: ExactCount
+          count: 1
+</code></pre>
+<p>这里有两个细节容易混：</p>
+<ul>
+<li><code>deviceClassName</code> 是 <code>gpu.nvidia.com</code>，不是 <code>nvidia.com/gpu</code></li>
+<li><code>ExactCount + count: 1</code> 表示申请 1 张整卡</li>
+</ul>
+<p>再提交 Kueue 管理的 Job：</p>
+<pre><code class="language-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kueue-dra-running-a
+  namespace: p3-dra-demo
+  labels:
+    kueue.x-k8s.io/queue-name: p3-dra-queue
+spec:
+  parallelism: 1
+  completions: 1
+  suspend: true
+  template:
+    spec:
+      resourceClaims:
+      - name: gpu-claim
+        resourceClaimTemplateName: single-gpu
+      restartPolicy: Never
+      containers:
+      - name: cuda-test
+        image: nvcr.io/nvidia/cuda:12.6.0-base-ubuntu24.04
+        command: ["bash", "-c", "nvidia-smi -L &amp;&amp; echo KUEUE_DRA_RUNNING_A &amp;&amp; sleep 3600"]
+        resources:
+          claims:
+          - name: gpu-claim
+</code></pre>
+<p>Job 被 Kueue 准入后，会从 <code>Suspended</code> 变成 <code>Running</code>：</p>
+<pre><code class="language-bash">$ kubectl get job,pod,workload -n p3-dra-demo
+NAME                             STATUS    COMPLETIONS
+job.batch/kueue-dra-running-a    Running   0/1
+
+NAME                             READY   STATUS
+pod/kueue-dra-running-a-kj7nw    1/1     Running
+
+NAME                                                     QUEUE          RESERVED IN   ADMITTED
+workload.kueue.x-k8s.io/job-kueue-dra-running-a-c3b3c    p3-dra-queue   p3-dra-cq     True
+</code></pre>
+<p>ResourceClaim 已经分配：</p>
+<pre><code class="language-bash">$ kubectl get resourceclaim -n p3-dra-demo
+NAME                                                        STATE
+kueue-dra-running-a-kj7nw-gpu-claim-c6j4j                   allocated,reserved
+</code></pre>
+<p>容器里能看到 T4：</p>
+<pre><code class="language-bash">$ kubectl logs -n p3-dra-demo -l job-name=kueue-dra-running-a
+GPU 0: Tesla T4 (UUID: GPU-6d8fdeb7-6247-e04e-81a7-7b42dc45180c)
+KUEUE_DRA_RUNNING_A
+</code></pre>
+<h3 id="24-看-kueue-是否真的扣了-gpu-配额">2.4 看 Kueue 是否真的扣了 GPU 配额</h3>
+<p>直接看 Workload 的准入结果：</p>
+<pre><code class="language-yaml">status:
+  admission:
+    clusterQueue: p3-dra-cq
+    podSetAssignments:
+    - count: 1
+      flavors:
+        nvidia.com/gpu: p3-t4
+      resourceUsage:
+        nvidia.com/gpu: "1"
+</code></pre>
+<p>这说明 <code>deviceClassMappings</code> 已经生效：用户写的是 ResourceClaimTemplate，Kueue 扣的是 <code>nvidia.com/gpu</code> 这个逻辑配额。</p>
+<p>再看看 ClusterQueue，可以发现 GPU 配额已经被扣掉了：</p>
+<pre><code class="language-yaml">status:
+  admittedWorkloads: 1
+  flavorsUsage:
+  - name: p3-t4
+    resources:
+    - name: nvidia.com/gpu
+      total: "1"
+</code></pre>
+<h3 id="25-第二个整卡-job-会被-kueue-卡住">2.5 第二个整卡 Job 会被 Kueue 卡住</h3>
+<p>队列里只有 1 张 GPU 配额。如果再提交一个同样申请 <code>single-gpu</code> 的 Job：</p>
+<pre><code class="language-text">kueue-dra-running-a：1 x gpu.nvidia.com
+kueue-dra-pending-b：1 x gpu.nvidia.com
+</code></pre>
+<pre><code class="language-bash">$ kubectl get job,workload -n p3-dra-demo
+NAME                             STATUS
+job.batch/kueue-dra-running-a    Running
+job.batch/kueue-dra-pending-b    Suspended
+
+NAME                                                     QUEUE          RESERVED IN   ADMITTED
+workload.kueue.x-k8s.io/job-kueue-dra-running-a-c3b3c    p3-dra-queue   p3-dra-cq     True
+workload.kueue.x-k8s.io/job-kueue-dra-pending-b-494a3    p3-dra-queue
+</code></pre>
+<p>再看 Workload 状态，就能发现为什么第二个 Job 一直起不来：</p>
+<pre><code class="language-yaml">status:
+  conditions:
+  - reason: Pending
+    message: 'couldn''t assign flavors to pod set main: insufficient unused quota
+      for nvidia.com/gpu in flavor p3-t4, 1 more needed'
+  resourceRequests:
+  - name: main
+    resources:
+      nvidia.com/gpu: "1"
+</code></pre>
+<h2 id="3-几个容易踩坑的点">3. 几个容易踩坑的点</h2>
+<h3 id="deviceclass-和配额资源不是同一个东西">DeviceClass 和配额资源不是同一个东西</h3>
+<p>ResourceClaimTemplate 里写的是：</p>
+<pre><code class="language-yaml">deviceClassName: gpu.nvidia.com
+</code></pre>
+<p>ClusterQueue 里写的是：</p>
+<pre><code class="language-yaml">coveredResources:
+- nvidia.com/gpu
+</code></pre>
+<p>两者靠 Kueue 配置里的 <code>deviceClassMappings</code> 关联起来。少了这段映射，Workload 会被标成 <code>Inadmissible</code>，原因类似：</p>
+<pre><code class="language-text">DeviceClass gpu.nvidia.com is not mapped in DRA configuration
+</code></pre>
+<h3 id="resourceclaimtemplate-要单独创建">ResourceClaimTemplate 要单独创建</h3>
+<p>这两个名字最容易看混：</p>
+<ul>
+<li><code>single-gpu</code>：前面单独创建的 <code>ResourceClaimTemplate</code>，定义“我要 1 张 <code>gpu.nvidia.com</code> 整卡”。</li>
+<li><code>gpu-claim</code>：Pod 里的本地 claim 名字，后面容器通过它来使用 GPU。</li>
+</ul>
+<p>Pod 里这段不是重新定义一个模板，而是引用已经存在的 <code>single-gpu</code> 模板：</p>
+<pre><code class="language-yaml">resourceClaims:
+- name: gpu-claim
+  resourceClaimTemplateName: single-gpu
+</code></pre>
+<p>容器里再通过同一个 <code>gpu-claim</code> 关联到这次申请到的设备：</p>
+<pre><code class="language-yaml">resources:
+  claims:
+  - name: gpu-claim
+</code></pre>
+<p>所以完整关系是：<code>ResourceClaimTemplate(single-gpu)</code> -&gt; <code>Pod resourceClaims(gpu-claim)</code> -&gt; <code>container resources.claims(gpu-claim)</code>。</p>
+<h3 id="kueue-准入不等于设备已经分配">Kueue 准入不等于设备已经分配</h3>
+<p>这里要注意一点：Kueue 只是负责“准入”，真正把 GPU 分配给 Pod 的还是 kube-scheduler 和 DRA Driver。</p>
+<p>所以生产环境里建议同时关注 <code>ResourceClaim</code> 状态和 Pod 状态。如果希望 Workload 在 Pod 长时间起不来时释放 Kueue 配额，可以结合 <code>waitForPodsReady</code> 做保护。</p>
+<h2 id="4-小结">4. 小结</h2>
+<p>到这里可以看到，Kueue 并没有直接参与 GPU 分配，而是站在 Job 准入这一层，通过 <code>deviceClassMappings</code> 把 DRA 的设备申请转换成队列里的配额资源。这样既保留了 DRA 的设备模型，也让 GPU 可以继续纳入 Kueue 的统一配额管理。</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>负责什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NVIDIA DRA Driver</td>
+<td>把 GPU 作为 <code>gpu.nvidia.com</code> DeviceClass / ResourceSlice 发布出来</td>
+</tr>
+<tr>
+<td>Kueue</td>
+<td>通过 <code>deviceClassMappings</code> 把 DRA 设备折算成 <code>nvidia.com/gpu</code> 配额</td>
+</tr>
+<tr>
+<td>kube-scheduler</td>
+<td>在 Pod 调度阶段完成 ResourceClaim 的实际设备分配</td>
+</tr>
+</tbody>
+</table>
+<p>下一篇继续往前走一步，把 HAMi 引入进来：一张 GPU 被切成多份 vGPU 之后，Kueue 是否还能继续管理显存和算力配额。</p>
+<h2 id="5-参考文章">5. 参考文章</h2>
+<ul>
+<li><a href="https://kueue.sigs.k8s.io/docs/concepts/dynamic_resource_allocation/" target="_blank" rel="noopener nofollow">Kueue Dynamic Resource Allocation</a></li>
+<li><a href="https://kueue.sigs.k8s.io/docs/tasks/manage/setup_dra/" target="_blank" rel="noopener nofollow">Set Up Dynamic Resource Allocation</a></li>
+<li><a href="https://kueue.sigs.k8s.io/docs/tasks/run/dra/" target="_blank" rel="noopener nofollow">Run Workloads With DRA Devices</a></li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-04 14:25">2026-08-04 14:25</span>&nbsp;
+<a href="https://www.cnblogs.com/KubeExplorer">探索云原生</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22207803);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FKubeExplorer%2Fp%2F22207803&amp;targetId=22207803&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
