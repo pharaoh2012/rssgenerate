@@ -1,0 +1,606 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/doiito/p/22223598" title="发布于 2026-08-04 20:36">
+    
+
+    <span role="heading" aria-level="2">【Agent Harness】流马（Gliding Horse）DeepSeek Responses API 接入介绍</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="deepseek-responses-api-接入说明">DeepSeek Responses API 接入说明</h1>
+<blockquote>
+<p><strong>Commit</strong>: <code>4391ba3</code> — update Responses API support<br>
+<strong>日期</strong>: 2026-08-04<br>
+<strong>范围</strong>: <code>src/gateway/unified_gateway.rs</code>、<code>src/llm/sse.rs</code>、<code>src/config/settings.rs</code>、<code>apps/gliding_code/src/config.rs</code>、<code>config.yaml</code> 及测试适配</p>
+</blockquote>
+<hr>
+<h2 id="1-背景">1. 背景</h2>
+<p>DeepSeek 官方推出 <strong>Responses API</strong>（<code>POST /v1/responses</code>）作为新一代接口，相比 Chat Completions 具备语义化的流式事件（<code>response.*</code>）、显式的工具调用往返结构、原生推理内容（<code>reasoning</code>）输出等能力。截至 2026-08-04，该接口<strong>仅支持 <code>deepseek-v4-flash</code> 模型</strong>（<code>deepseek-v4-pro</code> 预计 2026 年 8 月初启用）。</p>
+<p>本次修改为 Gliding Horse 接入 Responses API，同时保持对 Chat Completions 的完全兼容：</p>
+<ul>
+<li><code>deepseek-v4-flash</code> 请求默认路由到 <code>/v1/responses</code>；</li>
+<li>其余模型（含 <code>deepseek-v4-pro</code>）自动回退到 <code>/v1/chat/completions</code>；</li>
+<li>下游调用方（Agent Runner、工具执行器、TUI 等）<strong>无感知</strong>——两种协议在网关层统一收敛为内部 <code>ChatCompletionResponse</code> / <code>StreamEvent</code> 词汇表。</li>
+</ul>
+<hr>
+<h2 id="2-整体架构">2. 整体架构</h2>
+<div class="mermaid">flowchart TB
+    subgraph Config["配置层"]
+        ENV["环境变量&lt;br/&gt;USE_RESPONSES_API&lt;br/&gt;AGENT_OS_GATEWAY_USE_RESPONSES_API"]
+        YAML["config.yaml&lt;br/&gt;gateway.use_responses_api"]
+        Cfg["CliConfig&lt;br/&gt;apps/gliding_code/src/config.rs"]
+        S["Settings&lt;br/&gt;src/config/settings.rs&lt;br/&gt;GatewaySettings.use_responses_api"]
+        ENV --&gt; Cfg
+        YAML --&gt; S
+        Cfg --&gt;|"构造 GatewaySettings"| S
+    end
+
+    subgraph GW["统一网关 UnifiedGateway&lt;br/&gt;src/gateway/unified_gateway.rs"]
+        R["RwLock&amp;lt;bool&amp;gt; use_responses_api&lt;br/&gt;+ set_use_responses_api()"]
+        BR["should_use_responses_api(model)"]
+        CAP["is_responses_capable_model(model)&lt;br/&gt;deepseek-v4-flash*"]
+        BR --&gt; CAP
+
+        subgraph NonStream["非流式路径"]
+            N1["chat / chat_with_model / chat_with_params"]
+            N2["build_responses_body&lt;br/&gt;messages → instructions + input items"]
+            N3["send_responses_request&lt;br/&gt;→ send_with_retry（指数退避重试）"]
+            N4["parse_responses_response&lt;br/&gt;output items → ChatCompletionResponse"]
+        end
+
+        subgraph Stream["流式路径"]
+            S1["stream_chat_with_params"]
+            S2["build_responses_body（stream: true）"]
+            S3["send_stream_request&lt;br/&gt;Accept: text/event-stream"]
+        end
+    end
+
+    subgraph SSE["流式事件解析 src/llm/sse.rs"]
+        P1["SseParser::push → parse_frame"]
+        P2{"type 前缀 == response.* ?"}
+        P3["parse_responses_api_event&lt;br/&gt;response.* → StreamEvent"]
+        P4["parse_openai_stream_event&lt;br/&gt;chat completions 事件"]
+        P1 --&gt; P2
+        P2 --&gt;|是| P3
+        P2 --&gt;|否| P4
+    end
+
+    subgraph ACC["流式聚合 src/llm/stream_types.rs"]
+        A1["StreamAccumulator::process_event"]
+        A2["StreamResponse&lt;br/&gt;thought / content / tool_calls / usage"]
+        A1 --&gt; A2
+    end
+
+    subgraph Downstream["下游消费方（无感知）"]
+        D1["Agent Runner / SA"]
+        D2["Tool Executor"]
+        D3["Gliding Code TUI"]
+        D4["stream_processor.rs MessageStream"]
+    end
+
+    R --&gt; BR
+    BR --&gt;|"开启 且 模型为 v4-flash"| N2
+    BR --&gt;|"开启 且 模型为 v4-flash"| S2
+    BR --&gt;|"关闭 或 非 v4-flash"| CC["/v1/chat/completions 原有路径"]
+    N2 --&gt; N3 --&gt; N4
+    S2 --&gt; S3
+    S3 --&gt;|"HTTP body 流"| P1
+    P3 --&gt; A1
+    P4 --&gt; A1
+    N4 --&gt; D1
+    N4 --&gt; D2
+    A2 --&gt; D3
+    A2 --&gt; D4
+    D4 --&gt; D3
+</div><p><strong>设计要点</strong>：Responses API 是网关内部的一条<strong>协议适配分支</strong>，所有 Responses 特有的结构（input items、semantic events）都在网关 / SSE 解析层完成转换，业务层看到的数据形状与 Chat Completions 完全一致。</p>
+<hr>
+<h2 id="3-配置与开关">3. 配置与开关</h2>
+<h3 id="31-配置项">3.1 配置项</h3>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>字段 / 变量</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/config/settings.rs</code></td>
+<td><code>GatewaySettings.use_responses_api</code></td>
+<td><code>false</code>（程序化默认）/ <code>true</code>（CLI 默认）</td>
+<td>是否启用 Responses API 路由</td>
+</tr>
+<tr>
+<td><code>config.yaml</code></td>
+<td><code>gateway.use_responses_api</code></td>
+<td><code>true</code></td>
+<td>YAML 配置入口</td>
+</tr>
+<tr>
+<td><code>apps/gliding_code/src/config.rs</code></td>
+<td><code>USE_RESPONSES_API</code></td>
+<td><code>true</code></td>
+<td>环境变量，<code>1</code> / <code>true</code> 视为开启</td>
+</tr>
+<tr>
+<td>同上（兼容）</td>
+<td><code>AGENT_OS_GATEWAY_USE_RESPONSES_API</code></td>
+<td>—</td>
+<td>兼容别名</td>
+</tr>
+<tr>
+<td><code>unified_gateway.rs</code></td>
+<td><code>set_use_responses_api(&amp;self, enabled: bool)</code></td>
+<td>—</td>
+<td>运行时动态切换</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-yaml"># config.yaml 示例
+gateway:
+  base_url: "https://api.deepseek.com"
+  api_key: "sk-..."
+  timeout_seconds: 300
+  max_retries: 3
+  retry_base_ms: 500
+  # deepseek-v4-flash 走 Responses API (/v1/responses)，deepseek-v4-pro 继续走 chat completions
+  use_responses_api: true
+  model_mapping:
+    planning: "deepseek-v4-pro"
+    execution: "deepseek-v4-flash"
+</code></pre>
+<pre><code class="language-sh"># 环境变量方式
+export USE_RESPONSES_API=1        # 显式开启
+export USE_RESPONSES_API=0        # 强制走 chat completions
+</code></pre>
+<h3 id="32-模型能力判定">3.2 模型能力判定</h3>
+<pre><code class="language-rust">/// 仅 deepseek-v4-flash 支持 Responses API；
+/// deepseek-v4-pro 在 DeepSeek 启用前继续使用 chat completions。
+fn is_responses_capable_model(model: &amp;str) -&gt; bool {
+    let m = model.to_lowercase();
+    m == "deepseek-v4-flash" || m.starts_with("deepseek-v4-flash-")
+}
+
+fn should_use_responses_api(&amp;self, model: &amp;str) -&gt; bool {
+    *self.use_responses_api.read().unwrap() &amp;&amp; Self::is_responses_capable_model(model)
+}
+</code></pre>
+<blockquote>
+<p>即使 <code>use_responses_api</code> 为 <code>true</code>，非 <code>deepseek-v4-flash</code> 模型也绝不会被路由到 <code>/v1/responses</code>——这是硬性安全边界，防止对尚不支持该接口的模型产生 400 错误。</p>
+</blockquote>
+<hr>
+<h2 id="4-非流式请求chat--chat_with_model--chat_with_params">4. 非流式请求（<code>chat</code> / <code>chat_with_model</code> / <code>chat_with_params</code>）</h2>
+<div class="mermaid">sequenceDiagram
+    participant Caller as 调用方
+    participant GW as UnifiedGateway
+    participant API as DeepSeek /v1/responses
+
+    Caller-&gt;&gt;GW: chat_with_params(model, messages, temperature, max_tokens, tools, tool_choice)
+    GW-&gt;&gt;GW: should_use_responses_api(model)?
+    alt 是（v4-flash 且开关开启）
+        GW-&gt;&gt;GW: build_responses_body()
+        Note over GW: system → instructions&lt;br/&gt;user/assistant → input items&lt;br/&gt;tool_calls → function_call&lt;br/&gt;tool 消息 → function_call_output
+        GW-&gt;&gt;API: POST {base}/v1/responses
+        API--&gt;&gt;GW: { id, output[], usage{} }
+        GW-&gt;&gt;GW: parse_responses_response()
+        Note over GW: message→text&lt;br/&gt;reasoning→reasoning_content&lt;br/&gt;function_call/custom_tool_call→tool_calls&lt;br/&gt;usage 归一化
+        GW--&gt;&gt;Caller: ChatCompletionResponse（形状与 chat completions 一致）
+    else 否（其他模型或开关关闭）
+        GW--&gt;&gt;Caller: 走 /v1/chat/completions 原有逻辑
+    end
+</div><h3 id="41-消息转换responses_input_items">4.1 消息转换：<code>responses_input_items</code></h3>
+<table>
+<thead>
+<tr>
+<th>Chat Completions 消息</th>
+<th>Responses API input item</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第一条非空 <code>system</code></td>
+<td><code>instructions</code>（顶层字段）</td>
+</tr>
+<tr>
+<td>其余 <code>system</code> / <code>developer</code> / <code>user</code></td>
+<td><code>{type: message, role, content:[{type: input_text, text}]}</code></td>
+</tr>
+<tr>
+<td><code>assistant</code>（无工具调用）</td>
+<td><code>{type: message, role: assistant, content:[{type: output_text, text}]}</code></td>
+</tr>
+<tr>
+<td><code>assistant</code>（有工具调用）</td>
+<td>message item <strong>+</strong> 每个调用一个 <code>{type: function_call, call_id, name, arguments}</code></td>
+</tr>
+<tr>
+<td><code>tool</code></td>
+<td><code>{type: function_call_output, call_id, output}</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="42-工具定义转换convert_responses_tools">4.2 工具定义转换：<code>convert_responses_tools</code></h3>
+<p>Chat Completions 将函数定义嵌套在 <code>function</code> 键下，Responses API 要求扁平结构：</p>
+<pre><code class="language-jsonc">// chat completions（入参）
+{ "type": "function", "function": { "name": "get_weather", "description": "...", "parameters": {...} } }
+
+// responses（转换后）
+{ "type": "function", "name": "get_weather", "description": "...", "parameters": {...} }
+</code></pre>
+<p>非函数工具（<code>web_search</code>、自定义工具）原样透传。</p>
+<h3 id="43-响应解析parse_responses_response">4.3 响应解析：<code>parse_responses_response</code></h3>
+<div class="mermaid">flowchart LR
+    RAW["POST /v1/responses 响应&lt;br/&gt;{ id, output[], usage }"]
+    RAW --&gt; M{遍历 output items}
+    M --&gt;|"type == message"| T["content[] 各 block 的 text&lt;br/&gt;拼接为 content"]
+    M --&gt;|"type == reasoning"| R["content[] 的 reasoning_text&lt;br/&gt;拼接为 reasoning_content"]
+    M --&gt;|"type == function_call"| F["call_id/name/arguments&lt;br/&gt;→ ResponseToolCall{function}"]
+    M --&gt;|"type == custom_tool_call"| C["id/name/input&lt;br/&gt;→ ResponseToolCall{custom}"]
+    T --&gt; RESP
+    R --&gt; RESP
+    F --&gt; RESP
+    C --&gt; RESP
+    RESP["ChatCompletionResponse&lt;br/&gt;choices[0].message{content, reasoning_content, tool_calls}&lt;br/&gt;finish_reason: stop | tool_calls&lt;br/&gt;usage{input_tokens→prompt_tokens, output_tokens→completion_tokens}"]
+</div><p><strong>关键点</strong>：Responses API 的 usage 字段是 <code>input_tokens</code> / <code>output_tokens</code>，而 Chat Completions 是 <code>prompt_tokens</code> / <code>completion_tokens</code>——解析层完成归一化，下游统计与计费展示无需改动。</p>
+<h3 id="44-重试与错误处理send_with_retry">4.4 重试与错误处理：<code>send_with_retry</code></h3>
+<p>两种协议<strong>共享</strong>同一重试骨架（重构自原有逻辑）：</p>
+<ul>
+<li>指数退避：<code>retry_base_ms * 2^(attempt-1)</code>；</li>
+<li><strong>4xx 客户端错误立即终止</strong>（不重试），并将请求体前 8K 字符嵌入错误信息便于 TUI 直接排查；</li>
+<li>5xx / 网络错误按 <code>max_retries</code> 重试；</li>
+<li>解析失败（JSON 无效 / 结构不符）也会重试并记录响应长度日志。</li>
+</ul>
+<hr>
+<h2 id="5-流式请求stream_chat_with_params">5. 流式请求（<code>stream_chat_with_params</code>）</h2>
+<div class="mermaid">sequenceDiagram
+    participant Caller as 调用方
+    participant GW as UnifiedGateway
+    participant MS as MessageStream
+    participant SP as StreamingProcessor / SseParser
+    participant ACC as StreamAccumulator
+    participant API as DeepSeek /v1/responses (stream)
+
+    Caller-&gt;&gt;GW: stream_chat_with_params(...)
+    GW-&gt;&gt;GW: build_responses_body(stream: true)
+    GW-&gt;&gt;API: POST {base}/v1/responses（Accept: text/event-stream）
+    API--&gt;&gt;MS: HTTP chunk 流
+    MS-&gt;&gt;SP: push_chunk(bytes)
+    SP-&gt;&gt;SP: parse_frame → 识别 response.* 前缀
+    SP-&gt;&gt;ACC: StreamEvent 事件流
+    ACC-&gt;&gt;ACC: process_event 聚合
+    MS--&gt;&gt;Caller: collect_with_callback / collect_all → StreamResponse
+</div><h3 id="51-事件映射parse_responses_api_event">5.1 事件映射：<code>parse_responses_api_event</code></h3>
+<p>Responses API 流由<strong>语义事件</strong>组成（<code>type: "response.*"</code>），且<strong>没有</strong> <code>data: [DONE]</code> 终止帧——终止由 <code>response.completed</code> / <code>response.incomplete</code> / <code>response.failed</code> 承担。<code>parse_frame</code> 通过 <code>type</code> 前缀分流到 Responses 解析器：</p>
+<table>
+<thead>
+<tr>
+<th>Responses API 事件</th>
+<th>内部 StreamEvent</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>response.created</code></td>
+<td><code>MessageStart { id, model }</code></td>
+<td>记录 message_id / model</td>
+</tr>
+<tr>
+<td><code>response.output_item.added</code>（function_call / custom_tool_call）</td>
+<td><code>ContentBlockStart { ToolUse{id, name} }</code></td>
+<td>工具块开始</td>
+</tr>
+<tr>
+<td><code>response.output_text.delta</code></td>
+<td><code>ContentBlockDelta { TextDelta }</code></td>
+<td>正文增量</td>
+</tr>
+<tr>
+<td><code>response.reasoning_text.delta</code></td>
+<td><code>ContentBlockDelta { ThinkingDelta }</code></td>
+<td>推理内容（TUI 中以思考步骤呈现）</td>
+</tr>
+<tr>
+<td><code>response.function_call_arguments.delta</code></td>
+<td><code>ContentBlockDelta { ToolCallDelta{arguments} }</code></td>
+<td>工具参数增量</td>
+</tr>
+<tr>
+<td><code>response.custom_tool_call_input.delta</code></td>
+<td><code>ContentBlockDelta { ToolCallDelta{arguments} }</code></td>
+<td>自定义工具参数增量</td>
+</tr>
+<tr>
+<td><code>response.completed</code></td>
+<td><code>MessageDelta { finish_reason }</code></td>
+<td><code>completed</code>+有工具调用 → <code>tool_calls</code>；否则 → <code>stop</code>；附 usage</td>
+</tr>
+<tr>
+<td><code>response.incomplete</code></td>
+<td><code>MessageDelta { finish_reason: "length" }</code></td>
+<td>输出截断</td>
+</tr>
+<tr>
+<td><code>response.failed</code></td>
+<td><code>MessageDelta { finish_reason: "error" }</code></td>
+<td>失败</td>
+</tr>
+</tbody>
+</table>
+<h3 id="52-流式终止语义">5.2 流式终止语义</h3>
+<div class="mermaid">flowchart TD
+    START["流开始"] --&gt; CREATED["response.created"]
+    CREATED --&gt; LOOP["增量事件循环&lt;br/&gt;output_text / reasoning_text / function_call_arguments delta"]
+    LOOP --&gt; TERM{"终止事件"}
+    TERM --&gt;|"response.completed"| C1{"output 含 function_call?"}
+    C1 --&gt;|是| R1["finish_reason = tool_calls"]
+    C1 --&gt;|否| R2["finish_reason = stop"]
+    TERM --&gt;|"response.incomplete"| R3["finish_reason = length"]
+    TERM --&gt;|"response.failed"| R4["finish_reason = error"]
+    R1 --&gt; END["MessageStream::next_event 返回 None&lt;br/&gt;collect_all / collect_with_callback 完成"]
+    R2 --&gt; END
+    R3 --&gt; END
+    R4 --&gt; END
+</div><h3 id="53-与-chat-completions-流式路径的关系">5.3 与 Chat Completions 流式路径的关系</h3>
+<ul>
+<li><code>SseParser</code> / <code>MessageStream</code> / <code>StreamAccumulator</code> <strong>完全复用</strong>；</li>
+<li>差异仅在 <code>parse_frame</code> 内部：<code>response.*</code> 前缀走新解析器，其余走原有 <code>parse_openai_stream_event</code>；</li>
+<li><code>[DONE]</code> 帧仍被兼容处理（<code>parse_frame</code> 中 <code>payload == "[DONE]"</code> 返回 <code>None</code>），因此两种协议可在同一代码路径内共存。</li>
+</ul>
+<hr>
+<h2 id="6-调用链全景">6. 调用链全景</h2>
+<div class="mermaid">flowchart TB
+    subgraph App["应用层"]
+        TUI["Gliding Code TUI&lt;br/&gt;/model deepseek-v4-flash"]
+        AR["Agent Runner / SA 编排"]
+        TE["Tool Executor"]
+    end
+
+    subgraph GW2["UnifiedGateway"]
+        CHAT["chat_with_params（非流式）"]
+        STREAM["stream_chat_with_params（流式）"]
+    end
+
+    subgraph Proto["协议层"]
+        RP["/v1/responses"]
+        CC["/v1/chat/completions"]
+    end
+
+    subgraph Conv["转换层"]
+        BODY["build_responses_body"]
+        PARSER["parse_responses_response"]
+        SSEP["parse_responses_api_event"]
+    end
+
+    subgraph Core["核心层"]
+        RETRY["send_with_retry"]
+        MSTREAM["MessageStream + StreamAccumulator"]
+    end
+
+    subgraph DL["DeepSeek API"]
+        D1["deepseek-v4-flash&lt;br/&gt;Responses API 原生"]
+        D2["deepseek-v4-pro&lt;br/&gt;Chat Completions"]
+    end
+
+    TUI --&gt; AR
+    AR --&gt; CHAT
+    AR --&gt; STREAM
+    TE --&gt; CHAT
+    CHAT --&gt;|"v4-flash 且开启"| BODY --&gt; RP --&gt; RETRY --&gt; PARSER
+    STREAM --&gt;|"v4-flash 且开启"| BODY --&gt; RP --&gt; MSTREAM --&gt; SSEP
+    CHAT --&gt;|"其他模型"| CC --&gt; RETRY
+    STREAM --&gt;|"其他模型"| CC --&gt; MSTREAM
+    RETRY --&gt; D1
+    RETRY --&gt; D2
+    MSTREAM --&gt; D1
+    MSTREAM --&gt; D2
+</div><hr>
+<h2 id="7-配置与使用示例">7. 配置与使用示例</h2>
+<h3 id="71-完整启用配置">7.1 完整启用配置</h3>
+<pre><code class="language-sh"># 1) API Key
+export DEEPSEEK_API_KEY="sk-..."
+
+# 2) 显式启用 Responses API（v4-flash 默认已开启，可省略）
+export USE_RESPONSES_API=1
+
+# 3) 运行 Gliding Code，默认模型 deepseek-v4-flash 即走 /v1/responses
+./glidingcode "设计一个知识图谱的 schema"
+
+# 4) 切换到 v4-pro（自动回退 chat completions）
+./glidingcode --model deepseek-v4-pro "分析这段代码的时间复杂度"
+</code></pre>
+<h3 id="72-运行时动态切换编程接口">7.2 运行时动态切换（编程接口）</h3>
+<pre><code class="language-rust">// 任意时刻可切换，无需重建网关
+gateway.set_use_responses_api(false); // 强制全部模型走 chat completions
+gateway.set_use_responses_api(true);  // 恢复 v4-flash 走 responses
+</code></pre>
+<h3 id="73-观察点">7.3 观察点</h3>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>日志出现 <code>LLM API call successful</code></td>
+<td>非流式调用完成（含 usage）</td>
+</tr>
+<tr>
+<td>流式正常结束、无 <code>[DONE]</code> 依赖</td>
+<td>说明 <code>response.completed</code> 终止事件被正确解析</td>
+</tr>
+<tr>
+<td>TUI 中出现可展开的思考步骤</td>
+<td><code>response.reasoning_text.delta</code> → ThinkingDelta → thinking 聚合</td>
+</tr>
+<tr>
+<td>工具调用正常往返</td>
+<td><code>function_call</code> items / <code>function_call_arguments.delta</code> 转换正确</td>
+</tr>
+<tr>
+<td>4xx 错误附 8K 请求体预览</td>
+<td>便于直接定位请求构造问题</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="8-测试覆盖">8. 测试覆盖</h2>
+<p>新增 / 适配的测试（<code>cargo test --lib</code>，全量 1193 项通过）：</p>
+<table>
+<thead>
+<tr>
+<th>测试</th>
+<th>位置</th>
+<th>验证点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_build_responses_body_converts_messages</code></td>
+<td><code>unified_gateway.rs</code></td>
+<td>messages → instructions + input items 转换</td>
+</tr>
+<tr>
+<td><code>test_responses_api_text_stream</code></td>
+<td><code>sse.rs</code></td>
+<td>文本流全链路（created + delta + completed）聚合正确</td>
+</tr>
+<tr>
+<td><code>test_responses_api_no_done_terminator</code></td>
+<td><code>sse.rs</code></td>
+<td>不依赖 <code>[DONE]</code>，completed 即终止</td>
+</tr>
+<tr>
+<td><code>test_responses_api_reasoning_delta</code></td>
+<td><code>sse.rs</code></td>
+<td>推理增量 → thinking 聚合</td>
+</tr>
+<tr>
+<td><code>test_responses_api_tool_call_stream</code></td>
+<td><code>sse.rs</code></td>
+<td><code>function_call_arguments.delta</code> → 工具调用聚合</td>
+</tr>
+<tr>
+<td><code>test_responses_api_custom_tool_call_delta</code></td>
+<td><code>sse.rs</code></td>
+<td>自定义工具参数增量解析</td>
+</tr>
+<tr>
+<td><code>test_responses_api_incomplete_sets_length</code></td>
+<td><code>sse.rs</code></td>
+<td><code>response.incomplete</code> → <code>finish_reason: length</code></td>
+</tr>
+<tr>
+<td><code>test_responses_api_failed_sets_error</code></td>
+<td><code>sse.rs</code></td>
+<td><code>response.failed</code> → <code>finish_reason: error</code></td>
+</tr>
+<tr>
+<td><code>test_responses_api_live_non_streaming</code> / <code>_streaming</code> / <code>_tool_call</code></td>
+<td><code>unified_gateway.rs</code></td>
+<td>真实 API 端到端（无 <code>DEEPSEEK_API_KEY</code> 时自动跳过）</td>
+</tr>
+<tr>
+<td>各模块 <code>use_responses_api: false</code> 适配</td>
+<td>4 处测试结构体</td>
+<td>新字段向后兼容</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="9-边界与限制">9. 边界与限制</h2>
+<ol>
+<li><strong>模型支持面</strong>：Responses API 目前仅 <code>deepseek-v4-flash</code>；<code>deepseek-v4-pro</code> 在官方启用前自动走 chat completions（<code>is_responses_capable_model</code> 硬性判定）。</li>
+<li><strong>温度等参数</strong>：思考模式下 <code>temperature</code> 等参数不生效（DeepSeek 文档说明，兼容性静默忽略，不报错）；网关仍透传参数，由 API 侧处理。</li>
+<li><strong>无降级重试</strong>：若 <code>/v1/responses</code> 返回 4xx（如参数不合法），不会自动降级到 chat completions——这是有意设计，避免掩盖请求构造错误；可通过 <code>set_use_responses_api(false)</code> 手动回退。</li>
+<li><strong>流式终止</strong>：Responses 流没有 <code>[DONE]</code>；若服务端异常断流且无终止事件，<code>MessageStream</code> 依赖底层 HTTP 流结束（<code>None</code>）自然终止。</li>
+<li><strong>usage 归一化</strong>：<code>input_tokens/output_tokens</code> → <code>prompt_tokens/completion_tokens</code> 的映射在解析层完成，计费展示沿用原有逻辑。</li>
+</ol>
+<hr>
+<h2 id="10-文件变更清单">10. 文件变更清单</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>变更</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/gateway/unified_gateway.rs</code></td>
+<td>+678</td>
+<td>Responses API 非流式/流式接入、消息与响应转换、重试重构、运行时开关、测试</td>
+</tr>
+<tr>
+<td><code>src/llm/sse.rs</code></td>
+<td>+323</td>
+<td><code>parse_responses_api_event</code> 语义事件解析、流式测试</td>
+</tr>
+<tr>
+<td><code>src/config/settings.rs</code></td>
+<td>+5</td>
+<td><code>GatewaySettings.use_responses_api</code> 字段</td>
+</tr>
+<tr>
+<td><code>apps/gliding_code/src/config.rs</code></td>
+<td>+8</td>
+<td>环境变量读取（<code>USE_RESPONSES_API</code> / 兼容别名），默认开启</td>
+</tr>
+<tr>
+<td><code>config.yaml</code></td>
+<td>+2</td>
+<td>配置项与注释</td>
+</tr>
+<tr>
+<td><code>src/core/agent_runner/tests.rs</code></td>
+<td>+1</td>
+<td>结构体字段适配</td>
+</tr>
+<tr>
+<td><code>src/core/sa/tests.rs</code></td>
+<td>+1</td>
+<td>结构体字段适配</td>
+</tr>
+<tr>
+<td><code>src/skill_graph/skill_creator.rs</code></td>
+<td>+4</td>
+<td>结构体字段适配</td>
+</tr>
+<tr>
+<td><code>src/tools/tool_executor/tests.rs</code></td>
+<td>+1</td>
+<td>结构体字段适配</td>
+</tr>
+<tr>
+<td><code>src/worker/agent_os_worker.rs</code></td>
+<td>+2</td>
+<td>结构体字段适配</td>
+</tr>
+</tbody>
+</table>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-08-04 20:37">2026-08-04 20:36</span>&nbsp;
+<a href="https://www.cnblogs.com/doiito">doiito</a>&nbsp;
+阅读(<span id="post_view_count">61</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22223598);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdoiito%2Fp%2F22223598&amp;targetId=22223598&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
