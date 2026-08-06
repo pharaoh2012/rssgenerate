@@ -1,0 +1,419 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Ahoo-Wang/p/22270599/wow-command-wait-consistency" title="发布于 2026-08-06 10:54">
+    
+
+    <span role="heading" aria-level="2">接口返回 200，查询却查不到：别再 sleep(1s)，理解 Wow 的一致性等待</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/457833/202608/457833-20260806105621895-1119763026.png" alt="接口返回 200，查询却查不到：别再 sleep(1s)，理解 Wow 的一致性等待" class="desc_img">
+        从一次订单查询延迟问题出发，拆解 CQRS 中 SENT、PROCESSED、PROJECTED 的完成语义，以及 Wow 如何用可声明的等待计划替代固定延迟。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img2024.cnblogs.com/blog/457833/202608/457833-20260806104506781-33301852.png" alt="暗色技术插画：命令从入口经过聚合与事件流，最终让读模型可查询" loading="lazy"></p>
+<p><em>配图：命令从入口经过聚合与事件流，最终到达可查询的读模型。</em></p>
+<p><em>在异步系统里，真正重要的不是“接口有没有返回”，而是“返回时系统究竟承诺了什么”。</em></p>
+<blockquote>
+<p>用户点击“提交订单”，接口返回 200；前端马上跳转订单详情，却得到 404。团队第一反应是给客户端加 <code>sleep(1000)</code>，或者失败后再重试几次。</p>
+<p>但问题可能根本不是数据库慢，而是系统把“命令已发出”误认为“业务已完成”。</p>
+</blockquote>
+<p>这不是某个数据库或消息队列的偶发故障，而是 CQRS 读写分离中一个非常容易被忽略的契约问题：<strong>“成功”不是一个状态，而是一组不同的完成语义。</strong></p>
+<p>Wow 没有把这个语义藏在固定延迟里，而是把它显式建模为 <code>SENT</code>、<code>PROCESSED</code>、<code>PROJECTED</code>、<code>SNAPSHOT</code>、<code>EVENT_HANDLED</code> 和 <code>SAGA_HANDLED</code> 等命令处理阶段。调用方可以声明自己究竟要等到哪一个阶段，再让系统返回结果。</p>
+<h2 id="先回答http-返回-200到底意味着什么">先回答：HTTP 返回 200，到底意味着什么？</h2>
+<p>在 Wow 的 WebFlux 命令入口中，请求会先经过 <code>CommandWaitPolicy</code> 提取等待计划和超时时间，再由 <code>CommandHandler</code> 调用 <code>CommandGateway.sendAndWait</code> 或 <code>sendAndWaitStream</code>。因此，HTTP 响应的完成语义由请求携带的等待计划决定，并不是所有命令都天然代表“投影已经完成”。</p>
+<p>来源：<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-webflux/src/main/kotlin/me/ahoo/wow/webflux/route/command/CommandHandler.kt#L49-L61" target="_blank" rel="noopener nofollow">CommandHandler.sendCommand:49-61</a>、<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-webflux/src/main/kotlin/me/ahoo/wow/webflux/route/policy/CommandWaitPolicy.kt#L23-L27" target="_blank" rel="noopener nofollow">CommandWaitPolicy.waitPlan:23-27</a>。</p>
+<table>
+<thead>
+<tr>
+<th>等待阶段</th>
+<th>系统此时能证明什么</th>
+<th>不能证明什么</th>
+<th>适合的业务语义</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SENT</code></td>
+<td>命令总线已经接受发送</td>
+<td>聚合尚未必完成处理</td>
+<td>快速接收、异步任务、无需立即读取结果</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/CommandGateway.kt#L128-L142" target="_blank" rel="noopener nofollow"><code>CommandGateway.sendAndWaitForSent</code></a></td>
+</tr>
+<tr>
+<td><code>PROCESSED</code></td>
+<td>聚合已校验并执行命令，相关事件已发布</td>
+<td>查询模型不一定已经更新</td>
+<td>需要确认领域操作完成</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/CommandGateway.kt#L144-L157" target="_blank" rel="noopener nofollow"><code>CommandGateway.sendAndWaitForProcessed</code></a></td>
+</tr>
+<tr>
+<td><code>PROJECTED</code></td>
+<td>指定的投影处理已完成</td>
+<td>其他投影或 Saga 不一定完成</td>
+<td>写入后立即查询同一个读模型</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/NotifierFilters.kt#L84-L94" target="_blank" rel="noopener nofollow"><code>ProjectedNotifierFilter</code></a></td>
+</tr>
+<tr>
+<td><code>SNAPSHOT</code></td>
+<td>聚合快照已生成</td>
+<td>下游读模型不一定完成</td>
+<td>关心聚合状态检查点</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandStage.kt#L46-L54" target="_blank" rel="noopener nofollow"><code>CommandStage</code></a></td>
+</tr>
+<tr>
+<td><code>EVENT_HANDLED</code> / <code>SAGA_HANDLED</code></td>
+<td>指定事件处理器或 Saga 已处理事件</td>
+<td>不代表所有下游副作用都结束</td>
+<td>需要等待某个下游协作边界</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandStage.kt#L66-L86" target="_blank" rel="noopener nofollow"><code>CommandStage</code></a></td>
+</tr>
+</tbody>
+</table>
+<p>最容易犯的错误，是把 <code>SENT</code> 当成 <code>PROCESSED</code>，再把 <code>PROCESSED</code> 当成 <code>PROJECTED</code>。这三个状态之间的差异，正是“接口成功但页面查不到”的根源。</p>
+<h2 id="不是一条直线而是多个业务承诺">不是一条直线，而是多个业务承诺</h2>
+<p><code>CommandStage</code> 明确声明了各阶段的前置依赖：<code>PROCESSED</code> 依赖 <code>SENT</code>；而 <code>SNAPSHOT</code>、<code>PROJECTED</code>、<code>EVENT_HANDLED</code> 和 <code>SAGA_HANDLED</code> 都共享 <code>SENT</code>、<code>PROCESSED</code> 两个前置阶段。它们是从聚合处理完成后分叉出的目标，不是每个命令都必须经过的固定流水线。</p>
+<p><img src="https://img2024.cnblogs.com/blog/457833/202608/457833-20260806104528318-1313220512.png" alt="三个完成阶段的概念插图：消息接收、聚合处理、读模型同步" loading="lazy"></p>
+<p><em>配图：<code>SENT</code>、<code>PROCESSED</code>、<code>PROJECTED</code> 是三个不同的完成承诺。</em></p>
+<div class="mermaid">%%{init: {"theme": "dark", "themeVariables": {"primaryColor": "#2d333b", "primaryBorderColor": "#6d5dfc", "primaryTextColor": "#e6edf3", "lineColor": "#8b9498", "secondaryColor": "#161b22", "tertiaryColor": "#161b22", "stateBkg": "#2d333b", "stateBorder": "#6d5dfc", "stateLabelColor": "#e6edf3"}}}%%
+stateDiagram-v2
+    [*] --&gt; SENT: 命令总线已接收
+    SENT --&gt; PROCESSED: 聚合处理完成
+    PROCESSED --&gt; SNAPSHOT: 快照完成
+    PROCESSED --&gt; PROJECTED: 指定投影完成
+    PROCESSED --&gt; EVENT_HANDLED: 指定事件处理器完成
+    PROCESSED --&gt; SAGA_HANDLED: 指定 Saga 完成
+    SNAPSHOT --&gt; [*]
+    PROJECTED --&gt; [*]
+    EVENT_HANDLED --&gt; [*]
+    SAGA_HANDLED --&gt; [*]
+</div>
+<p>这带来一个重要设计结论：<strong>等待不是越久越好，而是要等待到刚好满足业务承诺的阶段。</strong></p>
+<p>例如：</p>
+<ul>
+<li>“请求已接收，后台慢慢处理”只需要 <code>SENT</code>。</li>
+<li>“订单聚合已经接受并执行了支付命令”需要 <code>PROCESSED</code>。</li>
+<li>“接口返回后，订单详情页必须能看到新订单”需要目标投影的 <code>PROJECTED</code>。</li>
+<li>“下单后库存 Saga 必须已经发出或处理扣减命令”才考虑 <code>SAGA_HANDLED</code>。</li>
+</ul>
+<h2 id="一条命令究竟经历了什么">一条命令，究竟经历了什么？</h2>
+<p>下面是从 HTTP 命令到读模型更新的简化时序。它强调的是等待语义，而不是某个具体存储实现：</p>
+<div class="mermaid">%%{init: {"theme": "dark", "themeVariables": {"primaryColor": "#2d333b", "primaryBorderColor": "#6d5dfc", "primaryTextColor": "#e6edf3", "lineColor": "#8b9498", "secondaryColor": "#161b22", "tertiaryColor": "#161b22", "actorBkg": "#2d333b", "actorBorder": "#6d5dfc", "actorTextColor": "#e6edf3", "signalColor": "#8b9498", "signalTextColor": "#e6edf3", "labelBoxBkgColor": "#2d333b", "labelBoxBorderColor": "#6d5dfc", "labelTextColor": "#e6edf3"}}}%%
+sequenceDiagram
+    autonumber
+    participant Client as 客户端
+    participant WebFlux
+    participant Gateway as CommandGateway
+    participant Wait as WaitCoordinator
+    participant Bus as CommandBus
+    participant Aggregate as 聚合处理器
+    participant EventBus as DomainEventBus
+    participant Projection as ProjectionDispatcher
+
+    Client-&gt;&gt;WebFlux: HTTP 命令 + wait target
+    WebFlux-&gt;&gt;Gateway: sendAndWait(command, waitPlan)
+    Gateway-&gt;&gt;Wait: createLast(waitPlan)
+    Gateway-&gt;&gt;Bus: send(command)
+    Bus--&gt;&gt;Gateway: 发送完成
+    Gateway--&gt;&gt;Wait: SENT
+    Bus-&gt;&gt;Aggregate: process(command)
+    Aggregate-&gt;&gt;EventBus: 发布 DomainEventStream
+    EventBus-&gt;&gt;Projection: 分发领域事件
+    Projection--&gt;&gt;Wait: PROJECTED
+    Wait--&gt;&gt;Gateway: CommandResult
+    Gateway--&gt;&gt;WebFlux: HTTP 响应或 SSE
+    WebFlux--&gt;&gt;Client: 业务完成结果
+</div>
+<p>源码中的关键顺序是：<code>DefaultCommandGateway.sendAndWait</code> 先注册等待句柄，再传播等待计划并发送命令；发送成功后可以产生 <code>SENT</code> 信号，后续阶段则由处理链上的 notifier 继续通知。等待句柄由 <code>WaitCoordinator</code> 按 <code>waitCommandId</code> 管理，收到信号后再交给对应的等待请求。</p>
+<p>来源：<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/DefaultCommandGateway.kt#L238-L266" target="_blank" rel="noopener nofollow">DefaultCommandGateway.sendAndWait:238-266</a>、<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/DefaultCommandGateway.kt#L282-L301" target="_blank" rel="noopener nofollow">DefaultCommandGateway.sendWithRegisteredWaitHandle:282-301</a>、<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/WaitCoordinator.kt#L34-L75" target="_blank" rel="noopener nofollow">DefaultWaitCoordinator.signal:34-75</a>。</p>
+<h2 id="wow-如何替代-sleep1s">Wow 如何替代 <code>sleep(1s)</code>？</h2>
+<p>核心不是“把等待时间调得更长”，而是让命令携带一个可传播的完成目标。<code>WaitPlan.propagate</code> 会把 <code>waitCommandId</code>、通知端点和目标阶段写入消息头；下游处理链完成后，再根据目标阶段和函数名称判断是否通知。</p>
+<p><img src="https://img2024.cnblogs.com/blog/457833/202608/457833-20260806104539085-1102455587.png" alt="固定延迟与明确完成信号的工程对比" loading="lazy"></p>
+<p><em>配图：从固定延迟和盲目重试，转向可定位的完成信号。</em></p>
+<div class="mermaid">%%{init: {"theme": "dark", "themeVariables": {"primaryColor": "#2d333b", "primaryBorderColor": "#6d5dfc", "primaryTextColor": "#e6edf3", "lineColor": "#8b9498", "secondaryColor": "#161b22", "tertiaryColor": "#161b22"}}}%%
+classDiagram
+    class CommandGateway {
+        +sendAndWait(command, waitPlan)
+        +sendAndWaitStream(command, waitPlan)
+    }
+    class WaitPlan {
+        +target
+        +propagate(endpoint, header)
+    }
+    class WaitCoordinator {
+        +createLast(plan)
+        +createStream(plan)
+        +signal(signal)
+    }
+    class CommandWaitNotifier {
+        +notify(endpoint, signal)
+    }
+    class ProjectedNotifierFilter {
+        +filter(exchange, next)
+    }
+
+    CommandGateway --&gt; WaitPlan : 传播等待目标
+    CommandGateway --&gt; WaitCoordinator : 注册句柄
+    ProjectedNotifierFilter --&gt; CommandWaitNotifier : 投影完成后通知
+    CommandWaitNotifier --&gt; WaitCoordinator : 本地转发信号
+</div>
+<p>投影 notifier 并不是收到任意事件就立刻报告成功。<code>AbstractNotifierFilter</code> 会在下游 filter chain 完成后才通知；<code>WaitTarget.shouldNotify</code> 还会检查目标阶段，并在 <code>PROJECTED</code>、<code>EVENT_HANDLED</code>、<code>SAGA_HANDLED</code> 等阶段匹配指定的 <code>contextName</code>、<code>processorName</code> 和 <code>functionName</code>。</p>
+<p>来源：<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/NotifierFilters.kt#L49-L58" target="_blank" rel="noopener nofollow">AbstractNotifierFilter.filter:49-58</a>、<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/WaitPlan.kt#L32-L50" target="_blank" rel="noopener nofollow">WaitTarget.shouldNotify:32-50</a>。</p>
+<p>因此，业务代码可以把“写入后必须可查询”表达成具体的等待目标：</p>
+<pre><code class="language-kotlin">val waitPlan = CommandWait.projected(
+    waitCommandId = command.commandId,
+    contextName = "order",
+    processorName = "OrderProjector",
+)
+
+gateway.sendAndWait(command, waitPlan)
+</code></pre>
+<p><code>CommandWait.projected</code> 本身支持按上下文、处理器和函数名称构造目标；它不是一个模糊的“等所有异步任务完成”，而是一个可以定位到特定投影函数的声明。</p>
+<p>来源：<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandWait.kt#L31-L43" target="_blank" rel="noopener nofollow">CommandWait.projected:31-43</a>。</p>
+<h2 id="分布式场景下等待信号怎么回来">分布式场景下，等待信号怎么回来？</h2>
+<p>当命令和投影位于同一个 JVM 时，<code>LocalCommandWaitNotifier</code> 可以直接把信号交给本地 <code>WaitCoordinator</code>。当处理发生在远程服务时，等待计划中携带的命令等待端点可以用于远程通知；WebFlux 侧提供了接收 <code>SimpleWaitSignal</code> 的内置路由。</p>
+<div class="mermaid">%%{init: {"theme": "dark", "themeVariables": {"primaryColor": "#2d333b", "primaryBorderColor": "#6d5dfc", "primaryTextColor": "#e6edf3", "lineColor": "#8b9498", "secondaryColor": "#161b22", "tertiaryColor": "#161b22"}}}%%
+flowchart LR
+    A["命令入口"] --&gt; B{"完成目标"}
+    B --&gt;|"只要接收"| C["SENT"]
+    B --&gt;|"聚合已执行"| D["PROCESSED"]
+    B --&gt;|"读模型立刻可查"| E["PROJECTED"]
+    B --&gt;|"等待跨服务协作"| F["SAGA_HANDLED"]
+    E --&gt; G["指定 context / processor / function"]
+    F --&gt; H["指定 Saga 处理范围"]
+    C --&gt; I["返回 CommandResult"]
+    D --&gt; I
+    G --&gt; I
+    H --&gt; I
+
+    classDef decision fill:#2d333b,stroke:#6d5dfc,color:#e6edf3
+    classDef stage fill:#2d333b,stroke:#6d5dfc,color:#e6edf3
+    class B decision
+    class C,D,E,F,G,H,I stage
+</div>
+<p>这里仍然需要区分两件事：<strong>等待信号到达</strong>和<strong>业务动作可回滚</strong>不是同一个概念。<code>PROJECTED</code> 只说明指定投影处理完成；<code>SAGA_HANDLED</code> 只说明指定 Saga 处理路径完成。它们都不自动等价于跨服务事务已经拥有数据库级原子性。</p>
+<h2 id="为什么不能所有接口都等待-projected">为什么不能所有接口都等待 <code>PROJECTED</code>？</h2>
+<p>等待目标本身就是系统承诺，承诺越强，调用方通常需要承担更多等待时间和资源占用。仓库 README 中的示例应用两分钟压测给出了一个直观对比：加入购物车等待 <code>SENT</code> 时平均 TPS 为 <code>59,625</code>、平均延迟 <code>29 ms</code>；等待 <code>PROCESSED</code> 时平均 TPS 为 <code>18,696</code>、平均延迟 <code>239 ms</code>。</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th style="text-align: right">等待目标</th>
+<th style="text-align: right">平均 TPS</th>
+<th style="text-align: right">平均延迟</th>
+<th>文章中的正确解读</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>加入购物车</td>
+<td style="text-align: right"><code>SENT</code></td>
+<td style="text-align: right">59,625</td>
+<td style="text-align: right">29 ms</td>
+<td>更快地接受命令，不代表聚合已处理</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/README.zh-CN.md#L101-L108" target="_blank" rel="noopener nofollow"><code>README.zh-CN.md:101-108</code></a></td>
+</tr>
+<tr>
+<td>加入购物车</td>
+<td style="text-align: right"><code>PROCESSED</code></td>
+<td style="text-align: right">18,696</td>
+<td style="text-align: right">239 ms</td>
+<td>获得更强的领域处理完成语义</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/README.zh-CN.md#L101-L108" target="_blank" rel="noopener nofollow"><code>README.zh-CN.md:101-108</code></a></td>
+</tr>
+</tbody>
+</table>
+<p>这些数据适合用来说明“等待语义会改变性能特征”，不适合直接包装成所有生产环境都能达到的容量承诺。Wow 的 benchmark 文档也明确区分了框架 E2E 的本地回归反馈与生产容量结论，并要求在正式性能判断前使用基线流程。</p>
+<p>来源：<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-benchmarks/README.md#L10-L25" target="_blank" rel="noopener nofollow">Wow Benchmarks 的层级与边界</a>、<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-benchmarks/README.md#L37-L44" target="_blank" rel="noopener nofollow">Quick Framework E2E 的证据边界</a>。</p>
+<p>真正成熟的做法不是“一律追求最强一致性”，而是让每个接口先回答一个问题：<strong>客户端在继续下一步之前，究竟需要系统保证什么？</strong></p>
+<h2 id="一张决策表到底应该等到哪一步">一张决策表：到底应该等到哪一步？</h2>
+<table>
+<thead>
+<tr>
+<th>业务问题</th>
+<th>推荐等待目标</th>
+<th>原因</th>
+<th>不要误解为</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>“请求先收下，稍后处理即可”</td>
+<td><code>SENT</code></td>
+<td>尽快释放调用方</td>
+<td>业务规则已经执行</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandStage.kt#L25-L34" target="_blank" rel="noopener nofollow"><code>CommandStage.SENT</code></a></td>
+</tr>
+<tr>
+<td>“订单聚合已经接受这个动作了吗？”</td>
+<td><code>PROCESSED</code></td>
+<td>等待聚合处理完成</td>
+<td>查询模型已经更新</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandStage.kt#L36-L44" target="_blank" rel="noopener nofollow"><code>CommandStage.PROCESSED</code></a></td>
+</tr>
+<tr>
+<td>“响应返回后，订单详情必须能查到”</td>
+<td><code>PROJECTED</code></td>
+<td>等待指定投影处理完成</td>
+<td>其他投影也都完成</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandWait.kt#L31-L43" target="_blank" rel="noopener nofollow"><code>CommandWait.projected</code></a></td>
+</tr>
+<tr>
+<td>“这个事件处理器必须完成”</td>
+<td><code>EVENT_HANDLED</code></td>
+<td>定位特定事件处理边界</td>
+<td>所有副作用都完成</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandStage.kt#L66-L75" target="_blank" rel="noopener nofollow"><code>CommandStage.EVENT_HANDLED</code></a></td>
+</tr>
+<tr>
+<td>“这个 Saga 协作节点必须完成”</td>
+<td><code>SAGA_HANDLED</code></td>
+<td>等待指定 Saga 处理边界</td>
+<td>获得分布式事务原子性</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandStage.kt#L77-L86" target="_blank" rel="noopener nofollow"><code>CommandStage.SAGA_HANDLED</code></a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="超时不是补丁而是等待契约的一部分">超时不是补丁，而是等待契约的一部分</h2>
+<p>固定 <code>sleep</code> 的另一个问题，是它既没有明确的完成条件，也没有可靠的截止时间。Wow 的 <code>sendAndWait</code> 使用等待计划的 deadline；等待句柄由 <code>Mono.using</code> 管理，完成、取消或超时后都会释放资源。对应的超时测试还验证了：等待超时后句柄被移除，同一个 <code>waitCommandId</code> 可以再次注册。</p>
+<pre><code class="language-kotlin">val waitPlan = CommandWait.projected(
+    waitCommandId = command.commandId,
+    contextName = "order",
+    processorName = "OrderProjector",
+).withTimeout(Duration.ofSeconds(5))
+
+gateway.sendAndWait(command, waitPlan)
+</code></pre>
+<p>这段代码表达了比 <code>sleep(1000)</code> 多得多的信息：</p>
+<ol>
+<li>我在等待哪个命令。</li>
+<li>我在等待哪个投影处理器。</li>
+<li>最多等待多长时间。</li>
+<li>超时后等待资源必须被清理。</li>
+</ol>
+<p>来源：<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/DefaultCommandGateway.kt#L238-L266" target="_blank" rel="noopener nofollow">DefaultCommandGateway.sendAndWait:238-266</a>、<a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/test/kotlin/me/ahoo/wow/command/DefaultCommandGatewayTimeoutTest.kt#L58-L93" target="_blank" rel="noopener nofollow">DefaultCommandGatewayTimeoutTest</a>。</p>
+<h2 id="生产代码的四条检查清单">生产代码的四条检查清单</h2>
+<p>在任何“写入后立即读取”的接口上，建议先检查下面四项：</p>
+<ol>
+<li><strong>不要用固定延迟代替完成条件。</strong> <code>sleep</code> 只能延后问题，不能证明目标投影已经处理了当前命令。</li>
+<li><strong>把完成语义写进接口契约。</strong> 明确这个接口返回的是 <code>SENT</code>、<code>PROCESSED</code> 还是某个指定的 <code>PROJECTED</code>。</li>
+<li><strong>投影等待要指定范围。</strong> 使用 <code>contextName</code>、<code>processorName</code> 和 <code>functionName</code>，避免把“某个投影完成”误解成“所有查询模型都已一致”。</li>
+<li><strong>为等待设置 deadline 并测试清理。</strong> 验证超时、取消、重复请求和远程通知失败时的行为，而不是只测成功路径。</li>
+</ol>
+<h2 id="结语不要问等几秒要问什么才算完成">结语：不要问“等几秒”，要问“什么才算完成”</h2>
+<p>“接口返回成功但查询不到”表面上是延迟问题，深层其实是系统没有定义清楚成功边界。</p>
+<p>传统做法把边界藏在 <code>sleep(1s)</code>、客户端重试次数和经验参数里；Wow 把它提升成了可传播、可观察、可测试的等待计划：命令可以等待总线接收、聚合处理、快照生成、指定投影、事件处理器或 Saga 节点完成。</p>
+<p>这也是 CQRS 真正值得学习的地方：读写分离并不等于放弃一致性，而是要求你更准确地描述<strong>哪一种一致性、在什么边界、对谁成立</strong>。</p>
+<p>所以，下次再遇到“接口返回 200，页面却查不到”，先别加 <code>sleep(1000)</code>。先问一句：</p>
+<blockquote>
+<p><strong>这个接口返回时，业务真正需要系统保证的完成阶段是什么？</strong></p>
+</blockquote>
+<h2 id="参考资料">参考资料</h2>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>关键源码或文档</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>命令阶段和依赖</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandStage.kt" target="_blank" rel="noopener nofollow"><code>CommandStage.kt</code></a></td>
+</tr>
+<tr>
+<td>等待计划工厂</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/CommandWait.kt" target="_blank" rel="noopener nofollow"><code>CommandWait.kt</code></a></td>
+</tr>
+<tr>
+<td>命令网关与 deadline</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/DefaultCommandGateway.kt" target="_blank" rel="noopener nofollow"><code>DefaultCommandGateway.kt</code></a></td>
+</tr>
+<tr>
+<td>投影与下游通知</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/NotifierFilters.kt" target="_blank" rel="noopener nofollow"><code>NotifierFilters.kt</code></a></td>
+</tr>
+<tr>
+<td>等待句柄协调</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/main/kotlin/me/ahoo/wow/command/wait/WaitCoordinator.kt" target="_blank" rel="noopener nofollow"><code>WaitCoordinator.kt</code></a></td>
+</tr>
+<tr>
+<td>WebFlux 命令入口</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-webflux/src/main/kotlin/me/ahoo/wow/webflux/route/command/CommandHandler.kt" target="_blank" rel="noopener nofollow"><code>CommandHandler.kt</code></a></td>
+</tr>
+<tr>
+<td>超时清理测试</td>
+<td><a href="https://github.com/Ahoo-Wang/Wow/blob/main/wow-core/src/test/kotlin/me/ahoo/wow/command/DefaultCommandGatewayTimeoutTest.kt" target="_blank" rel="noopener nofollow"><code>DefaultCommandGatewayTimeoutTest.kt</code></a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="相关文章">相关文章</h2>
+<table>
+<thead>
+<tr>
+<th>页面</th>
+<th>关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="../guide/command-gateway.md" target="_blank" rel="noopener nofollow">命令网关</a></td>
+<td>了解命令发送、等待和响应模型</td>
+</tr>
+<tr>
+<td><a href="../guide/projection.md" target="_blank" rel="noopener nofollow">投影</a></td>
+<td>了解领域事件如何驱动查询模型</td>
+</tr>
+<tr>
+<td><a href="../guide/eventstore.md" target="_blank" rel="noopener nofollow">事件存储</a></td>
+<td>了解 <code>PROCESSED</code> 之前的事件持久化基础</td>
+</tr>
+<tr>
+<td><a href="../guide/saga.md" target="_blank" rel="noopener nofollow">Saga</a></td>
+<td>了解跨服务协作与 <code>SAGA_HANDLED</code> 的边界</td>
+</tr>
+<tr>
+<td><a href="../guide/test-suite.md" target="_blank" rel="noopener nofollow">测试套件</a></td>
+<td>用 Given–When–Expect 验证领域行为和等待结果</td>
+</tr>
+</tbody>
+</table>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div style="border: 1px solid #ececec; padding: 5px 10px; background: #fdfdfd; color: #404040">
+    <p>作者：Ahoo Wang (阿虎)</p>
+    <p>Github: <a href="https://github.com/Ahoo-Wang/" title="Ahoo Wang 's Github!" target="_blank">https://github.com/Ahoo-Wang/</a></p>
+    <p>SmartSql(高性能、高生产力，超轻量级的ORM！): <a href="https://github.com/Ahoo-Wang/SmartSql" title="SmartSql" target="_blank">https://github.com/Ahoo-Wang/SmartSql</a></p>
+    <p>SmartCode(不只是代码生成器！): <a href="https://github.com/Ahoo-Wang/SmartCode" title="SmartCode" target="_blank">https://github.com/Ahoo-Wang/SmartCode</a></p>
+    <p>CoSky 高性能、低成本微服务治理平台 : <a href="https://github.com/Ahoo-Wang/CoSky" title="CoSky" target="_blank">https://github.com/Ahoo-Wang/CoSky</a></p>
+    <p>CosId 通用、灵活、高性能的分布式 ID 生成器 : <a href="https://github.com/Ahoo-Wang/CosId" title="CosId" target="_blank">https://github.com/Ahoo-Wang/CosId</a></p>
+    <p>Wow 基于 DDD、EventSourcing 的现代响应式 CQRS 架构微服务开发框架: <a href="https://github.com/Ahoo-Wang/Wow" title="Wow" target="_blank">https://github.com/Ahoo-Wang/Wow</a></p>
+    <p>CoSec 基于 RBAC 和策略的多租户响应式安全框架: <a href="https://github.com/Ahoo-Wang/CoSec" title="CoSec" target="_blank">https://github.com/Ahoo-Wang/CoSec</a></p>
+    <hr style="border: 1px solid #eaeaea">
+    <p>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须保留此段声明，且在文章页面明显位置给出原文连接，否则保留追究法律责任的权利。
+    </p>
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.001388888888888889" data-date-updated="2026-08-06 10:56">2026-08-06 10:54</span>&nbsp;
+<a href="https://www.cnblogs.com/Ahoo-Wang">Ahoo-Wang</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22270599);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FAhoo-Wang%2Fp%2F22270599%2Fwow-command-wait-consistency&amp;targetId=22270599&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
