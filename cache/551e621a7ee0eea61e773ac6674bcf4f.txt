@@ -1,0 +1,477 @@
+
+        <h1>
+            <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/aspnetx/p/22330225" title="发布于 2026-08-08 10:34">
+    
+
+    <span role="heading" aria-level="2">dbt+SQLServer构建数据仓库(5)：数据测试</span>
+    
+
+</a>
+
+        </h1>
+        <div class="postbody">
+                <div id="cnblogs_post_description" style="display: none">
+        
+        本文是系列第 5 篇,讲述怎么声明、dbt 怎么把 YAML 翻译成测试 SQL、测试失败怎么排查、自定义测试怎么加。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="dbtsqlserver构建数据仓库5数据测试">dbt+SQLServer构建数据仓库(5)：数据测试</h1>
+<p>本文是系列第 5 篇,讲述怎么声明、dbt 怎么把 YAML 翻译成测试 SQL、测试失败怎么排查、自定义测试怎么加。</p>
+<h2 id="一引言">一、引言</h2>
+<p>数据测试是 dbt 的核心价值之一。</p>
+<p>传统数仓方案靠"肉眼检查 + 抽样核对"保证数据质量,问题往往要等业务方报错才暴露。dbt 把测试变成了<strong>可声明、可自动运行、可阻断 CI</strong> 的代码:你在 YAML 里写一句 <code>unique</code>,dbt 自动生成 SQL、自动跑、返回行就报红。</p>
+<p>本篇讲述如何进行数据测试,执行 <code>dbt test</code> 后全部 PASS。本文就以这些真实声明为案例,讲清楚测试体系。</p>
+<h2 id="二测试类型generic-vs-singular">二、测试类型:generic vs singular</h2>
+<p>dbt 的数据测试分两类:</p>
+<p><strong>generic test(通用测试)</strong>:在 <code>schema.yml</code> 里声明,本质是"模板 + 参数"。dbt 内置四种模板(unique / not_null / relationships / accepted_values),也支持在 <code>macros/</code> 里自定义新模板。声明时只需指定列名和测试名,dbt 自动套模板生成 SQL。</p>
+<p><strong>singular test(单例测试)</strong>:在 <code>tests/</code> 目录下写 <code>.sql</code> 文件,整段 SQL 完全手写。dbt 执行它,<strong>返回任意行即判定失败</strong>。</p>
+<p>两者区别一句话:<strong>generic 是"填参数",singular 是"写全文"</strong>。</p>
+<h2 id="三四种内置-generic-test-详解">三、四种内置 generic test 详解</h2>
+<p>下面以项目里的真实声明为案例,逐种讲四种内置测试,并贴出 dbt 实际生成的测试 SQL(取自 <code>target/compiled/</code> 目录)。</p>
+<h3 id="1-unique唯一性">1. unique(唯一性)</h3>
+<p>检查某列的值是否唯一,常用于主键。</p>
+<pre><code class="language-yaml">- name: customer_id
+  description: "客户唯一标识."
+  tests:
+    - unique
+    - not_null
+</code></pre>
+<p>dbt 生成的测试 SQL:</p>
+<pre><code class="language-sql">select
+    customer_id as unique_field,
+    count(*) as n_records
+
+from "TEST"."dbt_dev_staging"."stg_customers"
+where customer_id is not null
+group by customer_id
+having count(*) &gt; 1
+</code></pre>
+<p>逻辑:按 <code>customer_id</code> 分组,筛出出现次数 &gt; 1 的值。<strong>返回行即失败</strong>(说明有重复主键)。</p>
+<h3 id="2-not_null非空">2. not_null(非空)</h3>
+<p>检查某列是否存在 NULL。声明见 stg_customers 的 <code>first_name</code>:</p>
+<pre><code class="language-yaml">- name: first_name
+  tests:
+    - not_null
+</code></pre>
+<p>dbt 生成的测试 SQL:</p>
+<pre><code class="language-sql">select first_name
+from "TEST"."dbt_dev_staging"."stg_customers"
+where first_name is null
+</code></pre>
+<p>逻辑:直接筛出 <code>first_name is null</code> 的行。<strong>返回行即失败</strong>。这是最简单的测试模板。</p>
+<h3 id="3-relationships引用完整性">3. relationships(引用完整性)</h3>
+<p>检查外键值是否在引用表中存在,是跨模型的测试。</p>
+<pre><code class="language-yaml">- name: customer_id
+  description: "下单客户 ID, 关联 stg_customers.customer_id."
+  tests:
+    - not_null
+    - relationships:
+        to: ref('stg_customers')
+        field: customer_id
+</code></pre>
+<p>dbt 生成的测试 SQL:</p>
+<pre><code class="language-sql">with child as (
+    select customer_id as from_field
+    from "TEST"."dbt_dev_staging"."stg_orders"
+    where customer_id is not null
+),
+
+parent as (
+    select customer_id as to_field
+    from "TEST"."dbt_dev_staging"."stg_customers"
+)
+
+select
+    from_field
+
+from child
+left join parent
+    on child.from_field = parent.to_field
+
+where parent.to_field is null
+</code></pre>
+<p>逻辑:子表 left join 父表,筛出父表匹配不到(<code>parent.to_field is null</code>)的行。<strong>返回行即失败</strong>(说明有断链的外键)。</p>
+<blockquote>
+<p>注意:<code>relationships</code> 里的 <code>ref('stg_customers')</code> 会被 dbt 解析成真实表名。这意味着<strong>测试本身也是 DAG 节点</strong>,它依赖两个模型,两个模型都必须先构建完成才能跑这条测试。</p>
+</blockquote>
+<h3 id="4-accepted_values枚举值">4. accepted_values(枚举值)</h3>
+<p>检查列值是否都在允许列表内。:</p>
+<pre><code class="language-yaml">- name: status
+  description: "订单状态: placed / shipped / completed / returned / return_pending."
+  tests:
+    - accepted_values:
+        values: ['placed', 'shipped', 'completed', 'returned', 'return_pending']
+</code></pre>
+<p>dbt 生成的测试 SQL(以 stg_payments 的 status 为例):</p>
+<pre><code class="language-sql">with all_values as (
+
+    select
+        status as value_field,
+        count(*) as n_records
+
+    from "TEST"."dbt_dev_staging"."stg_payments"
+    group by status
+
+)
+
+select *
+from all_values
+where value_field not in (
+    'completed','pending','refund'
+)
+</code></pre>
+<p>逻辑:先按 <code>status</code> 分组聚合,再筛出不在允许列表里的值。<strong>返回行即失败</strong>(说明出现了非法枚举值,常见于源数据拼写错误)。</p>
+<h2 id="四schemayml-完整解读">四、schema.yml 完整解读</h2>
+<p>这里示例测试声明分布在两个文件:</p>
+<h3 id="staging-层">staging 层</h3>
+<p>完整内容:</p>
+<pre><code class="language-yaml">version: 2
+
+models:
+  - name: stg_customers
+    description: "客户 staging 视图, 1:1 投影 raw_customers."
+    columns:
+      - name: customer_id
+        description: "客户唯一标识."
+        tests:
+          - unique
+          - not_null
+      - name: first_name
+        tests:
+          - not_null
+      - name: last_name
+        tests:
+          - not_null
+
+  - name: stg_orders
+    description: "订单 staging 视图, 1:1 投影 raw_orders."
+    columns:
+      - name: order_id
+        description: "订单唯一标识."
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: "下单客户 ID, 关联 stg_customers.customer_id."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: order_date
+        tests:
+          - not_null
+      - name: status
+        description: "订单状态: placed / shipped / completed / returned / return_pending."
+        tests:
+          - accepted_values:
+              values: ['placed', 'shipped', 'completed', 'returned', 'return_pending']
+
+  - name: stg_payments
+    description: "支付 staging 视图, 1:1 投影 raw_payments."
+    columns:
+      - name: payment_id
+        description: "支付唯一标识."
+        tests:
+          - unique
+          - not_null
+      - name: order_id
+        description: "关联订单 ID."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_orders')
+              field: order_id
+      - name: payment_method
+        tests:
+          - accepted_values:
+              values: ['credit_card', 'bank_transfer', 'coupon']
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['completed', 'pending', 'refund']
+</code></pre>
+<h3 id="marts-层">marts 层</h3>
+<p>[models/marts/schema.yml] 完整内容:</p>
+<pre><code class="language-yaml">version: 2
+
+models:
+  - name: dim_customers
+    description: "客户维度表: 包含客户基础信息 + 订单聚合指标 (首末单日期、订单数、LTV)."
+    columns:
+      - name: customer_id
+        description: "客户唯一标识, 主键."
+        tests:
+          - unique
+          - not_null
+      - name: first_name
+        tests:
+          - not_null
+      - name: last_name
+        tests:
+          - not_null
+      - name: first_order_date
+        description: "客户首单日期, 无订单客户为 NULL."
+      - name: most_recent_order_date
+        description: "客户最近一次下单日期."
+      - name: number_of_orders
+        description: "客户累计订单数."
+      - name: lifetime_value
+        description: "客户生命周期价值 (已完成支付金额合计)."
+
+  - name: fct_orders
+    description: "订单事实表: 每行一个订单, 含订单状态与已完成支付金额."
+    columns:
+      - name: order_id
+        description: "订单唯一标识, 主键."
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: "下单客户 ID, 关联 dim_customers.customer_id."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: order_date
+        tests:
+          - not_null
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['placed', 'shipped', 'completed', 'returned', 'return_pending']
+      - name: amount
+        description: "订单已完成支付金额, 无已完成支付则为 0."
+</code></pre>
+<h3 id="测试分布统计">测试分布统计</h3>
+<p>逐 model 逐 column 统计,全项目 26 条测试分布如下:</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>unique</th>
+<th>not_null</th>
+<th>relationships</th>
+<th>accepted_values</th>
+<th>合计</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>stg_customers</td>
+<td>1</td>
+<td>3</td>
+<td>0</td>
+<td>0</td>
+<td>4</td>
+</tr>
+<tr>
+<td>stg_orders</td>
+<td>1</td>
+<td>3</td>
+<td>1</td>
+<td>1</td>
+<td>6</td>
+</tr>
+<tr>
+<td>stg_payments</td>
+<td>1</td>
+<td>2</td>
+<td>1</td>
+<td>2</td>
+<td>6</td>
+</tr>
+<tr>
+<td>dim_customers</td>
+<td>1</td>
+<td>3</td>
+<td>0</td>
+<td>0</td>
+<td>4</td>
+</tr>
+<tr>
+<td>fct_orders</td>
+<td>1</td>
+<td>3</td>
+<td>1</td>
+<td>1</td>
+<td>6</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>5</strong></td>
+<td><strong>14</strong></td>
+<td><strong>3</strong></td>
+<td><strong>4</strong></td>
+<td><strong>26</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="测试的层次设计">测试的层次设计</h3>
+<p>观察上表,测试是<strong>分层复制</strong>的:</p>
+<ul>
+<li><strong>staging 层测源数据质量</strong>:每个模型的主键 <code>unique + not_null</code>,状态/支付方式做 <code>accepted_values</code>,外键做 <code>relationships</code>。staging 是 raw 数据的 1:1 投影,这里测的是"源数据本身干不干净"。</li>
+<li><strong>marts 层测业务一致性</strong>:<code>dim_customers</code> 和 <code>fct_orders</code> 重复了主键、非空、外键、枚举值测试。这里测的是"经过 JOIN/聚合后,业务表依然满足约束"。</li>
+</ul>
+<p>两层都测看起来"重复",但目的不同:staging 测输入,marts 测输出。如果某条测试在 staging PASS 但在 marts FAIL,说明问题出在转换逻辑,而不是源数据。</p>
+<h2 id="五dbt-test-的执行流程">五、dbt test 的执行流程</h2>
+<p>执行 <code>dbt test</code> 时,dbt 内部流程:</p>
+<ol>
+<li><strong>解析 schema.yml</strong>:读取所有 <code>models</code> 下的 <code>tests</code> 声明。</li>
+<li><strong>生成测试 SQL</strong>:为每条 generic test 套用模板,把 <code>ref()</code> 解析成真实表名,生成完整 SQL。</li>
+<li><strong>构建测试 DAG</strong>:测试也是节点。<code>relationships</code> 测试依赖两个模型,必须等两个模型都构建完才能执行。</li>
+<li><strong>按依赖顺序执行</strong>:逐条跑测试 SQL。</li>
+<li><strong>判定结果</strong>:<strong>返回行数 &gt; 0 即 FAIL,返回 0 行即 PASS</strong>。</li>
+</ol>
+<p>输出格式大致如下:</p>
+<pre><code>✓ Pass  34  not_null_stg_customers_customer_id (stg_customers.customer_id) [0.05s]
+✓ Pass  35  unique_stg_customers_customer_id (stg_customers.customer_id) [0.04s]
+...
+26 of 26 tests passed
+</code></pre>
+<p>关键点:<strong>测试是 DAG 的一部分</strong>。<code>dbt test</code> 会自动先构建被依赖的模型,再跑测试。所以 <code>relationships</code> 测试里写 <code>ref('stg_customers')</code>,dbt 会确保 <code>stg_customers</code> 先存在于库里。</p>
+<h2 id="六测试失败怎么排查">六、测试失败怎么排查</h2>
+<p>测试 FAIL 时,dbt 默认只告诉你"哪条测试失败、返回多少行",看不到具体是哪些数据出问题。排查工具:</p>
+<h3 id="1-dbt-test---store-failures">1. <code>dbt test --store-failures</code></h3>
+<p>加 <code>--store-failures</code> 参数,dbt 会把失败的行<strong>存到</strong> <strong><code>dbt_dev_staging</code></strong> <strong>schema 的表里</strong>,表名就是测试名。然后可以直接查:</p>
+<pre><code class="language-bash">dbt test --store-failures
+</code></pre>
+<pre><code class="language-sql">-- 在 SQL Server 里查失败行
+select * from "TEST"."dbt_dev_staging"."unique_stg_customers_customer_id"
+</code></pre>
+<p>这是最直接的排查手段——你能看到到底是哪个 <code>customer_id</code> 重复了。</p>
+<h3 id="2-dbt-test---select-只测一个模型">2. <code>dbt test --select</code> 只测一个模型</h3>
+<p>排查时不想等全量 26 条跑完,可以只测一个模型:</p>
+<pre><code class="language-bash">dbt test --select stg_customers
+</code></pre>
+<p>也可以只测某一列的测试:</p>
+<pre><code class="language-bash">dbt test --select stg_customers.customer_id
+</code></pre>
+<h3 id="3-看编译后的测试-sql">3. 看编译后的测试 SQL</h3>
+<p>所有测试 SQL 都会编译到 <code>target/compiled/</code> 目录,路径形如:</p>
+<pre><code>target/compiled/dbt_sqlserver_dw/models/staging/schema.yml/
+  ├── unique_stg_customers_customer_id.sql
+  ├── not_null_stg_customers_first_name.sql
+  └── relationships_stg_payments_order_id__order_id__ref_stg_orders_.sql
+</code></pre>
+<p>直接打开这些 <code>.sql</code> 文件,能看到 dbt 生成的完整 SQL(本文第三节贴的就是这些),可以拷到 SSMS 里手动跑,定位问题。</p>
+<h3 id="4-常见失败原因">4. 常见失败原因</h3>
+<ul>
+<li><strong>源数据有重复</strong>:主键 <code>unique</code> 失败,通常是 raw 表里就有重复行。</li>
+<li><strong>源数据有 NULL</strong>:<code>not_null</code> 失败,通常是上游字段缺失。</li>
+<li><strong>外键断裂</strong>:<code>relationships</code> 失败,通常是子表引用了父表不存在的 ID(如订单引用了已删除的客户)。</li>
+<li><strong>枚举值拼写错误</strong>:<code>accepted_values</code> 失败,如 <code>status</code> 出现了 <code>'shipped '</code> (多了空格)或 <code>'SHIP'</code>(大小写)。</li>
+</ul>
+<h3 id="排查流程图">排查流程图</h3>
+<pre><code>┌──────────────┐
+│  dbt test FAIL │
+└──────┬───────┘
+       │
+       ▼
+┌─────────────────────────────┐
+│ dbt test --store-failures   │
+│ --select &lt;失败模型&gt;          │
+└──────┬──────────────────────┘
+       │
+       ▼
+┌─────────────────────────────┐
+│ 查 dbt_dev_staging 里的     │
+│ 失败行表,看具体哪些数据出错 │
+└──────┬──────────────────────┘
+       │
+       ▼
+┌─────────────────────────────┐
+│ 定位根因:                   │
+│ - 源数据问题 → 修源/修 seed  │
+│ - 转换逻辑问题 → 修模型 SQL  │
+│ - 测试本身过严 → 调测试声明  │
+└──────┬──────────────────────┘
+       │
+       ▼
+┌─────────────────────────────┐
+│ 重新 dbt test 验证          │
+└─────────────────────────────┘
+</code></pre>
+<h2 id="七测试进阶">七、测试进阶</h2>
+<p>本项目只用了内置 generic test,但 dbt 的测试能力不止于此。</p>
+<h3 id="1-自定义-generic-test">1. 自定义 generic test</h3>
+<p>在 <code>macros/</code> 目录写一个 <code>test_</code> 开头的 macro,即可在 schema.yml 里像内置测试一样引用。例如定义一个"金额必须为正"的测试:</p>
+<pre><code class="language-sql">-- macros/test_positive_value.sql
+{% test positive_value(model, column_name) %}
+    select *
+    from {{ model }}
+    where {{ column_name }} &lt; 0
+{% endtest %}
+</code></pre>
+<p>在 schema.yml 里引用:</p>
+<pre><code class="language-yaml">- name: amount
+  tests:
+    - positive_value
+</code></pre>
+<p>dbt 会把 <code>{{ model }}</code> 替换成真实表名,<code>{{ column_name }}</code> 替换成 <code>amount</code>,生成测试 SQL。</p>
+<h3 id="2-singular-test">2. singular test</h3>
+<p>在 <code>tests/</code> 目录写任意 <code>.sql</code> 文件,例如 <code>tests/assert_order_amount_positive.sql</code>:</p>
+<pre><code class="language-sql">-- tests/assert_order_amount_positive.sql
+select *
+from {{ ref('fct_orders') }}
+where amount &lt; 0
+</code></pre>
+<p>执行 <code>dbt test</code> 时,dbt 会跑这段 SQL,<strong>返回行即失败</strong>。singular test 适合复杂断言,比如"所有已完成订单的支付金额合计应等于 fct_orders.amount"这种跨表核对。</p>
+<h3 id="3-severitywarn-vs-error">3. severity:warn vs error</h3>
+<p>每条测试可配 <code>severity</code>:</p>
+<ul>
+<li><code>error</code>(默认):失败即报错,<strong>阻断 CI</strong>。</li>
+<li><code>warn</code>:失败只告警,<strong>不阻断</strong>。</li>
+</ul>
+<pre><code class="language-yaml">- name: status
+  tests:
+    - accepted_values:
+        values: ['placed', 'shipped', 'completed', 'returned', 'return_pending']
+      severity: warn
+</code></pre>
+<p>适用场景:某些列存在已知脏数据,短期内无法修,但不想阻断流水线,先用 <code>warn</code> 监控。</p>
+<h3 id="4-测试也是代码">4. 测试也是代码</h3>
+<p>测试声明应该:</p>
+<ul>
+<li><strong>入 git</strong>:和模型 SQL 一起版本管理,变更可 review。</li>
+<li><strong>在 CI 里跑</strong>:每次 PR 触发 <code>dbt test</code>,测试不过则 CI 失败,把数据问题挡在合并之前。</li>
+</ul>
+<p>这是 dbt 测试体系相对传统方案的最大优势——<strong>数据质量保障从"人工抽检"升级为"自动化门禁"</strong>。</p>
+<h2 id="八小结">八、小结</h2>
+<p>数据测试是 dbt 把"数据质量"工程化的核心机制。本项目 26 条测试的要点:</p>
+<ol>
+<li><strong>测试分两类</strong>:generic(模板+参数,在 schema.yml 声明)和 singular(完整 SQL,在 tests/ 写)。本项目 26 条全是 generic。</li>
+<li><strong>四种内置模板</strong>:unique(查重复)、not_null(查空值)、relationships(查外键断链)、accepted_values(查枚举值)。覆盖了主键、非空、引用完整性、值域四类核心约束。</li>
+<li><strong>测试是 DAG 节点</strong>:relationships 测试依赖两个模型,dbt 自动按依赖顺序执行。</li>
+<li><strong>分层测试</strong>:staging 测源数据质量,marts 测业务一致性,两层都测以区分"源问题"和"转换问题"。</li>
+<li><strong>排查三件套</strong>:<code>--store-failures</code> 存失败行、<code>--select</code> 缩小范围、<code>target/compiled/</code> 看编译 SQL。</li>
+<li><strong>进阶能力</strong>:自定义 generic test macro、singular test、severity 控制阻断行为,测试入 git + CI 跑。</li>
+</ol>
+<p>写到这里,你已能为项目声明一套完整的数据测试并排查失败。但有个问题一直被"用着没深究":测试里的 <code>ref('stg_customers')</code> 是怎么被解析成真实表名的?整个 DAG 又是怎么自动构建的?下一篇回答这个。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>&nbsp;</p>
+
+<p>---------------------------------------------------------------<br></p>
+<p>来自<a href="http://www.cnblogs.com/" target="_blank">博客园</a>的<a href="http://aspnetx.cnblogs.com/" target="_blank">aspnetx</a><font color="white">宋卫东</font></p>
+<p>&nbsp;</p>
+<p>&nbsp;</p>
+</div>
+<div class="clear"></div>
+
+        </div>
+        <p class="postfoot">
+            posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-08 10:34">2026-08-08 10:34</span>&nbsp;
+<a href="https://www.cnblogs.com/aspnetx">哥本哈士奇(aspnetx)</a>&nbsp;
+阅读(<span id="post_view_count">31</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22330225);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Faspnetx%2Fp%2F22330225&amp;targetId=22330225&amp;targetType=0" target="_blank">举报</a>
+
+        </p>
+    
