@@ -1,0 +1,835 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/advisedy/p/22340602" title="发布于 2026-08-08 18:40">
+    
+
+    <span role="heading" aria-level="2">【adviskv】#04：PUT 链路 在 Storage 内部的 Replica 的设计与实现（上）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="日期-202688">日期: 2026.8.8</h1>
+<h2 id="写在开头的开头">写在开头的开头</h2>
+<p><code>AdvisKV</code> 是我用 <code>C++17</code> 从零写的一个分布式 <code>KV</code> 存储系统原型，包含 <code>Catalog</code>、<code>Topo</code>、<code>Storage</code>、<code>SDK</code> 四个主要模块，覆盖建库建表、路由查询、<code>KV</code> 读写、副本数扩缩容、坏副本替换、<code>Raft</code>、<code>WAL</code>/<code>snapshot</code> 恢复，跑了 <code>gtest</code> + <code>E2E</code> 测试和 <code>benchmark</code>。</p>
+<p>欢迎来给个 <code>star</code>~</p>
+<p>项目地址：<a href="https://github.com/advisedy/adviskv" target="_blank" rel="noopener nofollow">advisedy/adviskv: C++17 分布式 KV 存储原型，包含 Raft、Meta/SDM、分片路由与恢复链路 | A runnable C++17 distributed KV prototype</a></p>
+<h2 id="写在开头">写在开头</h2>
+<p>已经是秋招了，最近基本上无心准备秋招，心浮躁的很，特来决定继续更新 <code>AdvisKV</code>。</p>
+<p>之前的内容讲过 <code>PUT</code> 的一生，考虑以后打算要讲解清楚更详细的内容，所以应该要接下来我们不得不继续搞定这个 <code>Storage</code> 内部的这个硬骨头，同时也是我重构了好多次，思考过很久之后的模块，<code>Replica</code>。</p>
+<p>说实在的，这个肯定很难讲解清楚，因为这个不是一条清晰的链路就可以说明白的。里面涉及的模块相对来讲会稍微复杂一点。</p>
+<p>我们之前在第二篇的时候讲过关于 <code>PUT</code> 的链路，但是当时是走的整体链路，我们并没有深入讲解 <code>Replica</code> 的内部细节，关于 <code>PUT</code> 是怎么样处理的。</p>
+<p>今天就继续按照之前的逻辑去继续讲解。</p>
+<p>我的想法是还是接着之前的 <code>PUT</code> 链路去走，由于里面的模块太多了，所以每走到一个模块之后，就尽量的去详细讲解一下模块的内容，这样应该思路更通顺一点。</p>
+<p>先看一眼这个整体的走的流程，大致如下：</p>
+<pre><code class="language-text">StorageServiceImpl
+    -&gt; ReplicaManager
+    -&gt; Replica::put
+    -&gt; ReplicaLoop
+    -&gt; RaftCore
+    -&gt; PersistEngine
+    -&gt; ReplicaMessageDispatcher
+    -&gt; ReplicaLoop 处理 response
+    -&gt; commit
+    -&gt; ReplicaApplyTask
+    -&gt; ReplicaApplier
+    -&gt; KvStateMachine
+    -&gt; MapEngine
+</code></pre>
+<p>然后由于 <code>Replica</code> 的设计本身就有点繁琐，<code>Raft</code> 的设计同样也是这样，所以分成两期，这一期主要讲 <code>Replica</code> 的内容，下一期去主要讲关于 <code>Raft</code> 的内容，本期对于 <code>Raft</code> 的内容应该就是大致略过的那种。</p>
+<p>另外，<code>GET</code>、<code>snapshot</code>、恢复、成员变更虽然不是一次普通 <code>PUT</code> 的主路径，但后面我也会进行讲解。</p>
+<h2 id="一put-的整体链路">一、<code>PUT</code> 的整体链路</h2>
+<p><img src="https://img2024.cnblogs.com/blog/3435614/202608/3435614-20260808184003523-1308263342.png" alt="whiteboard_exported_image" loading="lazy"></p>
+<p>继续跟着我们之前的思路，此时 <code>SDK</code> 已经根据 <code>Route</code> 找到了某个 <code>Leader Replica</code>，并把 <code>PUT RPC</code> 发到了它所在的 <code>Storage</code>。</p>
+<p>完整链路可以先记成下面这样：</p>
+<pre><code class="language-text">StorageServiceImpl::Put
+        │
+        ▼
+ReplicaManager::get_replica_by_id
+        │
+        ▼
+Replica::put
+        │
+        ├── 参数、本地状态、recovering 检查
+        │
+        ▼
+ProposeCall
+        │
+        ▼
+ReplicaLoop::sync_submit
+        │
+        ▼
+submit_queue_ 批量收集 proposal
+        │
+        ▼
+RaftCore::propose_batch
+        │
+        ├── 追加本地 Raft log
+        ├── 产生 RaftEffects
+        ├── 写 WAL
+        └── 生成 AppendEntries 消息
+                │
+                ▼
+ReplicaMessageDispatcher
+        │
+        ▼
+其他 Replica 处理 AppendEntries
+        │
+        ▼
+AppendEntriesResponse 回到 Leader
+        │
+        ▼
+RaftCore 更新复制进度并推进 commit_index
+        │
+        ▼
+ReplicaLoop::resolve_pending_proposals
+        │
+        ▼
+Replica::put 返回 OK
+        │
+        ▼
+ReplicaApplyTask
+        │
+        ▼
+ReplicaApplier
+        │
+        ▼
+KvStateMachine
+        │
+        ▼
+MapEngine
+</code></pre>
+<p>另外，这里有一个前置知识：<code>PUT</code> 成功返回，意味着 <code>commit</code> 成功。</p>
+<h2 id="二storage-如何找到目标-replica">二、<code>Storage</code> 如何找到目标 <code>Replica</code></h2>
+<h3 id="21-replica-逻辑定义">2.1 <code>Replica</code> 逻辑定义</h3>
+<p><code>adviskv</code> 的数据层次是：</p>
+<pre><code class="language-text">Table
+  └── Shard
+        └── 一个 Raft Group
+              ├── Replica A
+              ├── Replica B
+              └── Replica C
+</code></pre>
+<p>一个 <code>Shard</code> 是一个 <code>Raft Group</code>，而每个 <code>Storage</code> 节点上承载的，是这个 <code>group</code> 的一个 <code>Replica</code>。</p>
+<p>同一个 <code>Storage</code> 进程可能同时放着很多不同 <code>Shard</code> 的 <code>Replica</code>，例如：</p>
+<pre><code class="language-text">table=1, shard=0, replica=0
+table=1, shard=2, replica=1
+table=3, shard=1, replica=0
+</code></pre>
+<p>所以 <code>Storage</code> 收到 <code>PUT</code> 后，不能只根据 <code>table_id</code> 或 <code>shard_index</code> 找对象，而是要根据完整的 <code>ReplicaID</code>：</p>
+<pre><code class="language-text">ReplicaID = table_id + shard_index + replica_seq
+</code></pre>
+<p>在 <code>ReplicaManager</code> 里维护了个索引：</p>
+<pre><code class="language-cpp">std::unordered_map&lt;ReplicaID, ReplicaPtr, ReplicaIDHash&gt; replica_map_;
+</code></pre>
+<p><code>ReplicaManager</code> 可以使用 <code>get_replica_by_id</code> 查询到对应的 <code>Replica</code>。</p>
+<h3 id="22-replicamanager-的作用">2.2 <code>ReplicaManager</code> 的作用</h3>
+<p><code>StorageServiceImpl::Put</code> 的主要工作是：</p>
+<pre><code class="language-text">收到 PutRequest
+    -&gt; 解码 ReplicaID
+    -&gt; ReplicaManager::get_replica_by_id
+    -&gt; 找不到则返回 REPLICA_NOT_FOUND
+    -&gt; 找到则调用 Replica::put
+</code></pre>
+<p>但是不仅是一个查询作用，由于 <code>ReplicaManager</code> 的内容比较简单，所以我就直接现在这里大致讲解 <code>ReplicaManager</code> 的功能了：</p>
+<pre><code class="language-cpp">
+class ReplicaManager {
+public:
+    //......
+    Status add_replica(const ReplicaInitParam&amp; param);
+    Status delete_replica(const ReplicaID&amp; replica_id);
+    Status add_member(const ReplicaID&amp; leader_replica_id, const PeerMember&amp; member);
+    Status remove_member(const ReplicaID&amp; leader_replica_id, const ReplicaID&amp; replica_id);
+    void start_tick();
+    void recover();
+
+private:
+    ReplicaInitParam fill_param_runtime(ReplicaInitParam param) const;
+
+    //......
+    ReplicaRuntimeOptions runtime_options_;
+    ReplicaMetaPersistEngine meta_persist_;
+};
+</code></pre>
+<p>其实作为 <code>ReplicaManager</code> 的作用，在 <code>PUT</code> 链路里面是查找到对应的 <code>Replica</code>；如果是在扩缩容的场景下，会提供给 <code>NodeAgent</code> 一个函数方便回调。</p>
+<p>这里又简单提一嘴 <code>NodeAgent</code>，目前就简单的理解成一个定时会给 <code>Topo</code> 打 <code>RPC</code> 的一个东西就好了，只不过在 <code>Topo</code> 希望扩缩容的时候，不是 <code>Topo</code> 打给 <code>Storage</code>，而是 <code>Storage</code> 打向 <code>Topo</code>，接收到期望态之后自己做处理，这个自己做处理，就是 <code>NodeAgent</code> 接受到了之后会去调用例如 <code>add_member</code>、<code>remove_member</code> 这种操作，<code>ReplicaManager</code> 就是负责提供这个回调函数的。</p>
+<p>然后除了刚才说的两个函数，还有 <code>start_tick</code>。也就是说，<code>Replica</code> 里面会有一个 <code>tick</code> 操作，定时触发，而这个定时触发，我们不是在每一个 <code>Replica</code> 里面塞了一个定时器，而是直接放在 <code>ReplicaManager</code> 搞了个定时任务，去定时触发所有的 <code>Replica</code>，不然每一个 <code>Replica</code> 都会搞一个线程，消耗太大了。</p>
+<p>还有一个就是 <code>recover</code>，负责拉起来所有的 <code>Replica</code>：</p>
+<pre><code class="language-cpp">
+void ReplicaManager::recover() {
+    std::unique_lock locker(mutex_);
+    {
+        //......
+        std::vector&lt;std::filesystem::path&gt; meta_paths = meta_persist_.scan_replica_meta_files();
+        for (const auto&amp; meta_path : meta_paths) {
+            ReplicaMetaPayload payload;
+            Status status = meta_persist_.load_replica_meta(meta_path, payload);
+            //...
+            ReplicaInitParam&amp; param = payload.init_param;
+            param = fill_param_runtime(param);
+            //...
+            auto replica = std::make_shared&lt;Replica&gt;();
+            status = replica-&gt;init(param);
+            //...
+        }
+    }
+
+    for (const auto&amp; [_, replica] : replica_map_) {
+        Status status = replica-&gt;recover();
+        //...
+    }
+    LOG_INFO("all replicas recovered");
+}
+
+</code></pre>
+<p>以上内容，就是 <code>ReplicaManager</code> 负责的内容了。</p>
+<p>所以现在需要再扯回来，继续进行 <code>PUT</code> 链路的细节部分。</p>
+<h2 id="三replicaput-进入-replica">三、<code>Replica::put</code> 进入 <code>Replica</code></h2>
+<h3 id="31-replica-各个模块">3.1 <code>Replica</code> 各个模块</h3>
+<p>一个 <code>Replica</code> 里面持有下面这些对象：</p>
+<pre><code class="language-text">Replica
+  ├── StateMachine（KvStateMachine）
+  │     └── MapEngine
+  ├── RaftCore
+  ├── PersistEngine
+  ├── ReplicaLoop
+  ├── ReplicaMessageDispatcher
+  ├── ReplicaApplier
+  ├── ReplicaApplyTask
+  ├── ReplicaReadIndexChecker
+  └── ReplicaSnapshotCoordinator
+</code></pre>
+<p>因此，<code>Replica</code> 不是 <code>MapEngine</code> 的一层薄包装。它把一个副本运行所需要的本地状态、<code>Raft</code>、持久化、网络、<code>apply</code>、读检查和 <code>snapshot</code> 都组合在了一起。</p>
+<h3 id="32-replicaput-的前置检查">3.2 <code>Replica::put</code> 的前置检查</h3>
+<p>当前 <code>Replica::put</code> 进入正式 <code>proposal</code> 之前，会做几层检查：</p>
+<pre><code class="language-text">PutParam 参数检查
+        │
+获取 OperGate 操作 guard
+        │
+检查 ReplicaLocalState 是否为 RUNNING
+        │
+检查 RaftCore 是否处于 RECOVERING
+        │
+创建 ProposeCall
+</code></pre>
+<p>源码主线可以简化成：</p>
+<pre><code class="language-cpp">Status Replica::put(const PutParam&amp; param) {
+    RETURN_IF_INVALID_PARAM(param)
+    RETURN_IF_OPER_GUARD_ACQUIRE_FAILED(oper_gate_)
+    RETURN_IF_INVALID_STATUS(ensure_local_state_running())
+
+    {
+        std::lock_guard lock(raft_core_mutex_);
+        if (raft_core_-&gt;is_recovering()) {
+            return Status::IS_RECOVERING("replica is recovering");
+        }
+    }
+
+    ProposeCall call{
+        ProposeParam::write(WriteOpType::PUT, param.key, param.value),
+        K_REPLICA_PROPOSAL_COMMIT_TIMEOUT
+    };
+
+    loop_-&gt;sync_submit(&amp;call);
+    RETURN_IF_INVALID_STATUS(call.status)
+
+    notify_apply_task();
+    return Status::OK();
+}
+</code></pre>
+<p>先说一下这个 <code>RETURN_IF_OPER_GUARD_ACQUIRE_FAILED(oper_gate_)</code>，这个是因为我们需要删除 <code>Replica</code> 的时候呢，得确保他所有的操作都是执行完了的，或者说起码得让他不再继续执行操作了。</p>
+<p>否则可能会出现，<code>ReplicaManager</code> 已经把 <code>Replica</code> 在磁盘级别删了，但是 <code>Replica</code> 内部可能还有一些操作，导致数据残留。例如这种，所以我们需要确保 <code>Replica</code> 的操作都执行了，就用了一个 <code>OperGuard</code>。</p>
+<p>这里关于 <code>Replica</code> 和 <code>Raft</code> 的状态内容可以等到下一篇的时候细讲。</p>
+<p>所以 <code>Replica</code> 主要是走了一个检查功能 + 投递到 <code>loop</code> 里面去，在 <code>loop</code> 里面再串行处理这个 <code>Raft</code> 相关内容。</p>
+<h2 id="四proposecall-如何进入-replicaloop">四、<code>ProposeCall</code> 如何进入 <code>ReplicaLoop</code></h2>
+<h3 id="41-replicaloop-的目的">4.1 <code>ReplicaLoop</code> 的目的</h3>
+<p>这里得扯一下了，这个设计的缘由是因为我最开始的是时候实现 <code>Raft</code> 没有想这么多，直接一股脑塞到这个 <code>Raft</code> 里面，（因为感觉各个模块都比较耦合，想着先直接实现了再说吧），但是结果搞了超级无敌屎山，1000+ 行的源文件，过了两三天再看我直接原地失忆，所以不得不对这坨东西进行了重构，目前才相对来讲比较好受一点。</p>
+<p><code>RaftCore</code> 里面有很多相互关联的状态：</p>
+<ul>
+<li><code>current term</code>；</li>
+<li><code>Leader</code>/<code>Follower</code>/<code>Candidate</code>；</li>
+<li><code>Raft log</code>；</li>
+<li><code>commit_index</code>；</li>
+<li><code>last_applied</code>；</li>
+<li><code>membership</code>；</li>
+<li><code>Leader</code> 视角下每个 <code>follower</code> 的复制进度；</li>
+<li><code>election</code> 和 <code>heartbeat</code> 的计时状态。</li>
+</ul>
+<p>如果 <code>PUT</code> 请求线程、<code>Raft RPC</code> 回调线程和 <code>tick</code> 线程都直接修改这些状态，就会产生复杂的并发交错。（当时的屎山简直了，锁也是满天飞，并发问题更是多的不敢想）</p>
+<p><code>ReplicaLoop</code> 的核心思路是：</p>
+<pre><code class="language-text">PUT proposal
+Raft RPC response
+Raft tick
+成员变更
+snapshot 状态变化
+以上内容，放入
+        │
+        ▼
+    ReplicaLoop
+        │
+        ▼
+一次串行执行一个 Raft 相关 step
+</code></pre>
+<p>有点类似线程池，具体来说是把 <code>Raft</code> 状态变化串行起来。</p>
+<p>当前实现仍然有 <code>raft_core_mutex_</code>、<code>state_machine_mutex_</code> 和 <code>persist_snapshot_mutex_</code>。<code>ReplicaLoop</code> 不是为了让整个 <code>Replica</code> 变成无锁结构，而是让 <code>Raft</code> 状态的主要修改有一个比较明确的串行入口。</p>
+<h3 id="42-replicaloop-的接口">4.2 <code>ReplicaLoop</code> 的接口</h3>
+<p><code>ReplicaLoop</code> 对外提供两个入口：</p>
+<pre><code class="language-cpp">void async_submit(Event event);
+void sync_submit(Call call);
+</code></pre>
+<p><code>Event</code> 表示异步事件，<code>Call</code> 表示调用者等待需要拿回结果。</p>
+<p><code>PUT</code> 使用的是 <code>ProposeCall</code>。它的路径大致是：</p>
+<pre><code class="language-text">Replica::put
+    -&gt; loop_-&gt;sync_submit(ProposeCall)
+    -&gt; ReplicaLoop::handle_call(ProposeCall)
+    -&gt; enqueue_proposal_and_wait
+    -&gt; submit_queue_
+    -&gt; proposal 被真正处理
+    -&gt; 等待 TimeoutWaiter
+</code></pre>
+<p>这里的同步等待不是“把整个 <code>Raft</code> 流程在当前线程里执行完”，而是当前线程提交 <code>proposal</code> 后挂起，等后续 <code>commit</code> 或超时唤醒。</p>
+<h3 id="43-为什么普通-proposal-要进入-submit_queue_">4.3 为什么普通 <code>proposal</code> 要进入 <code>submit_queue_</code></h3>
+<p><code>ReplicaLoop</code> 内部有两套队列：</p>
+<ul>
+<li><code>SerialTaskRunner</code>：串行执行已经准备好的任务；</li>
+<li><code>BatchDispatchQueue</code>：暂存外部提交的 <code>proposal</code> 和配置变更。</li>
+</ul>
+<p>多个 <code>PUT</code>/<code>DEL</code> 在很短时间内到达时，<code>BatchDispatchQueue</code> 会把它们收集起来，搞了两个边界：</p>
+<ul>
+<li>最多 64 个 <code>proposal</code>；</li>
+<li>或等待大约 200 微秒。</li>
+</ul>
+<p>然后由 <code>ReplicaLoop</code> 一次调用 <code>RaftCore::propose_batch</code>。</p>
+<pre><code class="language-text">PUT 1 ─┐
+PUT 2 ─┼── submit_queue_
+PUT 3 ─┘       │
+               ▼
+       RaftCore::propose_batch
+               │
+       一次追加多条日志
+</code></pre>
+<p>这就是当前代码中 <code>proposal batch</code> 的来源。它不是把多个客户端请求合并成一条 <code>KV</code> 操作，而是把多个独立的 <code>ProposeParam</code> 一次交给 <code>RaftCore</code> 处理。</p>
+<h3 id="44-event-和-call">4.4 <code>Event</code> 和 <code>Call</code></h3>
+<p><code>ReplicaLoop</code> 的 <code>Event</code> 定义包括：</p>
+<table>
+<thead>
+<tr>
+<th><code>Event</code></th>
+<th>产生原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TickEvent</code></td>
+<td><code>RaftTickTask</code> 定期触发</td>
+</tr>
+<tr>
+<td><code>AppendResponseEvent</code></td>
+<td><code>AppendEntries RPC</code> 成功返回</td>
+</tr>
+<tr>
+<td><code>VoteResponseEvent</code></td>
+<td><code>RequestVote RPC</code> 成功返回</td>
+</tr>
+<tr>
+<td><code>SnapshotResponseEvent</code></td>
+<td><code>InstallSnapshot RPC</code> 成功返回</td>
+</tr>
+<tr>
+<td><code>AppendSendFailedEvent</code></td>
+<td><code>AppendEntries</code> 发送失败</td>
+</tr>
+<tr>
+<td><code>SnapshotSendFailedEvent</code></td>
+<td><code>InstallSnapshot</code> 发送失败</td>
+</tr>
+<tr>
+<td><code>PublishSnapshotEvent</code></td>
+<td><code>snapshot</code> 发布状态发生变化</td>
+</tr>
+</tbody>
+</table>
+<p><code>Event</code> 不要求提交者等待处理结果。典型路径是：</p>
+<pre><code class="language-text">RPC worker 收到 AppendEntriesResponse
+        │
+        ▼
+构造 AppendResponseEvent
+        │
+        ▼
+async_submit
+        │
+        ▼
+ReplicaLoop::handle_event
+</code></pre>
+<p><code>Call</code> 则包含输入、输出和 <code>Status</code>。大致包括：</p>
+<ul>
+<li><code>RequestVoteCall</code>；</li>
+<li><code>AppendEntriesCall</code>；</li>
+<li><code>BuildReadIndexCall</code>；</li>
+<li><code>PrepareInstallSnapshotCall</code>；</li>
+<li><code>CommitInstallSnapshotCall</code>；</li>
+<li><code>AppendResponseCall</code>；</li>
+<li><code>SnapshotResponseCall</code>；</li>
+<li><code>ProposeCall</code>；</li>
+<li><code>AddMemberCall</code>；</li>
+<li><code>RemoveMemberCall</code>。</li>
+</ul>
+<p>使用 <code>Call</code>，一般都是因为 <code>RPC handler</code> 需要把 <code>result</code> 回填给 <code>StorageServiceImpl</code>；<code>Leader</code> 发出的 <code>RPC response</code> 通常使用 <code>Event</code>，是因为网络线程只需要把结果通知给 <code>ReplicaLoop</code>。</p>
+<h2 id="五raftcore-如何把-put-变成-rafteffects">五、<code>RaftCore</code> 如何把 <code>PUT</code> 变成 <code>RaftEffects</code></h2>
+<h3 id="51-接口边界">5.1 接口边界</h3>
+<p><code>PUT</code> 进入 <code>ReplicaLoop</code> 后，真正执行 <code>Raft</code> 判断的是 <code>RaftCore</code>。</p>
+<pre><code class="language-text">输入：
+    proposal / tick / RPC request / RPC response
+
+RaftCore 计算：
+
+输出：
+    RaftEffects
+</code></pre>
+<p><code>RaftCore</code> 不直接写 <code>WAL</code>，也不直接调用 <code>gRPC</code>。它把副作用放到 <code>RaftEffects</code> 中：</p>
+<pre><code class="language-cpp">struct RaftEffects {
+    std::optional&lt;RaftMeta&gt; hard_state;
+    std::vector&lt;LogEntry&gt; entries_to_append;
+    std::optional&lt;std::vector&lt;LogEntry&gt;&gt; entries_to_rewrite;
+    std::vector&lt;RaftMessage&gt; messages;
+};
+</code></pre>
+<p>这个 <code>RaftEffects</code>，主要是交给 <code>Replica</code> 层面，在设计的时候并不打算交给 <code>Raft</code> 层面去做，否则会有持久化，<code>RPC</code> 层面的事情耦合在一起，太复杂了。</p>
+<p>对一次正常 <code>PUT</code> 来说，可以把结果理解成：</p>
+<pre><code class="language-text">RaftEffects
+  ├── entries_to_append
+  │       └── 一条 PUT LogEntry
+  └── messages
+          └── 发给其他副本的 AppendEntries
+</code></pre>
+<h3 id="52-replicalooprun_step-的职责">5.2 <code>ReplicaLoop::run_step</code> 的职责</h3>
+<p><code>ReplicaLoop</code> 通过 <code>run_step</code> 包住一次 <code>RaftCore</code> 操作：</p>
+<pre><code class="language-text">拿住 raft_core_mutex_
+        │
+调用 RaftCore::propose / propose_batch / handle_xxx
+        │
+得到 RaftEffects
+        │
+PersistEngine 持久化 effects
+        │
+ReplicaMessageDispatcher 发送 effects.messages
+</code></pre>
+<p>源码主线可以简化成：</p>
+<pre><code class="language-cpp">Status ReplicaLoop::run_step(RaftStepFunc&amp;&amp; step) {
+    RaftEffects effects;
+
+    {
+        std::lock_guard lock(context_.raft_core_mutex);
+        Status status = step(effects);
+        RETURN_IF_INVALID_STATUS(persist_raft_effects(effects))
+        RETURN_IF_INVALID_STATUS(status)
+    }
+
+    return context_.message_dispatcher.async_send(
+        std::move(effects.messages));
+}
+</code></pre>
+<p>这里其实就是一套固定的流程搭配：</p>
+<blockquote>
+<p>先把 <code>RaftCore</code> 产生的持久化副作用落盘，再发送网络消息。</p>
+</blockquote>
+<p>这样其他副本收到 <code>AppendEntries</code> 时，<code>Leader</code> 本地已经先把对应日志写进 <code>WAL</code>，重启后仍然有机会恢复这条日志。</p>
+<p>由于这个流程固定，唯一的变动就是 <code>step</code> 具体的内容，所以把他当做参数传进来，做一层封装处理。</p>
+<h2 id="六persistengine-负责把本地结果落盘">六、<code>PersistEngine</code> 负责把本地结果落盘</h2>
+<p><code>PersistEngine</code> 主要负责三类持久化内容：</p>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WAL</code></td>
+<td>保存 <code>Raft</code> 日志</td>
+</tr>
+<tr>
+<td><code>raft_meta</code></td>
+<td>保存 <code>current term</code>、<code>voted_for</code> 等 <code>Raft hard state</code></td>
+</tr>
+<tr>
+<td><code>snapshot</code></td>
+<td>保存已经 <code>apply</code> 的状态机和当时的 <code>membership</code></td>
+</tr>
+</tbody>
+</table>
+<p>正常来说，一次 <code>PUT</code> 产生 <code>entries_to_append</code> 后，<code>ReplicaLoop</code> 会调用 <code>PersistEngine</code> 的 <code>append_wal_batch</code>。<code>PersistEngine</code> 写完 <code>WAL</code> 后还会 <code>fsync</code>。</p>
+<p>因此 <code>PUT</code> 的本地持久化路径是：</p>
+<pre><code class="language-text">RaftCore::propose_batch
+    -&gt; RaftEffects.entries_to_append
+    -&gt; ReplicaLoop::persist_raft_effects
+    -&gt; PersistEngine::append_wal_batch
+    -&gt; fsync
+</code></pre>
+<p><code>PersistEngine</code> 保存的是 <code>LogEntry</code>，不是直接保存最终的 <code>map</code> 内容。恢复时，系统可以先恢复 <code>snapshot</code>，再读取 <code>snapshot</code> 之后的 <code>WAL</code>，重新把日志 <code>apply</code> 到状态机。</p>
+<p>如果 <code>WAL</code>、<code>hard state</code> 或 <code>snapshot</code> 的关键持久化失败，<code>Replica</code> 会通过 <code>context</code> 中的 <code>fault_if_fail</code> 回调，把本地状态变成 <code>FAULTED</code>。</p>
+<pre><code class="language-cpp">// 负责WAL，snapshot，raft_meta的落盘
+class PersistEngine {
+public:
+    PersistEngine(const std::string&amp; data_dir, const ReplicaID&amp; replica_id);
+    ~PersistEngine();
+
+    Status init();
+    Status close();
+
+    Status append_wal(const LogEntry&amp; entry);
+    Status append_wal_batch(const std::vector&lt;LogEntry&gt;&amp; entries);
+    Status read_wal_batch(std::vector&lt;LogEntry&gt;&amp; entries);
+    Status rewrite_wal(const std::vector&lt;LogEntry&gt;&amp; entries);
+
+    // 和下面的truncate_wal_to_offset区分一下，这个是代码业务层这边调用的，用来截取到内存里的wal
+    // 而truncate_wal_to_offset是用来截取磁盘里的wal的
+    Status truncate_wal(const LogIndex&amp; snapshot_index);
+
+    Status save_raft_meta(const RaftMeta&amp; meta);
+    Status load_raft_meta(RaftMeta&amp; meta) const;
+
+    Status load_snapshot_meta(SnapshotPtr&amp; snap) const;
+    Status for_each_snapshot_kv(const KvVisitor&amp; fn) const;
+    Status read_snapshot_chunk(uint64 offset, size_t max_bytes, std::string&amp; data, bool&amp; eof) const;
+    Status append_snapshot_chunk(const InstallSnapshotParam&amp; param);
+    Status finish_snapshot_receive();
+
+    Status write_snapshot(const StateMachine&amp; state_machine, const std::vector&lt;RaftMember&gt;&amp; members = {});
+    Status clear_wal();
+
+    struct RecoverResult {
+        SnapshotPtr snapshot;
+        RaftMeta raft_meta;
+        std::vector&lt;LogEntry&gt; wal_entries;
+        bool need_recover{false};
+    };
+    Status recover(RecoverResult&amp; result);
+
+private:
+	//...
+};
+</code></pre>
+<p>这里先大概展示一下 <code>Replica</code> 里的 <code>PersistEngine</code> 提供的各个接口，主要就是 <code>WAL</code> + <code>raft_meta</code> + <code>snapshot</code> 这几个。之后的篇章我们再详谈这个。</p>
+<h2 id="七replicamessagedispatcher-如何发送-appendentries">七、<code>ReplicaMessageDispatcher</code> 如何发送 <code>AppendEntries</code></h2>
+<h3 id="71-dispatcher-是-rpc-层">7.1 <code>Dispatcher</code> 是 <code>RPC</code> 层</h3>
+<p><code>ReplicaLoop</code> 里面发 <code>RPC</code> 的是 <code>ReplicaMessageDispatcher</code>。内部搞了个 <code>Context</code>，可以使得 <code>ReplicaLoop</code> 获取到这个 <code>MessageDispatcher</code>。</p>
+<p>主线是：</p>
+<pre><code class="language-text">RaftEffects.messages
+        │
+        ▼
+ReplicaMessageDispatcher::async_send
+        │
+        ▼
+ThreadPool
+        │
+        ▼
+RaftSender
+        │
+        ▼
+其他 Storage 的 Raft RPC
+</code></pre>
+<p>当前 <code>RPC worker</code> 数量是 8 个。</p>
+<p>代码内容还是挺简单的：</p>
+<pre><code class="language-cpp">Status ReplicaMessageDispatcher::async_send(std::vector&lt;RaftMessage&gt; messages) {
+    for (const RaftMessage&amp; msg : messages) {
+        RETURN_IF_INVALID_STATUS(async_send_one(msg))
+    }
+    return Status::OK();
+}
+
+Status ReplicaMessageDispatcher::async_send_one(const RaftMessage&amp; msg) {
+    if (!rpc_pool_.started()) {
+        return Status::ERROR("raft rpc workers are not started");
+    }
+
+    rpc_pool_.submit([this, msg]() { send_task(msg); });
+    return Status::OK();
+}
+//这里简化描述一下，大概展示一下代码内容其实就是这样的
+void ReplicaMessageDispatcher::send_task(RaftMessage msg) {
+    switch (msg.type) {
+        case RaftMessageType::REQUEST_VOTE: {
+            RequestVoteResult result;
+            Status status = sender_.send_request_vote(msg.target, msg.vote_param, result);
+            callback(VoteResponseEvent{msg.target.replica_id, result});
+            break;
+        }
+        case RaftMessageType::APPEND_ENTRIES: {
+            AppendEntriesResult result;
+            Status status = sender_.send_append_entries(msg.target, msg.append_param, result);
+            if (status.ok()) {
+                callback(AppendResponseEvent{msg.target.replica_id, msg.append_param, result});
+            } else {
+                callback(AppendSendFailedEvent{msg.target.replica_id, msg.append_param, status});
+            }
+            break;
+        }
+    }
+}
+
+void ReplicaMessageDispatcher::callback(Event event) {
+    if (!event_callback_) {
+        LOG_WARN("drop raft response event because event sink is not set");
+        return;
+    }
+    event_callback_(std::move(event));
+}
+</code></pre>
+<p>然后这里面的 <code>callback</code> 就是一个回调函数，会去投递 <code>ReplicaLoop</code> 里面的投递 <code>Event</code> 函数。</p>
+<p><code>Dispatcher</code> 支持：</p>
+<ul>
+<li><code>RequestVote</code>；</li>
+<li><code>AppendEntries</code>；</li>
+<li><code>InstallSnapshot</code>。</li>
+</ul>
+<p>当然这个里面还是有一些同步的操作的，只不过没有展示出来，在 <code>GET</code> 链路里面会有处理。</p>
+<p>由于 <code>PUT</code> 链路基本上就是 <code>AppendEntries</code> 操作，在之后 <code>RPC worker</code> 调用 <code>RaftSender</code> 发送 <code>AppendEntries</code>：</p>
+<pre><code class="language-text">Leader Dispatcher
+    -&gt; RaftSender::send_append_entries
+    -&gt; Follower StorageServiceImpl::AppendEntries
+    -&gt; Follower Replica::handle_append_entries
+    -&gt; Follower ReplicaLoop
+    -&gt; Follower RaftCore
+    -&gt; AppendEntriesResponse
+</code></pre>
+<p>会发现还是这样同样的逻辑：关于收到了 <code>AppendEntries</code> 的 <code>RPC</code> 请求，<code>Replica</code> 也还是会放到 <code>ReplicaLoop</code> 里面，只不过我们不需要同步等待，这是异步操作，封装成 <code>Event</code> 里面去处理就好了。</p>
+<pre><code class="language-text">AppendEntriesResponse
+        │
+        ▼
+AppendResponseEvent
+        │
+        ▼
+event_callback_
+        │
+        ▼
+Leader ReplicaLoop::async_submit
+</code></pre>
+<p>另外提一句，这个 <code>callback</code> 是在 <code>Replica::init</code> 创建 <code>Dispatcher</code> 时传进去的。这个 <code>callback</code> 的工作就是把 <code>Event</code> 重新送回本 <code>Replica</code> 的 <code>ReplicaLoop</code>。</p>
+<p>另外，如果 <code>AppendEntries</code> 发送失败时，<code>Dispatcher</code> 会生成 <code>AppendSendFailedEvent</code>：</p>
+<pre><code class="language-text">网络/RPC 失败
+    -&gt; AppendSendFailedEvent
+    -&gt; ReplicaLoop
+    -&gt; RaftCore::handle_append_send_failed
+</code></pre>
+<p><code>RequestVote</code> 发送失败当前主要记录日志；<code>AppendEntries</code> 和 <code>InstallSnapshot</code> 的发送失败会转换成相应的失败 <code>Event</code>，把结果交回 <code>ReplicaLoop</code> 层进行处理。</p>
+<h2 id="八follower-如何接住-appendentries">八、<code>Follower</code> 如何接住 <code>AppendEntries</code></h2>
+<p>到目前为止，我们只跟了 <code>Leader</code> 侧的 <code>PUT</code>。现在把视线转到 <code>follower</code>。</p>
+<p><code>Follower</code> 收到 <code>AppendEntries RPC</code> 后，<code>StorageServiceImpl</code> 也会根据 <code>request</code> 里的 <code>ReplicaID</code> 找到本机 <code>Replica</code>，然后调用：</p>
+<pre><code class="language-cpp">replica-&gt;handle_append_entries(param, result);
+</code></pre>
+<p><code>Replica::handle_append_entries</code> 的主要流程是：</p>
+<pre><code class="language-text">获取 OperGate
+检查本地状态
+        │
+构造 AppendEntriesCall
+        │
+loop_-&gt;sync_submit(&amp;call)
+        │
+ReplicaLoop::handle_call
+        │
+RaftCore::handle_append_entries
+        │
+回填 AppendEntriesResult
+        │
+notify_apply_task
+</code></pre>
+<p>这里的 <code>Call</code> 是同步的，因为当前 <code>Storage RPC handler</code> 需要拿到：</p>
+<ul>
+<li><code>response term</code>；</li>
+<li><code>response success</code>；</li>
+<li><code>follower</code> 当前 <code>last_log_index</code>。</li>
+</ul>
+<pre><code class="language-cpp">Status Replica::handle_append_entries(const AppendEntriesParam&amp; param, AppendEntriesResult&amp; result) {
+    RETURN_IF_OPER_GUARD_ACQUIRE_FAILED(oper_gate_)
+    RETURN_IF_INVALID_STATUS(ensure_local_state_running())
+
+    // 这里是作为follower那边的handle，会更新commit_idx
+    {
+        ADVISKV_METRICS_TIMER("storage_replica_handle_append_entries_raft_step");
+        AppendEntriesCall call{param};
+        loop_-&gt;sync_submit(&amp;call);
+        RETURN_IF_INVALID_STATUS(call.status)
+        result = call.result;
+    }
+
+    notify_apply_task();
+
+    return Status::OK();
+}
+</code></pre>
+<p>这里可以简单看一下这个函数的内容，就是创建了个 <code>AppendEntriesCall</code>，然后投递到 <code>loop</code> 里面。另外，<code>AppendEntriesCall</code> 里面会有 <code>AppendEntriesResult</code>，装着我们期望获得的结果。</p>
+<p><code>Follower</code> 的 <code>RaftCore</code> 处理内容可以先简单理解为：</p>
+<ol>
+<li>检查 <code>Leader term</code>；</li>
+<li>检查 <code>prev_log_index</code> 和 <code>prev_log_term</code> 是否匹配；</li>
+<li>追加或重写本地日志；</li>
+<li>根据 <code>leader_commit</code> 更新本地 <code>commit_index</code>；</li>
+<li>生成 <code>response</code>。</li>
+</ol>
+<p><code>RaftCore</code> 处理完后，<code>Replica::handle_append_entries</code> 调用 <code>notify_apply_task</code>，让 <code>follower</code> 后台把已经 <code>commit</code> 的日志 <code>apply</code> 到自己的状态机。</p>
+<h2 id="九response-如何推进-commit">九、<code>response</code> 如何推进 <code>commit</code></h2>
+<h3 id="81-response-回到-leader-的-replicaloop">8.1 <code>response</code> 回到 <code>Leader</code> 的 <code>ReplicaLoop</code></h3>
+<p><code>Leader</code> 的 <code>AppendResponseEvent</code> 进入 <code>ReplicaLoop</code> 后，会执行：</p>
+<pre><code class="language-text">ReplicaLoop::handle_event(AppendResponseEvent)
+    -&gt; ReplicaLoop::run_step
+    -&gt; RaftCore::handle_append_response
+    -&gt; 更新该 follower 的复制进度
+    -&gt; 尝试推进 commit_index
+    -&gt; resolve_pending_proposals
+</code></pre>
+<p>这里前面的逻辑就比较重复了，经典的 <code>Loop</code> 投递 <code>Event</code>，然后最终会走到一个 <code>resolve_pending_proposals</code> 的地方。这个是负责处理我们的写操作的，之前我们的逻辑里面是有关于 <code>PUT</code> 操作的时限的，逻辑上来讲，等到 <code>commit_index</code> 推进到了目标的 <code>index</code> 位置，就可以返回成功了。</p>
+<p><code>ReplicaLoop</code> 内部有：</p>
+<pre><code class="language-cpp">std::multimap&lt;LogIndex, std::shared_ptr&lt;TimeoutWaiter&gt;&gt;
+    pending_proposals_;
+</code></pre>
+<p>当一批 <code>proposal</code> 被 <code>RaftCore</code> 接受，但它们对应的日志还没有 <code>commit</code> 时，<code>ReplicaLoop</code> 会把 <code>waiter</code> 按 <code>log index</code> 放进这个 <code>map</code>：</p>
+<pre><code class="language-text">proposal 对应 index = 10
+commit_index = 9
+        │
+        ▼
+pending_proposals_[10] = waiter
+</code></pre>
+<p>后续只要 <code>commit_index</code> 推进到 10，<code>resolve_pending_proposals</code> 就会完成这个 <code>waiter</code>：</p>
+<pre><code class="language-text">log_index &lt;= commit_index
+    -&gt; complete_proposal_commit(waiter, OK)
+    -&gt; condition_variable 唤醒
+    -&gt; Replica::put 继续执行
+</code></pre>
+<p>代码如下：</p>
+<pre><code class="language-cpp">
+// 只有在runner内部访问，目前并没有并发方面的危险
+void ReplicaLoop::resolve_pending_proposals() {
+    LogIndex commit_index;
+    {
+        std::lock_guard lock(context_.raft_core_mutex);
+        commit_index = context_.raft_core.commit_index();
+    }
+
+    for (auto it = pending_proposals_.begin(); it != pending_proposals_.end();) {
+        LogIndex log_index = it-&gt;first;
+        std::shared_ptr&lt;TimeoutWaiter&gt;&amp; waiter = it-&gt;second;
+
+        bool cancelled = false;
+        {
+            std::lock_guard lock(waiter-&gt;mutex);
+            cancelled = waiter-&gt;cancelled;
+        }
+        if (cancelled) {
+            it = pending_proposals_.erase(it);
+            continue;
+        }
+        if (log_index &gt; commit_index) {
+            break;
+        }
+        complete_proposal_commit(waiter, Status::OK());
+        it = pending_proposals_.erase(it);
+    }
+}
+</code></pre>
+<p>大致的逻辑就是这样，我们会把每一次的 <code>waiter</code> 存起来，然后去逐个遍历判断，如果达到了，就可以把 <code>waiter</code> 标记成功然后返回了。</p>
+<h2 id="十commit-之后的-applytask">十、<code>commit</code> 之后的 <code>ApplyTask</code></h2>
+<h3 id="91-replicaapplytask-如何被触发">9.1 <code>ReplicaApplyTask</code> 如何被触发</h3>
+<p><code>Replica::put</code> 在 <code>proposal</code> <code>waiter</code> 返回成功后调用：</p>
+<pre><code class="language-cpp">notify_apply_task();
+</code></pre>
+<p><code>Replica</code> 里定义的 <code>ReplicaApplyTask</code> 是一个 <code>BackgroundTask</code>，当前周期约为 5 ms。<code>run</code> 代码大致如下：</p>
+<pre><code class="language-cpp">
+void Replica::apply_committed_entries_from_task() {
+
+    OperGate::Guard guard;
+    if (oper_gate_.acquire(guard).fail()) {
+        return;//...
+    }
+    if (ensure_local_state_running().fail() || !applier_) {
+        return;//...
+    }
+    //...
+    {
+        std::lock_guard lock(raft_core_mutex_);
+        if (raft_core_-&gt;commit_index() &lt;= raft_core_-&gt;last_applied()) {
+            return;
+        }
+    }
+    //...
+    std::lock_guard lock(state_machine_mutex_);
+    Status status = fault_if_fail(applier_-&gt;apply_committed_entries());
+    //...
+}
+</code></pre>
+<p>这个后台任务执行时会：</p>
+<ol>
+<li>获取 <code>OperGate</code>；</li>
+<li>确认本地仍是 <code>RUNNING</code>；</li>
+<li>在 <code>raft_core_mutex_</code> 下检查 <code>commit_index</code> 是否领先 <code>last_applied</code>；</li>
+<li>获取 <code>state_machine_mutex_</code>；</li>
+<li>调用 <code>ReplicaApplier::apply_committed_entries</code>。</li>
+</ol>
+<p>而这个 <code>ReplicaApplier</code> 内部其实本身也比较简单，就是每一次都提取出来已经 <code>commit</code> 但是还没有 <code>apply</code> 的 <code>log</code>，逐个进行 <code>apply</code>。</p>
+<pre><code class="language-cpp">
+Status ReplicaApplier::apply_committed_entries() {
+    std::vector&lt;LogEntry&gt; entries;
+    {
+        std::lock_guard lock(context_.raft_core_mutex);
+        entries = context_.raft_core.extract_committed_entries();
+    }
+    for (const LogEntry&amp; entry : entries) {
+        RETURN_IF_INVALID_STATUS(apply_log_entry(entry))
+    }
+    return Status::OK();
+}
+
+Status ReplicaApplier::apply_log_entry(const LogEntry&amp; entry) {
+    switch (entry.op_type) {
+        case WriteOpType::PUT:
+        case WriteOpType::DEL:
+        case WriteOpType::NONE:
+            return apply_kv_log_entry(entry);
+        case WriteOpType::ADD_LEARNER:
+        case WriteOpType::PROMOTE_VOTER:
+        case WriteOpType::REMOVE_MEMBER:
+            return apply_config_log_entry(entry);
+    }
+
+    return Status{StatusCode::ERROR, "unsupported raft log entry type"};
+}
+
+Status ReplicaApplier::apply_kv_log_entry(const LogEntry&amp; entry) {
+    Status status = context_.state_machine.apply(entry);
+    if (status.fail()) {
+        return status;
+    }
+    {
+        std::lock_guard lock(context_.raft_core_mutex);
+        context_.raft_core.advance_last_applied(entry.index);
+    }
+
+    return Status::OK();
+}
+
+</code></pre>
+<p>这里最终就是交给 <code>state_machine</code> 去进行 <code>apply</code>，而目前代码里面只有个 <code>MAP_ENGINE</code> 为底座的 <code>kv_state_machine</code>，到这里后面的内容其实就很简单了，就是一个 <code>map</code> 去进行 <code>PUT</code> 了。</p>
+<p>由于这个项目我觉得应该不需要再在这个存储引擎里面下功夫了，复杂一点可以接入 <code>RocksDB</code>，或者说写个简单的跳表、<code>B+</code> 等这种都是没有问题的，只不过我觉得这个项目的主旨其实是分布式 <code>KV</code>，所以目前就先用 <code>MAP</code> 了，后续再打算进一步去考虑。</p>
+<h2 id="写在结尾">写在结尾</h2>
+<p>我靠东西实在太多（虽然这个项目也就那样吧，感觉垃圾的地方太多了，突然有一种感觉当做教学项目都不太够格的感觉）。</p>
+<p>下一篇打算讲一下 <code>Raft</code> 的内部细节，然后再把 <code>Replica</code> 这次没有提到的链路模块再展开讲讲。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-08 18:40">2026-08-08 18:40</span>&nbsp;
+<a href="https://www.cnblogs.com/advisedy">AdviseDY</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22340602);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fadvisedy%2Fp%2F22340602&amp;targetId=22340602&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
