@@ -1,0 +1,159 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/doiito/p/22341290" title="发布于 2026-08-08 20:38">
+    
+
+    <span role="heading" aria-level="2">【Agent Harness】Gliding Horse 最新升级：把“智能闭环”真正跑通的一次深度优化</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="gliding-horse-最新升级把智能闭环真正跑通的一次深度优化">Gliding Horse 最新升级：把“智能闭环”真正跑通的一次深度优化</h1>
+<blockquote>
+<p><strong>摘要</strong>：Gliding Horse 本次升级聚焦“智能闭环”的落地，重点打通记忆系统的一致性写入与预取链路、修复 SA 编排层的“假成功”问题、为安全门禁补充合规工具白名单，并新增日志实时镜像以消除长任务“无输出假死”。升级后各模块从“独立可用”走向“真正协同”，复杂任务状态如实反馈，长时间运行可观测。<br>
+<strong>关键词</strong>：Gliding Horse；智能闭环；记忆系统；预取引擎；SA 编排；安全门禁；可观测性；PDCA；DeepSeek；gRPC</p>
+</blockquote>
+<p>Gliding Horse 一直在构建一套完整的智能体系：动态 PDCA 编排、四层记忆、技能图谱自进化、因果引擎、Hyperspace 向量检索、安全门禁……这些能力在之前的文章中都有详细介绍。</p>
+<p>但一个系统不仅要“有”这些能力，更要让它们在实际运行中<strong>真正协同起来</strong>。如果安全门禁误伤了合规的验证工具，如果 Agent 明明报告“任务阻塞”却硬编码返回“成功”，如果记忆预取模块的事件总线根本没接上——那再好的模块也只是“存在”而已。</p>
+<p>这次升级要解决的正是这些问题。它不追求新增多少模块，而是把已有的能力之间的“连接点”逐一打通，让整个系统的智能闭环真正运转起来。</p>
+<h2 id="一记忆系统让写入即持久和预取即命中成为现实">一、记忆系统：让“写入即持久”和“预取即命中”成为现实</h2>
+<p>Gliding Horse 的四层记忆体系一直有 WriteThrough 和 WriteBack 两种写入策略。但在实际运行中，一致性引擎的 WriteThrough 钩子并没有完全发挥作用——关键标签的节点写入 L2 后，没有被即时刷入 L0，也没有触发 L3 投影缓存的失效。</p>
+<p>这次修复把这条路彻底打通了。</p>
+<div class="mermaid">sequenceDiagram
+    participant Agent as Agent 产出
+    participant L2 as L2 黑板
+    participant Hook as Write Hook
+    participant CE as ConsistencyEngine
+    participant L0 as L0 持久层
+    participant L3 as L3 投影缓存
+
+    Agent-&gt;&gt;L2: write_node_to_graph(iri, tags=["emphasis","confirmed_fact"])
+    L2-&gt;&gt;Hook: 触发写钩子（携带 tags + IRI）
+    Hook-&gt;&gt;CE: 检查 tags：命中 critical_tags
+    CE-&gt;&gt;L0: WriteThrough 即时刷入
+    CE-&gt;&gt;L3: 失效相关投影缓存
+    CE--&gt;&gt;Agent: 持久化确认
+</div><p>关键改动是：<code>Blackboard</code> 新增了写钩子机制，<code>ConsistencyEngine</code> 在构造时注册钩子，携带 <code>emphasis</code>、<code>confirmed_fact</code> 等关键标签的节点在写入 L2 的瞬间就会被同步刷入 L0，同时失效 L3 投影缓存。这意味着任务关键中间结果即使进程崩溃也不会丢失，缓存一致性也更加严格。</p>
+<p>下面是钩子注册与写入路径的关键代码：</p>
+<pre><code class="language-rust">// Blackboard 新增写钩子机制：写入节点时携带 tags，供一致性引擎拦截
+impl Blackboard {
+    pub fn write_node_to_graph(
+        &amp;mut self,
+        iri: &amp;str,
+        tags: &amp;[&amp;str],
+    ) -&gt; Result&lt;(), Error&gt; {
+        // 触发写钩子，携带 tags + IRI，让 ConsistencyEngine 决定是否 WriteThrough
+        if let Some(hook) = &amp;self.write_hook {
+            hook.on_write(iri, tags)?;
+        }
+        self.graph.insert(iri, tags)
+    }
+}
+
+// ConsistencyEngine 在构造时注册钩子，命中 critical_tags 即同步刷入 L0 并失效 L3 缓存
+impl ConsistencyEngine {
+    pub fn new(blackboard: &amp;mut Blackboard, l0: L0Store, l3: L3Cache) -&gt; Self {
+        let ce = Self { l0, l3, critical_tags: vec!["emphasis", "confirmed_fact"] };
+        blackboard.register_write_hook(WriteHook::new(move |iri, tags| {
+            if tags.iter().any(|t| ce.critical_tags.contains(t)) {
+                ce.l0.persist(iri)?;          // WriteThrough 即时刷入 L0
+                ce.l3.invalidate(iri);        // 失效相关投影缓存
+            }
+            Ok(())
+        }));
+        ce
+    }
+}
+</code></pre>
+<p>同时修复了一个隐蔽的线程泄漏：Oxigraph 的同步句柄在长跑进程中会无限堆积。现在 <code>reap_finished_syncs</code> 保持了句柄有界，<code>clear()</code> 会先刷 Oxigraph 再清空内存。</p>
+<h3 id="预取引擎终于通电了">预取引擎终于“通电”了</h3>
+<p>记忆预取引擎（PrefetchEngine）一直是 Gliding Horse 的一个重要组件——它能根据任务意图主动预热相关上下文，让 LLM 首轮调用就命中高相关度数据。但之前有一个 P0 级别的缺陷：<strong>预取引擎的事件总线是孤立的，没有和系统的主 EventBus 共享</strong>。这意味着预取事件（<code>MEMORY_PREFETCH</code>、<code>PREFETCH_REQUEST</code>）虽然能发出，但<strong>没有任何消费者能收到</strong>。</p>
+<p>这次修复把 Worker 和上层组件共享的主 EventBus 接入了预取引擎，并新增了 <code>spawn_consumer</code> 来实际消费预取事件。路径是这样的：</p>
+<p>关键代码是把主 EventBus 接入预取引擎并启动消费者：</p>
+<pre><code class="language-rust">// 将 Worker 与上层组件共享的主 EventBus 接入预取引擎
+impl PrefetchEngine {
+    pub fn connect(&amp;mut self, bus: &amp;EventBus) {
+        // 订阅主总线上的预取事件，避免事件发出后无人消费
+        bus.subscribe(EventKind::MemoryPrefetch, |evt| {
+            self.enqueue(evt.iri, evt.intent);
+        });
+        bus.subscribe(EventKind::PrefetchRequest, |evt| {
+            self.enqueue(evt.iri, evt.intent);
+        });
+    }
+
+    // 新增 spawn_consumer：真正消费预取队列，刷新知识图谱并排空队列
+    pub fn spawn_consumer(&amp;self, bus: &amp;EventBus) {
+        let worker = self.clone();
+        tokio::spawn(async move {
+            while let Some(req) = worker.queue.recv().await {
+                worker.refresh_kg(&amp;req.iri).await;   // 实体知识图谱刷新
+                bus.publish(EventKind::PrefetchDone, req); // 通知 L2 上下文已就绪
+            }
+        });
+    }
+}
+</code></pre>
+<div class="mermaid">flowchart LR
+    SA["SA 检测意图变化"] --&gt; EB["主 EventBus"]
+    EB --&gt; PE["PrefetchEngine.spawn_consumer"]
+    PE --&gt; KG["实体知识图谱刷新"]
+    PE --&gt; QUEUE["预取队列排空"]
+    QUEUE --&gt; L2["L2 黑板&lt;br/&gt;相关上下文已就绪"]
+    L2 --&gt; LLM["LLM 首轮调用&lt;br/&gt;命中预热数据"]
+</div><p>预取引擎现在能真正工作了：后续任务首次查询即可命中已预热的高相关度上下文，首轮 LLM 调用的时延和 Token 消耗都会降低。新增的 6 个单元测试锁定了这个行为，确保不再回归。</p>
+<h2 id="二sa-编排让假成功彻底消失">二、SA 编排：让“假成功”彻底消失</h2>
+<p>在复杂任务的执行中，我们发现了两个导致“任务显示成功但什么都没产出”的问题。</p>
+<h3 id="问题一aa-的-finish-硬编码为-success">问题一：AA 的 <code>finish</code> 硬编码为 <code>success</code></h3>
+<p>当 Agent 遇到阻塞情况（比如缺少任务规格、没有可交付物）时，它会在回复中明确输出 <code>"Blocked: no task spec; zero deliverables; terminate"</code> 这样的结论。但 AA 的 <code>finish</code> 动作此前硬编码 <code>status: "success"</code>，导致即使 Agent 自己都认为任务失败了，系统仍然上报 <code>✅ SUCCESS</code>。</p>
+<p>修复方案是在 <code>finish</code> 动作中加入一个阻塞判定解析器：</p>
+<pre><code class="language-rust">fn detect_blocker_verdict(summary: &amp;str) -&gt; Option&lt;&amp;str&gt; {
+    // 保守匹配显式阻塞措辞
+    // "no task spec" / "zero deliverables" / "cannot proceed" / "missing task spec" 等
+    // 命中返回 Some("failed")，否则返回 None
+}
+</code></pre>
+<p><code>finish</code> 动作现在用 <code>detect_blocker_verdict(...).unwrap_or("success")</code> 取代了硬编码。Agent 诚实报告阻塞时，系统就诚实反馈失败，SA 层的 PDCA 重试循环才能正常触发。</p>
+<h3 id="问题二verify-first-周期被错误短路">问题二：verify-first 周期被错误短路</h3>
+<p>AA 的 <code>verify</code> 动作被设计为“先检查再决定是否需要完整执行”。但此前无论检查结果如何，都硬编码返回 <code>success</code>，导致任务在仍需执行的情况下被提前终止。</p>
+<p>修复后，<code>verify_aa_needs_execution()</code> 解析器会检查 AA 的结论中是否包含 8 个完成标记——缺失、含糊或否定结论一律视为“需要完整 PDCA 执行”。只有明确确认不需要执行时，才真正结束。</p>
+<p>这两个修复的叠加效果是：<strong>复杂任务不再“假成功”，PDCA 重试真正生效，CLI 如实反馈真实状态</strong>。</p>
+<h2 id="三安全门禁在保护和可用之间找到平衡">三、安全门禁：在保护和可用之间找到平衡</h2>
+<p>Gliding Horse 的安全门禁（SecurityEngine）一直执行 fail-closed 原则。但之前有一个问题：AA 和 CA 在执行验证任务时需要调用 <code>file_list</code>、<code>workspace_status</code>、<code>rag_search</code>、<code>kg_search</code> 等只读巡检工具，而这些工具因为没有被注册为可执行技能，被安全门禁拒绝了。</p>
+<p>这意味着合规审计的工作流被安全机制误伤了。</p>
+<p>修复方案不是放松安全策略，而是<strong>补充白名单</strong>：将这些只读巡检工具显式映射到 <code>file_read</code> 能力，纳入安全引擎的合法调用范围。用户定义的技能和真正的未知工具仍然会被拒绝。回归测试 <code>security_gate_allows_aa_ca_inspection_tools_with_whitelisted_file_read</code> 锁定了这个行为。</p>
+<h2 id="四可观测性长任务不再无输出假死">四、可观测性：长任务不再“无输出假死”</h2>
+<p>之前 Gliding Code 在单任务模式下，所有日志先写入内存环形缓冲，任务结束后才一次性 dump。这导致长任务在 TUI 或流水线中表现为“完全无输出、疑似卡死”，用户中途终止后误判“什么都没生成”。</p>
+<p>这次新增了日志实时镜像能力：<code>LogBuffer</code> 支持 <code>set_mirror_to_stderr</code>，单任务模式下每条日志实时写入 stderr。长任务逐行可见——时间戳连续推进、工具调用实时涌现，用户随时可以判断任务是否仍在推进、何时可以安全中断。</p>
+<p>工作区监控器现在也注入了 L2 黑板引用，文件变更事件可以直接写入 L2，因果观测与文件变动监控的链路完整闭合。</p>
+<h2 id="五其他优化">五、其他优化</h2>
+<ul>
+<li><strong>DeepSeek Responses API 原生支持</strong>：网关层新增了对 DeepSeek v4-flash 的 Responses API 全链路支持，包括语义流事件解析和 reasoning 内容提取，同时保持对 Chat Completions 的完全兼容。</li>
+<li><strong>gRPC L2 驱逐接口</strong>：远程管理端可以经 gRPC 触发 L2 驱逐，proto 已同步更新，运维对齐“本地自治、中心调度”架构。</li>
+<li><strong>e2e 调度器测试</strong>：新增 209 行内存调度器全链路 e2e 测试，覆盖调度核心路径。</li>
+</ul>
+<h2 id="六这次升级的本质">六、这次升级的本质</h2>
+<p>Gliding Horse 一直具备理解上下文变化、从执行中学习和自我修正的能力。这次升级不是“补课”，而是<strong>把已有的智能体系打磨得更精密、更可靠</strong>。</p>
+<p>它修复了记忆系统的一致性闭环，接通了预取引擎的事件总线，消灭了编排层的“假成功”问题，补齐了安全门禁对合规工具的支持，还让长时间运行的任务变得可观测。</p>
+<p>这些改进让 Gliding Horse 从“各模块都能独立工作”的阶段，迈入了“模块间真正协同”的新阶段。它不再只是一个功能齐全的工具箱，而是一台各个齿轮紧密咬合的机器。</p>
+<p><em>Gliding Horse 已在 GitHub 开源：<a href="https://github.com/doiito/gliding_horse" target="_blank" rel="noopener nofollow">https://github.com/doiito/gliding_horse</a></em></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-08-08 20:39">2026-08-08 20:38</span>&nbsp;
+<a href="https://www.cnblogs.com/doiito">doiito</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22341290);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdoiito%2Fp%2F22341290&amp;targetId=22341290&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
