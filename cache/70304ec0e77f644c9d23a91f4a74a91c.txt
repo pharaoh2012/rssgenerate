@@ -1,0 +1,104 @@
+
+    <h2 class="postTitle"><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/myvin/p/22225535" title="发布于 2026-08-09 14:14">
+    
+
+    <span role="heading" aria-level="2">装闭 RenoPit 源码解析（02）：AI装修闭坑系统数据库与模型设计</span>
+    
+
+</a>
+</h2>
+    <div class="postText">    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/779193/202608/779193-20260804232336072-627757284.png" alt="装闭 RenoPit 源码解析（02）：AI装修闭坑系统数据库与模型设计" class="desc_img">
+        六张数据表如何保存装修项目、图纸、合同、AI 分析结果和 PDF 报告？深入 RenoPit 的 SQLAlchemy 模型、外键关系、状态字段与 JSON 数据结构，读懂 AI 装修闭坑系统的数据基础。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img2024.cnblogs.com/blog/779193/202608/779193-20260804232204022-1316012948.png" alt="1785881979716" loading="lazy"></p>
+<p>装闭 RenoPit 的项目、装修素材、AI 分析结果和 PDF 报告都需要跨请求保存。本篇结合开源仓库 <a href="https://github.com/fthux/RenoPit" target="_blank" rel="noopener nofollow">fthux/RenoPit</a> 中的 SQLAlchemy 模型，分析六张核心数据表如何组织一份完整的装修闭坑项目。</p>
+<h2 id="一六张表围绕-project-展开">一、六张表围绕 Project 展开</h2>
+<p>后端模型位于 <code>backend/app/models</code>，全部继承 <code>core/database.py</code> 中的 <code>Base</code>。六张表的关系如下：</p>
+<div class="mermaid">erDiagram
+    PROJECT ||--o{ PROJECT_IMAGE : contains
+    PROJECT ||--o{ PROJECT_FILE : contains
+    PROJECT ||--o{ ANALYSIS : produces
+    PROJECT ||--o{ DOCUMENT_ANALYSIS : produces
+    PROJECT ||--o{ REPORT : owns
+    ANALYSIS ||--o| REPORT : generates
+
+    PROJECT {
+        uuid id PK
+        string name
+        string status
+        text input_text
+    }
+    ANALYSIS {
+        uuid id PK
+        uuid project_id FK
+        json raw_result_json
+        string status
+    }
+    DOCUMENT_ANALYSIS {
+        uuid id PK
+        uuid project_id FK
+        uuid project_file_id FK
+        json risks_json
+    }
+</div><p><code>Project</code> 是整个数据模型的入口。图片、普通文件、设计分析和报告都通过 <code>project_id</code> 回到项目，因此 API 只要拿到项目 UUID，就能继续查询全部业务数据。</p>
+<h2 id="二project-保存业务状态">二、Project 保存业务状态</h2>
+<p><code>Project</code> 的核心字段如下：</p>
+<pre><code class="language-python">class Project(Base):
+    id = Column(Uuid(as_uuid=False), primary_key=True)
+    name = Column(String(255), nullable=False)
+    access_token = Column(String(64), nullable=False)
+    status = Column(String(20), default="pending")
+    input_text = Column(Text, nullable=True)
+</code></pre>
+<p><code>name</code> 和 <code>description</code> 描述项目，<code>input_text</code> 保存用户补充的装修需求。<code>status</code> 是前后端共同使用的状态字段，主要在 <code>pending</code>、<code>analyzing</code>、<code>completed</code> 和 <code>failed</code> 之间变化。</p>
+<p>模型还为 <code>access_token</code>、<code>status</code> 和 <code>created_at</code> 建立索引。列表接口按创建时间倒序查询，状态则会被项目页和 SSE 接口反复读取。</p>
+<p><code>images</code>、<code>files</code>、<code>analysis</code>、<code>report</code> 都设置了 <code>cascade="all, delete-orphan"</code>。删除项目 ORM 对象时，关联的数据行会一起进入删除流程。数据库外键同时使用 <code>ondelete="CASCADE"</code>，在数据库层继续维护父子关系。</p>
+<h2 id="三图片和文档为什么分表">三、图片和文档为什么分表</h2>
+<p><code>ProjectImage</code> 保存原始文件名、磁盘路径、文件大小、宽度和高度。图片会进入多模态 LLM，因此后端需要尺寸信息，并在分析前转换成 Base64。</p>
+<p><code>ProjectFile</code> 面向 TXT、Markdown、DOCX 和 PDF 等文档，除路径和文件类型外，还包含 <code>extracted_text</code>：</p>
+<pre><code class="language-python">class ProjectFile(Base):
+    original_filename = Column(String(500), nullable=False)
+    storage_path = Column(String(500), nullable=False)
+    file_type = Column(String(20), nullable=False)
+    extracted_text = Column(Text, nullable=True)
+</code></pre>
+<p>上传阶段提取出的文本会直接写入该字段。后续设计分析、合同审查和跨文档核查可以复用它，不必每次重新读取 PDF 或 DOCX。</p>
+<p>两个表都在 <code>project_id</code> 上建立索引，并通过 <code>back_populates</code> 回到 <code>Project.images</code> 和 <code>Project.files</code>。</p>
+<h2 id="四两类-ai-分析使用不同模型">四、两类 AI 分析使用不同模型</h2>
+<p><code>Analysis</code> 保存设计图和综合装修闭坑分析。大模型返回的完整结构放在 <code>raw_result_json</code>，失败原因放在 <code>error_message</code>。<code>project_id</code> 没有唯一约束，一次重新分析会创建新的 <code>Analysis</code> 记录，结果接口再按创建时间取最近一条。虽然 <code>Project.analysis</code> 在 ORM 中配置为标量关系，业务接口读取分析历史时使用的是显式查询和排序。</p>
+<p><code>DocumentAnalysis</code> 则保存单份合同或报价单的分析。它包含：</p>
+<ul>
+<li><code>doc_type</code>：合同、报价单或未知类型；</li>
+<li><code>confidence</code>：文档分类置信度；</li>
+<li><code>classifications_json</code>：分类依据和关键片段；</li>
+<li><code>risks_json</code>：风险项及增项预测；</li>
+<li><code>summary</code>、<code>risks_count</code>：供列表和报告快速读取。</li>
+</ul>
+<p><code>project_file_id</code> 使用 <code>ondelete="SET NULL"</code>。当原始文件记录被删除时，文档分析记录仍可保留，只是失去文件关联；<code>project_id</code> 则继续使用级联删除。</p>
+<h2 id="五report-连接分析结果和-pdf">五、Report 连接分析结果和 PDF</h2>
+<p><code>Report</code> 同时引用 <code>Project</code> 和 <code>Analysis</code>，<code>analysis_id</code> 上还有唯一约束：</p>
+<pre><code class="language-python">UniqueConstraint("analysis_id", name="uq_reports_analysis_id")
+</code></pre>
+<p>这表示一条分析记录最多对应一条报告记录；<code>project_id</code> 本身没有唯一约束。当前下载接口会优先复用项目已有的第一条 <code>Report</code> 记录。<code>file_path</code> 用来记录生成文件的位置，而实际下载接口也可以现场调用 ReportLab 生成 PDF 字节。</p>
+<h2 id="六模型如何变成-api-数据">六、模型如何变成 API 数据</h2>
+<p>数据库模型不会直接返回给浏览器。项目接口使用 Pydantic 的 <code>ProjectCreateRequest</code>、<code>ProjectUpdateRequest</code> 和 <code>ProjectResponse</code> 约束输入输出。例如创建项目时限制名称 255 字、描述 500 字、补充说明 2000 字。</p>
+<p><code>_project_to_response()</code> 还会根据 ORM 关系计算 <code>image_count</code> 和 <code>file_count</code>。前端 <code>types/index.ts</code> 中的 <code>Project</code>、<code>ProjectFile</code>、<code>ProjectImage</code>、<code>AnalysisResult</code> 等接口再接住这些 JSON 字段，使页面状态与后端响应保持同一套结构。</p>
+<h2 id="七数据模型调用链小结">七、数据模型调用链小结</h2>
+<p>RenoPit 的数据层可以分为三组：<code>Project</code>、<code>ProjectImage</code>、<code>ProjectFile</code> 保存用户输入；<code>Analysis</code> 和 <code>DocumentAnalysis</code> 保存 AI 结构化结果；<code>Report</code> 保存最终输出。所有后续调用链都围绕 <code>project_id</code> 展开。</p>
+<p>完整模型和 Schema 可以在 <a href="https://github.com/fthux/RenoPit" target="_blank" rel="noopener nofollow">fthux/RenoPit</a> 中继续对照查看。下一篇将沿着这些模型进入项目 API，分析一个装修项目从创建、编辑到复制和删除的完整生命周期。</p>
+
+
+</div>
+<div class="clear"></div>
+</div>
+    <p class="postfoot">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-09 14:14">2026-08-09 14:14</span>&nbsp;
+<a href="https://www.cnblogs.com/myvin">fthux</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22225535);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmyvin%2Fp%2F22225535&amp;targetId=22225535&amp;targetType=0" target="_blank">举报</a>
+</p>
