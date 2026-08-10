@@ -1,0 +1,141 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shukesio/p/22381368" title="发布于 2026-08-10 23:35">
+    
+
+    <span role="heading" aria-level="2">给桌面养了个鸣潮桌宠，在旧笔记本上卡成了PPT</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>项目是个 Electron 桌宠：透明无边框窗口 + Canvas 逐帧绘制，人物会呼吸、会跟着鼠标歪头、点一下会蹦。本文记录它在低配机器上卡顿的排查过程，四个坑都挺典型，做 Canvas 动画或 Electron 的应该都能对上号。立绘来自游戏，仅个人桌面自用。</p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810221742817-165221499.gif" alt="" loading="lazy"></p>
+<p><code>抖音地址：https://www.douyin.com/user/self?modal_id=7670880968940571958</code></p>
+<h2 id="起因">起因</h2>
+<p>事情的起点：同事提了一下这种实现思路，希望可以快速增加角色，出效果，看看是否能盈利</p>
+<p>具体点说，是想要一个常驻桌面右下角的小人，平时安安静静呼吸，鼠标划过去她歪歪头，点一下蹦一蹦、说句话，拖着还能满屏跑。市面上的桌宠软件要么塞满了广告，要么根本没有穗穗，索性自己写。Electron 加一个透明置顶窗口，Canvas 里画立绘，一个周末就跑起来了，但缺点就是只是一个2D立绘，可玩的东西不多！</p>
+<p>翻车发生在我把它拷到家里那台 2018 年的旧笔记本上。双击图标，桌面空了三秒钟，什么都没有，我以为没启动成功，又点了一下。结果两个桌宠先后蹦了出来，然后开始齐刷刷掉帧。</p>
+<p>在开发机上一切丝滑的东西，到了低配机器上原形毕露。下面按严重程度记录四个问题。</p>
+<h2 id="坑一启动卡死三秒主线程在硬算-233-万像素">坑一：启动卡死三秒，主线程在硬算 233 万像素</h2>
+<p>先说最疼的。</p>
+<p>穗穗的立绘是一张 1280×1822 的白底 PNG，人物要贴在透明窗口上，白底必须抠掉。我的做法是运行时抠：图片画到离屏 canvas 上，<code>getImageData</code> 拿出像素，从四条边洪水填充把连通的白色像素置透明，再侵蚀两圈白边、给轮廓做一层羽化（如果图片一开始就是透明的就基本没这个问题了）</p>
+<p>思路没问题，四个步骤单看也都没问题。问题是这些加起来是什么量级——1280×1822 = 233 万像素，<code>getImageData</code> 先掏出一个 9.3MB 的数组，然后：</p>
+<pre><code class="language-text">floodRemove   全图填充，额外两个 233 万长度的辅助数组
+erodeHalo     两轮全图扫描，每个像素查 4 个邻居
+feather       再来一轮全图，边缘像素逐个记录
+</code></pre>
+<p>粗算下来超过五千万次像素级操作，全部同步跑在渲染进程主线程上。开发机 CPU 好，几百毫秒忍了没察觉；旧笔记本上这段要跑一到三秒，期间窗口是纯透明的，看起来就是"点了没反应"。</p>
+<p>更冤的是 feather 里还有一句这样的代码：</p>
+<pre><code class="language-js">// 旧版：给每个边缘像素 new 一个小数组
+if (tn &gt; 0) soft.push([i, tn]);
+</code></pre>
+<p>一张立绘的轮廓边缘有几万个像素，就 new 几万个小数组，GC 跟着雪上加霜。</p>
+<p>修法分两步。第一步，整套像素处理搬进 Web Worker，buffer 用 Transferable 零拷贝转移，主线程只负责最后 <code>putImageData</code>：</p>
+<pre><code class="language-js">// 转移 buffer 送入 Worker，处理完再写回；主线程全程不阻塞
+pending.push((res) =&gt; {
+  cx.putImageData(new ImageData(new Uint8ClampedArray(res.buf), w, h), 0, 0);
+  done(true);
+});
+wk.postMessage({ buf: data.data.buffer, w, h }, [data.data.buffer]);
+</code></pre>
+<p>第二步，处理结果按图片路径缓存。我的两个角色皮肤共用同一张立绘，旧代码每次切换角色都把 233 万像素重新抠一遍，算出来的结果一模一样。加一个 <code>Map</code> 就完事的问题，之前愣是没看见。</p>
+<p>改完实测：总耗时 118ms（含图片解码），主线程最大阻塞 28ms。之前是整整卡死一到三秒，现在这个数字我盯着看了一会儿才敢信。</p>
+<h2 id="坑二一个-flag-用错位置硬件加速全程没开">坑二：一个 flag 用错位置，硬件加速全程没开</h2>
+<p>这个坑藏得深，而且是我自己埋的。</p>
+<p>为了不每帧缩放大图，立绘会预先降采样成一张显示尺寸的小位图，动画循环里每帧只画这张小图。降采样代码是这么写的：</p>
+<pre><code class="language-js">const out = document.createElement('canvas');
+out.width = dw; out.height = dh;
+const octx = out.getContext('2d', { willReadFrequently: true });
+</code></pre>
+<p><code>willReadFrequently: true</code> 是抄锐化代码时顺手带过来的，当时的理解是"反正后面要 getImageData，加上总没错"。</p>
+<p>错得离谱。这个 flag 的含义是把 canvas 固定在 CPU 软件渲染后端，专门优化"频繁读回像素"的场景。而这张 canvas 是什么？是动画循环里每帧 <code>drawImage</code> 的源。它被钉死在 CPU 内存里，等于每一帧都要把位图从内存重新提交给 GPU，硬件加速名存实亡。锐化只在构建时读一次像素，根本谈不上"frequently"。</p>
+<p>删掉这个参数，一行 diff。低配机上拖动桌宠的帧率肉眼可见地上来了。</p>
+<p>这类参数的坑在于它不报错、不警告，性能默默地烂着，你还觉得自己加了优化。</p>
+<h2 id="坑三一个永远到不了零的发光特效">坑三：一个永远到不了零的发光特效</h2>
+<p>点击桌宠时人物周围有一圈光晕，用 <code>shadowBlur</code> 实现，强度由变量 <code>hoverGlow</code> 控制，每帧向目标值做指数逼近：</p>
+<pre><code class="language-js">hoverGlow += (target - hoverGlow) * 0.12;
+// ...
+if (hoverGlow &gt; 0.01) {
+  ctx.shadowBlur = 26 * hoverGlow;
+}
+</code></pre>
+<p>写的时候觉得很优雅，衰减曲线自然。但指数逼近有个数学上的小事实：它永远到不了零。0.5、0.25、0.12……无限接近 0.01 附近来回徘徊。而 <code>shadowBlur</code> 是 Canvas 里数一数二昂贵的操作，等于点过一次桌宠之后，一个几乎看不见的高斯模糊就常驻在每一帧里了。</p>
+<p>修复是加一行强制归零：</p>
+<pre><code class="language-js">if (dt &gt;= 0.6 &amp;&amp; hoverGlow &lt; 0.02) hoverGlow = 0;
+</code></pre>
+<p>顺手把常态开销也压了压：环绕的星光粒子从 16 颗减到 8 颗（每颗每帧要画 4 段贝塞尔曲线，减一半就是减一半的路径运算）；再加了个空闲判定，没有交互、没有粒子飞的时候隔帧渲染，帧率降到 30，呼吸动画的幅度只有 ±1%，半帧率肉眼完全无感，CPU 占用直接砍半。</p>
+<p>跳帧有个前提得想清楚：跳过的帧不能清屏。透明无边框窗口不保证保留上一帧内容，静止时不清屏画布留着旧画面，一清屏就闪空白。这个点我在拖拽逻辑上踩过一次，代码里留了注释，这次做隔帧总算没有二进宫。</p>
+<p>优化后</p>
+<p>![](<a href="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810225840648-620523542.png" target="_blank">https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810225840648-620523542.png</a></p>
+<p><img src="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810225837220-486649646.png" alt="" loading="lazy"></p>
+<h2 id="成品">成品</h2>
+<img src="https://img2024.cnblogs.com/blog/1963715/202607/1963715-20260731181726896-1310881253.png" style="zoom: 50%">
+<h2 id="番外设置面板和人物气质不搭顺手拆出了一个-skill">番外：设置面板和人物气质不搭，顺手拆出了一个 skill</h2>
+<p>性能修完，另一件搁了很久的事被我翻出来了。</p>
+<p>桌宠是穗穗，鸣潮的角色。可她的设置面板是我随手写的：浅灰底、白色圆角卡片、一个蓝色主色、<code>border-radius: 16px</code> 铺满全场。功能没毛病，但和站在旁边的人物完全是两个世界的东西，像给游戏角色配了一套后台管理系统。</p>
+<p>那套界面的气质其实挺好复述：近黑底，金色是唯一的强调色，纯直角，发丝描边，卡片四角带 L 形角标，中文标题下面压一行大字距的英文，滑块和小圆点统一是 45° 转过来的菱形。</p>
+<p>照着这个方向改的过程中，我意识到一件事：这些不是"感觉"，是能列成条目的规则。既然能列成条目，就能交给 AI 复用。于是顺手把它抽成了一个 skill。</p>
+<p>核心就是一组令牌加几条硬性规定：</p>
+<pre><code class="language-css">:root {
+  --gold:        #c9ac67;   /* 品牌金，固定不动 */
+  --gold-bright: #e6cf95;
+  --cream:       #fafae9;
+  --bg-0:        #14161a;
+  --hair:        rgba(201, 172, 103, .2);   /* 发丝描边 */
+  --theme:       #d9b45c;   /* 唯一允许随内容变化的槽位 */
+}
+</code></pre>
+<div style="display: flex; align-items: center; justify-content: center; gap: 16px">
+  <img src="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810230253310-1512369998.png">
+  <img src="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810230228834-1128589390.png">
+</div>
+<div>
+<h3 id="两个具体教训">两个具体教训</h3>
+<p><strong>切角不是切了就好看。</strong> 鸣潮大量用 45° 切角替代圆角，我给窗口右上角也切了一刀，结果自己看着都别扭，像面板被啃掉一口。原因是那个切口光秃秃的，没有任何东西描出斜边。后来才想清判断标准：切角必须有"边缘表达"。图标框带 <code>border</code>，border 会跟着 <code>clip-path</code> 一起被裁，自动就描出了斜边；拨杆是实心色块，填色本身就是边缘；而窗口是一大片无边框表面，切完只剩一个豁口。要么单独补一条斜线，要么大面积表面干脆别切。</p>
+<img src="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810231630114-601090119.png" style="zoom: 50%">
+<p><strong>全局主题变量会伤及无辜。</strong> 面板要跟着角色换肤，我把角色主题色写进了 <code>:root</code> 的 <code>--primary</code>。切到"穗穗·青"之后蓝色主题生效，连另一张金色角色的缩略图底色也一起被染成了蓝的。改法是让每张卡片自己带颜色，别去动根节点：</p>
+<pre><code class="language-js">el.style.setProperty('--c', item.color);   // 逐卡注入，不影响兄弟节点
+</code></pre>
+<pre><code class="language-css">.item .thumb {
+  background: linear-gradient(165deg,
+    color-mix(in srgb, var(--c, var(--theme)) 32%, #12141a), #12141a);
+}
+</code></pre>
+<p>品牌金同样不该跟着角色变。游戏里换个角色不会把整个 UI 的金色也换掉。所以我立了条规矩：金色骨架固定，角色颜色只允许注入内容区域，比如缩略图底色。</p>
+<h3 id="为什么值得做成-skill">为什么值得做成 skill</h3>
+<p>是因为我发现自己讲不清"要什么"的时候，AI 默认给我的就是那套浅灰底白卡片圆角蓝主色。它不是不会做设计，是没有参考系。等我把具体的十六进制值、字号比例、还有"哪些写法看着像 bug"都列清楚之后，一次就能出对，而且下个项目直接复用，不用从头解释一遍，前端没有设计师辅助，束手束脚的</p>
+<p>skill 叫 <code>resonance-hud</code>，MIT 协议，已经开源：</p>
+<pre><code class="language-bash">https://github.com/KTBOY/resonance-hud
+</code></pre>
+<p>里面三个文件：<code>SKILL.md</code> 是令牌和规则，<code>reference.md</code> 是标题栏、选择器、开关、分段控件的可复制实现，<code>demo.html</code> 在浏览器打开就能看全部组件。零依赖，所有装饰都是 CSS 和内联 SVG 画出来的，不含任何游戏素材，任意 DPI 下都锐利。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810231858118-735171973.gif" alt="" loading="lazy"></p>
+<p>skill：<a href="https://github.com/KTBOY/resonance-hud" target="_blank" rel="noopener nofollow">KTBOY/resonance-hud: 一套深色金调游戏 HUD 界面的设计语言。所有装饰均由 CSS 或内联 SVG 绘制——零图片素材、零 Web 字体，任意 DPI 下都锐利。</a></p>
+<p>桌面宠物：<a href="https://github.com/KTBOY/fengyu-desktop-pet" target="_blank" rel="noopener nofollow">KTBOY/fengyu-desktop-pet: 鸣潮 桌面宠物</a></p>
+<p>抖音地址：<a href="https://www.douyin.com/user/self?modal_id=7670880968940571958" target="_blank" rel="noopener nofollow">https://www.douyin.com/user/self?modal_id=7670880968940571958</a></p>
+<div style="display: flex; align-items: center; flex-direction: column; justify-content: center; gap: 16px">
+  <div>
+      欢迎各位兄弟start
+    </div>
+<img src="https://img2024.cnblogs.com/blog/1963715/202608/1963715-20260810232152587-1094305535.gif" style="zoom: 25%">
+</div></div>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-08-10 23:36">2026-08-10 23:35</span>&nbsp;
+<a href="https://www.cnblogs.com/shukesio">舒克sk</a>&nbsp;
+阅读(<span id="post_view_count">5</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22381368);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshukesio%2Fp%2F22381368&amp;targetId=22381368&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
