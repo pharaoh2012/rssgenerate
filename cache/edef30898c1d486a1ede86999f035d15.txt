@@ -1,0 +1,382 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/horizondeveloper/p/22416354" title="发布于 2026-08-12 10:45">
+    
+
+    <span role="heading" aria-level="2">【征程6】校准量化中HistogramObserver解析</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        HistogramObserver是horizon_plugin_pytorch中一种基于直方图统计的量化Observer。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>声明：本文主要参考开源资料进行学习整理，如有错漏，欢迎评论交流~</p>
+</blockquote>
+<h2 id="1-histogramobserver的定义与原理">1. HistogramObserver的定义与原理</h2>
+<p>HistogramObserver是horizon_plugin_pytorch中一种基于直方图统计的量化Observer。与MinMaxObserver仅记录最小最大值、MSEObserver在线性搜索中计算MSE不同，HistogramObserver通过构建完整的数值分布直方图来捕获张量的统计特性，并支持多种量化参数计算方法。</p>
+<blockquote>
+<p>MinMaxObserver与MSEObserver解析可参考：<a href="https://developer.horizon.auto/blog/13467" target="_blank" rel="noopener nofollow">https://developer.horizon.auto/blog/13467</a></p>
+</blockquote>
+<h3 id="11-基本原理">1.1 基本原理</h3>
+<p>HistogramObserver的工作流程分为两个阶段：</p>
+<p><strong>阶段一：直方图收集（forward过程）</strong></p>
+<pre><code>对于每个输入张量 x:
+1. 计算当前batch的min_val_cur, max_val_cur
+2. 初始化或扩展直方图边界:
+   - 首次初始化：以max(|min|, |max|)为基准，扩展到最近的2的幂次
+   - 后续扩展：当数值超出当前边界时，边界按2倍扩展
+3. 将数值映射到直方图桶中，累加到全局直方图
+</code></pre>
+<blockquote>
+<p><strong>直方图桶（Histogram Bin）</strong>：将数值范围划分为若干个等宽的区间，每个区间就是一个"桶"（bin）。落在某个区间内的数值个数就是该桶的计数。</p>
+<p>例如，数据范围 <code>[-10, 10]</code>，设置 <code>bin_num=4</code>：</p>
+<ul>
+<li>桶0 <code>[-10, -5)</code> 包含 <code>-8, -6</code> → 计数 = 2</li>
+<li>桶1 <code>[-5, 0)</code> 包含 <code>-3</code> → 计数 = 1</li>
+<li>桶2 <code>[0, 5)</code> 包含 <code>2, 1, 4</code> → 计数 = 3</li>
+<li>桶3 <code>[5, 10]</code> 包含 <code>7, 9</code> → 计数 = 2</li>
+</ul>
+<p>桶越多（bin_num越大），分布刻画越精细，内存占用越大。</p>
+</blockquote>
+<p><strong>阶段二：量化参数计算（calculate_qparams过程）</strong></p>
+<p>HistogramObserver支持多种计算方法，在<code>calculate_qparams</code>时根据method参数选择：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mse</code></td>
+<td>最小化量化误差的积分估计（默认）</td>
+</tr>
+<tr>
+<td><code>kl</code></td>
+<td>最小化KL散度</td>
+</tr>
+<tr>
+<td><code>js</code></td>
+<td>最小化JS散度</td>
+</tr>
+<tr>
+<td><code>cdf_kl</code></td>
+<td>基于累积分布函数的KL散度</td>
+</tr>
+<tr>
+<td><code>cdf_js</code></td>
+<td>基于累积分布函数的JS散度</td>
+</tr>
+<tr>
+<td><code>wasserstein</code></td>
+<td>最小化Wasserstein距离</td>
+</tr>
+<tr>
+<td><code>percentile</code></td>
+<td>百分位截断</td>
+</tr>
+</tbody>
+</table>
+<p>重点关注<code>mse</code> 和 <code>percentile</code> 即可。</p>
+<h3 id="12-核心实现">1.2 核心实现</h3>
+<pre><code class="language-python">def forward(self, x_orig):
+    x = x_orig.detach().to(self.min_val.dtype)
+
+    # 计算当前batch的min/max
+    min_val_cur, max_val_cur = torch.aminmax(x, dim=1)
+
+    # 初始化直方图边界（首次）
+    if self.histogram_edges.numel() == 0:
+        max_abs = torch.maximum(-min_val_cur, max_val_cur)
+        max_abs = 2 ** torch.ceil(torch.log2(max_abs))  # 对齐到2的幂次
+        self.histogram_edges = ...
+
+    # 扩展边界（当数值超出范围时）
+    if need_update_hist.any():
+        multiple = 2 ** torch.ceil(torch.log2(...))
+        self.histogram_edges[idx] *= multiple
+
+    # 累加当前batch的直方图
+    bin_idx = vmap(self.bucketize_per_sample)(x, self.histogram_edges)
+    self.histogram += hist
+</code></pre>
+<h3 id="13-直方图扩展机制">1.3 直方图扩展机制</h3>
+<p>当遇到超出当前边界的数值时，边界会按2的幂次扩展，同时通过分桶合并保持bin数量不变：</p>
+<pre><code class="language-python"># 边界扩展倍数
+multiple = 2 ** torch.ceil(torch.log2(ratio))
+
+# 重构直方图：将原直方图的bins合并到新范围
+new_hist[slice_start:slice_end] = padded_histogram.reshape(-1, multiple).sum(dim=-1)
+</code></pre>
+<p>这种设计确保了：直方图可以处理任意范围的数值、内存占用保持恒定、多卡校准结果一致性。</p>
+<h3 id="14-特点分析">1.4 特点分析</h3>
+<p><strong>优点：</strong></p>
+<ul>
+<li>保留完整分布信息，支持多种量化参数计算方法</li>
+<li>计算与收集分离，可在校准后灵活切换方法</li>
+<li>边界对齐机制确保多卡校准结果一致</li>
+</ul>
+<p><strong>缺点：</strong></p>
+<ul>
+<li>内存占用较高（bin_num默认2048）</li>
+</ul>
+<h2 id="2-与minmaxobservermseobserver的区别">2. 与MinMaxObserver/MSEObserver的区别</h2>
+<h3 id="21-核心差异对比">2.1 核心差异对比</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>MinMaxObserver</th>
+<th>MSEObserver</th>
+<th>HistogramObserver</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>统计方式</td>
+<td>仅记录min/max</td>
+<td>在线搜索最优scale</td>
+<td>构建完整直方图</td>
+</tr>
+<tr>
+<td>内存占用</td>
+<td>极低</td>
+<td>中等</td>
+<td>较高</td>
+</tr>
+<tr>
+<td>计算时机</td>
+<td>forward时更新</td>
+<td>forward时搜索</td>
+<td>forward收集，qparams时计算</td>
+</tr>
+<tr>
+<td>分布感知</td>
+<td>否</td>
+<td>部分（通过MSE）</td>
+<td>是（完整分布）</td>
+</tr>
+<tr>
+<td>多方法支持</td>
+<td>否</td>
+<td>否（仅MSE）</td>
+<td>是（7种方法）</td>
+</tr>
+<tr>
+<td>Per-channel支持</td>
+<td>是</td>
+<td>是</td>
+<td>是</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-具体区别分析">2.2 具体区别分析</h3>
+<p><strong>与MinMaxObserver的区别：</strong></p>
+<ol>
+<li><strong>信息保留</strong>：MinMaxObserver只保留极值信息，丢失了分布密度；HistogramObserver保留完整分布信息。</li>
+<li><strong>离群值处理</strong>：MinMaxObserver对离群值极其敏感；HistogramObserver通过分布感知方法（如percentile、kl）自动处理离群值。</li>
+<li><strong>校准稳定性</strong>：MinMaxObserver的滑动平均可能导致校准结果不稳定；HistogramObserver的直方图累加更加稳定。</li>
+</ol>
+<p><strong>与MSEObserver的区别：</strong></p>
+<ol>
+<li><strong>计算时机</strong>：MSEObserver在每次forward时进行完整的搜索；HistogramObserver将收集和计算分离。</li>
+<li><strong>误差度量</strong>：MSEObserver仅支持L2误差；HistogramObserver支持MSE、KL、JS、Wasserstein等多种度量。</li>
+<li><strong>灵活性</strong>：HistogramObserver支持在计算量化参数时更换方法，无需重新校准。</li>
+</ol>
+<h2 id="3-reset_dtype与reset_scale用法">3. reset_dtype与reset_scale用法</h2>
+<h3 id="31-reset_dtype方法">3.1 reset_dtype方法</h3>
+<p><code>reset_dtype</code>方法定义在<code>ObserverBase</code>基类中，用于在运行时更改量化数据类型：</p>
+<pre><code class="language-python">def reset_dtype(self, dtype):
+    dtype = get_horizon_quant_dtype(dtype)
+    if dtype == self.dtype:
+        return
+    self.dtype = dtype
+    self._set_quant_min_max(self.dtype)
+</code></pre>
+<p><strong>使用场景：</strong></p>
+<ol>
+<li><strong>混合精度量化</strong>：不同层使用不同量化位宽时，动态调整Observer的dtype。</li>
+<li><strong>量化位宽探索</strong>：尝试INT8、INT4等不同位宽，无需重新校准。</li>
+</ol>
+<pre><code class="language-python">from horizon_plugin_pytorch.dtype import qint8, qint4
+
+observer = HistogramObserver(dtype=qint8)
+# 校准完成后，尝试INT16量化
+observer.reset_dtype(qint16)
+scale, zero_point = observer.calculate_qparams()
+</code></pre>
+<h3 id="32-reset_scale类方法">3.2 reset_scale类方法</h3>
+<p><code>reset_scale</code>是HistogramObserver的类方法，用于基于已收集的直方图重新计算量化参数：</p>
+<pre><code class="language-python">@classmethod
+def reset_scale(
+    cls,
+    model: torch.nn.Module,
+    method: str,
+    method_kwargs: Dict = None,
+    prefix: Tuple[str] = None,
+    dtype=None,
+):
+    for n, m in model.named_modules():
+        if isinstance(m, FakeQuantizeBase) and isinstance(
+            getattr(m, "activation_post_process", None), cls
+        ):
+            m.set_qparams(
+                m.activation_post_process.calculate_qparams(
+                    m.get_dtype(), method, **method_kwargs
+                )[0]
+            )
+</code></pre>
+<p><strong>参数说明：</strong></p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model</code></td>
+<td>待处理的模型</td>
+</tr>
+<tr>
+<td><code>method</code></td>
+<td>计算方法：mse/kl/js/cdf_kl/cdf_js/wasserstein/percentile</td>
+</tr>
+<tr>
+<td><code>method_kwargs</code></td>
+<td>方法参数（如steps、percentile）</td>
+</tr>
+<tr>
+<td><code>prefix</code></td>
+<td>仅处理指定前缀的模块</td>
+</tr>
+<tr>
+<td><code>dtype</code></td>
+<td>仅处理指定dtype的模块</td>
+</tr>
+</tbody>
+</table>
+<p><strong>使用场景：</strong></p>
+<ol>
+<li><strong>方法对比实验</strong>：使用同一份校准数据，对比不同量化参数计算方法的效果。</li>
+</ol>
+<pre><code class="language-python"># 对比不同方法
+methods = ['mse', 'kl', 'wasserstein', 'percentile']
+for method in methods:
+    HistogramObserver.reset_scale(model, method)
+    evaluate(model)
+</code></pre>
+<ol>
+<li><strong>混合策略量化</strong>：不同层使用不同的校准方法。</li>
+</ol>
+<pre><code class="language-python"># Attention层使用KL方法
+HistogramObserver.reset_scale(model, method='kl', prefix='model.layers.0.self_attn')
+
+# FFN层使用MSE方法
+HistogramObserver.reset_scale(model, method='mse', prefix='model.layers.0.mlp')
+</code></pre>
+<h3 id="33-reset_scale-vs-重新校准">3.3 reset_scale vs 重新校准</h3>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>reset_scale</th>
+<th>重新校准</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据需求</td>
+<td>无需校准数据</td>
+<td>需要校准数据</td>
+</tr>
+<tr>
+<td>时间成本</td>
+<td>极低</td>
+<td>高</td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>方法对比、参数调优</td>
+<td>分布变化、数据变更</td>
+</tr>
+</tbody>
+</table>
+<h2 id="4-使用场景建议">4. 使用场景建议</h2>
+<pre><code class="language-python">from horizon_plugin_pytorch.quantization.observer_v2 import HistogramObserver
+from horizon_plugin_pytorch.quantization.qconfig import QConfig
+from horizon_plugin_pytorch.quantization.fake_quantize import FakeQuantize
+
+# 高精度量化场景
+qconfig = QConfig(
+    weight=FakeQuantize.with_args(
+        observer=HistogramObserver,
+        dtype=qint8,
+        bin_num=2048,
+    ),
+    output=FakeQuantize.with_args(
+        observer=HistogramObserver,
+        dtype=qint8,
+        bin_num=2048,
+    ),
+)
+
+# 校准后尝试不同方法
+for method in ['mse', 'kl']:
+    HistogramObserver.reset_scale(model, method)
+    acc = evaluate(model)
+</code></pre>
+<p><strong>方法选择建议：</strong></p>
+<table>
+<thead>
+<tr>
+<th>数据分布特征</th>
+<th>推荐方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正态分布</td>
+<td>mse</td>
+</tr>
+<tr>
+<td>长尾分布</td>
+<td>percentile 或 kl</td>
+</tr>
+<tr>
+<td>多峰分布</td>
+<td>wasserstein</td>
+</tr>
+<tr>
+<td>存在离群值</td>
+<td>percentile(0.9999)</td>
+</tr>
+</tbody>
+</table>
+<p>HistogramObserver在实际应用中，适用于高精度量化需求、复杂分布数据、需要灵活调整量化策略的场景。</p>
+<p>建议：校准时收集直方图，通过reset_scale对比不同方法后确定最优策略。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-12 10:45">2026-08-12 10:45</span>&nbsp;
+<a href="https://www.cnblogs.com/horizondeveloper">地平线智能驾驶开发者</a>&nbsp;
+阅读(<span id="post_view_count">24</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22416354);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhorizondeveloper%2Fp%2F22416354&amp;targetId=22416354&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
