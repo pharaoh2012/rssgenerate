@@ -1,0 +1,93 @@
+
+    <h2 class="postTitle"><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/myvin/p/22225657" title="发布于 2026-08-12 22:00">
+    
+
+    <span role="heading" aria-level="2">装闭 RenoPit 源码解析（06）：SSE如何实时推送AI装修分析进度</span>
+    
+
+</a>
+</h2>
+    <div class="postText">    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/779193/202608/779193-20260804233225670-252201879.png" alt="装闭 RenoPit 源码解析（06）：SSE如何实时推送AI装修分析进度" class="desc_img">
+        后台 Celery 正在分析装修图纸，React 页面如何实时显示进度？从 EventSource、StreamingResponse 到数据库状态轮询，拆解 RenoPit 的 SSE 事件、进度模拟、失败提示和自动跳转机制。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img2024.cnblogs.com/blog/779193/202608/779193-20260804233132375-129183897.png" alt="1785882548061" loading="lazy"></p>
+<p>Celery 让 AI 装修分析脱离 HTTP 请求执行，但浏览器仍然需要知道任务是否完成。装闭 RenoPit 的开源代码 <a href="https://github.com/fthux/RenoPit" target="_blank" rel="noopener nofollow">fthux/RenoPit</a> 使用 Server-Sent Events（SSE）连接项目页和后台状态，本篇分析这条进度链路。</p>
+<h2 id="一为什么使用-sse">一、为什么使用 SSE</h2>
+<p>项目详情页只需要接收服务器消息，不需要通过同一连接向服务器发送数据，因此使用浏览器原生 <code>EventSource</code> 即可。相比不断发起普通请求，SSE 能保持一个 <code>text/event-stream</code> 响应，并按事件名称推送进度、完成、失败和停止状态。</p>
+<p>完整交互过程如下：</p>
+<div class="mermaid">sequenceDiagram
+    participant UI as ProjectPage
+    participant API as FastAPI
+    participant DB as PostgreSQL
+    participant Worker as Celery Worker
+
+    UI-&gt;&gt;API: POST /analyze
+    API-&gt;&gt;DB: status = analyzing
+    API--&gt;&gt;UI: 任务已启动
+    UI-&gt;&gt;API: GET /analyze/stream
+    loop 每 2 秒
+        API-&gt;&gt;DB: refresh Project.status
+        API--&gt;&gt;UI: progress 事件
+    end
+    Worker-&gt;&gt;DB: status = completed/failed
+    API--&gt;&gt;UI: completed/failed 事件
+</div><h2 id="二前端如何建立-eventsource">二、前端如何建立 EventSource</h2>
+<p><code>ProjectPage.tsx</code> 的 <code>startSSE()</code> 先设置本地分析状态，再关闭可能存在的旧连接：</p>
+<pre><code class="language-tsx">eventSourceRef.current?.close()
+const es = new EventSource(
+  `${API}/projects/${projectId}/analyze/stream`
+)
+eventSourceRef.current = es
+</code></pre>
+<p>页面监听四类事件：</p>
+<ul>
+<li><code>progress</code>：更新百分比和提示文字；</li>
+<li><code>completed</code>：进度设为 100%，刷新项目并跳转报告页；</li>
+<li><code>failed</code>：显示后端错误信息并结束分析状态；</li>
+<li><code>stopped</code>：恢复项目状态并提示分析已停止。</li>
+</ul>
+<p>如果用户刷新了正在分析的项目页，初始化逻辑会读取 <code>project.status</code>。只要状态仍为 <code>analyzing</code>，页面就会重新建立 EventSource，而不是依赖刷新前的 React 状态。</p>
+<p>组件卸载时会关闭局部连接和 <code>eventSourceRef</code>，避免离开页面后继续接收事件。</p>
+<h2 id="三sse-接口为什么轮询数据库">三、SSE 接口为什么轮询数据库</h2>
+<p>后端路由是 <code>GET /api/projects/{id}/analyze/stream</code>。项目中虽然存在 <code>SSEManager</code> 内存订阅管理器，但当前主接口明确使用数据库轮询：FastAPI 和 Celery Worker 是两个独立进程，Worker 内存中的消息队列无法直接被 Web 进程读取，而数据库状态可以跨进程共享。</p>
+<p><code>event_generator()</code> 为每个连接创建独立 <code>SessionLocal</code>，确认项目存在后先发送连接消息：</p>
+<pre><code class="language-text">event: progress
+data: {"progress": 5, "message": "正在连接 AI 服务..."}
+</code></pre>
+<p>随后每两秒执行一次 <code>sse_db.refresh(project)</code>，读取 Celery 写入的最新状态。</p>
+<h2 id="四进度百分比从哪里来">四、进度百分比从哪里来</h2>
+<p>Celery 当前写入的是业务状态，并没有为每一个 LLM 步骤记录精确百分比。因此 SSE 接口在状态仍为 <code>analyzing</code> 时维护 <code>simulated_progress</code>，从 10% 开始，每轮增加 2%，最高推进到 85%。</p>
+<p>不同区间对应不同提示，例如加载设计图、检查卫生死角、评估空间布局、排查隐性成本和生成报告。它们负责表达任务仍在运行，不参与 Celery 的实际控制。</p>
+<p>当数据库状态变成 <code>completed</code> 时，接口先发送 95% 的“正在保存结果”，再发送 100% 的 <code>completed</code>。状态为 <code>failed</code> 时，则查询最近一条 <code>Analysis</code>，把 <code>error_message</code> 放入事件数据。</p>
+<h2 id="五超时停止和连接头">五、超时、停止和连接头</h2>
+<p>轮询最多执行 150 次，每次间隔两秒，也就是五分钟。超过次数后发送 <code>failed</code> 事件和“分析超时，请重试”。如果项目状态回到 <code>pending</code>，接口发送 <code>stopped</code>。</p>
+<p>返回值使用 <code>StreamingResponse</code>，并设置：</p>
+<pre><code class="language-python">headers={
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+</code></pre>
+<p>生产环境的 Nginx 同时设置 <code>proxy_buffering off</code>、长读取超时和分块传输，确保事件生成后立即到达浏览器，而不是被代理缓存成完整响应。</p>
+<h2 id="六完成事件如何驱动页面跳转">六、完成事件如何驱动页面跳转</h2>
+<p>前端收到 <code>completed</code> 后关闭连接、刷新项目状态，并显示完成 Toast。随后通过定时器跳转到 <code>/project/{id}/analysis</code>。报告页再请求 <code>/result</code> 获取结构化结果，因此 SSE 事件不需要携带整份分析 JSON。</p>
+<p>失败事件同理：它只携带错误信息，项目详情页仍通过普通 API 重新读取项目。实时通道负责通知，REST API 负责获取持久化数据，两者分工清晰。</p>
+<h2 id="七sse-调用链小结">七、SSE 调用链小结</h2>
+<p>RenoPit 的进度机制可以概括为：Celery 更新 PostgreSQL，FastAPI 的 SSE 生成器轮询 PostgreSQL，React 的 EventSource 消费事件。这样即使刷新页面或 Web 与 Worker 分属不同进程，任务状态仍能重新连接。</p>
+<p>相关前后端实现都可以在 <a href="https://github.com/fthux/RenoPit" target="_blank" rel="noopener nofollow">fthux/RenoPit</a> 中对照阅读。下一篇将进入 AI 分析内部，先看装修闭坑知识库如何被加载并组装成系统 Prompt。</p>
+
+
+</div>
+<div class="clear"></div>
+</div>
+    <p class="postfoot">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-12 22:00">2026-08-12 22:00</span>&nbsp;
+<a href="https://www.cnblogs.com/myvin">fthux</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22225657);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmyvin%2Fp%2F22225657&amp;targetId=22225657&amp;targetType=0" target="_blank">举报</a>
+</p>
