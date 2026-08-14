@@ -1,0 +1,81 @@
+
+    <h2 class="postTitle"><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/myvin/p/22225698" title="发布于 2026-08-14 09:52">
+    
+
+    <span role="heading" aria-level="2">装闭 RenoPit 源码解析（08）：多模态AI调用、重试与文本降级</span>
+    
+
+</a>
+</h2>
+    <div class="postText">    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/779193/202608/779193-20260804233414658-470443874.png" alt="装闭 RenoPit 源码解析（08）：多模态AI调用、重试与文本降级" class="desc_img">
+        模型不支持图片、接口超时或返回空内容时，RenoPit 会怎样处理？解析 OpenAI 兼容客户端、多模态消息、联网工具、指数退避重试，以及从图片分析降级到纯文本分析的源码路径。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img2024.cnblogs.com/blog/779193/202608/779193-20260804233328274-1861157777.png" alt="1785882663954" loading="lazy"></p>
+<p>Prompt 构建完成后，RenoPit 还要面对不同模型、不同兼容接口以及图片能力差异。开源仓库 <a href="https://github.com/fthux/RenoPit" target="_blank" rel="noopener nofollow">fthux/RenoPit</a> 将这些差异集中在 <code>llm_service.py</code>，业务层只调用 <code>analyze_design()</code> 等统一函数。</p>
+<h2 id="一统一创建-openai-兼容客户端">一、统一创建 OpenAI 兼容客户端</h2>
+<p><code>_get_openai_client()</code> 使用三个环境配置创建 <code>AsyncOpenAI</code>：API Key、Base URL 和 180 秒请求超时。只要服务实现 OpenAI Chat Completions 兼容协议，RenoPit 就可以通过同一客户端调用。</p>
+<p>设计分析、合同分析、增项预测和交叉核查最终都进入两个底层函数：</p>
+<ul>
+<li><code>_call_llm()</code>：发送图片和文本；</li>
+<li><code>_call_llm_text()</code>：只发送系统 Prompt 与用户文本。</li>
+</ul>
+<p>这种划分让多模态能力判断集中在设计分析路径，文档类任务始终使用纯文本调用。</p>
+<h2 id="二图片如何进入多模态消息">二、图片如何进入多模态消息</h2>
+<p><code>_call_llm()</code> 遍历 Base64 图片，识别可能存在的 Data URL 前缀，默认 MIME 类型为 <code>image/jpeg</code>，然后构造 OpenAI 的 <code>image_url</code> 内容：</p>
+<pre><code class="language-python">content_parts.append({
+    "type": "image_url",
+    "image_url": {
+        "url": f"data:{mime_type};base64,{img_data}",
+        "detail": "high",
+    },
+})
+</code></pre>
+<p>全部图片之后再追加一个 <code>text</code> 内容块。最终请求包含一条 system 消息和一条 user 消息，其中 user 的 <code>content</code> 是图片块与文本块组成的数组。</p>
+<p>模型名称完全来自 <code>LLM_MODEL_NAME</code>，最大输出设置为 65536 Token，温度为 0.3，让结构化结果保持相对稳定。</p>
+<h2 id="三联网工具只对特定端点启用">三、联网工具只对特定端点启用</h2>
+<p>当 <code>ENABLE_WEB_SEARCH</code> 为真时，代码还会检查 Base URL 是否属于 OpenAI API。只有满足条件才附加 <code>web_search_preview</code> 工具。</p>
+<p>Gemini、DeepSeek、Ollama 等兼容端点不会收到该参数，因为它们可能能处理 Chat Completions，却不支持同样的工具定义。此时联网要求仍保留在系统 Prompt 中，API 请求本身保持普通聊天格式。</p>
+<h2 id="四重试封装如何工作">四、重试封装如何工作</h2>
+<p>多模态和纯文本各有一个指数退避封装。当前常量为：</p>
+<pre><code class="language-python">MAX_RETRIES = 2
+BASE_DELAY = 2
+TIMEOUT_SECONDS = 180
+</code></pre>
+<p>每次调用都由 <code>asyncio.wait_for()</code> 限制在 180 秒内。空字符串也会被视为失败。第一次失败后等待两秒再进行第二次尝试；两次都失败时抛出带模型名称和最后错误信息的 <code>RuntimeError</code>。</p>
+<p>多模态重试对 <code>ModelNotMultimodalError</code> 做了特殊处理：这种错误不会继续重复请求，而是立即交给上层决定是否走文本降级。</p>
+<h2 id="五如何识别模型不支持图片">五、如何识别模型不支持图片</h2>
+<p>部分纯文本模型收到 <code>image_url</code> 后会返回包含 <code>unknown variant image_url</code> 的 400 错误。<code>_call_llm()</code> 捕获异常并把它转换成 <code>ModelNotMultimodalError</code>。</p>
+<p><code>analyze_design()</code> 先判断是否有图片和文本，再决定执行路线：</p>
+<div class="mermaid">flowchart TD
+    A[analyze_design] --&gt; B{是否有图片}
+    B --&gt;|是| C[多模态调用]
+    C --&gt;|成功| D[返回 LLM 文本]
+    C --&gt;|不支持图片| E{是否还有文本}
+    C --&gt;|其他调用失败| E
+    B --&gt;|否| E
+    E --&gt;|有| F[纯文本调用]
+    E --&gt;|无| G[抛出 RuntimeError]
+    F --&gt; D
+</div><p>如果用户同时上传了图片和合同，即使当前模型不支持视觉输入，系统仍能使用提取出的合同文本和用户说明完成分析。只有“存在图片、模型不支持图片、又没有任何文本”时才无法降级。</p>
+<h2 id="六同步-celery-任务如何调用异步函数">六、同步 Celery 任务如何调用异步函数</h2>
+<p>LLM 服务全部使用 <code>async def</code>，但 Celery 的 <code>run_analysis_task</code> 和分析引擎是同步函数。<code>run_analysis_sync()</code> 通常通过 <code>asyncio.run()</code> 执行 <code>analyze_design()</code>；如果当前线程已经存在运行中的事件循环，则使用线程池创建新的异步执行环境。</p>
+<p>文档分析、增项预测和交叉核查也采用同样的同步包装。因此异步网络客户端被限制在服务层，Celery 编排代码仍然保持同步调用形式。</p>
+<h2 id="七llm-服务调用链小结">七、LLM 服务调用链小结</h2>
+<p>RenoPit 的 LLM 层完成四件事：根据配置创建兼容客户端，把图片和文本组装成请求，为超时及空响应提供重试，并在模型缺少视觉能力时切换到纯文本。上层分析引擎拿到的始终是一段待解析的模型输出文本。</p>
+<p>相关实现可以在 <a href="https://github.com/fthux/RenoPit" target="_blank" rel="noopener nofollow">fthux/RenoPit</a> 的 <code>llm_service.py</code> 中逐行对照。下一篇将分析这段原始文本如何经过 AnalysisEngine、JSON 修复和数据库事务，最终成为可查询的结构化装修闭坑结果。</p>
+
+
+</div>
+<div class="clear"></div>
+</div>
+    <p class="postfoot">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-14 09:52">2026-08-14 09:52</span>&nbsp;
+<a href="https://www.cnblogs.com/myvin">fthux</a>&nbsp;
+阅读(<span id="post_view_count">57</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22225698);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmyvin%2Fp%2F22225698&amp;targetId=22225698&amp;targetType=0" target="_blank">举报</a>
+</p>
