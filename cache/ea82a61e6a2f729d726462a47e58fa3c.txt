@@ -1,0 +1,473 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/realyin/p/22507939" title="发布于 2026-08-16 19:28">
+    
+
+    <span role="heading" aria-level="2">一个 SQL 字段到底是怎么算出来的？我做了一个能给出“证据”的血缘工具</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="一个-sql-字段到底是怎么算出来的我做了一个能给出证据的血缘工具">一个 SQL 字段到底是怎么算出来的？我做了一个能给出“证据”的血缘工具</h1>
+<p><img alt="SQL_1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1884494/202608/1884494-20260816192647595-2018838807.png" class="lazyload"></p>
+<p>我最近开源了一个 Spark/Hive SQL 静态分析工具：<strong>Scope Lineage</strong>。</p>
+<p>现在已经有了一些SQL的解析工具，为什么还要做一个 SQL Lineage？先看仓库里的一个真实例子。</p>
+<p>下面这段 SQL 把 App 和 Web 两个渠道的订单通过 <code>UNION ALL</code> 归一，再按渠道计算订单量、客户数和支付金额：</p>
+<pre><code class="language-sql">WITH normalized_orders AS (
+    SELECT
+        order_id,
+        customer_id,
+        pay_amount,
+        pay_status,
+        created_at,
+        'APP' AS order_channel
+    FROM ods.app_order
+    WHERE dt = '${bizdate}'
+
+    UNION ALL
+
+    SELECT
+        web_order_id AS order_id,
+        buyer_id AS customer_id,
+        order_amount AS pay_amount,
+        order_status AS pay_status,
+        order_time AS created_at,
+        'WEB' AS order_channel
+    FROM ods.web_order
+    WHERE dt = '${bizdate}'
+)
+SELECT
+    order_channel,
+    COUNT(*) AS order_count,
+    COUNT(DISTINCT customer_id) AS customer_count,
+    SUM(CASE WHEN pay_status = 'PAID' THEN pay_amount ELSE 0 END) AS paid_amount,
+    MIN(created_at) AS first_order_time,
+    MAX(created_at) AS last_order_time
+FROM normalized_orders
+GROUP BY order_channel;
+</code></pre>
+<p>先问一个最简单的问题：最终的 <code>order_channel</code> 从哪里来？</p>
+<p>答案其实写在 SQL 里：它不是任何源表中的列，而是两个 <code>UNION</code> 分支分别生成的字面量 <code>'APP'</code> 和 <code>'WEB'</code>。</p>
+<p>但我用 SQLLineage 1.5.8 对这份 SQL 做 column lineage 对照测试时，得到的是：</p>
+<pre><code class="language-text">mart.order_channel_metrics.order_channel &lt;- normalized_orders.order_channel
+</code></pre>
+<p>问题不只是“追得还不够深”。</p>
+<p>这是一个<strong>来源类别上的差异</strong>：<code>normalized_orders.order_channel</code> 是 CTE 的输出字段，而这个输出字段本身不是从某个物理列读取的，它是由 <code>'APP'</code> / <code>'WEB'</code> 两个常量生成的。</p>
+<p>这在工程上不是文字游戏。<strong>常量和物理字段是两类完全不同的依赖</strong>：物理字段变化可能触发下游影响分析，而上游表结构或字段值怎么变化，都不会改变 SQL 里写死的 <code>'APP'</code>。如果把生成值和读取值混在一起，后面的影响分析、知识图谱和自动解释都会建立在错误的事实类型上。</p>
+<p>Scope Lineage 对同一个字段会记录为：</p>
+<pre><code class="language-json">{
+  "column": "order_channel",
+  "source_kind": "generated",
+  "physical_sources": [],
+  "generated_sources": [
+    {"source_type": "CONSTANT", "value": "'APP'", "transform": "CONSTANT"},
+    {"source_type": "CONSTANT", "value": "'WEB'", "transform": "CONSTANT"}
+  ]
+}
+</code></pre>
+<p>这也是我做 Scope Lineage 的起点：<strong>字段血缘不应该只找到一个“看起来像上游”的名字，而应该沿着 SQL 的查询作用域和表达式，一直追到能够被证明的物理来源或生成来源。</strong></p>
+<p><img alt="sql_2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1884494/202608/1884494-20260816192704685-1787657323.png" class="lazyload"></p>
+<hr>
+<h2 id="一不只是从哪里来还要知道怎么算出来">一、不只是“从哪里来”，还要知道“怎么算出来”</h2>
+<p>再看同一份 SQL 里的 <code>paid_amount</code>：</p>
+<pre><code class="language-sql">SUM(CASE WHEN pay_status = 'PAID' THEN pay_amount ELSE 0 END) AS paid_amount
+</code></pre>
+<p>如果只看最终字段，很容易把它压缩成 <code>pay_amount → paid_amount</code>。但真正决定结果的物理字段有四个：</p>
+<ul>
+<li><code>ods.app_order.pay_amount</code></li>
+<li><code>ods.web_order.order_amount</code></li>
+<li><code>ods.app_order.pay_status</code></li>
+<li><code>ods.web_order.order_status</code></li>
+</ul>
+<p>前两个提供金额，后两个虽然不直接提供金额，却参与 <code>CASE WHEN pay_status = 'PAID'</code>，决定哪些金额能进入最终的 <code>SUM</code>。</p>
+<p>Scope Lineage 不只保存这四个最终来源，还保留加工表达式。下面是 README 中真实输出的裁剪片段；这里只省略了与本文解释无关的字段：</p>
+<pre><code class="language-json">{
+  "column": "paid_amount",
+  "transform": "AGGREGATE",
+  "expression": "SUM(CASE WHEN `normalized_orders`.`pay_status` = 'PAID' THEN `normalized_orders`.`pay_amount` ELSE 0 END)",
+  "physical_sources": [
+    {"table": "ods.app_order", "column": "pay_amount", "transform": "AGGREGATE"},
+    {"table": "ods.web_order", "column": "order_amount", "transform": "AGGREGATE"},
+    {"table": "ods.app_order", "column": "pay_status", "transform": "AGGREGATE"},
+    {"table": "ods.web_order", "column": "order_status", "transform": "AGGREGATE"}
+  ],
+  "trace_complete": true
+}
+</code></pre>
+<p>这里最重要的不只是四个 <code>physical_sources</code>，而是 <code>expression</code>。</p>
+<p>四个来源告诉我们<strong>结论是什么</strong>；表达式则提供了“为什么这四个字段会共同影响 <code>paid_amount</code>”的一部分证据。</p>
+<p>所以我后来把字段血缘需要回答的问题归纳成三层：</p>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>问题</th>
+<th>需要的信息</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Lineage</td>
+<td><strong>Where：从哪里来？</strong></td>
+<td>Physical Dependencies</td>
+</tr>
+<tr>
+<td>Transformation</td>
+<td><strong>How：怎么算出来？</strong></td>
+<td>Scope、Expression、Logic、Grain</td>
+</tr>
+<tr>
+<td>Verification</td>
+<td><strong>Why trust：为什么相信？</strong></td>
+<td>Evidence、Completeness、Diagnostics</td>
+</tr>
+</tbody>
+</table>
+<p>后面的设计基本都从这三个问题展开。</p>
+<hr>
+<h2 id="二how把-source-和-target-中间被压扁的过程还原出来">二、How：把 Source 和 Target 中间被压扁的过程还原出来</h2>
+<p><img alt="SQL_3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1884494/202608/1884494-20260816192723625-769173790.png" class="lazyload"></p>
+<p>普通字段血缘很擅长回答“谁依赖谁”，但复杂 SQL 真正麻烦的地方，往往发生在 Source 和 Target 中间。</p>
+<p>以 <code>paid_amount</code> 为例，它至少经历了：</p>
+<p><strong>物理字段 → UNION 分支 → CTE 输出 → CASE 条件 → SUM 聚合 → 目标字段。</strong></p>
+<p>如果只保留最终的 Source Set，中间这些信息就全部丢了。</p>
+<p>Scope Lineage 的做法是先恢复 Query Scope。ROOT 查询、CTE、子查询、<code>UNION</code> 分支都有自己的输入、输出和字段可见范围；字段解析始终发生在明确的 Scope 中。之后再做字段绑定：当前字段属于哪个输入？别名指向谁？<code>UNION</code> 两边的第 N 个输出如何对齐？如果能够唯一绑定，就形成确定关系；如果不能唯一绑定，就保留歧义，而不是任选一个候选。</p>
+<p>字段绑定之后，再继续分析直接投影、普通表达式、<code>CASE WHEN</code>、聚合、窗口函数，以及 JOIN、Filter、Group By 和 Grain Change。最后跨 Scope 递归回溯，直到物理来源。</p>
+<p>底层 SQL Parser 使用 SQLGlot，但 Parser 只是入口。真正决定结果深度的是后面的链路：</p>
+<p><strong>Parse → Query Scope → Field Binding → Expression / Logic → Cross-Scope Trace → Evidence Validation。</strong></p>
+<p>项目把 Source 与 Target 之间这部分有序加工过程称为 <strong>Transformation Lineage</strong>。它的价值不是再画一张更复杂的图，而是把“这个字段到底怎么算出来的”变成可以被程序查询的结构化事实。</p>
+<hr>
+<h2 id="三why-trust工具凭什么说这条血缘成立">三、Why trust：工具凭什么说这条血缘成立？</h2>
+<p><img alt="SQL_4" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1884494/202608/1884494-20260816192734742-1875887008.png" class="lazyload"></p>
+<p>加工过程还原出来以后，还有一个更麻烦的问题：<strong>这条链到底有多可信？</strong></p>
+<p>例如：</p>
+<pre><code class="language-sql">SELECT *
+FROM some_table
+</code></pre>
+<p>如果没有 <code>some_table</code> 的 Schema，工具其实不知道 <code>*</code> 究竟包含哪些字段。又比如一个未限定字段同时可能来自两个 JOIN 输入，工具也不能因为其中一个“看起来更合理”就把它当成确定来源。</p>
+<p>所以 Scope Lineage 不只保存 Lineage Claim，还保存 Evidence、Completeness 和 Diagnostics。我把这套结果模型称为 <strong>Verifiable Lineage（可验证血缘）</strong>。</p>
+<p>这里有四个容易混淆的概念：</p>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Evidence</td>
+<td>当前关系有什么证据</td>
+</tr>
+<tr>
+<td>Fact Gap</td>
+<td>哪个必要事实目前无法证明</td>
+</tr>
+<tr>
+<td>Completeness</td>
+<td>整条 Trace 是否完整</td>
+</tr>
+<tr>
+<td>Warning</td>
+<td>有什么值得关注，但不一定破坏完整性</td>
+</tr>
+</tbody>
+</table>
+<p>因此，<strong>Warning 不等于失败，Fact Gap 也不能被 Warning 代替。</strong></p>
+<p>例如官方 <a href="https://github.com/realyin/scope-lineage/blob/main/docs/zh-CN/diagnostics-json.md" target="_blank" rel="noopener nofollow"><code>diagnostics.json</code> 契约</a>中的一条 Warning 可以是：</p>
+<pre><code class="language-json">{
+  "type": "star_not_expanded",
+  "scope": "ROOT",
+  "msg": "SELECT * could not be expanded: no schema; missing_schema_sources=ods.raw_events"
+}
+</code></pre>
+<p>而真正无法建立确定事实时，会形成 Fact Gap。契约文档中的一个例子是：</p>
+<pre><code class="language-json">{
+  "gap_id": "lineage_gap:0001",
+  "gap_type": "alias_binding_missing",
+  "scope_id": "ROOT",
+  "object_name": "customer_id",
+  "expression_sql": "x.customer_id",
+  "source_kind": "unresolved",
+  "missing_reasons": ["alias_not_bound_to_input_source:x"],
+  "needed_fact": "input alias to source binding",
+  "root_impact": true
+}
+</code></pre>
+<p>这两个对象表达的严重程度完全不同：前者告诉你“这里需要注意”，后者告诉你“形成确定血缘所需的一项事实没有被证明”。</p>
+<p>这也是 Scope Lineage 最核心的一条原则：</p>
+<blockquote>
+<p><strong>无法证明，不等于可以猜测。</strong></p>
+</blockquote>
+<p>“可验证”不是承诺工具永远能给出完整答案，而是要求<strong>完整答案和不完整答案必须能够被机器区分</strong>。</p>
+<hr>
+<h2 id="四它和-sqllineagedatahubopenlineage-有什么区别">四、它和 SQLLineage、DataHub、OpenLineage 有什么区别？</h2>
+<p>Scope Lineage 并不是在说现有 Lineage 工具都不行。</p>
+<p>SQLLineage 已经支持表级和字段级血缘，也支持 Metadata-aware 分析。在仓库的 <code>customer_profile_daily.sql</code> 这类比较直接的 CTE + JOIN 任务上，两种工具对每个目标字段得到的物理 Source Set 是一致的。</p>
+<p>我反而认为这一点很重要：</p>
+<blockquote>
+<p><strong>一个新工具的价值不应该来自“所有地方我都和别人算得不一样”。简单场景应该得到一致事实，复杂场景才需要更多证据。</strong></p>
+</blockquote>
+<p>差异主要出现在结果模型和复杂场景上。例如前面的 Literal 投影，Scope Lineage 会区分 generated source 与 physical source；遇到 <code>UNION</code>、表达式和多层 Scope 时，它继续保存分支来源、加工表达式和有序步骤；无法证明时，则通过 Diagnostics 和完整性状态明确边界。</p>
+<p>README 中的对照可以概括为：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>SQLLineage 1.5.8</th>
+<th>Scope Lineage</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>普通 CTE / JOIN 字段血缘</td>
+<td>支持</td>
+<td>支持，很多场景来源一致</td>
+</tr>
+<tr>
+<td>Literal 投影</td>
+<td>示例中停在 CTE 字段</td>
+<td>记录为 <code>CONSTANT</code> generated source</td>
+</tr>
+<tr>
+<td>UNION 分支到物理表</td>
+<td>部分字段停在 CTE</td>
+<td>按分支继续追踪</td>
+</tr>
+<tr>
+<td>Transform 类型与表达式</td>
+<td>非核心结果</td>
+<td>保留类型和 SQL</td>
+</tr>
+<tr>
+<td>目标字段与 DDL 位置绑定</td>
+<td>非核心结果</td>
+<td>保存 binding / ordinal</td>
+</tr>
+<tr>
+<td>无法证明的关系</td>
+<td>不作为对应的诊断结果输出</td>
+<td>状态 + 缺失原因 + <code>diagnostics.json</code></td>
+</tr>
+</tbody>
+</table>
+<p>DataHub 和 OpenLineage 则属于不同层次。DataHub 是完整的 Metadata Platform；OpenLineage 更关注运行中 Job / Run / Dataset 的标准化 lineage metadata。Scope Lineage 更靠近底层静态分析：<strong>输入 SQL + Metadata，输出版本化的结构化 SQL Facts，供上层平台继续消费。</strong></p>
+<hr>
+<h2 id="五小-demo-能跑604-行-sql-呢">五、小 Demo 能跑，604 行 SQL 呢？</h2>
+<p><img alt="sql_5" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1884494/202608/1884494-20260816192751886-1367603434.png" class="lazyload"></p>
+<p>十几行 SQL 很容易做出漂亮 Demo。真正的问题是：面对真实数仓里几百行、多表 JOIN、多层子查询和大量条件聚合的 SQL，同一套模型还能不能成立？</p>
+<p>仓库里有一份结构保真的复杂脱敏样例 <a href="https://github.com/realyin/scope-lineage/blob/main/examples/sql/subscription_account_snapshot.sql" target="_blank" rel="noopener nofollow"><code>subscription_account_snapshot.sql</code></a>：</p>
+<table>
+<thead>
+<tr>
+<th>结构</th>
+<th style="text-align: right">数量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SQL 行数</td>
+<td style="text-align: right">604</td>
+</tr>
+<tr>
+<td>物理源表</td>
+<td style="text-align: right">19</td>
+</tr>
+<tr>
+<td>JOIN</td>
+<td style="text-align: right">20</td>
+</tr>
+<tr>
+<td>子查询</td>
+<td style="text-align: right">23</td>
+</tr>
+<tr>
+<td>聚合函数</td>
+<td style="text-align: right">57</td>
+</tr>
+<tr>
+<td>CASE WHEN</td>
+<td style="text-align: right">10</td>
+</tr>
+<tr>
+<td>窗口函数</td>
+<td style="text-align: right">1</td>
+</tr>
+<tr>
+<td>目标字段</td>
+<td style="text-align: right">112</td>
+</tr>
+</tbody>
+</table>
+<p>其中 <code>total_payable_amount</code> 的最终表达式会合并多个费用分支：</p>
+<pre><code class="language-sql">COALESCE(t7.upcoming_base_charge, 0)
++ COALESCE(t7.past_due_base_charge, 0)
++ COALESCE(t7.open_receivable_amount, 0)
++ COALESCE(t7.accrued_penalty_charge, 0)
++ COALESCE(t7.accrued_late_charge, 0)
++ COALESCE(t17.subscription_scheduled_charge, 0)
++ COALESCE(t7.accrued_service_charge, 0)
++ COALESCE(t7.accrued_support_charge, 0)
++ COALESCE(t7.accrued_base_charge, 0)
+AS total_payable_amount
+</code></pre>
+<p>而其中的 <code>open_receivable_amount</code> 又来自更深一层的条件聚合：</p>
+<pre><code class="language-sql">SUM(
+  CASE WHEN component_type LIKE 'PAYABLE%'
+       THEN component_amount
+  END
+) AS open_receivable_amount
+</code></pre>
+<p>这就是“18 个加工步骤”背后的真实 SQL：最终字段并不是直接从三列做一次运算，而是先在下层 Scope 中分类聚合，再在上层 Scope 中二次汇总，最后由 ROOT 合并多个费用分支。</p>
+<p>值得注意的是，九个费用分支最终只归结到三个物理字段：<code>component_type</code>、<code>component_amount</code> 和 <code>scheduled_charge_amount</code>。因为其中八个分支本质上都是对 <code>billing_balance_component</code> 中同一组 <code>component_type + component_amount</code> 做不同条件的聚合，另一条路径才来自 <code>scheduled_charge_amount</code>。</p>
+<p><strong>分支数是 SQL 的书写和加工结构，物理依赖才是真正会被上游字段变更影响的对象。</strong> 这也是后面做影响分析时必须区分的两个层次。</p>
+<p>按照仓库示例文档中的 <strong>Task Lineage 2.0</strong> 命令解析，这个字段得到：</p>
+<pre><code class="language-text">3 physical dependencies
+→ 4 query scopes
+→ 18 transformation steps
+→ demo_mart.subscription_account_snapshot.total_payable_amount
+
+chain_status: resolved
+trace_status: complete
+analysis_status: complete
+warnings: 48
+lineage_fact_gaps: 0
+metadata_coverage: 20 / 20
+</code></pre>
+<p>18 个步骤中，<code>subq:b_2</code> 负责条件聚合，<code>subq:t7</code> 负责第二层汇总，<code>subq:t17</code> 负责计划费用聚合，最后在 ROOT 合并九个费用分支。这里的 Scope 名称来自本地运行产物；其中 <code>t7</code>、<code>t17</code> 可以对应到 SQL 中的别名，<code>subq:b_2</code> 则是工具生成的内部 Scope ID，对应 SQL 中别名为 <code>b</code> 的子查询。SQL 里存在不止一个名为 <code>b</code> 的子查询，因此内部 Scope ID 需要进一步区分这些同名 Scope。</p>
+<p>换句话说，<code>ordered_steps</code> 保存的不是一个“18”这个统计数字，而是可以逐层回查的加工链。</p>
+<p>这里还有一个很有意思的结果：<strong>48 条 Warning，但 0 个 Fact Gap，Trace 仍然 complete。</strong></p>
+<p>48 条 Warning 中包括 43 条 <code>complex_aggregate_with_case</code> 和 5 条 <code>magic_number</code>。它们提示这个 SQL 中存在值得人工关注的复杂逻辑，但并没有造成必要来源事实缺失，因此不影响 <code>total_payable_amount</code> 的完整追踪。</p>
+<p>这个案例真正验证的不是“工具能解析 604 行 SQL”，而是：<strong>简单案例中的 Scope、Binding、Transformation、Cross-Scope Trace 和 Evidence Validation，在复杂 SQL 上仍然使用同一套模型。</strong></p>
+<p>要复现这组 2.0 结果，可以直接运行：</p>
+<pre><code class="language-bash">scope-lineage parse \
+  --task-file examples/tasks/subscription/subscription_account_snapshot.json \
+  --schema examples/metadata/subscription_account_snapshot/source_tables \
+  --schema-fallback examples/metadata/target_tables/demo_mart.subscription_account_snapshot_metadata.json \
+  --target-ddl-metadata examples/metadata/target_tables/demo_mart.subscription_account_snapshot_metadata.json \
+  --contract-version 2.0 \
+  --out /tmp/scope-lineage/subscription-account
+</code></pre>
+<p>需要说明：仓库当前没有把这次运行生成的完整 <code>lineage.json</code> 作为示例文件提交进去，所以本文不手写一个“看起来像真实”的 <code>ordered_steps</code> JSON。上面的 SQL、命令和统计结果都来自仓库现有示例与文档；运行后可以直接在产物中查看 18 个步骤的原始对象。</p>
+<hr>
+<h2 id="六有了这些结构化事实可以做什么">六、有了这些结构化事实，可以做什么？</h2>
+<p><img alt="sql_6" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1884494/202608/1884494-20260816192803154-1418838806.png" class="lazyload"></p>
+<p>如果最终只有 <code>Column A → Column B</code>，最大的用途通常是画血缘图。Scope、Expression、Logic、Evidence 和 Diagnostics 被结构化以后，它们才开始适合进入工程系统。</p>
+<h3 id="1-影响分析不只知道影响谁还知道怎么影响">1. 影响分析：不只知道“影响谁”，还知道“怎么影响”</h3>
+<p>例如上游字段 <code>demo_ods.subscription_charge_schedule.scheduled_charge_amount</code> 发生变化，现有示例可以沿血缘找到 <code>past_due_amount</code>、<code>special_charge_balance</code>、<code>subscription_due_balance</code>、<code>total_payable_amount</code> 等目标字段。</p>
+<p>更重要的是，加工链还能说明影响是怎样发生的。以 <code>total_payable_amount</code> 为例，路径可以回到 <code>subq:t17.subscription_scheduled_charge</code>，再进入 ROOT 的最终加总表达式。对于 <code>component_type</code>，则能看到它先作为 <code>CASE WHEN</code> 的条件决定 <code>open_receivable_amount</code>，再间接影响最终金额。</p>
+<p>因此影响分析不再只有“是否受影响”，还多了一层：<strong>通过计算、条件、JOIN、Filter、Group By 还是 Grain Change 影响过去。</strong></p>
+<h3 id="2-sql-变更评审与-ci从文本-diff-走向事实-diff">2. SQL 变更评审与 CI：从文本 Diff 走向事实 Diff</h3>
+<p>如果开发人员把 <code>component_type LIKE 'PAYABLE%'</code> 改成固定枚举，Git Diff 只能告诉我们某一行 SQL 变了。</p>
+<p>结构化结果则可以继续比较：表达式是否变化、Physical Dependencies 是否变化、JOIN / Filter / Aggregate 是否变化、关键字段是否仍然 <code>trace_complete</code>、是否新增 Fact Gap，以及是否出现需要阻断发布的 Warning。</p>
+<p>Scope Lineage Core 当前没有独立的 <code>diff</code> 命令，这些比较由上层流水线基于版本化 JSON Contract 完成。</p>
+<h3 id="3-给-agent--rag-一个事实层">3. 给 Agent / RAG 一个事实层</h3>
+<p>让模型直接读几百、几千行 SQL 并非做不到，真正的问题是：模型的解释里，哪些来自 SQL 本身，哪些只是推断？</p>
+<p>Scope Lineage 想提供的是中间的确定性层：</p>
+<p><strong>SQL → Structured Facts + Evidence Boundary → Agent / RAG / Search / Knowledge Graph。</strong></p>
+<p>Core 不负责向量库、图数据库或业务语义生成。它只负责把 SQL 与 Metadata 能够证明的事实提取出来，让上层系统可以引用具体 Scope、Expression、Physical Field 和 Diagnostic，而不是重新猜一遍 SQL。</p>
+<hr>
+<h2 id="七字段值之外sql-还会改变哪些记录存在">七、字段值之外：SQL 还会改变“哪些记录存在”</h2>
+<p>前面主要讨论 Value Lineage：一个字段值为什么是这个值。</p>
+<p>但 SQL 的影响不只有字段值。例如 <code>DELETE FROM account WHERE status = 'CANCELLED'</code> 中，<code>status</code> 并没有写入目标字段，却决定哪些记录会消失。</p>
+<p>Task Lineage 2.0 因此进一步区分 <code>value_sources</code>、<code>row_membership_sources</code> 和 <code>value_condition_sources</code>，并保留语句顺序和 Table State。这样 <code>DELETE</code> 的 WHERE 字段不会被伪装成目标字段值来源；<code>MERGE</code> 的 ON / WHEN 条件和真正的 UPDATE / INSERT 表达式也能被区分。</p>
+<p>这部分是 <strong>显式 opt-in 的 2.0 Contract</strong>，默认仍然是 1.0。它用于更完整地描述 <code>DELETE</code>、<code>TRUNCATE</code>、<code>UPDATE</code>、<code>MERGE</code> 和多语句任务，而不是暗示当前版本已经覆盖所有 DML 语义。</p>
+<hr>
+<h2 id="八scope-lineage-不负责什么">八、Scope Lineage 不负责什么？</h2>
+<p>静态分析工具最容易犯的错误，是把自己不能知道的事情也包装成“智能”。</p>
+<table>
+<thead>
+<tr>
+<th>Scope Lineage 不负责</th>
+<th>应该由谁解决</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>判断 SQL 在真实集群一定执行成功</td>
+<td>Spark / Hive / 实际执行环境</td>
+</tr>
+<tr>
+<td>判断运行时数据值是否正确</td>
+<td>查询结果 + 数据质量规则</td>
+</tr>
+<tr>
+<td>根据字段名猜业务含义</td>
+<td>领域知识 + 人工确认</td>
+</tr>
+<tr>
+<td>缺少证据时补一个“看起来合理”的来源</td>
+<td>不做，明确记录证据不足</td>
+</tr>
+</tbody>
+</table>
+<p>Scope Lineage 专注于：<strong>SQL 和提供的 Metadata 本身能够证明什么。</strong></p>
+<p>字段叫 <code>amount</code>，工具不会自动断言它是“应还金额”还是“实付金额”；它能证明的是这个字段来自哪里、经过什么表达式、在哪些条件下参与计算。</p>
+<hr>
+<h2 id="九当前还是-alpha">九、当前还是 Alpha</h2>
+<p>当前 <code>0.1.x</code> 系列仍然是 <strong>Alpha</strong>。</p>
+<p>核心分析模型已经能处理不少复杂 Spark/Hive SQL，JSON Contract 也已经版本化，但方言覆盖、Contract 和 DML 能力仍会继续演进。</p>
+<p>Alpha 阶段我更想坚持的不是“什么都支持”，而是另一件事：</p>
+<p><strong>遇到支持不了的地方，要把边界暴露出来，而不是把不确定性包装成确定事实。</strong></p>
+<p>这和前面的 Verifiable Lineage 是同一个设计原则。</p>
+<hr>
+<h2 id="十怎么复现本文的两个例子">十、怎么复现本文的两个例子？</h2>
+<p>项目采用 Apache-2.0 License 开源。</p>
+<p>如果只是安装 CLI：</p>
+<pre><code class="language-bash">pipx install scope-lineage
+scope-lineage --help
+</code></pre>
+<p>本文使用的 SQL、Schema 和目标表 Metadata 都在仓库中，所以复现前先 Clone。示例目录说明见 <a href="https://github.com/realyin/scope-lineage/blob/main/examples/README.zh-CN.md" target="_blank" rel="noopener nofollow"><code>examples/README.zh-CN.md</code></a>：</p>
+<pre><code class="language-bash">git clone https://github.com/realyin/scope-lineage.git
+cd scope-lineage
+</code></pre>
+<p>复现开头的 <a href="https://github.com/realyin/scope-lineage/blob/main/examples/sql/order_channel_metrics.sql" target="_blank" rel="noopener nofollow"><code>order_channel_metrics.sql</code></a>：</p>
+<pre><code class="language-bash">scope-lineage parse \
+  --sql-file examples/sql/order_channel_metrics.sql \
+  --schema examples/metadata/schema_info.json \
+  --target-ddl-metadata examples/metadata/target_tables \
+  --out /tmp/scope-lineage
+</code></pre>
+<p>然后打开：</p>
+<p><code>/tmp/scope-lineage/order_channel_metrics/lineage.json</code></p>
+<p>查看 <code>end_to_end_lineage</code>，可以核对本文开头的 <code>order_channel</code>、<code>paid_amount</code>、<code>expression</code>、<code>physical_sources</code> 和 <code>trace_complete</code>。同目录的 <code>diagnostics.json</code> 用于查看 Warning 和事实边界。</p>
+<p>604 行复杂案例使用上一节给出的 <code>--contract-version 2.0</code> 命令。<strong>Contract 1.0 当前仍然是默认版本，Task Lineage 2.0 需要显式开启。</strong> 2.0 的设计与字段说明见 <a href="https://github.com/realyin/scope-lineage/blob/main/docs/zh-CN/task-lineage-v2.md" target="_blank" rel="noopener nofollow"><code>docs/zh-CN/task-lineage-v2.md</code></a>。</p>
+<p>项目地址：</p>
+<p><a href="https://github.com/realyin/scope-lineage" target="_blank" rel="noopener nofollow">GitHub：realyin/scope-lineage</a></p>
+<hr>
+<h2 id="十一最后我真正想解决的是什么">十一、最后：我真正想解决的是什么？</h2>
+<p>最开始，我只是想回答一个很具体的问题：</p>
+<blockquote>
+<p><strong>一个目标字段，到底是怎么算出来的？</strong></p>
+</blockquote>
+<p>做到后面，我发现还必须回答另一个问题：</p>
+<blockquote>
+<p><strong>工具凭什么说这条关系成立？</strong></p>
+</blockquote>
+<p>所以 Scope Lineage 最终关心的是三个层次：字段最终来自哪里，中间经历了什么加工，以及当前结论的证据边界在哪里。</p>
+<p>如果一定要用一句话概括这个项目：</p>
+<blockquote>
+<p><strong>Scope Lineage 不只告诉你字段从哪里来，还试图还原它是怎么算出来的，并明确告诉你哪些结论已经被证明、哪些地方仍然缺少证据。</strong></p>
+</blockquote>
+<p>如果你手里正好有那种 CTE 套 CTE、<code>UNION</code> 套子查询、条件聚合一层又一层的 Spark/Hive SQL，可以拿来试。</p>
+<p>对于一个还在 Alpha 阶段的静态分析工具来说，找到“它还解释不清楚的 SQL”，和找到它已经能正确处理的 SQL，同样重要。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-16 19:29">2026-08-16 19:28</span>&nbsp;
+<a href="https://www.cnblogs.com/realyin">bransyin</a>&nbsp;
+阅读(<span id="post_view_count">38</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22507939);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Frealyin%2Fp%2F22507939&amp;targetId=22507939&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
