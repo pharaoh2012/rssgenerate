@@ -1,0 +1,630 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/OakMaker/p/22414557" title="发布于 2026-08-12 09:55">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">.NET/WPF 程序在部分 Windows 电脑无法保存用户环境变量：使用 DPAPI 实现安全兼容</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        一个.NET 8/WPF客户端在开发电脑正常运行，但在其他Windows电脑上无法保存访问密钥，报"未授权操作"错误。经排查发现是写入用户环境变量时被系统拒绝，即使管理员运行也无效。文章详细记录了问题定位过程，并提出了使用Windows DPAPI(Data Protection API)的解决方案：将密钥加密后存储在用户专属文件中，而非环境变量或明文配置。这种方案无需管理员权限，能防止密钥泄露，同时保持环境变量兼容性。文章包含完整实现代码，展示了如何使用.NET的ProtectedDa
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>事先叠甲,问题是我遇到的真实问题,bug又比较神奇,进而由AI代笔写的文章<br>
+<a href="https://github.com/A0000AAA/CodexNotif" target="_blank" rel="noopener nofollow">相关软件我已经上传GITHUB软件地址</a></p>
+</blockquote>
+<h2 id="前言">前言</h2>
+<p>最近在开发一个 .NET 8/WPF 客户端时遇到了一个很有代表性的兼容问题：</p>
+<p>同一份程序在开发电脑上运行正常，可以保存服务器地址和访问密钥；但复制到另一台 Windows 电脑后，服务器地址可以保存，访问密钥却始终保存失败。</p>
+<p>界面显示的异常类似：</p>
+<pre><code>Attempted to perform an unauthorized operation.
+</code></pre>
+<p>即使使用“以管理员身份运行”，问题依然存在。</p>
+<p>最终确认，故障并不在服务器，也不是应用配置目录不可写，而是目标电脑拒绝了程序写入当前用户环境变量的操作。</p>
+<p>本文完整记录定位过程，并介绍如何使用 Windows DPAPI，将访问密钥安全地保存到当前用户的加密存储中，同时保留环境变量兼容能力。</p>
+<blockquote>
+<p>本文所有程序名称、环境变量、服务器地址、文件路径和密钥均已替换为示例内容。</p>
+</blockquote>
+<hr>
+<h2 id="一原来的保存方式">一、原来的保存方式</h2>
+<p>客户端需要保存一个服务器访问密钥，用于给 HTTP 请求增加身份验证信息。</p>
+<p>最初采用的是 Windows 当前用户环境变量：</p>
+<pre><code>Environment.SetEnvironmentVariable(
+    "APP_ACCESS_KEY",
+    accessKey,
+    EnvironmentVariableTarget.User);
+</code></pre>
+<p>读取时则使用：</p>
+<pre><code>string? accessKey = Environment.GetEnvironmentVariable(
+    "APP_ACCESS_KEY",
+    EnvironmentVariableTarget.User);
+</code></pre>
+<p>在 Windows 上，<code>EnvironmentVariableTarget.User</code> 对应当前用户的环境变量区域，实际数据会保存到注册表的：</p>
+<pre><code>HKEY_CURRENT_USER\Environment
+</code></pre>
+<p>微软文档也说明，用户级环境变量会保存在当前用户对应的注册表项中，并由之后启动的新进程继承。<a href="https://learn.microsoft.com/en-us/dotnet/api/system.environment.setenvironmentvariable" target="_blank" rel="noopener nofollow">Environment.SetEnvironmentVariable 官方文档</a></p>
+<p>这种方式使用简单，但存在几个问题：</p>
+<ul>
+<li>某些安全策略可能禁止应用写入用户环境变量；</li>
+<li>企业安全软件或终端防护软件可能拦截注册表写入；</li>
+<li>用户配置文件或注册表 ACL 异常时也可能失败；</li>
+<li>新值不会自动进入已经运行的旧进程；</li>
+<li>环境变量并不是专门的密码存储，其内容并非加密保存。</li>
+</ul>
+<hr>
+<h2 id="二故障现象">二、故障现象</h2>
+<p>目标电脑上的表现如下：</p>
+<ol>
+<li>保存服务器地址时正常；</li>
+<li>不输入访问密钥时，“保存并测试”可以执行；</li>
+<li>输入访问密钥后立即提示无权操作；</li>
+<li>以管理员身份启动程序仍然失败；</li>
+<li>程序的普通配置文件可以正常创建和修改；</li>
+<li>服务器地址可以保存，但访问密钥无法保存。</li>
+</ol>
+<p>这组现象非常关键。</p>
+<p>如果整个配置目录都没有写入权限，那么服务器地址也应该保存失败。但实际只有访问密钥失败，说明故障点不在普通配置文件，而在密钥特有的持久化流程。</p>
+<hr>
+<h2 id="三如何缩小故障范围">三、如何缩小故障范围</h2>
+<p>排查时可以做一个非常简单的对照实验。</p>
+<h3 id="测试一不填写密钥">测试一：不填写密钥</h3>
+<p>只修改服务器地址，然后保存。</p>
+<p>结果：成功。</p>
+<p>这说明：</p>
+<ul>
+<li>程序可以访问本地配置目录；</li>
+<li>普通 JSON 配置文件可写；</li>
+<li>WPF 界面本身没有权限问题；</li>
+<li>服务器地址校验和保存流程正常。</li>
+</ul>
+<h3 id="测试二填写密钥">测试二：填写密钥</h3>
+<p>保持服务器地址不变，只在密钥框中输入新值，然后保存。</p>
+<p>结果：出现无权操作异常。</p>
+<p>因此，故障范围可以直接缩小到：</p>
+<pre><code>Environment.SetEnvironmentVariable(
+    variableName,
+    value,
+    EnvironmentVariableTarget.User);
+</code></pre>
+<p>微软文档明确列出了 <code>SecurityException</code>：当调用方没有所需权限时，该方法可能失败。<a href="https://learn.microsoft.com/en-us/dotnet/api/system.environmentvariabletarget" target="_blank" rel="noopener nofollow">EnvironmentVariableTarget 官方文档</a></p>
+<p>实际运行环境中，也可能看到 <code>UnauthorizedAccessException</code> 或只包含“unauthorized operation”的通用异常信息。</p>
+<hr>
+<h2 id="四为什么管理员运行也不一定有效">四、为什么管理员运行也不一定有效</h2>
+<p>很多人的第一反应是：</p>
+<blockquote>
+<p>写入失败，那就以管理员身份运行。</p>
+</blockquote>
+<p>但这个问题不能简单等同于“权限不够”。</p>
+<p>用户级环境变量属于当前用户配置的一部分。管理员身份并不代表程序一定能绕过以下限制：</p>
+<ul>
+<li>当前用户注册表 ACL 异常；</li>
+<li>组策略限制；</li>
+<li>企业终端防护软件拦截；</li>
+<li>用户配置文件未正常加载；</li>
+<li>安全软件针对环境变量或注册表持久化的保护规则；</li>
+<li>程序提升后所处用户上下文发生变化。</li>
+</ul>
+<p>即使管理员模式能够解决，也不应该要求普通桌面软件必须以管理员身份运行才能保存一项客户端设置。</p>
+<p>因此，正确方向不是继续提高权限，而是取消对用户环境变量的强依赖。</p>
+<hr>
+<h2 id="五为什么不能直接把密钥写入-settingsjson">五、为什么不能直接把密钥写入 settings.json</h2>
+<p>最简单的替代方案似乎是：</p>
+<pre><code>{
+  "serverUrl": "https://notify.example.com",
+  "accessKey": "真实密钥"
+}
+</code></pre>
+<p>但这样会让密钥以明文形式出现在磁盘上。</p>
+<p>它可能被以下渠道泄露：</p>
+<ul>
+<li>用户截图；</li>
+<li>日志收集；</li>
+<li>配置文件备份；</li>
+<li>云盘同步；</li>
+<li>故障报告；</li>
+<li>误提交到 Git；</li>
+<li>其他能够读取用户目录的程序。</li>
+</ul>
+<p>因此需要一个同时满足以下要求的方案：</p>
+<ul>
+<li>不要求管理员权限；</li>
+<li>不依赖用户环境变量一定可写；</li>
+<li>不把密钥明文写进 JSON；</li>
+<li>当前程序能够立即读取新密钥；</li>
+<li>后台通知进程也可以读取；</li>
+<li>换电脑时不会自动复制密钥；</li>
+<li>环境变量可用时仍然保持旧版本兼容。</li>
+</ul>
+<p>最终选择 Windows DPAPI。</p>
+<hr>
+<h2 id="六使用-dpapi-currentuser-加密保存">六、使用 DPAPI CurrentUser 加密保存</h2>
+<p>.NET 提供了 <code>ProtectedData</code> 类，可以访问 Windows Data Protection API，也就是 DPAPI。</p>
+<p>它可以把数据绑定到：</p>
+<ul>
+<li>当前 Windows 用户；</li>
+<li>或整台本机。</li>
+</ul>
+<p>本文选择：</p>
+<pre><code>DataProtectionScope.CurrentUser
+</code></pre>
+<p>使用这个范围加密后，数据通常只能在相同 Windows 用户上下文中解密。微软也建议大多数桌面端场景优先使用 <code>CurrentUser</code>，而不是权限范围更大的 <code>LocalMachine</code>。<a href="https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.dataprotectionscope" target="_blank" rel="noopener nofollow">DataProtectionScope 官方文档</a></p>
+<h3 id="加密存储实现">加密存储实现</h3>
+<pre><code>using System.Security.Cryptography;
+using System.Text;
+
+public sealed class ProtectedAccessKeyStore
+{
+    private static readonly byte[] Entropy =
+        Encoding.UTF8.GetBytes("ExampleClient.AccessKey.v1");
+
+    private readonly string _path;
+
+    public ProtectedAccessKeyStore(string? path = null)
+    {
+        _path = Path.GetFullPath(
+            path ?? Path.Combine(
+                Environment.GetFolderPath(
+                    Environment.SpecialFolder.LocalApplicationData),
+                "ExampleClient",
+                "access-key.dat"));
+    }
+
+    public void Save(string value)
+    {
+        string directory = Path.GetDirectoryName(_path)
+            ?? throw new InvalidOperationException(
+                "无法确定访问密钥存储目录。");
+
+        Directory.CreateDirectory(directory);
+
+        byte[] plaintext = Encoding.UTF8.GetBytes(value);
+        byte[]? protectedBytes = null;
+        string temporaryPath = _path + ".tmp";
+
+        try
+        {
+            protectedBytes = ProtectedData.Protect(
+                plaintext,
+                Entropy,
+                DataProtectionScope.CurrentUser);
+
+            File.WriteAllBytes(temporaryPath, protectedBytes);
+
+            // 使用临时文件替换，降低程序中途退出导致文件损坏的概率
+            File.Move(
+                temporaryPath,
+                _path,
+                overwrite: true);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+
+            if (protectedBytes is not null)
+            {
+                CryptographicOperations.ZeroMemory(protectedBytes);
+            }
+
+            try
+            {
+                File.Delete(temporaryPath);
+            }
+            catch
+            {
+                // 原子替换完成后，临时文件通常已经不存在
+            }
+        }
+    }
+
+    public string? Load()
+    {
+        if (!File.Exists(_path))
+        {
+            return null;
+        }
+
+        byte[]? plaintext = null;
+
+        try
+        {
+            byte[] protectedBytes = File.ReadAllBytes(_path);
+
+            plaintext = ProtectedData.Unprotect(
+                protectedBytes,
+                Entropy,
+                DataProtectionScope.CurrentUser);
+
+            return Encoding.UTF8.GetString(plaintext);
+        }
+        catch (CryptographicException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+        finally
+        {
+            if (plaintext is not null)
+            {
+                CryptographicOperations.ZeroMemory(plaintext);
+            }
+        }
+    }
+}
+</code></pre>
+<p><code>ProtectedData.Protect</code> 返回的是加密后的字节数组，可以安全地保存到本地文件；解密时必须使用相同的保护范围和附加熵。<a href="https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.protecteddata.protect" target="_blank" rel="noopener nofollow">ProtectedData.Protect 官方文档</a></p>
+<p>最终文件可以保存在：</p>
+<pre><code>%LOCALAPPDATA%\ExampleClient\access-key.dat
+</code></pre>
+<p>它不是明文 JSON，即使直接打开，也无法看到原始密钥。</p>
+<hr>
+<h2 id="七dpapi-作为主存储环境变量改为兼容层">七、DPAPI 作为主存储，环境变量改为兼容层</h2>
+<p>不能简单地把环境变量彻底删除，因为旧脚本或旧版本程序可能仍依赖它。</p>
+<p>最终设计是：</p>
+<pre><code>DPAPI 加密文件
+    ↓ 读取优先级最高
+当前进程环境变量
+    ↓
+当前用户环境变量
+</code></pre>
+<p>保存流程则是：</p>
+<pre><code>校验密钥
+    ↓
+先写入 DPAPI
+    ↓
+尝试写用户环境变量
+    ├─ 成功：继续兼容旧版本
+    └─ 被拒绝：使用 DPAPI，不影响当前功能
+    ↓
+尽力更新当前进程环境变量
+</code></pre>
+<p>核心实现如下：</p>
+<pre><code>using System.Security;
+
+public enum AccessKeySaveLocation
+{
+    UserEnvironment,
+    ProtectedLocalStorage
+}
+
+public sealed class AccessKeyPersistence
+{
+    private readonly ProtectedAccessKeyStore _protectedStore;
+
+    private readonly Func&lt;EnvironmentVariableTarget, string?&gt;
+        _readEnvironment;
+
+    private readonly Action&lt;EnvironmentVariableTarget, string?&gt;
+        _writeEnvironment;
+
+    public AccessKeyPersistence(
+        ProtectedAccessKeyStore? protectedStore = null,
+        Func&lt;EnvironmentVariableTarget, string?&gt;? readEnvironment = null,
+        Action&lt;EnvironmentVariableTarget, string?&gt;? writeEnvironment = null)
+    {
+        _protectedStore =
+            protectedStore ?? new ProtectedAccessKeyStore();
+
+        _readEnvironment = readEnvironment ?? (target =&gt;
+            Environment.GetEnvironmentVariable(
+                "APP_ACCESS_KEY",
+                target));
+
+        _writeEnvironment = writeEnvironment ?? ((target, value) =&gt;
+            Environment.SetEnvironmentVariable(
+                "APP_ACCESS_KEY",
+                value,
+                target));
+    }
+
+    public string? ReadOptional()
+    {
+        string? protectedValue = _protectedStore.Load();
+
+        if (AccessKeyValidator.IsValid(protectedValue))
+        {
+            return protectedValue;
+        }
+
+        return _readEnvironment(
+                   EnvironmentVariableTarget.Process)
+               ?? _readEnvironment(
+                   EnvironmentVariableTarget.User);
+    }
+
+    public AccessKeySaveLocation Save(string value)
+    {
+        string key = AccessKeyValidator.Validate(value);
+
+        // DPAPI 是可靠的主存储
+        _protectedStore.Save(key);
+
+        try
+        {
+            _writeEnvironment(
+                EnvironmentVariableTarget.User,
+                key);
+
+            TryWriteProcess(key);
+
+            return AccessKeySaveLocation.UserEnvironment;
+        }
+        catch (SecurityException)
+        {
+            TryWriteProcess(key);
+
+            return AccessKeySaveLocation.ProtectedLocalStorage;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            TryWriteProcess(key);
+
+            return AccessKeySaveLocation.ProtectedLocalStorage;
+        }
+    }
+
+    private void TryWriteProcess(string key)
+    {
+        try
+        {
+            _writeEnvironment(
+                EnvironmentVariableTarget.Process,
+                key);
+        }
+        catch (SecurityException)
+        {
+            // DPAPI 中已经有可用密钥
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // DPAPI 中已经有可用密钥
+        }
+    }
+}
+</code></pre>
+<p>这里最重要的设计是：</p>
+<pre><code>_protectedStore.Save(key);
+</code></pre>
+<p>必须先成功。</p>
+<p>用户环境变量只是兼容同步，不能再成为整个保存操作的单点故障。</p>
+<hr>
+<h2 id="八为什么-dpapi-必须优先于环境变量">八、为什么 DPAPI 必须优先于环境变量</h2>
+<p>旧进程启动时可能已经继承了一份旧环境变量。</p>
+<p>如果仍然优先读取进程环境变量，就可能出现：</p>
+<ol>
+<li>用户在界面保存了新密钥；</li>
+<li>新密钥已经写入 DPAPI；</li>
+<li>但当前进程仍保留旧环境变量；</li>
+<li>程序再次读取时又拿到旧密钥；</li>
+<li>服务器持续认证失败。</li>
+</ol>
+<p>所以读取顺序必须是：</p>
+<pre><code>DPAPI &gt; Process 环境变量 &gt; User 环境变量
+</code></pre>
+<p>这保证用户刚刚保存的新值不会被旧进程继承的环境变量覆盖。</p>
+<hr>
+<h2 id="九界面提示也要同步修改">九、界面提示也要同步修改</h2>
+<p>原来的界面可能显示：</p>
+<pre><code>访问密钥已从环境变量加载
+</code></pre>
+<p>改用 DPAPI 后，这种提示就不准确了。</p>
+<p>建议使用不暴露存储细节的通用状态：</p>
+<pre><code>访问密钥：已安全加载。
+</code></pre>
+<p>如果用户环境变量写入被拒绝，可以显示：</p>
+<pre><code>该电脑禁止写入用户环境变量，
+访问密钥已使用 Windows 当前用户加密存储。
+</code></pre>
+<p>认证失败时则显示：</p>
+<pre><code>访问密钥已安全保存，但服务器认证失败。
+请确认服务端配置了相同密钥。
+</code></pre>
+<p>注意不要在界面、日志或异常信息中输出：</p>
+<ul>
+<li>密钥原文；</li>
+<li>密钥开头或结尾；</li>
+<li>HTTP 请求头；</li>
+<li>完整配置文件；</li>
+<li>服务器生产地址。</li>
+</ul>
+<hr>
+<h2 id="十如何测试系统策略拒绝环境变量写入">十、如何测试系统策略拒绝环境变量写入</h2>
+<p>这类问题通常只在特定电脑出现，开发电脑未必可以稳定复现。</p>
+<p>解决办法是把环境变量读写封装成可注入委托，在测试中主动抛出 <code>SecurityException</code>。</p>
+<pre><code>[Fact]
+public void FallsBackToDpapiWhenUserEnvironmentIsDenied()
+{
+    string? processValue = null;
+
+    var store = new ProtectedAccessKeyStore(
+        Path.Combine(
+            Path.GetTempPath(),
+            Guid.NewGuid() + ".dat"));
+
+    var persistence = new AccessKeyPersistence(
+        store,
+        readEnvironment: target =&gt;
+            target == EnvironmentVariableTarget.Process
+                ? processValue
+                : null,
+        writeEnvironment: (target, value) =&gt;
+        {
+            if (target == EnvironmentVariableTarget.User)
+            {
+                throw new SecurityException(
+                    "Simulated policy denial");
+            }
+
+            processValue = value;
+        });
+
+    string key = new string('k', 32);
+
+    AccessKeySaveLocation location =
+        persistence.Save(key);
+
+    Assert.Equal(
+        AccessKeySaveLocation.ProtectedLocalStorage,
+        location);
+
+    Assert.Equal(
+        key,
+        persistence.ReadOptional());
+
+    Assert.Equal(
+        key,
+        processValue);
+}
+</code></pre>
+<p>这个测试验证了三个关键点：</p>
+<ul>
+<li>用户环境变量写入失败时，保存操作不会整体失败；</li>
+<li>DPAPI 中的密钥仍然可以读取；</li>
+<li>当前程序可以立即使用新密钥。</li>
+</ul>
+<p>还应该增加以下测试：</p>
+<ul>
+<li>少于最小长度的密钥不能保存；</li>
+<li>包含空白或控制字符的密钥不能保存；</li>
+<li>加密文件中不能找到密钥的 UTF-8 明文字节；</li>
+<li>DPAPI 值优先于旧进程环境变量；</li>
+<li>加密文件损坏时程序能够安全返回未配置状态；</li>
+<li>切换 Windows 用户后不能直接解密原文件。</li>
+</ul>
+<hr>
+<h2 id="十一dpapi-的安全边界">十一、DPAPI 的安全边界</h2>
+<p>DPAPI 解决的是“敏感数据不以明文落盘”，但它不是万能保险箱。</p>
+<p>使用 <code>CurrentUser</code> 时，应注意：</p>
+<h3 id="1-同一用户下的其他进程仍然需要被信任">1. 同一用户下的其他进程仍然需要被信任</h3>
+<p>微软文档指出，<code>CurrentUser</code> 保护的数据绑定到当前用户上下文，但运行在相同用户凭据下的程序也可能访问对应的保护能力。</p>
+<p>因此 DPAPI 不能防御：</p>
+<ul>
+<li>已经控制当前用户会话的恶意软件；</li>
+<li>能够在当前用户权限下运行的木马；</li>
+<li>进程内存读取；</li>
+<li>应用自身主动泄露解密结果。</li>
+</ul>
+<h3 id="2-加密文件不能直接复制到另一台电脑使用">2. 加密文件不能直接复制到另一台电脑使用</h3>
+<p>更换以下任一条件后，原文件可能无法解密：</p>
+<ul>
+<li>Windows 用户；</li>
+<li>用户配置文件；</li>
+<li>系统安装；</li>
+<li>电脑；</li>
+<li>用户安全标识；</li>
+<li>DPAPI 主密钥状态。</li>
+</ul>
+<p>因此换电脑后，应让用户重新输入服务器密钥，而不是复制 <code>access-key.dat</code>。</p>
+<h3 id="3-附加熵不是需要用户保管的密码">3. 附加熵不是需要用户保管的密码</h3>
+<p>传给 <code>ProtectedData.Protect</code> 的 entropy 用来增加保护上下文的一致性和隔离性。</p>
+<p>它可以作为程序常量，但不要把它误认为真正的加密主密钥。真正的保护能力仍来自 Windows DPAPI 和当前用户凭据。</p>
+<h3 id="4-网络传输仍然必须使用-https">4. 网络传输仍然必须使用 HTTPS</h3>
+<p>DPAPI 只保护磁盘上的本地密钥，不保护网络传输。</p>
+<p>客户端向服务器发送密钥时仍然应该：</p>
+<ul>
+<li>使用 HTTPS；</li>
+<li>禁止将认证头转发到其他域名；</li>
+<li>谨慎处理 HTTP 重定向；</li>
+<li>不在日志中记录完整请求头；</li>
+<li>服务端采用恒定时间比较或成熟认证组件；</li>
+<li>支持密钥轮换。</li>
+</ul>
+<hr>
+<h2 id="十二最终效果">十二、最终效果</h2>
+<p>修改后，两类电脑都可以正常使用。</p>
+<h3 id="普通电脑">普通电脑</h3>
+<pre><code>保存 DPAPI
+    ↓
+同步用户环境变量
+    ↓
+更新当前进程
+    ↓
+立即验证服务器
+</code></pre>
+<h3 id="禁止写用户环境变量的电脑">禁止写用户环境变量的电脑</h3>
+<pre><code>保存 DPAPI
+    ↓
+用户环境变量写入被拒绝
+    ↓
+自动回退
+    ↓
+更新当前进程
+    ↓
+立即验证服务器
+</code></pre>
+<p>用户不需要：</p>
+<ul>
+<li>以管理员身份运行；</li>
+<li>手动修改注册表；</li>
+<li>执行 PowerShell 脚本；</li>
+<li>把密钥写进 JSON；</li>
+<li>了解环境变量的继承机制。</li>
+</ul>
+<hr>
+<h2 id="十三这次排查得到的经验">十三、这次排查得到的经验</h2>
+<h3 id="1-不要把管理员也失败理解成权限不够">1. 不要把“管理员也失败”理解成权限不够</h3>
+<p>权限异常可能来自安全策略、用户配置、注册表 ACL 或终端防护，而不是简单的 UAC。</p>
+<h3 id="2-使用对照实验缩小范围">2. 使用对照实验缩小范围</h3>
+<p>“空密钥成功、填写密钥失败”比反复重装程序更有价值。</p>
+<p>它直接证明普通配置存储正常，故障只在密钥持久化路径。</p>
+<h3 id="3-环境变量不是可靠的桌面端密码存储">3. 环境变量不是可靠的桌面端密码存储</h3>
+<p>环境变量适合部署和进程配置，但不应该成为普通桌面软件唯一的敏感信息持久化方案。</p>
+<h3 id="4-兼容层不能成为主流程的单点故障">4. 兼容层不能成为主流程的单点故障</h3>
+<p>旧机制可以保留，但失败时不能阻止新机制工作。</p>
+<h3 id="5-安全存储必须有可模拟的失败测试">5. 安全存储必须有可模拟的失败测试</h3>
+<p>不要等待特定电脑再次出现问题。通过依赖注入主动抛出 <code>SecurityException</code>，才能形成稳定的回归测试。</p>
+<hr>
+<h2 id="总结">总结</h2>
+<p>本次问题的真正根因不是服务器配置，也不是 WPF 配置文件无法写入，而是：</p>
+<pre><code>Environment.SetEnvironmentVariable(
+    ...,
+    EnvironmentVariableTarget.User)
+</code></pre>
+<p>在部分 Windows 环境中被系统策略或权限控制拒绝。</p>
+<p>最终解决方案是：</p>
+<pre><code>DPAPI CurrentUser 作为可靠主存储
++ 当前进程环境变量用于立即生效
++ 用户环境变量作为兼容性同步
++ 写入被拒绝时自动回退
+</code></pre>
+<p>这套设计既避免了明文保存密钥，也不要求管理员权限，还兼容旧脚本和旧版本程序。</p>
+<p>对于需要保存 API Key、访问令牌、连接密码等敏感信息的 Windows 桌面程序，这种模式同样具有参考价值。</p>
+<hr>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/api/system.environment.setenvironmentvariable" target="_blank" rel="noopener nofollow">Environment.SetEnvironmentVariable</a></li>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/api/system.environmentvariabletarget" target="_blank" rel="noopener nofollow">EnvironmentVariableTarget</a></li>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.protecteddata.protect" target="_blank" rel="noopener nofollow">ProtectedData.Protect</a></li>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.dataprotectionscope" target="_blank" rel="noopener nofollow">DataProtectionScope</a></li>
+<li><a href="https://learn.microsoft.com/en-us/dotnet/standard/security/how-to-use-data-protection" target="_blank" rel="noopener nofollow">Microsoft：How to use Data Protection</a></li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-12 09:56">2026-08-12 09:55</span>&nbsp;
+<a href="https://www.cnblogs.com/OakMaker">.Peter</a>&nbsp;
+阅读(<span id="post_view_count">237</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22414557);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FOakMaker%2Fp%2F22414557&amp;targetId=22414557&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
