@@ -1,0 +1,147 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/A381532662/p/22638129" title="发布于 2026-08-23 08:46">
+    
+
+    <span role="heading" aria-level="2">给搜索数据采集加缓存层：省 credits、降延迟、防重复的工程实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>后台接搜索数据接口，第一反应是「怎么把请求发出去」。但跑一段时间你会发现，真正决定体验的是「<strong>怎么少发请求</strong>」——同一批关键词今天查完明天还查，中间没变化，重复请求就是纯浪费。这篇记录我给 SERP 采集任务加缓存层的完整过程：缓存键怎么设计、TTL 怎么定、怎么和接口的计费机制配合。</p>
+<h2 id="为什么需要缓存">为什么需要缓存</h2>
+<p>我的采集任务是「每天定时查几十个关键词的排名和结果」。观察到两个事实：</p>
+<ol>
+<li><strong>短期数据重复</strong>：同一关键词一天内查 3 次，结果几乎不变</li>
+<li><strong>批量任务有重复</strong>：不同功能模块（排名、快照、报表）会查同一个词</li>
+</ol>
+<p>没缓存时，这些重复请求都真实扣费。加一层缓存，效果立竿见影：请求量降了约 60%，延迟也从「等接口」变成「读缓存」。</p>
+<h2 id="第一步先看清接口的计费结构">第一步：先看清接口的计费结构</h2>
+<p>设计缓存前，我核对了数据源 SerpBase（官网 serpbase.dev，<code>/google/search</code> 端点）的计费规则：</p>
+<ul>
+<li><code>/google/search</code>、<code>/google/news</code>、<code>/google/videos</code> 每次 <strong>1 credits</strong></li>
+<li><code>/google/images</code> 和两个 Maps 端点每次 <strong>2 credits</strong></li>
+<li>请求失败和上游超时<strong>自动退 credits</strong>（所以缓存命中省的是真金白银，缓存缺失的失败也不算亏）</li>
+</ul>
+<p>图片端点 2 credits，意味着缓存它的收益是搜索端点的 2 倍——按「缓存收益 = 端点费率」排优先级，先缓存贵的。</p>
+<h2 id="第二步缓存键设计">第二步：缓存键设计</h2>
+<p>缓存键要能唯一对应一次请求。请求参数有 <code>q</code>、<code>hl</code>、<code>gl</code>、<code>page</code>、<code>device</code>，键就该把这些都拼进去，缺一个都会串数据：</p>
+<pre><code class="language-python">import hashlib
+import json
+
+def cache_key(endpoint, params):
+    raw = json.dumps({"endpoint": endpoint, "params": params}, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+</code></pre>
+<p>用 <code>sort_keys=True</code> 保证参数顺序不影响键。同样的参数，永远命中同一个缓存。</p>
+<h2 id="第三步本地缓存最简单版本">第三步：本地缓存（最简单版本）</h2>
+<p>如果任务单机跑，用磁盘 JSON 文件就行，不引入外部依赖：</p>
+<pre><code class="language-python">import json
+import os
+import time
+
+CACHE_DIR = "./serp_cache"
+
+def get_from_cache(key):
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        entry = json.load(f)
+    if entry["expire_at"] &lt; time.time():
+        return None   # 过期当 miss
+    return entry["data"]
+
+def put_to_cache(key, data, ttl_seconds):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"expire_at": time.time() + ttl_seconds, "data": data}, f)
+</code></pre>
+<h2 id="第四步缓存优先的请求封装">第四步：缓存优先的请求封装</h2>
+<p>把缓存逻辑包进请求函数，调用方无感知：</p>
+<pre><code class="language-python">import requests
+
+API_KEY = "你的Key"
+URL = "https://api.serpbase.dev/google/search"
+HEADERS = {"Content-Type": "application/json", "X-API-Key": API_KEY}
+
+def cached_search(params, ttl_seconds=3600, endpoint="/google/search"):
+    key = cache_key(endpoint, params)
+
+    hit = get_from_cache(key)
+    if hit is not None:
+        return hit, "cache"
+
+    resp = requests.post(
+        f"https://api.serpbase.dev{endpoint}",
+        headers=HEADERS, json=params, timeout=30,
+    )
+    data = resp.json()
+    if data.get("status") == 0:
+        put_to_cache(key, data, ttl_seconds)
+    return data, "remote"
+
+# 用法：同一关键词一小时内反复调，只有第一次真的发请求
+data, source = cached_search({"q": "serp api", "hl": "en", "gl": "us"})
+print(f"数据来源: {source}")   # 第一次 remote，之后 cache
+</code></pre>
+<h2 id="第五步ttl-怎么定经验值">第五步：TTL 怎么定（经验值）</h2>
+<p>缓存的核心参数是 TTL——太短省不了钱，太长拿不到最新数据。我的经验值：</p>
+<ul>
+<li><strong>排名监控</strong>：4 小时 TTL。排名一天内变化不剧烈，4 小时足够新</li>
+<li><strong>关键词快照</strong>：24 小时 TTL。日报场景，一天一查</li>
+<li><strong>热点/新闻类</strong>：不缓存或 15 分钟 TTL。时效性要求高</li>
+</ul>
+<p>按「数据变化的快慢」分配 TTL，而不是一刀切。</p>
+<h2 id="第六步多机环境上-redis">第六步：多机环境上 Redis</h2>
+<p>如果采集任务分布在多台机器，本地文件缓存会各自为战，重复就回来了。这种情况换成 Redis，逻辑一样：</p>
+<pre><code class="language-python">import redis
+
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+def cached_search_redis(params, ttl_seconds=3600):
+    key = cache_key("/google/search", params)
+    hit = r.get(key)
+    if hit:
+        return json.loads(hit), "cache"
+    data, _ = cached_search(params)   # 复用上面的远程请求逻辑
+    if data.get("status") == 0:
+        r.setex(key, ttl_seconds, json.dumps(data))
+    return data, "remote"
+</code></pre>
+<p><code>setex</code> 同时设值和过期时间，天然防「键永久滞留」。</p>
+<h2 id="踩坑记录">踩坑记录</h2>
+<p><strong>坑 1：把 <code>request_id</code> 也缓存了。</strong> 第一版直接缓存整个响应，导致日志里大量重复 request_id，排查问题时无法定位到真实请求。解决：缓存前把 <code>request_id</code>、<code>elapsed_ms</code> 清掉或单独记录，缓存里的数据只留业务字段。</p>
+<p><strong>坑 2：缓存键漏了 <code>page</code> 参数。</strong> 只拼了 <code>q</code>，结果第 1 页和第 2 页串了。解决：键必须包含全部请求参数。</p>
+<p><strong>坑 3：TTL 一刀切。</strong> 所有数据都设 24 小时，排名监控拿不到当日变化。解决：按场景分 TTL，如上文。</p>
+<h2 id="效果沉淀">效果沉淀</h2>
+<p>加上缓存层后：</p>
+<ul>
+<li>请求量降约 60%，credits 消耗同步下降</li>
+<li>重复查询延迟从「秒级」降到「毫秒级」（读本地文件/Redis）</li>
+<li>批量任务和多个功能模块之间不再重复扣费</li>
+</ul>
+<p>缓存不是复杂的活，但它是采集系统「省钱 + 提速」性价比最高的一笔投入。</p>
+<p>接口的计费规则和 <code>status</code>/<code>credits_charged</code> 字段语义在 <a href="https://serpbase.dev/docs" target="_blank" rel="noopener nofollow">SerpBase 官方文档</a>。先把缓存键和 TTL 定好，你的采集任务就少了一半的无谓消耗。</p>
+<p>有在缓存层踩过坑的同学，欢迎交流你的 TTL 策略。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-23 08:47">2026-08-23 08:46</span>&nbsp;
+<a href="https://www.cnblogs.com/A381532662">蜘蛛人</a>&nbsp;
+阅读(<span id="post_view_count">35</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22638129);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FA381532662%2Fp%2F22638129&amp;targetId=22638129&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
