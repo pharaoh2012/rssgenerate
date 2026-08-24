@@ -1,0 +1,276 @@
+
+        <div class="postTitle">
+            <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/amosli/p/22652811" title="发布于 2026-08-24 12:35">
+    
+
+    <span role="heading" aria-level="2">记一次 yfinance 源码调试：SOCKS5 代理下 Chart API 正常，历史数据却一直超时</span>
+    
+
+</a>
+
+        </div>
+        <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="记一次-yfinance-源码调试socks5-代理下-chart-api-正常历史数据却一直超时">记一次 yfinance 源码调试：SOCKS5 代理下 Chart API 正常，历史数据却一直超时</h1>
+<blockquote>
+<p>环境：Linux / Python 3.12 / yfinance 1.6.0（源码仓库）/ curl_cffi<br>
+最终成果：定位并修复 yfinance 的 4 处问题，补丁已提交官方 PR：<a href="https://github.com/ranaroussi/yfinance/pull/2953" target="_blank" rel="noopener nofollow">https://github.com/ranaroussi/yfinance/pull/2953</a></p>
+</blockquote>
+<h2 id="一需求背景">一、需求背景</h2>
+<p>因为网络环境限制，需要通过本地 SOCKS5 代理访问 Yahoo Finance，并且希望用 <code>curl_cffi</code> 模拟 Firefox 指纹、走 HTTP/2。代码大概是这样：</p>
+<pre><code class="language-python">from curl_cffi import CurlHttpVersion, requests
+import yfinance as yf
+
+proxy = "socks5h://127.0.0.1:1080"
+session = requests.Session(
+    impersonate="firefox",
+    http_version=CurlHttpVersion.V2TLS,
+    proxies={"http": proxy, "https": proxy},
+)
+
+tk = yf.Ticker("005930.KS", session=session)
+df = tk.history(start="2026-08-01", end="2026-08-23", interval="1d", auto_adjust=True)
+</code></pre>
+<p>诡异的地方来了——<strong>用同一个 session 直接请求 Chart API 一切正常</strong>：</p>
+<pre><code class="language-python">resp = session.get(
+    "https://query1.finance.yahoo.com/v8/finance/chart/005930.KS?range=5d&amp;interval=1d",
+    timeout=30,
+)
+print(resp.status_code, resp.http_version)
+# 输出: 200 HTTP/3   （代理、指纹、HTTP/2 全部生效）
+</code></pre>
+<p>但一调 <code>tk.history()</code> 就挂：</p>
+<pre><code class="language-text">Cookie/crumb fetch failed (Timeout), continuing without crumb
+Failed to get ticker '005930.KS' reason: Failed to perform,
+curl: (28) Connection timed out after 10002 milliseconds.
+</code></pre>
+<p>Chart API 明明是通的，为什么 yfinance 内部就超时？</p>
+<h2 id="二排查过程">二、排查过程</h2>
+<h3 id="21-先看失败调用栈">2.1 先看失败调用栈</h3>
+<p>开启 <code>yf.enable_debug_mode()</code> 后观察日志，失败发生在 yfinance 内部初始化阶段：</p>
+<pre><code class="language-text">yfinance
+  -&gt; _get_ticker_tz()
+  -&gt; _get_cookie_and_crumb()
+  -&gt; _get_cookie_basic()      # 访问 https://fc.yahoo.com
+  -&gt; _get_crumb_basic()       # 访问 https://query1.../v1/test/getcrumb
+</code></pre>
+<p>也就是说 yfinance 在发真正的数据请求前，会先请求两个"辅助接口"：</p>
+<ul>
+<li><code>https://fc.yahoo.com</code> —— 获取 Cookie</li>
+<li><code>https://query1.finance.yahoo.com/v1/test/getcrumb</code> —— 获取 crumb</li>
+</ul>
+<p>在我的代理链路下，<code>fc.yahoo.com</code> 经常 <code>curl: (28)</code> 超时，getcrumb 有时返回 429。</p>
+<h3 id="22-疑点为什么直接请求没事">2.2 疑点：为什么直接请求没事？</h3>
+<p>一开始以为是代理问题、指纹问题、HTTP 版本问题。但直接用 session 请求 getcrumb 也是成功的：</p>
+<pre><code class="language-python">resp = session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=30)
+print(resp.status_code, resp.http_version)   # 200 HTTP/3
+</code></pre>
+<p>同样的 session、同样的代理，yfinance 里就不行——<strong>说明问题在 yfinance 对 session 做了什么手脚</strong>。</p>
+<h3 id="23-读源码找到真凶">2.3 读源码找到真凶</h3>
+<p>翻 <code>yfinance/data.py</code>，在 <code>YfData._make_request()</code> 开头发现了这一行：</p>
+<pre><code class="language-python"># sync with config
+self._session.proxies = _normalize_proxy(YfConfig.network.proxy)
+</code></pre>
+<p>而 <code>_normalize_proxy</code> 是这样：</p>
+<pre><code class="language-python">def _normalize_proxy(proxy):
+    if isinstance(proxy, str):
+        return {"http": proxy, "https": proxy}
+    return proxy      # None 进来还是 None！
+</code></pre>
+<p>破案了：</p>
+<ul>
+<li>我把代理配置在 <strong>session 上</strong>，但没有调 <code>yf.set_config(proxy=...)</code></li>
+<li>于是全局配置 <code>YfConfig.network.proxy</code> 是默认的 <code>None</code></li>
+<li><code>_make_request()</code> 每次请求前都执行"同步配置"，把 <code>None</code> 赋给了 <code>session.proxies</code></li>
+<li><strong>我设置的 SOCKS5 代理被静默清空了</strong></li>
+<li>之后所有请求裸连 Yahoo → <code>curl: (28) timeout after 10002ms</code>（history 默认 timeout=10 秒）</li>
+</ul>
+<p>这也完美解释了为什么 <code>fc.yahoo.com</code> 那一步反而能降级——它走的是裸 <code>session.get()</code>，不经过 <code>_make_request()</code>，代理还在（虽然 fc.yahoo.com 本身经常慢）。</p>
+<h2 id="三顺藤摸瓜又发现-3-处健壮性问题">三、顺藤摸瓜：又发现 3 处健壮性问题</h2>
+<p>修复代理问题的过程中，发现 Cookie/crumb 流程还有几处设计缺陷：</p>
+<h3 id="问题-1fcyahoocom-超时是致命的">问题 1：<code>fc.yahoo.com</code> 超时是致命的</h3>
+<pre><code class="language-python">def _get_cookie_basic(self, timeout=30):
+    ...
+    try:
+        self._session.get(url='https://fc.yahoo.com', ...)
+    except requests.exceptions.DNSError as e:
+        return False          # 只捕获 DNS 错误！
+    ...
+</code></pre>
+<p>只捕获了 <code>DNSError</code>。而代理环境下更常见的是超时（curl error 28），直接往上抛，整个请求报废。可问题是——<strong>Chart API 根本不需要这个 Cookie</strong>。</p>
+<h3 id="问题-2getcrumb-返回-429-也致命">问题 2：getcrumb 返回 429 也致命</h3>
+<pre><code class="language-python">if crumb_response.status_code == 429 or "Too Many Requests" in self._crumb:
+    raise YFRateLimitError()
+</code></pre>
+<p>getcrumb 被 429 了就直接中止整个请求。但很多接口（比如 Chart API）没有 crumb 也能正常工作。</p>
+<h3 id="问题-3重试分支会把-crumb-none-写进参数">问题 3：重试分支会把 <code>'crumb': None</code> 写进参数</h3>
+<p>400+ 重试分支里二次取 crumb 失败时，<code>request_args['params']['crumb'] = crumb</code> 会写入 <code>None</code>，产生一个坏参数。</p>
+<h2 id="四修复方案">四、修复方案</h2>
+<p>全部改动集中在 <code>yfinance/data.py</code>，共 4 处，不改任何公开 API：</p>
+<h3 id="41-不再清空用户-session-上的代理核心-bug">4.1 不再清空用户 session 上的代理（核心 bug）</h3>
+<pre><code class="language-python"># sync with config, but never wipe proxies set directly on a
+# user-supplied session (e.g. SOCKS5 via curl_cffi)
+if YfConfig.network.proxy is not None:
+    self._session.proxies = _normalize_proxy(YfConfig.network.proxy)
+</code></pre>
+<p>只有显式配置了全局代理才覆盖，用户的 session 配置优先。</p>
+<h3 id="42-fcyahoocom-超时降级">4.2 fc.yahoo.com 超时降级</h3>
+<pre><code class="language-python">except requests.exceptions.DNSError as e:
+    ...
+    return False
+except Exception as e:
+    if _is_transient_error(e):
+        utils.get_yf_logger().warning(
+            f"Cookie fetch from fc.yahoo.com failed ({type(e).__name__}), continuing without it")
+        return False
+    raise
+</code></pre>
+<p>超时/连接错误与 DNS 错误同等对待：记 warning，继续。</p>
+<h3 id="43-crumb-获取失败降级为无-crumb-请求">4.3 crumb 获取失败降级为无 crumb 请求</h3>
+<pre><code class="language-python">try:
+    crumb, strategy = self._get_cookie_and_crumb()
+except YFRateLimitError:
+    utils.get_yf_logger().warning(
+        "Crumb fetch rate-limited (HTTP 429), continuing without crumb")
+    crumb, strategy = None, self._cookie_strategy
+except Exception as e:
+    if _is_transient_error(e):
+        crumb, strategy = None, self._cookie_strategy
+    else:
+        raise
+</code></pre>
+<p>需要 crumb 的接口（如 quoteSummary）拿不到 crumb 自然会失败，走已有的策略切换重试；目标接口真正的 429 依然抛 <code>YFRateLimitError</code>，不会掩盖限流。</p>
+<h3 id="44-重试分支不再写-crumb-none">4.4 重试分支不再写 <code>'crumb': None</code></h3>
+<p>二次取 crumb 失败时直接省略该参数。</p>
+<h2 id="五测试验证">五、测试验证</h2>
+<p>新增 <code>tests/test_cookie_crumb_degradation.py</code>，6 个用例：</p>
+<table>
+<thead>
+<tr>
+<th>测试</th>
+<th>验证内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_fc_yahoo_timeout_is_not_fatal</code></td>
+<td>fc.yahoo.com 超时 → 降级不抛异常</td>
+</tr>
+<tr>
+<td><code>test_getcrumb_429_degrades_to_no_crumb_request</code></td>
+<td>getcrumb 429 → 无 crumb 继续，Chart 仍 200</td>
+</tr>
+<tr>
+<td><code>test_transient_crumb_failure_degrades</code></td>
+<td>getcrumb 超时 → Chart 仍 200</td>
+</tr>
+<tr>
+<td><code>test_target_429_still_raises_rate_limit</code></td>
+<td>目标接口真 429 → 仍正确抛 <code>YFRateLimitError</code></td>
+</tr>
+<tr>
+<td><code>test_custom_proxies_not_overwritten</code></td>
+<td>用户代理映射不被覆盖</td>
+</tr>
+<tr>
+<td><code>test_make_request_does_not_wipe_session_proxies</code></td>
+<td>回归：<code>_make_request</code> 不清空 session 代理</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-bash">pytest tests/test_cookie_crumb_degradation.py tests/test_data.py -q
+# 21 passed
+ruff check yfinance/data.py tests/test_cookie_crumb_degradation.py
+# All checks passed!
+</code></pre>
+<p>最终用真实代理实测原脚本：</p>
+<pre><code class="language-text">✅ 代理连通测试成功, HTTP 200, HTTP/3
+✅ 获取 Crumb 成功, HTTP 200, HTTP/3
+正在获取 005930.KS 历史数据...
+✅ 成功获取 14 条历史数据
+</code></pre>
+<h2 id="六提交给官方">六、提交给官方</h2>
+<p>改动小、向后兼容、带测试，于是整理成英文 Issue + PR 提交上游：</p>
+<ol>
+<li>Fork 官方仓库 → 建分支 <code>fix/cookie-crumb-proxy-resilience</code> → 只提交 <code>data.py</code> 和测试文件</li>
+<li>用 <code>gh pr create --repo ranaroussi/yfinance</code> 创建 PR：<br>
+<a href="https://github.com/ranaroussi/yfinance/pull/2953" target="_blank" rel="noopener nofollow">https://github.com/ranaroussi/yfinance/pull/2953</a></li>
+</ol>
+<p>中间还遇到一个小坑：SSH 22 端口被网络拦截（连到了一个假 IP），<code>git push</code> 一直报权限错误。解决方式是把 fork 远程改成 HTTPS，用 <code>gh auth git-credential</code> 做凭证推送。</p>
+<h2 id="七下载修复版源码--使用临时本地版本">七、下载修复版源码 / 使用临时本地版本</h2>
+<p>在官方合并 PR 之前，如果你的项目也被这个问题困扰，可以直接使用我 fork 里的修复分支：</p>
+<blockquote>
+<p><strong>修复版源码仓库：</strong> <a href="https://github.com/amosli/yfinance" target="_blank" rel="noopener nofollow">https://github.com/amosli/yfinance</a><br>
+<strong>分支：</strong> <code>fix/cookie-crumb-proxy-resilience</code>（基于官方 main + 本文全部修复）</p>
+</blockquote>
+<h3 id="方式一直接从-github-安装最简单推荐">方式一：直接从 GitHub 安装（最简单，推荐）</h3>
+<pre><code class="language-bash"># 激活你的项目虚拟环境后
+source .venv/bin/activate
+
+pip install --force-reinstall --no-deps \
+    "yfinance @ git+https://github.com/amosli/yfinance@fix/cookie-crumb-proxy-resilience"
+</code></pre>
+<ul>
+<li><code>--no-deps</code>：只替换 yfinance 本身，不动项目其他依赖</li>
+<li>验证安装来源：</li>
+</ul>
+<pre><code class="language-bash">python -c "import yfinance; print(yfinance.__file__)"
+# 路径应位于 site-packages 中，版本号与提交一致
+</code></pre>
+<p>也可以写进项目的 <code>pyproject.toml</code> 固定依赖：</p>
+<pre><code class="language-toml">[project]
+dependencies = [
+    "yfinance @ git+https://github.com/amosli/yfinance@fix/cookie-crumb-proxy-resilience",
+]
+</code></pre>
+<h3 id="方式二克隆源码--可编辑安装方便自己再改">方式二：克隆源码 + 可编辑安装（方便自己再改）</h3>
+<pre><code class="language-bash"># 1. 克隆修复分支
+git clone -b fix/cookie-crumb-proxy-resilience \
+    https://github.com/amosli/yfinance.git ~/yfinance-fix
+cd ~/yfinance-fix
+pip install -e .        # 建议在项目虚拟环境中执行
+
+# 2. 验证指向本地目录
+python -c "import yfinance; print(yfinance.__file__)"
+# 应输出 .../yfinance-fix/yfinance/__init__.py
+</code></pre>
+<p>可编辑安装的好处：以后 <code>cd ~/yfinance-fix &amp;&amp; git pull</code> 即可同步我的更新，所有使用该虚拟环境的项目即时生效，无需重装。</p>
+<h3 id="方式三只打补丁不换包适合已深度定制环境的场景">方式三：只打补丁，不换包（适合已深度定制环境的场景）</h3>
+<pre><code class="language-bash"># 从 fork 下载补丁文件应用到现有 yfinance 源码
+git clone -b fix/cookie-crumb-proxy-resilience \
+    https://github.com/amosli/yfinance.git /tmp/yfinance-fix
+cd &lt;你项目虚拟环境的 site-packages&gt;/yfinance
+patch -p1 &lt; /tmp/yfinance-fix/yfinance/data.py.diff   # 或直接覆盖 data.py
+</code></pre>
+<blockquote>
+<p>不推荐手改 <code>.venv/lib/python3.12/site-packages/yfinance/</code>——升级即丢失，且容易改出不一致状态。方式一/二更可控。</p>
+</blockquote>
+<h3 id="恢复官方版本">恢复官方版本</h3>
+<p>官方合并 PR 后（或想切回时）：</p>
+<pre><code class="language-bash">pip uninstall yfinance
+pip install yfinance          # 或指定版本: pip install yfinance==&lt;原版本号&gt;
+</code></pre>
+<h2 id="八经验总结">八、经验总结</h2>
+<ol>
+<li><strong>"直接请求没问题，进库就报错"，八成是库改了你的配置。</strong> 这次就是 yfinance 在每次请求前无条件覆盖 <code>session.proxies</code>。遇到这类问题，尽早读库源码，别只在网络层打转。</li>
+<li><strong>给库传自定义 session 时，要弄清哪些属性会被库覆盖/修改。</strong> 代理、headers、cookies 都是高危区。</li>
+<li><strong>非关键依赖应该优雅降级。</strong> yfinance 把 Cookie/crumb 这种"部分接口才需要的东西"做成了全量强依赖，代理环境下一颗老鼠屎坏一锅粥。</li>
+<li><strong>错误要区分对待。</strong> 代理不通、Yahoo 限流、辅助接口超时、目标接口失败，表现和处理方式完全不同，混在一起只会增加排障成本。</li>
+<li><strong>给开源项目报问题时带上根因分析和回归测试</strong>，合并的概率会大很多。</li>
+</ol>
+<hr>
+<p><em>官方合并前，可从 <a href="https://github.com/amosli/yfinance" target="_blank" rel="noopener nofollow">https://github.com/amosli/yfinance</a> 分支 <code>fix/cookie-crumb-proxy-resilience</code> 获取修复版；合并后建议切回 PyPI 官方版本。</em></p>
+
+
+</div>
+<div class="clear"></div>
+
+        <div class="postDesc">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-24 12:36">2026-08-24 12:35</span>&nbsp;
+<a href="https://www.cnblogs.com/amosli">Hi_Amos</a>&nbsp;
+阅读(<span id="post_view_count">44</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22652811);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Famosli%2Fp%2F22652811&amp;targetId=22652811&amp;targetType=0" target="_blank">举报</a>
+</div>
+    
