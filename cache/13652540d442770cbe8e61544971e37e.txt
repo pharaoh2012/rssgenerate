@@ -1,0 +1,510 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zrui-xyu/p/22648318" title="发布于 2026-08-24 09:28">
+    
+
+    <span role="heading" aria-level="2">Docker搭建Redis集群完全指南</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文带来 Docker Compose 部署 3 主 3 从 Redis Cluster 完整实战，覆盖架构设计、配置模板、自动化部署脚本与 Spring Boot Lettuce 接入方案。重点解析`cluster‑announce‑ip`、总线端口映射等核心配置，解决 MOVED 重定向、容器重启集群崩溃、从节点无法晋升等高频生产坑点，附带调优、监控告警与故障排查清单，代码可直接复用，适合面试复习与生产落地。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="docker-搭建-redis-集群完全指南从原理到生产落地踩坑实录">Docker 搭建 Redis 集群完全指南：从原理到生产落地，踩坑实录</h1>
+<blockquote>
+<p>一篇讲透 Docker 环境下 Redis Cluster 的搭建、调优与生产级实战。含完整代码、避坑清单和 Spring Boot 接入方案，收藏即可复用。</p>
+</blockquote>
+<hr>
+<h2 id="为什么需要这篇">为什么需要这篇？</h2>
+<p>Redis 集群是后端面试的高频考点，也是生产环境的高可用基石。但网上的教程大多停留在「跑通 demo」层面，真正落地时你会遇到：容器重启后集群崩溃、客户端被 <code>MOVED</code> 重定向到 <code>127.0.0.1</code>、从节点无法自动晋升……</p>
+<p>这篇文章把 <strong>设计思路、完整代码、核心踩坑、生产调优、应用接入</strong> 一次讲清楚。所有代码均可直接复制使用。</p>
+<hr>
+<h2 id="一整体架构设计">一、整体架构设计</h2>
+<p>采用 <strong>Redis Cluster 原生方案 + Docker Compose 编排</strong>，最小高可用规格为 <strong>3 主 3 从共 6 节点</strong>：</p>
+<ul>
+<li>3 个主节点分担 16384 个哈希槽，负责读写</li>
+<li>3 个从节点分别与主节点一一对应，提供故障转移能力</li>
+<li>通过 Docker 自定义桥接网络实现容器间固定 IP 通信</li>
+</ul>
+<pre><code>
+</code></pre>
+<pre><code>┌──────────────────────────────────────────┐
+    │         Docker Bridge Network             │
+    │     (redis-cluster-net, 172.28.0.0/16)    │
+    └──────────────────────────────────────────┘
+        ↑          ↑          ↑          ↑
+</code></pre>
+<p>┌────────┴───┐ ┌───┴──────┐ ┌─┴────────┐ ┌─┴────────┐<br>
+│ redis-7001 │ │redis-7002│ │redis-7003│ │  ...     │<br>
+│   (主)     │ │  (主)    │ │  (主)    │ │redis-7006│<br>
+└────────┬───┘ └───┬──────┘ └─┬────────┘ └─┬────────┘<br>
+↑          ↑          ↑             ↑<br>
+┌────────┴───┐ ┌───┴──────┐ ┌─┴────────┐ ┌─┴────────┐<br>
+│ redis-7004 │ │redis-7005│ │redis-7006│ │  (从)    │<br>
+│   (从)     │ │  (从)    │ │  (从)    │ │          │<br>
+└────────────┘ └──────────┘ └──────────┘ └──────────┘</p>
+<pre><code>### 节点拓扑规划
+
+| 节点序号 | 容器名 | 服务端口 | 集群总线端口 | 初始角色 | 固定 IP |
+|----------|--------|----------|--------------|----------|---------|
+| 1 | redis-7001 | 7001 | 17001 | 主节点 | 172.28.0.11 |
+| 2 | redis-7002 | 7002 | 17002 | 主节点 | 172.28.0.12 |
+| 3 | redis-7003 | 7003 | 17003 | 主节点 | 172.28.0.13 |
+| 4 | redis-7004 | 7004 | 17004 | 从节点 | 172.28.0.14 |
+| 5 | redis-7005 | 7005 | 17005 | 从节点 | 172.28.0.15 |
+| 6 | redis-7006 | 7006 | 17006 | 从节点 | 172.28.0.16 |
+
+&gt; **关键概念**：集群总线端口 = 服务端口 + 10000，是节点间心跳同步、故障转移、数据迁移的专用通道。**必须与服务端口一起映射**，否则 `CLUSTER MEET` 直接失败，这是 90% 新手组网踩的第一个坑。
+
+---
+
+## 二、落地实操：从 0 到集群
+
+### Step 1：准备配置文件
+
+每个节点独立一份 `redis.conf`，以下是生产级完整配置模板（以 7001 节点为例，其余节点仅改端口和 IP）：
+
+```conf
+# ========== 基础网络 ==========
+bind 0.0.0.0
+protected-mode no
+port 6379
+daemonize no
+
+# ========== 集群核心 ==========
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 5000
+
+# 🔥 关键三件套：显式声明对外访问地址，彻底解决 MOVED 重定向到内网/回环地址的问题
+cluster-announce-ip 172.28.0.11        # 容器固定 IP
+cluster-announce-port 6379             # 容器内服务端口
+cluster-announce-bus-port 16379        # 容器内总线端口
+
+# ========== 安全认证（生产必开）==========
+# 所有节点密码必须完全一致
+requirepass your_redis_pwd
+masterauth your_redis_pwd
+
+# ========== 持久化 ==========
+appendonly yes
+appendfsync everysec
+save 900 1
+save 300 10
+
+# ========== 内存管理 ==========
+maxmemory 400mb
+maxmemory-policy allkeys-lru
+</code></pre>
+<p><strong>亮点解读：</strong></p>
+<ul>
+<li><code>cluster-announce-*</code> 三件套配置：显式声明节点对外地址，防止容器重启后 IP 漂移导致集群脑裂，这是最容易被忽略的关键配置</li>
+<li><code>requirepass</code> + <code>masterauth</code> 双保险：前者管控客户端访问，后者保障主从同步和总线通信认证，缺一不可</li>
+<li><code>maxmemory</code> + <code>allkeys-lru</code>：前置内存上限和淘汰策略，防止大 key 或流量突增导致节点 OOM</li>
+</ul>
+<h3 id="step-2编写-docker-composeyml">Step 2：编写 docker-compose.yml</h3>
+<pre><code class="language-yaml">version: '3.8'
+
+# 自定义静态子网，彻底解决容器重启 IP 漂移问题
+networks:
+  redis-cluster-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  redis-7001:
+    image: redis:7.2.5-alpine
+    container_name: redis-7001
+    restart: always
+    ports:
+      - "7001:6379"       # 客户端通信端口
+      - "17001:16379"     # 集群总线端口（Gossip 协议专用）
+    volumes:
+      - ./cluster/7001/redis.conf:/etc/redis/redis.conf
+      - ./cluster/7001/data:/data    # 全量挂载：含 AOF/RDB + 集群元数据 nodes.conf
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.11
+    mem_limit: 512m       # 资源配额，防止单节点 OOM 拖垮宿主机
+    cpus: "0.5"
+    command: redis-server /etc/redis/redis.conf
+
+  redis-7002:
+    image: redis:7.2.5-alpine
+    container_name: redis-7002
+    restart: always
+    ports:
+      - "7002:6379"
+      - "17002:16379"
+    volumes:
+      - ./cluster/7002/redis.conf:/etc/redis/redis.conf
+      - ./cluster/7002/data:/data
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.12
+    mem_limit: 512m
+    cpus: "0.5"
+    command: redis-server /etc/redis/redis.conf
+
+  redis-7003:
+    image: redis:7.2.5-alpine
+    container_name: redis-7003
+    restart: always
+    ports:
+      - "7003:6379"
+      - "17003:16379"
+    volumes:
+      - ./cluster/7003/redis.conf:/etc/redis/redis.conf
+      - ./cluster/7003/data:/data
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.13
+    mem_limit: 512m
+    cpus: "0.5"
+    command: redis-server /etc/redis/redis.conf
+
+  redis-7004:
+    image: redis:7.2.5-alpine
+    container_name: redis-7004
+    restart: always
+    ports:
+      - "7004:6379"
+      - "17004:16379"
+    volumes:
+      - ./cluster/7004/redis.conf:/etc/redis/redis.conf
+      - ./cluster/7004/data:/data
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.14
+    mem_limit: 512m
+    cpus: "0.5"
+    command: redis-server /etc/redis/redis.conf
+
+  redis-7005:
+    image: redis:7.2.5-alpine
+    container_name: redis-7005
+    restart: always
+    ports:
+      - "7005:6379"
+      - "17005:16379"
+    volumes:
+      - ./cluster/7005/redis.conf:/etc/redis/redis.conf
+      - ./cluster/7005/data:/data
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.15
+    mem_limit: 512m
+    cpus: "0.5"
+    command: redis-server /etc/redis/redis.conf
+
+  redis-7006:
+    image: redis:7.2.5-alpine
+    container_name: redis-7006
+    restart: always
+    ports:
+      - "7006:6379"
+      - "17006:16379"
+    volumes:
+      - ./cluster/7006/redis.conf:/etc/redis/redis.conf
+      - ./cluster/7006/data:/data
+    networks:
+      redis-cluster-net:
+        ipv4_address: 172.28.0.16
+    mem_limit: 512m
+    cpus: "0.5"
+    command: redis-server /etc/redis/redis.conf
+</code></pre>
+<p><strong>配置亮点总结：</strong></p>
+<table>
+<thead>
+<tr>
+<th>设计点</th>
+<th>解决的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自定义静态子网 + 固定 IP 分配</td>
+<td>容器重启后 IP 漂移导致集群节点失联</td>
+</tr>
+<tr>
+<td>双端口严格映射（服务 + 总线）</td>
+<td>覆盖服务访问与 Gossip 通信两条核心链路</td>
+</tr>
+<tr>
+<td>配置与数据双目录挂载</td>
+<td>持久化 <code>nodes.conf</code> 集群身份元数据，容器重建不丢失节点身份</td>
+</tr>
+<tr>
+<td>内存/CPU 资源配额</td>
+<td>避免单节点 OOM 挤占宿主机资源</td>
+</tr>
+<tr>
+<td>alpine 精简镜像 + always 自愈</td>
+<td>兼顾镜像体积与服务可用性</td>
+</tr>
+</tbody>
+</table>
+<h3 id="step-3启动容器--一键组建集群">Step 3：启动容器 &amp; 一键组建集群</h3>
+<pre><code class="language-bash"># 启动所有容器
+docker-compose up -d
+
+# 等待节点完全启动
+sleep 10
+
+# 一键创建集群（--cluster-yes 跳过交互确认，适配 CI/CD）
+docker exec -it redis-7001 redis-cli --cluster create \
+  172.28.0.11:6379 \
+  172.28.0.12:6379 \
+  172.28.0.13:6379 \
+  172.28.0.14:6379 \
+  172.28.0.15:6379 \
+  172.28.0.16:6379 \
+  --cluster-replicas 1 \
+  --cluster-yes
+</code></pre>
+<p>Redis 会自动分配主从关系和 16384 个哈希槽，输出类似：</p>
+<pre><code>&gt;&gt;&gt; Performing hash slots allocation on 6 nodes...
+Master[0] -&gt; Slots 0 - 5460
+Master[1] -&gt; Slots 5461 - 10922
+Master[2] -&gt; Slots 10923 - 16383
+Adding replica ...
+[OK] All nodes agree about slots configuration.
+</code></pre>
+<blockquote>
+<p><strong>致命提醒</strong>：组网命令中 <strong>绝对不能用 <code>127.0.0.1</code></strong>，必须填写宿主机真实 IP 或容器固定 IP。否则节点会把集群地址注册为本地回环，跨节点通信直接失败。</p>
+</blockquote>
+<h3 id="step-4验证集群状态">Step 4：验证集群状态</h3>
+<pre><code class="language-bash"># 查看集群节点（确认 3 master + 3 slave）
+redis-cli -h 127.0.0.1 -p 7001 cluster nodes
+
+# 查看槽位分布
+redis-cli -h 127.0.0.1 -p 7001 cluster slots
+
+# 读写验证（-c 开启集群重定向）
+redis-cli -c -h 127.0.0.1 -p 7001 -a your_redis_pwd set foo bar
+</code></pre>
+<p>能正常重定向并返回 <code>OK</code>，说明分片和迁移机制工作正常。</p>
+<hr>
+<h2 id="三生产级自动化部署脚本">三、生产级自动化部署脚本</h2>
+<p>以下脚本集成了 <strong>连通性预检 → 自动组网 → 健康校验</strong> 全流程，可直接接入 CI/CD 流水线：</p>
+<pre><code class="language-bash">#!/bin/bash
+# ========== 全局变量 ==========
+HOST_IP="宿主机真实IP"
+PASSWORD="your_redis_pwd"
+START_PORT=7001
+NODE_COUNT=6
+
+# ========== 前置校验：全节点连通性检测 ==========
+echo "🔍 开始校验所有节点连通性..."
+for ((i=0; i&lt;NODE_COUNT; i++))
+do
+  port=$((START_PORT + i))
+  if ! redis-cli -h $HOST_IP -p $port -a $PASSWORD ping &gt; /dev/null 2&gt;&amp;1; then
+    echo "❌ 节点$port 连通失败，请检查配置！"
+    exit 1
+  fi
+  echo "✅ 节点$port 连通正常"
+done
+
+# ========== 非交互式组建集群 ==========
+echo "🚀 开始组建 Redis 集群..."
+echo "yes" | redis-cli -a $PASSWORD --cluster create \
+  $HOST_IP:7001 $HOST_IP:7002 $HOST_IP:7003 \
+  $HOST_IP:7004 $HOST_IP:7005 $HOST_IP:7006 \
+  --cluster-replicas 1
+
+# ========== 组网后健康校验 ==========
+if [ $? -eq 0 ]; then
+  echo "🎉 集群组建成功！集群状态："
+  redis-cli -h $HOST_IP -p 7001 -a $PASSWORD cluster info | grep cluster_state
+else
+  echo "❌ 集群组建失败，请排查节点日志！"
+  exit 1
+fi
+</code></pre>
+<p><strong>脚本亮点：</strong></p>
+<ul>
+<li>前置连通性校验：提前拦截端口不通、密码错误等基础问题，避免组网中途异常</li>
+<li><code>--cluster-yes</code> 非交互模式：无需人工确认，直接接入自动化部署流水线</li>
+<li>组网后自动健康校验：快速输出集群状态，降低部署后验证成本</li>
+</ul>
+<hr>
+<h2 id="四spring-boot-接入-redis-集群">四、Spring Boot 接入 Redis 集群</h2>
+<p>集群搭好了，应用端怎么连？以下是 Spring Boot + Lettuce 的生产级配置：</p>
+<pre><code class="language-yaml"># application.yml
+spring:
+  redis:
+    cluster:
+      nodes:
+        - 192.168.1.100:7001
+        - 192.168.1.100:7002
+        - 192.168.1.100:7003
+        - 192.168.1.100:7004
+        - 192.168.1.100:7005
+        - 192.168.1.100:7006
+    password: your_redis_pwd
+    lettuce:
+      pool:
+        max-active: 20
+        max-idle: 10
+      cluster:
+        refresh:
+          adaptive: true       # 自适应拓扑刷新
+          period: 30s          # 定时刷新周期
+</code></pre>
+<p><strong>关键配置解读：</strong></p>
+<ul>
+<li><code>adaptive: true</code>：开启自适应拓扑刷新，当集群发生扩缩容或故障转移时，客户端自动感知新拓扑，无需重启</li>
+<li><code>period: 30s</code>：定时兜底刷新，防止自适应事件丢失</li>
+<li>使用 Lettuce 而非 Jedis：Lettuce 原生支持集群拓扑刷新和连接池共享，线程安全，高并发场景性能更优</li>
+</ul>
+<hr>
+<h2 id="五核心踩坑与技术难点">五、核心踩坑与技术难点</h2>
+<p>这是全文最值钱的部分——每一个都是真实踩过的坑：</p>
+<table>
+<thead>
+<tr>
+<th>序号</th>
+<th>技术难点</th>
+<th>问题表现</th>
+<th>根因</th>
+<th>解决方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><strong>集群 IP 寻址异常</strong>（最高频）</td>
+<td>客户端报 <code>MOVED 127.0.0.1</code>；跨节点迁移失败；心跳失联</td>
+<td>Redis 默认注册容器内网 IP/回环地址，外部无法路由</td>
+<td>配置 <code>cluster-announce-ip</code> 显式声明对外 IP；组网命令禁用 <code>127.0.0.1</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>集群总线端口未映射</strong></td>
+<td><code>CLUSTER MEET</code> 超时，Gossip 协议不通</td>
+<td>只映射了服务端口，遗漏了总线端口</td>
+<td>每个节点<strong>同时暴露</strong>服务端口和总线端口（+10000），防火墙一并放行</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>自动故障转移失效</strong></td>
+<td>主节点宕机，从节点无法晋升，集群只读</td>
+<td>仅配了 <code>requirepass</code>，未配 <code>masterauth</code>；或各节点密码不一致</td>
+<td>所有节点<strong>同时配置</strong> <code>requirepass</code> + <code>masterauth</code>，密码全集群统一</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>容器重启后集群崩溃</strong></td>
+<td>节点丢失集群身份，槽位数据不可用</td>
+<td><code>nodes.conf</code> 未持久化，容器重建后生成新节点 ID</td>
+<td>数据目录完整挂载到宿主机；搭配静态 IP，避免 IP 漂移</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>跨宿主机网络不通</strong></td>
+<td>多服务器部署时节点无法建立心跳</td>
+<td>Docker bridge 网络为宿主机隔离，容器 IP 无法跨主机路由</td>
+<td>方案一：<code>cluster-announce-ip</code> + 宿主机端口映射；方案二：Docker Overlay 跨主机网络</td>
+</tr>
+<tr>
+<td>6</td>
+<td><strong>单宿主机脑裂风险</strong></td>
+<td>宿主机宕机全集群不可用</td>
+<td>3 个主节点全在同一台机器，不满足「半数以上存活」选举规则</td>
+<td>生产环境必须<strong>跨 3 台及以上宿主机</strong>部署主节点</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>在线扩缩容阻塞</strong></td>
+<td><code>reshard</code> 迁移槽位时请求超时</td>
+<td>大 key 迁移或业务高峰期操作</td>
+<td>指定 <code>--cluster-timeout</code>，使用 pipeline 批量迁移，选择低峰期操作</td>
+</tr>
+<tr>
+<td>8</td>
+<td><strong>监控盲区</strong></td>
+<td>集群出问题后才发现，定位困难</td>
+<td>缺少监控体系</td>
+<td>接入 <code>redis-exporter</code> + Prometheus + Grafana，重点监控 <code>cluster_state</code>、<code>cluster_slots_fail</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="六生产环境进阶建议">六、生产环境进阶建议</h2>
+<h3 id="持久化策略">持久化策略</h3>
+<ul>
+<li>开启 <code>appendonly yes</code> + <code>appendfsync everysec</code>，兼顾性能与安全</li>
+<li>可叠加 <code>aof-use-rdb-preamble yes</code> 混合持久化，加速重启恢复</li>
+<li>配合 <code>save 900 1</code> / <code>save 300 10</code> RDB 快照，双保险</li>
+</ul>
+<h3 id="监控告警">监控告警</h3>
+<p>接入 <code>redis-exporter</code> + Prometheus + Grafana，核心告警规则：</p>
+<pre><code class="language-yaml"># 典型告警规则
+- alert: RedisClusterDown
+  expr: redis_cluster_state != 1
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Redis 集群状态异常"
+
+- alert: RedisClusterSlotsFail
+  expr: redis_cluster_slots_fail &gt; 0
+  for: 30s
+  labels:
+    severity: warning
+  annotations:
+    summary: "Redis 集群存在失败槽位"
+</code></pre>
+<p>重点监控指标：<code>cluster_state</code>、<code>cluster_slots_fail</code>、<code>cluster_known_nodes</code>、各节点内存使用率。</p>
+<h3 id="动态扩缩容">动态扩缩容</h3>
+<ul>
+<li><strong>扩容</strong>：<code>redis-cli --cluster add-node</code> 加入新节点 → <code>reshard</code> 迁移槽位</li>
+<li><strong>缩容</strong>：先 <code>rebalance</code> 迁移槽位 → 再 <code>del-node</code> 移除节点，全程在线不中断</li>
+<li><strong>K8s 环境</strong>：生产建议使用 StatefulSet + Headless Service，让 Redis Cluster 自行管理节点 IP</li>
+</ul>
+<h3 id="故障转移验证">故障转移验证</h3>
+<p>手动停止一个主节点容器，观察从节点是否自动晋升为主；原主节点恢复后应自动转为从节点。如果失败，优先排查 <code>masterauth</code> 配置和密码一致性。</p>
+<hr>
+<h2 id="七整体架构全景图">七、整体架构全景图</h2>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202608/739056-20260824092729267-231557464.png" class="lazyload"></p>
+<hr>
+<h2 id="总结">总结</h2>
+<p>Docker + Compose 搭建 Redis Cluster，核心抓住 <strong>五个关键点</strong>：</p>
+<ol>
+<li><strong>端口双开</strong>：服务端口 + 集群总线端口（+10000），缺一不可</li>
+<li><strong>IP 固定</strong>：静态子网 + 固定 IP 分配，或 <code>cluster-announce-ip</code> 显式声明，杜绝 IP 漂移</li>
+<li><strong>密码统一</strong>：<code>requirepass</code> + <code>masterauth</code> 全节点一致，保障故障转移正常</li>
+<li><strong>数据持久化</strong>：完整挂载数据目录，持久化 <code>nodes.conf</code> + AOF/RDB</li>
+<li><strong>客户端适配</strong>：开启集群拓扑刷新（Lettuce adaptive），正确处理 <code>MOVED</code> 重定向</li>
+</ol>
+<p>掌握这五点，无论是面试回答还是生产落地，都能稳扎稳打。</p>
+<hr>
+<p>公众号“Rain的Java大神之路”<br>
+个人博客“www.javadashen.com”</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-24 09:29">2026-08-24 09:28</span>&nbsp;
+<a href="https://www.cnblogs.com/zrui-xyu">Rain的Java大神实战圈</a>&nbsp;
+阅读(<span id="post_view_count">110</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22648318);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzrui-xyu%2Fp%2F22648318&amp;targetId=22648318&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
