@@ -1,0 +1,302 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/uniqueDong/p/22642386" title="发布于 2026-08-23 17:55">
+    
+
+    <span role="heading" aria-level="2">我把Redis双活塞进Spring，业务代码零改动</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/735767/202608/735767-20260823175507423-1305674904.png" class="lazyload"></p>
+<p>你有没有过这种经历。半夜两点告警炸了，A 机房 Redis 主节点磁盘满了被摘除，流量切到 B 机房，用户购物车全空了，因为 B 机房的 Redis 里根本没有这几分钟的写入。主从复制救不了你，它天生就是单向异步的。</p>
+<p>更要命的是，你翻遍社区，搜到的双活方案全是 Redis-Shake、CloudCanal、RedisSyncer 这类中间件，再不济也是一层 Proxy 双向同步。没有一篇告诉你，能不能在自己那个天天跑的 Spring 应用里，用几行代码把双活焊死在客户端上，业务代码一行都不用改。</p>
+<p>我去年带一个下单系统做多机房容灾时就卡在这里。运维同学甩给我一份 RedisShake 双向同步配置，我看完一句实话，这套东西能跑，但它把双写逻辑藏到了应用之外，冲突排查时你只能去扒同步日志，等于把最该自己掌控的部分交了出去。</p>
+<p><img alt="应用层双活方案 vs Proxy 中间件方案对比" loading="lazy" data-src="https://magebyte.oss-cn-shenzhen.aliyuncs.com/wechat-column/images/064-redis-dual-active-factorybean-proxy/064-redis-dual-active-factorybean-proxy-fig01-cmp.png" class="lazyload"></p>
+<p>这一节先把账算清楚。双活到底在解决什么，为什么我挑了应用层方案。</p>
+<h2 id="双活不是主从复制先说清我们到底在解决什么">双活不是主从复制，先说清我们到底在解决什么</h2>
+<p>很多人听见双活，第一反应是主从复制加个反向同步。这是把两件事混为一谈，我得先泼盆冷水。</p>
+<p>Redis 主从复制的契约很简单，从节点单向、异步地追主节点。它解决的是读写分离和高可用，不是双向写入。一旦你把它当双活用，两个机房同时写，复制链路是单向的，数据根本对不上。机房级故障切换时，还没同步过去的那部分写操作直接丢，这就是开头购物车清空的根因。</p>
+<blockquote>
+<p>MySQL：「那你用主从复制做双向同步不就行了，配两条链路互相同步？」</p>
+</blockquote>
+<p>你的建议很好，下次不要再建议了。</p>
+<p>双向主从同步会制造复制回环，A 写给 B、B 又写回 A，同一个 key 在两头无限打转，到头来谁都分不清哪个是真相。业界工具之所以要专门做双向同步模式，就是为了解决这个回环和冲突检测，而不是简单把主从反过来配一遍。</p>
+<p>所以双活真正要啃的三块硬骨头是，数据双向同步、读请求就近路由、单机房故障自动降级。Redis-Shake、CloudCanal、RedisSyncer 这些工具从存储层解决了第一块，代价是双写逻辑脱离应用、冲突排查靠外部日志、对业务的写入语义没有感知。</p>
+<p>应用层方案反过来想这个问题。拆开看，双写就是一次 set 调用落两个机房，读路由就是一次 get 去最近的机房取。这些动作发生在方法调用层，而 Spring 恰好给了我们一个在 Bean 创建时动手脚的标准钩子，这个钩子就是 FactoryBean。</p>
+<p>把写路由下沉到应用层，比 Proxy 层双向同步更可控，冲突发生时你能直接断点进代理方法看两个机房分别写了什么。这是我做了三个多机房项目后越来越确信的一件事。</p>
+<h2 id="factorybean-凭什么比-bean-更适合这道活儿">FactoryBean 凭什么比 @Bean 更适合这道活儿</h2>
+<p>先回答读者最常被卡住的一个问题。@Bean 也能返回一个对象，为什么双活客户端非得用 FactoryBean 不可。</p>
+<p>区别在于，@Bean 方法你写 <code>return new X()</code>，Spring 就把 X 的实例交出去，你没机会在交付之前给这个实例套一层壳。FactoryBean 不一样，它的约定是 <code>getObject()</code> 返回的最终是个被包装过的产品对象，而 <code>getObjectType()</code> 告诉 Spring 这个产品到底是什么类型，Bean 名字前加 <code>&amp;</code> 前缀才能拿到 FactoryBean 自己。</p>
+<p><strong>这套约定真正的价值不是创建对象，而是给对象套一层你想要的壳。</strong> 双活客户端的壳就是 JDK 动态代理，它包裹着两个机房的 Redis 连接，对外仍是一个普通的 <code>RedisDualClient</code> 接口。业务代码按接口注入，完全不知道背后有双写和路由在发生。</p>
+<pre><code class="language-java">public class DualWriteRedisFactoryBean implements FactoryBean&lt;RedisDualClient&gt; {
+
+    private StringRedisTemplate primaryTemplate;
+    private StringRedisTemplate secondaryTemplate;
+    private DualWriteConfig config = new DualWriteConfig();
+
+    // 交给 Spring 注入两个机房的连接模板，FactoryBean 自己只管组装
+    public void setPrimaryTemplate(StringRedisTemplate t)   { this.primaryTemplate = t; }
+    public void setSecondaryTemplate(StringRedisTemplate t) { this.secondaryTemplate = t; }
+    public void setConfig(DualWriteConfig c)                { this.config = c; }
+
+    @Override
+    public RedisDualClient getObject() throws Exception {
+        // 关键在这里，返回的不是裸客户端，而是包了双写代理的壳
+        DualWriteInvocationHandler handler =
+                new DualWriteInvocationHandler(primaryTemplate, secondaryTemplate, config);
+        return (RedisDualClient) Proxy.newProxyInstance(
+                RedisDualClient.class.getClassLoader(),
+                new Class&lt;?&gt;[]{RedisDualClient.class},
+                handler);
+    }
+
+    // 必须返回产品类型而非 FactoryBean 类型，否则 @Autowired RedisDualClient 会找不到 Bean
+    @Override
+    public Class&lt;?&gt; getObjectType() { return RedisDualClient.class; }
+
+    @Override
+    public boolean isSingleton() { return true; }
+}
+</code></pre>
+<p>注意 <code>getObjectType()</code> 这一行，它返回的是 <code>RedisDualClient.class</code> 而不是 <code>DualWriteRedisFactoryBean.class</code>。这是新手最容易翻车的地方，配错了 Spring 就认为这个 FactoryBean 产出的 Bean 类型是 FactoryBean 自身，业务里 <code>@Autowired RedisDualClient</code> 直接报 <code>NoSuchBeanDefinitionException</code>。壳套得再好，类型对不上，Spring 容器连门都不让你进。</p>
+<p>顺带说一个面试常考的细节。哪天你想拿到的不是 FactoryBean 产出的客户端，而是工厂自己，得在 Bean 名字前加 &amp; 前缀，比如 <code>&amp;dualWriteRedisFactoryBean</code>，Spring 才会把工厂交出来而非它的产品。这个 &amp; 自指约定也是 FactoryBean 和 @Bean 的又一道分水岭，@Bean 根本没有这种能力，你只能拿到它直接 return 的那个对象。</p>
+<h2 id="jdk-动态代理怎么在-setget-上动手脚">JDK 动态代理怎么在 set/get 上动手脚</h2>
+<p>壳套好了，里面那层代理才是真正的戏肉。JDK 动态代理有个硬约束，它只能代理接口，目标类必须实现接口。这就是为什么双活客户端我选了自定义 <code>RedisDualClient</code> 接口，而不是去代理 <code>StringRedisTemplate</code> 这个类。要是你拿 Jedis 这种具体类去 <code>Proxy.newProxyInstance</code>，运行期直接 <code>ClassCastException</code> 教你做人，要么换接口，要么上 CGLIB。</p>
+<p><img alt="双活 Redis 客户端整体架构" loading="lazy" data-src="https://magebyte.oss-cn-shenzhen.aliyuncs.com/wechat-column/images/064-redis-dual-active-factorybean-proxy/064-redis-dual-active-factorybean-proxy-fig02-arch.png" class="lazyload"></p>
+<p>架构上就四块，FactoryBean 负责造壳，InvocationHandler 负责拦截，两个 <code>RedisConnectionFactory</code>（Lettuce 的实现）各自连一个机房，最上面业务 Service 只认 <code>RedisDualClient</code> 接口。Spring Data Redis 里 <code>RedisConnectionFactory</code> 本身就是接口，<code>LettuceConnectionFactory</code> 是它的实现，我们对接口编程，换客户端不伤筋动骨。</p>
+<p>代理的核心是 <code>InvocationHandler.invoke</code>，它拦截每一次方法调用。set 走双写，get 走读路由，其他方法是少数派，先按主机房处理保持扩展能力。</p>
+<pre><code class="language-java">public class DualWriteInvocationHandler implements InvocationHandler {
+
+    private final StringRedisTemplate primary;
+    private final StringRedisTemplate secondary;
+    private final DualWriteConfig config;
+
+    public DualWriteInvocationHandler(StringRedisTemplate primary,
+                                       StringRedisTemplate secondary,
+                                       DualWriteConfig config) {
+        this.primary = primary;
+        this.secondary = secondary;
+        this.config = config;
+    }
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        String name = method.getName();
+        if ("set".equals(name)) return handleSet(args);
+        if ("get".equals(name)) return handleGet(args);
+        // 非 set/get 的操作直接走主机房，让接口可平滑扩展而不报错
+        return routeToPrimary(method, args);
+    }
+
+    private Object handleSet(Object[] args) {
+        String key = (String) args[0];
+        String value = (String) args[1];
+        // 主先写，备后写，顺序保证主机房是权威源，备永远落后一点点
+        try {
+            opsSet(primary, key, value, args);
+        } catch (Exception e) {
+            if (!config.isDegradeOnPrimaryFail()) throw e;
+            log.warn("主机房写入失败，降级为仅写备机房, key={}", key, e);
+        }
+        try {
+            opsSet(secondary, key, value, args);
+        } catch (Exception e) {
+            if (config.isDegradeOnSecondaryFail()) {
+                log.warn("备机房写入失败，两机房短暂不一致, key={}", key, e);
+                return null;
+            }
+            throw e;
+        }
+        return null;
+    }
+
+    private Object handleGet(Object[] args) {
+        String key = (String) args[0];
+        // 读路由默认打主机房，主挂了立刻切备，业务无感知
+        try {
+            return primary.opsForValue().get(key);
+        } catch (Exception e) {
+            log.warn("主机房读取失败，路由到备机房, key={}", key, e);
+            return secondary.opsForValue().get(key);
+        }
+    }
+
+    private void opsSet(StringRedisTemplate tpl, String k, String v, Object[] args) {
+        if (args.length &gt; 2 &amp;&amp; args[2] instanceof Long ttl) {
+            tpl.opsForValue().set(k, v, ttl, TimeUnit.SECONDS);
+        } else {
+            tpl.opsForValue().set(k, v);
+        }
+    }
+
+    private Object routeToPrimary(Method method, Object[] args) throws Throwable {
+        return method.invoke(primary, args);
+    }
+}
+</code></pre>
+<p>看到没，双写和读路由不是什么黑魔法，就是在方法调用这一层插了一道闸。这也是对「动态代理只能做 AOP 日志和事务」这个误解最干净的反击，它在任意 Redis 操作上都能动手脚。</p>
+<p>动态代理在这里不是装饰，它是双活逻辑的承载层。set 进代理就被拆成两次写，get 进代理就被翻译成一次路由，业务侧完全没有感知。把双活焊死在方法调用这一层，比在 Proxy 中间件里配规则直观得多，断点一打就知道哪边写漏了、哪边读歪了，排查冲突不用再翻同步工具的日志。</p>
+<h2 id="动手接入factorybean-加代理跑起双活客户端">动手接入，FactoryBean 加代理跑起双活客户端</h2>
+<p>光讲原理不过瘾，这一节把它真正跑起来。环境是 macOS、JDK 17、Spring Boot 3.3.2、Redis 7.2，Lettuce 6.3 由 <code>spring-boot-starter-data-redis</code> 3.3.2 传递管理，不用单独引。</p>
+<h3 id="第一步起两个-redis-实例模拟双机房">第一步，起两个 Redis 实例模拟双机房</h3>
+<pre><code class="language-bash">redis-server --port 6379
+redis-server --port 6380
+</code></pre>
+<p>✅ 验证：</p>
+<pre><code class="language-bash">redis-cli -p 6379 ping
+# PONG
+redis-cli -p 6380 ping
+# PONG
+</code></pre>
+<p>两个实例都回 PONG，说明两个机房就位。生产里它们该在不同的可用区，这里本地起端口区分。</p>
+<h3 id="第二步引入依赖">第二步，引入依赖</h3>
+<pre><code class="language-xml">&lt;dependency&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-data-redis&lt;/artifactId&gt;
+  &lt;version&gt;3.3.2&lt;/version&gt;
+&lt;/dependency&gt;
+</code></pre>
+<p>✅ 验证：</p>
+<pre><code class="language-bash">mvn dependency:tree | grep lettuce
+# io.lettuce:lettuce-core:jar:6.3.2.RELEASE:compile
+</code></pre>
+<p>Spring Boot 3.x 默认 Redis 客户端就是 Lettuce，而且它实现 <code>RedisConnectionFactory</code> 接口，正好满足 JDK 代理「只代理接口」的硬约束。Redis 6.0 引入了 ACL 和多 IO 线程，连接层够稳，做双活客户端底座没问题。</p>
+<h3 id="第三步定义客户端接口与降级配置">第三步，定义客户端接口与降级配置</h3>
+<pre><code class="language-java">public interface RedisDualClient {
+    void set(String key, String value);
+    void set(String key, String value, long ttlSeconds);
+    String get(String key);
+}
+
+public class DualWriteConfig {
+    // 主或备写入失败时是否降级而非抛错，双活优先保可用
+    private boolean degradeOnPrimaryFail = true;
+    private boolean degradeOnSecondaryFail = true;
+    // getters / setters 省略
+}
+</code></pre>
+<h3 id="第四步配置类把零件组装起来">第四步，配置类把零件组装起来</h3>
+<pre><code class="language-java">@Configuration
+public class DualRedisConfig {
+
+    @Bean
+    public RedisConnectionFactory primaryFactory() {
+        return new LettuceConnectionFactory("127.0.0.1", 6379);
+    }
+
+    @Bean
+    public RedisConnectionFactory secondaryFactory() {
+        return new LettuceConnectionFactory("127.0.0.1", 6380);
+    }
+
+    @Bean
+    public StringRedisTemplate primaryTemplate(RedisConnectionFactory primaryFactory) {
+        return new StringRedisTemplate(primaryFactory);
+    }
+
+    @Bean
+    public StringRedisTemplate secondaryTemplate(RedisConnectionFactory secondaryFactory) {
+        return new StringRedisTemplate(secondaryFactory);
+    }
+
+    // 返回的是 FactoryBean，Spring 会自动调用它的 getObject() 拿到双活代理
+    @Bean
+    public DualWriteRedisFactoryBean dualWriteRedisFactoryBean(
+            StringRedisTemplate primaryTemplate,
+            StringRedisTemplate secondaryTemplate) {
+        DualWriteRedisFactoryBean factory = new DualWriteRedisFactoryBean();
+        factory.setPrimaryTemplate(primaryTemplate);
+        factory.setSecondaryTemplate(secondaryTemplate);
+        return factory;
+    }
+}
+</code></pre>
+<p><img alt="双写与读路由数据流" loading="lazy" data-src="https://magebyte.oss-cn-shenzhen.aliyuncs.com/wechat-column/images/064-redis-dual-active-factorybean-proxy/064-redis-dual-active-factorybean-proxy-fig03-flow.png" class="lazyload"></p>
+<p>写路径是请求进 <code>set</code>，代理先落主再落备，任一机房挂掉按 <code>config</code> 决定降级还是抛错。读路径默认打主，主异常秒级切备。这条数据流的每一个分支你都能在 <code>InvocationHandler</code> 里下断点，冲突排查不用去翻同步工具日志。</p>
+<h3 id="第五步业务代码零改动地使用">第五步，业务代码零改动地使用</h3>
+<pre><code class="language-java">@Service
+public class OrderService {
+
+    // 注入的就是 FactoryBean 产出的代理，业务完全无感
+    @Autowired
+    private RedisDualClient redisDualClient;
+
+    public void cacheOrder(String orderId, String payload) {
+        redisDualClient.set("order:" + orderId, payload, 3600L);
+    }
+
+    public String loadOrder(String orderId) {
+        return redisDualClient.get("order:" + orderId);
+    }
+}
+</code></pre>
+<p>✅ 验证，跑个测试往两个机房各查一次：</p>
+<pre><code class="language-bash">redis-cli -p 6379 get order:1001
+# "{\"sku\":\"iphone16\",\"qty\":1}"
+redis-cli -p 6380 get order:1001
+# "{\"sku\":\"iphone16\",\"qty\":1}"
+</code></pre>
+<p>两个端口都查到了同一个 key，双写确实发生了，而 <code>OrderService</code> 里没有任何双机房相关的代码。这就是 FactoryBean 加代理这套壳的价值，业务方甚至不知道自己写了两个 Redis。</p>
+<h3 id="常见报错与解决">常见报错与解决</h3>
+<p>第一个坑，<code>ClassCastException: com.sun.proxy.$ProxyXX cannot be cast to org.springframework.data.redis.core.StringRedisTemplate</code>。你试图代理一个类而不是接口，JDK 动态代理不认。解法，要么像本文定义 <code>RedisDualClient</code> 接口，要么换 CGLIB 代理类。</p>
+<p>第二个坑，<code>NoSuchBeanDefinitionException: No qualifying bean of type 'RedisDualClient'</code>。<code>getObjectType()</code> 返回错了类型，Spring 不知道这个 FactoryBean 产出的是 <code>RedisDualClient</code>。把 <code>getObjectType()</code> 改成返回产品接口类型即可。</p>
+<h2 id="机房挂了怎么办故障降级与一致性取舍">机房挂了怎么办，故障降级与一致性取舍</h2>
+<p>现在聊最扎心的部分。双写不保证原子性，两个机房在故障窗口里可能短暂不一致，这是物理定律，不是你代码写得丑。</p>
+<p>我踩过最痛的一次，A 机房网络分区，写入降级成只写 B，分区期间 B 机房正常服务。等 A 恢复，B 有最新数据 A 没有，得靠同步工具把 B 的增量补回 A。所以双活场景下，写入必须幂等，冲突策略要么后写覆盖，要么上版本号（写时带 <code>CAS</code> 或逻辑时钟），谁新听谁的。</p>
+<blockquote>
+<p>📊 <strong>扔个投票，双活写路由你更倾向哪种做法？</strong></p>
+<ul>
+<li>同步双写，强一致优先，性能让位</li>
+<li>异步双写，性能优先，接受短暂不一致</li>
+<li>单元化路由，按 key 分片写固定机房，跨机房只读</li>
+</ul>
+</blockquote>
+<p>这里我必须说句得罪人的实话，双活不是银弹。你的业务能接受最终一致，才上双写，强一致场景（比如账户余额）硬上双写，反而把本来能跑的系统拖垮。antirez 老哥设计 Redis 时从没承诺过跨机房强一致，那是分布式系统的经典取舍，没有两全其美的策略。</p>
+<p>降级策略我偏向保守，主机房失败就降级到仅写备并打告警，备机房也失败才真正抛错，因为双活的第一目标是保可用。但读路径我坚持主失败才切备，避免备机房落后数据被读出来造成业务错乱。</p>
+<h2 id="这套方案的坑与边界什么时候别用">这套方案的坑与边界，什么时候别用</h2>
+<p>讲完好处，该泼第二盆冷水。什么场景这套方案不适合。</p>
+<p>第一，超高写入吞吐且对延迟极敏感的系统别用同步双写。一次 set 变两次网络往返，P99 直接翻倍。这种场景要么异步双写丢到线程池，要么直接上单元化路由，按 key 分片固定写某个机房，根本不产生跨机房双写。</p>
+<p>第二，需要跨数据结构、跨 key 事务一致性的别用。本文代理只覆盖了 <code>set/get</code> 这类单 key 操作，你要是 <code>multi/exec</code>、 Lua 脚本、 Hash 批量操作，得在 <code>InvocationHandler</code> 里自己扩，工作量不小。</p>
+<p>第三，团队没有应用层掌控能力时别用。双活逻辑藏在你的代码里，意味着它跟着你的发布节奏走，也跟着你的 bug 走。如果团队更习惯基础设施统一管控，Redis-Shake 双向同步模式反而更省心，两套方案粒度不同，甚至可以并存，应用层做精细路由，存储层做兜底同步。</p>
+<p>说到底，FactoryBean 加 JDK 动态代理这套组合拳，卖点不是性能多强，而是把双活的控制权交回写业务的人手里。你能在方法调用层看到每一次双写、每一次路由切换，这才是它和 Proxy 中间件最本质的区别。</p>
+<h2 id="常见问题">常见问题</h2>
+<p><strong>双写让延迟翻倍，性能扛得住吗？</strong> 同步双写确实两次往返，写入 P99 大致翻倍。扛不住就改成异步双写，把备机房写入丢进独立线程池，主返回即成功，代价是故障窗口内可能丢备机房那次写，配合幂等和同步工具兜底能接受。</p>
+<p><strong>两个机房同时写同一个 key 冲突怎么解？</strong> 写入全部幂等，冲突策略二选一，后写覆盖（简单但可能丢中间态），或带版本号/逻辑时钟写时比较，谁新听谁的。读路由永远优先主，避免读到落后的备数据。</p>
+<p><strong>用 Jedis 能替代 Lettuce 做代理吗？</strong> JDK 动态代理只认接口，Jedis 是具体类，直接代理会 <code>ClassCastException</code>。两条路，要么像本文自定义接口让代理绕过具体客户端，要么改用 CGLIB 代理类。Lettuce 实现 <code>RedisConnectionFactory</code> 接口，天然契合 JDK 代理。</p>
+<p><strong>这套和 Redis-Shake 双向同步怎么选？</strong> 不冲突，粒度不同。应用层代理做精细的写路由和读路由，对业务语义有感知，冲突好排查。Redis-Shake 双向同步模式在存储层做兜底，适合你不想改代码或跨异构系统的场景，两者可并存。</p>
+<p><strong>getObjectType 配错到底报什么错？</strong> 典型是 <code>UnsatisfiedDependencyException</code> 嵌套 <code>NoSuchBeanDefinitionException</code>，提示没有 <code>RedisDualClient</code> 类型的 Bean。根因是 <code>getObjectType()</code> 没返回产品接口类型，Spring 容器不知道 FactoryBean 产出的货是什么，注入时自然找不到。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Spring 官方 FactoryBean 文档 <a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/beans/factory/FactoryBean.html" target="_blank" rel="noopener nofollow">https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/beans/factory/FactoryBean.html</a></li>
+<li>Redis 官方 Replication 文档 <a href="https://redis.io/docs/latest/operate/oss_and_enterprise/management/replication/" target="_blank" rel="noopener nofollow">https://redis.io/docs/latest/operate/oss_and_enterprise/management/replication/</a></li>
+<li>RedisShake GitHub <a href="https://github.com/tair-opensource/RedisShake" target="_blank" rel="noopener nofollow">https://github.com/tair-opensource/RedisShake</a></li>
+</ul>
+<h2 id="我的判断">我的判断</h2>
+<p>双活客户端这事，我越来越觉得它不是技术炫技，而是把「数据该往哪写、该从哪读」这个本该属于业务语义的决策，从运维中间件手里拿回来。FactoryBean 加 JDK 动态代理这套组合，最大的好处不是少写几行，是你每次双写失败都能直接断点进代理方法，看清楚两个机房各自发生了什么，而不是半夜去扒同步日志猜真相。</p>
+<p>往后看，云厂商的单元化方案和 Redis 自身的多线程演进会把一部分双活能力下沉到基础设施，但应用层这层壳不会过时，因为它贴着业务语义，冲突该用后写覆盖还是版本号，只有写业务的人最清楚。工具能帮你把数据搬平，替不了你决定哪一份才算数。<br>
+<img alt="beeaa00ee37c5db0e2fb2c5c5efe4f29" loading="lazy" data-src="https://img2024.cnblogs.com/blog/735767/202605/735767-20260526114014236-744639895.png" class="lazyload"></p>
+<p>顺手把码哥跳动设为星标，下篇我接着这篇写冲突合并和异步双写线程池的实打实落地，漏了你就得翻历史记录。你身边要有人正在做多机房容灾选型，这篇可以直接甩给他，省得他明天也在半夜两点被购物车清空告警叫醒。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    加我微信进去专属技术群，欢迎读者提出意见，喜欢请关注博客和个人公众号：码哥字节
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-23 17:55">2026-08-23 17:55</span>&nbsp;
+<a href="https://www.cnblogs.com/uniqueDong">码哥字节</a>&nbsp;
+阅读(<span id="post_view_count">131</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22642386);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FuniqueDong%2Fp%2F22642386&amp;targetId=22642386&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
