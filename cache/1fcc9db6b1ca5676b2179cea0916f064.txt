@@ -1,0 +1,279 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Qiniu-developer/p/22676127" title="发布于 2026-08-25 14:27">
+    
+
+    <span role="heading" aria-level="2">61 亿次请求背后：LLM Serving 的 Cache 与调度难题</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142720287-1298244419.png" alt="61 亿次请求背后：LLM Serving 的 Cache 与调度难题" class="desc_img">
+        本文基于CompanyX一年61.2亿次真实LLM请求Trace，揭示Serving工作负载动态演化规律：长输入/短输出趋势凸显、Prefix Cache复用呈强时间局部性（99%在15分钟内），并首次系统论证多节点下“缓存复用”与“负载均衡”的本质权衡——Cache-aware路由可提升效率，仅牺牲5%~7%负载均衡度。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>随着 LLM 进入真实业务环境，LLM Serving 面临的问题正从单纯的单次推理加速，扩展到集群层面的资源调度与运行效率。一次请求的计算成本不仅取决于模型参数量，还受到输入输出 Token 长度、用户交互方式、上下文复用以及请求路由策略影响。</p>
+<p>论文《A Year in LLM Serving: Workload Evolution,Caching and Load-Balancing》分析了一份覆盖一年的真实生产 LLM Serving Trace，包含 61.2 亿次请求、31.5 万用户、9174 个模型以及约 87.6 万个服务实例。</p>
+<p>研究聚焦在两个问题：真实环境中的 LLM Serving 工作负载到底呈现什么规律？这些规律又如何影响 Cache 和负载均衡设计？通过大规模生产数据揭示了一条完整链路：LLM 工作负载持续变化，Prefix Cache 复用呈现明显时间规律，而多节点部署进一步引出了局部缓存性与负载均衡之间的系统权衡。</p>
+<h1 id="从-61-亿次请求重新认识-llm-serving-工作负载">从 61 亿次请求重新认识 LLM Serving 工作负载</h1>
+<p>过去很多 LLM 系统优化依赖 Benchmark，它可以帮助开发者比较：</p>
+<ul>
+<li>
+<p>模型推理速度；</p>
+</li>
+<li>
+<p>平均延迟；</p>
+</li>
+<li>
+<p>吞吐能力。</p>
+</li>
+</ul>
+<p>但生产环境中的请求模式更加复杂。用户不会按照固定模板调用模型，不同业务会产生不同长度的上下文，不同模型也会承担不同任务。因此，一个 Serving 系统如果只根据请求数量或者单次测试结果进行优化，很难准确反映真实运行状态。</p>
+<p>论文选择从生产数据出发，分析了一份来自 CompanyX 的一年 LLM Serving Trace。</p>
+<p><img alt="1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142616179-181927352.png" class="lazyload"></p>
+<p>图注：CompanyX 生产 Trace 数据规模概览</p>
+<p>数据规模包括：</p>
+<ul>
+<li>
+<p>61.2 亿次请求；</p>
+</li>
+<li>
+<p>31.5 万用户；</p>
+</li>
+<li>
+<p>9174 个模型；</p>
+</li>
+<li>
+<p>87.6 万个服务实例。</p>
+</li>
+</ul>
+<p>相比短时间 Benchmark，这份 Trace 覆盖了更长时间周期，也包含用户、模型、请求和实例多个维度的信息。</p>
+<p><img alt="2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142623136-1895214550.png" class="lazyload"></p>
+<p>图注：一年内 LLM Serving 工作负载变化趋势</p>
+<p>论文发现，LLM Serving 工作负载并不是固定不变的。随着时间变化：</p>
+<ul>
+<li>
+<p>请求规模会变化；</p>
+</li>
+<li>
+<p>模型使用情况会变化；</p>
+</li>
+<li>
+<p>用户行为会变化；</p>
+</li>
+<li>
+<p>Token 分布也会变化。</p>
+</li>
+</ul>
+<p>因此，Serving 系统不能只针对某个时间点的流量状态优化，而需要理解长期工作负载演化规律。但请求数量本身仍然不足以描述 LLM Serving 压力。LLM 请求最大的特点在于一次调用背后的计算成本高度依赖请求内容。这引出了论文接下来关注的问题：不同请求究竟如何改变 Serving 负载？</p>
+<h1 id="长-prompt短输出正在改变推理压力">长 Prompt、短输出正在改变推理压力</h1>
+<p>LLM 推理通常包含两个阶段：</p>
+<ul>
+<li>
+<p>Prefill：处理输入上下文并构建中间状态；</p>
+</li>
+<li>
+<p>Decode：基于已有状态逐步生成输出 Token。</p>
+</li>
+</ul>
+<p>输入长度主要影响 Prefill 成本，输出长度影响 Decode 持续时间。因此，相同数量的请求，并不代表相同的计算压力。</p>
+<p><img alt="3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142633013-1947589847.png" class="lazyload"></p>
+<p>图注：不同模型输入输出 Token 分布差异</p>
+<p>论文分析发现，不同模型承担的任务类型不同，输入输出 Token 分布存在明显差异。部分模型面对大量长上下文请求，部分模型更多处理短交互任务。这种差异直接影响：</p>
+<ul>
+<li>
+<p>GPU 计算压力；</p>
+</li>
+<li>
+<p>Prefill 与 Decode 的资源占比；</p>
+</li>
+<li>
+<p>系统容量规划。</p>
+</li>
+</ul>
+<p>研究进一步观察到随着用户任务复杂化，输入上下文长度持续增长，而输出 Token 并没有同步增加。生产工作负载正逐渐呈现：长输入、短生成。这种变化增加了长上下文处理带来的 Prefill 压力，也提高了上下文复用优化的价值。</p>
+<p>过去系统更多关注模型生成速度，而在真实环境中，请求形态本身已经成为影响 Serving 性能的重要因素。这一变化也带来了另一个系统问题：如果大量请求包含相似上下文，是否可以避免重复计算？这正是 Prefix Cache 需要解决的问题。</p>
+<h1 id="prefix-cache-中的短周期复用规律">Prefix Cache 中的短周期复用规律</h1>
+<p>在长上下文场景中，重复计算是一个重要成本。Prefix Cache 的目标，是复用已经处理过的上下文计算结果。例如，用户持续让模型分析同一个代码仓库：第一次请求需要处理完整上下文，后续请求如果继续围绕相同内容展开，系统可以复用已有 Prefix Cache，减少重复 Prefill。</p>
+<p>但论文关注的问题不是 Prefix Cache 是否有效，而是真实生产环境中的复用机会到底是什么样。作者通过一年 Trace 分析发现，Prefix Cache 的访问模式与传统缓存存在明显差异。</p>
+<p><img alt="4" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142641164-924166058.png" class="lazyload"></p>
+<p>图注：Prefix Cache 命中分布</p>
+<p>论文发现，Prefix Cache 命中呈现明显双峰分布。大量请求：</p>
+<ul>
+<li>
+<p>几乎没有复用；</p>
+</li>
+<li>
+<p>或者能够获得较高比例复用。</p>
+</li>
+</ul>
+<p>中间状态相对较少，该结果表明，Prefix Cache 收益高度依赖用户交互模式。连续多轮任务可能产生大量复用，而一次性独立请求则很难获得收益。</p>
+<p>另一个重要发现是，Prefix Cache reuse 具有明显时间局部性。</p>
+<p><img alt="5" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142647942-2125088534.png" class="lazyload"></p>
+<p>图注：Cache reuse 时间间隔分布</p>
+<p>数据显示，约 50% 的复用请求在 0.1 秒内再次出现，80% 在 10 秒内发生，99% 的重用集中在 15 分钟以内。</p>
+<p>这一规律为缓存生命周期设计提供了参考：系统无需简单追求无限期保存历史缓存，而应结合真实访问周期设计缓存保留策略。</p>
+<h1 id="传统-cache-策略在-llm-serving-中的适用边界">传统 Cache 策略在 LLM Serving 中的适用边界</h1>
+<p>理解 Prefix Cache 的访问规律后，论文进一步研究现有缓存淘汰策略是否适用于 LLM Serving。作者比较了多种缓存策略，包括：FIFO、LRU、ARC、Sieve、Belady。</p>
+<p><img alt="6" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142655285-774098372.png" class="lazyload"></p>
+<p>图注：不同 Prefix Cache 策略效果比较</p>
+<p>结果显示，在该生产 Trace 条件下，面向传统 Web 和存储场景设计的复杂 Cache 策略并没有展现出明显优势，FIFO、LRU 等简单策略反而表现出较好的稳定性。原因就在于 LLM Prefix Cache 的访问模式与传统缓存存在差异。传统缓存通常依赖：</p>
+<ul>
+<li>
+<p>访问频率；</p>
+</li>
+<li>
+<p>长期热度；</p>
+</li>
+<li>
+<p>历史访问趋势。</p>
+</li>
+</ul>
+<p>而 Prefix Cache 中，大量前缀呈现出更明显的短周期特征：一<strong>次连续交互期间，缓存价值快速提升；交互结束后，访问机会迅速下降</strong>。</p>
+<p>作者分析认为，传统基于历史访问模式预测未来价值的方法，在这种短周期复用场景下优势有限。对于 LLM Serving 来说，缓存系统需要关注哪些上下文正在被持续使用，而不是简单判断哪些数据过去访问最多。</p>
+<h1 id="多节点-serving-中局部缓存性与负载均衡的权衡">多节点 Serving 中局部缓存性与负载均衡的权衡</h1>
+<p>单机缓存策略解决的是“保存什么状态”，但当 LLM Serving 扩展到多节点集群后，还需要解决另一个问题：请求应该发送到哪里。</p>
+<p>传统负载均衡通常希望让请求尽可能平均分布。这样可以：</p>
+<ul>
+<li>
+<p>避免单节点压力过高；</p>
+</li>
+<li>
+<p>提高 GPU 利用率。</p>
+</li>
+</ul>
+<p>但 Prefix Cache 引入了新的约束：请求发送到哪个节点，会影响后续缓存复用。</p>
+<p>例如：第一次请求被发送到实例 A，实例 A 保存了对应上下文的 Prefix Cache。用户继续围绕相同上下文交互，如果后续请求继续发送到 A，系统可以复用已有 Cache。但如果负载均衡策略将请求发送到实例 B，实例 B 没有对应缓存，需要重新计算。</p>
+<p>因此，系统同时面对两个目标：</p>
+<ul>
+<li>
+<p>请求分散，提高资源均衡；</p>
+</li>
+<li>
+<p>请求保持局部，提高缓存复用。</p>
+</li>
+</ul>
+<p>这形成了 LLM Serving 中新的系统权衡——局部缓存性与负载均衡。</p>
+<h2 id="不同路由策略中的取舍">不同路由策略中的取舍</h2>
+<p>论文通过 Trace Simulation 分析了不同路由策略的影响。</p>
+<p><img alt="7" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202608/3796273-20260825142703367-410920784.png" class="lazyload"></p>
+<p>图注：不同路由策略模拟结果</p>
+<p><strong>四种策略：</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>### <strong>策略</strong></td>
+<td>### <strong>核心目标</strong></td>
+<td>### <strong>主要特点</strong></td>
+</tr>
+<tr>
+<td>Round Robin</td>
+<td>平均分配请求</td>
+<td>关注整体均衡，不考虑缓存状态</td>
+</tr>
+<tr>
+<td>Load First</td>
+<td>优先选择低负载节点</td>
+<td>降低节点压力，但可能降低缓存复用</td>
+</tr>
+<tr>
+<td>Sticky</td>
+<td>保持用户请求粘性</td>
+<td>提高连续交互复用，但可能产生负载倾斜</td>
+</tr>
+<tr>
+<td>Cache First</td>
+<td>优先利用已有缓存节点</td>
+<td>兼顾缓存复用和集群负载</td>
+</tr>
+</tbody>
+</table>
+<p>Round Robin 和 Load First 更关注资源均衡。它们能够避免请求集中到少数节点，但不会考虑当前节点是否已经保存相关 Prefix Cache。结果是系统获得更好的负载分布，但可能牺牲缓存复用。</p>
+<p>Sticky 路由策略尝试保持用户与节点之间的关联。这种方式能够提高上下文连续性，但如果部分用户产生大量请求，也可能导致节点负载不均。</p>
+<p>Cache First 则进一步考虑节点上的缓存状态，如果某个节点已经拥有相关 Prefix Cache，系统优先继续利用该节点。这样可以减少：</p>
+<ul>
+<li>
+<p>Cache 重复存储；</p>
+</li>
+<li>
+<p>重复 Prefill；</p>
+</li>
+<li>
+<p>无效计算。</p>
+</li>
+</ul>
+<h1 id="cache-aware-路由中的系统权衡">Cache-aware 路由中的系统权衡</h1>
+<p>论文进一步量化了 Cache 与负载均衡之间的权衡。其中一个关键指标是缓存复制率，它衡量：相同 Prefix Cache 在多个节点重复保存的程度。如果路由只关注负载均衡，相同上下文可能被分散到不同机器。结果同一份 Cache 被复制多份，占用额外 GPU 显存资源，降低缓存容量利用率。</p>
+<p>实验表明 Cache First 能够降低缓存复制，同时保持较高 Cache 利用率。相比完全追求负载均衡的策略，Cache-aware 路由策略需要接受一定程度的负载偏差。</p>
+<p>根据论文实验，Cache First 在提升局部缓存性的同时，负载不均衡度增加约 5%～7%。这一结果说明在真实 LLM 工作负载下，完全均衡并不一定是最优目标。适当利用请求局部性，可以换取更高的计算复用效率。</p>
+<h2 id="跨节点搬运-kv-cache-的高成本">跨节点搬运 KV Cache 的高成本</h2>
+<p>面对局部缓存性问题，一个自然方案是如果目标节点没有 Cache，就直接把 KV Cache 传过去。但长上下文场景下，KV Cache 本身可能达到较大规模。</p>
+<p>论文进一步分析了这种方式的成本，当上下文规模达到几十万 Token 级别时，跨节点传输 KV Cache 可能产生明显网络开销。相比之下，让请求继续访问已有 Cache 所在节点，可能更加高效。因此，对于长上下文 Serving：计算就地访问可能比跨节点搬运数据更具实际价值。</p>
+<h1 id="从真实-trace-重新理解-llm-serving-系统设计">从真实 Trace 重新理解 LLM Serving 系统设计</h1>
+<p>《A Year in LLM Serving》没有提出一个新的推理框架，也没有给出一套可以直接复制的生产架构。论文的核心价值，在于通过一年、61 亿次请求的真实 Trace，展示了大规模 LLM 服务中的几个系统规律。</p>
+<p>第一，LLM Serving 工作负载持续变化。请求数量、模型使用方式以及 Token 分布都会随时间变化，系统设计需要建立在真实工作负载分析之上。</p>
+<p>第二，Prefix Cache 的收益高度依赖用户行为。缓存价值来自上下文复用，而不是单纯来自模型热度或者请求数量。</p>
+<p>第三，多节点 Serving 中，路由策略需要同时考虑资源状态和缓存状态。</p>
+<p>请求调度不能只关注当前节点负载和 GPU 利用率。还需要考虑哪些节点已经拥有计算状态，哪些请求具有复用价值。</p>
+<p>从这份 61 亿次请求的生产 Trace 中，开发者可以看到未来 LLM Serving 优化不会只围绕“让模型运行更快”。系统还需要理解：用户如何使用模型；哪些请求能够复用已有状态；计算状态应该如何在集群中流动。</p>
+<p>模型能力决定应用上限，而 Serving 系统决定这些能力如何被稳定、高效地交付。</p>
+<h1 id="研究的适用边界">研究的适用边界</h1>
+<p>需要说明的是，该论文研究的是真实生产环境中的 LLM Serving 工作负载分析，以及这些观察对系统设计的启示。</p>
+<p>它并没有证明：</p>
+<ul>
+<li>
+<p>Cache First 适用于所有生产环境；</p>
+</li>
+<li>
+<p>所有 LLM 服务都应该采用相同路由策略；</p>
+</li>
+<li>
+<p>Prefix Cache 一定是所有场景下的最佳优化方向。</p>
+</li>
+</ul>
+<p>不同业务仍然存在不同约束：</p>
+<ul>
+<li>
+<p>实时延迟要求；</p>
+</li>
+<li>
+<p>用户交互模式；</p>
+</li>
+<li>
+<p>GPU 规模；</p>
+</li>
+<li>
+<p>模型数量；</p>
+</li>
+<li>
+<p>成本目标。</p>
+</li>
+</ul>
+<p>例如，从这些结果推测，高度依赖连续多轮 Agent 交互的场景可能拥有更高 Cache 收益，但也可能带来更强节点粘性和负载倾斜。因此，这篇论文提供的是一套来自真实生产数据的系统观察。具体工程设计仍需要结合业务环境进一步验证。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-25 14:27">2026-08-25 14:27</span>&nbsp;
+<a href="https://www.cnblogs.com/Qiniu-developer">小七-七牛开发者</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22676127);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FQiniu-developer%2Fp%2F22676127&amp;targetId=22676127&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
