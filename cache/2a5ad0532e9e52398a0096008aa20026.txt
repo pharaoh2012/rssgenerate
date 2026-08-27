@@ -1,0 +1,65 @@
+
+	<article>
+		<div class="postTitle">
+			<h1><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xiexj/p/22720207" title="发布于 2026-08-27 16:40">
+    
+
+    <span role="heading" aria-level="2">那个内存泄漏一直都在，只是旧 GC 悄悄替我兜了三年</span>
+    
+
+</a>
+</h1>
+		</div>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>一个我们三年都没发现的内存泄漏，被一次「应该毫无影响」的 Java 版本升级炸了出来。在那之前它一直安安静静地待着，因为有个我们从没意识到的机制在默默替我们收尾。</p>
+<p>这事的过程比结论有意思。</p>
+<h2 id="症状监控全绿容器却在自杀">症状，监控全绿，容器却在自杀</h2>
+<p>我们有个很普通的功能，用户上传视频，后台截一帧生成封面缩略图。上线好几年，稳得像块砖。</p>
+<p>直到开始灰度升级 Java 版本，从 8 升到 11，先拿一部分流量试。升上去没多久，运维开始收到告警，某几个容器隔一两天就被 OOM 杀掉、自动重启一次。</p>
+<p>第一反应是查内存。诡异的地方来了，<strong>JVM 堆内存监控一切正常</strong>。堆用量平稳，GC 曲线健康，没有任何一条线告诉你我要爆了。可容器就是被系统以内存超限为由干掉了。</p>
+<p>堆没事，进程却因为内存被杀。</p>
+<p>这两句话放一起，本身就是答案的一半。</p>
+<h2 id="排错流量没变代码也没动">排错，流量没变，代码也没动</h2>
+<p>顺着最容易想到的方向查了一圈，全是死胡同。</p>
+<ul>
+<li>升级后流量涨了？没有，流量没变。</li>
+<li>我们动了缩略图的代码？翻 git，那块几个月没人碰。</li>
+<li>新版本 JVM 更吃内存？堆调大调小都试了，没用，因为问题根本不在堆里。</li>
+</ul>
+<p>唯一确定的线索只有一条，它是从我们切到 Java 11 那天开始的。可我们又没改那块代码。一个没被改动的功能，仅仅因为运行环境换了个版本就开始漏内存，矛头就指向了那些看不见的地方。</p>
+<h2 id="真因堆外内存加一个靠-gc-兜底的库">真因，堆外内存加一个靠 GC 兜底的库</h2>
+<p>那个缩略图功能，底层用的是 JavaCV，封装了 OpenCV 和 FFmpeg。这类库有个特点，真正干活的是 C/C++ 写的原生代码，它申请的内存是<strong>堆外内存</strong>，不归 JVM 堆管，你的堆监控自然也看不见。</p>
+<p>问题出在释放上。我们的代码抓完视频帧、转完图，只调了 <code>stop()</code>，<strong>没调 <code>release()</code></strong>。这两个不是一回事，<code>stop()</code> 停的是采集，<code>release()</code> 还的是原生内存。于是那些内存申请了，却没被显式还回去。</p>
+<p>那为什么用了三年都没事？</p>
+<p>这才是最精彩的地方。<strong>这个库当年是靠 GC 来兜底释放原生内存的</strong>，它给每个原生对象挂了个清道夫，等 JVM 垃圾回收时顺手把对应的堆外内存也释放掉。</p>
+<ul>
+<li>Java 8 默认的 <strong>Parallel GC</strong>，年轻代回收非常频繁。每次回收都顺手触发了这些清道夫，把我们忘记释放的堆外内存悄悄清掉了。泄漏一直存在，只是被高频 GC 盖住了。</li>
+<li>换到 Java 11 默认的 <strong>G1</strong> 之后，情况反过来。那些包装原生内存的 Java 对象本身极小，G1 不着急回收它们，它们能存活很久。清道夫迟迟不触发，堆外内存就一次上传、一次上传地往上堆，直到把整个容器的内存吃穿，被系统 OOM 掉。</li>
+</ul>
+<p>所以那次升级本身没有错，它只是把盖子掀开了。</p>
+<h2 id="我从这个-bug-里拿走的三条">我从这个 bug 里拿走的三条</h2>
+<p><strong>1. 堆外内存泄漏，你的 JVM 监控是瞎的。</strong></p>
+<p>所有盯着堆用量、GC 次数的仪表盘，对堆外内存一无所知。当你看到「进程被 OOM 杀了，但堆一切正常」，第一时间就该往堆外想，native 库、DirectByteBuffer、线程栈、内存映射文件，这几类都在堆监控的视野之外。</p>
+<p><strong>2. 「一直没出事」不等于「没有 bug」，可能只是有人替你扛着。</strong></p>
+<p>这个泄漏三年没爆，它一直都在，只是旧 GC 的高频回收在替我们收尾。很多系统的稳定，都建立在某个你没意识到的隐性兜底上。哪天这个兜底被换掉、被优化掉、被升级掉，账就一次性还给你。升级、重构、换框架之前，最该问的一句是，现在这套东西为什么能正常跑，靠的是不是一个我不知道的前提。</p>
+<p><strong>3. native 资源，谁申请谁释放，写进 finally，别赌 GC。</strong></p>
+<p>只要一个库的资源是堆外的（视频、图像、加解密、序列化……），就把它当成文件句柄和数据库连接来对待，用完立刻显式关，放进 finally。指望 GC 帮你还堆外的债迟早出事，而且是在你最想不到的时候，比如一次「无害」的升级。</p>
+<h2 id="最后">最后</h2>
+<p>工程里最危险的状态不是报错了，是看起来一切正常。报错至少会喊你，而一个被兜底盖住的 bug、一个监控看不见的泄漏，会安安静静地待到某一天，等那个替你扛着的东西一撤，再一次性还给你。</p>
+<p>所以每次系统莫名其妙变好了、或者莫名其妙没事了，我都会多问一句，到底是真好了，还是有什么东西在替我兜着。</p>
+<p>本文首发于公众号「编程一生」，<a href="https://mp.weixin.qq.com/s/PwZczuxx3NE6ZZyy8kig6g" target="_blank" rel="noopener nofollow">点这里看原文</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+	</article>
+	<div class="postDesc">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-27 16:40">2026-08-27 16:40</span>&nbsp;
+<a href="https://www.cnblogs.com/xiexj">编程一生</a>&nbsp;
+阅读(<span id="post_view_count">167</span>)&nbsp;
+评论(<span id="post_comment_count">4</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22720207);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxiexj%2Fp%2F22720207&amp;targetId=22720207&amp;targetType=0" target="_blank">举报</a>
+</div>
