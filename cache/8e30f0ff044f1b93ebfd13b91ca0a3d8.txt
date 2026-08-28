@@ -1,0 +1,1488 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/GlenTt/p/22742530" title="发布于 2026-08-28 16:51">
+    
+
+    <span role="heading" aria-level="2">模型训练稳定性：从训练链路到排障手册</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="模型训练稳定性从训练链路到排障手册">模型训练稳定性：从训练链路到排障手册</h1>
+<blockquote>
+<p>我写这篇手册，不是为了追求一条毫无波动的 loss 曲线，而是为了回答一个更实际的问题：<strong>怎样让模型在训练预算内持续、有效、可控地学习，并在出现异常时尽快找到真正原因？</strong></p>
+</blockquote>
+<h2 id="导读先把目标说清楚什么才算训练稳定">导读：先把目标说清楚——什么才算训练稳定</h2>
+<h3 id="01-loss-有波动不等于训练不稳定">0.1 loss 有波动，不等于训练不稳定</h3>
+<p>大模型训练通常使用小批量数据。不同 batch 的内容和难度不同，单步训练损失（training loss）自然会波动。因此，我不会因为某一步 loss 上升，就立刻判断训练不稳定；也不会因为 loss 曲线平滑，就断定训练一定正确。</p>
+<p>我把稳定训练定义为：</p>
+<blockquote>
+<p><strong>在给定的数据、模型、计算精度和训练预算下，所有关键计算保持可执行，梯度信号能够正常传播，参数获得受控且有效的更新，训练目标呈总体改善趋势，并最终产生符合预期的验证结果。</strong></p>
+</blockquote>
+<p>这个定义包含五层要求：</p>
+<ol>
+<li><strong>数值可计算</strong>：loss、激活值、梯度、参数和优化器状态不能出现 <code>NaN</code> 或 <code>inf</code>。</li>
+<li><strong>梯度信号健康</strong>：误差信号能够传到应该学习的参数，既没有系统性消失，也没有持续爆炸。</li>
+<li><strong>参数更新受控</strong>：单步更新不能大到破坏已有模型状态。</li>
+<li><strong>参数更新有效</strong>：应该学习的参数确实发生了足够的变化，而不是看似运行、实际没有学习。</li>
+<li><strong>训练方向正确</strong>：数据、标签、mask、loss 和分布式归约都符合训练目标，验证结果能够改善。</li>
+</ol>
+<p>其中，前四项保证训练链路能够工作，第五项决定模型是不是在学正确的东西。</p>
+<h3 id="02-目标指标现象原因和处理手段不能混在一起">0.2 目标、指标、现象、原因和处理手段不能混在一起</h3>
+<p>训练排障最容易出现的错误，是把观察到的现象直接当成原因。例如：“loss 很震荡，所以学习率一定太大”，或者“grad norm 很高，所以一定发生了梯度爆炸”。这两种推断都缺少证据。</p>
+<p>我会严格区分下面五类信息：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>例子</th>
+<th>我用它回答什么问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练目标</td>
+<td>validation loss、perplexity、任务指标</td>
+<td>模型最终是否学到了有用能力</td>
+</tr>
+<tr>
+<td>过程指标</td>
+<td>grad norm、相对更新量、AMP scale</td>
+<td>训练链路内部正在发生什么</td>
+</tr>
+<tr>
+<td>异常现象</td>
+<td>loss spike、长期不降、出现 <code>NaN</code></td>
+<td>哪个时间点可能出现了问题</td>
+</tr>
+<tr>
+<td>候选原因</td>
+<td>异常 batch、学习率过大、mask 错误</td>
+<td>哪条链路值得优先验证</td>
+</tr>
+<tr>
+<td>处理手段</td>
+<td>梯度裁剪、降低学习率、修复数据</td>
+<td>根因确认后应该怎样处理</td>
+</tr>
+</tbody>
+</table>
+<p><strong>一个指标只能提供证据，不能自动给出根因。</strong>我会先寻找第一个偏离健康状态的信号，再用重放或单变量对照实验确认原因。</p>
+<h3 id="03-全文主线一次训练更新怎样发生">0.3 全文主线：一次训练更新怎样发生</h3>
+<p>一轮参数更新可以压缩成下面这条链路：</p>
+<blockquote>
+<p>数据与训练目标 → 前向计算 → loss → 反向传播 → gradient → optimizer → parameter update → 新的模型状态 → 后续训练与验证结果</p>
+</blockquote>
+<p>后文的四道保障都附着在这条链路上：</p>
+<ul>
+<li><strong>数值保障</strong>覆盖前向、反向和优化器计算；</li>
+<li><strong>梯度保障</strong>覆盖误差信号从 loss 返回各层参数的过程；</li>
+<li><strong>更新保障</strong>覆盖优化器把梯度转换为参数变化的过程；</li>
+<li><strong>正确性保障</strong>覆盖数据、目标函数、mask、归约和验证链路。</li>
+</ul>
+<p><img src="https://img2024.cnblogs.com/blog/3670197/202608/3670197-20260828164744714-1782047264.png" alt="图1：一次大模型训练更新的完整因果链" loading="lazy"></p>
+<hr>
+<h2 id="part-1-一次训练更新究竟发生了什么">Part 1 一次训练更新究竟发生了什么</h2>
+<h3 id="11-从一个-batch-到-loss">1.1 从一个 batch 到 loss</h3>
+<p>一个 batch 是一次前向和反向计算使用的数据集合。在大语言模型训练中，batch 通常包含 token 序列以及与训练目标有关的辅助信息：</p>
+<ul>
+<li><strong>token</strong>：分词器把文本转换得到的离散编号；</li>
+<li><strong>label</strong>：模型需要预测的目标 token；</li>
+<li><strong>attention mask</strong>：规定每个位置可以关注哪些位置；</li>
+<li><strong>loss mask</strong>：规定哪些位置参与 loss；</li>
+<li><strong>有效 token 数</strong>：真正参与 loss 计算的位置数量。</li>
+</ul>
+<p>模型通过前向传播产生 logits。logits 是 softmax 之前的未归一化分数。以自回归语言模型为例，模型用当前位置之前的上下文预测下一个 token，交叉熵损失衡量预测分布和正确 token 之间的差异。</p>
+<p>如果第 <span class="math inline">\(i\)</span> 个有效 token 的损失为 <span class="math inline">\(\ell_i\)</span>，一个 batch 的 token 平均损失通常写为：</p>
+<p></p><div class="math display">\[L=\frac{\sum_{i=1}^{N}\ell_i}{N}
+\]</div><p></p><p>这里的 <span class="math inline">\(N\)</span> 必须是有效 token 数，而不是张量总长度。如果 padding、被屏蔽位置或只作为上下文的位置错误地进入分母，loss 的数值和梯度尺度都会改变。</p>
+<h3 id="12-参数激活值和梯度分别是什么">1.2 参数、激活值和梯度分别是什么</h3>
+<p>这三个概念都以张量形式存在，但含义完全不同。</p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>英文</th>
+<th>产生时间</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>参数</td>
+<td>parameter / weight</td>
+<td>初始化或加载 checkpoint 时产生</td>
+<td>保存模型已经学到的状态</td>
+</tr>
+<tr>
+<td>激活值</td>
+<td>activation</td>
+<td>每次前向传播时产生</td>
+<td>把输入逐层转换为 logits</td>
+</tr>
+<tr>
+<td>梯度</td>
+<td>gradient</td>
+<td>反向传播时产生</td>
+<td>描述 loss 对参数的局部变化率</td>
+</tr>
+</tbody>
+</table>
+<p>例如：</p>
+<pre><code class="language-python">h = self.proj(x)
+</code></pre>
+<ul>
+<li><code>self.proj.weight</code> 是参数；</li>
+<li><code>h</code> 是这一层的激活值；</li>
+<li>反向传播后的 <code>self.proj.weight.grad</code> 是梯度。</li>
+</ul>
+<p>参数异常会影响后续所有 batch；激活异常首先发生在当前前向传播；梯度异常首先影响当前参数更新。排障时，我会沿着时间顺序寻找第一个异常对象。</p>
+<h3 id="13-梯度表示什么">1.3 梯度表示什么</h3>
+<p>设模型参数为 <span class="math inline">\(\theta\)</span>，当前 loss 为 <span class="math inline">\(L(\theta)\)</span>，梯度定义为：</p>
+<p></p><div class="math display">\[g_t=\nabla_\theta L(\theta_t)
+\]</div><p></p><p>梯度告诉我：在当前参数附近，如果轻微改变某个参数，loss 会怎样变化。它提供局部方向和敏感程度，但它<strong>不是最终参数更新量</strong>。</p>
+<p>最基本的梯度下降会直接使用：</p>
+<p></p><div class="math display">\[\theta_{t+1}=\theta_t-\eta g_t
+\]</div><p></p><p>其中，<span class="math inline">\(\eta\)</span> 是学习率（learning rate）。但大模型训练通常使用 AdamW。AdamW 会用历史梯度计算一阶矩和二阶矩，再结合学习率、数值稳定项和权重衰减产生实际更新。</p>
+<h3 id="14-参数更新量表示什么">1.4 参数更新量表示什么</h3>
+<p>我把第 <span class="math inline">\(t\)</span> 步的参数更新量定义为：</p>
+<p></p><div class="math display">\[\Delta\theta_t=\theta_{t+1}-\theta_t
+\]</div><p></p><p>因此：</p>
+<blockquote>
+<p><strong>梯度 <span class="math inline">\(g_t\)</span> 是优化器的输入，参数更新量 <span class="math inline">\(\Delta\theta_t\)</span> 是优化器处理后的结果。</strong></p>
+</blockquote>
+<p>即使梯度正常，参数也可能没有有效更新。例如：</p>
+<ul>
+<li>当前学习率已经降为零；</li>
+<li>参数被冻结；</li>
+<li>参数没有加入 optimizer；</li>
+<li>FP16 检测到非有限梯度并跳过了 optimizer step；</li>
+<li>AdamW 的二阶矩把当前梯度大幅缩小；</li>
+<li>scheduler 在错误的时间点推进。</li>
+</ul>
+<p>这就是为什么我会分别监控 grad norm 和相对更新量，而不是把二者视为同一个指标。</p>
+<hr>
+<h2 id="part-2-第一道保障所有数值必须可计算">Part 2 第一道保障：所有数值必须可计算</h2>
+<h3 id="21-什么是数值稳定">2.1 什么是数值稳定</h3>
+<p>计算机不能表示任意大的实数，也不能无限精确地表示任意小数。训练中的张量必须落在当前浮点格式能够表示的范围和精度内。</p>
+<p>我重点关注三类异常：</p>
+<ul>
+<li><strong>上溢（overflow）</strong>：数值太大，超出表示范围，可能变成 <code>inf</code>；</li>
+<li><strong>下溢（underflow）</strong>：数值太小，无法保留，可能被舍入为零；</li>
+<li><strong>非法运算</strong>：例如 <code>0/0</code>、对负数开平方，结果可能变成 <code>NaN</code>。</li>
+</ul>
+<p><code>NaN</code> 是 Not a Number，表示结果不是合法数值；<code>inf</code> 是 infinity，表示正无穷或负无穷。一旦非有限值进入后续矩阵乘法、归一化或优化器状态，它通常会迅速污染更多参数。</p>
+<h3 id="22-浮点数的范围和精度来自哪里">2.2 浮点数的范围和精度来自哪里</h3>
+<p>浮点数可以直观理解为科学计数法：</p>
+<p></p><div class="math display">\[\text{value}=(-1)^{\text{sign}}\times\text{significand}\times 2^{\text{exponent}}
+\]</div><p></p><ul>
+<li><strong>符号位</strong>决定正负；</li>
+<li><strong>指数位</strong>主要决定能表示多大、多小的数；</li>
+<li><strong>尾数位</strong>主要决定数值精度。</li>
+</ul>
+<p>常见训练格式如下：</p>
+<table>
+<thead>
+<tr>
+<th>格式</th>
+<th style="text-align: right">指数位</th>
+<th style="text-align: right">尾数位</th>
+<th>核心特点</th>
+<th>训练中的主要风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32</td>
+<td style="text-align: right">8</td>
+<td style="text-align: right">23</td>
+<td>范围和精度都较高</td>
+<td>显存和计算开销较大</td>
+</tr>
+<tr>
+<td>FP16</td>
+<td style="text-align: right">5</td>
+<td style="text-align: right">10</td>
+<td>精度高于 BF16，但范围较小</td>
+<td>大值上溢、小梯度下溢</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td style="text-align: right">8</td>
+<td style="text-align: right">7</td>
+<td>范围接近 FP32，精度低于 FP16</td>
+<td>小变化可能被舍入，非法运算仍会产生非有限值</td>
+</tr>
+</tbody>
+</table>
+<p>这里最重要的区别是：<strong>指数位控制动态范围，尾数位控制有效精度。</strong>BF16 不容易因为动态范围不足而溢出，但它并不等于“数值绝对安全”。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3670197/202608/3670197-20260828164746006-304632802.png" alt="图2：FP32、FP16 与 BF16 的范围和精度对比" loading="lazy"></p>
+<h3 id="23-什么是自动混合精度训练">2.3 什么是自动混合精度训练</h3>
+<p>自动混合精度（Automatic Mixed Precision，AMP）不是把所有计算统一改成 FP16 或 BF16，而是让框架根据算子特性选择精度：</p>
+<ul>
+<li>适合低精度的矩阵乘法使用 FP16 或 BF16；</li>
+<li>对精度敏感的归约或特定算子保留 FP32；</li>
+<li>优化器状态通常使用更高精度保存。</li>
+</ul>
+<p>这样可以降低显存占用并提高吞吐，同时减少低精度计算带来的风险。</p>
+<p>在新的 PyTorch 接口中，典型写法是：</p>
+<pre><code class="language-python">with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    logits = model(input_ids, attention_mask=attention_mask).logits
+    loss = loss_fn(logits, labels)
+</code></pre>
+<p>我不会假设进入 <code>autocast</code> 后每个算子都采用同一种 dtype。排查数值问题时，需要定位实际发生异常的算子和张量。</p>
+<h3 id="24-fp16-为什么需要-loss-scaling">2.4 FP16 为什么需要 loss scaling</h3>
+<p>损失缩放（loss scaling）主要解决 FP16 反向传播中的小梯度下溢。</p>
+<p>设原始 loss 为 <span class="math inline">\(L\)</span>，缩放系数为 <span class="math inline">\(S\)</span>。反向传播前先计算：</p>
+<p></p><div class="math display">\[L'=S\cdot L
+\]</div><p></p><p>对应梯度也被放大：</p>
+<p></p><div class="math display">\[\nabla_\theta L'=S\cdot\nabla_\theta L
+\]</div><p></p><p>这样，小梯度在 FP16 中更不容易被舍入为零。optimizer step 前再把梯度除以 <span class="math inline">\(S\)</span>，恢复真实尺度。</p>
+<p>动态损失缩放会根据非有限梯度调整 <span class="math inline">\(S\)</span>：</p>
+<ul>
+<li>检测到 <code>inf</code> 或 <code>NaN</code> 时，跳过当前 optimizer step，并降低 scale；</li>
+<li>连续一段时间没有溢出时，逐步增大 scale。</li>
+</ul>
+<p>需要注意：scale 下降说明框架检测到了不可用于更新的梯度，但它没有告诉我根因。根因可能是 FP16 范围不足，也可能是输入、loss 或模型计算已经出现异常。</p>
+<h3 id="25-fp16-下统计和裁剪梯度的正确顺序">2.5 FP16 下统计和裁剪梯度的正确顺序</h3>
+<p><code>scaler.scale(loss).backward()</code> 得到的是放大后的梯度。我要先还原真实梯度，再统计 grad norm 和执行裁剪：</p>
+<pre><code class="language-python">optimizer.zero_grad(set_to_none=True)
+
+with torch.autocast(device_type="cuda", dtype=torch.float16):
+    logits = model(input_ids, attention_mask=attention_mask).logits
+    loss = loss_fn(logits, labels)
+
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)
+
+grad_norm = torch.nn.utils.clip_grad_norm_(
+    model.parameters(),
+    max_norm=clip_threshold,
+)
+
+scaler.step(optimizer)
+scaler.update()
+</code></pre>
+<p>如果先裁剪缩放后的梯度，裁剪阈值就失去了原本含义。如果使用梯度累积，我会等完整有效 batch 的梯度全部累积完成，再执行一次 <code>unscale_</code>、统计、裁剪和 optimizer step。</p>
+<h3 id="26-常见数值危险点">2.6 常见数值危险点</h3>
+<table>
+<thead>
+<tr>
+<th>危险点</th>
+<th>典型错误</th>
+<th>更可靠的处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>softmax</td>
+<td>对过大 logits 直接手写 <code>exp</code></td>
+<td>使用框架提供的 softmax、cross entropy 或 logsumexp</td>
+</tr>
+<tr>
+<td>对数</td>
+<td>对零概率计算 <code>log(0)</code></td>
+<td>使用数值稳定实现，并明确概率下界的业务含义</td>
+</tr>
+<tr>
+<td>除法</td>
+<td>有效 token 数或归一化分母为零</td>
+<td>在运算前显式检查分母</td>
+</tr>
+<tr>
+<td>attention mask</td>
+<td>一整行都被设为负无穷后执行 softmax</td>
+<td>保证每个查询至少存在合法键，或显式处理空行</td>
+</tr>
+<tr>
+<td>loss reduction</td>
+<td>空 mask 后继续求平均</td>
+<td>把有效数量为零作为数据或实现错误处理</td>
+</tr>
+<tr>
+<td>自定义算子</td>
+<td>低精度中执行大范围累加</td>
+<td>对敏感计算指定 FP32 或使用稳定 kernel</td>
+</tr>
+</tbody>
+</table>
+<p>我不会用 <code>torch.clamp(loss)</code> 作为通用止损手段。直接截断总 loss 会改变训练目标，还可能把真正的实现错误隐藏起来。</p>
+<h3 id="27-数值稳定的直接监控项">2.7 数值稳定的直接监控项</h3>
+<p>我只保留能直接触发行动的数值监控：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>统计位置</th>
+<th>异常后的直接行动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>loss 是否有限</td>
+<td>backward 前</td>
+<td>保存 batch 和前向现场，停止当前更新</td>
+</tr>
+<tr>
+<td>gradient 是否有限</td>
+<td>backward 后、optimizer step 前</td>
+<td>跳过更新并定位第一个异常梯度</td>
+</tr>
+<tr>
+<td>parameter 是否有限</td>
+<td>optimizer step 后</td>
+<td>停止训练并回滚到最后一个健康 checkpoint</td>
+</tr>
+<tr>
+<td>optimizer step 是否执行</td>
+<td>每个计划更新点</td>
+<td>检查 AMP 跳步、参数冻结和控制流</td>
+</tr>
+<tr>
+<td>AMP scale</td>
+<td>仅 FP16 训练</td>
+<td>连续下降时检查溢出位置和模型是否适合 FP16</td>
+</tr>
+</tbody>
+</table>
+<p>activation 和 logits 的详细分层统计不作为常驻核心指标。只有当 loss 首先出现异常、而输入仍然有限时，我才临时开启分层检查，定位第一个产生非有限值或异常放大的模块。</p>
+<hr>
+<h2 id="part-3-第二道保障梯度信号必须健康">Part 3 第二道保障：梯度信号必须健康</h2>
+<h3 id="31-梯度为什么需要沿网络传播">3.1 梯度为什么需要沿网络传播</h3>
+<p>大模型包含许多层。靠近输出的 loss 必须通过反向传播，把误差信号传回每一层参数。对于从 <span class="math inline">\(h_0\)</span> 到 <span class="math inline">\(h_N\)</span> 的深层网络，可以写成：</p>
+<p></p><div class="math display">\[\frac{\partial L}{\partial h_0}
+=
+\frac{\partial L}{\partial h_N}
+\prod_{l=1}^{N}
+\frac{\partial h_l}{\partial h_{l-1}}
+\]</div><p></p><p>这里的每一项都是局部变换对输入的敏感程度。它们连续相乘后，某些方向的信号可能逐层缩小，也可能逐层放大。</p>
+<p><strong>梯度信号健康</strong>不是要求所有层的梯度一样大，而是要求应该学习的层在当前阶段持续收到可用信号。</p>
+<h3 id="32-梯度消失是什么">3.2 梯度消失是什么</h3>
+<p>梯度消失（gradient vanishing）是指反向信号在传播过程中被系统性削弱，使部分层长期几乎得不到有效梯度。</p>
+<p>我会同时检查三个证据：</p>
+<ol>
+<li>训练仍处于应该明显学习的阶段，但 loss 长期停在较高位置；</li>
+<li>靠近输入的若干层，其 grad norm 长期远小于靠近输出的层；</li>
+<li>对应层的相对更新量长期接近测量下限，验证结果也没有改善。</li>
+</ol>
+<p>仅仅看到训练中后期全局 grad norm 变小，不足以证明梯度消失。正常收敛时，模型接近当前可达到的低损失区域，梯度变小是合理现象。</p>
+<h3 id="33-梯度爆炸是什么">3.3 梯度爆炸是什么</h3>
+<p>梯度爆炸（gradient explosion）是指反向信号在传播过程中被持续放大，最终使梯度尺度异常增大，并可能造成过大的参数更新。</p>
+<p>我会区分三种现象：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>更可能说明什么</th>
+<th>不能直接断言什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>某个 batch 的 grad norm 单步尖峰，随后恢复</td>
+<td>当前 batch 更难或存在异常样本</td>
+<td>网络结构必然发生梯度爆炸</td>
+</tr>
+<tr>
+<td>深层到浅层的 grad norm 系统性放大</td>
+<td>反向传播链路可能放大信号</td>
+<td>根因一定是学习率过大</td>
+</tr>
+<tr>
+<td>grad norm 持续抬升并伴随 loss 恶化</td>
+<td>训练状态正在偏离健康区域</td>
+<td>仅靠一次裁剪就能修复根因</td>
+</tr>
+</tbody>
+</table>
+<p>学习率不会改变当前 backward 已经算出的原始梯度，但它会改变这一步参数更新和下一步模型所在的位置。因此，过大学习率可能先造成参数移动过远，再让后续步骤进入高梯度区域。</p>
+<h3 id="34-grad-norm-是什么">3.4 grad norm 是什么</h3>
+<p>梯度范数（gradient norm，grad norm）通常指所有目标参数梯度组成的整体 L2 范数：</p>
+<p></p><div class="math display">\[\lVert g\rVert_2=\sqrt{\sum_i g_i^2}
+\]</div><p></p><p>它把大量梯度压缩成一个数，适合发现整体尖峰和长期漂移，但有三个边界：</p>
+<ul>
+<li>它不能指出是哪一层首先异常；</li>
+<li>它会受 loss reduction、有效 token 数和参数集合影响；</li>
+<li>它的绝对大小不能跨模型直接比较。</li>
+</ul>
+<p>因此，我不会把 <code>0.1–10</code> 写成通用健康区间。我先用健康的 pilot run 建立同一模型、同一统计口径下的基线，再关注相对变化。</p>
+<h3 id="35-全局和分层-grad-norm-怎样配合">3.5 全局和分层 grad norm 怎样配合</h3>
+<p>常驻监控只记录<strong>裁剪前全局 grad norm</strong>，因为它成本低，而且能够及时发现整体异常。</p>
+<p>只有当全局指标异常时，我才开启分层统计，并按 Transformer 的自然边界比较：</p>
+<ul>
+<li>token embedding；</li>
+<li>前部 Transformer block；</li>
+<li>中部 Transformer block；</li>
+<li>后部 Transformer block；</li>
+<li>最终归一化层；</li>
+<li>language modeling head。</li>
+</ul>
+<p>分层统计的目的不是画出更多曲线，而是回答一个具体问题：<strong>哪一组参数最先偏离自己的健康基线？</strong></p>
+<h3 id="36-梯度裁剪解决什么问题">3.6 梯度裁剪解决什么问题</h3>
+<p>全局 L2 梯度裁剪（gradient clipping）会在梯度范数超过阈值 <span class="math inline">\(c\)</span> 时，按同一比例缩小所有梯度：</p>
+<p></p><div class="math display">\[g\leftarrow g\cdot\min\left(1,\frac{c}{\lVert g\rVert_2+\epsilon}\right)
+\]</div><p></p><p>统一缩放保留整体梯度方向，同时限制当前更新风险。</p>
+<p>我会同时记录：</p>
+<ul>
+<li>裁剪前 grad norm；</li>
+<li>当前 step 是否触发裁剪；</li>
+<li>实际缩放系数。</li>
+</ul>
+<p>如果多数 step 都被大幅裁剪，配置中的 learning rate 已经不再代表实际更新尺度。此时我会检查裁剪阈值、loss 归一化和异常来源，而不是把长期裁剪当作正常状态。</p>
+<h3 id="37-transformer-结构怎样帮助梯度传播">3.7 Transformer 结构怎样帮助梯度传播</h3>
+<p>残差连接提供接近恒等映射的主路径，让梯度不必完全穿过每个非线性子层。归一化和初始化则控制各层激活及局部变换的尺度。</p>
+<p>在许多 Transformer 配置中，Pre-LN 比原始 Post-LN 更容易稳定启动，因为残差主路径更直接。但这不是说 Post-LN 一定不能训练，也不是说使用 Pre-LN 后就不需要 warmup。</p>
+<p>我只把以下结构因素纳入排障：</p>
+<ul>
+<li>残差分支输出是否随深度合理缩放；</li>
+<li>LayerNorm 或 RMSNorm 的位置和 <code>eps</code> 是否正确；</li>
+<li>attention 的 Q、K 尺度是否符合实现预期；</li>
+<li>初始化是否与既定模型结构一致。</li>
+</ul>
+<p>这些是模型设计和实现检查项，不应该在发现一次 loss spike 后随意叠加修改。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3670197/202608/3670197-20260828164746727-1646252662.png" alt="图3：梯度传播与参数更新不是同一过程" loading="lazy"></p>
+<p><img src="https://img2024.cnblogs.com/blog/3670197/202608/3670197-20260828164747554-423648350.png" alt="图4：正常梯度、梯度消失和梯度爆炸的分层对比" loading="lazy"></p>
+<hr>
+<h2 id="part-4-第三道保障参数更新必须受控且有效">Part 4 第三道保障：参数更新必须受控且有效</h2>
+<h3 id="41-正常梯度为什么不保证正常更新">4.1 正常梯度为什么不保证正常更新</h3>
+<p>反向传播结束后，优化器才决定怎样改变参数。以 AdamW 为例，同一个当前梯度会因为历史一阶矩、二阶矩、学习率和权重衰减不同，产生不同的更新量。</p>
+<p>因此我把更新健康拆成两个问题：</p>
+<ul>
+<li><strong>受控</strong>：更新没有大到破坏当前模型状态；</li>
+<li><strong>有效</strong>：更新没有小到让应该学习的参数长期不动。</li>
+</ul>
+<p>训练可能非常平滑但没有效果。例如，learning rate 过小会让 loss 缓慢变化甚至几乎不变。训练也可能短期下降很快但不可控，例如大学习率在早期跨过多个高曲率区域，随后引发震荡或发散。</p>
+<h3 id="42-adamw-怎样把梯度变成更新">4.2 AdamW 怎样把梯度变成更新</h3>
+<p>AdamW 对每个参数维护两个历史状态。</p>
+<p>一阶矩（first moment）是梯度的指数移动平均：</p>
+<p></p><div class="math display">\[m_t=\beta_1m_{t-1}+(1-\beta_1)g_t
+\]</div><p></p><p>二阶矩（second moment）是梯度平方的指数移动平均：</p>
+<p></p><div class="math display">\[v_t=\beta_2v_{t-1}+(1-\beta_2)g_t^2
+\]</div><p></p><p>偏差修正（bias correction）用于修正状态从零开始带来的系统偏小：</p>
+<p></p><div class="math display">\[\hat m_t=\frac{m_t}{1-\beta_1^t},\qquad
+\hat v_t=\frac{v_t}{1-\beta_2^t}
+\]</div><p></p><p>AdamW 的一次更新可以写为：</p>
+<p></p><div class="math display">\[\theta_{t+1}
+=
+(1-\eta\lambda)\theta_t
+-
+\eta\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}
+\]</div><p></p><p>其中：</p>
+<ul>
+<li><span class="math inline">\(\eta\)</span> 是 learning rate；</li>
+<li><span class="math inline">\(\lambda\)</span> 是 weight decay 系数；</li>
+<li><span class="math inline">\(\epsilon\)</span> 防止分母过小；</li>
+<li><span class="math inline">\(\hat m_t\)</span> 提供经过平滑的方向信息；</li>
+<li><span class="math inline">\(\hat v_t\)</span> 根据历史梯度平方调整每个参数的更新尺度。</li>
+</ul>
+<p>“一阶矩管方向、二阶矩管步长”适合建立直觉，但不是完整定义。一阶矩也包含幅度信息，二阶矩也会改变不同参数之间的相对更新尺度。</p>
+<p>AdamW 的关键变化，是把权重衰减（weight decay）与自适应梯度更新分开，避免 L2 项再次被二阶矩缩放。</p>
+<h3 id="43-learning-rate-为什么会导致震荡或学不动">4.3 learning rate 为什么会导致震荡或学不动</h3>
+<p>先看一个局部二次函数：</p>
+<p></p><div class="math display">\[L(\theta)=\frac{1}{2}\lambda\theta^2
+\]</div><p></p><p>使用普通梯度下降时：</p>
+<p></p><div class="math display">\[\theta_{t+1}=(1-\eta\lambda)\theta_t
+\]</div><p></p><p>只有满足：</p>
+<p></p><div class="math display">\[|1-\eta\lambda|&lt;1
+\]</div><p></p><p>参数才会逐步接近最优点。这个例子说明，同一个 learning rate 在平坦方向可能安全，在高曲率方向可能过大。</p>
+<p>真实大模型和 AdamW 更复杂，但判断逻辑不变：我不会只看配置中的 learning rate，而会结合实际相对更新量和训练结果判断步长是否合适。</p>
+<h3 id="44-warmup-是什么">4.4 warmup 是什么</h3>
+<p>学习率预热（learning rate warmup）是在训练开始阶段，从较小 learning rate 逐步增加到峰值 learning rate 的过程。</p>
+<p>warmup 的作用不是单纯“等待 AdamW 的二阶矩稳定”。训练初期同时存在以下风险：</p>
+<ul>
+<li>模型仍在初始化附近；</li>
+<li>局部曲率和激活尺度快速变化；</li>
+<li>优化器历史统计很短；</li>
+<li>前几个 batch 可能不能代表总体数据分布。</li>
+</ul>
+<p>较小的初始步长可以降低模型一步进入高风险区域的概率。warmup 是否需要、需要多长，必须结合模型结构、初始化、有效 batch 和峰值 learning rate 验证。</p>
+<p>我会区分三个单位：</p>
+<ul>
+<li><strong>micro-step</strong>：执行一次 forward 和 backward；</li>
+<li><strong>optimizer step</strong>：真正更新一次参数；</li>
+<li><strong>warmup token</strong>：warmup 期间实际看过的有效 token 数。</li>
+</ul>
+<p>存在梯度累积时，scheduler 应该按 optimizer step 推进，而不是按每个 micro-step 推进。</p>
+<h3 id="45-update-norm-是什么">4.5 update norm 是什么</h3>
+<p>更新范数（update norm）是参数更新量的 L2 范数：</p>
+<p></p><div class="math display">\[\text{Update Norm}=\lVert\Delta\theta_t\rVert_2
+\]</div><p></p><p>它回答：<strong>这一步参数一共改变了多少？</strong></p>
+<p>如果某层参数从 <span class="math inline">\(\theta_t\)</span> 变成 <span class="math inline">\(\theta_{t+1}\)</span>，可以直接计算：</p>
+<pre><code class="language-python">update_norm = (new_param - old_param).float().norm(2)
+</code></pre>
+<p>update norm 是绝对量。参数规模和参数自身尺度不同，绝对量不能直接用于跨层比较。</p>
+<h3 id="46-weight-norm-和相对更新量是什么">4.6 weight norm 和相对更新量是什么</h3>
+<p>权重范数（weight norm）表示参数当前的整体尺度：</p>
+<p></p><div class="math display">\[\text{Weight Norm}=\lVert\theta_t\rVert_2
+\]</div><p></p><p>我把某个参数组的相对更新量定义为：</p>
+<p></p><div class="math display">\[r=
+\frac{\lVert\Delta\theta_t\rVert_2}
+{\lVert\theta_t\rVert_2+\epsilon}
+\]</div><p></p><p>它常被称为 update-to-weight ratio，可以直观理解为：<strong>这一步参数变化相对于参数自身尺度有多大。</strong></p>
+<p>我不会把 <code>0.001–0.01</code> 当作所有模型的健康区间。相对更新量会受到参数化方式、参数组、训练阶段、weight decay 和统计频率影响。更可靠的使用方式是：</p>
+<ol>
+<li>为固定模型和固定统计口径建立健康 pilot run 基线；</li>
+<li>比较同一参数组在不同时段的变化；</li>
+<li>比较关键参数组之间是否出现持续失衡；</li>
+<li>将异常与 loss、grad norm、learning rate 和验证结果对齐。</li>
+</ol>
+<h3 id="47-哪些参数组值得常驻监控">4.7 哪些参数组值得常驻监控</h3>
+<p>为了避免指标过载，我不记录每一层的相对更新量。对标准 decoder-only Transformer，我选择四个代表性参数组：</p>
+<ol>
+<li>token embedding；</li>
+<li>前部 Transformer blocks；</li>
+<li>后部 Transformer blocks；</li>
+<li>language modeling head。</li>
+</ol>
+<p>如果输入 embedding 和输出 head 共享权重，只记录一次并明确标记 tied weight。bias 和归一化参数的 weight norm 可能很小，不与大矩阵使用同一报警规则。</p>
+<p>常驻监控可以降低采样频率，例如每隔固定数量的 optimizer step 计算一次。真正出现异常时，再临时展开到逐层统计。</p>
+<h3 id="48-怎样判断更新受控且有效">4.8 怎样判断更新受控且有效</h3>
+<p>我把判断压缩成下面这张表：</p>
+<table>
+<thead>
+<tr>
+<th>观察</th>
+<th>更新状态</th>
+<th>下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>相对更新量突增，随后 loss 和 grad norm 恶化</td>
+<td>更新可能过大</td>
+<td>检查 learning rate、异常 batch、裁剪和 optimizer state</td>
+</tr>
+<tr>
+<td>grad norm 正常，但相对更新量长期极小</td>
+<td>更新可能不足</td>
+<td>检查 learning rate、二阶矩、冻结参数和 optimizer 参数组</td>
+</tr>
+<tr>
+<td>optimizer step 持续跳过</td>
+<td>参数没有按计划更新</td>
+<td>检查 FP16 溢出和 GradScaler 状态</td>
+</tr>
+<tr>
+<td>各参数组均有稳定更新，但验证结果不改善</td>
+<td>更新存在但方向未必正确</td>
+<td>检查数据、目标函数和验证链路</td>
+</tr>
+<tr>
+<td>更新稳定，训练与验证目标总体改善</td>
+<td>更新受控且有效</td>
+<td>继续训练并保持监控口径不变</td>
+</tr>
+</tbody>
+</table>
+<p><img src="https://img2024.cnblogs.com/blog/3670197/202608/3670197-20260828164748283-1348722291.png" alt="图5：训练稳定性最小监控面板" loading="lazy"></p>
+<hr>
+<h2 id="part-5-第四道保障数据目标函数和实现必须正确">Part 5 第四道保障：数据、目标函数和实现必须正确</h2>
+<h3 id="51-loss-下降为什么仍然可能训练错误">5.1 loss 下降为什么仍然可能训练错误</h3>
+<p>优化器只负责降低我提供的目标函数。只要目标函数可以被优化，loss 就可能下降；它不会替我判断标签、mask 和数据划分是否符合真实目标。</p>
+<p>下面这些错误都可能得到平滑下降的 training loss：</p>
+<ul>
+<li>label 与输入序列错位；</li>
+<li>验证数据混入训练数据；</li>
+<li>padding 或只作为上下文的位置进入 loss；</li>
+<li>packing 后不同样本之间发生错误 attention；</li>
+<li>指令微调中把不应监督的 prompt token 计入 loss；</li>
+<li>验证代码使用了和训练目标不一致的预处理。</li>
+</ul>
+<p>因此，<strong>训练稳定不只是“能够算下去”，还包括“模型在学正确的东西”。</strong></p>
+<h3 id="52-loss-reduction-为什么会改变梯度尺度">5.2 loss reduction 为什么会改变梯度尺度</h3>
+<p>假设第 <span class="math inline">\(k\)</span> 个 micro-batch 有 <span class="math inline">\(n_k\)</span> 个有效 token，第 <span class="math inline">\(i\)</span> 个 token 的损失为 <span class="math inline">\(\ell_{k,i}\)</span>。如果训练目标是所有有效 token 的平均损失，正确形式是：</p>
+<p></p><div class="math display">\[L=
+\frac{\sum_k\sum_{i=1}^{n_k}\ell_{k,i}}
+{\sum_k n_k}
+\]</div><p></p><p>下面这种“先对每个 micro-batch 求平均，再对 micro-batch 求平均”的做法通常不等价：</p>
+<p></p><div class="math display">\[L_{\text{wrong}}
+=
+\frac{1}{K}
+\sum_k
+\left(
+\frac{1}{n_k}
+\sum_{i=1}^{n_k}\ell_{k,i}
+\right)
+\]</div><p></p><p>当不同 micro-batch 的有效 token 数差异很大时，错误聚合会改变样本权重和梯度尺度。它还会让不同 batch、序列长度和并行配置下的 grad norm 无法比较。</p>
+<h3 id="53-数据异常怎样传导成训练异常">5.3 数据异常怎样传导成训练异常</h3>
+<p>数据问题通常沿下面的顺序传播：</p>
+<blockquote>
+<p>异常输入或标签 → 异常 logits 或单样本 loss → grad norm 尖峰 → 参数更新异常 → 后续 loss 无法恢复</p>
+</blockquote>
+<p>因此，发现单步 loss spike 时，我会对齐查看当前 batch 的四项上下文：</p>
+<ol>
+<li>有效 token 数；</li>
+<li>序列长度；</li>
+<li>数据来源或数据桶；</li>
+<li>是否存在非有限输入或越界 label。</li>
+</ol>
+<p>这些不是泛化的“数据统计面板”，而是为了回答：<strong>当前异常是否和 batch 构成同步发生？</strong></p>
+<h3 id="54-分布式训练最容易改变哪些口径">5.4 分布式训练最容易改变哪些口径</h3>
+<p>大模型训练通常横跨多个设备。下面四项必须明确采用全局还是本地口径：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>正确问题</th>
+<th>常见错误</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>loss</td>
+<td>是否按全局有效 token 加权</td>
+<td>只记录 rank 0 的局部均值</td>
+</tr>
+<tr>
+<td>有效 token 数</td>
+<td>是否对所有数据并行 rank 求和</td>
+<td>每卡先平均后再平均</td>
+</tr>
+<tr>
+<td>grad norm</td>
+<td>是否覆盖完整参数集合</td>
+<td>只统计当前 shard 却当作全局值</td>
+</tr>
+<tr>
+<td>optimizer step</td>
+<td>所有 rank 是否一致执行或跳过</td>
+<td>某些 rank 跳步、其他 rank 更新</td>
+</tr>
+</tbody>
+</table>
+<p>此外，我会确认 scheduler 按实际 optimizer step 推进。如果某一步因为 FP16 溢出而被跳过，scheduler 是否仍然推进必须符合训练框架的既定语义，并在日志中保持一致。</p>
+<h3 id="55-最小正确性验证">5.5 最小正确性验证</h3>
+<p>正式训练前，我至少执行下面四个验证：</p>
+<ol>
+<li><strong>随机抽查样本</strong>：直接查看 token、label、attention mask 和 loss mask 是否对齐。</li>
+<li><strong>固定 batch 重复训练</strong>：确认模型能够在同一个小 batch 上明显降低 loss。</li>
+<li><strong>小数据集过拟合</strong>：确认模型、loss 和 optimizer 的完整链路具有学习能力。</li>
+<li><strong>单卡与多卡对照</strong>：使用相同有效 token 数比较前几个 optimizer step 的 loss 和更新趋势。</li>
+</ol>
+<p>固定 batch loss 能下降，只能证明当前实现具有优化能力；它不能证明数据分布、验证集和最终目标正确。每个实验都只回答一个问题。</p>
+<hr>
+<h2 id="part-6-最小监控面板训练时到底应该看什么">Part 6 最小监控面板：训练时到底应该看什么</h2>
+<h3 id="61-我的取舍原则">6.1 我的取舍原则</h3>
+<p>我不会因为某个指标“可能有用”就把它放进常驻面板。一个常驻指标必须同时满足三个条件：</p>
+<ol>
+<li>能稳定采集，统计口径明确；</li>
+<li>能区分至少一种重要训练状态；</li>
+<li>异常后有明确的下一步行动。</li>
+</ol>
+<p>按照这个原则，我把常驻监控压缩成九项。</p>
+<h3 id="62-九项常驻核心监控">6.2 九项常驻核心监控</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right">编号</th>
+<th>指标</th>
+<th>记录频率</th>
+<th>我怎样使用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right">1</td>
+<td>单步 training loss</td>
+<td>每个 optimizer step</td>
+<td>对齐具体异常 step 和 batch</td>
+</tr>
+<tr>
+<td style="text-align: right">2</td>
+<td>training loss 滑动平均</td>
+<td>每个 optimizer step</td>
+<td>判断总体改善、平台期和持续漂移</td>
+</tr>
+<tr>
+<td style="text-align: right">3</td>
+<td>validation loss / perplexity</td>
+<td>固定验证间隔</td>
+<td>判断模型是否真正改善</td>
+</tr>
+<tr>
+<td style="text-align: right">4</td>
+<td>learning rate</td>
+<td>每个 optimizer step</td>
+<td>检查 warmup、decay 和 scheduler</td>
+</tr>
+<tr>
+<td style="text-align: right">5</td>
+<td>裁剪前全局 grad norm</td>
+<td>每个 optimizer step</td>
+<td>发现梯度尖峰和持续偏移</td>
+</tr>
+<tr>
+<td style="text-align: right">6</td>
+<td>clip coefficient 或裁剪触发标记</td>
+<td>每个 optimizer step</td>
+<td>判断裁剪是否长期改变优化过程</td>
+</tr>
+<tr>
+<td style="text-align: right">7</td>
+<td>四组参数的相对更新量</td>
+<td>固定采样间隔</td>
+<td>判断更新过大、过小和组间失衡</td>
+</tr>
+<tr>
+<td style="text-align: right">8</td>
+<td>非有限值与 optimizer step 执行状态</td>
+<td>每个计划更新点</td>
+<td>发现数值故障和实际跳步</td>
+</tr>
+<tr>
+<td style="text-align: right">9</td>
+<td>每个 optimizer step 的有效 token 数</td>
+<td>每个 optimizer step</td>
+<td>保证 loss 和梯度尺度可比较</td>
+</tr>
+</tbody>
+</table>
+<p>预训练通常使用 validation loss 或 perplexity。微调任务还应记录一个与任务目标直接对应的验证指标，例如分类准确率或生成任务的既定评估分数；具体指标由任务定义决定，不能由稳定性手册代替业务选择。</p>
+<h3 id="63-fp16-的两个条件监控">6.3 FP16 的两个条件监控</h3>
+<p>只有使用 FP16 和动态 GradScaler 时，我才额外记录：</p>
+<ul>
+<li>当前 AMP scale；</li>
+<li>skipped step 的连续次数和累计次数。</li>
+</ul>
+<p>单次 skipped step 不一定意味着训练失败。连续跳步说明模型没有按计划更新，我会立即检查 loss、梯度是否有限，以及 FP16 动态范围是否适合当前模型。</p>
+<p>BF16 或 FP32 训练没有使用 GradScaler 时，不保留这两项，避免在面板中放置没有语义的空指标。</p>
+<h3 id="64-故障发生后再开启的诊断指标">6.4 故障发生后再开启的诊断指标</h3>
+<p>常驻面板发现异常后，我才临时开启以下统计：</p>
+<table>
+<thead>
+<tr>
+<th>诊断指标</th>
+<th>开启条件</th>
+<th>要回答的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分层 activation 最大绝对值和有限值检查</td>
+<td>loss 在 forward 后已经异常</td>
+<td>哪一层首先产生异常激活</td>
+</tr>
+<tr>
+<td>分层 grad norm</td>
+<td>全局 grad norm 偏离基线</td>
+<td>哪一组参数首先出现梯度异常</td>
+</tr>
+<tr>
+<td>logits 最大绝对值</td>
+<td>loss 异常但前部 activation 正常</td>
+<td>输出分布是否异常集中或溢出</td>
+</tr>
+<tr>
+<td>AdamW 二阶矩摘要</td>
+<td>grad norm 正常但更新量异常</td>
+<td>优化器状态是否大幅改变有效步长</td>
+</tr>
+<tr>
+<td>异常 batch 四项上下文</td>
+<td>单步 loss 或 grad norm spike</td>
+<td>异常是否由 batch 构成触发</td>
+</tr>
+</tbody>
+</table>
+<p>这些指标的价值在于缩小范围。根因确认后，我会关闭临时统计，避免长期增加存储、通信和分析负担。</p>
+<h3 id="65-怎样建立健康基线">6.5 怎样建立健康基线</h3>
+<p>绝对数值只有在统计口径固定时才有意义。我会在 pilot run 中固定：</p>
+<ul>
+<li>模型和参数分组；</li>
+<li>loss reduction；</li>
+<li>有效 batch 的定义；</li>
+<li>梯度累积步数；</li>
+<li>分布式归约方式；</li>
+<li>统计发生在裁剪前还是裁剪后。</li>
+</ul>
+<p>然后保留单步原始值和滑动平均。单步值用于定位具体 batch，滑动平均用于判断持续趋势。</p>
+<p>我重点区分三种异常形态：</p>
+<ul>
+<li><strong>单步尖峰</strong>：一步偏离后迅速恢复；</li>
+<li><strong>持续漂移</strong>：多个窗口逐渐离开基线；</li>
+<li><strong>结构性失衡</strong>：某个参数组长期与其他组行为不同。</li>
+</ul>
+<p>报警规则应围绕这三种形态建立，而不是从其他模型复制一个固定阈值。</p>
+<hr>
+<h2 id="part-7-从异常现象到根因不要看见-loss-就猜-learning-rate">Part 7 从异常现象到根因：不要看见 loss 就猜 learning rate</h2>
+<h3 id="71-第一原则寻找第一个异常信号">7.1 第一原则：寻找第一个异常信号</h3>
+<p>如果 loss 在第 <span class="math inline">\(t\)</span> 步变成 <code>NaN</code>，原因可能在更早的位置发生：输入已经异常、某层 activation 首先溢出、loss 计算包含非法操作、backward 产生非有限梯度，或者上一步参数已经被污染。</p>
+<p>我的排查顺序始终沿计算链路前进：</p>
+<ol>
+<li>输入和 label；</li>
+<li>activation；</li>
+<li>logits；</li>
+<li>各项 loss；</li>
+<li>gradient；</li>
+<li>optimizer state；</li>
+<li>parameter；</li>
+<li>后续验证结果。</li>
+</ol>
+<p>找到第一个异常位置，才有可能区分根因和后果。</p>
+<h3 id="72-异常发生时先保存什么">7.2 异常发生时先保存什么</h3>
+<p>我会在继续重跑前保存最小现场：</p>
+<ul>
+<li>global step、optimizer step 和 checkpoint 标识；</li>
+<li>数据分片、样本索引和随机种子；</li>
+<li>单步 loss、各 loss 分项和有效 token 数；</li>
+<li>learning rate、裁剪前 grad norm 和 clip coefficient；</li>
+<li>optimizer step 是否执行；</li>
+<li>FP16 下的 AMP scale 与 skipped step；</li>
+<li>各 rank 是否出现非有限值。</li>
+</ul>
+<p>如果合规要求不允许保存原始文本，我保存能够重放的样本索引和脱敏统计。</p>
+<h3 id="73-第一个-step-就出现-nan">7.3 第一个 step 就出现 NaN</h3>
+<p>第一个 step 尚未经历历史更新，因此我优先检查：</p>
+<ol>
+<li>输入、label 和 mask 是否合法；</li>
+<li>初始化后的参数是否有限；</li>
+<li>forward 中哪一层首先产生非有限 activation；</li>
+<li>loss 是否包含除零、空平均或非法索引；</li>
+<li>当前精度从 BF16/FP16 改为 FP32 后是否仍能复现。</li>
+</ol>
+<p>如果 FP32 仍然复现，问题通常不只是低精度动态范围。如果只有 FP16 复现，我再检查模型数值范围和 loss scaling。</p>
+<h3 id="74-loss-突然出现-spike">7.4 loss 突然出现 spike</h3>
+<p>我先判断 spike 之后是否恢复。</p>
+<h4 id="单步-spike-后恢复">单步 spike 后恢复</h4>
+<p>优先对齐当前 batch 的有效 token 数、序列长度、数据来源和 label 合法性。如果相同 batch 可以稳定重放出 spike，继续检查数据与 loss；如果无法重放，检查随机算子、并行执行和前一状态差异。</p>
+<h4 id="连续多个-spike">连续多个 spike</h4>
+<p>对齐 grad norm、clip coefficient、相对更新量和 learning rate。如果这些指标持续偏离，训练状态可能已经离开健康区域。</p>
+<h4 id="spike-后永久不恢复">spike 后永久不恢复</h4>
+<p>我会停止让异常状态进入新的正式 checkpoint，从最后一个健康 checkpoint 重放。如果健康 checkpoint 加相同 batch 会复现，优先检查数据；如果更换 batch 仍然复现，优先检查模型和 optimizer state。</p>
+<h3 id="75-loss-长期不下降">7.5 loss 长期不下降</h3>
+<p>我按下面顺序排查：</p>
+<ol>
+<li>固定 batch 能否过拟合；</li>
+<li>learning rate 是否为预期值；</li>
+<li>optimizer step 是否实际执行；</li>
+<li>关键参数组是否加入 optimizer；</li>
+<li>裁剪前 grad norm 是否存在有效信号；</li>
+<li>四组相对更新量是否持续接近测量下限；</li>
+<li>label、loss mask 和 loss reduction 是否正确。</li>
+</ol>
+<p>如果梯度存在但更新量极小，我检查 optimizer 和 learning rate；如果梯度本身在部分层长期近零，我检查梯度传播；如果参数持续更新但验证结果不改善，我检查数据和目标。</p>
+<h3 id="76-loss-平滑但验证结果不改善">7.6 loss 平滑，但验证结果不改善</h3>
+<p>这种情况不属于典型数值失稳。我会检查：</p>
+<ul>
+<li>训练与验证预处理是否一致；</li>
+<li>训练数据是否泄漏验证信息；</li>
+<li>训练目标是否覆盖目标能力；</li>
+<li>微调数据格式和 loss mask 是否正确；</li>
+<li>validation loss 与任务指标是否给出一致信号。</li>
+</ul>
+<p>不能通过降低 learning rate 自动解决目标错位。</p>
+<h3 id="77-只有多卡训练异常">7.7 只有多卡训练异常</h3>
+<p>我使用相同初始 checkpoint 和相同数据，比较单卡与最小多卡配置的前几个 optimizer step，并检查：</p>
+<ul>
+<li>全局有效 token 数是否一致；</li>
+<li>loss 是否按有效 token 正确归约；</li>
+<li>所有 rank 是否一致执行 backward 和 optimizer step；</li>
+<li>grad norm 是否使用了正确的全局统计；</li>
+<li>scheduler 是否按同一个 optimizer step 推进。</li>
+</ul>
+<p>如果单卡正常、多卡异常，先验证归约和控制流，不先调整模型超参数。</p>
+<h3 id="78-诊断总表">7.8 诊断总表</h3>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>首先查看</th>
+<th>最小验证</th>
+<th>确认后才采取的处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第一步 <code>NaN</code></td>
+<td>输入、activation、loss</td>
+<td>单 batch FP32 重放</td>
+<td>修复第一个非有限运算或精度配置</td>
+</tr>
+<tr>
+<td>单步 loss spike 后恢复</td>
+<td>batch 四项上下文、grad norm</td>
+<td>重放相同 batch</td>
+<td>修复损坏数据；合法难样本不直接丢弃</td>
+</tr>
+<tr>
+<td>spike 后不恢复</td>
+<td>相对更新量、optimizer state</td>
+<td>健康 checkpoint 对照</td>
+<td>修复根因后从健康 checkpoint 恢复</td>
+</tr>
+<tr>
+<td>loss 长期不降</td>
+<td>learning rate、step 状态、更新量</td>
+<td>固定 batch 过拟合</td>
+<td>修复更新链路或数据目标</td>
+</tr>
+<tr>
+<td>grad norm 持续抬升</td>
+<td>分层 grad norm、activation</td>
+<td>降低单一风险因素做对照</td>
+<td>调整已确认的结构、数据或步长问题</td>
+</tr>
+<tr>
+<td>训练正常但验证变差</td>
+<td>validation loss、任务指标</td>
+<td>检查数据划分与评估链路</td>
+<td>修复泄漏、目标错位或过拟合</td>
+</tr>
+<tr>
+<td>只有多卡异常</td>
+<td>归约和 rank 控制流</td>
+<td>单卡/双卡对照</td>
+<td>修复分布式实现</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-8-从开跑到恢复一套可以直接执行的训练流程">Part 8 从开跑到恢复：一套可以直接执行的训练流程</h2>
+<h3 id="81-正式训练前">8.1 正式训练前</h3>
+<p>我在开跑前完成下面十项检查：</p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 固定代码版本、训练配置、数据版本和随机种子；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 随机检查 token、label、attention mask 和 loss mask；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 用一个 batch 完成 forward、backward 和 optimizer step；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认初始参数、loss 和梯度都是有限值；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认所有目标参数已经加入 AdamW 参数组；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认 weight decay 参数组符合既定配置；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认梯度累积按有效 token 正确归一化；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认 FP16 下先 unscale，再统计和裁剪梯度；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认 scheduler 按 optimizer step 推进；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认 checkpoint 包含 model、optimizer、scheduler 和 scaler state。</label></li>
+</ul>
+<h3 id="82-pilot-run-是什么">8.2 pilot run 是什么</h3>
+<p>pilot run（小规模试运行）是在投入完整训练资源之前，用受控的较小预算验证训练能否健康启动，并筛选关键配置。</p>
+<p>它不是“随便跑几步”，也不是固定使用总训练步数的某个百分比。一个有用的 pilot run 至少覆盖：</p>
+<ol>
+<li>完整 warmup；</li>
+<li>一小段达到峰值 learning rate 后的训练；</li>
+<li>具有代表性的数据来源和序列长度；</li>
+<li>至少一次 validation；</li>
+<li>九项常驻核心监控。</li>
+</ol>
+<p>如果训练启动风险通常在特定 token 规模后出现，pilot run 应覆盖该风险窗口，而不是机械地按 step 百分比截断。</p>
+<h3 id="83-怎样比较-learning-rate-候选">8.3 怎样比较 learning rate 候选</h3>
+<p>我先从同类模型的可靠配置选择中心值，再比较少量候选。每个候选使用相同：</p>
+<ul>
+<li>初始 checkpoint；</li>
+<li>数据顺序；</li>
+<li>有效 batch；</li>
+<li>warmup 口径；</li>
+<li>训练 token 预算；</li>
+<li>validation 流程。</li>
+</ul>
+<p>比较结果时，我同时看 validation loss、裁剪前 grad norm、相对更新量和实际吞吐。early training loss 更低，不自动代表最终配置更好。</p>
+<h3 id="84-正式训练期间">8.4 正式训练期间</h3>
+<p>我把监控分成三个时间尺度：</p>
+<ul>
+<li><strong>每步检查</strong>：loss 是否有限、梯度是否有限、optimizer step 是否执行；</li>
+<li><strong>窗口检查</strong>：training loss、grad norm、裁剪行为和相对更新量是否持续偏离；</li>
+<li><strong>周期检查</strong>：validation loss、任务指标和 checkpoint 可恢复性。</li>
+</ul>
+<p>单步异常触发现场保存，持续异常触发停止或回滚，验证异常触发数据和目标检查。三者不能使用同一报警逻辑。</p>
+<h3 id="85-发生异常后怎样恢复">8.5 发生异常后怎样恢复</h3>
+<p>我的恢复顺序是：</p>
+<ol>
+<li>停止让异常状态写入新的正式 checkpoint；</li>
+<li>保存异常 step 的最小现场；</li>
+<li>找到最后一个所有核心指标仍健康的 checkpoint；</li>
+<li>用异常 batch 和普通 batch 分别重放；</li>
+<li>通过单变量实验确认根因；</li>
+<li>修复后重新执行最小正确性验证；</li>
+<li>从健康 checkpoint 恢复正式训练。</li>
+</ol>
+<p>如果非有限梯度已经进入 optimizer state，我不会只修复模型参数后继续使用可疑 optimizer state。</p>
+<hr>
+<h2 id="part-9-训练规模发生变化后我具体怎么调">Part 9 训练规模发生变化后，我具体怎么调</h2>
+<p>规模变化后，最没有帮助的建议是“重新调参”。我需要的是一个默认动作：<strong>哪些配置先不动，哪些配置必须跟着改，出现什么证据后才继续调整。</strong></p>
+<p>我先用下面这张表做决策，后面再解释每种情况。</p>
+<table>
+<thead>
+<tr>
+<th>发生的变化</th>
+<th>我的默认动作</th>
+<th>什么时候继续调整</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>增加同分布新数据，并从头训练</td>
+<td>保持 AdamW、峰值 learning rate 和有效 batch 不变；增加总训练 token；按新训练终点重算 decay</td>
+<td>pilot run 出现持续裁剪、相对更新量异常或 validation 变差</td>
+</tr>
+<tr>
+<td>从已有 checkpoint 继续训练同分布数据</td>
+<td>不把 learning rate 拉回初始峰值；从 checkpoint 当前 learning rate 平滑继续，并重新安排剩余 decay</td>
+<td>当前 learning rate 已接近零且模型几乎不再学习</td>
+</tr>
+<tr>
+<td>加入新领域或新来源数据</td>
+<td>先保持旧 learning rate；为旧分布和新分布分别保留 validation</td>
+<td>新数据引起 loss、grad norm 或相对更新量系统性偏移</td>
+</tr>
+<tr>
+<td>对原数据训练更多 epoch</td>
+<td>不重新使用初始峰值；继续 decay 或保持较低 learning rate</td>
+<td>validation 仍改善但更新量已经过小时才向上试探</td>
+</tr>
+<tr>
+<td>只改变 micro-batch，有效 batch 不变</td>
+<td>learning rate、warmup token 和 decay 全部不变</td>
+<td>不需要因为 micro-batch 本身调参</td>
+</tr>
+<tr>
+<td>有效 batch 扩大为原来的 <span class="math inline">\(k\)</span> 倍</td>
+<td>先保留旧 learning rate，再把 <span class="math inline">\(\sqrt{k}\)</span> 倍作为第二候选</td>
+<td>旧值稳定但 validation 改善明显变慢</td>
+</tr>
+<tr>
+<td>序列长度增加，有效 token/step 不变</td>
+<td>learning rate 不变；只调整 micro-batch 和梯度累积</td>
+<td>attention logits 或梯度行为出现新异常</td>
+</tr>
+<tr>
+<td>序列长度增加，有效 token/step 同时增加</td>
+<td>按“有效 batch 增大”处理</td>
+<td>比较旧值和平方根缩放候选</td>
+</tr>
+<tr>
+<td>模型规模增大，使用标准参数化</td>
+<td>固定数据和有效 batch，试 <code>0.5×、0.7×、1.0×</code> 原 learning rate</td>
+<td>根据 validation、持续裁剪和相对更新量选择</td>
+</tr>
+<tr>
+<td>从预训练进入微调</td>
+<td>使用明显低于预训练的 learning rate，并保留基础能力回归评估</td>
+<td>当前任务学不动时向上试；基础能力下降时向下调</td>
+</tr>
+</tbody>
+</table>
+<h3 id="91-增加同分布新数据">9.1 增加同分布新数据</h3>
+<p>如果模型、数据分布、有效 batch 和优化器都没有变化，我的默认动作是：</p>
+<blockquote>
+<p><strong>峰值 learning rate 先不动，AdamW 配置先不动，有效 batch 先不动；我只增加总训练 token，并把 decay 的终点移动到新的训练终点。</strong></p>
+</blockquote>
+<p>例如，原计划训练 300B token，现在增加同分布数据后训练 500B token。我不会因为数据多了就自动放大 learning rate。我要重新计算的是 learning rate schedule：原本在 300B token 降到最低点的 decay，现在应该和新的 500B token 训练终点对齐。</p>
+<p>如果从头训练，并且有效 batch 不变，我先保持原来的 warmup token 数，而不是保持 warmup 占总训练量的百分比。总训练量变大，不代表启动阶段需要同比例变长。</p>
+<h3 id="92-从-checkpoint-继续训练同分布数据">9.2 从 checkpoint 继续训练同分布数据</h3>
+<p>如果原训练已经结束，现在从最终 checkpoint 接着训练新增数据，我不会重新执行完整 warmup，也不会把 learning rate 突然拉回原始峰值。这样做可能直接破坏已经形成的模型状态。</p>
+<p>我的默认做法是：</p>
+<ol>
+<li>从 checkpoint 当前 learning rate 开始；</li>
+<li>用短过渡保持 learning rate 连续，不制造突然跳变；</li>
+<li>根据新增 token 预算重新安排后续 decay；</li>
+<li>使用同一 validation 判断模型是否继续改善。</li>
+</ol>
+<p>如果 checkpoint 的 learning rate 已经接近零，模型几乎没有更新，我才增加一个候选实验：使用明显低于原始峰值的新 learning rate，并配合短 warmup。这个新值必须通过 pilot run 确认，不能直接恢复到最初峰值。</p>
+<h3 id="93-加入新分布或者重复训练原数据">9.3 加入新分布，或者重复训练原数据</h3>
+<p>新领域数据会改变模型看到的梯度分布。我先保持旧 learning rate，把旧分布 validation 和新分布 validation 分开记录。这样我才能判断新能力是否增长，以及旧能力是否退化。</p>
+<p>如果新数据加入后出现持续更高的 grad norm、更强的裁剪或更大的相对更新量，我比较两个候选：</p>
+<ul>
+<li>原 learning rate；</li>
+<li><code>0.5 ×</code> 原 learning rate。</li>
+</ul>
+<p>数据混合比例决定模型最终学习什么，属于训练目标和业务取舍，不能由稳定性指标替我决定。</p>
+<p>如果只是对原数据训练更多 epoch，我不会把 learning rate 重置到初始峰值。我继续现有 decay，或者保持一个较低的恒定值，并用 validation 判断是否继续训练。validation 已经恶化时，正确动作通常是停止，而不是继续调学习率强行拟合。</p>
+<h3 id="94-batch-发生变化">9.4 batch 发生变化</h3>
+<p>我先区分 micro-batch 和有效 batch：</p>
+<ul>
+<li>micro-batch 变小，但通过梯度累积保持每个 optimizer step 的有效 token 数不变：<strong>learning rate 和 schedule 都不改。</strong></li>
+<li>每个 optimizer step 的有效 token 数扩大为原来的 <span class="math inline">\(k\)</span> 倍：先保留旧 learning rate，再把 <span class="math inline">\(\sqrt{k}\)</span> 倍作为第二候选。</li>
+</ul>
+<p>如果总训练 token 不变，而有效 batch 扩大 <span class="math inline">\(k\)</span> 倍，总 optimizer step 大约会缩短为原来的 <span class="math inline">\(1/k\)</span>。为了保持相同 warmup token 数，warmup step 也应相应缩短，而不是继续使用原来的 step 数。</p>
+<p>对 AdamW，我不默认使用 <span class="math inline">\(k\)</span> 倍线性放大学习率。只有旧 learning rate 下训练稳定、相对更新量偏小、validation 改善明显变慢时，我才尝试更大的候选。</p>
+<h3 id="95-序列长度增加">9.5 序列长度增加</h3>
+<p>如果序列长度增加，但我通过减小 micro-batch 保持每个 optimizer step 的有效 token 数不变，learning rate 先不改。我只检查：</p>
+<ol>
+<li>attention mask 和 packing 边界；</li>
+<li>loss 是否仍按有效 token 归一化；</li>
+<li>attention logits 是否出现新的异常范围；</li>
+<li>micro-batch 与梯度累积是否仍然对齐。</li>
+</ol>
+<p>如果序列长度增加的同时，每个 optimizer step 的有效 token 数也增加，我就把它视为有效 batch 增大，按照上一节比较旧 learning rate 和平方根缩放候选。</p>
+<h3 id="96-模型规模增大">9.6 模型规模增大</h3>
+<p>在标准参数化下，我不会直接套用“参数量扩大十倍，learning rate 降低几倍”的固定公式。我的默认候选是原 learning rate 的：</p>
+<p></p><div class="math display">\[0.5\times,\qquad 0.7\times,\qquad 1.0\times
+\]</div><p></p><p>三个实验保持数据顺序、有效 batch、训练 token、优化器和 validation 完全一致。我按下面的顺序选择：</p>
+<ol>
+<li>排除出现非有限值、持续强裁剪或异常相对更新量的候选；</li>
+<li>比较同等 token 预算下的 validation loss；</li>
+<li>如果差异很小，选择更新更受控的较低 learning rate；</li>
+<li>确定峰值后，再调整 warmup 和 decay。</li>
+</ol>
+<p>如果模型使用 <span class="math inline">\(\mu\)</span>P 或其他专门的参数化规则，应遵循对应规则重新设计候选，不能把上面的标准参数化建议直接搬过去。</p>
+<h3 id="97-从预训练进入微调">9.7 从预训练进入微调</h3>
+<p>微调从已经具备能力的 checkpoint 开始，我的默认动作是使用明显低于预训练的 learning rate，同时检查当前任务和基础能力：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>我的下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>当前任务 loss 不降，相对更新量很小</td>
+<td>提高一个 learning rate 档位</td>
+</tr>
+<tr>
+<td>当前任务改善，但基础能力明显下降</td>
+<td>降低 learning rate 或减少训练步数</td>
+</tr>
+<tr>
+<td>training loss 下降，validation 不改善</td>
+<td>检查数据、loss mask 和过拟合，不先提高 learning rate</td>
+</tr>
+<tr>
+<td>两类 validation 都改善，更新保持受控</td>
+<td>保持配置继续训练</td>
+</tr>
+</tbody>
+</table>
+<p>微调的具体 learning rate 仍应从同类模型和任务的可靠配置出发。稳定性手册负责给调整方向，不替任务实验决定唯一数值。</p>
+<hr>
+<h2 id="part-10-边界说明不要把-token-embedding-和超大稀疏-id-表混为一谈">Part 10 边界说明：不要把 token embedding 和超大稀疏 ID 表混为一谈</h2>
+<h3 id="101-本文的直接结论">10.1 本文的直接结论</h3>
+<p>在标准大模型预训练和微调中，我默认让 token embedding 跟随模型主体使用 AdamW。除非已有训练方案明确把 embedding 放进不同参数组，否则没有必要仅因为输入是离散 token，就单独换成 Adagrad。</p>
+<h3 id="102-adamw-和-adagrad-的关系">10.2 AdamW 和 Adagrad 的关系</h3>
+<p>二者都使用历史梯度平方，按参数调整有效步长，这是它们相似的地方。但二者不是同一个算法。</p>
+<p>Adagrad 累加从训练开始以来的梯度平方：</p>
+<p></p><div class="math display">\[G_t=G_{t-1}+g_t^2
+\]</div><p></p><p>AdamW 使用指数移动平均，较早历史会逐渐衰减：</p>
+<p></p><div class="math display">\[v_t=\beta_2v_{t-1}+(1-\beta_2)g_t^2
+\]</div><p></p><p>AdamW 还包含一阶矩和解耦 weight decay。因此，更准确的说法是：<strong>AdamW 延续了自适应梯度方法按历史梯度平方调整步长的思想，但它不等于把 Adagrad 原样包含进来。</strong></p>
+<p>对本文的大模型主线，这个算法差异不会改变操作结论：token embedding 继续使用既定 AdamW 配置。</p>
+<h3 id="103-稀疏数据真正解决不了的是什么">10.3 稀疏数据真正解决不了的是什么</h3>
+<p>某个 token 或 ID 很少出现，首先意味着模型几乎没有关于它的训练数据。AdamW 和 Adagrad 都只能调整已经观察到的梯度，不能替从未出现的 ID 创造训练信号。</p>
+<p>如果低频 token 的学习效果不足，我优先检查数据覆盖、分词方式和采样策略，而不是先更换优化器。</p>
+<p>推荐系统的超大 ID 表还涉及参数存储、梯度布局和优化器状态成本，这是另一套工程问题，不属于本文的大模型训练稳定性主线。这里不再扩展监控指标，也不替推荐系统选择统一优化器。</p>
+<hr>
+<h2 id="附录-a核心概念速查">附录 A：核心概念速查</h2>
+<table>
+<thead>
+<tr>
+<th>中文名称</th>
+<th>英文名称或缩写</th>
+<th>定义</th>
+<th>我用它判断什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练损失</td>
+<td>training loss</td>
+<td>当前训练数据上的目标函数值</td>
+<td>模型是否在优化当前目标</td>
+</tr>
+<tr>
+<td>验证损失</td>
+<td>validation loss</td>
+<td>固定验证集上的目标函数值</td>
+<td>模型是否真正改善和泛化</td>
+</tr>
+<tr>
+<td>困惑度</td>
+<td>perplexity</td>
+<td>语言模型平均 token loss 的指数形式</td>
+<td>模型对验证 token 的不确定程度</td>
+</tr>
+<tr>
+<td>激活值</td>
+<td>activation</td>
+<td>前向传播中各层产生的中间张量</td>
+<td>哪一层首先发生数值异常</td>
+</tr>
+<tr>
+<td>梯度</td>
+<td>gradient</td>
+<td>loss 对参数的偏导数</td>
+<td>当前误差信号怎样作用于参数</td>
+</tr>
+<tr>
+<td>梯度范数</td>
+<td>gradient norm / grad norm</td>
+<td>目标梯度集合的 L2 范数</td>
+<td>梯度整体是否出现尖峰或持续漂移</td>
+</tr>
+<tr>
+<td>梯度裁剪</td>
+<td>gradient clipping</td>
+<td>超过阈值时按比例缩小梯度</td>
+<td>限制当前 step 的更新风险</td>
+</tr>
+<tr>
+<td>更新范数</td>
+<td>update norm</td>
+<td>参数更新量的 L2 范数</td>
+<td>当前 step 的绝对参数变化量</td>
+</tr>
+<tr>
+<td>权重范数</td>
+<td>weight norm</td>
+<td>参数本身的 L2 范数</td>
+<td>参数当前的绝对尺度</td>
+</tr>
+<tr>
+<td>相对更新量</td>
+<td>update-to-weight ratio</td>
+<td>update norm 除以 weight norm</td>
+<td>当前更新相对参数尺度有多大</td>
+</tr>
+<tr>
+<td>学习率</td>
+<td>learning rate</td>
+<td>控制优化器整体更新尺度的系数</td>
+<td>当前训练阶段的计划步长</td>
+</tr>
+<tr>
+<td>学习率预热</td>
+<td>learning rate warmup</td>
+<td>从较小学习率逐步升至峰值</td>
+<td>降低训练启动阶段的大步更新风险</td>
+</tr>
+<tr>
+<td>自动混合精度</td>
+<td>Automatic Mixed Precision / AMP</td>
+<td>按算子选择高低精度计算</td>
+<td>在性能和数值可靠性之间取得平衡</td>
+</tr>
+<tr>
+<td>损失缩放</td>
+<td>loss scaling</td>
+<td>放大 loss 和反向梯度后再还原</td>
+<td>减少 FP16 小梯度下溢</td>
+</tr>
+<tr>
+<td>优化器更新步</td>
+<td>optimizer step</td>
+<td>优化器真正改变参数的一次操作</td>
+<td>区分计算过 backward 和真正更新过参数</td>
+</tr>
+<tr>
+<td>小规模试运行</td>
+<td>pilot run</td>
+<td>正式训练前的受控短训练</td>
+<td>验证启动稳定性并筛选关键配置</td>
+</tr>
+</tbody>
+</table>
+<p>困惑度与 token 平均交叉熵的关系通常为：</p>
+<p></p><div class="math display">\[\text{Perplexity}=\exp(\text{Token Average Loss})
+\]</div><p></p><p>不同数据集、分词器和 loss mask 下的 perplexity 不能直接横向比较。</p>
+<hr>
+<h2 id="附录-b关键指标的统一计算口径">附录 B：关键指标的统一计算口径</h2>
+<h3 id="b1-training-loss">B.1 training loss</h3>
+<ul>
+<li>分子：所有有效 token 的 loss 之和；</li>
+<li>分母：所有数据并行 rank 和所有 micro-batch 的有效 token 总数；</li>
+<li>单步值：对应一次 optimizer step 累积的数据；</li>
+<li>滑动平均：只用于观察趋势，不覆盖原始单步值。</li>
+</ul>
+<h3 id="b2-grad-norm">B.2 grad norm</h3>
+<ul>
+<li>统计时间：完整有效 batch backward 完成之后；</li>
+<li>FP16：在 <code>scaler.unscale_(optimizer)</code> 之后；</li>
+<li>裁剪：记录裁剪前数值；</li>
+<li>参数范围：必须明确是完整模型、完整参数组还是当前 shard；</li>
+<li>分布式：使用训练框架能够表示完整目标参数集合的实现。</li>
+</ul>
+<h3 id="b3-clip-coefficient">B.3 clip coefficient</h3>
+<p>若全局裁剪阈值为 <span class="math inline">\(c\)</span>，裁剪前 grad norm 为 <span class="math inline">\(G\)</span>，缩放系数可以写为：</p>
+<p></p><div class="math display">\[\alpha=\min\left(1,\frac{c}{G+\epsilon}\right)
+\]</div><p></p><p><span class="math inline">\(\alpha=1\)</span> 表示没有缩小梯度；<span class="math inline">\(\alpha\)</span> 越小，当前 step 受到的裁剪越强。</p>
+<h3 id="b4-update-norm-和相对更新量">B.4 update norm 和相对更新量</h3>
+<ul>
+<li>统计对象：四个已定义的代表性参数组；</li>
+<li>统计时间：optimizer step 前后；</li>
+<li>FP16：使用 FP32 转换后计算范数，减少统计本身的精度误差；</li>
+<li>tied weight：共享参数只统计一次；</li>
+<li>skipped step：更新量记录为未执行，而不是和正常的零更新混为一谈；</li>
+<li>采样频率：固定间隔采集，保持实验间一致。</li>
+</ul>
+<p>如果我希望把 weight decay 的贡献和梯度更新贡献分开，需要从优化器内部直接取得分量。仅通过 <span class="math inline">\(\theta_{t+1}-\theta_t\)</span> 计算的 update norm 包含该 optimizer step 的全部参数变化。</p>
+<h3 id="b5-optimizer-step-执行状态">B.5 optimizer step 执行状态</h3>
+<p>这个指标必须是显式布尔状态或单调递增的真实更新计数，不能用 micro-step 或 dataloader iteration 代替。FP16 发生溢出时，即使完成 backward，参数也可能没有更新。</p>
+<hr>
+<h2 id="附录-c最小-pytorch-训练循环">附录 C：最小 PyTorch 训练循环</h2>
+<p>下面的示例强调执行顺序。实际分布式训练应使用框架提供的全局 grad norm 和参数分片接口，不能直接假设 <code>model.parameters()</code> 表示所有全局参数。</p>
+<pre><code class="language-python">import torch
+
+
+def tensors_are_finite(tensors):
+    return all(
+        tensor is None or torch.isfinite(tensor).all().item()
+        for tensor in tensors
+    )
+
+
+optimizer.zero_grad(set_to_none=True)
+
+with torch.autocast(device_type="cuda", dtype=torch.float16):
+    outputs = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+    )
+    loss_sum = token_loss_sum(outputs.logits, batch["labels"])
+    valid_tokens = batch["loss_mask"].sum()
+
+if valid_tokens.item() == 0:
+    raise ValueError("当前 optimizer step 没有有效 token")
+
+loss = loss_sum / valid_tokens
+
+if not torch.isfinite(loss):
+    save_debug_context(batch=batch, loss=loss)
+    raise FloatingPointError("loss 出现非有限值")
+
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)
+
+if not tensors_are_finite(parameter.grad for parameter in model.parameters()):
+    save_debug_context(batch=batch, loss=loss)
+    raise FloatingPointError("gradient 出现非有限值")
+
+grad_norm = torch.nn.utils.clip_grad_norm_(
+    model.parameters(),
+    max_norm=clip_threshold,
+)
+
+# 如果需要计算相对更新量，只在固定采样 step 保存代表性参数组。
+before_update = snapshot_monitored_parameter_groups(model)
+
+previous_scale = scaler.get_scale()
+scaler.step(optimizer)
+scaler.update()
+current_scale = scaler.get_scale()
+
+# 具体框架应直接暴露 step 是否执行；这里仅展示 FP16 GradScaler 的判断思路。
+optimizer_step_executed = current_scale &gt;= previous_scale
+
+if optimizer_step_executed:
+    scheduler.step()
+    relative_updates = compute_relative_updates(
+        before_update=before_update,
+        model=model,
+    )
+else:
+    relative_updates = None
+
+optimizer.zero_grad(set_to_none=True)
+</code></pre>
+<p>这段代码只展示控制顺序，不定义分布式 loss 聚合、参数分片和监控函数。生产训练代码应复用现有训练框架的接口，并为这些接口写最小验证。</p>
+<p>如果使用 BF16，通常不需要 GradScaler。执行链可以简化为：</p>
+<blockquote>
+<p>forward → loss 有限值检查 → backward → gradient 有限值检查 → grad norm → clip → optimizer step → scheduler step → 相对更新量</p>
+</blockquote>
+<hr>
+<h2 id="附录-d训练稳定性检查清单">附录 D：训练稳定性检查清单</h2>
+<h3 id="d1-开跑前">D.1 开跑前</h3>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 数据、代码、配置和随机种子可以追溯；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> token、label、attention mask 和 loss mask 已抽查；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> loss 按全局有效 token 正确归一化；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 固定 batch 可以明显降低 loss；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 参数组、weight decay 和冻结规则符合预期；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> AMP、梯度累积、裁剪和 scheduler 顺序正确；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 九项常驻指标均有明确统计口径；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> checkpoint 可以完整恢复训练状态。</label></li>
+</ul>
+<h3 id="d2-pilot-run">D.2 pilot run</h3>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 覆盖完整 warmup；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 覆盖一小段峰值 learning rate 阶段；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 覆盖代表性数据来源和序列长度；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 完成至少一次 validation；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 没有持续非有限值或 optimizer step 跳过；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> grad norm 没有持续偏离健康趋势；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 四组参数均有受控更新；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> validation loss 或任务指标朝预期方向变化。</label></li>
+</ul>
+<h3 id="d3-正式训练">D.3 正式训练</h3>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 单步数据和滑动平均同时保留；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 每次异常都能定位到 step 和数据分片；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> skipped step、连续裁剪和持续漂移有报警；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> validation 使用固定数据和固定口径；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> checkpoint 定期执行可恢复性验证。</label></li>
+</ul>
+<h3 id="d4-异常恢复">D.4 异常恢复</h3>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 已保存最小现场；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 已确认第一个异常信号；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 已分别重放异常 batch 和普通 batch；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 已用单变量对照实验确认根因；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 已确认最后一个健康 checkpoint；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 修复后重新完成最小正确性验证；</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 没有继续使用被污染的 optimizer state。</label></li>
+</ul>
+<hr>
+<h2 id="参考资料">参考资料</h2>
+<p>下面的论文支撑原理与实验现象，官方文档支撑具体工程操作。论文中的配置和阈值只代表相应实验设置，不自动成为通用规则。</p>
+<h3 id="优化器与参数更新">优化器与参数更新</h3>
+<ol>
+<li>Kingma, Ba. <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener nofollow">Adam: A Method for Stochastic Optimization</a>。用于理解一阶矩、二阶矩和偏差修正。</li>
+<li>Loshchilov, Hutter. <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener nofollow">Decoupled Weight Decay Regularization</a>。用于理解 AdamW 和解耦权重衰减。</li>
+<li>Duchi, Hazan, Singer. <a href="https://www.jmlr.org/papers/v12/duchi11a.html" target="_blank" rel="noopener nofollow">Adaptive Subgradient Methods for Online Learning and Stochastic Optimization</a>。用于核对 Adagrad 累积历史梯度平方的定义。</li>
+<li>PyTorch. <a href="https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html" target="_blank" rel="noopener nofollow">AdamW documentation</a>。用于核对 AdamW 的当前接口、公式和参数含义。</li>
+</ol>
+<h3 id="混合精度与数值稳定">混合精度与数值稳定</h3>
+<ol>
+<li>Micikevicius et al. <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener nofollow">Mixed Precision Training</a>。用于理解 FP16 混合精度和 loss scaling。</li>
+<li>PyTorch. <a href="https://docs.pytorch.org/docs/stable/amp.html" target="_blank" rel="noopener nofollow">Automatic Mixed Precision package</a>。用于核对 autocast、GradScaler 和梯度缩放行为。</li>
+<li>PyTorch. <a href="https://docs.pytorch.org/docs/stable/notes/amp_examples.html" target="_blank" rel="noopener nofollow">Automatic Mixed Precision examples</a>。用于核对梯度累积、unscale 和 clipping 的正确顺序。</li>
+<li>NVIDIA. <a href="https://developer.nvidia.com/blog/mixed-precision-training-deep-neural-networks/" target="_blank" rel="noopener nofollow">Mixed-Precision Training of Deep Neural Networks</a>。用于理解低精度训练的工程背景。</li>
+</ol>
+<h3 id="transformer-梯度与训练尖峰">Transformer 梯度与训练尖峰</h3>
+<ol>
+<li>Xiong et al. <a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener nofollow">On Layer Normalization in the Transformer Architecture</a>。用于理解 Pre-LN、Post-LN 和训练启动行为的适用边界。</li>
+<li>Kalra, Barkeshli. <a href="https://arxiv.org/abs/2406.09405" target="_blank" rel="noopener nofollow">Why Warmup the Learning Rate? Underlying Mechanisms and Improvements</a>。用于理解 warmup 与初始化、曲率和优化动态的关系。</li>
+<li>Takase et al. <a href="https://arxiv.org/abs/2312.16903" target="_blank" rel="noopener nofollow">Spike No More: Stabilizing the Pre-training of Large Language Models</a>。用于理解 Transformer 子层尺度、梯度范数和 loss spike 之间的关系。</li>
+<li>Fan et al. <a href="https://arxiv.org/abs/2404.10630" target="_blank" rel="noopener nofollow">HLAT: High-quality Large Language Model Pre-trained on AWS Trainium</a>。用于参考长周期大模型训练中的 loss、grad norm 和 parameter norm 监控案例。</li>
+</ol>
+<h3 id="扩容与适用边界">扩容与适用边界</h3>
+<ol>
+<li>Brown et al. <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener nofollow">Language Models are Few-Shot Learners</a>。用于参考 GPT-3 各模型规模的具体 batch token 和 learning rate 配置，不用于推导通用缩放公式。</li>
+<li>Hoffmann et al. <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener nofollow">Training Compute-Optimal Large Language Models</a>。用于理解固定计算预算下模型规模和训练 token 的共同选择，不作为训练稳定性阈值。</li>
+<li>Yang et al. <a href="https://arxiv.org/abs/2203.03466" target="_blank" rel="noopener nofollow">Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer</a>。用于理解参数化方式与超参数迁移的关系。</li>
+</ol>
+<h3 id="数据loss-和梯度累积">数据、loss 和梯度累积</h3>
+<ol>
+<li>Hugging Face. <a href="https://huggingface.co/blog/gradient_accumulation" target="_blank" rel="noopener nofollow">Fixing Gradient Accumulation</a>。用于理解变长序列下按有效 token 聚合 loss 的工程问题。</li>
+</ol>
+<hr>
+<h2 id="写在最后">写在最后</h2>
+<p>训练稳定不是某一个指标落在固定区间，也不是 loss 每一步都下降。它是一条完整训练链路持续保持健康的结果。</p>
+<p>如果只保留一套判断顺序，我会记住下面五句话：</p>
+<ol>
+<li><strong>先确认数值能不能算。</strong></li>
+<li><strong>再确认梯度能不能传。</strong></li>
+<li><strong>再确认参数有没有以合理幅度更新。</strong></li>
+<li><strong>再确认模型是不是在优化正确目标。</strong></li>
+<li><strong>最后用验证结果判断训练是否真正有效。</strong></li>
+</ol>
+<p>看到异常时，我不先猜 learning rate，也不先堆更多监控。我会保存现场，沿训练链寻找第一个异常信号，再用最小重放和单变量实验确认根因。</p>
+<blockquote>
+<p><strong>稳定训练的核心，不是消灭所有波动，而是让每一次异常都能够被观察、解释、验证和处理。</strong></p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-08-28 16:51">2026-08-28 16:51</span>&nbsp;
+<a href="https://www.cnblogs.com/GlenTt">石头开会</a>&nbsp;
+阅读(<span id="post_view_count">31</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22742530);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FGlenTt%2Fp%2F22742530&amp;targetId=22742530&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
