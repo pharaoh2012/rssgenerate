@@ -1,0 +1,168 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Big-Yellow/p/22797274" title="发布于 2026-09-01 21:16">
+    
+
+    <span role="heading" aria-level="2">Agent上下文管理概述-1</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        Agent上下文管理核心是组织与压缩。组织采用静态+动态提示词：启动时载入系统提示词、工具描述、Skill名称路径；运行时拼接用户消息、工具调用及结果，并依KV缓存命中优化排列。压缩需兼顾速度与token占用。工业界常用确定性清理加摘要：Pi
+  Agent压缩历史后重建上下文，OpenCode对工具结果标记生命周期并驱逐过期输出，Manus将长输出落盘仅保留指针。学术研究涵盖Selective Context/LLMLingua-2的token级过滤，ICAE/500xCompressor的隐状态压缩，MEM1/Context-folding/ACM的轨迹压缩，以及StreamingLLM保留起始token的KV以稳定注意力。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>agent在运行过程中一般会去将历史、任务状态、记忆等内容进行“选择拼接”去构成完整的上下文（context）去交给大模型处理，其中就有几点设计理念需要考虑：1、大模型推理过程中都会选择kv-cache去加速推理，那么如何保证对话过程中cache命中高加快推理，亦或者说频繁的工具调用/文本内容如何拼接到上下文中；2、模型输入上下文总是有限的如何保证在超出上限之后对上下文压缩，而且压缩还不能都是关键信息；3、过长的上下文反而会去影响到模型的效果<sup class="footnote-ref"><a href="#fn1" id="fnref1" rel="noopener nofollow">[1]</a></sup>，因此这些都是上下文管理需要考虑的事情。</p>
+<h2 id="上下文组织">上下文组织</h2>
+<p>claude code/codex/pi agent等在构建上下文中一般选择的架构组织方式是：<code>静态提示词+ 动态提示词</code>，其中<strong>静态提示词</strong>指的一般是不会改变的提示词，如系统提示词、工具介绍等，而<strong>动态提示词</strong> 指的是经常发生改变内容，比如用户内容输入等，在上文组织过程中以pi agent为例介绍其组织过程，在第一次启动之后其context为：</p>
+<pre><code class="language-text">AgentContext
+├── systemPrompt
+│    ├── Pi Base System Prompt
+│    ├── Tool 使用说明
+│    ├── Guidelines
+│    ├── APPEND_SYSTEM.md
+│    ├── AGENTS.md / CLAUDE.md
+│    ├── Available Skills Index
+│    └── Current Working Directory
+├── messages
+│    └── []
+└── tools
+     ├── read schema
+     ├── bash schema
+     ├── edit schema
+     ├── write schema
+     └── extension tool schemas...
+</code></pre>
+<p>这里 <code>messages</code> 还是空的，因为用户还没有真正开始对话；但 System Prompt 和可用 Tool 已经准备完成。Pi 会在启动阶段读取 <code>AGENTS.md</code>、<code>CLAUDE.md</code> 等项目规则，同时扫描当前可用的 Skills（<strong>Skill 并不会在启动时把完整内容全部塞进 Context</strong> 一般只会保存 description、name、path）。<strong>不断对话过程中</strong> <code>用户输入问题-&gt;调用工具</code> 此过程会将工具结果 <em>补充到对话结尾</em></p>
+<h2 id="上下文压缩">上下文压缩</h2>
+<p>因为模型上下文是有限的因此不对对话过程中就需要去对内容进行压缩保证后续对话进行，对于普通对话压缩可能就是对上下文进行简短即可，但是对于Agent而言上下文不是一篇单纯的长文本，而是一个持续变化的运行状态。压缩策略也比较多一般而言压缩需要同时考虑：速度、效率（压缩后内容尽可能少的占用token），从两个角度出发了解上下文压缩策略：</p>
+<h3 id="常用agent架构中使用的压缩策略">常用Agent架构中使用的压缩策略</h3>
+<p><strong>工业 Agent 很少使用 LLMLingua 式 Token 分类器直接压缩整个对话。更常见的是“确定性选择与清理 + 专用 LLM 生成任务交接摘要 + 原始尾部 + 外部可恢复状态”。</strong></p>
+<h4 id="1pi-agent-上下文压缩策略">1、Pi Agent 上下文压缩策略</h4>
+<p>Pi 的自动触发条件是：<span class="math inline">\(\text{ContextTokens}&gt; \text{ContextWindow}-\text{ReserveTokens}\)</span> 其中 <code>reservetokens</code> 表示给下一次模型输出和工具执行留空间，除此之外在压缩过程中假如对话窗口为 <code>SystemPrompt+Context_i</code> 其中 <code>Context_i</code>可能就是表示一轮对话结果（<code>User+Assistance+toolCall+toolResult</code> 其中 <code>toolCall</code> 表示调用工具名称、 <code>toolResult</code> 表示对应的工具返回的结果）在Pi的<em>第一轮压缩过程</em>中它会先从<strong>最新消息往前扫描</strong>，尽量找到一段近期上下文（比如检索到 <code>i=2</code> 那么就会将前两轮对话历史结果进行压缩）在压缩过程中通过<a href="https://github.com/earendil-works/pi/blob/ee29aa118bdeb7d8c4fdafa81130e0c61f8e0423/packages/coding-agent/src/core/compaction/compaction.ts#L467" target="_blank" rel="noopener nofollow">提示词</a>引导进行“结构化压缩”比如说：</p>
+<pre><code class="language-markdown">## Goal
+当前任务最终目标
+
+## Constraints &amp; Preferences
+用户约束、技术限制、不允许执行的操作
+
+## Progress
+### Done
+已经完成的工作
+
+### In Progress
+当前正在做什么
+
+### Blocked
+被什么问题阻塞
+
+## Key Decisions
+关键决策，以及做出决策的原因
+
+## Next Steps
+后续动作
+
+## Critical Context
+关键报错、实体、路径、函数名、API和数据结构
+
+## Read Files
+已经读取的文件
+
+## Modified Files
+已经修改的文件
+</code></pre>
+<p>压缩后不是将内容进行删除只是以后<strong>不再发送给 LLM</strong>。官方文档明确描述为：追加 <code>CompactionEntry</code>，然后下一轮根据 <code>firstKeptEntryId</code> 重建 Context，所以下一轮对话内容为：<code>SystemPrompt+CompactionSummary+Context_j</code>。在<em>后续n轮压缩过程中</em> 会直接把 上一轮的压缩内容和最近需要压缩的内容一起进行压缩。</p>
+<p>从上面过程可以发现Pi里面压缩比较简单粗暴并<strong>没有去区分tool result直接通过一个prompt进行全部压缩</strong>。</p>
+<h4 id="2open-code-上下文压缩策略">2、Open Code 上下文压缩策略</h4>
+<p>OpenCode 比 Pi 更复杂一点，因为它实际上有两个完全不同的 Context Reduction 层：<code>Tool Result Pruning</code> 和 <code>Conversation Compaction</code>。<strong>第一层对工具调用结果进行压缩</strong>（也容易理解在coding任务中一个 <code>grep</code>的工具调用，返回的结果可能就有上千行内容这些内容不是都有用的，只需要对他们进行标记后续去掉就行）在对话中一轮工具调用可能是 <code>Assistance+ toolCall+ toolResult+ Assistance</code> OpenCode 会把旧 Tool Result 标记为 compacted，其中<strong>它主要压掉的是 Tool Result 的 output，而不是直接把整个 Tool Call + Assistant 消息链都删掉。</strong> 换言之在进行对话过程中 <code>toolResult</code> 是有生命周期的，这一层没有去调用llm处理，在代码里面会对旧 completed tool parts 上标记 <code>compacted</code>，而不是调用 LLM 改写这些结果。</p>
+<pre><code class="language-text">Assistant: 我先搜索 refresh_token。 
+ToolCall: grep -R "refresh_token" src/ 
+ToolResult: src/auth/token.py:... src/auth/service.py:... src/api/login.py:... ...... 几千行内容 
+Assistant: 主要逻辑位于 src/auth/token.py，接下来读取该文件。
+
+----- 进行 tool result pruning -----
+Assistant: 我先搜索 refresh_token。 
+ToolCall: grep -R "refresh_token" src/ 
+ToolResult: [旧 output 已从 Active Context 中移除] 
+Assistant: 最终定位到 src/auth/token.py
+</code></pre>
+<blockquote>
+<p>OpenCode 并不知道某条 Tool Result 在语义上“已经没用了”。它采用的是一种更工程化的启发式规则：近期工具输出优先保护，较老、已完成、非保护类型的工具输出，在累计超过一定 Token 预算以后直接从 Active Context 中驱逐。</p>
+</blockquote>
+<p><strong>第二层对内容进行压缩</strong>这个过程和上面的Pi的处理类似通过<a href="https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/compaction.ts" target="_blank" rel="noopener nofollow">提示词</a>进行结构化压缩，不过对话过程中进行压缩之后为了保证agent loop不被打断，会将对话重新拼接到压缩后内容后面（<code>Summary + RecentContext</code>）</p>
+<h4 id="3其他闭源压缩策略">3、其他闭源压缩策略</h4>
+<p>Manus 强调将网页、文件、中间结果和长 Tool Output 写入文件系统，只在活动 Context 中保留路径、URL、对象 ID 和简要结论。Todo / Plan 会不断重写到最近上下文，形成 Goal Recitation<sup class="footnote-ref"><a href="#fn2" id="fnref2" rel="noopener nofollow">[2]</a></sup>。Langchain DeepAgents会先把大型 Tool Result 写入文件，并在 Context 中留下文件指针和预览；必要时再对旧历史生成 Summary，同时保留完整 Transcript 作为 Canonical Record<sup class="footnote-ref"><a href="#fn3" id="fnref3" rel="noopener nofollow">[3]</a></sup>。</p>
+<h3 id="学术领域中常用的压缩策略">学术领域中常用的压缩策略</h3>
+<p>个人认为工程化实践上可以重点关注两点策略：<strong>1、离散文本与token级压缩</strong> 以及 <strong>2、面向Agent运行轨迹压缩</strong>。</p>
+<h4 id="1离散文本与token级压缩">1、离散文本与token级压缩</h4>
+<blockquote>
+<p>推荐直接使用: <a href="https://github.com/microsoft/LLMLingua" target="_blank" rel="noopener nofollow">https://github.com/microsoft/LLMLingua</a></p>
+</blockquote>
+<p>这一类方法最终仍然输出可读文本，对于原始输入文本 <span class="math inline">\(X=[x_1,x_2,\ldots,x_n]\)</span> 通过压缩器为每个 Token 或文本片段决定 <span class="math inline">\(z_i\in\{0,1\}\)</span> 最终保留：<span class="math inline">\(X'=\{x_i\mid z_i=1\}\)</span>（一般希望<span class="math inline">\(\max_{X'}\operatorname{Utility}(X',Q) \quad \text{s.t.} \quad |X'|\le B\)</span> 其中 <span class="math inline">\(B\)</span> 为压缩后的token budget）。<br>
+在论文 <strong>Selective Context</strong><sup class="footnote-ref"><a href="#fn4" id="fnref4" rel="noopener nofollow">[4]</a></sup>和<strong>LLMLingua-2</strong><sup class="footnote-ref"><a href="#fn5" id="fnref5" rel="noopener nofollow">[5]</a></sup>处理思路类似都是 <em>对不重要token进行过滤只将重要token进入模型推理</em> ，以selective context为例其处理思路很简单对于较长的prompt直接计算 <span class="math inline">\(I(x)=-\log P(x)\)</span> 其中 <span class="math inline">\(x\)</span> 表示较长的prompt而 <span class="math inline">\(P\)</span> 对应一个较小的模型而后对计算结果计算阈值过滤即可达到压缩目的（<strong>实际过程llm类似prefill处理prompt这样就可以得到每一个token的logits然后阈值过滤即可</strong>）下图红色表示保留文本</p>
+<p><img src="https://files.seeusercontent.com/2026/08/19/xH5o/20260819210036197.png" alt="image.png585" loading="lazy"></p>
+<p>这一类方法最大的优点是兼容闭源模型；最大的局限是：<strong>Token 级“相关性”不等于 Agent 状态级“未来效用”。</strong></p>
+<h4 id="2latent压缩">2、latent压缩</h4>
+<p>将长 Context 编码 <span class="math inline">\(X\in\mathbb{R}^{n\times d}\)</span> 压缩为：<span class="math inline">\(Z=C_{\phi}(X)\in\mathbb{R}^{m\times d},\quad m\ll n\)</span> 其目标不是生成可读摘要，而是<strong>让下游模型能够从少量隐状态中恢复任务所需信息</strong>，简而言之将中间状态结果进行压缩处理，不过对于这种策略需要考虑一点就是LLM都是自回归的，就需要考虑如何将内容进行拼接输入。比如在论文<strong>ICAE</strong><sup class="footnote-ref"><a href="#fn6" id="fnref6" rel="noopener nofollow">[6]</a></sup>直接将原本的大模型推理过程<code>Context+Prompt+Deocer</code> 替换为 <code>Context+Summary</code>在经过一次编码后在将 <code>Summary+Prompt</code> 就行decoder处理。训练分为两部分预训练和微调，预训练阶段<strong>文本复写任务</strong>通过MemoryTokens去复写后面内容（相当于截断文本而后decoder通过MemoryTokens去复写出来）以及 <strong>文本续写任务</strong>（或者说“问题回答”）。在后续论文<strong>500xCompressor</strong><sup class="footnote-ref"><a href="#fn7" id="fnref7" rel="noopener nofollow">[7]</a></sup>中处理思路类似不过将 <code>embeding</code> 替换为 <code>KV-value</code>去实现压缩。</p>
+<p><img src="https://files.seeusercontent.com/2026/08/21/ht4J/20260821222214428.png" alt="image.png772" loading="lazy"></p>
+<h4 id="3面向agent运行轨迹压缩">3、面向Agent运行轨迹压缩</h4>
+<p>主要是将 <span class="math inline">\(t\)</span> 轮中对话结果进行压缩比如说 <span class="math inline">\(S_t=\{G,C,P,D,E,F,A_t,O_t\}\)</span> 其中内部就是Agent不同运行轨迹状态因此轨迹压缩的目标是构造 <span class="math inline">\(\hat{S}_t=C(S_{1:t})\)</span> 。<strong>MEM1</strong><sup class="footnote-ref"><a href="#fn8" id="fnref8" rel="noopener nofollow">[8]</a></sup>在处理React每一步推理过程中进行“微压缩”然后进入下一轮的推理在react中每一轮推理都会直接将上一轮内容叠加到状态里面进行推理。</p>
+<p><img src="https://files.seeusercontent.com/2026/08/20/Gdy7/20260820163238916.png" alt="image837" loading="lazy"></p>
+<p>比如说上图中左下方每一次act推理过程中都会将工具结果等都记录到 <code>IS</code>中，再训练过程中因为每轮都有一个压缩处理因此在计算Attention过程中下一轮的 <code>&lt;IS&gt;</code> 状态“看不到”前面状态结果（<code>2D Attention Mask</code>）。在<strong>Context-folding论文</strong><sup class="footnote-ref"><a href="#fn9" id="fnref9" rel="noopener nofollow">[9]</a></sup>和<strong>论文 ACM</strong><sup class="footnote-ref"><a href="#fn10" id="fnref10" rel="noopener nofollow">[10]</a></sup>中不是讲状态进行总结而是将状态进行“折叠”，比如在Context-folding中：<br>
+<img src="https://files.seeusercontent.com/2026/08/23/vjS8/20260823152852098.png" alt="image665" loading="lazy"></p>
+<p>在上述过程中，工具调用产生的中间结果会被统一“折叠”，仅将 Sub-agent 最终返回的结果保留在主上下文中。该方法采用 Main Agent 与 Sub-agent 协同的架构：前者负责在 Planning State 中进行任务规划与子任务拆解，后者根据规划执行 ReAct 式推理及工具调用。与其他上下文压缩方法的主要区别在于，Sub-agent 的完整执行轨迹不会写入主上下文，只有其最终返回的结果会被保留。而ACM更加简单直接通过两个上下文管理工具，使代理能够模仿人类的记忆机制：manage_context，它将之前的转换压缩成简洁的摘要，并将原始消息卸载到磁盘上的外部文件中；以及 query_memory，它允许代理查询存储的原始消息以精确地检索信息。</p>
+<h4 id="4kv-cache压缩">4、KV cache压缩</h4>
+<p>KV Cache Compression 处理的是 Transformer 每层的 Key 和 Value：<span class="math inline">\(K_l,V_l\)</span>，目标是在生成过程中只保留一部分历史 KV：<span class="math inline">\((K'_l,V'_l)=\operatorname{Select}(K_l,V_l,B_l)\)</span> 其中 <span class="math inline">\(B_l\)</span> 是第 <span class="math inline">\(l\)</span> 层的缓存预算，所以说严格意义上不太算是上下文压缩策略，在论文 <strong>StreamingLLM</strong> <sup class="footnote-ref"><a href="#fn11" id="fnref11" rel="noopener nofollow">[11]</a></sup>中发现使用 windows attention并不能扩展长度（主要测试的是Llama-2模型，发现模型不能很好外推到训练长度之外），但是通过一种现象 attention sink（保留 起始token 的 KV ）能够恢复 windows attention 的效果。之所以出现这一现象是因为<strong>起始 token 有着更高的注意力分数，即便是当它在语义上已经不重要了</strong>（实验直接将其换成 <code>\n</code> 对于表现影响很大）也依然如此。</p>
+<p><img src="https://files.seeusercontent.com/2026/08/21/Gr3b/20260822010355744.png" alt="image773" loading="lazy"></p>
+<p>操作方式也很简单在计算 windows attention 时候将开始的 <span class="math inline">\(n\)</span> 个token保留即可（测试llama-2中 <span class="math inline">\(n=4\)</span> ）</p>
+<h2 id="总结">总结</h2>
+<p>对于 Agent 运行上下文，主要分为两大部分：<strong>1、上下文组织</strong>，可分为两个阶段：<em>启动时</em>，拼接系统提示词、Skills、工具 Description、必备文件（如 CLAUDE.md）等静态内容；<em>运行时</em>，持续拼接用户消息、Agent 回复、工具调用及工具结果。参考 Pi Agent 的组织方式，可以概括为：<code>静态内容 + 用户消息 + Agent 交互轨迹 + 工具结果</code>。<strong>2、上下文压缩</strong>，考虑到每个 LLM 的上下文窗口都存在上限，因此需要对内容进行压缩。综合工业实践和学术研究，较为稳妥的策略包括：<em>1、选择性保留工具结果</em>，例如 OpenCode 的 Tool Result Pruning 和 Context Folding。Agent 运行过程中，工具结果可能占用大量上下文，并且部分结果会过期、重复或可以重新获取，因此没有必要始终保留在主上下文中；<em>2、基于提示词进行摘要</em>，通过提示词将历史内容压缩为结构化摘要，同时保留任务目标、运行状态、执行进度、关键结论、环境变化、失败尝试和待办事项，具体可以参考 OpenCode、Pi Agent 和 Claude Code 的提示词设计；<em>3、选择性丢弃或 Token 级压缩</em>（谨慎使用），直接丢弃低价值、重复或可恢复的内容，或者通过离散 Token 压缩等算法缩短文本。此类方法只能尽量保持原始语义，无法保证关键信息完全不丢失；<em>4、运行状态压缩</em>（不建议作为应用层首选方案），直接对 KV-cache 等模型运行状态进行压缩或量化。这类方法主要用于降低显存占用和提高推理效率，并不等同于语义层面的上下文压缩。</p>
+<h2 id="参考">参考</h2>
+<hr class="footnotes-sep">
+<section class="footnotes">
+<ol class="footnotes-list">
+<li id="fn1" class="footnote-item"><p><a href="https://arxiv.org/pdf/2307.03172" target="_blank" rel="noopener nofollow">https://arxiv.org/pdf/2307.03172</a> <a href="#fnref1" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn2" class="footnote-item"><p><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener nofollow">https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus</a> <a href="#fnref2" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn3" class="footnote-item"><p><a href="https://docs.langchain.com/oss/python/deepagents/context-engineering" target="_blank" rel="noopener nofollow">https://docs.langchain.com/oss/python/deepagents/context-engineering</a> <a href="#fnref3" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn4" class="footnote-item"><p><a href="https://arxiv.org/pdf/2310.06201" target="_blank" rel="noopener nofollow">https://arxiv.org/pdf/2310.06201</a> <a href="#fnref4" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn5" class="footnote-item"><p><a href="https://arxiv.org/pdf/2403.12968" target="_blank" rel="noopener nofollow">https://arxiv.org/pdf/2403.12968</a> <a href="#fnref5" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn6" class="footnote-item"><p><a href="https://arxiv.org/pdf/2307.06945" target="_blank" rel="noopener nofollow">https://arxiv.org/pdf/2307.06945</a> <a href="#fnref6" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn7" class="footnote-item"><p><a href="https://aclanthology.org/2025.acl-long.1219.pdf" target="_blank" rel="noopener nofollow">https://aclanthology.org/2025.acl-long.1219.pdf</a> <a href="#fnref7" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn8" class="footnote-item"><p><a href="https://arxiv.org/pdf/2506.15841" target="_blank" rel="noopener nofollow">https://arxiv.org/pdf/2506.15841</a> <a href="#fnref8" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn9" class="footnote-item"><p><a href="https://arxiv.org/pdf/2510.11967" target="_blank" rel="noopener nofollow">https://arxiv.org/pdf/2510.11967</a> <a href="#fnref9" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn10" class="footnote-item"><p><a href="https://arxiv.org/pdf/2607.23809" target="_blank" rel="noopener nofollow">https://arxiv.org/pdf/2607.23809</a> <a href="#fnref10" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+<li id="fn11" class="footnote-item"><p><a href="http://arxiv.org/abs/2309.17453" target="_blank" rel="noopener nofollow">http://arxiv.org/abs/2309.17453</a> <a href="#fnref11" class="footnote-backref" rel="noopener nofollow">↩︎</a></p>
+</li>
+</ol>
+</section>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-01 21:17">2026-09-01 21:16</span>&nbsp;
+<a href="https://www.cnblogs.com/Big-Yellow">Big-Yellow-J</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22797274);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FBig-Yellow%2Fp%2F22797274&amp;targetId=22797274&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
