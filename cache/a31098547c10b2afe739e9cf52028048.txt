@@ -1,0 +1,165 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/accordion/p/22787957" title="发布于 2026-09-01 11:32">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">Graph RAG，不一定要图数据库</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="常规路径和它的代价">常规路径和它的代价</h2>
+<p>Graph RAG 的主流做法大致分三步：部署图数据库，写 ETL pipeline 把文档灌进去，跑实体抽取和关系挖掘，建出知识图谱，再做图检索。HippoRAG 的知识图谱就是这么来的，Graphiti 和 Zep 维护的 temporal graph 走的也是这条路。</p>
+<p>对一个团队级的、多源异构的文档库来说，这条路径是合理的。但对于另一种场景——单用户、markdown 知识库，笔记之间已经用手工双链互相引用——这三步里有两步是多余的。</p>
+<p>图数据库和 ETL 是多余的，因为图已经以 <code>[[wikilinks]]</code> 的形式存在于笔记正文里。实体抽取是多余的，因为人手工连的边，比模型从文本里挖出来的准确得多。真正影响召回质量的变量不是图遍历的复杂度，而是 reranker 的精度——把候选池从 60 个缩到 12 个，靠的是 cross-encoder 的深度语义比对，和图的规模无关。</p>
+<p>基于这个判断，可以砍出一个完全不同的技术栈：用 SQLite 代替图数据库，用正则解析 wikilink 代替实体抽取，用 cross-encoder 做最后把关。</p>
+<h2 id="架构总览">架构总览</h2>
+<p>整个系统由三个独立组件构成，共享同一个 SQLite 数据库，但彼此不耦合——任何一个挂掉都不影响另外两个。</p>
+<div class="mermaid">flowchart TB
+    subgraph 离线["离线：建索引"]
+        A[index_notes.py] --&gt; |"chunk + e5 embed → .npy/.pkl"| IDX[("索引文件&lt;br/&gt;_brain_e5.npy + .pkl")]
+    end
+
+    subgraph 查询时["查询时：召回管线"]
+        B[brain_ask.py] --&gt; |"① 向量召回 top-60"| V[向量命中]
+        V --&gt; |"② 1-hop wikilink 扩展"| G[图邻居&lt;br/&gt;max 40]
+        V --&gt; C[候选池合并]
+        G --&gt; C
+        C --&gt; |"③ cross-encoder 重排"| R[top-12 结果]
+    end
+
+    subgraph 运行时["运行时：per-turn 账本"]
+        D[turnstate_hook.py&lt;br/&gt;Agent Stop-hook] --&gt; |"0 LLM token&lt;br/&gt;纯正则解析"| DB[("turnstate.db&lt;br/&gt;turns 表 + ab_recall 表")]
+        R --&gt; |"--ab 模式"| DB
+    end
+
+    NOTES[("markdown 笔记&lt;br/&gt;带 [[wikilinks]]")] --&gt; A
+    NOTES --&gt; B
+    B -.-&gt; |"查询期现 parse wikilink"| NOTES
+    E[turnstate_show.py&lt;br/&gt;只读查看器] --&gt; DB
+</div><p>图中最关键的决策：<strong>图本身不落库</strong>。每次查询时从笔记文件里现 parse <code>[[wikilinks]]</code>，限 1 跳、最多 40 个邻居。零维护成本，永远和笔记同步。</p>
+<h2 id="索引层">索引层</h2>
+<p>离线建索引，流程简单直接。</p>
+<p>扫全部 markdown 文件，正则剥掉 YAML front-matter，抽 <code>date</code> 字段。定长切块，每块 1200 字符，相邻块之间重叠 200 字符。切法故意粗糙——下游 reranker 会兜底，不用在切块策略上花太多精力。</p>
+<p>每块文本加 <code>'passage: '</code> 前缀，用 <code>intfloat/multilingual-e5-base</code> 做 embedding，L2 归一化。最终输出两个文件：一个 float32 矩阵（每行一个块），一个元数据列表（每块的 path、title、snippet、date）。小块模型在笔记本 GPU 上就能跑，CPU 也够用。</p>
+<h2 id="召回管线">召回管线</h2>
+<p>召回管线在一个文件里，四步，顺序执行。每次查询都从磁盘加载全量索引，没有服务端，没有 daemon。</p>
+<div class="mermaid">flowchart LR
+    Q["query"] --&gt; E["e5 编码&lt;br/&gt;'query: ' + query"]
+    E --&gt; S["sims = emb @ qv&lt;br/&gt;全库余弦相似度"]
+    S --&gt; D["按文件去重&lt;br/&gt;每文件取最佳块&lt;br/&gt;→ top-60"]
+    D --&gt; G{"图扩展?"}
+    G --&gt;|"--graph / --ab"| GE["从 top-15 种子出发&lt;br/&gt;parse [[出链]]&lt;br/&gt;解析邻居 → 挑最佳块&lt;br/&gt;最多 +40"]
+    G --&gt;|否| POOL["候选池"]
+    GE --&gt; POOL
+    POOL --&gt; R["cross-encoder 重排&lt;br/&gt;→ top-12"]
+    R --&gt; OUT["输出"]
+</div><h3 id="向量召回">向量召回</h3>
+<p>第一步是标准的 bi-encoder 检索。query 加 <code>'query: '</code> 前缀，用 e5 编码，算和全库每块向量的余弦相似度。得到一个长度等于全库总块数的分数数组。按降序遍历，<strong>按文件去重</strong>——同一个文件如果被切成了多块，只取分数最高的那一块。最终保留 top-60 个唯一文件。</p>
+<p>这个分数数组在后续步骤里还会复用，零额外开销。</p>
+<h3 id="图扩展">图扩展</h3>
+<p>图扩展是这个设计的核心，也是最容易误读的地方。它不是一个独立的检索通道，而是挂在向量结果之上的候选增强——把和被命中笔记有人工链接关系的邻居，也拉进候选池。</p>
+<p>具体过程分四步。</p>
+<p><strong>第一步，建解析表。</strong> 用一个临时字典，把文件名（小写，不含 <code>.md</code>）映射到该文件所有 chunk 的索引列表。一篇笔记如果被切成了三块，字典里对应键的值就是三个索引。这个表只在查询期存在，一次查询建一次，不落盘。</p>
+<p><strong>第二步，从种子出发抓出链。</strong> 从向量召回的 top-60 中取前 15 个文件作为种子。打开每篇种子笔记，用正则抽出正文里所有的 <code>[[出链]]</code>。正则只抓 <code>[[</code> 之后、遇到 <code>]</code> 或 <code>|</code> 或 <code>#</code> 之前的内容——别名和锚点都被剥掉，只保留文件名。</p>
+<p>三个硬约束：只 1-hop，邻居的链接不再跟进，没有二跳。只 outgoing，看的是种子文件自己写了什么出链，不查反向链接。只文件名，匹配靠的是文件名的小写形式。</p>
+<p><strong>第三步，选块。</strong> 每个链接目标能解析到已索引的邻居文件后，该邻居文件的所有候选块里，挑出对本 query 向量相似度最高的那一块当代表。因为第一步向量召回时已经算好了全库每块和本 query 的相似度数组，这一步就是在这个数组上取 <code>max</code>，零额外计算。</p>
+<p>为什么不能随便拿第一块？因为一篇长笔记可能开头讲 A、结尾讲 B，如果 query 问的是 B，拿开头那块喂给 reranker，这篇笔记会被误杀。用相似度挑块，保证即便是图硬拉进来的笔记，也带着它最能回答本问题的那一段进场，给 reranker 一次公平评判的机会。</p>
+<p>这一步的设计思路：<strong>发现靠图，选块靠向量。</strong> 图负责"把谁叫进来"，向量负责"带哪块料进来"。</p>
+<p><strong>第四步，封顶和去重。</strong> 最多加 40 个邻居。去重是块级的——但因为向量召回和这里的选块逻辑用的是同一个相似度数组和同一个 <code>max</code> 策略，同一个文件在两个地方算出的"最佳块"索引天然一致，所以一个已经是向量命中的文件不会又被图重复拉进来。处理顺序是种子 1 的全部链接、种子 2 的全部链接……一旦累计到 40 个就提前终止，排在后面的种子可能根本没机会被处理。</p>
+<p><strong>图扩展的核心角色：候选生成，不是排序。</strong> 邻居笔记和向量命中被扔进同一个候选池，不分区对待。最终由 reranker 统一打分——不相关的链接笔记会被自然埋掉。这就是 1-hop 扩展可以安全常开的原因：图只提名，不打分，去留全交给 cross-encoder。</p>
+<h3 id="cross-encoder-重排">cross-encoder 重排</h3>
+<p>候选池合并后，用 <code>cross-encoder/mmarco-mMiniLMv2-L12-H384-v1</code> 做重排。这个模型把 query 和候选文本拼在一起送进同一个 transformer，输出一个相关性分数，取 top-12。</p>
+<p>cross-encoder 和第一步的 bi-encoder（e5）是两种不同的模型架构：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>bi-encoder（e5）</th>
+<th>cross-encoder（mmarco）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>怎么算分</td>
+<td>query 和 doc 分别编码，再算余弦</td>
+<td>query 和 doc 拼一起过 transformer</td>
+</tr>
+<tr>
+<td>速度</td>
+<td>快，全库向量可预计算</td>
+<td>慢，每个 (query, doc) 对都要过一遍模型</td>
+</tr>
+<tr>
+<td>精度</td>
+<td>粗</td>
+<td>精</td>
+</tr>
+<tr>
+<td>用途</td>
+<td>从几万块里粗筛到几十</td>
+<td>从几十个候选里精排到十几个</td>
+</tr>
+</tbody>
+</table>
+<p>必须两段的理由很简单：cross-encoder 没法预计算，全库跑会爆炸。bi-encoder 便宜地粗筛一遍，cross-encoder 在小池子里精排，这是 RAG 里经典的 retrieve-then-rerank 两段式。</p>
+<h3 id="管线分离不是双路融合">管线分离，不是双路融合</h3>
+<p>这里有一个容易混淆的地方。经典"双路召回"通常指两条独立并行的 recall 通道——比如 BM25 稀疏检索加向量稠密检索——然后融合。这个设计不是这样。它只有一条入口：向量检索。图扩展是串行挂在向量结果之上的，不是独立通道。真正跑两条管线比对的只有 A/B 遥测模式，那是测量用的，不是生产召回的融合策略。</p>
+<h2 id="entity-gate按-query-类型开关图">Entity Gate：按 query 类型开关图</h2>
+<p>A/B 遥测积累一定数据后，发现一个规律：图扩展对主题类 query（"agent memory 的几种做法"）有帮助，但对名字/工具类 query（"Obsidian"、"NotebookLM"）有害。</p>
+<p>原因不复杂。一张人物或项目的名片，链接到所有相关笔记。从这张名片出发做 1-hop，拉回来的不是相关联想，是一堆噪声。所以需要一道门：当 query 看起来像专有名词或工具名时，关掉图扩展。</p>
+<p>判断逻辑是几个纯字符串规则，不调模型，开销为零：</p>
+<ul>
+<li>已知的工具名（白名单）→ 关</li>
+<li>包含下划线（snake_case 命名）→ 关</li>
+<li>驼峰命名（CamelCase，如 NotebookLM、PyTorch）→ 关</li>
+<li>首字母大写的专有名词，且不是纯大写缩写（AI、RAG 这类不算）→ 关</li>
+</ul>
+<p>这道门故意保守：拿不准就返回"不关"，默认开图。宁可多拉几个噪声让 reranker 滤掉，也不错杀一个可能有效的图扩展。</p>
+<h2 id="ab-遥测">A/B 遥测</h2>
+<p>"联想记忆到底有没有用"不是靠直觉判断的。每条真实 query 都跑两条管线——纯向量和向量加图——然后 diff 结果，把"图额外拉进了多少篇笔记"记进 SQLite 的 <code>ab_recall</code> 表。</p>
+<p>表里记录了每次 query 的候选增量、新增进 top-N 的笔记数、其中多少是图拉进来的、以及具体是哪些标题。每周一条 SQL，就能看到关联扩展在哪些 query 类型上收益最大，哪些类型上纯属噪声。</p>
+<h2 id="crash-safety">Crash-safety</h2>
+<p>图扩展和 Stop-hook 都被异常捕获包裹。任何一步失败，都退化成前一个行为：图挂了，退化成纯向量召回；账本写坏了，跳过这行。输出结果永远不会因为记忆层的故障而变差。</p>
+<p>这个策略的底线是：<strong>记忆层绝不能让 agent 比没有记忆时更差。</strong> 宁可少召回几篇关联笔记，也不能因为图扩展挂了就返回空结果或报错打断对话。</p>
+<h2 id="per-turn-账本">Per-turn 账本</h2>
+<p>每个 agent turn 结束后，从 transcript 尾部解析出"刚才发生了什么"，写一行进 SQLite 的 <code>turns</code> 表。全程不调模型，纯正则和 JSON 解析。</p>
+<p>实现上用了增量读取——每次只读 transcript 文件里新增的字节片段，通过一个 offset 文件追踪读到哪里。解析出的内容很朴素：用户问了什么、助手答了什么摘要、动了哪些文件、用了哪些工具、跑了哪些命令、有没有命中决策关键词的行。每一行都带了 <code>evidence</code> 字段，指向原始 transcript 的路径和字节范围，保证可追溯。</p>
+<p>这张表的价值在于，它把 agent 的行为变成了可查询的结构化数据。不用去翻几千行的 transcript 日志，一条 SQL 就能看到最近一周做了哪些决策、哪些文件被频繁修改、哪些工具使用率最高。</p>
+<h2 id="bi-temporal-边图落库后的时间维度">Bi-temporal 边：图落库后的时间维度</h2>
+<p>当前设计里图不落库，也就不存在"边过期"的问题。但如果哪天图真的被持久化到 SQLite 里（比如语料库太大、查询期解析太慢），会立刻遇到一个新问题：落库的图通常靠定时重建来更新，而重建是无状态的——一条边从笔记里消失后，下次重建就静默蒸发了。你没法问"这件事什么时候不再成立"，也没法回溯上个月的图谱长什么样。</p>
+<p>解决思路是给每条边加有效窗口：<code>valid_from</code> 记录事实首次被观察到的时间，<code>valid_to</code> 记录事实从语料库中消失的时间（<code>NULL</code> 表示仍然有效），<code>observed_at</code> 记录源笔记的修改时间作为新鲜度信号，<code>confidence</code> 做置信度衰减权重。</p>
+<p>重建从"删掉重来"变成 diff-upsert：边还在，只刷新时间戳；边没了，设 <code>valid_to</code> 关窗；新边，开新窗。历史累积，不覆盖。</p>
+<p>两个直接收益。prefer the present：只查 <code>valid_to IS NULL</code>，按 <code>observed_at</code> 倒序排，新鲜证据优先浮上来。time travel：传一个 <code>as_of</code> 时间戳，只查当时有效的边，可以重构任意历史时刻的图谱快照。</p>
+<p>初始实测的数据是：context size 基本不变，召回候选的平均新鲜度提升约 60%。bloat 削减是累积效应，不是一天的数。</p>
+<h2 id="局限">局限</h2>
+<p>这个设计有几个硬前提和已知盲区。</p>
+<p><strong>前提是手工维护了双链。</strong> 如果你的 markdown 里没有 <code>[[wikilinks]]</code>，图扩展这条路径等于是空的——它不自己挖掘关系，全靠人手工连的边。这不是一个"从零建图"的方案，而是一个"把已有图用起来"的方案。</p>
+<p><strong>没有增量索引。</strong> 每次笔记更新，需要全量重建 embedding 索引。对于小语料库（几千篇）这不是问题，但量级上去之后会有瓶颈。</p>
+<p><strong>没有独立的实体检索通道。</strong> 生产环境中，除了通用的 wikilink 图扩展，还有一条专门针对人物和项目名片的额外检索 lane。因为和隐私数据耦合太紧，没有被开源出来。</p>
+<p><strong>没有 eval suite。</strong> 目前召回质量靠 A/B 遥测和自己的 SQL 查询来感知，没有一套标注好的标准 query 集合和评估指标。v0.2 的计划是做一个 200-500 篇笔记的合成 mini-vault，加上 200 条分类标注的 query，做完整的消融实验。</p>
+<p><strong>索引器会误吞无关文件。</strong> 当前索引阶段 <code>rglob('*.md')</code> 会不加区分地把 <code>.stversions</code> 备份、同步冲突副本、<code>.obsidian</code> 目录下的配置 markdown 等也一并索引进去。</p>
+<h2 id="总结">总结</h2>
+<p>这个设计的本质是把 Graph RAG 的传统技术栈——图数据库、ETL、实体抽取——全部替换成更轻的东西：手工 wikilink 代替模型挖掘，SQLite 代替 Neo4j，查询期正则解析代替持久化图结构。代价是它只适用于一个前提：你的笔记里已经有人工维护的双链。但如果这个前提成立，它就避开了 Graph RAG 里最贵的三件事。</p>
+<p>更值得注意的，是它把"信不信"这个判断从系统设计里拿掉了，换成了可查询的数据。A/B 遥测跑在每条真实 query 上，图扩展到底有没有用、对哪类 query 有用、对哪类有害，每周一条 SQL 回答。不做假设，只积累证据。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-01 11:32">2026-09-01 11:32</span>&nbsp;
+<a href="https://www.cnblogs.com/accordion">royalrover</a>&nbsp;
+阅读(<span id="post_view_count">155</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22787957);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Faccordion%2Fp%2F22787957&amp;targetId=22787957&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

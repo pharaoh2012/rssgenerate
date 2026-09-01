@@ -1,0 +1,419 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/FatTiger4399/p/22798096" title="发布于 2026-09-01 23:30">
+    
+
+    <span role="heading" aria-level="2">DDIA(六):编码格式的取舍与JSON战报体积优化方案</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="ddia六编码格式的取舍与json战报体积优化方案">DDIA(六):编码格式的取舍与JSON战报体积优化方案</h1>
+<p>好家伙,</p>
+<p>最近在研究战报的数据结构和体积压缩:于是去翻 DDIA 第 4 章,正好整章讲的就是这件事:</p>
+<pre><code class="language-text">数据要跨进程、跨服务、落盘存档,
+就得从内存结构体变成字节序列——这就是编码.
+</code></pre>
+<p>编码格式怎么选,直接影响包体大小、解析开销,以及未来改字段时会不会炸.</p>
+<p>这篇拿三种最常见的格式,对着我这份战报真刀真枪比一遍:JSON、Protobuf、Avro.</p>
+<h2 id="0背景一份战报要出门得先打包">0.背景:一份战报要出门,得先"打包"</h2>
+<p>先把标本摆上桌.下面是一份最小可用战报——从一场真实战斗的战报里抽出来的,只保留胜负、回合数,和"阿尔德一刀砍中豺狼人"这一次伤害计算的 4 条过程日志:</p>
+<pre><code class="language-json">{
+  "winner": "player",
+  "rounds": 6,
+  "entries": [
+    {"seq": 413, "depth": 7, "kind": "start",   "process": "calc.damage", "text": "目标:gnoll#1 单位:alde#1 技能:strike"},
+    {"seq": 414, "depth": 8, "kind": "trigger", "process": "calc.damage", "text": "触发器[warcry.buff]（来源:alde#1）在 on:calc.damage 生效"},
+    {"seq": 415, "depth": 8, "kind": "note",    "process": "calc.damage", "text": "乘区 panel=0 item=0 status=原值[0.3]→衰减后0.3 固定=0"},
+    {"seq": 416, "depth": 7, "kind": "end",     "process": "calc.damage", "text": "结果=31.2"}
+  ]
+}
+</code></pre>
+<p>这份小战报要出门三趟:发给客户端展示、写进存储、丢给 worker 做验算.每趟都得先打包:</p>
+<pre><code class="language-text">内存里: BattleReport 结构体
+  -&gt; 编码 -&gt; 字节序列(发给客户端 / 写进存储 / 丢给 worker)
+  -&gt; 解码 -&gt; 另一台机器上的结构体
+</code></pre>
+<p>这篇要做的事很具体:把这份小战报分别用 JSON、Protobuf、Avro 真的编一遍,一个字节一个字节数,看钱花在哪.</p>
+<p>心里再挂个数:它来自的那份完整战报有 1648 条日志,JSON 落盘 562.8KB.小样本上看清了,完整版的账自然对得上.</p>
+<h2 id="1json-的三个问题">1.JSON 的三个问题</h2>
+<p>第一个:体积.小战报压成一行(去掉缩进换行)是 508 字节.但里面真正的信息量——text 里那些字加几个小整数——远没有 508 字节.钱花哪了:</p>
+<pre><code class="language-text">"seq":"depth":"kind":"process":"text":
+                  五个字段名, 原样重复了 4 遍
+"calc.damage":    同一个值, 重复了 4 遍
+"start"/"end"...: kind 明明只有 4 种取值, 却按完整字符串存
+seq 413~416:      值恒等于"它是第几条", 纯冗余
+</code></pre>
+<p>放大到 1648 条的完整战报,这笔账变成:</p>
+<pre><code class="language-text">缩进和换行: 压成一行, 562.8KB -&gt; 286.6KB, 一半是空白字符
+字段名:     五个字段名重复 1648 遍, 共 62KB
+枚举值:     kind 4 种、process 43 种取值, 按字符串存了 1648 遍
+真正的信息: 所有 text 加起来 29.1KB
+</code></pre>
+<p>为 29.1KB 的内容付了 562.8KB 的运费.</p>
+<p>第二个:类型含糊.</p>
+<pre><code class="language-text">JSON 只有 number, 不分 int 和 float.
+战报里 initiative 结果 124.85 和 hp 100 落盘后是同一种东西,
+读回来全靠解析方猜; player_id 这类 int64 一旦超过 2^53,
+JS 解析直接丢精度: 72057594037927937 读出来变成 72057594037927936.
+没有二进制类型, 想内嵌一段压缩快照还得 base64, 体积再涨约 1/3.
+</code></pre>
+<p>第三个:解析贵.</p>
+<pre><code class="language-text">文本 -&gt; 结构体, 要逐字符扫描、转数字、处理转义.
+完整战报解析一次要过 57 万个字符;
+战斗服高峰期每秒几千条协议, 这部分 CPU 占比会难看到
+你抓一次 profile 就能一眼认出来.
+</code></pre>
+<p>小结:JSON 的可读性是给人看的,但体积和解析的代价是机器在付.</p>
+<p>顺带一提:"先 gzip 一下"确实立竿见影——完整战报 minify+gzip 后只剩 20.4KB.但压缩解决的是传输和存储,解压回来还是那 28 万字符要逐个解析,CPU 的账一分没少.MessagePack、BSON 这类"二进制 JSON"同理,字段名还在每条记录里,治标不治本.</p>
+<h2 id="2protobuf用-tag-号代替字段名">2.Protobuf:用 tag 号代替字段名</h2>
+<p>Protobuf 的思路:先写 schema,编码时只传字段编号(tag),不传字段名.给小战报写 schema:</p>
+<pre><code class="language-text">message ReportEntry {
+  uint32 seq      = 1;
+  uint32 depth    = 2;
+  Kind   kind     = 3;   // enum: start=0 note=1 end=2 trigger=3
+  string process  = 4;
+  string text     = 5;
+}
+message BattleReport {
+  string winner           = 1;
+  uint32 rounds           = 2;
+  repeated ReportEntry entries = 3;
+}
+</code></pre>
+<p>按这份 schema 把小战报编出来:508 字节的 JSON 变成 289 字节.省在哪,拿最短的那条日志(seq=416,"结果=31.2")看字节:</p>
+<pre><code class="language-text">JSON 版, 79 字节:
+{"seq":416,"depth":7,"kind":"end","process":"calc.damage","text":"结果=31.2"}
+
+Protobuf 版, 33 字节:
+08 a0 03        tag=1(seq),   值 416
+10 07           tag=2(depth), 值 7
+18 02           tag=3(kind),  值 2(end 在枚举里排第 2)
+22 0b calc.damage   tag=4(process), 长度 11, 内容
+2a 0b 结果=31.2     tag=5(text),    长度 11, 内容
+</code></pre>
+<p>逐条看省钱的三招:</p>
+<pre><code class="language-text">字段名没了:   "seq" 五个字节 -&gt; 08 一个字节(tag 号)
+枚举字符串没了: "end" 连引号 5 字节 -&gt; 02 一个字节
+数字不再是字符: 416 三个字符 -&gt; varint 两字节 a0 03
+</code></pre>
+<p>(08 和 a0 03 这些字节具体是怎么算出来的,文末附录有逐位的计算过程,这里先记住"字段名变编号、数字变二进制"这两件事即可.)</p>
+<p>字段名只存在于 schema 里,通信双方各存一份.第 1 节算过完整战报字段名占 62KB——在这里直接归零.</p>
+<p>兼容演进全靠 tag 号的纪律.拿一个真实的改需求节奏说:上线第 3 周,策划要求日志条目里加"耗时毫秒"字段:</p>
+<pre><code class="language-text">1. 新加字段 = 用新 tag 号(cost_ms = 6).
+   旧代码读到不认识的 tag 直接跳过 -&gt; 旧代码能读新数据
+2. 新代码读旧数据: 新字段必须 optional 或有默认值
+3. tag 号一旦用过, 永远不能复用.
+   实习生把删掉的 tag=2 复用给新字段,
+   老数据里所有 depth 都会被解读成新字段.
+   所以删字段也要把号保留成 reserved
+4. 字段类型不是随便改, 只有部分变更安全(比如 int32 -&gt; int64)
+</code></pre>
+<p>小结:Protobuf 用"字段名换成编号 + schema 纪律",换来小体积和兼容演进.</p>
+<h2 id="3avro连-tag-号也省了字节里只剩值">3.Avro:连 tag 号也省了,字节里只剩值</h2>
+<p>Avro 走得更彻底.先看结果再讲原理——还是那条 seq=416 的日志:</p>
+<pre><code class="language-text">Protobuf 版, 33 字节:
+08 a0 03  10 07  18 02  22 0b calc.damage  2a 0b 结果=31.2
+↑ 每个值前面都有个 tag 字节, 说明"我是几号字段"
+
+Avro 版, 28 字节:
+c0 06  0e  04  16 calc.damage  16 结果=31.2
+↑ 没有任何 tag, 五个值按顺序光屁股排队
+</code></pre>
+<p>Avro 编码里只有值:第 1 个是 seq,第 2 个是 depth,第 3 个是 kind……仅此而已.</p>
+<p>这时候自然的疑问来了:解码的人拿到 <code>c0 06 0e 04...</code> 这串字节,凭什么知道第 1 个是 seq、第 4 个是 process?</p>
+<p>答案:凭 schema——写这份数据时用的那份 schema,必须跟数据一起保存.Avro 的 schema 就是一个 JSON,描述"字段按什么顺序、各是什么类型":</p>
+<pre><code class="language-text">{
+  "type": "record",
+  "name": "ReportEntry",
+  "fields": [
+    {"name": "seq",     "type": "int"},
+    {"name": "depth",   "type": "int"},
+    {"name": "kind",    "type": {"type": "enum", "symbols": ["start","note","end","trigger"]}},
+    {"name": "process", "type": "string"},
+    {"name": "text",    "type": "string"}
+  ]
+}
+</code></pre>
+<p>说白了,它就是一张座位表:第 1 个座位坐 seq(int),第 4 个座位坐 process(string).解码方拿着座位表按顺序读字节,才知道每个值是谁.</p>
+<p>所以 Avro 的完整工作流程是:</p>
+<pre><code class="language-text">写入方: 按自己手里的 schema(写时 schema)编码,
+        把 schema 原文跟数据存在一起(归档文件的文件头),
+        或者存进一个公共的 schema 仓库(schema registry)
+
+读取方: 先拿到写时 schema(从文件头或仓库里取),
+        再拿自己手里的 schema(读时 schema)跟它对齐:
+        字段按名字配对, 我没有的字段跳过, 我多出的字段用默认值
+</code></pre>
+<p>注意"读时对齐"这步是 Avro 独有的.对比一下两者处理"新旧版本"的方式:</p>
+<pre><code class="language-text">Protobuf: 兼容性编码在字节里(tag 号), 写的那一刻就定死了
+Avro:     兼容性在读的那一刻现场协商(两份 schema 按字段名对齐)
+</code></pre>
+<p>这换来的好处:百万场战报归档,每条日志再省 5 个 tag 字节,而且整个文件只存一份 schema,摊到每条记录上约等于零.</p>
+<p>代价也直白:</p>
+<pre><code class="language-text">字节里没有任何自描述信息.
+schema 丢了, 数据文件就是一堆无法解读的死字节——
+连"这里有几个字段"都推不出来.
+schema 管理从可选项变成硬依赖.
+</code></pre>
+<p>小结:三份编码摆在一起,小战报 JSON 508 字节、Protobuf 289 字节、Avro 263 字节.省的每一步都有来路:JSON 什么都带,Protobuf 把字段名换成 tag,Avro 连 tag 都交给了 schema.</p>
+<h2 id="4三种格式怎么选">4.三种格式怎么选</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>JSON</th>
+<th>Protobuf</th>
+<th>Avro</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>小战报实测</td>
+<td>508 字节</td>
+<td>289 字节</td>
+<td>263 字节</td>
+</tr>
+<tr>
+<td>体积</td>
+<td>大</td>
+<td>小</td>
+<td>最小</td>
+</tr>
+<tr>
+<td>需要 schema</td>
+<td>不需要</td>
+<td>需要</td>
+<td>需要, 且读时解析</td>
+</tr>
+<tr>
+<td>可读性</td>
+<td>人可直接读</td>
+<td>不可读</td>
+<td>不可读</td>
+</tr>
+<tr>
+<td>典型场景</td>
+<td>对外 API、配置、调试</td>
+<td>服务间 RPC、客户端协议</td>
+<td>数据归档、数仓文件</td>
+</tr>
+</tbody>
+</table>
+<p>放到游戏场景里,我现在的理解是:</p>
+<pre><code class="language-text">客户端协议、服务间调用 -&gt; Protobuf(高频, 体积和解析都敏感)
+运营配置、调试接口     -&gt; JSON(低频, 可读性值钱)
+战报/日志长期归档      -&gt; Avro 类(海量, 每个字节都要钱)
+</code></pre>
+<p>有一个例外值得单独说:对外开放的 API.第三方没有你的 schema,JSON 的自描述就成了优点,这种场合别强求二进制.</p>
+<h2 id="5容易踩的坑">5.容易踩的坑</h2>
+<p>第一个坑:</p>
+<pre><code class="language-text">"二进制编码不可读, 排查问题怎么办."
+</code></pre>
+<p>保留一条 JSON 调试通道即可,主链路不必为可读性天天付费.</p>
+<p>第二个坑:</p>
+<pre><code class="language-text">以为 Protobuf 改字段是自由的.
+</code></pre>
+<p>加字段自由,改类型和复用 tag 号不自由.schema 纪律破了,兼容就没了.</p>
+<p>第三个坑:</p>
+<pre><code class="language-text">选了 Avro 但不建 schema 管理.
+</code></pre>
+<p>没有 schema registry 或文件内嵌 schema,半年后没人解得开旧数据.</p>
+<p>第四个坑:</p>
+<pre><code class="language-text">拿 Avro 存异构数据.
+</code></pre>
+<p>Avro 敢连 tag 都不要,靠的是一个前提:每条记录长得一样,字段按座位表顺序必然出现.结构一乱,前提就塌了.</p>
+<p>完整战报里就有现成的反例:1648 条日志大部分是 5 个字段,但 128 条 snapshot 额外带一个大 data 字段(整个单位列表).两种 schema 对付它的方式:</p>
+<pre><code class="language-text">Protobuf: optional SnapshotData data = 6;
+          没有 data 的 1520 条, 线上 0 字节, tag 干脆不出现.
+          "字段可以缺席"是 tag 机制白送的.
+
+Avro:     字段必须写成 union ["null", "SnapshotData"],
+          每条记录都要为"选了哪个分支"付一个标记字节,
+          且 schema 必须把所有形态提前枚举干净.
+</code></pre>
+<p>一个可选字段还好.但要是 43 种 process 各带一套自己形状的载荷,Avro 就得写一个 43 分支的巨型 union——省下的 tag 字节从 union 标记里加倍吐回去.更疼的是演化:</p>
+<pre><code class="language-text">加第 44 种载荷:
+Avro:     改写时 schema 的 union 分支 -&gt; 所有读方 schema 跟着对齐
+Protobuf: 发个新 tag 号, 旧代码按类型码跳过, 完事
+</code></pre>
+<p>所以选型表里给 Avro 的场景才只有归档和数仓:记录同构、批量写入、schema 集中管理.真要归档这份战报,现实做法也不是硬上 union,而是归档前先把结构压平成同构记录(比如 data 拆到单独的表)——让数据去凑 Avro 的前提,而不是让 schema 去迁就混乱.</p>
+<h2 id="6总结">6.总结</h2>
+<p>所以这篇先记住一句话:</p>
+<pre><code class="language-text">编码格式的取舍, 本质是"把多少信息放进编码里":
+JSON 全带, Protobuf 带编号, Avro 什么都不带、全靠 schema.
+</code></pre>
+<h2 id="出题">出题</h2>
+<ol>
+<li>本文的小战报 JSON 508 字节、Protobuf 289 字节.省下的 219 字节主要来自哪三招?</li>
+<li>实习生删了 Protobuf 里一个废弃字段,顺手把它的 tag 号给了新字段.上线后会出什么事?</li>
+<li>Avro 编码里连 tag 都没有,解码方拿到一串光字节,靠什么知道第 4 个值是 process?这带来什么硬依赖?</li>
+<li>你项目里"客户端协议、运营配置、战报归档"三类数据,各自该选哪种格式?</li>
+</ol>
+<h2 id="解答">解答</h2>
+<ol>
+<li>字段名换 tag 号("seq" 5 字节 -&gt; 08 一个字节)、枚举字符串换编号("end" 5 字节 -&gt; 02 一个字节)、数字从字符变 varint(416 三字符 -&gt; a0 03 两字节).外加引号冒号花括号这些结构字符全部消失.(对应第 1、2 节)</li>
+<li>老数据里原字段的值会被当成新字段解读,数据全乱.tag 号一旦用过就永远不能复用,删字段要把号保留成 reserved.(对应第 2 节)</li>
+<li>靠写时 schema——那张"座位表"记录了字段顺序和类型,解码方先取到它(从文件头或 schema registry),再和自己的读时 schema 按字段名对齐.代价是 schema 丢了数据就是死字节,schema 管理成为硬依赖.(对应第 3 节)</li>
+<li>客户端协议选 Protobuf(高频,体积和解析敏感),运营配置选 JSON(低频,可读性值钱),战报归档选 Avro 类(海量,编码最小).(对应第 4 节)</li>
+</ol>
+<p>下一篇把这套知识用到一个实战案例上:我们项目的战报,是怎么从 774KB 压到 32KB 的.</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a href="https://dataintensive.net/" target="_blank" rel="noopener nofollow">Designing Data-Intensive Applications</a> 第 4 章<br>
+JSON/Protobuf/Avro 的三层对比框架来自这一章. 引用它是为了支撑"编码里放多少信息"这条主线,以及 Avro 读时解析 schema 的机制.</li>
+<li><a href="https://protobuf.dev/programming-guides/encoding/" target="_blank" rel="noopener nofollow">Protobuf 官方编码文档</a><br>
+官方对 tag 号编码和兼容规则的权威说明. 引用它是为了支撑"tag 号不复用、类型变更受限"这些具体纪律,建议改 schema 前都翻一遍.</li>
+<li><a href="https://avro.apache.org/docs/" target="_blank" rel="noopener nofollow">Apache Avro 官方文档</a><br>
+Avro schema resolution 的权威定义在这里. 引用它是为了支撑"写时 schema + 读时 schema 在读方解析"这个核心机制.</li>
+</ul>
+<h2 id="附录08-和-a0-03-是怎么算出来的">附录:08 和 a0 03 是怎么算出来的</h2>
+<p>正文第 2 节说 <code>"seq":416</code> 编码后是 <code>08 a0 03</code> 三个字节.这里把两部分的计算过程摆开.</p>
+<h3 id="tag-字节08">tag 字节:08</h3>
+<p>Protobuf 编码时,每个值前面放一个 tag 字节,同时装两样信息——字段编号和值的类型:</p>
+<pre><code class="language-text">tag 字节 = (字段编号 &lt;&lt; 3) | 类型码
+
+常用类型码就两个:
+0 = varint(整数)
+2 = 带长度前缀的字节串(字符串、嵌套消息)
+</code></pre>
+<p>seq 在 schema 里是 1 号字段,值是整数:</p>
+<pre><code class="language-text">(1 &lt;&lt; 3) | 0 = 8 = 0x08
+
+按二进制看:
+0000 1___    前 5 位: 字段编号 1
+_____ 000    后 3 位: 类型码 0(varint)
+</code></pre>
+<p>拿这个公式验证正文里其余四个 tag,全都对得上:</p>
+<pre><code class="language-text">10 = (2&lt;&lt;3)|0  -&gt; 2 号字段 depth,   varint
+18 = (3&lt;&lt;3)|0  -&gt; 3 号字段 kind,    varint
+22 = (4&lt;&lt;3)|2  -&gt; 4 号字段 process, 字节串(后面跟长度 0b=11)
+2a = (5&lt;&lt;3)|2  -&gt; 5 号字段 text,    字节串(后面跟长度 0b=11)
+</code></pre>
+<p>解码方读到 <code>08</code>,右移 3 位得到字段编号 1,查 schema:"1 号是 seq"——字段名就是这么从线上消失的.</p>
+<h3 id="varint-字节a0-03">varint 字节:a0 03</h3>
+<p>先回答一个自然的疑问:416 的十六进制就是 <code>01 a0</code>,两个字节装得下,为什么不直接写进字节流?</p>
+<p>因为解码方不知道这个数占几个字节.假设直接写:</p>
+<pre><code class="language-text">字节流: ... 08 01 a0 10 07 ...
+
+解码方读完 tag 08, 知道"接下来是 seq 的值". 然后读几个字节?
+读 1 个: seq = 0x01 = 1          x
+读 2 个: seq = 0x01a0 = 416      对
+读 4 个: seq = 0x01a01007        x 把后面 depth 的字节都吞了
+</code></pre>
+<p>数字不像字符串有长度前缀,字节流里没有任何标记说"这个数到哪结束".要让边界可知,只有三条路:</p>
+<pre><code class="language-text">路 1: 定长.     所有整数一律 4 字节. 边界永远清楚,
+                但 depth=7 这种小数字也要花 4 字节.
+路 2: 长度前缀. 像字符串那样先写"占 2 字节". 每个数字多付 1 字节.
+路 3: varint.   从每个字节抽 1 位当"后面还有没有"的路标,
+                数字自己宣告自己的结束位置. 小数字 1 字节, 零额外开销.
+</code></pre>
+<p>Protobuf 选了路 3:牺牲每字节 1 位的容量(8 位只有 7 位装数据),换来"数字自带边界".这就是为什么 416 要重新切成 7 位一组——第 8 位被征用当路标了.规则:</p>
+<pre><code class="language-text">每个字节低 7 位装数据,最高位是续传标志:
+1 = 后面还有字节, 0 = 到此为止.
+低位组在前.
+</code></pre>
+<p>对 416 编码走一遍:</p>
+<pre><code class="language-text">416 的二进制:  1 1010 0000   (9 位, 一个字节装不下)
+
+从低位切 7 位一组:
+低 7 位:  010 0000  = 0x20
+剩余高位: 000 0011  = 0x03
+
+低位组在前, 第一组不是最后一组, 最高位置 1:
+0x20 | 0x80 = 0xa0
+第二组是最后一组, 最高位保持 0:
+0x03
+
+所以 416 -&gt; a0 03
+</code></pre>
+<p>再从解码方视角走一遍,看"路标"怎么起作用:</p>
+<pre><code class="language-text">读第 1 个字节 a0 = 1010 0000
+  最高位是 1 -&gt; 后面还有, 收下数据位 010 0000
+读第 2 个字节 03 = 0000 0011
+  最高位是 0 -&gt; 到此为止, 收下数据位 000 0011
+
+拼回去(低位组在前, 后读的放高位):
+000 0011 ++ 010 0000 = 1 1010 0000 = 416
+</code></pre>
+<p>全程不需要 schema、不需要长度,读到最高位为 0 自然停下——数字的边界写在数字自己身上.</p>
+<p>varint 的妙处是小数字只花一个字节:depth=7 就是 <code>07</code>,kind=2 就是 <code>02</code>,不用像定长 int32 那样永远占 4 个字节.战报里绝大多数数字都很小,这一招把"数字按字符存"的浪费全收了回来.</p>
+<h3 id="全部-33-个字节逐字段算一遍">全部 33 个字节逐字段算一遍</h3>
+<p>工具备齐(tag 公式 + varint 规则),把正文那条日志的五个字段全部推出来.</p>
+<p>字段 1:seq = 416</p>
+<pre><code class="language-text">tag:  (1 &lt;&lt; 3) | 0 = 0x08          (1 号字段, 类型码 0 = varint)
+值:   varint(416) = a0 03          (上一节刚算的)
+产出:  08 a0 03                     (3 字节)
+</code></pre>
+<p>字段 2:depth = 7</p>
+<pre><code class="language-text">tag:  (2 &lt;&lt; 3) | 0 = 0x10
+值:   7 &lt; 128, varint 一个字节搞定 -&gt; 07
+产出:  10 07                        (2 字节)
+</code></pre>
+<p>字段 3:kind = "end"</p>
+<pre><code class="language-text">schema 里枚举定了编号: start=0 note=1 end=2 trigger=3
+tag:  (3 &lt;&lt; 3) | 0 = 0x18           (enum 线上就是个 varint, 类型码 0)
+值:   end -&gt; 2 -&gt; 02
+产出:  18 02                        (2 字节)
+</code></pre>
+<p>字段 4:process = "calc.damage"</p>
+<pre><code class="language-text">tag:  (4 &lt;&lt; 3) | 2 = 0x22           (字符串, 类型码 2 = 长度+内容)
+长度:  "calc.damage" 共 11 字节 -&gt; varint(11) = 0b
+内容:  ASCII 原样上线:
+       63 61 6c 63 2e 64 61 6d 61 67 65
+       c  a  l  c  .  d  a  m  a  g  e
+产出:  22 0b 63 61 6c 63 2e 64 61 6d 61 67 65    (13 字节)
+</code></pre>
+<p>字段 5:text = "结果=31.2"</p>
+<pre><code class="language-text">tag:  (5 &lt;&lt; 3) | 2 = 0x2a
+内容:  UTF-8: 结=e7 bb 93  果=e6 9e 9c  "=31.2"=3d 33 31 2e 32
+       共 3+3+5 = 11 字节
+长度:  varint(11) = 0b
+产出:  2a 0b e7 bb 93 e6 9e 9c 3d 33 31 2e 32    (13 字节)
+</code></pre>
+<p>合计 3+2+2+13+13 = 33 字节,正文的数就是这么来的.</p>
+<p>顺带注意类型码的分工:seq 是 uint32、kind 是 enum,schema 类型不同,线上类型码却都是 0——类型码不是字段的数据类型,只负责说清"这个值到哪结束"(varint 读到最高位为 0 为止,字节串按长度跳).值到底解读成数字还是枚举,查 schema.这也是旧代码能跳过陌生新字段的底气:不认识 tag 没关系,按类型码就知道跳几个字节.</p>
+<h3 id="追问kind-不映射成-2直接按字符串传行不行">追问:kind 不映射成 2,直接按字符串传行不行</h3>
+<p>行.schema 里把 kind 声明成 string,它就走类型码 2:</p>
+<pre><code class="language-text">方案 A(enum):   Kind kind = 3;     -&gt;  18 02              (2 字节)
+方案 B(string): string kind = 3;   -&gt;  1a 03 65 6e 64     (5 字节)
+                                        ↑(3&lt;&lt;3)|2=0x1a, 长度3, "end"原文
+</code></pre>
+<p>(小心一个巧合:方案 A 里的 02 是枚举值 2,方案 B 里 1a 的低 3 位是类型码 2,两个 2 毫无关系.)</p>
+<p>两种都是合法的 Protobuf.但正文选 enum,三笔账:</p>
+<pre><code class="language-text">体积账: 5 字节 vs 2 字节, kind 在完整战报里出现 1648 次.
+        取值只有 4 种却按完整字符串传, 正是第 1 节骂 JSON 的原罪,
+        string 版等于把这毛病原样搬进 Protobuf.
+约束账: enum 编译期钉死取值, 代码里拼错编不过;
+        string 版 "End"、"ennd" 都能塞进去, 坏数据到消费端才炸.
+解析账: enum 直接 switch 整数; string 还得做一次比较或查表.
+</code></pre>
+<p>什么时候该用 string?取值集合不固定、schema 管不住的时候——正文里 process 有 43 种还在随版本增加,它就是 string;kind 的 4 种是引擎写死的生命周期状态,enum 合适.</p>
+<p>这个选择其实是全文主线缩小到单个字段上的变奏:enum vs string,就是"'end'-&gt;2 这张映射表放 schema 里还是放数据里"——和 JSON vs Protobuf 的分野一模一样.</p>
+<h3 id="对账79-字节和-33-字节的差在哪">对账:79 字节和 33 字节的差在哪</h3>
+<p>两个字符串的内容(11+11=22 字节)在 JSON 和 Protobuf 里一模一样,一个字节都省不了.省的全是"包装":</p>
+<pre><code class="language-text">JSON:     79 = 22(字符串内容) + 57(字段名/引号/冒号/逗号/花括号/数字字符)
+Protobuf: 33 = 22(字符串内容) + 11(5 个 tag + 2 个长度 + 4 个数字值字节)
+</code></pre>
+<p>包装从 57 字节缩到 11 字节.放大到 1648 条日志,就是正文里那笔"562.8KB 只装着 29.1KB 内容"的账.</p>
+<p>顺带一提:正文第 3 节 Avro 版里 416 编码成 <code>c0 06</code>,和这里的 <code>a0 03</code> 不一样,是因为 Avro 的整数多做了一步 ZigZag 变换(把 416 映射成 832 再走 varint),让负数也能编得短.感兴趣可以拿 832 用上面的规则验算一遍 <code>c0 06</code>.</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-09-01 23:31">2026-09-01 23:30</span>&nbsp;
+<a href="https://www.cnblogs.com/FatTiger4399">养肥胖虎</a>&nbsp;
+阅读(<span id="post_view_count">18</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22798096);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FFatTiger4399%2Fp%2F22798096&amp;targetId=22798096&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
