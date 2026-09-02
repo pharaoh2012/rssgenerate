@@ -1,0 +1,317 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/fs7744/p/22811546" title="发布于 2026-09-02 17:19">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">用 runtime-async 写一个支持 async/await 的轻量脚本引擎</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="起因一个好奇">起因：一个好奇</h2>
+<p>事情的开头很简单。</p>
+<p>给 .NET 做过动态脚本的人大概都碰到过同一堵墙：<strong>表达式树也好、<code>Reflection.Emit</code> 也好，都很难支持 <code>async</code>/<code>await</code></strong>。原因不在语法，而在 <code>await</code> 的实现方式——C# 编译器要为每个 <code>async</code> 方法生成一个状态机结构体，把方法体切成若干片，配上 <code>AsyncTaskMethodBuilder</code>、awaiter 字段、<code>MoveNext</code> 的巨型 switch。这套东西你在编译期用 Roslyn 生成很自然，但要在运行时用 IL 一条条 emit 出来，工作量和出错面都大到不合理。</p>
+<p>所以脚本引擎通常二选一：要么放弃 <code>await</code>，要么退回到解释执行（然后性能就没得谈了）。</p>
+<p>后来看到 runtime-async 这个提案，我的第一反应是——<strong>如果状态机改由 JIT 来生成，那"动态生成的代码"和"编译期生成的代码"不就站在同一起跑线上了吗？</strong> 换句话说：一个运行时 emit 出来的方法，能不能既真正支持 <code>await</code>，又保持接近手写 C# 的性能？</p>
+<p>这个好奇没法靠读文档回答，只能写代码试。于是有了 <a href="https://github.com/fs7744/V.Script" target="_blank" rel="noopener nofollow"><strong>V.Script</strong></a>：一个编译成委托、兼容 C# 类型系统的轻量脚本引擎。</p>
+<p>结论先放这里：<strong>能，但代价在你可能没预料到的地方</strong>。</p>
+<blockquote>
+<h3 id="关于版本先说清楚">关于版本，先说清楚</h3>
+<p>这个想法最早是冲着 .NET 10 去的——runtime-async 是在 .NET 10 周期里作为实验特性登场的。</p>
+<p>但<strong>本文所有代码和所有数字，都是在 .NET 11.0.100-preview.7 上跑出来的</strong>，仓库的 <a href="https://github.com/fs7744/V.Script/blob/main/global.json" target="_blank" rel="noopener nofollow"><code>global.json</code></a> 也精确 pin 了这个预览版号。我没有在 .NET 10 上完整跑过下面这套验证，所以不替它背书；如果你在 .NET 10 上试，请自己先跑一遍仓库里的 <a href="https://github.com/fs7744/V.Script/tree/main/tools/V.Script.RuntimeAsyncCheck" target="_blank" rel="noopener nofollow"><code>tools/V.Script.RuntimeAsyncCheck</code></a>。</p>
+<p>另外 <code>AsyncHelpers</code> 目前带着 <code>SYSLIB5007</code> 实验性标记，签名随时可能变。</p>
+</blockquote>
+<hr>
+<h2 id="runtime-async-是什么一处-il-层面的差异">runtime-async 是什么：一处 IL 层面的差异</h2>
+<p>先看传统的 <code>async</code> 方法在 IL 里长什么样。这是 <code>async Task&lt;int&gt; F() =&gt; await GetAsync();</code> 编译出来的东西的骨架：</p>
+<pre><code>// 编译器额外生成的类型
+.class nested private sealed beforefieldinit '&lt;F&gt;d__0'
+       extends [System.Runtime]System.ValueType
+       implements [System.Runtime]IAsyncStateMachine
+{
+    .field public int32 '&lt;&gt;1__state'
+    .field public valuetype AsyncTaskMethodBuilder`1&lt;int32&gt; '&lt;&gt;t__builder'
+    .field private valuetype TaskAwaiter`1&lt;int32&gt; '&lt;&gt;u__1'
+
+    .method private hidebysig newslot virtual final
+            instance void MoveNext() cil managed
+    {
+        // 一个按 &lt;&gt;1__state 分派的大 switch，
+        // 把原方法体切成若干段，每段之间保存/恢复局部变量
+    }
+}
+
+// 原方法只剩下引导代码
+.method public hidebysig static
+        class Task`1&lt;int32&gt; F() cil managed
+{
+    .custom instance void AsyncStateMachineAttribute::.ctor(class Type)
+    // 构造状态机、Start、返回 builder.Task
+}
+</code></pre>
+<p>要用 <code>Reflection.Emit</code> 复刻这一坨：你得定义一个额外的类型、实现 <code>IAsyncStateMachine</code>、自己做局部变量提升、自己切分基本块、自己写状态分派。这不是"麻烦"，这是重新实现一遍编译器里最难的一个 lowering。</p>
+<p><strong>runtime-async 把这件事整个搬走了。</strong> 同样的语义，IL 变成这样：</p>
+<pre><code>.method public hidebysig static
+        class Task`1&lt;int32&gt; Run(class ScriptHost, !!TGlobals) cil managed async
+//                                                                      ^^^^^
+//                                    MethodImplAttributes.Async == 0x2000
+{
+    // 直线 IL，没有状态机，没有额外类型
+    call     class Task`1&lt;int32&gt; Service::GetAsync()
+    call     !!0 AsyncHelpers::Await&lt;int32&gt;(class Task`1&lt;!!0&gt;)   // ← 挂起点
+    ret                                                          // ← 注意这里
+}
+</code></pre>
+<p>三处关键差异：</p>
+<ol>
+<li><strong>方法上多了一个 <code>async</code> 实现标志</strong>（<code>MethodImplAttributes.Async</code>，值 <code>0x2000</code>）。它告诉 JIT：这个方法体需要被改写成状态机。</li>
+<li><strong><code>await</code> 变成一次普通的 <code>call</code></strong>，调用 <code>System.Runtime.CompilerServices.AsyncHelpers.Await&lt;T&gt;</code>。JIT 认得这个调用，把它变成真正的挂起点。</li>
+<li><strong>签名声明返回 <code>Task&lt;int&gt;</code>，但 IL 里 <code>ret</code> 弹出的是 <code>int</code></strong>。包装成 <code>Task</code> 是运行时的事，emit 方不用管。</li>
+</ol>
+<p>对一个代码生成器来说，这个差异是决定性的。在 V.Script 里，整个 <code>await</code> 的发射逻辑就是这么长：</p>
+<p><a href="https://github.com/fs7744/V.Script/blob/main/src/V.Script/Emit/IlEmitter.Expressions.cs" target="_blank" rel="noopener nofollow"><code>src/V.Script/Emit/IlEmitter.Expressions.cs</code></a>：</p>
+<pre><code class="language-csharp">/// &lt;summary&gt;
+/// A suspension point. The JIT turns this call into the state machine, so the whole of
+/// &lt;c&gt;await&lt;/c&gt; support on the emit side is one operand plus one call.
+/// &lt;/summary&gt;
+private void EmitAwait(BoundAwait await)
+{
+    EmitExpression(await.Operand);
+    _il.Emit(OpCodes.Call, await.AwaitHelper);
+}
+</code></pre>
+<p><strong>两行。</strong> 绑定器那边也只是根据操作数类型在 <code>Task</code> / <code>Task&lt;T&gt;</code> / <code>ValueTask</code> / <code>ValueTask&lt;T&gt;</code> 四个重载里挑一个。原本"重新实现一遍 lowering"的工作量，压缩成了"选个重载再 emit 一条 call"。</p>
+<hr>
+<h2 id="但这里有一个坑dynamicmethod-用不了">但这里有一个坑：<code>DynamicMethod</code> 用不了</h2>
+<p>好消息说完了，说坏消息。</p>
+<p>动态生成方法最轻的载体是 <code>DynamicMethod</code>：不需要程序集、不需要类型，委托没人引用时自动回收。V.Script 的同步脚本就用它——一个脚本大约 1.3 KB、几微秒。</p>
+<p>问题是：<strong><code>DynamicMethod</code> 没有 <code>SetImplementationFlags</code></strong>。</p>
+<p><a href="https://github.com/fs7744/V.Script/blob/main/tools/V.Script.RuntimeAsyncCheck/Program.cs" target="_blank" rel="noopener nofollow"><code>tools/V.Script.RuntimeAsyncCheck/Program.cs</code></a>：</p>
+<pre><code class="language-csharp">Check("DynamicMethod 无法标记 Async",
+    typeof(DynamicMethod).GetMethod("SetImplementationFlags") is null,
+    "这一个 API 缺口决定了异步脚本必须用独占程序集");
+</code></pre>
+<p>上面这行来自仓库里的 <a href="https://github.com/fs7744/V.Script/tree/main/tools/V.Script.RuntimeAsyncCheck" target="_blank" rel="noopener nofollow"><code>tools/V.Script.RuntimeAsyncCheck</code></a>——一个专门用来验证 runtime-async 前提条件的小程序。这一个 API 缺口，直接决定了整个异步方案的形状：<strong>异步脚本没法用 <code>DynamicMethod</code>，只能退到 <code>AssemblyBuilder</code> + <code>MethodBuilder</code></strong>。</p>
+<p>于是 V.Script 有了两个载体：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>同步脚本</th>
+<th>异步脚本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>载体</td>
+<td><code>DynamicMethod</code></td>
+<td>独占的 collectible 程序集</td>
+</tr>
+<tr>
+<td>内存</td>
+<td>~1.3 KB</td>
+<td>~31 KB</td>
+</tr>
+<tr>
+<td>回收</td>
+<td>委托没人引用即回收</td>
+<td>需要显式 <code>Dispose</code>，卸载整个程序集</td>
+</tr>
+<tr>
+<td>能否标记 <code>Async</code></td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<p>这个"一个 API 缺口 → 载体必须换 → 成本涨 24 倍"的因果链，是这个项目里最贵的一课，后面性能一节还会再见到它。</p>
+<p>顺带一提，<code>async</code> lambda 也踩同一个坑：lambda 平时编译成 <code>DynamicMethod</code>，一旦写了 <code>async</code>，它就必须搬进程序集。所以<strong>同步脚本里出现 <code>async</code> lambda，也会让这个脚本多出一个程序集</strong>（脚本体本身仍是 <code>DynamicMethod</code>，只有这些 lambda 搬家）。</p>
+<hr>
+<h2 id="长什么样">长什么样</h2>
+<pre><code class="language-csharp">using var engine = new ScriptEngine(ScriptOptions.Default);
+
+// 同步：编译成委托，DynamicMethod 载体
+using var rule = engine.Compile&lt;Order, bool&gt;(
+    "Total &gt; 1000 &amp;&amp; Customer.IsVip");
+
+bool ok = rule.Run(order);
+
+// 异步：真正的 await，独占程序集载体
+using var flow = engine.CompileAsync&lt;Context, int&gt;("""
+    var total = 0;
+    for (var i = 0; i &lt; Ids.Length; i++)
+        total += await Service.GetAsync(Ids[i]);
+    return total;
+    """);
+
+int result = await flow.RunAsync(context);
+</code></pre>
+<p><code>Compile</code> 和 <code>CompileAsync</code> 是<strong>两个不同的入口</strong>，不是一个方法加个开关——因为它们背后是两个载体、两套成本模型，让调用方知道自己在付什么代价比"透明"更重要。</p>
+<hr>
+<h2 id="性能实测">性能实测</h2>
+<p>环境：Windows 11 x64，.NET 11.0.100-preview.7，BenchmarkDotNet 短任务、进程内 toolchain。</p>
+<h3 id="同步执行与手写-c-持平">同步执行：与手写 C# 持平</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th style="text-align: right">手写 C#</th>
+<th style="text-align: right">脚本</th>
+<th style="text-align: right">分配</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>decimal 公式</td>
+<td style="text-align: right">20.0 ns</td>
+<td style="text-align: right">21.0 ns</td>
+<td style="text-align: right">0 B</td>
+</tr>
+<tr>
+<td>bool 规则</td>
+<td style="text-align: right">5.2 ns</td>
+<td style="text-align: right">8.7 ns</td>
+<td style="text-align: right">0 B</td>
+</tr>
+<tr>
+<td>1000 次循环</td>
+<td style="text-align: right">3100 ns</td>
+<td style="text-align: right">3077 ns</td>
+<td style="text-align: right">0 B</td>
+</tr>
+</tbody>
+</table>
+<p>这个结果没什么好惊讶的：两侧都是 JIT 编译的 IL，持平才是预期。1000 次循环那行脚本略快是噪声，不必当真。</p>
+<h3 id="异步执行多一次委托调用的量级">异步执行：多一次委托调用的量级</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th style="text-align: right">手写 C#</th>
+<th style="text-align: right">脚本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单次 await</td>
+<td style="text-align: right">12.4 ns</td>
+<td style="text-align: right">25.9 ns</td>
+</tr>
+<tr>
+<td>循环内 10 次 await</td>
+<td style="text-align: right">12.0 ns</td>
+<td style="text-align: right">24.6 ns</td>
+</tr>
+</tbody>
+</table>
+<p><strong>这是本文最想给出的那个数字。</strong> 一个运行时 emit 出来的异步方法，单次 <code>await</code> 是 25.9 ns——同一量级，不是"慢一个数量级"。</p>
+<p>两个必须说明的点，否则这张表会骗人：</p>
+<ul>
+<li><strong>基线也开了 <code>runtime-async=on</code> 编译。</strong> 如果拿脚本的 runtime-async 去比手写 C# 的经典状态机，比的是两种 lowering，不是这个引擎做得好不好。</li>
+<li><strong>被 await 的 Task 都是已完成的</strong>，量的是 runtime-async 的快路径，不含调度开销。真挂起的场景由调度器主导，两边差异会被淹没。</li>
+</ul>
+<p>还有一个数字值得单独讲：<strong>在移除超时机制之前，同一场景要 241 ns。</strong> 早期版本给每次异步调用都挂了 linked <code>CancellationTokenSource</code> + 定时器，光这套"安全设施"就吃掉了 90% 的时间。把它整个删掉、把取消交还给宿主之后才有上面的 25.9 ns。<strong>异步的开销往往不在 <code>await</code> 本身，而在你顺手加在它周围的东西。</strong></p>
+<h3 id="编译代价全在这里">编译：代价全在这里</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th style="text-align: right">耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同步，小脚本</td>
+<td style="text-align: right">8.6 µs</td>
+</tr>
+<tr>
+<td>同步，中等（5 条语句）</td>
+<td style="text-align: right">31.0 µs</td>
+</tr>
+<tr>
+<td><strong>异步，小脚本</strong></td>
+<td style="text-align: right"><strong>346 µs</strong></td>
+</tr>
+<tr>
+<td><strong>异步，含 await 的循环</strong></td>
+<td style="text-align: right"><strong>629 µs</strong></td>
+</tr>
+<tr>
+<td>缓存命中</td>
+<td style="text-align: right">54.5 ns</td>
+</tr>
+</tbody>
+</table>
+<p><strong>异步比同步贵约 40 倍</strong>，而且这 40 倍跟 runtime-async 一点关系都没有——它全部来自 collectible 程序集的创建与卸载。也就是说：</p>
+<blockquote>
+<p><code>DynamicMethod</code> 不能标记 <code>Async</code> 这一个 API 缺口，全部代价就体现在这张表上。</p>
+</blockquote>
+<p>如果哪天 <code>DynamicMethod</code> 补上 <code>SetImplementationFlags</code>，异步脚本的编译开销会直接掉回同步那一档，31 KB 的常驻内存也一起消失。</p>
+<hr>
+<h2 id="局限请务必读完这一节">局限：请务必读完这一节</h2>
+<p>前面都是好消息，这一节是买单的地方。</p>
+<h3 id="1-await-不能出现在-catch--finally-里这会让进程直接崩溃">1. <code>await</code> 不能出现在 <code>catch</code> / <code>finally</code> 里——<strong>这会让进程直接崩溃</strong></h3>
+<p>这是最严重的一条。当前运行时对<strong>处理器块内的挂起点</strong>不提供保护：不是抛异常，不是返回错误，是<strong>整个进程带着 <code>0xC0000005</code> 退出</strong>。</p>
+<p>验证工具里这条 case 必须开子进程来跑，因为它没法在本进程里安全地测：</p>
+<pre><code>OK  catch 内真正挂起的 await 会终止进程（预期如此）
+    子进程退出码 -1073741819；为 0 说明运行时行为已改变，需重新评估 VS3004
+</code></pre>
+<p>所以 V.Script 的绑定器<strong>在编译期无条件拒绝</strong>这种写法（诊断码 <code>VS3004</code>），不提供任何开关。</p>
+<p>这里有个反直觉的细节值得单独说：<code>AsyncHelpers.Await</code> 对<strong>已完成的 Task 走快路径，根本不会到达挂起点</strong>。所以你在 <code>catch</code> 里写 <code>await SomethingAlreadyCompleted()</code> 很可能跑得好好的——<strong>直到某天那个 Task 真的挂起，然后线上进程没了</strong>。正因为它"偶尔能跑通"，编译期拒绝才更有必要，而不是更没必要。</p>
+<h3 id="2-异步脚本-31-kb-常驻且必须显式释放">2. 异步脚本 31 KB 常驻，且必须显式释放</h3>
+<p>每个异步脚本一个 collectible 程序集。一万个异步脚本 ≈ 310 MB，而且只有在你 <code>Dispose</code> 掉脚本、且没有任何委托还引用着它时才会卸载。</p>
+<p>热更新场景要按代次换新，不能无限编译新版本。同步脚本没有这个问题。</p>
+<h3 id="3-生成的程序集失去-skipvisibility">3. 生成的程序集失去 <code>skipVisibility</code></h3>
+<p><code>DynamicMethod</code> 可以用 <code>skipVisibility: true</code> 访问 globals 类型的非公开成员;独立程序集不行。</p>
+<p>所以<strong>异步脚本（以及带 <code>async</code> lambda 的同步脚本）只能访问公开成员</strong>。给 lambda 加个 <code>async</code> 会改变它的可见性权限——这个副作用不明显，但确实存在。</p>
+<h3 id="4-预览版依赖">4. 预览版依赖</h3>
+<ul>
+<li><code>AsyncHelpers</code> 带 <code>SYSLIB5007</code> 实验性标记，签名可能变。V.Script 把使用点全部收拢在 <a href="https://github.com/fs7744/V.Script/blob/main/src/V.Script/Binding/AwaitHelpers.cs" target="_blank" rel="noopener nofollow"><code>Binding/AwaitHelpers.cs</code></a> 一个文件里，就是为了将来好改。</li>
+<li><a href="https://github.com/fs7744/V.Script/blob/main/global.json" target="_blank" rel="noopener nofollow"><code>global.json</code></a> 精确 pin 了预览版号（<code>rollForward</code> 没法从正式版号回退到预览版），GA 后需要改。</li>
+<li><strong>GA 后请重跑 <a href="https://github.com/fs7744/V.Script/tree/main/tools/V.Script.RuntimeAsyncCheck" target="_blank" rel="noopener nofollow"><code>tools/V.Script.RuntimeAsyncCheck</code></a></strong>，整个异步设计都建立在它那 9 条结论上。</li>
+</ul>
+<h3 id="5-与载体绑定的其它缺口">5. 与载体绑定的其它缺口</h3>
+<p>这些不是待办项，是载体选择的直接后果：</p>
+<ul>
+<li><strong>无调试信息</strong>：<code>DynamicMethod</code> 和动态程序集都出不了 PDB，调试器进不去脚本。</li>
+<li><strong>不支持 NativeAOT</strong>：异步载体依赖 <code>Reflection.Emit</code>。</li>
+<li><strong>不支持类型声明与特性</strong>：脚本编译成的是一个方法，不是一个编译单元;同步载体连承载新类型的模块都没有。</li>
+</ul>
+<h3 id="6-语言层面还没做的">6. 语言层面还没做的</h3>
+<p><code>yield</code> 迭代器（runtime-async 只管 <code>await</code>，迭代器仍需自己写状态机）、<code>await foreach</code> / <code>await using</code>、泛型局部函数、匿名类型、<code>ref</code> 局部与返回、<code>Span&lt;T&gt;</code> / <code>stackalloc</code>、<code>dynamic</code>。</p>
+<p>完整清单在仓库 <a href="https://github.com/fs7744/V.Script/blob/main/docs/design.md" target="_blank" rel="noopener nofollow"><code>docs/design.md</code></a> 的「暂不支持」一节，每一项都写了为什么没做。</p>
+<hr>
+<h2 id="结语">结语</h2>
+<p>回到最初那个好奇：<strong>动态生成的代码能不能借 runtime-async 拿到好性能？</strong></p>
+<p>答案是能。单次 <code>await</code> 25.9 ns vs 手写 12.4 ns，同步执行与手写 C# 持平，而发射端的 <code>await</code> 支持只有两行代码。runtime-async 确实把"生成异步代码"从一件需要重写编译器 lowering 的事，变成了一件发射一条 <code>call</code> 的事。</p>
+<p>但真正的收获不在这个结论，而在过程里那几处<strong>意料之外的成本</strong>：</p>
+<ul>
+<li>最贵的东西不是 runtime-async，是 <code>DynamicMethod</code> 少了一个 <code>SetImplementationFlags</code>——一个 API 缺口换来 40 倍编译开销和 31 KB 常驻内存。</li>
+<li>第二贵的东西是我自己加的超时机制，占了 90% 的运行时开销，删掉才看见真实数字。</li>
+<li>最危险的东西是 <code>catch</code> 里的 <code>await</code>——它会在测试里"看起来能跑"，然后在生产里带走整个进程。</li>
+</ul>
+<p>这三条都不是读文档能读出来的。</p>
+<p>代码、完整设计文档、性能基准和那个验证工具都在：</p>
+<p><strong><a href="https://github.com/fs7744/V.Script" target="_blank" rel="noopener nofollow">https://github.com/fs7744/V.Script</a></strong></p>
+<p>如果你也在 .NET 上做代码生成，<a href="https://github.com/fs7744/V.Script/tree/main/tools/V.Script.RuntimeAsyncCheck" target="_blank" rel="noopener nofollow"><code>tools/V.Script.RuntimeAsyncCheck</code></a> 可能是最值得先跑一遍的东西——它会告诉你，在你手上这个运行时版本上，哪些前提还成立。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-02 17:20">2026-09-02 17:19</span>&nbsp;
+<a href="https://www.cnblogs.com/fs7744">victor.x.qu</a>&nbsp;
+阅读(<span id="post_view_count">61</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22811546);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Ffs7744%2Fp%2F22811546&amp;targetId=22811546&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
