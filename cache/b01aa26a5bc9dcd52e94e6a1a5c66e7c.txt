@@ -1,0 +1,114 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/znlgis/p/22827886" title="发布于 2026-09-03 16:46">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">让 AI Agent 读写 Office 文档、看懂大图：几个绕开模型硬约束的工程技巧</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一模型读不了二进制文件用格式桥接消化掉">一、模型读不了二进制文件？用「格式桥接」消化掉</h2>
+<p>很多 Agent 的 <code>read</code> 工具会<strong>直接拒绝二进制文件</strong>，导致 <code>.docx</code> / <code>.xlsx</code> 这类常见文档无法被模型读取。一个务实的解法是<strong>不引入重型依赖（MS Office / MCP 服务器），而是用纯 Python 脚本做格式桥接</strong>：</p>
+<pre><code>.docx  →  Markdown   (docx2md.py)
+.xlsx  →  CSV        (xlsx2csv.py，每 sheet 一个文件)
+Markdown → .docx     (md2docx.py)
+CSV     → .xlsx      (csv2xlsx.py，每个 CSV 一个 sheet)
+</code></pre>
+<p>关键设计取舍：</p>
+<ul>
+<li><strong>读取方向</strong>：先转成纯文本/Markdown，让模型用普通 <code>read</code> 工具读，绕开二进制限制。</li>
+<li><strong>写入方向</strong>：让模型先产出 <code>.md</code> / <code>.csv</code>，再脚本转回 Office 格式。</li>
+<li><strong>诚实标注有损</strong>：这类转换是 lossy 的——复杂样式、内嵌图片、宏都不保留；编号列表会被 Markdown 渲染器重新编号而非保留原值；CSV 转 xlsx 时 <code>007</code> 会丢前导零、16 位以上 ID 会撞 Excel 的 15 位精度。<strong>需要高保真往返时，应明确指向更重的方案（如 MCP 文档服务器）。</strong></li>
+<li><strong>遗留格式兜底</strong>：<code>.doc</code> / <code>.xls</code> 老格式脚本不处理，但可提供通过 Word/Excel COM 先转 <code>.docx</code>/<code>.xlsx</code> 的兜底路径。</li>
+</ul>
+<p>核心思路：<strong>把「模型读不了二进制」这个硬约束，用一层薄薄的转换脚本消化掉</strong>，而不是让 Agent 每次去猜怎么处理。</p>
+<h2 id="二视觉模型的两个硬限制与切图解法">二、视觉模型的两个硬限制与「切图」解法</h2>
+<p>处理视觉输入时，很多模型有两个<strong>硬性限制</strong>：</p>
+<ol>
+<li><strong>拒绝 PDF 输入</strong>——只接受 JPEG/PNG/GIF/WebP，PDF 必须先栅格化成 PNG。</li>
+<li><strong>每张图会被降采样到约 800×800 的像素预算</strong>——大图里的小字会糊到认不出。</li>
+</ol>
+<p>第二个限制尤其反直觉：很多框架本身会做自动 resize（如 2000×2000 / 5MiB），所以<strong>上传超大图不是真问题，真正的坑是模型内部的 800×800 降采样</strong>。</p>
+<p>解法是<strong>切图（tiling）</strong>：把大图切成 N×N 的带重叠网格，让<strong>每一块 tile 各自拥有一个 800×800 的预算</strong>：</p>
+<pre><code>PDF → PNG 页面      (pdf2png.py，--zoom 控制分辨率)
+大图 → 重叠 tiles   (tile.py，--grid NxN，--overlap 0.10)
+</code></pre>
+<p>配套的决策表很清晰：</p>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>小图（长边 &lt; ~1600px）</td>
+<td>直接发，无需预处理</td>
+</tr>
+<tr>
+<td>大图 / 密集小字</td>
+<td>切成 2×2（或更细）网格</td>
+</tr>
+<tr>
+<td>网格大小</td>
+<td><code>N = ceil(长边 / 800)</code>，保证每块 ≤ ~800px</td>
+</tr>
+<tr>
+<td>PDF</td>
+<td>先栅格化成 PNG，页面大再切</td>
+</tr>
+</tbody>
+</table>
+<p>10% 的重叠是为了防止文字正好跨在切割线上被截断。关键洞察是：<strong>「切图」解决的是可读性，不是文件大小</strong>——这是很多人会搞反的地方。</p>
+<h2 id="三按模型成本差异化压缩上下文">三、按模型成本差异化压缩上下文</h2>
+<p>当系统里有多个成本差异很大的模型时，上下文压缩策略可以<strong>按模型差异化</strong>。逻辑很直接：</p>
+<blockquote>
+<p>贵的模型（如 pro）输入成本可能是便宜模型（如 flash）的 <strong>3 倍</strong>，所以贵模型的会话应该<strong>更早压缩</strong>，缩短昂贵的上下文窗口。</p>
+</blockquote>
+<p>实现上，压缩工具支持按 <code>providerID/modelID</code> 精确覆盖阈值：</p>
+<pre><code class="language-jsonc">"modelMaxLimits": { "deepseek/deepseek-v4-pro": 55000 },
+"modelMinLimits": { "deepseek/deepseek-v4-pro": 26000 }
+</code></pre>
+<p>贵的模型在 55K 就触发压缩（全局默认 77K），便宜的保持 77K/38K 基线。<strong>这是把「成本」这个维度显式编码进上下文管理策略</strong>——不是一刀切，而是让贵的模型更早瘦身。</p>
+<h2 id="四配套的细节打磨">四、配套的细节打磨</h2>
+<p>同一批工作里还有几处值得记录的工程细节：</p>
+<ul>
+<li><strong>图片 token 成本上界</strong>：给视觉模型加图片附件配置——超过一定尺寸/字节数先自动 resize。因为模型内部会降采样，超大上传只是浪费 base64 字节。</li>
+<li><strong>共享词汇表（glossary）</strong>：为「模块 / 接口 / 深度 / 接缝」这类架构术语建立精确的共享词汇，让设计讨论更具体，而不是各说各话。</li>
+<li><strong>调试纪律</strong>：先建一个「能变红」的反馈回路再理论化——没有能复现失败的命令，任何假设都不值得验证；调试日志用 <code>[DEBUG-&lt;hex&gt;]</code> 标签，方便一次 grep 清理。</li>
+<li><strong>易变区纪律</strong>：时间戳、随机 ID、动态文件列表这类易变内容要放在 payload 尾部，避免破坏 prompt-cache 的前缀命中。</li>
+<li><strong>验证预算</strong>：明确「能通过 typecheck」不等于行为变更的 QA，要为变更预先设定最小非重复的验证证据。</li>
+</ul>
+<h2 id="小结">小结</h2>
+<p>这些技巧背后有几条可复用的方法论：</p>
+<ol>
+<li><strong>模型硬约束要用工程手段消化，而不是让 Agent 硬扛</strong>——二进制文档用转换脚本桥接，800×800 降采样用切图破解。</li>
+<li><strong>成本要显式编码进策略</strong>——按模型差异化压缩阈值，贵的模型更早瘦身。</li>
+<li><strong>诚实标注能力边界</strong>——有损转换就明说，需要高保真时指向更重的方案。</li>
+<li><strong>先建反馈回路再调试</strong>——没有能复现失败的「红灯」命令，就不要开始猜根因。</li>
+</ol>
+<hr>
+<p>项目地址：<a href="https://github.com/znlgis/my-opencode-deepseek-config" target="_blank" rel="noopener nofollow">https://github.com/znlgis/my-opencode-deepseek-config</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-03 16:47">2026-09-03 16:46</span>&nbsp;
+<a href="https://www.cnblogs.com/znlgis">我才是银古</a>&nbsp;
+阅读(<span id="post_view_count">114</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22827886);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fznlgis%2Fp%2F22827886&amp;targetId=22827886&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
