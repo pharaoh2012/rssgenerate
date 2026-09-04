@@ -1,0 +1,167 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/lgg20/p/22842603" title="发布于 2026-09-04 15:28">
+    
+
+    <span role="heading" aria-level="2">生产删除 大量数据引起的锁表问题</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p>单条sql去删除大量数据，会导致锁表，事务提交失败，一直执行10多个小时也没成功：<br>DELETE FROM AIMAS_ENGAGEMENT_STATS_STAGING&nbsp; WHERE SOURCE_CREATE_TIME &lt; CURDATE()</p>
+<p><img src="https://img2024.cnblogs.com/blog/1703795/202609/1703795-20260904152701203-1064939640.png" alt="image"><br><br>改造成服务去调存储过程，分批量删数据：</p>
+<pre class="highlighter-prismjs prismjs-lines-highlighted language-java" tabindex="0"><code>-- drop procedure proc_delete_dummy_comm_dtl;
+CREATE PROCEDURE `proc_delete_dummy_comm_dtl`()
+BEGIN
+    -- 1. 定义变量
+    DECLARE done INT DEFAULT 0;
+    DECLARE v_row_id varchar(15);
+    DECLARE v_count INT DEFAULT 0;
+    DECLARE v_total_count INT DEFAULT 0;
+    DECLARE v_batch_size INT DEFAULT 200; -- 每 100 条提交一次
+    DECLARE v_mgr_queue_count BIGINT DEFAULT 0;
+    DECLARE v_mgr_sleep_seconds INT DEFAULT 10;
+    DECLARE v_mgr_threshold BIGINT DEFAULT 10000;
+    DECLARE v_mgr_sleep_count INT DEFAULT 0;
+    DECLARE has_error INT DEFAULT 0;
+    
+    -- 定义游标 (去掉了 LIMIT 7，以便处理所有数据，如需限制可加回)
+    DECLARE cur CURSOR FOR 
+select a.row_id from CUSTOMER_COMM_DTL a 
+inner join CUSTOMER_COMMUNICATION b on a.par_row_id = b.COMMUNICATION_ID
+inner join SUPPORT.DUMMY_MARKETING_OFFERS tmp on b.DCP_ID = tmp.CAMP_TRTM_ID
+where tmp.END_DT&lt;date_add(CURRENT_DATE(),interval -1 month);
+    
+    -- 定义 Handler
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+    
+
+    -- 2. 创建临时表存储当前批次的 PK
+    CREATE TEMPORARY TABLE IF NOT EXISTS tmp_batch_pks (
+        pk_val varchar(15) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci PRIMARY KEY
+    ) ENGINE=MEMORY; -- 使用 MEMORY 引擎提高速度
+
+    -- 3. 打开游标
+    OPEN cur;
+
+    read_loop: LOOP
+        FETCH cur INTO v_row_id;
+        
+        IF done THEN
+            LEAVE read_loop;
+        END IF;
+
+        -- 将 PK 加入临时表
+        INSERT ignore INTO tmp_batch_pks (pk_val) VALUES (v_row_id);
+        SET v_count = v_count + 1;
+        SET v_total_count = v_total_count + 1;
+
+        -- 【关键逻辑】当达到批次大小时，执行事务
+        IF v_count &gt;= v_batch_size THEN
+            START TRANSACTION;
+            -- A. 执行delete(从原表关联临时表)
+                    DELETE t 
+FROM CUSTOMER_COMM_DTL t
+INNER JOIN tmp_batch_pks tmp ON t.row_id = tmp.pk_val;
+           
+            -- C. 提交事务
+            IF has_error = 0 THEN
+                COMMIT;
+
+                -- MGR事务延时检查
+                BEGIN
+                    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;
+                    SELECT SUM(COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE) INTO v_mgr_queue_count
+                    FROM performance_schema.replication_group_member_stats
+                    WHERE CHANNEL_NAME = 'group_replication_applier';
+                    IF v_mgr_queue_count &gt; v_mgr_threshold THEN
+                        SET v_mgr_sleep_count = v_mgr_sleep_count + 1;
+                        SELECT CONCAT('[MGR] Transaction queue delay detected: ', v_mgr_queue_count, 
+                                      ' &gt; ', v_mgr_threshold, ', sleeping ', v_mgr_sleep_seconds, 's... (sleep #', v_mgr_sleep_count, ')') AS MgrStatus;
+                        DO SLEEP(v_mgr_sleep_seconds);
+                    END IF;
+                END;
+
+                -- 可选：输出进度日志
+                SELECT CONCAT('Batch committed: ', v_count,',Total committed: ',v_total_count) AS Info;
+            ELSE
+                -- 发生错误，Handler 已回滚，这里可以选择退出循环或继续
+                -- 为了数据安全，建议遇到错误直接退出
+                CLOSE cur;
+                DROP TEMPORARY TABLE IF EXISTS tmp_batch_pks;
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Error occurred during batch processing. Transaction rolled back.';
+            END IF;
+           
+            -- D. 清空临时表并重置计数器
+            TRUNCATE TABLE tmp_batch_pks;
+            SET v_count = 0;
+        END IF;
+    END LOOP;
+
+    CLOSE cur;
+
+    -- 4. 【收尾】处理最后不足 100 条的剩余数据
+    IF v_count &gt; 0 THEN
+        START TRANSACTION;
+        
+        -- delete
+          DELETE t 
+FROM CUSTOMER_COMM_DTL t
+INNER JOIN tmp_batch_pks tmp ON t.row_id = tmp.pk_val;
+
+
+        -- 提交
+        IF has_error = 0 THEN
+            COMMIT;
+
+            -- MGR事务延时检查
+            BEGIN
+                DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;
+                SELECT SUM(COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE) INTO v_mgr_queue_count
+                FROM performance_schema.replication_group_member_stats
+                WHERE CHANNEL_NAME = 'group_replication_applier';
+                IF v_mgr_queue_count &gt; v_mgr_threshold THEN
+                    SET v_mgr_sleep_count = v_mgr_sleep_count + 1;
+                    SELECT CONCAT('[MGR] Transaction queue delay detected: ', v_mgr_queue_count, 
+                                  ' &gt; ', v_mgr_threshold, ', sleeping ', v_mgr_sleep_seconds, 's... (sleep #', v_mgr_sleep_count, ')') AS MgrStatus;
+                    DO SLEEP(v_mgr_sleep_seconds);
+                END IF;
+            END;
+
+            SELECT CONCAT('Final batch committed: ', v_count, ' rows.','Total committed: ',v_total_count,' rows.') AS Status;
+        ELSE
+            ROLLBACK;
+            SELECT 'Final batch failed and rolled back.' AS Status;
+       END IF;
+    ELSE
+        IF v_start IS NOT NULL THEN -- 避免空跑时输出
+             SELECT 'Processing completed. No remaining records.' AS Status;
+        END IF;
+    END IF;
+
+    -- 5. 清理临时表
+    DROP TEMPORARY TABLE IF EXISTS tmp_batch_pks;
+END;</code></pre>
+<p>&nbsp;</p>
+
+</div>
+<div id="MySignature" role="contentinfo">
+    学海无涯 代码作伴
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-04 15:28">2026-09-04 15:28</span>&nbsp;
+<a href="https://www.cnblogs.com/lgg20">liguogui</a>&nbsp;
+阅读(<span id="post_view_count">4</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22842603);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Flgg20%2Fp%2F22842603&amp;targetId=22842603&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
