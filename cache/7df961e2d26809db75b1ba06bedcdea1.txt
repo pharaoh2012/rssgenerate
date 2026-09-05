@@ -1,0 +1,474 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/morec/p/22853549" title="发布于 2026-09-05 12:45">
+    
+
+    <span role="heading" aria-level="2">深入 netcorespot：一个 .NET 9 全栈交易系统里，AI 是如何被「关进笼子」的</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>项目：CryptoSpot（仓库名 netcorespot）<br>
+地址：<a href="https://github.com/liuzhixin405/netcorespot" target="_blank" rel="noopener nofollow">https://github.com/liuzhixin405/netcorespot</a><br>
+技术栈：.NET 9 / ASP.NET Core · React 18 · SignalR + MessagePack · MySQL(EF Core) · OpenAI 兼容协议</p>
+</blockquote>
+<p>很多人做「AI + 交易」的 Demo，止步于让模型聊两句行情、给点建议。这个项目不一样的地方在于：<strong>它让 AI 真正能下单，但把 AI 的每一个动作都关进了一个由「工具隔离 + 规则风控 + 人工审批 + 全链路审计 + 模型容错」组成的笼子里。</strong></p>
+<h2 id="本文不写怎么跑起来这种入门内容readme-里已经很全而是聚焦两件事核心交易引擎是怎么设计的以及-ai-这整条链路是怎么被工程化约束起来的声明该项目仅供练手本项目不具备实际spot的业务">本文不写「怎么跑起来」这种入门内容（README 里已经很全），而是聚焦两件事：<strong>核心交易引擎是怎么设计的，以及 AI 这整条链路是怎么被工程化约束起来的。</strong><br>
+声明：该项目仅供练手，本项目不具备实际spot的业务。</h2>
+<h2 id="一总体架构五层依赖只朝一个方向">一、总体架构：五层，依赖只朝一个方向</h2>
+<p>后端是一个典型的 Clean Architecture 五层结构：</p>
+<pre><code>CryptoSpot.Domain            实体、枚举、仓储接口（无任何依赖）
+        ▲
+CryptoSpot.Application       DTO、服务抽象(IAiModel/ITradingService/...)、接口
+        ▲
+CryptoSpot.Infrastructure    实现层：撮合引擎、行情源、AI、SignalR、后台服务
+        ▲
+CryptoSpot.Persistence       EF Core DbContext、仓储实现
+        ▲
+CryptoSpot.API               控制器、中间件、Program.cs（组合根）
+</code></pre>
+<p>关键点：<strong>所有「AI 能干什么」的能力，在 Application 层只以接口形式存在</strong>。比如 AI 统一抽象 <code>IAiModel</code>、只读工具执行器 <code>IAiToolExecutor</code>、风控/审计/审批服务，都定义在 <code>Application.Abstractions</code> 里，<code>Infrastructure</code> 才给出具体实现。这个分层是后面整套 AI 安全设计能成立的前提——业务规则与「模型供应商」彻底解耦。</p>
+<p><code>Program.cs</code> 是纯组合根，用扩展方法 <code>AddInfrastructure(configuration)</code>、<code>AddCleanArchitecture()</code> 一次性装配。值得注意的几处基础设施：</p>
+<ul>
+<li><strong>JWT</strong>：标准 Bearer 认证，同时支持 <code>access_token</code> 走 query string（SignalR WebSocket 握手时浏览器没法加 header）。</li>
+<li><strong>限流</strong>：<code>AddRateLimiter</code> 用固定窗口，<code>auth</code> 接口 1 分钟 5 次。</li>
+<li><strong>JSON</strong>：<code>long</code> 会被序列化成字符串（<code>LongToStringJsonConverter</code>），避免 JS 精度丢失——这是交易系统里很常见但容易被忽略的坑。</li>
+<li><strong>异常</strong>：<code>UseGlobalExceptionHandling()</code> 全局中间件在最前。</li>
+<li><strong>健康检查</strong>：自定义 <code>AddCryptoSpotHealthChecks</code> + 启动时 <code>PerformStartupHealthChecks</code>。</li>
+</ul>
+<hr>
+<h2 id="二撮合引擎进程内-channel--价格时间优先">二、撮合引擎：进程内 Channel + 价格时间优先</h2>
+<p>撮合引擎在 <code>CryptoSpot.Infrastructure/MatchEngine</code>，核心是 <code>ChannelMatchEngineService</code>，纯内存、无 Redis 依赖（配置文件里的 Redis 段仅历史保留）。</p>
+<h3 id="21-每个交易对一个订单簿--一个有界-channel--一个消费循环">2.1 每个交易对一个「订单簿 + 一个有界 Channel + 一个消费循环」</h3>
+<pre><code class="language-csharp">private readonly ConcurrentDictionary&lt;string, IOrderBook&gt; _orderBooks = new();
+private readonly ConcurrentDictionary&lt;string, Channel&lt;OrderRequest&gt;&gt; _orderChannels = new();
+private readonly ConcurrentDictionary&lt;string, Task&gt; _processingTasks = new();
+
+public void InitializeSymbol(string symbol)
+{
+    var normalizedSymbol = NormalizeSymbol(symbol);
+    if (!_orderBooks.TryAdd(normalizedSymbol, new InMemoryOrderBook(normalizedSymbol)))
+        return;
+
+    var channel = Channel.CreateBounded&lt;OrderRequest&gt;(new BoundedChannelOptions(10000)
+    {
+        FullMode = BoundedChannelFullMode.Wait
+    });
+    _orderChannels[normalizedSymbol] = channel;
+
+    _processingTasks[normalizedSymbol] = Task.Run(async () =&gt;
+    {
+        await foreach (var request in channel.Reader.ReadAllAsync(_cts.Token))
+        {
+            try
+            {
+                if (request.Type == OrderRequestType.Cancel) { ProcessCancelOrder(...); continue; }
+                await ProcessSingleOrderAsync(request.Order, orderBook, symbol, _cts.Token);
+            }
+            catch (Exception ex) { request.Completion?.TrySetException(ex); }
+        }
+    });
+}
+</code></pre>
+<p>设计意图很清晰：</p>
+<ol>
+<li><strong>串行化撮合</strong>：每个交易对只有一个消费者任务，天然避免了同一订单簿上的并发写，不需要在订单簿内部加锁（<code>InMemoryOrderBook</code> 的 <code>GetBestOpposite</code> 也就无需线程安全）。</li>
+<li><strong>背压</strong>：<code>BoundedChannelFullMode.Wait</code>，写入端满 10000 时阻塞等待，而不是无限膨胀内存。</li>
+<li><strong>下单路径</strong>：<code>PlaceOrderAsync</code> 先 <code>FreezeAssetAsync</code> 冻结资产（失败直接抛「余额不足」），再把订单入队，保证「先占款、后撮合」。</li>
+</ol>
+<h3 id="22-价格时间优先算法">2.2 价格时间优先算法</h3>
+<p><code>PriceTimePriorityMatchingAlgorithm.Match(book, taker)</code> 是一个 <code>yield return</code> 的迭代器，逐个产出 <code>MatchSlice</code>：</p>
+<pre><code class="language-csharp">public IEnumerable&lt;MatchSlice&gt; Match(IOrderBook book, Order taker)
+{
+    while (taker.FilledQuantity &lt; taker.Quantity)
+    {
+        var maker = book.GetBestOpposite(taker.Side);
+        if (maker == null) yield break;                 // 对手盘为空
+        if (!PriceCross(taker, maker)) yield break;      // 价格不交叉
+
+        if (maker.UserId == taker.UserId)                // 自成交防护
+        { book.Remove(maker); continue; }
+
+        var qty = Math.Min(taker.Quantity - taker.FilledQuantity,
+                           maker.Quantity - maker.FilledQuantity);
+        var price = maker.Price ?? taker.Price ?? 0m;    // 以 maker 价为成交价
+
+        yield return new MatchSlice(maker, taker, price, qty);
+    }
+}
+</code></pre>
+<ul>
+<li><strong>价格交叉判断</strong>：买单要求 <code>taker.Price &gt;= maker.Price</code>，卖单反之；市价单直接视为可成交。</li>
+<li><strong>自成交防护</strong>：同用户的两笔单直接跳过（移除 maker 后继续）。</li>
+<li><strong>成交价取 maker 价</strong>：符合主流撮合惯例，taker 吃到更优的价格。</li>
+</ul>
+<h3 id="23-结算与持久化的细节">2.3 结算与持久化的细节</h3>
+<p><code>ProcessSingleOrderAsync</code> 里，每产出一个 <code>MatchSlice</code> 就 <code>SettleTradeAsync</code> 做<strong>纯内存资产结算</strong>（买方解冻计价币、增加基准币；卖方解冻基准币、增加计价币），再累加双方 <code>FilledQuantity</code>、更新状态、发布 SignalR 事件。</p>
+<p>持久化有两点值得学习：</p>
+<ol>
+<li><strong>taker 单独持久化 + 受影响 maker 批量持久化</strong>，用 <code>affectedMakers</code> 集合去重后单次 DB 往返，避免一单吃多档时对每个 maker 各打一次 UPDATE。</li>
+<li><strong>成交记录 <code>Id=0</code> 交给数据库自增</strong>，内存里用 <code>Interlocked</code> 生成临时 id，避免并发下主键冲突（注释里明确写了 <code>// 数据库自增，避免 Duplicate entry</code>）。</li>
+</ol>
+<p>撮合中「结算失败则 break 终止」、<code>CancelOrderAsync</code> 用 <code>TaskCompletionSource</code> + <code>WaitAsync</code> 等待消费循环处理结果，这些都属于生产级的健壮性处理。</p>
+<hr>
+<h2 id="三行情源okx-websocket--binance-rest-兜底">三、行情源：OKX WebSocket + Binance REST 兜底</h2>
+<ul>
+<li><strong>实时</strong>：OKX 公共 WebSocket（<code>business</code> K 线）驱动内存订单簿与价格。</li>
+<li><strong>兜底</strong>：<code>BinanceMarketDataProvider</code> 提供 REST 历史 K 线，带 <code>ProxyUrl</code> 代理配置，并通过 <code>AddStandardResilienceHandler()</code> 加了重试/超时/熔断的 Resilience 策略。</li>
+<li><strong>异步桥接</strong>：后台服务把 WebSocket 数据推送到内存，<code>ITradingService</code> 暴露统一查询接口（ticker / klines / orderbook / recent trades），AI 的只读工具底层调的就是这些。</li>
+</ul>
+<p>这种「实时通道 + REST 兜底」的双源设计，是行情类系统里很实用的稳定思路。</p>
+<hr>
+<h2 id="四ai-增强重头戏">四、AI 增强：重头戏</h2>
+<p>这是全文的重点。整个 AI 体系可以拆成六块来看。</p>
+<h3 id="41-统一抽象-iaimodel彻底解耦供应商">4.1 统一抽象 <code>IAiModel</code>，彻底解耦供应商</h3>
+<p>Application 层只有一个模型抽象，Infrastructure 用 <code>OpenAiCompatAiModel</code> 实现，走 OpenAI 兼容的 <code>/chat/completions</code>：</p>
+<pre><code class="language-csharp">public interface IAiModel
+{
+    string ModelId { get; }
+    Task&lt;AiChatResponse&gt; ChatAsync(AiChatRequest request, CancellationToken ct = default);
+    IAsyncEnumerable&lt;AiChatChunk&gt; ChatStreamAsync(AiChatRequest request, CancellationToken ct = default);
+}
+</code></pre>
+<p>默认配置指向本地 Ollama（<code>http://localhost:11434/v1</code> + <code>qwen2.5:7b</code>），但只要改 <code>appsettings</code> 的 <code>Ai</code> 节点，就能换成 DeepSeek / GLM / Qwen / llama.cpp 等任何 <code>/v1</code> 兼容端点，<strong>代码零改动</strong>。</p>
+<h3 id="42-非流式与流式sse两种调用">4.2 非流式与流式（SSE）两种调用</h3>
+<p><strong>非流式 <code>ChatAsync</code></strong> 的请求体把 <code>messages</code>、<code>tools</code>、<code>temperature</code>、<code>max_tokens</code> 全部透传，并把工具定义里的 JSON Schema 字符串 <code>Deserialize&lt;JsonElement&gt;</code> 后回填，保证发给模型的 schema 是合法 JSON。响应解析时同时取 <code>content</code> 和 <code>tool_calls</code>，并且校验「content 和 tool_calls 不能同时为空」，空响应直接抛异常——避免静默吞掉异常响应。</p>
+<p><strong>流式 <code>ChatStreamAsync</code></strong> 走 SSE（<code>text/event-stream</code>），逐行解析 <code>data: </code> 前缀，识别 <code>[DONE]</code>。这里有一个很关键的细节——<strong>流式工具调用参数的累积</strong>：</p>
+<pre><code class="language-csharp">// 工具调用参数是分片到达的：{"  ... {"x":100 ... }，必须按 index 累积
+var toolCalls = new Dictionary&lt;int, StreamingToolCall&gt;();
+...
+if (delta.TryGetProperty("tool_calls", out var toolCallsElement))
+{
+    foreach (var toolCall in toolCallsElement.EnumerateArray())
+    {
+        var index = toolCall.GetProperty("index").GetInt32();
+        if (!toolCalls.TryGetValue(index, out var accumulated))
+        { accumulated = new StreamingToolCall(); toolCalls[index] = accumulated; }
+        if (toolCall.TryGetProperty("id", out var id)) accumulated.Id = id.GetString();
+        if (toolCall.TryGetProperty("function", out var function))
+        {
+            if (function.TryGetProperty("name", out var name)) accumulated.Name = name.GetString();
+            if (function.TryGetProperty("arguments", out var arguments)) accumulated.Arguments.Append(arguments.GetString());
+        }
+    }
+}
+// 只有当 finish_reason == "tool_calls" 时才把累积结果拼成完整 AiToolCall
+</code></pre>
+<p>这是很多 OpenAI 兼容流式实现最容易踩的坑：模型流式返回工具参数是<strong>逐 token 分片</strong>的，如果拿到一块就 <code>JsonDocument.Parse</code>，一定会解析失败。这里选择了「按 index 累积到 StringBuilder，流结束时统一组装」的正确做法。</p>
+<h3 id="43-工具系统读写分离--严格参数校验">4.3 工具系统：读写分离 + 严格参数校验</h3>
+<p>工具分两类，边界非常清楚：</p>
+<p><strong>只读工具（<code>AiToolExecutor</code>，6 个）</strong>——用于分析，绝不能改状态：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>get_ticker</code></td>
+<td>实时行情</td>
+</tr>
+<tr>
+<td><code>get_klines</code></td>
+<td>最近 24 根 1h K 线</td>
+</tr>
+<tr>
+<td><code>get_orderbook</code></td>
+<td>前 10 档订单簿</td>
+</tr>
+<tr>
+<td><code>get_assets</code></td>
+<td>当前用户资产</td>
+</tr>
+<tr>
+<td><code>get_open_orders</code></td>
+<td>未完成订单</td>
+</tr>
+<tr>
+<td><code>get_recent_trades</code></td>
+<td>市场最近成交（50 条）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>写工具（<code>AiTradeService</code> 内，3 个）</strong>——用于交易，全部经过风控：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>place_order</code></td>
+<td>下市价/限价单</td>
+</tr>
+<tr>
+<td><code>cancel_order</code></td>
+<td>撤单</td>
+</tr>
+<tr>
+<td><code>cancel_all_orders</code></td>
+<td>批量撤单（必审批）</td>
+</tr>
+</tbody>
+</table>
+<p>每个工具都有严格的 JSON Schema（<code>additionalProperties:false</code>，<code>quantity</code> 用 <code>exclusiveMinimum:0</code>）。更关键的是<strong>入参二次校验</strong>：<code>ParseOrder</code> 里 <code>EnsureOnlyProperties</code> 只允许白名单字段，<code>GetRequiredString</code> / <code>GetRequiredDecimal</code> 强校验 side/type/quantity/price，任何不合法的参数直接抛 <code>ArgumentException</code> 返回 <code>denied</code>——<strong>即使用户能注入恶意 tool call，也过不了参数层</strong>。</p>
+<h3 id="44-分析链路-aianalyzer多轮工具调用--数据引用">4.4 分析链路 <code>AiAnalyzer</code>：多轮工具调用 + 数据引用</h3>
+<p><code>AiAnalyzer.AnalyzeAsync</code> 是一条典型的多轮 ReAct 循环：</p>
+<pre><code class="language-csharp">for (var round = 0; round &lt; 5; round++)
+{
+    response = await _model.ChatAsync(...);          // 带 Tools
+    if (response.ToolCalls is not { Count: &gt; 0 })
+        return new AiAnalysisResult(response.Content, citations);
+
+    messages.Add(new AiMessage("assistant", response.Content, ToolCalls: response.ToolCalls));
+    foreach (var toolCall in response.ToolCalls)
+    {
+        var result = await _tools.ExecuteAsync(userId, toolCall, ct);
+        citations.Add(toolCall.Name);
+        await _audit.WriteAsync(... "ai.tool.call" ...);
+        messages.Add(new AiMessage("tool", result, toolCall.Id));
+    }
+}
+throw new InvalidOperationException("AI analysis exceeded the maximum of five tool-call rounds.");
+</code></pre>
+<p>三个设计点：</p>
+<ol>
+<li><strong>最多 5 轮工具调用</strong>，防止模型陷入无限调用工具的循环。</li>
+<li><strong><code>citations</code> 收集</strong>：模型最终结论里引用了哪些数据工具，前端可展示「本结论基于：get_ticker / get_klines」，从机制上对抗幻觉。</li>
+<li><strong>系统提示词强约束</strong>：「只允许依据提供的真实平台数据作答，禁止编造价格、持仓或指标」，且每次工具结果都回填给模型。</li>
+</ol>
+<h3 id="45-交易链路-aitradeservice规划--风控--审批--二次校验执行">4.5 交易链路 <code>AiTradeService</code>：规划 → 风控 → 审批 → 二次校验执行</h3>
+<p>这是整个项目最核心、也最能体现「AI 能干但不能乱来」的地方。</p>
+<p><code>PlanAndExecuteAsync</code> 的编排与分析链路类似（5 轮上限、<code>Temperature = 0</code>、<code>MaxTokens = 512</code>），但关键在 <code>ExecuteToolAsync</code> 对写工具的 <code>switch</code> 分发：</p>
+<pre><code class="language-csharp">return toolCall.Name switch
+{
+    "place_order"     =&gt; await PlanOrSubmitOrderAsync(...),
+    "cancel_order"    =&gt; await CancelOrderAsync(...),
+    "cancel_all_orders" =&gt; await CreateCancellationApprovalAsync(...),
+    _ =&gt; throw new InvalidOperationException($"AI attempted to use unsupported tool '{toolCall.Name}'.")
+};
+</code></pre>
+<p><code>place_order</code> 会先走 <code>EvaluateOrderAsync</code> 做<strong>下单前风控评估</strong>，评估结果决定三种走向：</p>
+<ul>
+<li><strong><code>DenyReason != null</code></strong> → 直接拒绝（<code>denied</code>），不落库、不审批。</li>
+<li><strong><code>RequiresApproval == true</code></strong> → 生成 Pending 审批单，返回 <code>pending_approval</code> + <code>approvalId</code>。</li>
+<li><strong>否则</strong> → <code>SubmitOrderAsync</code> 直接提交。</li>
+</ul>
+<p>审批通过后的执行并不是「直接提交」，而是 <code>ExecuteApprovedAsync</code> <strong>再次跑一遍 <code>EvaluateOrderAsync</code></strong>：</p>
+<pre><code class="language-csharp">case "place_order":
+    var plan = ParseOrder(approval.PayloadJson);
+    var evaluation = await EvaluateOrderAsync(userId, plan, ct);
+    outcome = evaluation.DenyReason is not null
+        ? await DenyAsync(...)
+        : await SubmitOrderAsync(...);
+</code></pre>
+<p>这个「审批时风控一次、执行时再风控一次」的双重校验很关键——因为审批到真正执行之间有时间差，市场价可能已经变了，必须用最新价格重新算偏离度。</p>
+<h3 id="46-风控规则详解aiguardrailoptions">4.6 风控规则详解（<code>AiGuardrailOptions</code>）</h3>
+<p>默认阈值（全部可配）：</p>
+<table>
+<thead>
+<tr>
+<th>规则</th>
+<th>默认值</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>市价单审批阈值</td>
+<td>1000 USDT</td>
+<td>超过 → 转审批</td>
+</tr>
+<tr>
+<td>限价单审批阈值</td>
+<td>5000 USDT</td>
+<td>超过 → 转审批</td>
+</tr>
+<tr>
+<td>价格偏离</td>
+<td>5%</td>
+<td>超过 → 直接拒绝</td>
+</tr>
+<tr>
+<td>下单频率</td>
+<td>5 次/分钟</td>
+<td>超过 → 直接拒绝</td>
+</tr>
+<tr>
+<td>日累计成交额</td>
+<td>10000 USDT</td>
+<td>超过 → 后续转审批</td>
+</tr>
+</tbody>
+</table>
+<p><code>EvaluateOrderAsync</code> 的完整检查链：</p>
+<ol>
+<li>订单有效性（数量、交易对、限价必须有价）。</li>
+<li>当前价可用（拿不到价格直接拒，<strong>绝不盲目下单</strong>）。</li>
+<li>限价偏离最新价 &gt; 5% → 拒。</li>
+<li>最近 1 分钟内 <code>place_order</code> 成功次数 ≥ 5 → 拒（查审计日志表统计）。</li>
+<li><strong>自成交防护</strong>：与用户反向挂单价交叉 → 拒。</li>
+<li>日累计成交额（解析历史审计日志里的 <code>notional</code> 累加）+ 本单 &gt; 阈值 → 转审批。</li>
+</ol>
+<p>注意第 4、6 条：<strong>风控数据来源是 AI 审计日志本身</strong>，形成了一个自洽的「审计即数据」闭环，不需要额外建风控计数表。</p>
+<h3 id="47-审批与审计闭环">4.7 审批与审计闭环</h3>
+<ul>
+<li><strong>审批</strong>：<code>AiApprovalService</code> 生成 Pending 审批单（<code>ActionType</code> + <code>PayloadJson</code>），用户通过 <code>POST /api/ai/approvals/{id}/approve|reject</code> 决策。approve 后由 <code>ExecuteApprovedAsync</code> 真正执行，状态流转 <code>Pending → Approved → Executed/Failed</code>。</li>
+<li><strong>审计</strong>：<code>AiAuditService</code> 贯穿全链路，动作类型覆盖 <code>ai.analyze</code>、<code>ai.tool.call</code>、<code>ai.tool.execute</code>、<code>ai.trade.plan</code>、<code>ai.approval.approved/rejected</code>、<code>ai.docs.answer</code>、<code>ai.news.sentiment</code>、<code>ai.portfolio.report</code>，每条记录都含 <code>userId</code>、<code>modelId</code>、<code>toolName</code>、<code>arguments</code>、<code>result</code>、<code>status</code>、<code>elapsedMs</code>。出问题时可以精确还原「AI 在什么时间、用哪个模型、调了什么工具、给了什么参数、结果是什么」。</li>
+</ul>
+<h3 id="48-扩展能力文档助手--新闻情绪--持仓报告">4.8 扩展能力：文档助手 / 新闻情绪 / 持仓报告</h3>
+<p><code>AiExpansionService</code> 实现了三个「增强型」AI 能力，它们的共同设计是 <strong>LLM 为主 + 确定性 fallback 兜底</strong>：</p>
+<p><strong>① 文档助手（一个轻量 RAG）</strong></p>
+<ul>
+<li>启动时用 <code>Lazy</code> 加载 <code>docs/</code> 下所有 <code>.md</code>，按 <code>\n\n</code> 切块（单块 ≤ 1400 字符）。</li>
+<li>检索：把问题 tokenize（正则取英文/数字/下划线 token + 中文字符拆成单字），<code>score = 交集数 + 包含原问题 ? 10 : 0</code>，取 Top 4。</li>
+<li>命中后交给 LLM 基于片段作答；<strong>LLM 调用抛 <code>HttpRequestException</code> / 超时，则回退到「抽取式答案」</strong>——直接把最相关的片段原文返回给用户。</li>
+</ul>
+<p><strong>② 新闻情绪分析</strong></p>
+<ul>
+<li>先走<strong>词法分析</strong>（<code>AnalyzeLexically</code>）得到确定性基线：命中利好词（上涨/获批/突破/bullish…）加分、利空词（暴跌/黑客/处罚/bearish…）减分，算出 <code>[-1,1]</code> 的 score。</li>
+<li>LLM 可用时覆盖为模型结果，并做<strong>严格 JSON 校验</strong>（<code>sentiment</code> 必须三选一、<code>score</code> 必须可解析、<code>summary</code> 非空，否则抛异常走 fallback）。</li>
+</ul>
+<p><strong>③ 持仓报告</strong></p>
+<ul>
+<li>注入<strong>真实数据</strong>（资产列表、近 10 笔成交、总估值）作为上下文，让 LLM 生成中文报告；失败则回退到结构化模板。</li>
+</ul>
+<p>这三个能力展示了同一种工程范式：<strong>AI 是不可靠的，所以永远要有一条「没有 AI 也能给出合理结果」的兜底路径</strong>。</p>
+<h3 id="49-模型容错熔断--降级">4.9 模型容错：熔断 + 降级</h3>
+<p><code>OpenAiCompatAiModel</code> 内置了简易熔断器：</p>
+<pre><code class="language-csharp">private readonly ConcurrentDictionary&lt;string, CircuitState&gt; _circuits = new();
+
+private bool IsOpen(AiModelEndpoint endpoint) =&gt;
+    _circuits.TryGetValue(endpoint.BaseUrl, out var state) &amp;&amp;
+    state.OpenUntil &gt; DateTimeOffset.UtcNow;
+
+private void RecordFailure(AiModelEndpoint endpoint)
+{
+    _circuits.AddOrUpdate(endpoint.BaseUrl, _ =&gt; new CircuitState(1, ...),
+        (_, state) =&gt;
+        {
+            var failures = state.Failures + 1;
+            return failures &gt;= options.CircuitBreakerFailureThreshold  // 默认 3 次
+                ? new CircuitState(failures, DateTimeOffset.UtcNow.AddSeconds(options.CircuitBreakerCooldownSeconds)) // 默认 60s
+                : new CircuitState(failures, state.OpenUntil);
+        });
+}
+</code></pre>
+<p>配合 <code>Endpoints()</code> 依次产出「主模型 + <code>FallbackModels</code> 备用列表」，<code>ChatAsync</code> / <code>ChatStreamAsync</code> 会遍历所有端点，跳过熔断中的，任一成功即返回。<strong>主模型连续失败 3 次 → 熔断 60 秒 → 自动切换备用模型</strong>，全链路对调用方透明。同时每次请求都套 <code>CreateTimeoutTokenSource</code> 做超时控制。</p>
+<hr>
+<h2 id="五实时推送signalr--messagepack">五、实时推送：SignalR + MessagePack</h2>
+<p><code>Program.cs</code> 里 <code>AddSignalR().AddMessagePackProtocol()</code>，Hub 映射到 <code>/tradingHub</code>，推送价格、订单簿、K 线、订单、风控事件。MessagePack 相比 JSON 更省带宽，适合高频行情推送。AI 的 SSE 对话流走 <code>text/event-stream</code>（<code>event: message</code> / <code>event: done</code>），与 SignalR 分开，各司其职。</p>
+<hr>
+<h2 id="六ai-相关-api-一览">六、AI 相关 API 一览</h2>
+<table>
+<thead>
+<tr>
+<th>端点</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /api/ai/analyze</code></td>
+<td>行情分析（含 citations、会话、审计）</td>
+</tr>
+<tr>
+<td><code>POST /api/ai/trade</code></td>
+<td>自然语言交易（规划 → 风控 → 审批）</td>
+</tr>
+<tr>
+<td><code>POST /api/ai/approvals/{id}/approve</code> / <code>reject</code></td>
+<td>审批决策</td>
+</tr>
+<tr>
+<td><code>POST /api/ai/chat</code></td>
+<td>SSE 流式对话</td>
+</tr>
+<tr>
+<td><code>POST /api/ai/assistant</code></td>
+<td>文档助手（RAG）</td>
+</tr>
+<tr>
+<td><code>POST /api/ai/news/sentiment</code></td>
+<td>新闻情绪</td>
+</tr>
+<tr>
+<td><code>POST /api/ai/portfolio/report</code></td>
+<td>持仓报告</td>
+</tr>
+<tr>
+<td><code>GET /api/ai/conversations</code> / <code>{id}</code></td>
+<td>会话管理</td>
+</tr>
+<tr>
+<td><code>GET /api/ai/audit</code></td>
+<td>审计查询</td>
+</tr>
+</tbody>
+</table>
+<p>所有 AI 端点都在 <code>[Authorize]</code> 下，且通过 <code>ICurrentUserService</code> 拿当前用户 id，AI 工具执行时也只能操作「当前用户」的资产与订单，天然做了租户隔离。</p>
+<hr>
+<h2 id="七配置与体验">七、配置与体验</h2>
+<p>后端 <code>appsettings</code> 的 <code>Ai</code> 节点即可控制一切：</p>
+<pre><code class="language-jsonc">"Ai": {
+  "Enabled": true,
+  "BaseUrl": "http://localhost:11434/v1",
+  "ApiKey": "ollama",
+  "Model": "qwen2.5:7b",
+  "Temperature": 0.2,
+  "MaxTokens": 2048,
+  "TimeoutSeconds": 120,
+  "FallbackModels": [],
+  "CircuitBreakerFailureThreshold": 3,
+  "CircuitBreakerCooldownSeconds": 60
+}
+</code></pre>
+<p>不想要 AI 就把 <code>Enabled</code> 设为 false，交易、撮合、行情、推送等其余功能完全不受影响——<strong>AI 是插拔式的能力，而不是系统的命脉</strong>，这本身就是架构解耦的证明。</p>
+<hr>
+<h2 id="八总结这套设计可以复制到任何ai-agent-操作真实业务的场景">八、总结：这套设计可以复制到任何「AI Agent 操作真实业务」的场景</h2>
+<p>netcorespot 最值得借鉴的不是某个 AI 接口写得漂亮，而是那一整套<strong>工程约束</strong>：</p>
+<ol>
+<li><strong>抽象解耦</strong>：<code>IAiModel</code> + OpenAI 兼容协议，供应商可替换、AI 可开关。</li>
+<li><strong>工具读写分离</strong>：读工具随意用，写工具全部过风控。</li>
+<li><strong>参数强校验</strong>：JSON Schema + 白名单字段 + 类型强校验，堵死注入。</li>
+<li><strong>多轮上限 + 数据引用</strong>：防工具循环，防幻觉。</li>
+<li><strong>规则风控 + 人工审批 + 二次校验</strong>：AI 出牌前先过规则，审批通过后执行前再过一遍。</li>
+<li><strong>全链路审计</strong>：审计日志反过来又成为风控的计数来源，自洽闭环。</li>
+<li><strong>熔断 + 备用模型 + 超时</strong>：模型不可靠，就用工程手段兜住。</li>
+<li><strong>确定性 fallback</strong>：文档助手、新闻情绪、持仓报告都有「没有 LLM 也能出结果」的兜底路径。</li>
+</ol>
+<p>把「交易」换成「审批、报销、下单、发消息」等任何真实业务动作，这套模式都成立。这正是它比一个「会聊天的交易机器人」更有价值的根本原因。</p>
+<hr>
+<p><img alt="交易界面" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1099890/202609/1099890-20260905124540760-1890518220.jpg" class="lazyload"></p>
+<hr>
+<blockquote>
+<p>⚠️ 免责声明：本项目为学习/演示用途，撮合与行情均为模拟/公共数据，不构成任何投资建议。</p>
+</blockquote>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <a href="https://github.com/liuzhixin405"><img loading="lazy" width="149" height="149" src="https://github.blog/wp-content/uploads/2008/12/forkme_left_darkblue_121621.png?resize=149%2C149" class="attachment-full size-full" alt="Fork me on GitHub" data-recalc-dims="1"></a>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.009027777777777777" data-date-updated="2026-09-05 12:58">2026-09-05 12:45</span>&nbsp;
+<a href="https://www.cnblogs.com/morec">星仔007</a>&nbsp;
+阅读(<span id="post_view_count">74</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22853549);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmorec%2Fp%2F22853549&amp;targetId=22853549&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
