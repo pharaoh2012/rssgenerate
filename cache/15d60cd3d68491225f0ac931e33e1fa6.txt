@@ -1,0 +1,362 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/powertoolsteam/p/22868171" title="发布于 2026-09-07 09:07">
+    
+
+    <span role="heading" aria-level="2">Agent Harness 的热插拔难题：DeepSeek 论文揭秘 Cordis 如何管理可逆副作用与动态依赖</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="读a-programming-paradigm-for-spatiotemporal-composability">读《A Programming Paradigm for Spatiotemporal Composability》</h2>
+<p>今天的 Agent 已经不只是一个“模型 + Prompt”。一个可长期运行的 Agent harness，通常还要管理工具、记忆、权限、沙箱、会话状态、子 Agent 和任务编排。更进一步，未来的 Agent 可能会在服务请求的同时修改自己的工具链或运行时模块。</p>
+<p>这会立刻带来一个问题：</p>
+<blockquote>
+<p>如果组件可以在运行时被加载、卸载、替换和重配置，系统怎样保证状态不泄漏、依赖不失效、正在执行的任务不被无序打断？</p>
+</blockquote>
+<p>论文《A Programming Paradigm for Spatiotemporal Composability》给出的答案，是把动态组合拆成两个维度，并把传统编程语言里的 effect 和 coeffect 提升为运行时机制。</p>
+<p>本文不复述论文中的全部证明，而是从工程角度解释它的核心模型、实现方式，以及它对 Agent harness 的启发。</p>
+<h2 id="一动态组合缺的不是加载而是可控的卸载">一、动态组合缺的不是加载，而是可控的卸载</h2>
+<p>传统软件组合大多在编译期完成：函数调用、模块导入、类继承都形成相对固定的结构。插件系统和自演化 Agent 则要求组件在运行时到来和离开。</p>
+<p>论文认为，动态组合至少有两个正交维度。</p>
+<p><img src="https://img2024.cnblogs.com/blog/139239/202609/139239-20260907090620065-646015531.png" alt="image" loading="lazy"></p>
+<p>很多系统采用粗粒度的替代方案：出问题就重启进程，服务依赖交给容器编排。这样当然能恢复，但代价是丢失进程内状态、打断进行中的请求，并把本来可以是进程内调用的依赖变成网络调用。</p>
+<p>对自演化 Agent 来说，频繁重启尤其昂贵。Agent 可能正处于一个长任务中，拥有尚未持久化的上下文、缓存和连接；如果一次自修改必须让整个 harness 重启，修改本身还可能破坏负责恢复系统的代码。</p>
+<p><img src="https://img2024.cnblogs.com/blog/139239/202609/139239-20260907090627533-137515014.png" alt="image" loading="lazy"></p>
+<p><em>图 1：动态组合同时关注组件生命周期和组件依赖拓扑。</em></p>
+<h2 id="二从静态-effectcoeffect-到运行时上下文">二、从静态 effect/coeffect 到运行时上下文</h2>
+<p>经典 effect system 描述“一个计算会对环境做什么”，coeffect system 描述“一个计算要求环境提供什么”。论文的关键动作不是再加一层类型注解，而是把上下文本身变成运行时的一等实体。</p>
+<p>可以先把上下文 <code>Γ</code> 想成一个共享运行时环境：工具注册表、事件监听器、权限、连接、缓存和组件提供的服务都可以通过它访问。</p>
+<p>论文的统一方向是：</p>
+<ul>
+<li>effect 负责修改上下文，并且必须能撤销；</li>
+<li>coeffect 负责声明依赖，并且在依赖变化时触发响应；</li>
+<li>所有组件和环境的交互都经过同一个 context。</li>
+</ul>
+<p>这样，加载和卸载不再是两个容易漂移的生命周期回调，而是同一套上下文变换的正向和逆向。</p>
+<h2 id="三可逆效果每次修改都带着-undo">三、可逆效果：每次修改都带着 undo</h2>
+<h3 id="31-基本模型">3.1 基本模型</h3>
+<p>普通的环境变换可以写成：</p>
+<p>f : Γ -&gt; Γ</p>
+<p>论文要求一个 effect 同时返回新上下文和撤销函数：</p>
+<p>e : Γ -&gt; Γ × (Γ -&gt; Γ)</p>
+<p>也就是：</p>
+<p>e(oldContext) = (newContext, undo)</p>
+<p>例如，一个组件注册天气工具时，操作不是简单地执行：</p>
+<p>set("weather", weatherTool)</p>
+<p>而是同时提供：</p>
+<p>undo(context) = delete("weather")</p>
+<p>组件卸载时，运行时执行当时保存的 <code>undo</code>，而不是依赖开发者另外写一个可能遗漏清理动作的 <code>deactivate</code>。</p>
+<h3 id="32-运行时怎样累计撤销操作">3.2 运行时怎样累计撤销操作</h3>
+<p>论文用 effect context 保存两部分状态：</p>
+<p>∂Γ = Γ × (Γ -&gt; Γ)</p>
+<p>第二项是撤销累加器。假设组件依次执行：</p>
+<p>A：注册工具       -&gt; undo_A</p>
+<p>B：注册事件监听器 -&gt; undo_B</p>
+<p>累加器会保存组合后的撤销函数，卸载时按逆序执行：</p>
+<p>undo_B</p>
+<p>undo_A</p>
+<p>这和资源管理中的 LIFO 原则一致：后申请的资源先释放。</p>
+<p>如果用伪代码表达，核心大致是：</p>
+<p>async function effect(callback) {</p>
+<p>const inverses = []</p>
+<p>for await (const inverse of callback()) {</p>
+<p>inverses.unshift(inverse) // 后发生的效果先撤销</p>
+<p>}</p>
+<p>return async function dispose() {</p>
+<p>for (const inverse of inverses) {</p>
+<p>await inverse()</p>
+<p>}</p>
+<p>}</p>
+<p>}</p>
+<p><img src="https://img2024.cnblogs.com/blog/139239/202609/139239-20260907090636983-142634269.png" alt="image" loading="lazy"></p>
+<p><em>图 2：effect 不只修改上下文，还把对应的撤销操作交给运行时追踪。</em></p>
+<p>论文中的实现 <code>ctx.effect</code> 还支持异步迭代：每完成一个 effect，就把它的 inverse 放入累加器；如果组件在中途被要求停止，只撤销已经完成的部分。</p>
+<h3 id="33-为什么-inverse-必须在运行时产生">3.3 为什么 inverse 必须在运行时产生</h3>
+<p>很多操作没有一个对所有状态都适用的固定逆函数。</p>
+<p>例如：</p>
+<ul>
+<li>分配资源后，逆操作需要知道本次分配得到的句柄；</li>
+<li>建立连接后，逆操作需要关闭这条具体连接；</li>
+<li>注册组件后，逆操作需要撤退刚刚生成的 fiber；</li>
+<li>创建临时文件后，逆操作需要删除这一个文件。</li>
+</ul>
+<p>所以论文允许 effect 在实际执行时，根据当前状态生成自己的 inverse。</p>
+<h3 id="34-可逆不等于可以随便删除">3.4 可逆不等于可以随便删除</h3>
+<p>单个组件按自己的逆序撤销通常没有问题。多个组件交错修改同一环境时，就必须讨论 <strong>independence，效果独立性</strong>。</p>
+<p>论文要求两个独立 effect 满足更强的条件：</p>
+<ol>
+<li>双方的正向操作和逆操作可以交换；</li>
+<li>一个 effect 不会因为另一个 effect 改变状态，就生成不同的 inverse。</li>
+</ol>
+<p>如果两个组件都在修改一个有顺序的中间件链，先插入谁、后插入谁会改变行为，那么它们就不能被视为独立。此时只能依赖明确的顺序，不能任意卸载。</p>
+<p>这也是论文一个很实用的分工：</p>
+<blockquote>
+<p>effect 处理可以交换的修改；coeffect 处理必须保留的依赖顺序。</p>
+</blockquote>
+<h2 id="四反应式共效果依赖变化会驱动生命周期">四、反应式共效果：依赖变化会驱动生命周期</h2>
+<h3 id="41-依赖表和依赖规格">4.1 依赖表和依赖规格</h3>
+<p>论文把 coeffect context 建模成一个带类型的有限表：</p>
+<p>Σ = {</p>
+<p>key_1 -&gt; value_1,</p>
+<p>key_2 -&gt; value_2,</p>
+<p>...</p>
+<p>}</p>
+<p>每个 key 对应自己的值类型。组件则声明一个依赖规格：</p>
+<p>d = { memory, search, permission }</p>
+<p>组件只有在所有 key 都存在时才满足依赖：</p>
+<p>σ ⊨ d  &lt;=&gt;  d 中的每个 key 都在 σ 中</p>
+<p>这比组件先启动、再在运行时调用一个不存在的服务安全得多。</p>
+<h3 id="42-三类通知">4.2 三类通知</h3>
+<p>每次上下文发生变化，运行时都会根据组件的依赖规格重新分类：</p>
+<p>activating   依赖从不满足变为满足</p>
+<p>deactivating 依赖从满足变为不满足</p>
+<p>neutral      满足状态没有改变</p>
+<p>例如：</p>
+<p>A 提供 weather</p>
+<p>B 声明依赖 weather</p>
+<p>当 A 激活并提供 <code>weather</code> 时，B 进入激活流程；当 A 开始撤销 <code>weather</code> 时，B 被通知并进入停用流程。</p>
+<p>组件不会因为依赖暂时缺失而立刻报错，而是保持 inactive，等待依赖重新出现。</p>
+<h3 id="43-provider-必须先停止提供再等待消费者清理">4.3 Provider 必须先停止提供，再等待消费者清理</h3>
+<p>这里有一个容易忽略的顺序问题：B 的 teardown 可能仍然需要访问 A 提供的 <code>weather</code>。</p>
+<p>因此论文把 provider 的停用拆成两个阶段：</p>
+<ol>
+<li>provider 先标记为 <code>UNLOADING</code>，从新的依赖解析中消失；</li>
+<li>所有依赖它的 consumer 开始停用，但仍能读取自己已经提交的依赖视图；</li>
+<li>consumer 全部完成 teardown 后，provider 才执行自己的 inverse，真正删除绑定。</li>
+</ol>
+<p>Cordis 的实现对应为：</p>
+<p>mark provider as UNLOADING</p>
+<p>notify dependents</p>
+<p>await all(dependents become INACTIVE)</p>
+<p>await provider.dispose()</p>
+<p><img src="https://img2024.cnblogs.com/blog/139239/202609/139239-20260907090650815-1541308188.png" alt="image" loading="lazy"></p>
+<p><em>图 3：deactivation 的关键是保留 consumer 已提交的依赖视图，并等待依赖方完成清理。</em></p>
+<p>这比单纯调用一组同步 <code>deactivate()</code> 更强，因为异步清理也被纳入生命周期协议。</p>
+<h2 id="五统一-contexteffect-和-coeffect-放在同一个运行时实体里">五、统一 Context：effect 和 coeffect 放在同一个运行时实体里</h2>
+<p>论文最终把上下文写成递归类型：</p>
+<p>Γ∞ = μΓ. Γ × (Γ -&gt; Γ) × Σ</p>
+<p>可以把它理解成一个三元组：</p>
+<ol>
+<li>当前上下文状态；</li>
+<li>能恢复这一层 effect 的累加器；</li>
+<li>携带依赖信息的 coeffect context。</li>
+</ol>
+<p>递归结构支持嵌套上下文。一个父组件可以创建子组件，父级累积子级的 effect；卸载父级时，子级会被逐层撤退。</p>
+<h3 id="51-为什么不是要求物理状态完全相同">5.1 为什么不是要求物理状态完全相同</h3>
+<p>论文很诚实地指出，恢复通常不能保证物理表示逐字节相同。</p>
+<p>例如：</p>
+<ul>
+<li><code>free</code> 释放内存后，堆分配器内部布局不会恢复到完全一样；</li>
+<li>删除一个生成的名字后，下次生成可能得到不同名字；</li>
+<li>文件描述符可能被操作系统重新分配。</li>
+</ul>
+<p>因此论文采用 <strong>observational equivalence，观测等价</strong>：只要组件通过公开 coeffect 操作观察不到差异，就视为恢复成功。</p>
+<p>这比“内存快照恢复”更符合实际系统，也说明了恢复保证的边界：它针对系统可观察行为，而不是所有底层物理细节。</p>
+<h2 id="六从局部机制到全局组件演算">六、从局部机制到全局组件演算</h2>
+<p>前面的定义只说明单个组件怎样可逆、怎样响应依赖。第 4 节把它们组合成动态组合演算。</p>
+<h3 id="61-componentfiber-和-registry">6.1 Component、Fiber 和 Registry</h3>
+<p>一个组件由三部分构成：</p>
+<p>Component = (dependencies, provisions, effects)</p>
+<ul>
+<li><code>dependencies</code>：组件需要读取什么；</li>
+<li><code>provisions</code>：组件可能提供什么；</li>
+<li><code>effects</code>：组件激活时执行的可逆效果。</li>
+</ul>
+<p>组件的一次实例化叫作 <strong>fiber</strong>。fiber 除了携带组件本身，还记录：</p>
+<ul>
+<li>父 fiber；</li>
+<li>当前生命周期状态；</li>
+<li>自己的撤销累加器；</li>
+<li>激活时实际绑定到哪些 provider；</li>
+<li>是否已经被退休。</li>
+</ul>
+<p>这里“实际绑定到哪个 provider”很重要。即使两个 provider 提供完全相同的值，只要 provider 身份变了，consumer 也能检测到依赖解析发生了变化。</p>
+<h3 id="62-生命周期状态">6.2 生命周期状态</h3>
+<p>论文从简单的两态模型逐步扩展为：</p>
+<p>INACTIVE</p>
+<p>-&gt; RELOADING</p>
+<p>-&gt; ACTIVE</p>
+<p>-&gt; UNLOADING</p>
+<p>-&gt; INACTIVE</p>
+<p>还要处理：</p>
+<ul>
+<li><strong>Iteration</strong>：一次激活由多个 effect 步骤组成；</li>
+<li><strong>Asynchrony</strong>：某一步已经发出但尚未完成；</li>
+<li><strong>Failure</strong>：某一步失败时，必须撤销已经完成的前置步骤；</li>
+<li><strong>Withdrawal</strong>：provider 等待所有 consumer 清理后才真正撤销服务。</li>
+</ul>
+<p>异步场景引入了 inertia：一个 transition 一旦开始，就必须先完成当前在途操作，再处理新的 target 变化。否则会出现一个 effect 按旧依赖启动、却在新依赖环境中落地的状态。</p>
+<h3 id="63-论文给出的全局性质">6.3 论文给出的全局性质</h3>
+<p>在若干条件成立时，论文证明了：</p>
+<ul>
+<li><strong>Preservation</strong>：生命周期转换保持系统结构和不变量；</li>
+<li><strong>Temporal composability</strong>：组件结束后，它的环境贡献被撤销；</li>
+<li><strong>Spatial composability</strong>：依赖总是在 provider 之后激活、在 provider 撤销之前完成停用；</li>
+<li><strong>Progress</strong>：没有违反条件的循环依赖时，系统不会因为撤销 guard 永久死锁；</li>
+<li><strong>Confluence</strong>：只要组件效果满足独立性，最终静止状态与组件经历过的动态加载顺序无关，等价于按最终配置从头组装。</li>
+</ul>
+<p>这里必须强调“在若干条件成立时”。论文依赖的关键前提包括：</p>
+<ul>
+<li>provider-consumer 依赖图无环；</li>
+<li>共享 key 的操作满足适当的可交换性；</li>
+<li>组件最终确实安装它声明的 provision；</li>
+<li>动态注册不会无限制地产生 fiber；</li>
+<li>所有需要纳入保证的共享位置都被 reify 成 context/coeffect。</li>
+</ul>
+<h2 id="七cordis把理论落成一组-api">七、Cordis：把理论落成一组 API</h2>
+<p>论文用 Cordis 实现了这套模型。它不是一个面向 Web、数据库或 UI 的应用框架，而是一个提供动态组合语义的 meta-framework。</p>
+<p>核心 API 可以概括为：</p>
+<p>ctx.effect(callback)       // 运行可逆 effect，返回 dispose</p>
+<p>ctx.set(key, value)        // 提供一个依赖</p>
+<p>ctx.get(key)               // 读取依赖</p>
+<p>ctx.use(component, config) // 实例化组件</p>
+<p>ctx.isolate(key, realm)    // 改变依赖解析域</p>
+<p>ctx.intercept(key, meta)   // 为依赖访问附加策略元数据</p>
+<p>实现上，所有 context mutation 都经过 <code>ctx.effect</code>，因此 <code>ctx.set</code>、组件实例化和其他修改都自动进入同一个撤销体系。</p>
+<h3 id="71-声明式配置和增量-reconciliation">7.1 声明式配置和增量 reconciliation</h3>
+<p>Cordis 还提供组件 loader。编排器维护一棵声明式配置树，每个 entry 描述：</p>
+<ul>
+<li>组件模块 URL；</li>
+<li>稳定 ID；</li>
+<li>isolate 和 intercept 配置；</li>
+<li>组件 config；</li>
+<li>是否 disabled。</li>
+</ul>
+<p>配置发生变化时，loader 不会粗暴地重启整个系统，而是根据字段选择最小更新：</p>
+<ul>
+<li><code>id</code> 或 <code>url</code> 变化：重建 fiber；</li>
+<li><code>isolate</code> 变化：重分配解析域；</li>
+<li><code>intercept</code> 变化：原地更新；</li>
+<li><code>config</code> 变化：交给组件做 diff；</li>
+<li><code>disabled</code> 变化：卸载或重新激活。</li>
+</ul>
+<h3 id="72-hot-module-replacement">7.2 Hot Module Replacement</h3>
+<p>HMR 也可以被看作组件级的可逆替换：</p>
+<ol>
+<li>找出受修改模块影响的组件；</li>
+<li>dispose 旧 fiber，恢复旧组件安装的 effect；</li>
+<li>清理模块缓存并导入新模块；</li>
+<li>用新模块创建新 fiber；</li>
+<li>如果任何一步失败，恢复缓存并用旧模块重建。</li>
+</ol>
+<p>因此 HMR 不需要每个组件额外声明一套接受边界，组件生命周期本身就是替换边界。</p>
+<h2 id="八koishi-案例说明了什么">八、Koishi 案例说明了什么</h2>
+<p>Koishi 是一个基于 Cordis 的开源聊天机器人框架，论文提到其生态已经积累了 4000 多个社区插件，覆盖 IM 适配器、数据库驱动、管理控制台和用户功能。</p>
+<p>这个案例主要说明三点：</p>
+<ol>
+<li><strong>可表达性</strong>：只靠通用 context 原语，就能承载一个完整生产系统；</li>
+<li><strong>通用性</strong>：同一套机制既能用于服务端机器人，也能用于浏览器 Web 控制台；</li>
+<li><strong>开放生态中的依赖协调</strong>：不同作者编写的插件可以通过 coeffect 连接，而不需要共享内部实现。</li>
+</ol>
+<p>Koishi 中的插件可以被单独禁用，插件效果会在原地撤销；开发时，HMR 可以重新应用修改过的插件，同时保留系统其他部分的连接和状态。</p>
+<p>不过，论文也承认这不是一个受控的性能实验：证据来自单一生态和单一 TypeScript 实现，尚没有和传统插件框架做系统性的开销或开发效率对比。</p>
+<h2 id="九把这套模型放进-agent-harness">九、把这套模型放进 Agent harness</h2>
+<p>可以把一个 Agent harness 抽象成下面的依赖图：</p>
+<p>memory-provider ─────┐</p>
+<p>search-provider ─────┼──&gt; planner / executor</p>
+<p>permission-provider ─┘</p>
+<p>│</p>
+<p>└──&gt; tool registry / sub-agent coordinator</p>
+<p>在这个模型里：</p>
+<ul>
+<li>工具注册、事件监听、会话句柄是 revertible effects；</li>
+<li>memory、search、permission 是 coeffects；</li>
+<li>planner 声明自己需要哪些 coeffects；</li>
+<li>provider 变化时，只有受影响的 Agent 组件进入 reload/unload；</li>
+<li>permission 还可以通过 interception 附加只读、路径限制或租户信息；</li>
+<li>service broker 可以让多个工具 provider 共存，并在后台做负载均衡和滚动替换。</li>
+</ul>
+<p>一个更具体的例子是切换向量数据库：</p>
+<ol>
+<li>新数据库 provider 先加载并完成健康检查；</li>
+<li>依赖 <code>memory</code> 的组件解析到新 provider 后重新激活；</li>
+<li>旧 provider 进入 <code>UNLOADING</code>，停止接受新绑定；</li>
+<li>依赖旧 provider 的 teardown 完成；</li>
+<li>旧 provider 撤销连接、注册表和事件监听。</li>
+</ol>
+<p>整个过程不需要重启 Agent 进程，也不需要每个 consumer 自己实现一套“发现 provider 变化”的逻辑。</p>
+<h2 id="十这套方案的边界">十、这套方案的边界</h2>
+<h3 id="101-外部副作用不一定真正可逆">10.1 外部副作用不一定真正可逆</h3>
+<p>论文把系统边界定义得很清楚：只有系统能独占修改、并且能恢复的资源，才属于 context 内部。</p>
+<p>例如：</p>
+<ul>
+<li>打开文件并记录文件描述符，通常可以跟踪；</li>
+<li>创建私有临时文件并删除，通常可以补偿；</li>
+<li>向外部邮箱发出的邮件，无法真正撤回；</li>
+<li>已经发出的支付请求或网络消息，不能靠普通 inverse 消除。</li>
+</ul>
+<p>对于越过边界的 emission，系统只能：</p>
+<ul>
+<li>延迟输出，直到内部状态确定提交；</li>
+<li>提供业务层 compensation，例如退款、撤销订单或发送更正事件。</li>
+</ul>
+<p>所以“完整恢复”不是对整个宇宙状态的承诺，而是对系统边界内、可被重新表示的行为的承诺。</p>
+<h3 id="102-依赖-key-还不够解决版本问题">10.2 依赖 key 还不够解决版本问题</h3>
+<p>形式化模型主要通过 key 身份连接 provider 和 consumer。这会遇到：</p>
+<ul>
+<li>provider 升级后接口漂移；</li>
+<li>不同包使用同名 key 表示不同接口；</li>
+<li>独立构建的组件缺少结构兼容性检查。</li>
+</ul>
+<p>Cordis 当前更多依赖包管理器的 peer dependency。更彻底的方案可能是命名空间 key、版本约束或结构兼容性检查，但语言无关的结构兼容性并不容易定义。</p>
+<h3 id="103-依赖环和组件粒度">10.3 依赖环和组件粒度</h3>
+<p>如果 A 依赖 B、B 又依赖 A，两者的 satisfaction predicate 都无法成立，最终会永久 inactive。工程上需要拆分出更细的 integration component，把双向交互拆成两个单向绑定。</p>
+<p>代价是组件数量和配置复杂度上升。论文建议用组件打包、约定式 wiring 和脚手架工具降低认知成本。</p>
+<h3 id="104-这不是完整的安全沙箱">10.4 这不是完整的安全沙箱</h3>
+<p>依赖声明可以限制组件通过 context 能访问什么，但恶意代码如果直接拿到宿主运行时对象，语言级检查就可能被绕开。</p>
+<p>真正的不可信组件仍然需要隔离进程、独立运行时、WebAssembly 或容器；context 机制负责控制沙箱边界上的依赖桥接。</p>
+<h2 id="十一我的总结">十一、我的总结</h2>
+<p>这篇论文最重要的贡献，不是提出一种新的 Agent 推理算法，而是提出了一种可以支撑动态 Agent 系统的运行时组织方式：</p>
+<p>Effect    = 我对环境做了什么，以及如何撤销</p>
+<p>Coeffect  = 我依赖环境提供什么，以及变化时如何响应</p>
+<p>Context   = 让两者在同一个运行时实体中协作</p>
+<p>Component = 依赖 + 提供 + 可逆效果</p>
+<p>如果把 Agent harness 看作一个可以持续演化的程序，那么它需要的不只是“加载工具”的能力，还需要：</p>
+<ul>
+<li>工具卸载时不泄漏资源；</li>
+<li>provider 替换时不让 consumer 读到混合状态；</li>
+<li>异步 teardown 能被等待；</li>
+<li>部分失败能撤销已经完成的步骤；</li>
+<li>最终状态与从头组装的配置一致。</li>
+</ul>
+<p>这正是论文所谓的 <strong>spatiotemporal composability</strong>：</p>
+<blockquote>
+<p>在时间上，组件可以加入、离开并恢复自己的影响；在空间上，组件可以声明依赖并随依赖拓扑变化自动重组。</p>
+</blockquote>
+<p>论文最后也把自演化 Agent harness 列为下一步验证方向。真正有意思的实验是：让 Agent 自动生成和替换自己的工具、记忆或权限组件，然后观察 Cordis 这类机制能否在高频拓扑变化中维持状态恢复和依赖协调。</p>
+<h2 id="参考">参考</h2>
+<ul>
+<li>Yifan Shi, Wei Zhang, Tianyi Cui, <em>A Programming Paradigm for Spatiotemporal Composability</em>.</li>
+</ul>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <hr>
+<br>
+<p style="font-size: 16px; font-family: 微软雅黑, 黑体, Arial; color: #000">本文是由葡萄城技术开发团队发布，转载请注明出处：<a href="https://www.grapecity.com.cn/" target="_blank">葡萄城官网</a></p>
+<!--p style="font-size: 16px; font-family: 微软雅黑, 黑体, Arial; color: #000">了解企业级低代码开发平台，请前往<a href="https://www.grapecity.com.cn/solutions/huozige" target="_blank">活字格</a>
+</p><p style="font-size: 16px; font-family: 微软雅黑, 黑体, Arial; color: #000">了解可嵌入您系统的在线 Excel，请前往<a href="https://www.grapecity.com.cn/developer/spreadjs" target="_blank">SpreadJS纯前端表格控件</a></p>
+<p style="font-size: 16px; font-family: 微软雅黑, 黑体, Arial; color: #000">了解嵌入式的商业智能和报表软件，请前往<a href="https://www.grapecity.com.cn/solutions/wyn" target="_blank">Wyn Enterprise
+</a></p-->
+
+<br>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-07 09:07">2026-09-07 09:07</span>&nbsp;
+<a href="https://www.cnblogs.com/powertoolsteam">葡萄城技术团队</a>&nbsp;
+阅读(<span id="post_view_count">131</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22868171);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fpowertoolsteam%2Fp%2F22868171&amp;targetId=22868171&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
