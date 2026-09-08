@@ -1,0 +1,486 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Alkaid2077/p/22895168" title="发布于 2026-09-08 19:15">
+    
+
+    <span role="heading" aria-level="2">【手搓 Agent 第2.3关-中】搭建 Agent 进阶能力：Text-to-SQL 数据库查询</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本篇我们继续拓展 Agent 工具生态，聚焦结构化数据交互能力，实现完整的 Text-to-SQL 工具体系。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>上一关我们成功落地了安全可控的文件读写工具，让 Agent 实现了非结构化文本的整理、输出与持久化，具备了内容沉淀的基础能力。但在企业级业务场景中，绝大多数核心业务数据均存储在数据库中，结构化数据的查询与分析，是 Agent 落地业务场景的核心刚需。</p>
+<p>依托前期搭建的工具注册中心架构，本篇我们继续拓展 Agent 工具生态，聚焦结构化数据交互能力，实现完整的 Text-to-SQL 工具体系。通过动态数据库结构探测、智能 SQL 语句生成、高危操作安全拦截、只读权限隔离等全套能力，让 Agent 可以理解自然语言、自动转换 SQL、安全查询数据库数据，彻底打通大模型与业务数据库的交互壁垒。</p>
+<h1 id="一阶段二text-to-sql数据库查询">一、阶段二：Text-to-SQL（数据库查询）</h1>
+<h2 id="1-思路">1. 思路</h2>
+<p>因为之前已经编写了工具注册中心，因此只需要按照固定模板顺序书写代码就可以：安全校验函数 → main 业务函数 → function schema → 注册进注册中心，同步追加到 tools 数组。以后添加新函数也可以按照这个流程添加。</p>
+<p>注意，在将 Agent 连接到 SQL 数据库的过程中，我们需要考虑：</p>
+<ol>
+<li>如何让 Agent 能够读取数据库的表头；</li>
+<li>如何让 Agent 保持只读权限，避免它删改数据库，造成损失；</li>
+<li>如何让 Agent 理解 SQL 的错误回传，并在这个过程中避免数据泄露；</li>
+<li>如何使用模拟 SQL 数据库进行测试。</li>
+</ol>
+<h2 id="2-数据库读取工具主流程">2. 数据库读取工具主流程</h2>
+<h3 id="环境导入与全局执行器初始化">环境导入与全局执行器初始化</h3>
+<p>我们需要先整一个 SQL 模拟测试环境，方便后期验证我们的 SQL 工具是否可用。因此，在第一步我们先把两个 Mock 执行器搬进主程序，然后在全局创建一个执行器实例，供后续工具函数直接使用。</p>
+<p>考虑到代码整洁问题，我们希望主程序只负责 Agent 逻辑。因此，我们计划把数据库的细节隔离在单独文件，也方便未来如果写第二个 Agent 可以直接 <code>import</code> 导入。所以，我们在同目录下新建一个 python 文件，命名为 <code>db_executors.py</code>。</p>
+<p>我们在<code>db_executors.py</code>里进行如下操作：</p>
+<p><strong>导入依赖库</strong>：</p>
+<pre><code class="language-python">import sqlite3
+import logging
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+</code></pre>
+<p><strong>加入日志调用</strong>：</p>
+<p>这样，当 <code>db_executors.py</code> 内部发生数据库连接错误、SQL执行异常时，日志标签会显示 <code>db_executors - ERROR</code>，精准定位问题。这行代码的唯一且不可替代的作用，就是让这条日志记录<strong>带上产生它的文件名/模块名</strong>。如果不写这句，那 <code>logging.info</code> 会自动使用根日志器，打印出来的文件名永远都是 <code>"root"</code>。如果你有多个文件报错，就区分不了了。</p>
+<pre><code class="language-python">logger = logging.getLogger(__name__)
+</code></pre>
+<p>也需要在主程序里也加上这一行，目的也是为了打标签。这样，当你的 Agent 调用工具失败、大模型超时等逻辑出问题时，日志标签显示 <code>__main__</code> 或者主程序代码的文件名 ，方便区分是“主流程报错”还是“数据库模块报错”。</p>
+<p>另外，主程序的末尾代码中还需要插入以下代码，从而打印<strong>所有触发了日志记录的报错</strong>。之后，无论是主循环里的 <code>logger.error</code>，还是 <code>db_executors</code> 里的 <code>logger.exception</code>，<strong>全部都会打印出来</strong>，且都带时间、模块名。</p>
+<pre><code class="language-python">if __name__ == "__main__":
+    # 插入日志全局配置（放在对话循环开始之前）
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+</code></pre>
+<p><strong>加入执行器类</strong>：</p>
+<p>在 <code>db_executors.py</code> 中加入三个类：</p>
+<ol>
+<li><strong><code>BaseDbExecutor</code>（抽象基类）</strong></li>
+</ol>
+<p>这是数据库执行器抽象接口，是执行器的核心，可以实现测试/正式环境解耦。它规定：任何想充当“数据库执行器”的类，<strong>必须</strong>实现一个 <code>run_sql</code> 方法，且输入 <code>sql</code> 字符串，输出固定格式的字典。</p>
+<p>这样，不管你是连 MySQL、SQLite 还是只做假数据，只要遵守这个规定，<code>text_to_sql_main</code> 就能放心调用，无需关心底层细节。</p>
+<pre><code class="language-python">class BaseDbExecutor(ABC):
+    @abstractmethod
+    def run_sql(self, sql: str) -&gt; Dict[str, Any]:
+        """
+        执行sql，统一返回格式 {"success":bool, "data":list, "err_msg":str}
+        """
+        pass
+</code></pre>
+<ol start="2">
+<li><strong><code>MockNoRunExecutor</code>（纯假执行器）</strong></li>
+</ol>
+<p>这是第一个用于测试的纯Mock，不真正执行SQL，只返回生成的SQL文本。它被用于<strong>调试 Prompt</strong>。当你只想看大模型生成的 SQL 语法对不对、逻辑合不合理，又不想真正查库浪费资源时，用这个。</p>
+<pre><code class="language-python">class MockNoRunExecutor(BaseDbExecutor):
+    def run_sql(self, sql: str) -&gt; Dict[str, Any]:
+        return {
+            "success": True,
+            "data": [],
+            "err_msg": "",
+            "generated_sql": sql # 关键：把生成的SQL原样返回
+        }
+</code></pre>
+<ol start="3">
+<li><strong><code>MockMemorySqliteExecutor</code>（内存真实执行器）</strong></li>
+</ol>
+<p>这个类用来<strong>真的执行 SQL</strong>。因为是内存库，运行速度快，且不会污染硬盘。完美地模拟了真实数据库环境，适合用来验证“安全拦截是否生效”、“结果格式化是否正确”。</p>
+<pre><code class="language-python">class MockMemorySqliteExecutor(BaseDbExecutor):
+    def __init__(self):
+        self.conn = sqlite3.connect(":memory:") # 在内存中创建数据库，进程结束即销毁
+        self._init_test_table() # 建表并插入示例数据
+
+    def _init_test_table(self):
+        # 初始化模拟业务表，仅用于测试
+        cur = self.conn.cursor()
+        cur.execute("""
+        CREATE TABLE sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_name TEXT,
+            sale_amount REAL,
+            sale_date TEXT
+        )
+        """)
+        test_data = [
+            ("手机", 12000.0, "2025-08-01"),
+            ("电脑", 25000.0, "2025-08-02"),
+            ("手机", 9000.0, "2025-08-10"),
+        ]
+        cur.executemany("INSERT INTO sales(product_name, sale_amount, sale_date) VALUES (?,?,?)", test_data)
+        self.conn.commit()
+
+    def run_sql(self, sql: str) -&gt; Dict[str, Any]:
+        try:
+            cur = self.conn.cursor()
+            cur.execute(sql)
+            rows = cur.fetchall()
+            cols = [i[0] for i in cur.description]
+            result_data = [dict(zip(cols, row)) for row in rows]
+            return {"success": True, "data": result_data, "err_msg": ""}
+        except Exception as e:
+            logger.exception("内存sqlite执行异常")
+            return {"success": False, "data": [], "err_msg": str(e)}
+</code></pre>
+<p>然后我们回到我们的 Agent 主程序，导入我们的三个类，并初始化数据库执行器。由于 Python 会按照固定顺序在 <code>sys.path</code> 列表（<strong>包含被运行脚本的目录</strong>）中逐级查找，因此只要我们把 <code>db_executors.py</code> 放在主代码的同级目录下，python 就可以直接找到。</p>
+<pre><code class="language-python">from db_executors import MockMemorySqliteExecutor
+db_executor = MockMemorySqliteExecutor()
+</code></pre>
+<p>此时，当你运行主程序时，<code>db_executor</code> 对象已经被创建，它内部自带一张 <code>sales</code> 表和 3 条测试数据。此时虽然还没注册工具，但这个“数据库沙箱”已经准备就绪，随时可以接受 <code>run_sql</code> 调用。</p>
+<p>之后如果想替换成真实的数据库，只需要更改 <code>db_executors.py</code> 文件中的类，比如<code>class RealMysqlExecutor...</code>，然后把这行全局变量的代码改成 <code>db_executor = RealMysqlExecutor()</code> 就可以。</p>
+<h3 id="数据库-schema-获取机制">数据库 Schema 获取机制</h3>
+<p>在真正与数据库相连接、执行 SQL 工具时，必须先知道数据库都有哪些表头，这样 Agent 才能把自然语言转换成 SQL。比如表头有<code>sales</code>，<code>product_name</code>，<code>sale_amount</code>，如果大模型不知道这些表头，它写 SQL 语言时可能会猜测有字段是 <code>products</code>，<code>price</code>等，这样写出的 SQL 就找不到正确的表头了。</p>
+<p>所以我们需要一个函数 <code>get_schema</code>，去告诉 Agent 这个数据库里有哪些表，每张表有哪些字段。</p>
+<p>由于这件事的本质是“和数据库交流”，因此，我们把这个函数放进文件 <code>db_executors.py</code>。</p>
+<p><strong>抽象基类</strong>：</p>
+<p>在 <code>class BaseDbExecutor(ABC)</code> 里加入函数：</p>
+<pre><code class="language-python">    @abstractmethod
+    def get_schema(self) -&gt; str:
+        """
+        获取数据库的表和字段信息，供LLM生成SQL时参考
+        """
+        pass
+</code></pre>
+<p>此时，<code>BaseDbExecutor</code> 规定：以后所有数据库执行器，都必须会 <code>run_sql()</code> 和 <code>get_schema()</code>。</p>
+<p><strong>纯假执行器</strong>：</p>
+<p>在 <code>MockNoRunExecutor</code> 里加入函数：</p>
+<pre><code class="language-python">    def get_schema(self) -&gt; str:
+        return """
+Table: sales
+Columns:
+- id
+- product_name
+- sale_amount
+- sale_date
+"""
+</code></pre>
+<p>注意这里的 Schema 是<strong>假的、写死的</strong>，因为 <code>MockNoRunExecutor</code> 本身就是假的。</p>
+<p><strong>内存真实执行器</strong>：</p>
+<p>在 <code>class MockMemorySqliteExecutor(BaseDbExecutor)</code>里加入函数：</p>
+<pre><code class="language-python">    def get_schema(self) -&gt; str:
+        cur = self.conn.cursor()
+
+        # 第一步：查询数据库中有哪些表
+        cur.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table'
+        AND name NOT LIKE 'sqlite_%'
+        """)
+
+        tables = cur.fetchall()
+
+        schema_parts = []
+
+        # 第二步：逐张表读取字段
+        for table_row in tables:
+            table_name = table_row[0]
+
+            cur.execute(f"PRAGMA table_info({table_name})")
+            columns = cur.fetchall()
+
+            column_names = [column[1] for column in columns]
+
+            schema_text = (
+                f"Table: {table_name}\n"
+                f"Columns:\n"
+                + "\n".join(f"- {name}" for name in column_names)
+            )
+
+            schema_parts.append(schema_text)
+
+        # 第三步：把所有表的信息拼起来
+        return "\n\n".join(schema_parts)
+</code></pre>
+<p>这里我们连接的都是模拟数据库，以后连接真实的数据库（比如 MySQL），可以再写一个函数：</p>
+<pre><code class="language-python">class RealMysqlExecutor(BaseDbExecutor): ...
+</code></pre>
+<p>然后在里面实现 <code>run_sql()</code>、<code>get_schema()</code>。主程序调用不变。</p>
+<h3 id="安全校验函数">安全校验函数</h3>
+<p>针对 SQL 工具，我们需要检查 Agent 传入工具的参数是否合法。的问题是：</p>
+<ol>
+<li>query 是否为空，且 query 必须是字符串；</li>
+<li>table_list 格式是否合法；</li>
+<li>limit 是否为合法整数，并限制在 1~50。</li>
+</ol>
+<pre><code class="language-python">def text_to_sql_security_check(
+    query: str,
+    table_list=None,
+    limit: int = 10,
+    **kwargs
+) -&gt; Optional[str]:
+
+    # 1. 检查 query
+    if not isinstance(query, str):
+        return "query 必须是字符串"
+    if not query.strip():
+        return "query 不能为空"
+
+    # 2. 检查 table_list
+    if table_list is not None:
+        if not isinstance(table_list, list):
+            return "table_list 必须是列表"
+
+        for table_name in table_list:
+            if not isinstance(table_name, str):
+                return "table_list 中的表名必须是字符串"
+            if not table_name.strip():
+                return "table_list 中不能包含空表名"
+
+    # 3. 检查 limit
+    if not isinstance(limit, int):
+        return "limit 必须是整数"
+    if limit &lt; 1:
+        return "limit 不能小于 1"
+    if limit &gt; 50:
+        return "limit 最大只能为 50"
+
+    return None
+</code></pre>
+<h3 id="sql-读取主函数">SQL 读取主函数</h3>
+<p><strong>主程序调用：</strong></p>
+<p>在主程序里引用 <code>db_executors.py</code> 里获取数据库：</p>
+<pre><code class="language-python">def text_to_sql_main(
+    query: str,
+    table_list=None,
+    limit: int = 10
+) -&gt; str:
+    """
+    将用户自然语言查询转换为 SQL，
+    执行只读数据库查询，并返回结果。
+    """
+    db_schema = db_executor.get_schema()
+</code></pre>
+<p><strong>构造 SQL Prompt</strong>：</p>
+<p>这个 Prompt 不是给主 Agent 的，而是给负责生成 SQL 的这一次 LLM 调用的。</p>
+<pre><code class="language-python">    sql_prompt = f"""
+你是一名专业的 SQLite SQL 生成助手。
+
+当前数据库结构如下：
+
+{db_schema}
+
+用户查询：
+{query}
+
+要求：
+1. 只能生成 SELECT 查询。
+2. 禁止生成 INSERT、UPDATE、DELETE、DROP、ALTER、CREATE、REPLACE、TRUNCATE 等修改数据库的语句。
+3. 只能使用数据库 Schema 中真实存在的表名和字段名。
+4. 如果用户指定了查询表，应优先限制在指定表范围内。
+5. 查询结果最多返回 {limit} 行。
+6. 只输出 SQL 语句，不要输出解释、Markdown、代码块或其他文字。
+"""
+
+    # 如果 Agent 传入了 table_list，就把限制追加到 Prompt 中
+    if table_list:
+        sql_prompt += f"""
+
+允许查询的表：
+{", ".join(table_list)}
+"""
+</code></pre>
+<p>然后调用 LLM，将自然语言转换为 SQL。</p>
+<pre><code class="language-python">    response = client.chat.completions.create(
+        model=Model_ID,
+        messages=[
+            {
+                "role": "system",
+                "content": "你只负责把自然语言转换成安全、只读的 SQLite SQL。"
+            },
+            {
+                "role": "user",
+                "content": sql_prompt
+            }
+        ],
+        timeout=30
+    )
+
+    if not response.choices:
+        raise Exception("Text-to-SQL 模型返回空结果")
+
+    generated_sql = response.choices[0].message.content.strip()
+
+    print(f"\n[Text-to-SQL] LLM 生成 SQL：\n{generated_sql}")
+</code></pre>
+<p><strong>清理模型</strong>：</p>
+<p>为了避免有时模型返回会同步返回 Markdown 格式的外壳，我们需要清理一下模型。</p>
+<pre><code class="language-python">    generated_sql = generated_sql.replace("```sql", "")
+    generated_sql = generated_sql.replace("```SQL", "")
+    generated_sql = generated_sql.replace("```", "")
+    generated_sql = generated_sql.strip()
+</code></pre>
+<p><strong>第二层安全检查</strong>：</p>
+<p>这里还有第二层的安全检查，为了 SQL 不是以 <code>SELECT</code> 开头，直接拒绝。</p>
+<pre><code class="language-python">    sql_upper = generated_sql.upper().strip()
+
+    if not sql_upper.startswith("SELECT"):
+        return f"SQL安全拦截：只允许 SELECT 查询，模型生成了：{generated_sql}"
+
+    forbidden_keywords = [
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "DROP",
+        "ALTER",
+        "CREATE",
+        "REPLACE",
+        "TRUNCATE",
+        "ATTACH",
+        "DETACH"
+    ]
+
+    for keyword in forbidden_keywords:
+        if re.search(rf"\b{keyword}\b", sql_upper):
+            return f"SQL安全拦截：检测到危险关键词 {keyword}"
+</code></pre>
+<p>如果模型没有主动加 LIMIT，为了防止返回数据太多，我们自动补一个。</p>
+<pre><code class="language-python">    if not re.search(r"\bLIMIT\b", sql_upper):
+        generated_sql = generated_sql.rstrip(";")
+        generated_sql += f" LIMIT {limit};"
+
+    print(f"[Text-to-SQL] 最终执行 SQL：\n{generated_sql}")
+</code></pre>
+<p><strong>调用并返回</strong>：</p>
+<p>最后，我们再调用之前的 <code>db_executors</code> 文件并返回数据。</p>
+<pre><code class="language-python">    result = db_executor.run_sql(generated_sql)
+
+    if result.get("success"):
+        return json.dumps(
+            {
+                "generated_sql": generated_sql,
+                "data": result.get("data", [])
+            },
+            ensure_ascii=False,
+            indent=2
+        )
+
+    return f"SQL执行失败：{result.get('err_msg', '未知错误')}"
+</code></pre>
+<h3 id="function-schema">function schema</h3>
+<p>在 <code>tools</code> 数组里追加 <code>function schema</code>。</p>
+<pre><code class="language-python">{
+    "type": "function",
+    "function": {
+        "name": "text_to_sql",
+        "description": "根据用户的自然语言问题查询数据库，仅支持只读SELECT查询",
+        "parameters": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "需要查询数据库的自然语言问题"
+                },
+                "table_list": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "可选，限定允许查询的数据库表"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回结果最大行数，默认10，最大50",
+                    "default": 10
+                }
+            }
+        }
+    }
+}
+</code></pre>
+<h3 id="将数据库工具注册到注册中心">将数据库工具注册到注册中心</h3>
+<pre><code class="language-python">registry.register(
+    name="text_to_sql",
+    schema=text_to_sql_schema,
+    main_func=text_to_sql_main,
+    security_check=text_to_sql_security_check
+)
+tool_registry.register("text_to_sql", text_to_sql_main, text_to_sql_security_check)
+</code></pre>
+<h2 id="3-测试">3. 测试</h2>
+<p>可以新建一个 <code>test.py</code> 测试文件，依次测试：</p>
+<ol>
+<li>安全校验函数是否可以拦截非法字段</li>
+</ol>
+<pre><code class="language-python">from multi_tool import text_to_sql_security_check
+
+print("测试1：正常参数")
+print(
+    text_to_sql_security_check(
+        query="查询手机销售额",
+        table_list=["sales"],
+        limit=10
+    )
+)
+
+print("测试2：query为空")
+print(
+    text_to_sql_security_check(
+        query="",
+        table_list=["sales"],
+        limit=10
+    )
+)
+
+print("测试3：limit太大")
+print(
+    text_to_sql_security_check(
+        query="查询手机销售额",
+        table_list=["sales"],
+        limit=100
+    )
+)
+
+print("测试4：table_list格式错误")
+print(
+    text_to_sql_security_check(
+        query="查询手机销售额",
+        table_list="sales",
+        limit=10
+    )
+)
+</code></pre>
+<ol start="2">
+<li>用不同问题测试主循环 SQL 工具是否可以正常调用</li>
+</ol>
+<pre><code class="language-python">from multi_tool import text_to_sql_main
+
+result = text_to_sql_main(
+    query="查询所有销售记录",
+    limit=10
+)
+
+print(result)
+</code></pre>
+<pre><code class="language-python">from multi_tool import text_to_sql_main
+
+result = text_to_sql_main(
+    query="手机的总销售额是多少？"
+)
+
+print(result)
+</code></pre>
+<p>然后就可以运行主程序文件，用自然语言交互尝试。</p>
+<ol start="3">
+<li>测试安全校验函数是否有效</li>
+</ol>
+<p>输入prompt：删除 'sales' 表。</p>
+<p>此时模型应该返回说它没有权限，只支持只读的 SELECT 查询。</p>
+<h1 id="二本篇总结--下期预告">二、本篇总结 &amp; 下期预告</h1>
+<p>本篇我们完成了 Text-to-SQL 全套工具的落地，为 Agent 赋予了结构化数据库查询能力。通过双工具架构实现库表结构探测与智能 SQL 查询分离，搭配严格的安全拦截、只读账号隔离、错误信息回传机制，既实现了自然语言转 SQL 的智能化交互，又规避了数据库误操作、高危指令执行等生产风险，让 Agent 安全、高效地对接企业结构化业务数据。</p>
+<p>至此，Agent 已具备信息检索、联网搜索、文档输出、数据库查询四大核心能力。下一关我们将攻坚 Stage 2 工具模块最高难度、最高风险的核心能力——代码沙箱执行工具，让 Agent 拥有自主编写、运行、调试代码的独立运算能力。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-08 19:16">2026-09-08 19:15</span>&nbsp;
+<a href="https://www.cnblogs.com/Alkaid2077">Alkaid2077</a>&nbsp;
+阅读(<span id="post_view_count">28</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22895168);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FAlkaid2077%2Fp%2F22895168&amp;targetId=22895168&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
