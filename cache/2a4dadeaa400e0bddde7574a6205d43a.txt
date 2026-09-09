@@ -1,0 +1,177 @@
+
+    <a name="top"></a>
+    <h2><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/jyzhao/p/22899083" title="发布于 2026-09-09 07:09">
+    
+
+    <span role="heading" aria-level="2">进程都杀了，为什么 `netstat` 还能看到端口？</span>
+    
+
+</a>
+</h2>
+    <small>
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-09 07:09">2026-09-09 07:09</span>&nbsp;
+<a href="https://www.cnblogs.com/jyzhao">AlfredZhao</a>&nbsp;
+阅读(<span id="post_view_count">129</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22899083);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjyzhao%2Fp%2F22899083&amp;targetId=22899083&amp;targetType=0" target="_blank">举报</a>
+</small>
+    <div class="entry">
+        <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>在运维和开发过程中，你可能也遇到过类似的“诡异”现象：某个服务占用端口出了问题，你找到它的 PID，执行了 <code>kill -9 &lt;PID&gt;</code> 强制杀掉进程。但当再次用 <code>netstat</code> 或 <code>ss</code> 检查时，却发现该端口依然留在列表中：</p>
+<pre><code class="language-bash">$ netstat -anop | grep 8000
+tcp  0  1 [已脱敏IP]:8000  [已脱敏IP]:23331  FIN_WAIT1  -  on (0.15/1/0)
+tcp  0  1 [已脱敏IP]:8000  [已脱敏IP]:24535  FIN_WAIT1  -  on (0.18/1/0)
+</code></pre>
+<p>进程明明已经死了（PID 变成了 <code>-</code>），为什么端口连接还在？这个 <code>FIN_WAIT1</code> 到底是什么？在这些 <code>FIN_WAIT1</code> 连接消失之前，其他程序还能使用这个端口吗？本文将为你揭开 TCP 连接生命周期与操作系统内核接管机制的幕后真相。</p>
+<h2 id="01--关键概念listen-端口-vs-established-连接">01 | 关键概念：LISTEN 端口 vs ESTABLISHED 连接</h2>
+<p>在解答这个问题之前，首先需要厘清操作系统中的两种网络状态：</p>
+<ol>
+<li><strong>监听端口（LISTEN）</strong>：应用程序通过绑定并监听某个端口，随时准备接收新的连接请求。</li>
+<li><strong>已建立的连接（ESTABLISHED）</strong>：客户端与服务端完成“三次握手”后建立的通信通道。</li>
+</ol>
+<p>当你执行 <code>kill -9</code> 杀掉进程时，<strong>应用程序绑定的 LISTEN 监听端口已经被立刻释放了</strong>。这也是为什么在上面的 <code>netstat</code> 输出中，你再也找不到 <code>[已脱敏IP]:8000 LISTEN</code> 这一行。</p>
+<p>然而，那些<strong>已经建立好的 TCP 连接</strong>，其生命周期并不会随着应用程序的死亡而立刻画上句号。</p>
+<div class="mermaid">flowchart LR
+    subgraph 进程存活时
+        A[应用程序进程] --&gt;|bind + listen| B[LISTEN 监听端口]
+        A --&gt;|accept| C[ESTABLISHED 已建立连接]
+    end
+
+    subgraph kill -9 之后
+        D[应用程序进程已死] -.-&gt;|立即释放| E[LISTEN 监听端口消失]
+        D -.-&gt;|内核接管 Socket 句柄| F[ESTABLISHED 连接转为 FIN_WAIT1]
+    end
+
+    B --&gt; E
+    C --&gt; F
+</div><h2 id="02--什么是-fin_wait1">02 | 什么是 <code>FIN_WAIT1</code>？</h2>
+<p><strong>全称</strong>：Finish Wait 1（终止等待 1 状态），标准写法为 <code>FIN_WAIT_1</code>。</p>
+<p>TCP 是一种面向连接的、可靠的传输层协议。为了保证数据传输的完整性，不管服务是正常退出还是崩溃被杀，TCP 必须通过“四次挥手”来优雅地关闭连接。</p>
+<ul>
+<li><strong>原理</strong>：当一方（这里是你的宿主机内核）决定主动关闭连接时，会向对端发送一个 <strong>FIN</strong> 数据包，表示“我没有数据要继续发送了，请求断开连接”。</li>
+<li><strong>定义</strong>：发出 <code>FIN</code> 包之后、收到对方回应的 <strong>ACK</strong> 确认包之前，这个 TCP 连接在本地操作系统内部所处的状态就被称为 <strong><code>FIN_WAIT1</code></strong>。</li>
+</ul>
+<div class="mermaid">stateDiagram-v2
+    [*] --&gt; ESTABLISHED: 三次握手完成
+    ESTABLISHED --&gt; FIN_WAIT1: 主动发送 FIN 包
+    FIN_WAIT1 --&gt; FIN_WAIT2: 收到对端 ACK 确认
+    FIN_WAIT1 --&gt; FIN_WAIT1: 未收到 ACK，指数退避重传
+    FIN_WAIT2 --&gt; TIME_WAIT: 收到对端 FIN 包
+    TIME_WAIT --&gt; [*]: 等待 2MSL 后关闭
+</div><h2 id="03--幕后主使linux-内核接管了断开流程">03 | 幕后主使：Linux 内核接管了断开流程</h2>
+<p>当进程被 <code>kill -9</code> 强制杀死时，发生了以下过程：</p>
+<ol>
+<li><strong>内核接管</strong>：应用程序死亡后，操作系统内核会自动接过该进程拥有的所有 TCP Socket 句柄。</li>
+<li><strong>发送 FIN 包</strong>：内核主动向网络对端发送一个带有 <code>FIN</code> 标志位的数据包，告诉对方：“我这边要关闭连接了”。</li>
+<li><strong>卡在 <code>FIN_WAIT1</code> 的原因</strong>：如果对端是公网上的恶意扫描器、发生了网络丢包、或者对端主机宕机，对方就不会正常回应 <code>ACK</code>。Linux 内核会启动指数退避重传机制（如 netstat 中的 <code>on (0.15/1/0)</code>），在重传超时之前，连接会一直处于 <code>FIN_WAIT1</code> 状态。</li>
+</ol>
+<div class="mermaid">sequenceDiagram
+    participant App as 应用程序 (PID)
+    participant Kernel as Linux 内核
+    participant Client as 外部客户端
+
+    App-&gt;&gt;Kernel: 进程被 kill -9 杀死
+    Kernel-&gt;&gt;Kernel: 接管所有 TCP Socket 句柄
+    Kernel-&gt;&gt;Client: 发送 FIN 包（主动关闭连接）
+    alt 客户端正常响应
+        Client--&gt;&gt;Kernel: 回应 ACK 确认包
+        Kernel-&gt;&gt;Kernel: 连接进入 FIN_WAIT2，继续完成四次挥手
+    else 客户端无响应（丢包/宕机/恶意扫描器）
+        Client--xKernel: 无 ACK 回应
+        Kernel-&gt;&gt;Kernel: 指数退避重传 FIN 包&lt;br/&gt;netstat 显示 on (0.15/1/0)
+        Note over Kernel: 连接暂时卡在 FIN_WAIT1&lt;br/&gt;直到重传超时后强制销毁
+    end
+</div><h2 id="04--fin_wait1-没消失其他程序能用这个端口吗">04 | <code>FIN_WAIT1</code> 没消失，其他程序能用这个端口吗？</h2>
+<p><strong>结论：在开启 <code>SO_REUSEADDR</code> 的情况下，通常可以正常绑定，不会报错！</strong></p>
+<p>很多人的误区在于把“连接状态”和“监听端口”混为一谈了，担心启动新程序会报 <code>Address already in use</code>（地址已被占用）的错误。实际上不会，原因如下：</p>
+<ol>
+<li><strong>端口“监听权”已经释放</strong>：报“端口被占用”错误的常见原因是有另一个进程正在 <code>LISTEN</code> 状态下占用该端口；此外，若未开启 <code>SO_REUSEADDR</code>，处于 <code>TIME_WAIT</code> 等状态的残余连接也可能导致绑定失败。杀掉原进程后，<code>LISTEN</code> 句柄已被立即释放，残留的 <code>FIN_WAIT1</code> 只是连接在做收尾清理，并不占据端口的“监听权”。</li>
+<li><strong><code>SO_REUSEADDR</code> 机制保障</strong>：多数现代 Web 框架（如 FastAPI、Uvicorn、Spring Boot、Nginx 等）在创建端口监听时，默认会开启系统级的 <strong><code>SO_REUSEADDR</code></strong> 选项，但具体行为需以所用框架和版本为准。这个选项告诉操作系统：“只要没有其他进程在 LISTEN，即便该端口上还有处于挥手/清理状态（如 <code>FIN_WAIT1</code>、<code>TIME_WAIT</code>）的残余连接，也允许新程序直接绑定并监听该端口。”</li>
+</ol>
+<div class="mermaid">flowchart TD
+    A[新程序尝试绑定端口 8000] --&gt; B{是否有进程在 LISTEN?}
+    B --&gt;|是| C[报错 Address already in use]
+    B --&gt;|否| D{端口上是否存在残余连接?&lt;br/&gt;FIN_WAIT1 / TIME_WAIT}
+    D --&gt;|是, 但已开启 SO_REUSEADDR| E[允许绑定，新程序正常启动]
+    D --&gt;|否| F[允许绑定，新程序正常启动]
+    C --&gt; G[需要先处理占用端口的进程]
+    E --&gt; H[✅ 新服务正常运行]
+    F --&gt; H
+</div><h2 id="05--总结">05 | 总结</h2>
+<table>
+<thead>
+<tr>
+<th>疑问 / 现象</th>
+<th>幕后真相</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>为什么 PID 变成了 <code>-</code>？</strong></td>
+<td>进程已死，连接当前由 Linux 内核接管维护。</td>
+</tr>
+<tr>
+<td><strong><code>FIN_WAIT1</code> 是什么？</strong></td>
+<td>Finish Wait 1（标准写法 <code>FIN_WAIT_1</code>），内核已发出断开请求（<code>FIN</code>），正在等待对端回应 <code>ACK</code> 的中间状态。</td>
+</tr>
+<tr>
+<td><strong>会阻塞新程序启动吗？</strong></td>
+<td><strong>通常不会。</strong> <code>LISTEN</code> 状态已释放，在开启 <code>SO_REUSEADDR</code> 的情况下，新程序可以立刻绑定该端口。</td>
+</tr>
+<tr>
+<td><strong>需要手动处理吗？</strong></td>
+<td>通常不需要。内核重传超时后会自动强制销毁，一般不会永久占用资源。</td>
+</tr>
+</tbody>
+</table>
+<div class="mermaid">flowchart LR
+    subgraph 现象
+        A[kill -9 杀掉进程] --&gt; B[netstat 仍显示端口连接]
+        B --&gt; C[PID 显示为 -]
+        B --&gt; D[状态为 FIN_WAIT1]
+    end
+
+    subgraph 原因
+        E[LISTEN 监听端口已立即释放] --&gt; F[新程序可正常绑定端口]
+        G[内核接管已建立的 TCP 连接] --&gt; H[主动发送 FIN 包等待 ACK]
+        H --&gt; I[对端无响应时卡在 FIN_WAIT1]
+    end
+
+    subgraph 结果
+        J[不会报 Address already in use]
+        K[内核重传超时后自动清理]
+        L[无需手动干预]
+    end
+
+    A --&gt; E
+    A --&gt; G
+    B --&gt; I
+    F --&gt; J
+    I --&gt; K
+    K --&gt; L
+</div><p>下次再遇到杀掉进程后 <code>netstat</code> 里残留 <code>FIN_WAIT1</code> 连接的情况，不用惊慌，直接启动你的新服务即可，这正是 Linux 内核网络协议栈在默默履行其可靠传输职责的表现。</p>
+<p>关注我，和AI一起成长~</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <a href="https://www.cnblogs.com/jyzhao/" target="_blank">AlfredZhao</a>©版权所有「从Oracle起航，领略精彩的IT技术。」<br>
+转载请注明原文链接：<a href="https://www.cnblogs.com/jyzhao/p/22899083" target="_blank">https://www.cnblogs.com/jyzhao/p/22899083</a>
+<hr>
+<div style="text-align:center; margin-top:30px;">
+  <p style="font-size:14px;color:#555;">
+    👋 感谢阅读，欢迎关注我的公众号 <b>「赵靖宇」</b>
+  </p>
+  <img src="https://images.cnblogs.com/cnblogs_com/jyzhao/824234/o_250208075013_qrcode-zjy.jpg" width="160" style="border:1px solid #ddd;border-radius:8px;">
+</div>
+</div>
+<div class="clear"></div>
+
+        <div class="clear"></div>
+        
+</div>
+    <ul class="postmetadata">
+        <vc:categories-tags blog-app="jyzhao" blog-id="186567" post-id="22899083"></vc:categories-tags>
+    </ul>

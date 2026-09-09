@@ -1,0 +1,193 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sdcb/p/22900887/20260909-simdpaddleocr-1-2" title="发布于 2026-09-09 09:59">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">ARM64端到端再提速40%：SimdPaddleOCR 1.2 发布！</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>前两天连载了 <a href="https://www.cnblogs.com/sdcb/p/22863347/20260907-simdpaddleocr-intro" target="_blank">SimdPaddleOCR 的发布</a> 和 <a href="https://www.cnblogs.com/sdcb/p/22880800/20260908-csharp-simd-intro" target="_blank">C# 手写向量化的底层逻辑</a>。1.1 版本在 win-x64 上已经基本站稳了脚跟，但短板也很明显：<strong>ARM64 环境下虽然能跑，但速度明显慢了一截。</strong></p>
+<p>现在 ARM64 早就不是小众平台了——MacBook、手机、Windows on ARM 以及越来越多的 Linux ARM 服务器包括国产Linux服务器都在用。在 1.1 里，ARM 属于「x64 调完顺便能跑」的状态；而这次发布的 1.2 版本，我把 ARM64 当成了一等公民来专门优化。</p>
+<p><img src="https://img2024.cnblogs.com/blog/233608/202609/233608-20260909095748232-1420341005.png" alt="image" loading="lazy"></p>
+<p>废话不多说，先看优化结果。为了保证严谨，以下数字全部跑在同一台 GitHub-hosted <strong>linux-arm64（Neoverse N2，<code>CPU part 0xd49</code>）</strong> 机器上，使用 PP-OCRv6 <strong>tiny</strong> 模型，且去掉了首次加载（warmup）的耗时。这是中位墙钟时间对比：</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>1.1 版本</th>
+<th>1.2 版本</th>
+<th>墙钟对比</th>
+<th>吞吐对比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4 worker</td>
+<td>472 ms</td>
+<td><strong>273 ms</strong></td>
+<td><strong>快约 42%</strong></td>
+<td><strong>约 1.73×</strong></td>
+</tr>
+<tr>
+<td>1 worker</td>
+<td>658 ms</td>
+<td><strong>399 ms</strong></td>
+<td><strong>快约 40%</strong></td>
+<td><strong>约 1.65×</strong></td>
+</tr>
+<tr>
+<td>关掉全部硬件加速 (scalar)</td>
+<td>1162 ms</td>
+<td>1159 ms</td>
+<td>基本持平</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>标题里说的「提速 40%」指的就是真实物理机上的这一档表现，不是虚拟机，也不是个别模型的特殊爆发。注意看最后一行 scalar（标量）的对照数据，两者几乎没变，这说明这 40% 的提升纯粹来自于代码层面的 SIMD 优化，而不是因为跑 CI 的机器恰好变快了。</p>
+<h2 id="这-40-是从哪里抠出来的">这 40% 是从哪里抠出来的？</h2>
+<p>我们把推理过程按算子拆开来看（以 N2 机器 tiny 4 worker 为例）。下面是每张图各算子耗时的均值：</p>
+<table>
+<thead>
+<tr>
+<th>核心算子</th>
+<th>1.1 耗时</th>
+<th>1.2 耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conv（合计）</td>
+<td>712 ms</td>
+<td><strong>309 ms</strong></td>
+</tr>
+<tr>
+<td>- 其中 Conv1x1</td>
+<td>469 ms</td>
+<td><strong>176 ms</strong></td>
+</tr>
+<tr>
+<td>- 其中 Conv3x3Stride2</td>
+<td>79 ms</td>
+<td><strong>19 ms</strong></td>
+</tr>
+<tr>
+<td>Depthwise3x3</td>
+<td>30 ms</td>
+<td>27 ms</td>
+</tr>
+<tr>
+<td>MatMul</td>
+<td>77 ms</td>
+<td>71 ms</td>
+</tr>
+<tr>
+<td>Erf</td>
+<td>68 ms</td>
+<td>61 ms</td>
+</tr>
+</tbody>
+</table>
+<p>可以看出，大头全在 <strong>1×1 卷积</strong> 和 <strong>stride-2 的 3×3 卷积</strong> 上。像 MatMul、Erf 和深度卷积几乎没动。昨天那篇文章提到过，C# 可以用同一份源码覆盖 x64 和 ARM。1.2 所做的事情，就是针对 ARM64 的指令集特性，把 <code>AdvSimd</code> 铺进了这两条热点路径里，让 x64 和 ARM 各走各的最优解，互不拖累。</p>
+<h2 id="代码到底改了什么">代码到底改了什么？</h2>
+<p>这里稍微深入一下实现细节。</p>
+<p>1×1 卷积的特点是不看邻域，每个输出通道就是对所有输入通道做加权求和。在检测网络里这种操作极多，所以它占了耗时的半壁江山。</p>
+<p>在 ARM64 上，一个 <code>Vector&lt;float&gt;</code> 一次能装 <strong>4 个相邻像素</strong>。我们每次同时计算 <strong>8 个输出通道</strong>。原本用普通 C# 写的逻辑是这样的：</p>
+<pre><code class="language-csharp">// value 是 4 个像素，w[k] 是第 k 个输出通道的权重标量
+// 每次都要把 w[k] 复制成 [w, w, w, w] 再去乘
+a0 = a0 + value * new Vector&lt;float&gt;(w[0]);
+a1 = a1 + value * new Vector&lt;float&gt;(w[1]);
+// ... 一路加到 a7
+
+</code></pre>
+<p>这在数学上没问题，但慢在「取权重」这一步：8 次标量读内存，每次还要再广播成向量。考虑到输入通道动辄几十上百，这 8 次操作会被循环放大无数倍。</p>
+<p>在 ARM 指令集里，有一条专门干这事的指令，在 C# 里叫 <code>FusedMultiplyAddBySelectedScalar</code>。简单来说，它允许你<strong>不用提前广播标量，指令自己会从权重向量里挑出一个特定的位置（lane）去相乘累加</strong>。</p>
+<p>于是，优化后的代码就变成了这样：一次性加载 8 个权重，然后按需挑拣。</p>
+<pre><code class="language-csharp">Vector128&lt;float&gt; v = value.AsVector128();
+Vector128&lt;float&gt; low = Vector128.Load(weights);      // 一次装入 w0, w1, w2, w3
+Vector128&lt;float&gt; high = Vector128.Load(weights + 4); // 一次装入 w4, w5, w6, w7
+
+// 四个像素一起乘同一个 w0，省去了前面频繁读标量和广播的开销
+a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0.AsVector128(), v, low, 0).AsVector();
+a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1.AsVector128(), v, low, 1).AsVector();
+// a2..a7 依此类推
+
+</code></pre>
+<p>同样的算术题，开销大幅下降（详见 <a href="https://github.com/sdcb/SimdPaddleOCR/blob/main/src/Sdcb.SimdPaddleOCR/Kernels/SimdOps.cs" target="_blank" rel="noopener nofollow"><code>SimdOps.VectorAddMulPacked8</code></a>）。利用 JIT 时常量的特性，不同架构在编译时会自动剥离不需要的分支，做到零运行时开销。</p>
+<p>另一个关键点是 <strong>stride-2 的 3×3 卷积</strong>。特征图要缩小一半，我们需要的是“隔一个取一个”（p0, p2, p4, p6），而不是连续的。如果硬取，会把不需要的像素（p1, p3）也带进来。这里我用到了 ARM 的 <code>UnzipEven</code>，专门用来从两段向量里抽出偶数位：</p>
+<pre><code class="language-csharp">Vector128&lt;float&gt; first  = Vector128.LoadUnsafe(ref source);                 // p0 p1 p2 p3
+Vector128&lt;float&gt; second = Vector128.LoadUnsafe(ref Unsafe.Add(ref source, 4)); // p4 p5 p6 p7
+
+// UnzipEven 直接把偶数位置抽出来，拼成 p0 p2 p4 p6
+return AdvSimd.Arm64.UnzipEven(first, second).AsVector();
+
+</code></pre>
+<p>x64 上对应的等价操作是 <code>Sse.Shuffle</code>。下采样全靠这一手，这也就是为什么表里的 Stride2 耗时能从 79 ms 暴跌到 19 ms。不必在评论区对汇编，看懂这两处优化，这 40% 的提升就落到实处了。</p>
+<h2 id="内存比-openvinonet-更轻量">内存：比 OpenVINO.NET 更轻量</h2>
+<p>光看墙钟时间还不够，作为 OpenVINO.NET 的作者，我知道很多人会拿它来做对比。我们来看看在同一台 <strong>win-x64 / EPYC 7763</strong> 机器上，使用同一套 tiny 模型的表现：</p>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>4 worker 中位墙钟</th>
+<th>工作集峰值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>本库 (SimdPaddleOCR)</td>
+<td>224 ms</td>
+<td><strong>约 790 MB</strong></td>
+</tr>
+<tr>
+<td>OpenVINO.NET</td>
+<td>214 ms (约 0.95×)</td>
+<td><strong>约 2600 MB</strong></td>
+</tr>
+<tr>
+<td>lw.PPOCR.C</td>
+<td>281 ms</td>
+<td>约 586 MB</td>
+</tr>
+</tbody>
+</table>
+<p>OpenVINO.NET 在速度上略快了约 5%，但它的工作集内存是本库的 <strong>三倍</strong>。SimdPaddleOCR 加载后大约上涨 370–380 MB，峰值非常稳定。如果你在意服务器的单机多实例部署成本，或者觉得内存比这 5% 的时间更贵，这个差距绝对值得考虑。（注：ARM64 上本库的峰值大约 847 MB，量级和 Windows 接近。最瘦的依然是纯 C 引擎，但速度较慢。）</p>
+<h2 id="其他变化基础向量化路径也提速了-11">其他变化：基础向量化路径也提速了 11%</h2>
+<p>除了 ARM64 的专属优化，这次版本更新也惠及了旧设备。在关闭 AVX 的情况下，走通用的 <code>Vector&lt;float&gt;</code> 路径，在同一颗 EPYC 7763 上，耗时从 554 ms 下降到了 494 ms，快了约 <strong>11%</strong>。</p>
+<p>至于正确率，大家放心，完全没动。在 100 张合成图的测试集上，依然保持 757/1022 行精确、CER 3.53%，不管你是 x64 还是 ARM64，哪怕是纯标量路径，结果都是严格一致的。</p>
+<p>这次优化过程中，大模型帮了不少忙。我主要利用大模型在热点路径上生成汇编指令参考，辅助理解底层寄存器的运作，最后再自己动手翻译回 C# 向量化代码。模型是非常好的辅助工具，但最终的性能数字，一切以 GitHub Actions 的实测为准。</p>
+<h2 id="开源与本地部署">开源与本地部署</h2>
+<p>SimdPaddleOCR 采用 Apache-2.0 协议开源。它的核心竞争力依然是：<strong>纯托管 C#，无痛跨平台</strong>。不绑 Paddle Inference，不绑 ONNX Runtime，不绑原生 OpenCV，极其适合内网和离线环境部署。</p>
+<p><strong>开源仓库：</strong> <a href="https://github.com/sdcb/SimdPaddleOCR" target="_blank" rel="noopener nofollow">https://github.com/sdcb/SimdPaddleOCR</a></p>
+<p>如果这个项目对你有帮助，欢迎去 GitHub 点个 Star。1.2.0 版本会同步推送到 NuGet，搜索 <code>Sdcb.SimdPaddleOCR</code> 即可。已经在用 1.1 的朋友，直接升级核心包就好。</p>
+<hr>
+<p><strong>前情回顾：</strong></p>
+<ul>
+<li><a href="https://www.cnblogs.com/sdcb/p/22863347/20260907-simdpaddleocr-intro" target="_blank">SimdPaddleOCR发布——一个纯 C# 的完整 OCR 推理库</a></li>
+<li><a href="https://www.cnblogs.com/sdcb/p/22880800/20260908-csharp-simd-intro" target="_blank">C# 手写向量化能追上 C 吗？</a></li>
+</ul>
+<p>欢迎关注我的微信公众号 <strong>.NET骚操作</strong>，或者加入 SimdPaddleOCR 微信交流群：<img src="https://io.starworks.cc:88/cv-public/2026/ocr-wxg-qr.png" alt="" loading="lazy"></p>
+<p><em>(如果微信群二维码过期，请加入 C# / .NET 计算机视觉交流 QQ 群：<strong>579060605</strong>)</em></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-09-09 10:00">2026-09-09 09:59</span>&nbsp;
+<a href="https://www.cnblogs.com/sdcb">.NET骚操作</a>&nbsp;
+阅读(<span id="post_view_count">75</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22900887);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsdcb%2Fp%2F22900887%2F20260909-simdpaddleocr-1-2&amp;targetId=22900887&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
