@@ -1,0 +1,123 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zhangs1986/p/22947591" title="发布于 2026-09-15 08:00">
+    
+
+    <span role="heading" aria-level="2">一次RabbitMQ重启引发的网关雪崩复盘</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img2024.cnblogs.com/blog/273387/202609/273387-20260912170725153-1580399781.png" alt="aafe485de814c29d821bdfedb2695aaf_6dHGAvlTiAAAAAElFTkSuQmCC" loading="lazy"></p>
+<p>晚上生产告警群里突然开始刷屏。网关 Pod 不断重启，有客户反馈操作页面时好时坏，K8s 事件里清一色的：</p>
+<pre><code class="language-Plain">Readiness probe failed: Get "http://192.168.5.1:7888/actuator/health":
+read tcp 192.168.5.90:53038-&gt;192.168.5.1:7888: read: connection reset by peer
+</code></pre>
+<p>打开网关的日志查看原来是MQ连不上，一直在报异常；突然想起来今晚运维在做MQ的升级，评估升级不超过3分钟，但以现在情况看已经超过8分钟；之前提前将management.health.rabbit.enabled 明明已经设成 false 了啊。当时第一反应是：RabbitMQ 重启跟你们的健康检查有什么关系？</p>
+<p>服务框架：线上 Kubernetes 集群跑着一套微服务架构，Spring Cloud Gateway 做网关，base-server 做基础服务，Nacos 做注册中心和配置中心，RabbitMQ 做消息总线。整体跑了几个月，没出过什么大问题。</p>
+<p>直到今晚运维那边的 RabbitMQ 升级做了一次滚动重启。</p>
+<h2 id="排查网关connection-reset-by-peer">排查网关：connection reset by peer</h2>
+<p>先看日志connection reset by peer 说明 TCP 连接被 Pod 内的进程直接拒绝了，内核发的 RST。通常意味着进程要么没启动完，要么根本没能力处理新连接。</p>
+<p>pod的探针路径 /actuator/health，initialDelaySeconds: 40。40 秒的启动延迟，正常情况下绰绰有余。</p>
+<p>但日志里发现了这么一条：</p>
+<pre><code class="language-Plain">logger: c.j.servicemesh.gateway.service.AccessLogService
+msg: access logs save error:{}
+org.springframework.amqp.AmqpIOException: java.io.IOException
+    at org.springframework.amqp.rabbit.core.RabbitAdmin.initialize(RabbitAdmin.java:591)
+    at org.springframework.amqp.rabbit.connection.CachingConnectionFactory.createConnection(...)
+    ...
+    at com.join.servicemesh.gateway.service.AccessLogService.sendLog(AccessLogService.java:186)
+</code></pre>
+<p>AccessLogService.sendLog() 是个 @Async 方法，往 RabbitMQ 发访问日志。RabbitMQ 挂了之后，amqpTemplate.convertAndSend() 不会立刻失败——Spring AMQP 内置了 RetryTemplate，会反复重试等待重连，单次阻塞可以卡 30 到 60 秒。</p>
+<p>这本身没什么，@Async 嘛，在独立线程池里跑，不影响主链路。</p>
+<p><strong>直到我去看了线程池的配置。</strong></p>
+<pre><code class="language-Java">executor.setCorePoolSize(50);
+executor.setMaxPoolSize(100);
+executor.setQueueCapacity(200);
+executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+</code></pre>
+<p>CallerRunsPolicy 看到这四个字的时候，我基本就知道问题出在哪了。</p>
+<p>线程池的执行逻辑是这样的：先创建核心线程（50个），核心线程满了放队列（200个），队列满了继续创建线程直到最大线程数（100个）。当线程和队列全满的时候，触发拒绝策略。</p>
+<p>CallerRunsPolicy 的行为是：<strong>谁提交的任务，谁自己来执行。</strong></p>
+<p>那提交任务的是谁？是 Netty 的 Event Loop 线程。</p>
+<p>于是故障链就清晰了：</p>
+<pre><code class="language-Plain">RabbitMQ 重启
+  → convertAndSend() 阻塞等待重连（30~60秒）
+  → @Async 线程池里 100 个线程全部卡在 RabbitMQ 上
+  → 队列塞满 200 个任务
+  → 再来请求，触发 CallerRunsPolicy
+  → Netty Event Loop 线程亲自执行 sendLog()
+  → Event Loop 线程也被阻塞
+  → 整个网关无法接受任何连接
+  → K8s 探针打过来，收到 RST
+  → connection reset by peer
+</code></pre>
+<p>一个发日志的辅助功能，把整个网关拖死了。</p>
+<p>在基础设施抖动期间，如果连接池恰好被打满，这指示器随便哪个卡一下，health 端点就响应不出来了。10 秒超时一到，K8s 判定 liveness 失败。</p>
+<p>更严重的是 liveness 失败不是摘流量，是<strong>直接重启 Pod</strong>。Pod 重启 → 启动过程中 RabbitMQ 还没恢复 → 又失败 → 无限循环。</p>
+<h2 id="怎么修复">怎么修复</h2>
+<p><strong>第一处，线程池拒绝策略改为 DiscardPolicy。</strong></p>
+<pre><code class="language-Java">executor.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardPolicy());
+</code></pre>
+<p>DiscardPolicy 在线程池满的时候直接丢弃任务，不抛异常，不阻塞调用者。丢几条访问日志无所谓，网关的核心职责是转发请求，不能因为日志发不出去就把自己搞挂了。</p>
+<p>CallerRunsPolicy 适合什么场景？订单处理、支付回调这种任务必须执行的业务。拿它来发日志，属于用大炮打蚊子，还打到了自己脚上。</p>
+<p><strong>第二处，convertAndSend 加 try-catch 隔离。</strong></p>
+<pre><code class="language-Java">try {
+    amqpTemplate.convertAndSend(QueueConstants.QUEUE_ACCESS_LOGS, map);
+} catch (Exception e) {
+    log.warn("access log amqp send failed, will be discarded: {}", e.getMessage());
+}
+</code></pre>
+<p>这是个兜底。即使线程池没满，单个 @Async 线程也不应该在 RabbitMQ 重连上卡太久。catch 住异常，快速释放线程。</p>
+<h2 id="事后复盘">事后复盘</h2>
+<p>1. 辅助功能和核心链路必须物理隔离</p>
+<p>发日志、打埋点、上报指标，这些都是辅助功能。它们的线程池、连接池、超时配置都应该和核心链路隔离开。这次的问题本质上是日志发送的阻塞扩散到了请求转发的主链路。</p>
+<p>2. CallerRunsPolicy 不是万能药</p>
+<p>很多人觉得 CallerRunsPolicy 是个"保险"策略——任务不会丢，还能自动反压。但在异步场景下，它把任务回退到调用者线程执行，如果调用者是 Web 容器的工作线程，那就是在给自己埋雷。选拒绝策略之前，先想清楚"调用者线程被阻塞会怎样"。</p>
+<p>3. 健康探针要越轻越好</p>
+<p>show-details: ALWAYS 是个方便调试的配置，但在生产环境配合 K8s 探针使用，等于给每次健康检查都加了 N 个组件的连通性测试。任何一个组件抖动都可能导致探针超时。探针就应该是"你还活着吗"这种最简问题，不是"你所有零件都好吗"这种全面体检。</p>
+<p>4. 一个 RabbitMQ 重启不应该导致服务雪崩</p>
+<p>RabbitMQ 在这个架构里只承担访问日志投递和消息总线的职责，不是核心链路上的组件。但它的一次重启导致了网关瘫痪，说明系统对非核心依赖的故障隔离做得不够。核心原则：<strong>任何一个非核心组件的故障，都不应该导致核心服务不可用。</strong></p>
+<p>之前网关问题也写过《干货分享Gateway踩坑实录：Netty直接内存把网关吃垮了OutOfDirectMemoryError<br>
+》，不过这次是另一个问题。本次最终改动量很小：拒绝策略、 try-catch。但定位问题的过程，把线程池模型、Netty Event Loop、Spring AMQP 重连机制、K8s 探针行为都过了一遍。有时候修复一个线上问题，改的代码不超过十行，但理解这十行为什么要改，可能需要一整个下午。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div style="background: rgb(230, 250, 230); padding: 10px 10px 10px 10px; border: 1px dashed rgb(224, 224, 224); font-family: 微软雅黑; font-size: 13px">
+作者：<a href="http://www.cnblogs.com/zhangs1986/" target="_blank">一个码农的日常</a>
+<br>公众号【一个码农的日常】
+
+<br>
+出处：<a href="http://zhangs1986.cnblogs.com/" target="_blank">http://zhangs1986.cnblogs.com/</a>
+<br>
+码云：<a href="https://gitee.com/huanzui" target="_blank">https://gitee.com/huanzui</a>
+<br>
+本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须保留此段声明，且在文章页面明显位置给出原文连接，否则保留追究法律责任的权利。
+
+ 
+<div style="position: fixed; right: 140px; bottom: 40px" id="div_diggc">            
+    <div class="diggit" style="height: 25px; background-image: none; color: #FFFFFF; background-color: #2DAEBF; border: medium none; font-weight: bold; text-decoration: none">
+        <span class="diggnum"><a style="color: #FFFFFF; font-size: 12pt" href="#top">Top</a></span>         
+    </div>            
+</div>
+ 
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-15 08:00">2026-09-15 08:00</span>&nbsp;
+<a href="https://www.cnblogs.com/zhangs1986">一个码农的日常</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22947591);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzhangs1986%2Fp%2F22947591&amp;targetId=22947591&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

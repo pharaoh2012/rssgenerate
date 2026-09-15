@@ -1,0 +1,430 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zrui-xyu/p/22960699" title="发布于 2026-09-14 09:40">
+    
+
+    <span role="heading" aria-level="2">高并发下的抽奖系统：不只是扣库存，还要防作弊与风控</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        拆解生产级高并发抽奖系统核心设计！聚焦高并发超卖、黑产作弊、流量雪崩三大难题，详解Redis+Lua原子扣减库存、单次IO完成全校验的高性能方案。搭建端网云三层防作弊风控体系，结合MQ异步削峰、热点Key打散、多级降级容灾机制，解决数据一致性与资损风险，附完整可落地代码，吃透电商营销高并发核心架构。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="高并发抽奖系统全链路设计从防超卖到反作弊">高并发抽奖系统全链路设计：从防超卖到反作弊</h2>
+<blockquote>
+<p>每逢大促、年会、营销活动，"抽奖"几乎是标配。但真正能把抽奖系统做稳的人，远比想象中少。本文从一个真实的高并发抽奖系统出发，从架构分层、库存原子扣减、全链路防作弊、多层风控，到兜底容灾，带你完整拆解一个生产级抽奖系统的设计思路与核心代码。全文干货，建议收藏。</p>
+</blockquote>
+<hr>
+<h2 id="一先想清楚抽奖系统到底在解什么题">一、先想清楚：抽奖系统到底在解什么题？</h2>
+<p>很多人第一反应是"抽奖不就是扣库存吗？"——这恰恰是最危险的误区。</p>
+<p>一个生产级抽奖系统，本质要同时解决<strong>三个核心矛盾</strong>：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">核心矛盾</th>
+<th style="text-align: left">本质问题</th>
+<th style="text-align: left">设计目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left"><strong>高并发库存安全</strong></td>
+<td style="text-align: left">峰值流量下奖品绝对不能超卖、不少发</td>
+<td style="text-align: left">Redis + Lua 原子扣减，异步削峰落库</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>全链路防作弊</strong></td>
+<td style="text-align: left">脚本、羊毛党、设备农场批量刷奖</td>
+<td style="text-align: left">端-网-云三层纵深防御，假中奖兜底</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>多层级风控</strong></td>
+<td style="text-align: left">规则过严误杀用户，过松造成资损</td>
+<td style="text-align: left">实时规则引擎 + 离线大数据，高价值奖品二次复核</td>
+</tr>
+</tbody>
+</table>
+<p>把这三个矛盾想清楚，架构自然就出来了。</p>
+<hr>
+<h2 id="二整体架构流量过滤--风险决策--原子扣库存--异步持久化">二、整体架构：流量过滤 → 风险决策 → 原子扣库存 → 异步持久化</h2>
+<pre><code class="language-text">用户端
+  │
+  ▼
+┌──────────────────────────────┐
+│  接入层：网关 / Nginx          │  ← 限流、鉴权、请求签名、验证码
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  前置校验层                    │  ← 幂等校验、参与次数限制、设备指纹
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  实时风控引擎                  │  ← 规则引擎打分，高风险直接"假中奖"
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  抽奖核心服务                  │  ← 概率匹配 + Redis Lua 原子扣库存
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  消息队列（RocketMQ / Kafka）  │  ← 削峰、异步落库、触发发奖
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│  数据库 / 离线风控平台          │  ← 中奖记录持久化、T+1 聚类分析
+└──────────────────────────────┘
+</code></pre>
+<p><strong>核心思路一句话</strong>：每一层都有防御，层层过滤后，真正到达核心扣库存逻辑的请求已经非常干净。</p>
+<hr>
+<p>关于这个问题的底层原理和更多实战细节，我整理了一份《大厂面试手册》，包含大厂高频面试题、源码解析和性能调优案例。<br>
+关注公众号【Rain的Java大神之路】，回复“Java”即可免费领取，持续更新中。</p>
+<hr>
+<h2 id="三硬核部分高并发库存原子扣减">三、硬核部分：高并发库存原子扣减</h2>
+<h3 id="31-库存预热活动全程不碰数据库">3.1 库存预热：活动全程不碰数据库</h3>
+<p>活动开始前，将所有奖品库存、中奖概率配置全量预热到 Redis：</p>
+<ul>
+<li><code>lottery:stock:{activityId}:{prizeId}</code> — 奖品剩余库存</li>
+<li><code>prize:daily:{prizeId}:{date}</code> — 奖品日发放量</li>
+<li><code>user:daily:win:{uid}:{date}</code> — 用户每日中奖次数</li>
+<li><code>lottery:idempotent:{requestId}</code> — 幂等标记</li>
+</ul>
+<p>整个抽奖核心流程<strong>只操作 Redis，不查数据库</strong>，这是扛住万级 QPS 的基础。</p>
+<h3 id="32-lua-脚本一次-io-完成全部校验与扣减">3.2 Lua 脚本：一次 IO 完成全部校验与扣减</h3>
+<p>这是整个系统<strong>最核心的技术点</strong>。抽奖概率匹配后，用一段 Lua 脚本在 Redis 中原子执行「幂等校验 + 库存扣减 + 不足回补」：</p>
+<pre><code class="language-lua">-- lottery_deduct_stock.lua
+-- KEYS[1] 幂等校验 key: lottery:idempotent:{requestId}
+-- KEYS[2] 目标奖品库存 key: lottery:stock:{activityId}:{prizeId}
+-- KEYS[3] 用户当日中奖次数 key: user:daily:win:{uid}:{date}
+-- KEYS[4] 奖品当日限量 key: prize:daily:{prizeId}:{date}
+-- ARGV[1] 幂等过期时间（秒，与活动时长对齐）
+-- ARGV[2] 单次扣减数（固定为 1）
+-- ARGV[3] 奖品当日上限
+-- ARGV[4] 用户当日上限
+-- ARGV[5] 奖品 ID（用于返回）
+
+-- ① 幂等校验：重复请求直接拦截
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return {0, 'duplicate_request'}
+end
+
+-- ② 奖品总库存校验
+local stock = redis.call('GET', KEYS[2])
+if not stock or tonumber(stock) &lt;= 0 then
+    return {-1, 'stock_empty'}
+end
+
+-- ③ 奖品日限校验
+local daily_prize = redis.call('GET', KEYS[4])
+if daily_prize and tonumber(daily_prize) &gt;= tonumber(ARGV[3]) then
+    return {-2, 'prize_daily_limit'}
+end
+
+-- ④ 用户日限校验
+local user_daily = redis.call('GET', KEYS[3])
+if user_daily and tonumber(user_daily) &gt;= tonumber(ARGV[4]) then
+    return {-3, 'user_daily_limit'}
+end
+
+-- ⑤ 全部校验通过，原子扣减
+redis.call('DECRBY', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[3])
+redis.call('INCR', KEYS[4])
+
+-- ⑥ 写入幂等标记
+redis.call('SETEX', KEYS[1], ARGV[1], 'WIN')
+
+return {1, ARGV[5]}
+</code></pre>
+<p><strong>为什么这段脚本是灵魂？</strong></p>
+<ul>
+<li><strong>单次网络 IO</strong>：所有校验 + 扣减在一次 Redis 调用中完成，没有多次 RTT 的开销</li>
+<li><strong>原子性保证</strong>：Redis 单线程执行 Lua 脚本，天然无锁，杜绝超卖</li>
+<li><strong>幂等防护</strong>：同一 requestId 重复提交直接返回，不会重复中奖</li>
+<li><strong>库存回补</strong>：扣减后库存不足时自动 INCR 回补，避免负数异常</li>
+<li><strong>性能极高</strong>：单机可达 10W+ QPS</li>
+</ul>
+<h3 id="33-java-调用层生产级落地">3.3 Java 调用层：生产级落地</h3>
+<pre><code class="language-java">@Service
+public class LotteryService {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    // 预加载 Lua 脚本，启动时一次性解析，避免运行时重复解析开销
+    private final DefaultRedisScript&lt;List&gt; deductStockScript;
+
+    public LotteryService() {
+        deductStockScript = new DefaultRedisScript&lt;&gt;();
+        deductStockScript.setScriptSource(
+            new ClassPathResource("lua/lottery_deduct_stock.lua"));
+        deductStockScript.setResultType(List.class);
+    }
+
+    public LotteryResultDTO doLottery(String requestId, Long activityId,
+                                       Long userId, Long prizeId) {
+        // 1. 前置校验：活动有效期、用户参与次数（省略）
+
+        // 2. 概率匹配：基于本地缓存的概率配置，计算命中奖品
+        if (prizeId == null) {
+            return LotteryResultDTO.fail("未中奖");
+        }
+
+        // 3. 组装 Redis Key
+        String today = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+        List&lt;String&gt; keys = Arrays.asList(
+            "lottery:idempotent:" + requestId,           // 幂等 key
+            "lottery:stock:" + activityId + ":" + prizeId, // 奖品库存
+            "user:daily:win:" + userId + ":" + today,    // 用户日限
+            "prize:daily:" + prizeId + ":" + today       // 奖品日限
+        );
+
+        // 4. 执行 Lua 原子扣减
+        List result;
+        try {
+            result = stringRedisTemplate.execute(
+                deductStockScript, keys,
+                String.valueOf(24 * 3600),  // 幂等过期 24h
+                "1",                         // 扣减数
+                "100",                       // 奖品日上限
+                "3",                         // 用户日上限
+                String.valueOf(prizeId)
+            );
+        } catch (Exception e) {
+            // Redis 异常降级：切换数据库乐观锁扣库存
+            log.error("Redis 扣库存异常，降级到数据库", e);
+            return deductStockByDbWithOptimisticLock(activityId, prizeId, userId);
+        }
+
+        // 5. 结果分支处理
+        int code = Integer.parseInt(result.get(0).toString());
+        if (code == 0) {
+            return LotteryResultDTO.fail("重复请求");
+        } else if (code &lt; 0) {
+            return LotteryResultDTO.fail("未中奖");
+        }
+
+        // 6. 中奖成功：异步 MQ 落库 + 触发发奖
+        rocketMQTemplate.asyncSend("lottery_win_topic",
+            buildWinMessage(requestId, activityId, userId, prizeId),
+            new SendCallback() { /* 失败重试 + 对账兜底 */ });
+
+        return LotteryResultDTO.win(prizeId);
+    }
+}
+</code></pre>
+<p><strong>代码亮点</strong>：</p>
+<ul>
+<li>Lua 脚本<strong>预加载</strong>，启动时解析一次，运行时零额外开销</li>
+<li>Redis 异常时<strong>自动降级</strong>到数据库乐观锁（version 字段），保证极端场景不超卖</li>
+<li>中奖后<strong>异步 MQ</strong> 削峰，消费端做幂等校验，支撑万级 QPS</li>
+</ul>
+<hr>
+<h2 id="四纵深防御全链路防作弊体系">四、纵深防御：全链路防作弊体系</h2>
+<p>不能只做"扣库存"，要先回答<strong>"这个请求有没有资格扣"</strong>。</p>
+<h3 id="41-三层防御架构">4.1 三层防御架构</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">防护层级</th>
+<th style="text-align: left">核心手段</th>
+<th style="text-align: left">解决的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left"><strong>端侧（第一道）</strong></td>
+<td style="text-align: left">设备指纹 + JS 混淆 + 动态令牌</td>
+<td style="text-align: left">识别模拟器、设备农场，防接口抓包重放</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>接入层（第二道）</strong></td>
+<td style="text-align: left">令牌桶限流 + 滑块验证 + 请求签名</td>
+<td style="text-align: left">单用户 1次/秒，IP 10次/秒，防暴力刷奖</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>业务层（第三道）</strong></td>
+<td style="text-align: left">设备指纹 + 实名校验 + 行为异常检测</td>
+<td style="text-align: left">拦截一机多号、虚拟号、脚本化操作</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42-风控引擎实时决策假中奖兜底">4.2 风控引擎：实时决策，假中奖兜底</h3>
+<p>风控引擎接收用户行为特征，实时算分：</p>
+<ul>
+<li><strong>设备维度</strong>：是否 root/越狱、设备指纹是否命中黑库</li>
+<li><strong>账号维度</strong>：注册时长、好友数、实名等级、历史行为</li>
+<li><strong>网络维度</strong>：IP 归属地变动频率、同 IP 多账号检测</li>
+<li><strong>行为维度</strong>：请求频率、时间间隔规律性、操作轨迹</li>
+</ul>
+<p><strong>关键规则示例</strong>：</p>
+<pre><code class="language-java">// 责任链模式：可插拔的规则引擎
+public abstract class RiskRule {
+    public abstract RiskResult evaluate(UserContext ctx);
+}
+
+// 规则1：新注册(&lt;24h)用户中大奖 → 高风险
+public class NewUserBigPrizeRule extends RiskRule {
+    public RiskResult evaluate(UserContext ctx) {
+        if (ctx.getRegisterHours() &lt; 24 &amp;&amp; ctx.getPrizeLevel() &gt; 5) {
+            return RiskResult.reject("新用户中大奖风险");
+        }
+        return RiskResult.pass();
+    }
+}
+
+// 规则2：同 IP 下多账号 → 羊毛党特征
+public class IPBatchRule extends RiskRule {
+    public RiskResult evaluate(UserContext ctx) {
+        long count = redisTemplate.opsForSet()
+            .size("ip:users:" + ctx.getIp());
+        if (count &gt; 5) {
+            return RiskResult.reject("IP 下账号异常多");
+        }
+        return RiskResult.pass();
+    }
+}
+
+// 风控引擎：遍历规则链，任一拦截即拒绝
+public class RiskEngine {
+    private List&lt;RiskRule&gt; rules = Arrays.asList(
+        new NewUserBigPrizeRule(), new IPBatchRule());
+
+    public boolean pass(UserContext ctx) {
+        for (RiskRule rule : rules) {
+            if (rule.evaluate(ctx).isReject()) return false;
+        }
+        return true;
+    }
+}
+</code></pre>
+<p><strong>最狠的一招</strong>：风控返回"高风险"时，服务端<strong>直接返回"谢谢参与"或默认奖品</strong>，不扣真实大奖库存。表面上看用户"没中奖"，实际上他的请求根本没进入真正的抽奖池。黑产完全无感知。</p>
+<h3 id="43-后置离线风控持续进化">4.3 后置离线风控：持续进化</h3>
+<p>T+1 用 Spark 跑全量用户行为数据，通过聚类算法识别羊毛党集群、批量注册账号，更新风险标签同步到 Redis，供实时风控使用。<strong>防护能力随时间持续迭代</strong>。</p>
+<p>高价值奖品（手机、现金等）中奖后，还会触发<strong>深度风控 + 人工复核</strong>，确认非作弊账号再发奖，兜住大额资损。</p>
+<hr>
+<h2 id="五兜底与容灾生产环境不能没有的安全网">五、兜底与容灾：生产环境不能没有的安全网</h2>
+<h3 id="51-库存回补机制">5.1 库存回补机制</h3>
+<p>中奖后发送延迟消息，15 分钟未领奖/未填写收货地址的订单，自动触发库存回补。回补操作同样用 Lua 原子执行，并增加幂等标记避免重复回补导致库存虚高。</p>
+<h3 id="52-降级兜底策略">5.2 降级兜底策略</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">异常场景</th>
+<th style="text-align: left">降级方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">Redis 宕机</td>
+<td style="text-align: left">自动切换数据库乐观锁（version 字段）扣库存 + 全局限流</td>
+</tr>
+<tr>
+<td style="text-align: left">风控系统故障</td>
+<td style="text-align: left">降级为仅校验黑名单 + 基础限流，保证核心流程可用</td>
+</tr>
+<tr>
+<td style="text-align: left">数据库压力过高</td>
+<td style="text-align: left">关闭中奖记录查询等非核心接口</td>
+</tr>
+<tr>
+<td style="text-align: left">新活动上线</td>
+<td style="text-align: left">灰度放量，异常自动熔断降级为"谢谢参与"</td>
+</tr>
+</tbody>
+</table>
+<h3 id="53-数据一致性保障">5.3 数据一致性保障</h3>
+<ul>
+<li><strong>事务消息</strong>（RocketMQ）或<strong>本地消息表 + 定时补偿</strong>：Redis 扣减成功但 MQ 发送失败时，确保不丢奖品</li>
+<li><strong>每日定时对账</strong>：凌晨跑批，核对 Redis 库存、数据库库存、中奖记录三者一致性，修复异常数据</li>
+<li><strong>幂等性</strong>：每个抽奖请求携带唯一 requestId，Redis 缓存结果，重复提交直接返回</li>
+</ul>
+<h3 id="54-热门奖品热点-key-打散">5.4 热门奖品热点 Key 打散</h3>
+<p>头部大奖的库存 Key 可能成为超级热点，单 Redis 分片 CPU 被打满。解决方案：<strong>库存分片</strong>——将单个奖品库存拆成 N 个子 Key（如 <code>stock:0</code> ~ <code>stock:9</code>），扣减时随机选择子 Key，将热点流量分散到多个 Redis 分片。</p>
+<hr>
+<h2 id="六前端协同别忽视体验层的优化">六、前端协同：别忽视体验层的优化</h2>
+<ul>
+<li>抽奖按钮点击后<strong>立即置灰</strong>，防止重复提交</li>
+<li>结果 loading 动画，降低用户焦虑和重复点击</li>
+<li>活动倒计时 + 库存余量展示，营造紧迫感</li>
+<li>前端 JS 混淆 + 动态令牌，抽奖按钮点击后才生成一次性 token，防抓接口重放</li>
+</ul>
+<hr>
+<h2 id="七核心技术难点速查表">七、核心技术难点速查表</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">难点</th>
+<th style="text-align: left">问题本质</th>
+<th style="text-align: left">落地方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left"><strong>奖品超卖</strong></td>
+<td style="text-align: left">并发下多请求同时扣库存</td>
+<td style="text-align: left">Redis + Lua 原子脚本，单次 IO 完成校验+扣减</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>热点 Key</strong></td>
+<td style="text-align: left">热门奖品 Redis key 访问集中</td>
+<td style="text-align: left">库存分片打散 + 本地预扣 + 定时回补</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>黑产识别</strong></td>
+<td style="text-align: left">脚本、模拟器、设备农场难区分</td>
+<td style="text-align: left">端-网-云三层纵深 + 假中奖兜底</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>数据一致性</strong></td>
+<td style="text-align: left">Redis 扣成功但消息丢失</td>
+<td style="text-align: left">事务消息 / 本地消息表 + 定时对账</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>风控延迟</strong></td>
+<td style="text-align: left">复杂规则计算拖慢接口</td>
+<td style="text-align: left">轻量规则前置网关，核心规则内存并行计算，复杂规则异步后置</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>概率与库存矛盾</strong></td>
+<td style="text-align: left">抽中奖品但库存已空</td>
+<td style="text-align: left">Lua 扣减失败自动降级到其他奖品或"未中奖"，前端无感知</td>
+</tr>
+<tr>
+<td style="text-align: left"><strong>峰值雪崩</strong></td>
+<td style="text-align: left">同步写库扛不住</td>
+<td style="text-align: left">Redis 托管核心读写 + MQ 削峰异步落库 + 降级兜底</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="八总结">八、总结</h2>
+<p>一个高并发抽奖系统的本质是：</p>
+<blockquote>
+<p><strong>在巨大流量下，用最少的热点资源（Redis + Lua）原子化地完成"资格校验 + 库存扣减"，用异步解耦处理耗时的发货与记录，并叠加多维度纵深风控，把作弊损失降到最低。</strong></p>
+</blockquote>
+<p>记住三个关键词：<strong>原子扣减、纵深防御、异步兜底</strong>。把这三件事做扎实，抽奖系统就稳了。</p>
+<hr>
+<p>如果本文对你有帮助，欢迎关注我的公众号【Rain的Java大神之路】。<br>
+专注 Java 面试、源码、高并发实战，回复“Java”领取《大厂面试手册》，持续更新。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-14 09:41">2026-09-14 09:40</span>&nbsp;
+<a href="https://www.cnblogs.com/zrui-xyu">Rain的Java大神实战圈</a>&nbsp;
+阅读(<span id="post_view_count">229</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22960699);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzrui-xyu%2Fp%2F22960699&amp;targetId=22960699&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
