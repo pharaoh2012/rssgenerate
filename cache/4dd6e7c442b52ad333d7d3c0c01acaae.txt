@@ -1,0 +1,196 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shanyou/p/23002817" title="发布于 2026-09-17 10:16">
+    
+
+    <span role="heading" aria-level="2">.NET 11 性能深度解读：这一次，真的「到 11」了</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        .NET 11 的性能故事没有单一主角：Runtime Async 重构异步底座，JIT 在边界检查、断言传播、逃逸分析上继续精进，向量化和 Arm64/SVE 指令选择全面开花，GC 与线程池默默降本，MAUI 全面切换到 CoreCLR。「这些，都可以到 11。」
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img2024.cnblogs.com/blog/510/202609/510-20260916224803419-2072418752.jpg" alt="NET 11 性能优化全景架构" loading="lazy"></p>
+<blockquote>
+<p>原文：Performance Improvements in .NET 11，Stephen Toub，Microsoft DevBlogs（2026-09-15）<br>
+译文/解读：本文基于原文精选编译，略有删减</p>
+</blockquote>
+<h2 id="写在前面">写在前面</h2>
+<p>每年 .NET 发布前夕，Stephen Toub 都会在 DevBlogs 上发表一篇「Performance Improvements in .NET X」长文。这已经成了 .NET 社区的年度惯例，从 .NET Core 2.0 一路写到了今天的 .NET 11。</p>
+<p>今年的开篇是一个《摇滚万万岁》（This Is Spinal Tap）的梗：吉他放大器的音量旋钮最高是 10，Nigel 的定制款「可以到 11」。.NET 11 的寓意正在于此：不是某个革命性的突破，而是成百上千个小改进的复利积累。一个被消除的边界检查、一个不再发生的堆分配、一把没被拿起的锁、一个用 SIMD 重写的数组拷贝，每一项单独看都不起眼，合起来就是实打实、可测量的「响了一度」。</p>
+<h2 id="一runtime-async异步编程的底层重构">一、Runtime Async：异步编程的底层重构</h2>
+<p>如果说 .NET 11 只能挑一个亮点，那非 Runtime Async 莫属。这是近十年来 CLR 异步底层最大的一次重构。</p>
+<p>传统 <code>async</code>/<code>await</code> 里，每个异步方法编译后都会生成一个状态机，方法之间每传递一次结果都要物化一个 <code>Task</code> 对象。A 调 B、B 调 C，C 同步完成时，结果本可以直接作为普通返回值层层传回，却要被迫包装成 <code>Task&lt;int&gt;</code> 再解包。</p>
+<p>.NET 11 中，JIT 能识别「调用一个返回 Task 的方法并立刻 await 它」这个惯用模式：同步完成时，<code>int</code> 直接穿透融合后的调用链，只有最外层边界才把结果包装成 <code>Task</code>；真正发生挂起时，运行时用续体（continuation）记录串起整条链，中间的每一层都不再需要那个 <code>Task&lt;int&gt;</code>。</p>
+<p>效果立竿见影（仅两层调用的基准测试）：</p>
+<ul>
+<li>同步完成的路径：快 3 倍以上，并且消除了全部中间 Task 分配；</li>
+<li>真正发生挂起的路径：耗时不到原来的一半，每次调用少分配 80 字节。</li>
+</ul>
+<p>异常处理的差距更大。过去一个未处理异常穿过 10 层 async 方法，会被「抛出、捕获、存入 Task」重复 10 次，即使所有方法都没有显式的 catch。Runtime Async 下，同步路径上异常正常展开；挂起后也由一次分发循环直接把异常写入可观察的根 Task。</p>
+<p>.NET 11 还配套新增了轻量级 async 探查事件流（<code>dotnet/runtime#127238</code>）：不为每次小转换发送完整事件，改为写入每线程缓冲、增量编码、批量刷新，并在线程栈上放置可识别的包装帧作为探查器的锚点。某些测量中开销低于 1%，追踪数据量减少了一个数量级，而且对传统编译器状态机同样生效。</p>
+<p>注意：Runtime Async 并不会让所有异步操作零分配。如果你把 Task 存进集合、手动挂接续体、或者以对象形式观察它，那个对象依然必要。它的目标是：不为「观察不到的边界」付费。</p>
+<h2 id="二jit-去抽象化更聪明的逃逸分析">二、JIT 去抽象化：更聪明的逃逸分析</h2>
+<p>「逃逸分析」是编译器回答「这个对象会不会逃出当前方法」的技术。如果一个新分配的对象引用可以证明不会逃逸，JIT 就可以把它分配到栈上，分配和回收几乎免费，且对 GC 零压力。</p>
+<p>.NET 11 在这一领域收获了一批改进：</p>
+<p>可空装箱的内部化（<code>dotnet/runtime#122167</code>）：JIT 把 Nullable 的装箱内联展开，临时的 box 因此暴露给逃逸分析。<code>int?</code> 格式化这类场景里，那个 24 字节的临时堆分配被彻底消除：<code>FormatNullableInt</code> 从 9.58 ns 降到 1.99 ns，提速近 5 倍，分配从 24B 降为 0。</p>
+<p>接口泛型虚调用也能去虚拟化：把刚 new 出来的 <code>Processor</code> 强转成 <code>IProcessor</code> 再调用泛型方法，IL 层面是接口泛型虚调用；.NET 11 的 JIT 能看到接收者的精确类型（即使是共享代码路径如 <code>string</code>），完成去虚拟化 + 内联，进而把 <code>Unsafe.SizeOf&lt;T&gt;()</code> 折叠成常量，并证明这个短命的 <code>Processor</code> 根本不需要被分配。</p>
+<p><code>constrained.</code> 前缀的地址暴露问题（<code>dotnet/runtime#121918</code>）：<code>EqualityComparer&lt;T&gt;.Default</code> 内部的 <code>ObjectEqualityComparer&lt;T&gt;.Equals</code> 里，接收者曾被表示为对局部变量地址的间接读取。仅仅是「取了地址」这个动作，就把局部标记为已暴露，阻止了栈分配。现在改为直接值加载，24 字节堆分配消失。</p>
+<p>Tier 0 也优化装箱（<code>dotnet/runtime#129392</code>）：<code>ArgumentNullException.ThrowIfNull(value)</code> 在 <code>T</code> 为非空值类型时本来要装箱，过去只在优化后的 Tier 1 消除，现在 Tier 0 就能消除，对启动阶段和分析器里的分配噪声都是好事。</p>
+<h2 id="三边界检查消除每一代都在啃的硬骨头">三、边界检查消除：每一代都在啃的硬骨头</h2>
+<p><code>for (int i = 0; i &lt; array.Length; i++)</code> 这种循环里的边界检查，JIT 早就免了。但真实代码里有太多变体，.NET 11 又拿下了一批：</p>
+<p><code>!=</code> 循环也终于支持循环克隆（<code>dotnet/runtime#129268</code>）：有些开发者觉得 <code>i != length</code> 更高效，结果反而阻止了优化。现在步长为 1 或 -1 时（<code>i++</code> 可以，<code>i += 2</code> 不行），<code>!=</code> 循环同样能克隆出无检查的快速路径。</p>
+<p>return 语句纳入范围检查克隆（<code>dotnet/runtime#124705</code>）：<code>abcd[0] + abcd[1] + abcd[2] + abcd[3]</code> 这样的返回语句过去因为位于块末尾而错过克隆，.NET 11 里一次快速路径守卫就能覆盖全部 4 次访问。</p>
+<p>基本块内的检查合并（<code>dotnet/runtime#127439</code>）：即使没有克隆，JIT 也会把同一个基本块内的多个边界检查合并，把第一个检查强化到最大常量下标，删掉其余。<code>BinaryPrimitives.ReadInt32BigEndian</code> 的辅助函数从 73 字节瘦到 28 字节，只剩原始的长度守卫。</p>
+<p>Span 切片跟踪（<code>dotnet/runtime#122040</code>、<code>#127117</code>）：向量化循环常对 span 一段段 <code>Slice</code>，JIT 过去跟不上「越来越小的切片与原 span 的关系」，导致每轮重复检查。现在跟踪更聪明，去掉了重复检查。</p>
+<p>解析器式的前瞻检查（<code>dotnet/runtime#124242</code>、<code>#125235</code>）：识别 <code>(uint)(i + 2) &lt; (uint)span.Length</code> 这类条件，并据此消除对 <code>span[i + 1]</code>、<code>span[i + 2]</code> 的后续检查。</p>
+<p><code>LeadingZeroCount</code> 返回值范围：JIT 现在知道 <code>LeadingZeroCount(uint)</code> 的返回值在 0~32 之间，查找表的下标检查直接消失（516 ns → 438 ns）。</p>
+<p>此外还有一长串小改进：同一索引的重复访问不必再查（<code>#121640</code>）、长度可以贯穿整个方法追踪（<code>#121683</code>）、<code>arr[^4]</code> 成立则 <code>arr[^3]</code> 无需再查（<code>#124571</code>）、位运算和无符号除法的范围更精确（<code>#129101</code>），等等。</p>
+<h2 id="四断言传播让-jit-学会从成功中学习">四、断言传播：让 JIT 学会「从成功中学习」</h2>
+<p>范围不只来自显式比较，还来自操作本身的成功执行。<code>dotnet/runtime#124711</code> 教会 JIT 从「已经成功完成的操作」中提取隐含事实：</p>
+<ul>
+<li>创建数组成功 ⇒ 请求的长度不是负数；</li>
+<li>引用数组的协变检查辅助函数成功返回 ⇒ 下标在范围内；</li>
+<li>整除 / 取模执行成功 ⇒ 除数不为零。</li>
+</ul>
+<p><code>CovariantArrayStore</code> 基准因此从 3.57 ns 降到 2.99 ns。配套的改进还包括：<code>byte</code> 转换天然限定 0~255 作为范围分析起点（<code>#119474</code>）、<code>??=</code> 懒初始化后两条路径合流时值必然非空（<code>#127810</code>）、静态字符串已知长度传播后可把通用字符串比较变成定长向量化比较（<code>#128522</code>）、结构体拷贝辅助函数里重复的源/目标空检查探测被移除（<code>#128701</code>）。</p>
+<h2 id="五代码简化与无分支化">五、代码简化与无分支化</h2>
+<ul>
+<li>if-conversion 更聪明：<code>bool x = false; if (cond) x = true;</code> 现在也能识别隐式 else，折叠成条件移动指令（<code>#124738</code>）；位测试的幂等归一化（<code>(A &amp; bit) == bit</code> ≡ <code>(A &amp; bit) != 0</code>）让布尔优化能「在半路相遇」（<code>#128533</code>）。</li>
+<li>有符号字节比较不再做符号扩展：<code>cmp cl, 0C0</code> 替代 <code>movsx</code> + <code>cmp eax</code>（14 字节 → 10 字节）。</li>
+<li>AVX-512 / AVX10.2 机器上的 <code>float</code>/<code>double</code> 到 <code>long</code>/<code>ulong</code> 转换不再调用辅助函数，保持内联和寄存器内完成（<code>#125180</code>）。</li>
+</ul>
+<h2 id="六向量化与硬件指令">六、向量化与硬件指令</h2>
+<p>AVX-512 嵌入式广播与掩码：嵌入式广播让指令直接从内存加载单个标量并复制到所有通道，只读数据段从存 64 字节变成存 4 字节；嵌入式掩码把「计算全部通道再混合」折叠进单条指令，省掉单独的 blend 和零向量初始化。VNNI 的 <code>vpdpbusd</code> 现在用 <code>dword {1to4}</code> 广播，常量池占用从 16 字节降到 4 字节。</p>
+<p>更宽的向量归约：<code>Vector256.Sum</code> / <code>Vector512.Sum</code> 改为主要在全宽度下归约、最后合并各通道结果，避免为拆成 128 位片段而做的大量 extract/shuffle（<code>#127329</code>）。<code>Vector256&lt;byte&gt;</code> 乘法基准：3.75 ns → 2.17 ns，代码从 114 字节瘦到 73 字节。</p>
+<p>stackalloc 清零提速近一倍：<code>Stackalloc16384</code> 从 313 ns 降到 163 ns（0.52）。</p>
+<p>Arm64 指令选择大丰收（多位 ARM 工程师贡献）：</p>
+<table>
+<thead>
+<tr>
+<th>惯用法</th>
+<th>.NET 10</th>
+<th>.NET 11</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>与零比较</td>
+<td><code>and</code> + <code>cmp</code></td>
+<td><code>ands</code>（复用标志位）</td>
+</tr>
+<tr>
+<td><code>(v &gt;&gt; 6) &amp; 0x3F</code></td>
+<td><code>asr</code> + <code>and</code></td>
+<td>专用 <code>ubfx</code> 指令</td>
+</tr>
+<tr>
+<td>位计数</td>
+<td>通用序列</td>
+<td><code>cnt</code> / <code>ctz</code>（FEAT_CSSC）</td>
+</tr>
+<tr>
+<td>相邻 64 位清零</td>
+<td>4 条 <code>str</code></td>
+<td>2 条 <code>stp</code></td>
+</tr>
+</tbody>
+</table>
+<p>SVE（可伸缩向量）继续演进：更多循环模式获得硬件生成的谓词掩码、掩码操作减少设置搬运、可伸缩向量常量与向量存储初始化替代标量循环。</p>
+<h2 id="七写屏障与-gc让每一次引用写入更便宜">七、写屏障与 GC：让每一次引用写入更便宜</h2>
+<p>.NET 的分代 GC 要求「老对象写入指向新对象的引用」时必须更新 GC 记账（写屏障）。引用写入极其频繁，所以屏障越便宜越好，能证明不需要就越过。</p>
+<p>协变数组存储（<code>#126547</code>）：JIT 把数组存储辅助函数展开成独立操作，知道数组精确类型时消除协变检查并优化屏障。循环往 <code>object[]</code> 写 4096 个元素：10.85 μs → 6.04 μs（0.56）。</p>
+<p>结构体整体拷贝（<code>#128238</code> + <code>#128542</code>）：堆目标分析从单个 store 扩展到整个结构体拷贝，引用字段用引用 store、非引用数据用 SIMD 向量 store。<code>HeapStructCopy</code>：4.13 ns → 3.07 ns（0.74）。</p>
+<p>相邻字段合并写（<code>#130535</code>、<code>#126562</code>、<code>#130107</code>）：<code>Int128</code> 赋值从两次 64 位 store 变成一条 16 字节向量写；两个相邻 <code>int</code> 字段甚至能合并成一条 64 位 store（<code>mov rax, 200000001</code>）。</p>
+<p>GC 本体也有两处值得一说：</p>
+<ul>
+<li>vxsort 向量化排序扩展到 Arm64（<code>#110692</code>）：压缩式回收需要排序存活对象地址，大列表上排序是回收的重要开销，现在 Arm64 也能吃向量化红利。</li>
+<li>依赖句柄「随龄增长」（<code>#78746</code>）：<code>ConditionalWeakTable</code> 底层的依赖句柄过去不随引用对象老化，导致每次 gen0/gen1 回收都要重新扫描。现在句柄会随 referent 晋升，年老的句柄可以被年轻的回收直接跳过。</li>
+</ul>
+<h2 id="八启动与部署maui-全面投奔-coreclr">八、启动与部署：MAUI 全面投奔 CoreCLR</h2>
+<p>.NET 11 起，MAUI 在 Android、iOS 和 Mac Catalyst 上正式切换到 CoreCLR，最后一批还在用 Mono 的 MAUI 平台完成迁移。切换后，移动应用和 ASP.NET Core、云服务、桌面 .NET 共享同一个运行时、同一个 JIT、同一个 GC、同一套诊断设施和性能改进，并引入 CoreCLR 的分层编译、ReadyToRun 和 PGO，也为 NativeAOT 打下共同基础。</p>
+<p>NativeAOT 的 <code>AllocHeap</code> 在 Windows 上过去为每个块保留 64 KB 虚拟内存（即使只用 4 KB），现在小块改用普通 <code>new</code>/<code>delete</code>（<code>#122822</code>），内存足迹更合理。</p>
+<h2 id="九线程与线程池">九、线程与线程池</h2>
+<ul>
+<li>运行时内部 <code>HashMap</code> 的全屏障替换为更窄的 acquire/release（<code>#125259</code>）；</li>
+<li>VM 内多张哈希表（如 <code>EEHashTable</code>）引入基于纪元的回收（<code>#124822</code>），读多写少场景下读者不再需要进入协作式 GC 模式；</li>
+<li>哈希函数从逐字节哈希换成每次消费 4 字节的 xxHash（<code>#129640</code>）；</li>
+<li>线程池小任务的调度开销降低（<code>#122726</code>）：去掉不必要的内存栅栏和共享状态更新、每批而非每个任务与控制器交互、减少信号量自旋、只在队列确实需要时才请求新 worker，协调开销更少，也少了「队列刚空就被唤醒」的冤种 worker。</li>
+</ul>
+<h2 id="十数值计算biginteger-换大长腿">十、数值计算：BigInteger 换「大长腿」</h2>
+<p><code>BigInteger</code> 的存储单元（limb）从 <code>uint</code> 换成 <code>nuint</code>（<code>#125799</code>）：64 位机器上每个 limb 从 32 位翻倍到 64 位，而同代价的 64 位运算能一次处理两倍比特。配合 Montgomery 乘法、<code>ModPow</code> 滑动窗口、融合位运算、循环展开与缓存等算法改进，再叠加此前预览版里的大数十进制转换提速（<code>#112178</code>）、Toom-Cook 大数乘法（<code>#112876</code>）、移位与旋转优化（<code>#113005</code>）。</p>
+<p>三角函数也大幅提速：<code>Asin</code> 的 <code>float</code> 版本 33.7 μs → 8.2 μs（0.24），<code>double</code> 版本 35.8 μs → 11.0 μs（0.31）。<code>TensorPrimitives</code> 的 <code>BitIncrement</code>/<code>BitDecrement</code> 也走向 SIMD，<code>Half</code> 路径直接操作原始 <code>ushort</code> 位模式，避免与 <code>float</code> 来回转换。</p>
+<h2 id="十一字符串与-span">十一、字符串与 Span</h2>
+<ul>
+<li>UTF-8 验证提速 3 倍以上：<code>ValidWithSurrogatePairs</code> 从 2.99 μs 降到 857 ns（0.29）；</li>
+<li>Arm 上 UTF-8 → UTF-16 解码先做廉价的整向量 ASCII 测试，命中慢路径才计算具体 lane 位置（<code>#121382</code>）；</li>
+<li><code>string.Split</code> 在 x86/x64 上对 ASCII 分隔符把两个 UTF-16 向量打包成一个字节向量一次比较，无匹配路径一次跳过两倍输入（<code>#125379</code>）；</li>
+<li><code>SequenceEqual&lt;Guid&gt;</code> / <code>SequenceEqual&lt;Int128&gt;</code> 不再逐元素比较，而是按原始字节走优化过的内存比较路径，享受 JIT 展开与向量化（<code>#130644</code>）；</li>
+<li>字符串相等比较：长度 15 时 6.18 ns → 2.40 ns（0.39）。</li>
+</ul>
+<h2 id="十二全球化时区转换快了一倍多">十二、全球化：时区转换快了一倍多</h2>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>.NET 10</th>
+<th>.NET 11</th>
+<th>比例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ConvertTimeFromUtc</code></td>
+<td>45.13 ns</td>
+<td>19.44 ns</td>
+<td>0.43</td>
+</tr>
+<tr>
+<td><code>ConvertTimeToUtc</code></td>
+<td>51.97 ns</td>
+<td>20.23 ns</td>
+<td>0.39</td>
+</tr>
+<tr>
+<td><code>GetLocalNow</code></td>
+<td>76.41 ns</td>
+<td>34.39 ns</td>
+<td>0.45</td>
+</tr>
+</tbody>
+</table>
+<p><code>ToUpperInvariant</code>/<code>ToLowerInvariant</code> 现在优先走托管 ASCII 路径，能推迟甚至避免 ICU 的初始化（<code>#120685</code>）；invariant 模式下不加载 ICU，ASCII 大小写吞吐同样受益。</p>
+<h2 id="如何亲手验证">如何亲手验证</h2>
+<p>官方文章的基准都基于 BenchmarkDotNet 双目标编译。把 <code>csproj</code> 的 <code>TargetFrameworks</code> 设为 <code>net11.0;net10.0</code>，安装 <code>BenchmarkDotNet</code>，用 <code>--runtimes net10.0 net11.0</code> 跑同一组基准，你就能得到自己机器上的 .NET 11 性能收益报告。升级运行时零代码改动，收益自动到账，这就是 .NET 每年一次「免费午餐」的传统艺能。</p>
+<h2 id="结语">结语</h2>
+<p>.NET 11 的性能故事没有单一主角：Runtime Async 重构异步底座，JIT 在边界检查、断言传播、逃逸分析上继续精进，向量化和 Arm64/SVE 指令选择全面开花，GC 与线程池默默降本，MAUI 全面切换到 CoreCLR。「这些，都可以到 11。」</p>
+<p>对于绝大多数应用来说，升级到 .NET 11 不需要改一行代码，就能拿到上述全部收益。建议尽早把基准跑起来，量化属于你工作负载的那一度音量。</p>
+<hr>
+<p><em>原文链接：<a href="https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/" target="_blank" rel="noopener nofollow">https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-11/</a></em><br>
+<em>文中所有数据均来自原文的 BenchmarkDotNet 基准测试，具体结果因机器与工作负载而异。</em></p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>欢迎大家扫描下面二维码成为我的客户，扶你上云</p>
+<img src="https://images.cnblogs.com/cnblogs_com/shanyou/57459/o_220125090408_%E9%82%80%E8%AF%B7%E4%BA%8C%E7%BB%B4%E7%A0%81-258px.jpeg" width="170">
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-17 10:17">2026-09-17 10:16</span>&nbsp;
+<a href="https://www.cnblogs.com/shanyou">张善友</a>&nbsp;
+阅读(<span id="post_view_count">86</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23002817);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshanyou%2Fp%2F23002817&amp;targetId=23002817&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
