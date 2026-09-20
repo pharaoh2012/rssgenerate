@@ -1,0 +1,186 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zjdxr-up/p/23049231" title="发布于 2026-09-20 15:15">
+    
+
+    <span role="heading" aria-level="2">Docker Swarm 线上环境 MariaDB XA 悬停事务故障排查</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="_"></h1>
+<blockquote>
+<p>场景：Docker Swarm 集群，MariaDB 10.4 服务异常重启，启动失败；数据库日志发现残留 XA Prepared 事务，常规重启无法自动恢复，业务无法连接数据库。 环境：Docker Swarm + MariaDB 10.4，业务使用XA分布式事务。</p>
+</blockquote>
+<h2 id="一故障现象">一、故障现象</h2>
+<ol>
+<li>
+<p>MariaDB service 在 Swarm 集群反复重启，容器不断 crash，业务无法访问数据库；</p>
+</li>
+<li>
+<p>查看容器日志，数据库启动阶段卡在事务恢复流程，无法完成启动；</p>
+</li>
+<li>
+<p>多次重启 Swarm service 无效，数据卷 PVC（Swarm volume）数据保留完好，不能直接删除 volume。</p>
+<p>mysql容易的异常日志：</p>
+</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/1110857/202609/1110857-20260920151414123-10014286.png" alt="image" loading="lazy"></p>
+<h2 id="二排障思路完整定位过程">二、排障思路（完整定位过程）</h2>
+<blockquote>
+<p>核心原则：<strong>不直接在故障业务容器内操作数据，防止数据损坏；使用同版本临时容器挂载原数据卷做离线修复</strong></p>
+</blockquote>
+<ol>
+<li>查看 Swarm service 容器日志，初步判断是数据库内部事务恢复问题，不是 Swarm 网络、端口或资源限制问题；</li>
+<li>进入故障容器查看 mysqld 内核日志，发现关键日志：<code>Found prepared XA transactions</code>，确认存在<strong>XA悬停事务</strong>；</li>
+</ol>
+<p>​    直接进容器看到的异常日志，一直不能明确定位到具体原因。排查服务器磁盘空间都是够用的。</p>
+<p><strong>容器内手动前台启动 mysqld（最关键，直接打印崩溃原因）</strong></p>
+<pre><code># 容器内执行
+mysqld --datadir=/config/databases
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/1110857/202609/1110857-20260920151540170-1961229655.png" alt="image" loading="lazy"></p>
+<ol start="3">
+<li>
+<p>原理回顾：XA 两阶段事务，prepare 成功之后，协调器宕机/网络中断，没有收到 commit/rollback。数据库重启时会尝试自动处理；协调器永久丢失时，自动恢复失败，数据库无法启动；而且容器内的mysql进程无法杀除并重启，因为mysql的容器镜像中加了mysqld-safe的异常重启服务。</p>
+</li>
+<li>
+<p>方案：新建临时容器，挂载原有 MariaDB 数据 volume，手动启动 mysqld，完成XA事务检查与清理；</p>
+</li>
+</ol>
+<p>4.1 踩坑：临时容器缺少 <code>/var/run/mysqld</code> 目录，mysqld 默认把 sock、pid 文件写入该路径，导致启动失败；修改启动参数，将 sock/pid 文件放到 <code>/tmp</code> 目录解决；</p>
+<pre><code>docker run --rm -it \
+--entrypoint bash \
+-v /root/controller_deployer/data/mysql:/config \
+-e PUID=0 -e PGID=0 \
+registry.tethrnet.com:5000/mariadb:version-110.4.15mariabionic
+
+</code></pre>
+<p><code>--entrypoint bash</code> 是关键！</p>
+<ul>
+<li>不再执行镜像默认的 mariadb 启动脚本</li>
+<li>容器启动直接进入 bash，<strong>不会自动启动 mysqld_safe</strong></li>
+</ul>
+<p>4.2 数据库成功拉起后，登录验证XA事务；MariaDB 10.4 没有 <code>information_schema.innodb_prepared_transactions</code> 系统表，使用 <code>XA RECOVER;</code> 命令检查；</p>
+<p>临时容器内执行恢复命令</p>
+<pre><code>mysqld --datadir=/config/databases --tc-heuristic-recover=ROLLBACK
+</code></pre>
+<p>此时前台启动，执行 XA 事务恢复。</p>
+<ul>
+<li>看到 <code>ready for connections</code> 就代表恢复成功。</li>
+<li>保持这个终端，新开一个临时容器终端进去验证 XA 事务。</li>
+</ul>
+<p>4.3  确认XA残留事务清理完成，优雅关闭临时数据库，重新启动 Swarm 的 MariaDB 业务服务，故障恢复。</p>
+<p>执行查询，确认 XA 事务：</p>
+<pre><code>SELECT * FROM information_schema.innodb_prepared_transactions;
+</code></pre>
+<h2 id="重要提醒">重要提醒</h2>
+<ul>
+<li>以后<strong>绝对不要再带 <code>--tc-heuristic-recover</code> 参数启动</strong>，这个参数是一次性修复参数；重复带参数启动会直接 abort。</li>
+<li>启动业务容器前，留意宿主机数据目录权限，避免再次出现 Permission denied。</li>
+</ul>
+<h2 id="三完整操作步骤">三、完整操作步骤</h2>
+<h3 id="31-备份数据卷操作前必做">3.1 备份数据卷（操作前必做）</h3>
+<blockquote>
+<p>修复前先备份 volume，防止误操作丢失数据</p>
+</blockquote>
+<pre><code># 将你的mariadb数据卷做备份，替换 volume 名称
+docker run --rm -v mariadb-data:/source -v /host/backup:/dest alpine cp -r /source /dest
+</code></pre>
+<h3 id="32-启动临时容器挂载原数据卷">3.2 启动临时容器挂载原数据卷</h3>
+<blockquote>
+<p>使用和业务完全一致的 MariaDB 版本，保证数据文件兼容</p>
+</blockquote>
+<pre><code>docker run -it --rm \
+-v mariadb-data:/config/databases \
+--entrypoint bash mariadb:10.4.15
+</code></pre>
+<blockquote>
+<p>进入容器后，<code>/config/databases</code> 就是原数据库的数据目录。</p>
+</blockquote>
+<h3 id="33-启动-mysqld指定参数规避-sockpid-目录缺失问题">3.3 启动 mysqld，指定参数规避 sock/pid 目录缺失问题</h3>
+<pre><code>mysqld --datadir=/config/databases \
+--skip-networking=0 \
+--socket=/tmp/mysqld.sock \
+--pid-file=/tmp/mysqld.pid
+</code></pre>
+<p>等待日志输出 <code>ready for connections</code>，代表数据库内核成功启动。</p>
+<blockquote>
+<p>注意：这个终端保持不动，mysqld 在此前台运行。</p>
+</blockquote>
+<h3 id="34-新开宿主机终端进入临时容器登录数据库">3.4 新开宿主机终端，进入临时容器登录数据库</h3>
+<pre><code># 查看临时容器ID，替换为你的容器ID
+docker exec -it 982c15977c7a bash
+# 使用自定义sock文件登录
+mysql -uroot -S /tmp/mysqld.sock
+</code></pre>
+<h3 id="35-检查xa事务重点踩坑点">3.5 检查XA事务（重点踩坑点）</h3>
+<p>❌ 错误命令（MySQL8专属，MariaDB 10.4不存在这张表）</p>
+<pre><code>select * from information_schema.innodb_prepared_transactions;
+</code></pre>
+<p>✅ MariaDB 正确查看XA pending事务命令</p>
+<pre><code>XA RECOVER;
+</code></pre>
+<ul>
+<li>返回空结果：✅ 残留XA事务已经处理完成；</li>
+<li>如有返回记录：可以手动执行 <code>XA ROLLBACK 'gid';</code> 逐个回滚。</li>
+</ul>
+<h3 id="36-验证库表可用性">3.6 验证库表可用性</h3>
+<pre><code>show databases;
+</code></pre>
+<p>确认业务库都正常加载，表可以正常访问。</p>
+<h3 id="37-关闭临时库恢复业务服务">3.7 关闭临时库，恢复业务服务</h3>
+<ol>
+<li>在 mysqld 运行窗口按 <code>Ctrl+C</code>，优雅关闭数据库进程；</li>
+<li>退出临时容器，容器会自动销毁；</li>
+<li>回到 Docker Swarm，重启 mariadb service：</li>
+</ol>
+<pre><code>docker service update --force mariadb-service
+</code></pre>
+<ol>
+<li>观察容器状态，容器正常启动不再反复crash，业务连接恢复。</li>
+</ol>
+<h2 id="四原理分析">四、原理分析</h2>
+<p>XA分布式事务分为2PC：</p>
+<ol>
+<li>Prepare：各资源节点持久化事务，返回成功；</li>
+<li>Commit：事务协调器通知所有节点提交。</li>
+</ol>
+<p>故障场景：业务XA事务执行到<code>prepare</code>成功，协调器节点崩溃/网络断开，<strong>没有下发commit/rollback指令</strong>。 数据库重启时，InnoDB引擎会扫描所有prepared状态XA事务，等待协调器指令。协调器永久丢失时，数据库无法自动完成事务处理，数据库启动阻塞。</p>
+<blockquote>
+<p>⚠️ 重要提醒：启发式回滚属于应急修复手段。修复完成后，业务侧需要核对相关业务数据，校验数据一致性。</p>
+</blockquote>
+<h2 id="五本次故障踩坑清单">五、本次故障踩坑清单</h2>
+<ol>
+<li>混淆 MySQL8 和 MariaDB 的系统表，MariaDB 10.4 没有 innodb_prepared_transactions，查询会报表不存在；</li>
+<li>临时容器环境缺少 <code>/var/run/mysqld</code> 目录，mysqld 启动时创建pid、socket文件失败，数据库内核已经加载完成但服务退出；</li>
+<li>不要直接在业务Swarm容器内直接修改、启动mysqld，容易引发数据损坏；优先临时容器挂载volume离线修复；</li>
+<li>Docker Swarm 服务会自动重启崩溃容器，反复重启会加剧事务恢复异常，故障期间建议先缩容副本为0，避免持续损坏数据。</li>
+</ol>
+<h2 id="六预防方案">六、预防方案</h2>
+<ol>
+<li>XA事务协调器做好状态持久化，记录每个XA事务全局ID和状态，协调器重启后可以继续处理残留事务；</li>
+<li>增加监控：定时执行 <code>XA RECOVER;</code>，一旦检测到pending事务，触发告警，尽早发现；</li>
+<li>Swarm中数据库服务配置合理的重启策略，故障时不要无限快速重启，避免放大故障；</li>
+<li>定期备份volume，数据库数据卷损坏时可以快速回滚；</li>
+</ol>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-20 15:16">2026-09-20 15:15</span>&nbsp;
+<a href="https://www.cnblogs.com/zjdxr-up">FutureAI-Zeng</a>&nbsp;
+阅读(<span id="post_view_count">6</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23049231);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzjdxr-up%2Fp%2F23049231&amp;targetId=23049231&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
