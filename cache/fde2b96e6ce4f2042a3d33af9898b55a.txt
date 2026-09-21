@@ -1,0 +1,339 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/guoxiaoyu/p/23053825" title="发布于 2026-09-21 09:10">
+    
+
+    <span role="heading" aria-level="2">Spring AI RAG接上观测云怎么做全链路观测？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>做 RAG 应用时，最让人头疼的问题往往不是“彻底不能用”，而是“偶尔有点慢”。</p>
+<p>RAG 可以先理解成“先找相关资料，再让大模型带着资料回答”。Embedding 负责把文字问题变成数字向量，Milvus 则保存这些向量并找出最相近的内容。</p>
+<p>用户发来一个问题，页面转了几秒才开始输出。应用日志告诉我，这次请求总共用了三秒多，但三秒花在哪里，它没有说。</p>
+<p>可能是把问题转成向量的 Embedding 模型慢了，可能是 Milvus 相似度检索慢了，也可能是大模型生成首字慢了。还有一种更容易被忽略的情况：Milvus 本身没问题，慢的是应用到 Milvus 之间的网络。</p>
+<p>如果只有一个总耗时，这几种情况看起来几乎一样。排查只能靠猜：重启服务、换模型、调线程池，甚至先把锅甩给向量库。</p>
+<p>这次我没有做一个空项目演示，而是直接拿自己的 Spring AI Alibaba RAG 应用改造。项目使用 Spring Boot 3.2.0、Spring AI 1.0.0、Spring AI Alibaba 1.0.0.2，Embedding 模型是 text-embedding-v4，生成模型是 qwen-plus，向量库是部署在服务器上的 Milvus。</p>
+<p>我在 Windows 本机安装 DataKit，把应用的链路和指标送进观测云，同时从本机跨网络抓取远程 Milvus 的 Prometheus 指标。接入后，我又主动给“应用到 Milvus”这段网络增加延迟，跑完故障和恢复两组对照。</p>
+<p>最后的结果很明确：这次慢点出现在向量检索的客户端链路，但 Milvus 服务端处理时间没有跟着升高。也就是说，问题在网络路径，不在大模型，也不能简单写成“Milvus 变慢”。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222803627-1389906497.png" alt="image" loading="lazy"></p>
+<h2 id="先说清楚我想看到的不是一堆曲线">先说清楚：我想看到的不是一堆曲线</h2>
+<p>接入监控之前，我先给这次实践定了一个验收标准：观测页面必须能回答具体问题，而不是只证明“数据传上去了”。</p>
+<p>对一次 RAG 请求，我至少要看到下面这条调用链：</p>
+<pre><code class="language-text">用户请求
+  └─ ChatClient
+      ├─ Advisor / 记忆处理
+      ├─ EmbeddingModel
+      ├─ Milvus VectorStore query
+      └─ ChatModel
+</code></pre>
+<p>Trace 是一次请求经过各步骤的完整调用记录，其中每个计时片段叫 Span。它回答“这一次请求的时间去了哪里”；应用指标回答“同类操作最近是不是普遍变慢”；Milvus 指标回答“向量库内部是否同时出现压力”。这三层合起来，才有机会区分模型、向量库和网络。</p>
+<p>我还加了一条隐私要求：不能为了看耗时，把用户问题、模型答案和召回文档一起上传。对定位性能来说，操作名称、耗时、状态和必要标签已经够用，正文内容没有必要进入观测平台。</p>
+<h2 id="我的真实链路长什么样">我的真实链路长什么样</h2>
+<p>应用运行在 Windows 本机，Milvus 在远程服务器，观测云是 SaaS。DataKit 是负责采集和转发数据的程序，我把它装在应用所在的本机，而不是 Milvus 服务器。</p>
+<p>这样放有两个原因。</p>
+<p>第一，应用把 OTLP Trace 发到本机地址，不需要把接收端口暴露到公网。第二，DataKit 可以同时抓本机应用的 Prometheus 端点和远程 Milvus 的指标端点，再统一上传。</p>
+<p>实际链路是：</p>
+<pre><code class="language-text">Spring AI Alibaba RAG
+  ├─ OTLP Trace ───────────────┐
+  └─ /actuator/prometheus ──┐  │
+                            ↓  ↓
+                     Windows DataKit ──→ 观测云
+                            ↑
+远程 Milvus /metrics ───────┘
+</code></pre>
+<p>这也回答了一个常见问题：Milvus 在服务器上，本机 DataKit 能不能监控？可以，前提是本机能访问 Milvus 的指标端点，并且服务器防火墙只向必要来源开放。我的实践就是这种部署方式。</p>
+<p>DataKit 2.13.0 安装后以 Windows 服务运行，启动类型是 Automatic。观测云基础设施页面已经能看到这台主机，说明最基础的数据通路正常。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222837496-848652572.png" alt="image" loading="lazy"></p>
+<h2 id="应用侧只加四块东西">应用侧只加四块东西</h2>
+<p>项目本来已经使用 Spring AI 的 ChatClient、Advisor、EmbeddingModel 和 MilvusVectorStore。这一点很重要，因为 Spring AI 已经为这些组件提供了 Micrometer Observation。接入时不需要在每个方法外面手写计时器，先把现成的观测能力打开即可。</p>
+<h3 id="第一块补齐依赖">第一块：补齐依赖</h3>
+<p>我在 <code>pom.xml</code> 中加入了 Actuator、Prometheus 指标注册表、Micrometer 的 OpenTelemetry 桥接和 OTLP 导出器：</p>
+<pre><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+    &lt;artifactId&gt;micrometer-registry-prometheus&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+    &lt;artifactId&gt;micrometer-tracing-bridge-otel&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.opentelemetry&lt;/groupId&gt;
+    &lt;artifactId&gt;opentelemetry-exporter-otlp&lt;/artifactId&gt;
+&lt;/dependency&gt;
+</code></pre>
+<p>Actuator 暴露健康检查和 Prometheus 指标，也就是可以被持续抓取、统计和比较的数值；Tracing Bridge 把 Micrometer 的 Observation 转成链路；OTLP Exporter 再通过通用传输协议把链路发给 DataKit。</p>
+<h3 id="第二块配置-otlp-和-prometheus">第二块：配置 OTLP 和 Prometheus</h3>
+<p>我的应用端口是 9166，管理端点单独放在本机 9167。核心配置如下：</p>
+<pre><code class="language-yaml">management:
+  server:
+    address: 127.0.0.1
+    port: 9167
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: http://127.0.0.1:9529/otel/v1/traces
+      timeout: 10s
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      environment: practice
+</code></pre>
+<p>这里的 100% 采样只适合本次实践和小流量验证。生产环境如果请求量大，需要按成本和排障需要调整，否则链路量会迅速上涨。</p>
+<p>管理端口绑定 <code>127.0.0.1</code> 也是刻意的。Prometheus 端点包含应用运行信息，不应该为了采集方便直接暴露到公网。本机 DataKit 能访问它，就没有必要扩大访问范围。</p>
+<h3 id="第三块让-datakit-抓两类指标">第三块：让 DataKit 抓两类指标</h3>
+<p>应用侧要抓的是：</p>
+<pre><code class="language-text">http://127.0.0.1:9167/actuator/prometheus
+</code></pre>
+<p>远程 Milvus 抓的是服务器上的 Prometheus 指标地址。我的采集配置没有把所有指标一股脑全收进来，而是先保留与这次排查直接相关的搜索、Proxy、QueryNode 和资源状态指标。</p>
+<p>Windows 安装版 DataKit 的 Prom 配置放在 <code>C:\Program Files\datakit\conf.d\prom</code>。应用侧配置可以先用这一份：</p>
+<pre><code class="language-toml">[[inputs.prom]]
+  urls = ["http://127.0.0.1:9167/actuator/prometheus"]
+  interval = "15s"
+  timeout = "10s"
+  source = "clxzs-spring-ai"
+  metric_types = ["counter", "gauge", "histogram", "summary"]
+  metric_name_filter = [
+    "^gen_ai_.*$",
+    "^db_vector_.*$",
+    "^http_server_requests_seconds.*$",
+    "^jvm_memory_used_bytes$",
+    "^process_cpu_usage$"
+  ]
+  measurement_name = "clxzs_spring_ai"
+  keep_exist_metric_name = true
+  election = false
+</code></pre>
+<p>远程 Milvus 另建一个配置，把地址换成自己的服务器内网地址或受控访问地址：</p>
+<pre><code class="language-toml">[[inputs.prom]]
+  urls = ["http://&lt;MILVUS_HOST&gt;:9091/metrics"]
+  interval = "15s"
+  timeout = "10s"
+  source = "milvus-remote"
+  metric_types = ["counter", "gauge", "histogram"]
+  metric_name_filter = [
+    "^milvus_proxy_req_latency.*$",
+    "^milvus_proxy_sq_latency.*$",
+    "^milvus_querynode_sq_req_latency.*$",
+    "^milvus_querynode_sq_req_count$"
+  ]
+  measurement_name = "milvus"
+  keep_exist_metric_name = true
+  election = false
+</code></pre>
+<p>保存后，用管理员 PowerShell 执行 <code>Restart-Service datakit</code>。先在本机打开两个指标地址，确认能返回文本；再看 DataKit 日志是否还有抓取错误；最后到观测云按 <code>source</code> 或 <code>measurement</code> 查询。三步都通过，才算采集真正接上。</p>
+<p>这是观测成本里很容易踩的坑。Milvus 指标数量不少，如果把高基数标签和所有序列直接放开，页面可能很丰富，账单也会很丰富。先围绕问题做白名单，后续遇到新场景再扩，比“全收再说”稳妥。</p>
+<p>接入后，观测云中已经能查询到 Spring AI 的 <code>gen_ai_client_operation_*</code>、<code>db_vector_client_operation_*</code> 等指标。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222858520-252704383.png" alt="image" loading="lazy"></p>
+<p>远程 Milvus 的搜索与组件耗时指标也进入了同一工作空间，后面会用它和应用侧耗时做交叉判断。</p>
+<h3 id="第四块默认关闭敏感正文">第四块：默认关闭敏感正文</h3>
+<p>我明确保留了下面三项关闭状态：</p>
+<pre><code class="language-yaml">spring:
+  ai:
+    chat:
+      client:
+        observations:
+          log-prompt: false
+          log-completion: false
+    vectorstore:
+      observations:
+        log-query-response: false
+</code></pre>
+<p>同时移除了会把增强提示词写进日志的调试代码。整个实验中，请求正文只在内存里使用；留证时只记录响应字节数和 SHA-256，没有把用户问题、模型答案、召回文档写进证据目录。</p>
+<p>这不是为了“看起来安全”。一旦提示词中包含业务资料、用户信息或内部知识，开启正文采集就会改变数据边界。性能排查通常不需要这些内容，默认关着更合适。</p>
+<h2 id="第一个坑有-span不等于有完整-trace">第一个坑：有 Span，不等于有完整 Trace</h2>
+<p>第一次跑请求时，观测云里已经出现了数据，但链路并不完整。</p>
+<p>HTTP 请求、ChatClient 和模型生成在一条 Trace 里，Embedding 与 Milvus query 却像两条孤立链路。单看列表，好像每个步骤都有；点进一条请求，却无法把它们按父子关系串起来。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222907889-2101843541.png" alt="image" loading="lazy"></p>
+<p>原因出在响应式上下文传播。这个项目使用流式生成，代码跨过 Reactor 异步边界后，观测上下文没有自动带过去。Span 产生了，但父 Trace 信息丢了。</p>
+<p>修复只加了一项：</p>
+<pre><code class="language-yaml">spring:
+  reactor:
+    context-propagation: auto
+</code></pre>
+<p>重新启动后，同一次请求中出现了 12 个 Span：HTTP 入口、<code>spring_ai_chat_client</code>、消息记忆、向量检索 Advisor、Embedding、Milvus query、qwen-plus 流式生成都挂在同一条 Trace 下。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222915714-947582192.png" alt="image" loading="lazy"></p>
+<p>这一步比“能看到 Trace”更关键。链路没有串起来时，后面的耗时对比很容易拿错样本。监控平台不会自动替我们修正应用里的上下文传播，页面上有数据也不代表接入已经完成。</p>
+<h2 id="一条-rag-trace应该怎样读">一条 RAG Trace，应该怎样读</h2>
+<p>第一次打开链路详情，很容易被十几个 Span 名称吓到。我的读法不是从上到下逐行研究，而是先找三块最影响用户等待时间的主干。</p>
+<p>先看 ChatModel。它通常占据较长的一段，但流式生成有一个特殊点：总生成时间长，不一定等于用户一直看着空白页。生产排查时，最好把首字时间和完整生成时间分开。如果首字很快、后续持续输出，用户感受未必差；如果第一个字迟迟不来，即使总耗时一样，体验也会明显更糟。</p>
+<p>再看 Embedding。它负责把用户问题转成向量，是进入 Milvus 前的一步。如果这一段突然升高，先检查模型服务的网络、限流、超时和批量策略。此时调整 Milvus 索引通常没有帮助，因为请求还没真正进入向量检索。</p>
+<p>最后看 VectorStore query。它是应用侧看到的向量检索总耗时，里面可能包含连接建立、网络往返、服务端排队与实际查询。这个 Span 变长，只能把范围缩到“应用调用向量库这一段”，还不能直接断言向量库内部变慢。要继续和 Milvus Proxy、QueryNode 指标对照。</p>
+<p>Advisor、消息记忆和提示词组装也值得看，但优先级取决于占比。如果它们只占几毫秒，就先别急着优化；如果自定义 Advisor 中还有数据库查询、文件读取或远程接口，就要继续补更细的业务 Span。Trace 的作用不是让每一行都变成绿色，而是告诉我们下一步该把时间花在哪里。</p>
+<p>另外，父子关系和时间轴要一起看。两个 Span 看起来都用了 500ms，如果它们并行执行，对总耗时的贡献可能仍接近 500ms；如果串行执行，才可能累加成 1 秒。只把列表中的耗时全部相加，往往会得到一个超过接口总耗时的错误数字。</p>
+<p>到这里，应用 Trace、应用指标和远程 Milvus 指标已经通过本机 DataKit 汇到同一个工作空间。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222925331-1134636273.png" alt="image" loading="lazy"></p>
+<h2 id="然后我主动制造了一次慢请求">然后，我主动制造了一次慢请求</h2>
+<p>我用 Toxiproxy 放在应用和远程 Milvus 之间，只对这段测试链路增加延迟：上行 350ms、下行 350ms，强度 100%。Embedding 模型和 ChatModel 的访问路径不变，Milvus 服务本身也没有做 CPU 限速或资源压测。</p>
+<p>测试容器的启动命令如下，端口只绑定本机：</p>
+<pre><code class="language-powershell">docker run -d --name clxzs-milvus-toxiproxy `
+  -p 127.0.0.1:8474:8474 `
+  -p 127.0.0.1:19531:8666 `
+  ghcr.io/shopify/toxiproxy:2.12.0
+</code></pre>
+<p>然后通过 Toxiproxy 的 8474 管理接口创建 <code>0.0.0.0:8666 → &lt;MILVUS_HOST&gt;:19530</code> 代理，再分别添加 upstream 和 downstream 两个 latency toxic，<code>latency</code> 都设为 350。应用测试时临时把 <code>MILVUS_PORT</code> 改成 19531。</p>
+<p>这组操作只适合隔离的测试环境。看到结果后，先删除两个 toxic，再执行 <code>docker rm -f clxzs-milvus-toxiproxy</code>，把应用端口恢复为 19530 并重启。健康检查不为 <code>UP</code>、检索没有返回 200，或恢复后耗时没有回落，都不能算实验结束。</p>
+<p>每个阶段使用相同接口和相同问题，记录固定次数，然后移除延迟，再跑恢复组。因此，后面看到向量检索耗时增加时，先把它叫作“到 Milvus 的网络变慢”，不能直接说成“Milvus 服务器变慢”。</p>
+<p>为了减少流式模型波动对结论的干扰，我同时看两组数据：完整问答请求用于观察一条真实 RAG Trace；独立检索端点连续调用三次，用于比较向量检索的中位数。再用 Micrometer 累计值计算 VectorStore、Embedding、ChatModel 的阶段平均耗时。</p>
+<p>故障阶段，完整请求在观测云里显示总耗时 2.40 秒，其中 Milvus query 约 1.37 秒，ChatModel 约 1.02 秒。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222932592-841828836.png" alt="image" loading="lazy"></p>
+<p>恢复直连后，一条请求总耗时 1.84 秒，Milvus query 回到约 739 毫秒，ChatModel 约 1.05 秒。</p>
+<p>单条 Trace 会受模型响应、网络抖动和缓存影响，所以我没有拿这两张图直接算百分比。更稳的对照来自固定次数的检索请求和阶段累计指标：</p>
+<table>
+<thead>
+<tr>
+<th>观察项</th>
+<th style="text-align: right">故障阶段</th>
+<th style="text-align: right">恢复阶段</th>
+<th style="text-align: right">变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/debug/search</code> 三次中位数</td>
+<td style="text-align: right">1595ms</td>
+<td style="text-align: right">1097ms</td>
+<td style="text-align: right">增加约498ms</td>
+</tr>
+<tr>
+<td>VectorStore 平均耗时</td>
+<td style="text-align: right">1395ms</td>
+<td style="text-align: right">838ms</td>
+<td style="text-align: right">增加约557ms</td>
+</tr>
+<tr>
+<td>Embedding 平均耗时</td>
+<td style="text-align: right">158ms</td>
+<td style="text-align: right">244ms</td>
+<td style="text-align: right">没有随故障升高</td>
+</tr>
+<tr>
+<td>ChatModel 耗时</td>
+<td style="text-align: right">1023ms</td>
+<td style="text-align: right">1050ms</td>
+<td style="text-align: right">基本稳定</td>
+</tr>
+<tr>
+<td>Milvus Proxy 服务端平均耗时</td>
+<td style="text-align: right">466ms</td>
+<td style="text-align: right">507ms</td>
+<td style="text-align: right">没有随故障升高</td>
+</tr>
+<tr>
+<td>Milvus QueryNode 样本平均耗时</td>
+<td style="text-align: right">233ms</td>
+<td style="text-align: right">253ms</td>
+<td style="text-align: right">没有随故障升高</td>
+</tr>
+</tbody>
+</table>
+<p>这个表就是整次排查最有价值的证据。</p>
+<p>应用侧看到 VectorStore 多了约 557ms，但 Embedding 和 ChatModel 没有同步变慢。继续看 Milvus 服务端，Proxy 与 QueryNode 的处理时间也没有升高。客户端多花了时间，服务端却没有多做同等时间的工作，差值最合理的去向就是应用和 Milvus 之间的网络路径。</p>
+<p>这里有两个数字看上去可能不够“整齐”。我注入的是上下行各 350ms，理论上是 700ms，但 <code>/debug/search</code> 中位数只增加约 498ms，VectorStore 平均值增加约 557ms。真实系统里的连接复用、采样窗口、远程服务自然波动都会影响结果，所以不能期待观测值与配置值毫秒不差地相等。</p>
+<p>我更关心的是方向是否一致：故障阶段客户端向量检索明显抬高，恢复后回落；与这条路径无关的 Embedding 和 ChatModel 没有同方向上涨；Milvus 内部指标也没有出现对应增量。</p>
+<p>这也是为什么完整问答和独立检索要分开测。大模型生成具有随机波动，如果只拿两次完整请求比较，很可能一次模型快、一次模型慢，反而遮住网络延迟。独立检索端点减少了模型变量，完整 Trace 则保留真实用户链路，两者各自回答不同问题。</p>
+<p>如果只看应用总耗时，我只能说“RAG 变慢了”。如果只看 VectorStore Span，我可能会说“Milvus 变慢了”。把应用 Trace 和 Milvus 服务端指标放在一起，才有足够依据把范围缩到网络。</p>
+<p>实验结束后，我删除了 Toxiproxy 的 toxic 和测试容器，应用切回远程 Milvus 直连。健康检查为 <code>UP</code>，向量检索返回 200，恢复组指标也回落。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222943210-944465561.png" alt="image" loading="lazy"></p>
+<h2 id="把三层数据放在一起少猜一轮">把三层数据放在一起，少猜一轮</h2>
+<p>先说结论：观测云没有替我“自动诊断出网络问题”。它提供的是把不同层数据放到一起观察的条件，最后的判断仍然来自实验设计和交叉验证。</p>
+<p>最直接的帮助是一条 Trace 把一次 RAG 请求拆开了。以前我只能看到接口总耗时，现在能点开某次请求，确认时间主要落在向量检索还是模型生成。对于偶发慢请求，这比只看平均值更有用。</p>
+<p>Spring AI 指标和 Milvus 指标又补上了整体视角。Trace 告诉我“这一次”发生了什么，Prometheus 指标告诉我“这一类操作”是否持续异常。两种视角放在一起，才完成了这次网络与服务端的排除。</p>
+<p>DataKit 则解决了数据怎么汇到一起：应用只向本机 OTLP 端点上报，管理端点也只监听本机；DataKit 再去访问远程 Milvus 指标。这种部署对 Windows 开发环境和小规模实践比较顺手。</p>
+<p>但它也不是接上就万事大吉。</p>
+<p>链路是否完整，取决于应用有没有正确传播上下文；自动 Span 覆盖多少，取决于代码是否走 Spring AI 的标准组件；指标量和成本，取决于采集范围与标签基数；真正能否定位问题，还取决于有没有基线和对照。</p>
+<p>这次页面没有自动弹出一句“根因是网络”。它让我更快地把一次请求、应用指标和 Milvus 指标放在一起，但故障变量仍要由人控制，比较口径也要事先确定。少了这两步，同样一张图可能被解释成不同结论。</p>
+<p>从这次体验看，它比较适合已经有多段调用、又不想分别维护链路平台和指标平台的团队。尤其是 RAG 这种跨模型服务、向量库和业务代码的流程，一条请求能下钻到各阶段，再切到同工作空间的服务指标，排查路径会短很多。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920222952282-1071204029.png" alt="image" loading="lazy"></p>
+<p>相应的代价也很现实。你需要维护 DataKit 配置，理解指标名称，处理采样和数据量，还要给服务补齐稳定的标签。页面不会替你决定哪些标签会造成高基数，也不会知道哪个业务字段敏感。对只有一个接口、几乎没有跨服务调用的小项目，这套投入未必划算；对已经出现偶发慢请求、并且靠日志难以复现的 RAG 应用，收益才更明显。</p>
+<p>因此，在这次 Windows 本机应用加远程 Milvus 的实践中，它确实承接了 OTLP Trace、Spring AI 指标和 Milvus 指标，并支持我完成一次从故障到恢复的跨层对照。</p>
+<p>如果项目直接调用 DashScope 原生 SDK、Milvus Java SDK，或者把整个 RAG 流程封装在自定义线程和异步任务里，部分步骤可能不会自动出现。这时需要在业务边界补自定义 <code>Observation</code> 或 OpenTelemetry Span，而不是认为换一个监控平台就会自动补齐。</p>
+<h2 id="把这套方法带到另一个项目">把这套方法带到另一个项目</h2>
+<p>如果你也要给 RAG 应用加观测，更省力的起点是一条最小闭环，而不是先做十几张面板。</p>
+<p>先选一个稳定请求，记录正常状态下的完整 Trace。确认 Embedding、VectorStore、ChatModel 都在同一条链路，父子关系正确。这个结果就是基线。</p>
+<p>然后确认三个数据入口：应用 OTLP Trace、应用 Prometheus、Milvus Prometheus。任意一个缺失，先修采集，不急着做故障结论。</p>
+<p>接着做一次可恢复的小故障。可以是测试环境中的网络延迟、受控超时或限流，但一次只改一个变量，并且提前写清恢复方法。不要直接在生产环境里试。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920223000078-52794934.png" alt="image" loading="lazy"></p>
+<p>最后按下面的顺序判断：</p>
+<table>
+<thead>
+<tr>
+<th>看到的现象</th>
+<th>优先怀疑</th>
+<th>下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ChatModel Span 上升，向量检索稳定</td>
+<td>模型服务或模型网络</td>
+<td>看模型请求错误率、首字时间和供应商状态</td>
+</tr>
+<tr>
+<td>Embedding Span 上升，Milvus稳定</td>
+<td>Embedding 服务</td>
+<td>看向量化请求、限流、超时和批量大小</td>
+</tr>
+<tr>
+<td>VectorStore 客户端与 Milvus 服务端同时上升</td>
+<td>Milvus内部或资源压力</td>
+<td>看 Proxy、QueryNode、CPU、内存和磁盘</td>
+</tr>
+<tr>
+<td>VectorStore 客户端上升，Milvus服务端稳定</td>
+<td>应用到Milvus的网络路径</td>
+<td>看跨机房、代理、连接池、DNS和丢包</td>
+</tr>
+<tr>
+<td>总耗时上升，但各关键Span变化不大</td>
+<td>未覆盖的业务代码或排队</td>
+<td>补业务Span，检查线程池和异步边界</td>
+</tr>
+</tbody>
+</table>
+<p>这张表不是通用真理，但它能避免一看到“向量检索慢”就立刻调 Milvus 参数。先判断慢时间发生在客户端、网络还是服务端，再决定改什么。</p>
+<h2 id="项目接入观测云真正容易踩的是这几处">项目接入观测云，真正容易踩的是这几处</h2>
+<p>第一处是把 DataKit 的两个 OTLP 入口混在一起。4317 通常接收 gRPC，9529 提供 HTTP 接口。本项目使用 Spring Boot 的 HTTP 导出方式，所以地址写成 <code>http://127.0.0.1:9529/otel/v1/traces</code>。如果只照搬一个端口，协议和路径却没对上，DataKit 服务看起来正常，观测云里仍然收不到 Trace。</p>
+<p>第二处是忽略 DataKit 装在哪里。本次 DataKit 和应用在同一台 Windows 电脑上，因此 Actuator 绑定 <code>127.0.0.1:9167</code> 仍能被采集。如果 DataKit 改装到服务器，这个地址就只代表服务器自己，抓不到开发电脑的管理端点。要么让采集器与应用同机，要么给管理端点配置受控的可访问地址，不能原样复制本次地址。</p>
+<p>第三处是混淆 Milvus 的业务端口和指标端口。应用通过 19530 做向量查询，DataKit 抓取的是 <code>9091/metrics</code>。只测试 19530 能连通，并不能说明 Milvus 指标能采到；远程部署时还要确认 9091 对 DataKit 所在机器可达，并限制访问来源。</p>
+<p>第四处出现在故障恢复。Toxiproxy 容器删掉以后，如果应用仍指向 19531，下一次请求会直接连接失败。恢复时要把 <code>MILVUS_PORT</code> 改回 19530，重启应用，再依次检查健康状态、检索响应和向量检索耗时。三个结果都恢复，才算测试环境真正收尾。<br>
+<img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920223009241-1618028854.png" alt="image" loading="lazy"></p>
+<p>第五处是以为所有 RAG 代码都会自动产生 Span。ChatClient、Advisor、EmbeddingModel、VectorStore 走 Spring AI 标准组件时，自动观测比较完整；如果代码直接调用 DashScope 或 Milvus 原生 SDK，或者把检索放进自定义异步线程，缺失的步骤仍要补 <code>Observation</code> 或自定义 Span。</p>
+<p>最后一处是为了“看得更详细”打开正文采集。<code>log-prompt</code>、<code>log-completion</code> 和 <code>log-query-response</code> 对这次耗时定位没有必要，保持关闭也能区分模型、向量检索和网络。如果确实要打开，应该先确认用户问题、模型回答和召回文档允许进入观测平台。</p>
+<h2 id="最后的判断">最后的判断</h2>
+<p>做完这次实践后，我对“RAG 可观测”有了一个很朴素的标准：不是页面里出现几条 Trace、几张曲线就算完成，而是当一次回答变慢时，能沿着同一请求找到可疑阶段，再用另一层数据排除错误判断。</p>
+<p>在这次实验里，完整 Trace 先把慢点指向 VectorStore；应用指标确认它不是单条请求的偶然波动；Milvus 服务端指标又排除了内部处理变慢。三层证据拼在一起，才得到“应用到 Milvus 的网络链路变慢”这个结论。</p>
+<p>观测云在这里更像一个工作台：它把 Trace、应用指标和远程服务指标放到了同一个地方。工作台本身不替代判断，但能让判断有证据、有路径，也能在恢复后看到结果是否真的回落。</p>
+<p>如果准备把这套方法用到自己的项目，先别急着做大屏。挑一个真实请求，确认链路完整，留一份正常基线，再制造一个可恢复的小故障。移除故障后，直到健康检查为 <code>UP</code>、检索返回 200、关键耗时回到基线附近，这次排查才算结束。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1423484/202609/1423484-20260920223022960-780945527.png" alt="image" loading="lazy"></p>
+<p>监控的终点不是“看见数据”，而是少走一次错误的排查方向。对 RAG 来说，先把模型、向量检索和网络拆开看</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-21 09:10">2026-09-21 09:10</span>&nbsp;
+<a href="https://www.cnblogs.com/guoxiaoyu">努力的小雨</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23053825);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fguoxiaoyu%2Fp%2F23053825&amp;targetId=23053825&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
