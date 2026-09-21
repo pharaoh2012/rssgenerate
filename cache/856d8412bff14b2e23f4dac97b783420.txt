@@ -1,0 +1,719 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/miku196/p/23064342" title="发布于 2026-09-21 16:51">
+    
+
+    <span role="heading" aria-level="2">geo-toolbox 插件算法解析：RUSLE 与 MUSLE 的工程化落地</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="基于-geo-toolbox-分层结构的-rusle--musle-参考实现">基于 geo-toolbox 分层结构的 RUSLE / MUSLE 参考实现</h1>
+<blockquote>
+<p>本文以 <a href="https://github.com/Miku196/geo-toolbox" target="_blank" rel="noopener nofollow">Miku196/geo-toolbox</a> 的分层架构为背景，讨论如何在 <code>geo-plugin-ecology</code> 这一层实现 RUSLE / MUSLE 土壤侵蚀模型，并给出可复现的参考实现。</p>
+<p><strong>代码性质说明</strong>：文中 Rust 代码为基于标准文献的参考实现示意，用于说明算法结构、量纲处理与工程约定，<strong>并非仓库逐行摘录</strong>。实际实现请以仓库源码为准。</p>
+</blockquote>
+<hr>
+<h2 id="一先看整体分层">一、先看整体分层</h2>
+<div class="mermaid">graph TD
+    A["应用层&lt;br/&gt;野外 PWA · 离线数据采集 · 侵蚀评估报告"] --&gt; B["插件层 plugins/&lt;br/&gt;ecology · hydro · remote-sensing · geohazard · forestry · carbon"]
+    B --&gt; C["核心层 geo-core&lt;br/&gt;BBox 粗筛 · 坐标校验 · CRS 分类 · 距离 trait"]
+    C --&gt; D["基础层&lt;br/&gt;geo · geo-types · i_overlay"]
+
+    style A fill:#fdf2f8,stroke:#f9a8d4,color:#9d174d
+    style B fill:#e0f2fe,stroke:#7dd3fc,color:#075985
+    style C fill:#dcfce7,stroke:#86efac,color:#065f46
+    style D fill:#f1f5f9,stroke:#cbd5e1,color:#334155
+</div><p>插件层不重新发明几何算法，它的职责是把领域模型与核心层提供的空间计算原语组合起来。RUSLE / MUSLE 的因子计算正是这一思路的典型体现。</p>
+<hr>
+<h2 id="二rusle把年均侵蚀量拆成五个可计算因子">二、RUSLE：把年均侵蚀量拆成五个可计算因子</h2>
+<p></p><div class="math display">\[A = R \times K \times LS \times C \times P
+\]</div><p></p><p>其中 <code>A</code> 是单位面积年均土壤流失量（t·ha⁻¹·yr⁻¹）。五个因子各自独立可计算，允许按需组合。</p>
+<div class="mermaid">graph LR
+    subgraph SRC["空间数据源"]
+        D1[DEM]
+        D2[NDVI]
+        D3[土壤属性]
+        D4[降雨数据]
+        D5[土地利用]
+    end
+
+    subgraph FAC["因子计算"]
+        F1[LS 因子]
+        F2[C 因子]
+        F3[K 因子]
+        F4[R 因子]
+        F5[P 因子]
+    end
+
+    OUT["A = R x K x LS x C x P"]
+
+    D1 --&gt; F1
+    D2 --&gt; F2
+    D3 --&gt; F3
+    D4 --&gt; F4
+    D5 --&gt; F5
+    F1 --&gt; OUT
+    F2 --&gt; OUT
+    F3 --&gt; OUT
+    F4 --&gt; OUT
+    F5 --&gt; OUT
+
+    style SRC fill:#f1f5f9,stroke:#cbd5e1
+    style FAC fill:#e0f2fe,stroke:#7dd3fc
+    style OUT fill:#dcfce7,stroke:#86efac,color:#065f46
+</div><h3 id="21-降雨侵蚀力-r-因子">2.1 降雨侵蚀力 R 因子</h3>
+<p>R 因子有两个来源，单位约定与适用场景分别说明：</p>
+<ul>
+<li><code>compute_r_factor</code>：由月降雨序列经 Renard &amp; Freimund (1994) 回归式计算，<strong>输出 SI 单位</strong> <code>MJ·mm·ha⁻¹·h⁻¹·yr⁻¹</code>。原文回归式输出美制单位 <code>(hundreds of ft·tonf·in)/(acre·h·yr)</code>，函数内部乘 <strong>17.02</strong> 完成换算。</li>
+<li><code>compute_r_factor_simple</code>：由年降雨量经周伏建等 (1989) 经验式估算，<strong>输出单位依原始文献</strong>。该公式在不同转载文献中单位标注不统一（有引为美制，有引为 SI），使用前请核实原始文献，必要时乘换算系数。</li>
+</ul>
+<p><strong>选择建议</strong>：有月降雨序列时优先用 <code>compute_r_factor</code>（Renard &amp; Freimund 月尺度法，精度更高）；只有年降雨量时用 <code>compute_r_factor_simple</code>。两者单位不一致，混用前请先统一。</p>
+<pre><code class="language-rust">/// 由月降雨序列计算年均 R 因子
+///
+/// 输出单位：SI (MJ·mm·ha⁻¹·h⁻¹·yr⁻¹)。
+///
+/// Renard &amp; Freimund (1994) 原文回归式输出为美制单位
+/// (hundreds of ft·tonf·in)/(acre·h·yr)，本函数内部乘 17.02 转为 SI。
+///
+/// `monthly_rainfall_mm` 的每个元素是某一年的 12 个月降雨量 (mm)。
+/// 少于 12 个月的年份会被跳过，且不计入年均分母。
+pub fn compute_r_factor(monthly_rainfall_mm: &amp;[&amp;[f64]]) -&gt; f64 {
+    let mut r_sum = 0.0;
+    let mut valid_years = 0usize;
+
+    for year_data in monthly_rainfall_mm {
+        if year_data.len() &lt; 12 { continue; }
+        let annual: f64 = year_data.iter().sum();
+        if annual &lt;= 0.0 { continue; }
+
+        // p = 0 的月份贡献 0；p &lt; 0 视为数据错误，一并过滤。
+        let mfi: f64 = year_data
+            .iter()
+            .filter(|&amp;&amp;p| p &gt; 0.0)
+            .map(|&amp;p| p * p / annual)
+            .sum();
+
+        // 注意：Renard &amp; Freimund 原文两段回归在 MFI = 55 处不连续，
+        // 55⁻ 侧约 1212，55⁺ 侧约 1204，相对差异约 0.6%。
+        // 这是原文公式本身的特性，非实现误差。
+        let year_r = if mfi &lt; 55.0 {
+            0.7397 * mfi.powf(1.847)
+        } else {
+            95.77 - 6.081 * mfi + 0.477 * mfi.powi(2)
+        };
+        r_sum += year_r.max(0.0);
+        valid_years += 1;
+    }
+
+    if valid_years == 0 { return 0.0; }
+    let r_us = r_sum / valid_years as f64;
+    r_us * 17.02
+}
+
+/// 由年降雨量估算 R 因子（周伏建等 1989，中国湿润/半湿润区）
+///
+/// 输出单位：依原始文献。周伏建等 (1989) 的公式
+/// `R = 0.0483 × P^1.61` 在不同转载文献中单位标注不统一
+/// （有引为美制 hundred ft·tonf·in/(acre·h·yr)，有引为 SI）。
+/// 使用前请核实原始文献的单位约定，必要时乘换算系数。
+pub fn compute_r_factor_simple(annual_rainfall_mm: f64) -&gt; f64 {
+    if annual_rainfall_mm &lt;= 0.0 { return 0.0; }
+    0.0483 * annual_rainfall_mm.powf(1.61)
+}
+</code></pre>
+<h3 id="22-土壤可蚀性-k-因子">2.2 土壤可蚀性 K 因子</h3>
+<p>完整方案使用 Wischmeier &amp; Smith 诺模公式：</p>
+<p></p><div class="math display">\[100K = 2.1 \times 10^{-4} \cdot M^{1.14} \cdot (12 - OM) + 3.25 \cdot (S - 2) + 2.5 \cdot (P - 3)
+\]</div><p></p><p>美制 K 值乘 <code>0.1317</code> 转换为 SI 单位（t·ha·h·ha⁻¹·MJ⁻¹·mm⁻¹）。</p>
+<p><strong>常见错误提醒</strong>：<code>100K</code> 中的 <code>/100</code> 必须分配到各项。若只保留后两项的整数系数（<code>3.25</code>、<code>2.5</code>）而漏掉第一项的 <code>/100</code>，会得到 100K 而非 K，导致 K 值偏大约 100 倍后被 clamp 截断。</p>
+<pre><code class="language-rust">/// Wischmeier &amp; Smith 诺模公式（SI 单位输出）
+///
+/// - `sand_pct` / `silt_pct` / `clay_pct` / `very_fine_sand_pct`：质量百分比 (%)
+/// - `om_pct`：有机质百分比 (%)
+/// - `structure_code`：1~4（极细、细、中、块状）
+/// - `permeability_code`：1~6（快 → 极慢）
+///
+/// `sand_pct` 不参与诺模公式计算，保留此参数仅为与简化方案
+/// `compute_k_factor_simple` 保持接口一致。若不需要接口对齐，
+/// 可删除此参数。
+///
+/// `(12 - OM)` 在 OM &gt; 12% 时截断为 0，这是诺模公式的标准处理。
+pub fn compute_k_factor(
+    _sand_pct: f64, silt_pct: f64, clay_pct: f64,
+    very_fine_sand_pct: f64, om_pct: f64,
+    structure_code: u32, permeability_code: u32,
+) -&gt; f64 {
+    let m = (silt_pct + very_fine_sand_pct) * (100.0 - clay_pct);
+    let om_factor = (12.0 - om_pct).max(0.0);
+    let s_code = structure_code.clamp(1, 4);
+    let p_code = permeability_code.clamp(1, 6);
+
+    // K_US = 100K / 100
+    //      = 2.1e-6·M^1.14·(12−OM) + 0.0325·(S−2) + 0.025·(P−3)
+    // 其中 100K = 2.1e-4·M^1.14·(12−OM) + 3.25·(S−2) + 2.5·(P−3)
+    let k_us = 2.1e-4 * m.powf(1.14) * om_factor / 100.0
+        + 0.0325 * (s_code as f64 - 2.0)
+        + 0.025 * (p_code as f64 - 3.0);
+
+    // US → SI
+    (k_us * 0.1317).clamp(0.0, 0.7)
+}
+</code></pre>
+<p>简化方案使用修正的 EPIC 公式。<strong>健壮性处理</strong>：<code>f2</code> 的分母 <code>clay_pct + silt_pct</code> 在纯砂土情形下为 0，需保护避免 <code>NaN</code>。</p>
+<pre><code class="language-rust">/// 修正 EPIC 公式（SI 单位输出）
+///
+/// - `sand_pct` / `silt_pct` / `clay_pct`：质量百分比 (%)
+/// - `om_pct`：**有机质**百分比 (%)，内部会 × 0.58 转为有机碳
+///
+/// 要求 `sand_pct + silt_pct + clay_pct ≈ 100`。
+/// 当 `clay_pct + silt_pct = 0`（纯砂土）时，`f2` 项取 0。
+pub fn compute_k_factor_simple(
+    sand_pct: f64, silt_pct: f64, clay_pct: f64, om_pct: f64,
+) -&gt; f64 {
+    let san = sand_pct;
+    let sil = silt_pct;
+    let cla = clay_pct;
+    let c = om_pct * 0.58;
+    let sn1 = 1.0 - san / 100.0;
+
+    let f1 = 0.2 + 0.3 * (-0.0256 * san * (1.0 - sil / 100.0)).exp();
+
+    let denom = cla + sil;
+    let f2 = if denom &gt; 0.0 { (sil / denom).powf(0.3) } else { 0.0 };
+
+    let f3 = 1.0 - 0.25 * c / (c + (3.72 - 2.95 * c).exp());
+    let f4 = 1.0 - 0.7 * sn1 / (sn1 + (-5.51 + 22.9 * sn1).exp());
+
+    let k = 0.1317 * f1 * f2 * f3 * f4;
+    k.clamp(0.0, 0.7)
+}
+</code></pre>
+<h3 id="23-地形-ls-因子">2.3 地形 LS 因子</h3>
+<p>LS 因子采用 Desmet &amp; Govers (1996) 坡长公式：</p>
+<p></p><div class="math display">\[L_{ij} = \frac{(A_{ij-in} + D^2)^{m+1} - A_{ij-in}^{m+1}}{D^{m+2} \cdot x_{ij}^m \cdot 22.13^m}
+\]</div><p></p><p><strong>实现约定</strong>：</p>
+<ul>
+<li><code>slope_pct</code> 与 <code>flow_acc_cells</code> 长度均须 ≥ <code>rows * cols</code>，否则 panic。</li>
+<li><code>flow_acc_cells</code> 为<strong>含自身像元</strong>的汇流累积，函数内部减 1 得到上坡面积。</li>
+<li><code>x_ij</code> 固定为 <code>1.0</code>，等效 D8；完整 MFD 需外部传入各方向分流比例。</li>
+<li>平坦地区返回<strong>无量纲</strong>小下限 <code>0.01</code>，不随像元大小变化。</li>
+</ul>
+<pre><code class="language-rust">/// Desmet &amp; Govers (1996) 逐像元 L 因子
+///
+/// `x_ij` 固定为 1.0，等价 D8；完整 MFD 需外部传入各方向分流比例。
+///
+/// - `slope_pct`：坡度百分比 (%)，由调用方统一算好后传入
+/// - `flow_acc_cells`：**含自身像元**的汇流累积（以像元数计）
+/// - 返回：逐像元 L 因子（无量纲）
+///
+/// **Panics**：
+/// - 当 `slope_pct.len() &lt; rows * cols` 时 panic。
+/// - 当 `flow_acc_cells.len() &lt; rows * cols` 时 panic。
+pub fn compute_l_factor_d8(
+    slope_pct: &amp;[f64],
+    flow_acc_cells: &amp;[f64],
+    cellsize_m: f64,
+    rows: usize,
+    cols: usize,
+) -&gt; Vec&lt;f64&gt; {
+    let n = rows * cols;
+    assert!(
+        slope_pct.len() &gt;= n,
+        "slope_pct 长度不足：期望 ≥ {}，实际 {}", n, slope_pct.len()
+    );
+    assert!(
+        flow_acc_cells.len() &gt;= n,
+        "flow_acc_cells 长度不足：期望 ≥ {}，实际 {}", n, flow_acc_cells.len()
+    );
+
+    let mut l_factor = vec![0.0; n];
+
+    for i in 0..n {
+        if slope_pct[i] &lt;= 0.0 {
+            l_factor[i] = 0.01;
+            continue;
+        }
+
+        let m = slope_length_exponent(slope_pct[i]);
+
+        let a_in_cells = (flow_acc_cells[i] - 1.0).max(0.0);
+        let a_in = a_in_cells * cellsize_m * cellsize_m;
+
+        let d = cellsize_m;
+        let x_ij = 1.0;
+
+        let num = (a_in + d * d).powf(m + 1.0) - a_in.powf(m + 1.0);
+        let den = d.powf(m + 2.0) * x_ij.powf(m) * 22.13_f64.powf(m);
+        l_factor[i] = if den &gt; 0.0 { num / den } else { 0.0 };
+    }
+
+    l_factor
+}
+
+/// 坡长指数 m 随坡度变化 (McCool et al., 1989)
+fn slope_length_exponent(slope_pct: f64) -&gt; f64 {
+    if slope_pct &lt; 1.0 { 0.2 }
+    else if slope_pct &lt; 3.0 { 0.3 }
+    else if slope_pct &lt; 5.0 { 0.4 }
+    else { 0.5 }
+}
+
+/// McCool (1987) 坡度因子 S
+///
+/// - `slope_pct`：坡度百分比 (%)，例如 5.0 表示 5%
+pub fn compute_s_factor(slope_pct: f64) -&gt; f64 {
+    if slope_pct &lt;= 0.0 { return 0.03; }
+    let angle_rad = (slope_pct / 100.0).atan();
+    let s = angle_rad.sin();
+    if slope_pct &lt; 9.0 {
+        // 9% 处两段不连续：9⁻ 侧约 0.998，9⁺ 侧约 1.006，
+        // 相对差异约 0.8%，属原文公式特性。
+        10.8 * s + 0.03
+    } else {
+        16.8 * s - 0.50
+    }
+}
+
+/// 合成 LS = L × S
+///
+/// **Panics**：
+/// - 当 `slope_pct.len() &lt; rows * cols` 时 panic。
+/// - 当 `flow_acc_cells.len() &lt; rows * cols` 时 panic（由内部
+///   `compute_l_factor_d8` 触发）。
+pub fn compute_ls_factor(
+    slope_pct: &amp;[f64],
+    flow_acc_cells: &amp;[f64],
+    cellsize_m: f64,
+    rows: usize,
+    cols: usize,
+) -&gt; Vec&lt;f64&gt; {
+    let n = rows * cols;
+    assert!(
+        slope_pct.len() &gt;= n,
+        "slope_pct 长度不足：期望 ≥ {}，实际 {}", n, slope_pct.len()
+    );
+
+    let l = compute_l_factor_d8(slope_pct, flow_acc_cells, cellsize_m, rows, cols);
+    let mut ls = vec![0.0; n];
+    for i in 0..n {
+        ls[i] = l[i] * compute_s_factor(slope_pct[i]);
+    }
+    ls
+}
+</code></pre>
+<h3 id="24-覆盖管理-c-因子">2.4 覆盖管理 C 因子</h3>
+<p>C 因子通过 NDVI 估算。水体与裸土分开处理，用 EPS 容差替代浮点 <code>==</code> 比较。</p>
+<p><strong>NaN 处理约定</strong>：<code>compute_c_factor_from_ndvi</code> 对 NaN 输入返回 NaN；NaN 经 <code>compute_soil_loss</code> 传播到 <code>soil_loss</code> 后，由 <code>compute_erosion_statistics</code> 在统计汇总时跳过，并在 <code>RusleAssessment.nan_cells</code> 中报告被跳过的像元数。这样水体、云掩膜等天然 NaN 区域不会让整个评估失败。</p>
+<pre><code class="language-rust">/// 由 NDVI 估算 C 因子
+///
+/// - NaN 输入：返回 NaN，由 `compute_erosion_statistics` 汇总时跳过，
+///   结果在 `RusleAssessment.nan_cells` 中报告。
+/// - NDVI &lt; -EPS：水体/云，C = 0.0
+/// - NDVI ≤ EPS：裸土（含 0 附近），C = 1.0
+/// - NDVI ≥ 1 - EPS：完全覆盖，C = 0.001
+/// - 其他：Van der Knijff 指数模型，系数 -2.0
+///
+/// 水体与裸土的判别边界为 `NDVI = -EPS`。略负的 NDVI
+/// （如 -1e-7）会被判为裸土，这是简化处理；若研究区水体
+/// 占比高，建议结合水体掩膜先行剔除。
+pub fn compute_c_factor_from_ndvi(ndvi: &amp;[f64]) -&gt; Vec&lt;f64&gt; {
+    const EPS: f64 = 1e-6;
+    ndvi.iter().map(|&amp;v| {
+        if v.is_nan() { return f64::NAN; }
+        if v &lt; -EPS { return 0.0; }
+        if v &lt;= EPS { return 1.0; }
+        if v &gt;= 1.0 - EPS { return 0.001; }
+        (-2.0 * v / (1.0 - v)).exp()
+    }).collect()
+}
+
+/// 由土地利用类型查表得到 C 因子
+///
+/// 未列出的类型返回 0.15，取耕地与草地之间的保守中间值。
+pub fn c_factor_for_landuse(code: &amp;str) -&gt; f64 {
+    match code {
+        "forest" | "林地" =&gt; 0.005,
+        "shrub" | "灌木" =&gt; 0.02,
+        "grass" | "草地" =&gt; 0.05,
+        "cropland" | "耕地" | "农田" =&gt; 0.25,
+        "bare" | "裸地" | "bareland" =&gt; 1.0,
+        "urban" | "建设用地" | "built-up" =&gt; 0.01,
+        "water" | "水体" =&gt; 0.0,
+        _ =&gt; 0.15,  // 未知类型：耕地与草地之间的保守中间值
+    }
+}
+</code></pre>
+<h3 id="25-水土保持措施-p-因子">2.5 水土保持措施 P 因子</h3>
+<pre><code class="language-rust">/// 由坡度和措施类型查表得到 P 因子
+///
+/// `PracticeType` 未列出的变体按未采取措施处理（P = 1.0）。
+pub fn compute_p_factor(slope_pct: &amp;[f64], practice: PracticeType) -&gt; Vec&lt;f64&gt; {
+    slope_pct.iter().map(|&amp;s| match practice {
+        PracticeType::None =&gt; 1.0,
+        PracticeType::Contouring =&gt; {
+            if s &lt; 1.0 { 0.60 } else if s &lt; 2.0 { 0.50 }
+            else if s &lt; 5.0 { 0.45 } else if s &lt; 8.0 { 0.50 }
+            else if s &lt; 12.0 { 0.60 } else { 0.90 }
+        }
+        PracticeType::Terracing =&gt; {
+            if s &lt; 1.0 { 0.20 } else if s &lt; 2.0 { 0.15 }
+            else if s &lt; 5.0 { 0.12 } else { 0.30 }
+        }
+        // 其他变体（如新增的 StripCropping）按未采取措施处理
+        _ =&gt; 1.0,
+    }).collect()
+}
+</code></pre>
+<h3 id="26-错误类型与合成-a-值">2.6 错误类型与合成 A 值</h3>
+<p>库函数面对输入长度不匹配这类可预期的调用错误，返回 <code>Result</code> 而不是 <code>panic</code>，让调用方自行决定如何处理。<code>check_len</code> 提取为私有辅助函数。</p>
+<pre><code class="language-rust">#[derive(Debug, PartialEq, Eq)]
+pub enum RusleError {
+    /// 因子数组长度小于像元数
+    LengthMismatch { name: &amp;'static str, expected: usize, got: usize },
+}
+
+impl std::fmt::Display for RusleError {
+    fn fmt(&amp;self, f: &amp;mut std::fmt::Formatter&lt;'_&gt;) -&gt; std::fmt::Result {
+        match self {
+            RusleError::LengthMismatch { name, expected, got } =&gt;
+                write!(f, "{} 长度不足：期望 ≥ {}，实际 {}", name, expected, got),
+        }
+    }
+}
+
+impl std::error::Error for RusleError {}
+
+/// 检查数组长度，不足则返回 `LengthMismatch`
+fn check_len(name: &amp;'static str, len: usize, expected: usize)
+    -&gt; Result&lt;(), RusleError&gt;
+{
+    if len &lt; expected {
+        Err(RusleError::LengthMismatch { name, expected, got: len })
+    } else {
+        Ok(())
+    }
+}
+
+/// 逐像元合成 A = R × K × LS × C × P
+///
+/// 返回 `Err(RusleError::LengthMismatch)` 当任一因子数组长度小于 `cells`。
+/// 任一因子为 NaN 时，该像元的 A 也为 NaN，由上游统计函数负责过滤。
+pub fn compute_soil_loss(
+    r_factor: &amp;[f64], k_factor: &amp;[f64], ls_factor: &amp;[f64],
+    c_factor: &amp;[f64], p_factor: &amp;[f64], cells: usize,
+) -&gt; Result&lt;Vec&lt;f64&gt;, RusleError&gt; {
+    check_len("r_factor",  r_factor.len(),  cells)?;
+    check_len("k_factor",  k_factor.len(),  cells)?;
+    check_len("ls_factor", ls_factor.len(), cells)?;
+    check_len("c_factor",  c_factor.len(),  cells)?;
+    check_len("p_factor",  p_factor.len(),  cells)?;
+
+    Ok((0..cells).map(|i| {
+        r_factor[i] * k_factor[i] * ls_factor[i] * c_factor[i] * p_factor[i]
+    }).collect())
+}
+</code></pre>
+<h3 id="27-评估结果结构与统计汇总">2.7 评估结果结构与统计汇总</h3>
+<p><code>RusleAssessment</code> 汇总评估区整体指标，供上层报告消费。<strong>NaN 像元</strong>（水体、云掩膜等）在统计时被跳过，数量在 <code>nan_cells</code> 中报告；<code>mean_soil_loss</code> 与 <code>total_soil_loss_t</code> 仅统计有效像元。</p>
+<pre><code class="language-rust">#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RusleAssessment {
+    /// 平均侵蚀模数 (t·ha⁻¹·yr⁻¹)，仅统计有效像元
+    pub mean_soil_loss: f64,
+    /// 总流失量 (t·yr⁻¹)，仅统计有效像元
+    pub total_soil_loss_t: f64,
+    /// 评估区总面积 (ha)，含 NaN 像元
+    pub area_ha: f64,
+    /// 有效像元数
+    pub valid_cells: usize,
+    /// NaN 像元数（水体、云掩膜等）
+    pub nan_cells: usize,
+    /// 各因子区均值（仅有效像元）
+    pub r_mean: f64,
+    pub k_mean: f64,
+    pub ls_mean: f64,
+    pub c_mean: f64,
+    pub p_mean: f64,
+}
+
+/// 汇总因子统计与侵蚀量
+///
+/// `total_soil_loss_t = Σ_i (A_i × area_cell_ha)`，仅累加非 NaN 像元。
+/// 各因子均值同样只统计非 NaN 像元（以 `soil_loss` 的有效掩膜为准）。
+fn compute_erosion_statistics(
+    r: &amp;[f64], area_cell_ha: f64, area_ha: f64,
+    k: &amp;[f64], ls: &amp;[f64], c: &amp;[f64], p: &amp;[f64], soil_loss: &amp;[f64],
+) -&gt; RusleAssessment {
+    let n = soil_loss.len();
+    // 有效像元掩膜：soil_loss 非 NaN
+    let valid: Vec&lt;usize&gt; = (0..n).filter(|&amp;i| !soil_loss[i].is_nan()).collect();
+    let valid_cells = valid.len();
+    let nan_cells = n - valid_cells;
+
+    let mean_of = |v: &amp;[f64]| -&gt; f64 {
+        if valid_cells == 0 { return 0.0; }
+        valid.iter().map(|&amp;i| v[i]).sum::&lt;f64&gt;() / valid_cells as f64
+    };
+
+    let total_soil_loss_t: f64 = valid.iter()
+        .map(|&amp;i| soil_loss[i] * area_cell_ha)
+        .sum();
+
+    RusleAssessment {
+        mean_soil_loss: mean_of(soil_loss),
+        total_soil_loss_t,
+        area_ha,
+        valid_cells,
+        nan_cells,
+        r_mean: mean_of(r),
+        k_mean: mean_of(k),
+        ls_mean: mean_of(ls),
+        c_mean: mean_of(c),
+        p_mean: mean_of(p),
+    }
+}
+
+/// 解析 K 因子栅格
+///
+/// - `Some(grid)`：要求 `grid.len() &gt;= n`，否则返回 `Err(LengthMismatch)`。
+/// - `None`：全部回退到粉砂壤土默认值 0.032。
+fn resolve_k_factor(grid: Option&lt;&amp;[f64]&gt;, n: usize)
+    -&gt; Result&lt;Vec&lt;f64&gt;, RusleError&gt;
+{
+    const DEFAULT_K: f64 = 0.032;
+    match grid {
+        Some(g) =&gt; {
+            check_len("k_factor_grid", g.len(), n)?;
+            Ok(g[..n].to_vec())
+        }
+        None =&gt; Ok(vec![DEFAULT_K; n]),
+    }
+}
+</code></pre>
+<h3 id="28-完整评估入口">2.8 完整评估入口</h3>
+<p><strong>错误通道统一</strong>：<code>assess_soil_loss</code> 在入口处对所有长度做前置检查，后续调用的库函数虽保留 <code>assert!</code> 保护自身契约，但正常路径不会触发 panic。所有长度错误统一走 <code>RusleError::LengthMismatch</code>。</p>
+<pre><code class="language-rust">/// 完整 RUSLE 评估入口
+///
+/// 坡度百分比只计算一次，透传给 LS 与 P 因子。
+///
+/// **R 因子空间变化**：本实现把 `r_factor` 广播为常数，适用于
+/// 研究区内降雨空间差异不显著的情形。若需空间变化 R，请修改
+/// 接口为 `r_factor_grid: &amp;[f64]` 并按像元索引。
+pub fn assess_soil_loss(
+    dem: &amp;[f64],
+    slope_deg: Option&lt;&amp;[f64]&gt;,
+    flow_acc_cells: &amp;[f64],
+    cellsize_m: f64,
+    rows: usize,
+    cols: usize,
+    r_factor: f64,
+    k_factor_grid: Option&lt;&amp;[f64]&gt;,
+    ndvi: &amp;[f64],
+    practice: PracticeType,
+) -&gt; Result&lt;RusleAssessment, RusleError&gt; {
+    let n = rows * cols;
+
+    // 入口前置长度检查：确保后续调用不 panic
+    check_len("flow_acc_cells", flow_acc_cells.len(), n)?;
+    check_len("ndvi", ndvi.len(), n)?;
+    match slope_deg {
+        Some(s) =&gt; check_len("slope_deg", s.len(), n)?,
+        None =&gt; check_len("dem", dem.len(), n)?,
+    }
+
+    let area_cell_ha = cellsize_m * cellsize_m / 10000.0;
+    let area_ha = n as f64 * area_cell_ha;
+
+    let slope = match slope_deg {
+        Some(s) =&gt; s.to_vec(),
+        None =&gt; compute_slope_from_dem(dem, cellsize_m, rows, cols),
+    };
+    let slope_pct: Vec&lt;f64&gt; = slope.iter()
+        .map(|d| d.to_radians().tan() * 100.0).collect();
+
+    let ls = compute_ls_factor(&amp;slope_pct, flow_acc_cells, cellsize_m, rows, cols);
+    let k  = resolve_k_factor(k_factor_grid, n)?;
+    let c  = compute_c_factor_from_ndvi(ndvi);
+    let p  = compute_p_factor(&amp;slope_pct, practice);
+    let r_arr = vec![r_factor; n];
+
+    let soil_loss = compute_soil_loss(&amp;r_arr, &amp;k, &amp;ls, &amp;c, &amp;p, n)?;
+    Ok(compute_erosion_statistics(&amp;r_arr, area_cell_ha, area_ha,
+        &amp;k, &amp;ls, &amp;c, &amp;p, &amp;soil_loss))
+}
+</code></pre>
+<hr>
+<h2 id="三musle把尺度从年切换到场次">三、MUSLE：把尺度从“年”切换到“场次”</h2>
+<p>MUSLE 用于估算<strong>单次暴雨事件的产沙量</strong>，核心改动是用径流能量因子替代 RUSLE 中的降雨侵蚀力因子 R。Williams (1975) 原始公式为：</p>
+<p></p><div class="math display">\[Sed = 11.8 \times (Q_{surf} \times q_{peak})^{0.56} \times K \times LS \times C \times P
+\]</div><p></p><p><strong>单位说明</strong>：Williams (1975) 原式为美制单位经验式。工程中广泛使用的公制版本沿用系数 <code>11.8</code>，约定 <code>Q_surf</code> 为 m³、<code>q_peak</code> 为 m³/s、<code>Sed</code> 为 t、K/LS/C/P 无量纲。系数 <code>11.8</code> 为经验系数，量纲不严格，不可直接代入英制单位数值。</p>
+<div class="mermaid">graph LR
+    subgraph HYD["geo-plugin-hydro"]
+        H1["SCS-CN 产流&lt;br/&gt;曲线数法估算径流"]
+        H2["马斯京根汇流&lt;br/&gt;洪水演进求洪峰"]
+    end
+
+    M["MUSLE&lt;br/&gt;Sed = 11.8 x (Q_surf x q_peak)^0.56&lt;br/&gt;x K x LS x C x P"]
+
+    R["Sed&lt;br/&gt;场次产沙量 (t)"]
+
+    F["K · LS · C · P 因子复用&lt;br/&gt;直接取自 RUSLE 因子计算层"]
+
+    H1 -- "Q_surf (m³)" --&gt; M
+    H2 -- "q_peak (m³/s)" --&gt; M
+    M --&gt; R
+    F -.-&gt; M
+
+    style HYD fill:#f0f9ff,stroke:#bae6fd
+    style M fill:#e0f2fe,stroke:#38bdf8,color:#075985
+    style R fill:#dcfce7,stroke:#4ade80,color:#065f46
+    style F fill:#fef3c7,stroke:#fcd34d,color:#92400e
+</div><h3 id="31-能量因子与核心公式">3.1 能量因子与核心公式</h3>
+<p>能量因子 <code>(Q × qp)^0.56</code> 被提取为私有内联函数，<code>musle_soil_loss</code> 与 <code>assess_musle</code> 共用同一份实现。<strong>非正输入保护</strong>：径流或洪峰为负时乘积为负，<code>powf(0.56)</code> 会返回 <code>NaN</code>；乘积为零（无径流）时能量因子为 0。本实现对<strong>非正乘积一律归零</strong>，不区分"无径流"与"负输入"——两者产沙量都应视为 0。若调用方需要区分，应在更上层做输入校验。</p>
+<pre><code class="language-rust">/// MUSLE 能量因子 (Q × qp)^0.56
+///
+/// 当 `runoff_m3 * peak_flow_m3s &lt;= 0` 时返回 0.0。
+/// 零径流与负输入（物理上无意义）在此合并处理，均为 Sed = 0。
+#[inline]
+fn musle_energy_factor(runoff_m3: f64, peak_flow_m3s: f64) -&gt; f64 {
+    let product = runoff_m3 * peak_flow_m3s;
+    if product &lt;= 0.0 { return 0.0; }
+    product.powf(0.56)
+}
+
+/// MUSLE 场次产沙量（标量返回）
+///
+/// - `runoff_m3`：地表径流总量 (m³)
+/// - `peak_flow_m3s`：洪峰流量 (m³/s)
+/// - `k` / `ls` / `c` / `p`：RUSLE 侧已算好的无量纲因子
+/// 返回：场次产沙量 (t)
+///
+/// 系数 11.8 为 Williams (1975) 经验系数，量纲不严格，
+/// 仅适用于上述公制约定。
+pub fn musle_soil_loss(
+    runoff_m3: f64, peak_flow_m3s: f64,
+    k: f64, ls: f64, c: f64, p: f64,
+) -&gt; f64 {
+    let ef = musle_energy_factor(runoff_m3, peak_flow_m3s);
+    11.8 * ef * k * ls * c * p
+}
+
+/// 单场 MUSLE 评估，返回结构化结果
+///
+/// 与 `musle_soil_loss` 共享 `musle_energy_factor`；
+/// 额外记录中间量（能量因子、各因子值、单位面积侵蚀量）
+/// 以便审计与统计。
+pub fn assess_musle(
+    runoff_m3: f64, peak_flow_m3s: f64,
+    k: f64, ls: f64, c: f64, p: f64, area_ha: f64,
+) -&gt; MusleResult {
+    let ef = musle_energy_factor(runoff_m3, peak_flow_m3s);
+    let soil_loss_t = 11.8 * ef * k * ls * c * p;
+    MusleResult {
+        soil_loss_t,
+        runoff_vol_m3: runoff_m3,
+        peak_flow_m3s,
+        runoff_energy_factor: ef,
+        k_factor: k,
+        ls_factor: ls,
+        c_factor: c,
+        p_factor: p,
+        soil_loss_per_ha: if area_ha &gt; 0.0 { soil_loss_t / area_ha } else { 0.0 },
+    }
+}
+</code></pre>
+<p>来源：<em>Williams, J.R. (1975). Sediment-yield prediction with universal equation using runoff energy factor. In: Present and Prospective Technology for Predicting Sediment Yield and Sources, ARS-S-40, USDA, pp. 244-252.</em></p>
+<h3 id="32-结构化结果">3.2 结构化结果</h3>
+<pre><code class="language-rust">#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusleResult {
+    pub soil_loss_t: f64,
+    pub runoff_vol_m3: f64,
+    pub peak_flow_m3s: f64,
+    pub runoff_energy_factor: f64,
+    pub k_factor: f64,
+    pub ls_factor: f64,
+    pub c_factor: f64,
+    pub p_factor: f64,
+    pub soil_loss_per_ha: f64,
+}
+</code></pre>
+<h3 id="33-从-scs-cn-估算洪峰">3.3 从 SCS-CN 估算洪峰</h3>
+<p>SCS 三角形单位线峰值公式：</p>
+<p></p><div class="math display">\[q_p = 0.208 \times \frac{A_{km^2} \times Q_{mm}}{T_p(h)}
+\]</div><p></p><p>利用 <code>V = A × Q × 1000</code>（m³）代入，得到以径流体积表达的等价形式：</p>
+<p></p><div class="math display">\[q_p = 0.000208 \times \frac{V}{T_p}
+\]</div><p></p><pre><code class="language-rust">/// SCS 三角形单位线估算洪峰流量 (m³/s)
+///
+/// - `runoff_m3`：径流总量 (m³)
+/// - `tc_hours`：汇流时间 (h)，必须 &gt; 0
+///
+/// 等价于 0.208 × A(km²) × Q(mm) / T_p(h)。
+/// 注意 T_p 单位为小时，无需再乘 3600。
+pub fn estimate_peak_scs_triangular(
+    runoff_m3: f64, tc_hours: f64,
+) -&gt; f64 {
+    if tc_hours &lt;= 0.0 || runoff_m3 &lt;= 0.0 { return 0.0; }
+    0.000208 * runoff_m3 / tc_hours
+}
+</code></pre>
+<blockquote>
+<p><strong>常见错误</strong>：若公式写作 <code>k × V / (T_p × 3600)</code>，则 <code>k</code> 应取 <code>0.749</code>（= 0.000208 × 3600），而非 <code>0.208</code>。混用会导致洪峰偏小约 3.6 倍。</p>
+</blockquote>
+<h3 id="34-批量事件计算">3.4 批量事件计算</h3>
+<pre><code class="language-rust">/// 对多个暴雨事件逐场计算 MUSLE 产沙量
+///
+/// `events` 的每个元素为 `(runoff_m3, peak_flow_m3s)`。
+/// 返回与输入等长的 `Vec&lt;MusleResult&gt;`；空输入返回空 `Vec`，
+/// 不做任何聚合。若需年均产沙量，调用方自行对结果求平均。
+pub fn musle_event_assessment(
+    events: &amp;[(f64, f64)],
+    k: f64, ls: f64, c: f64, p: f64, area_ha: f64,
+) -&gt; Vec&lt;MusleResult&gt; {
+    events.iter()
+        .map(|&amp;(q, qp)| assess_musle(q, qp, k, ls, c, p, area_ha))
+        .collect()
+}
+</code></pre>
+<hr>
+<h2 id="四因子共享与跨插件工作流">四、因子共享与跨插件工作流</h2>
+<ol>
+<li><strong>水文计算</strong>：<code>geo-plugin-hydro</code> 的 <code>scs_cn</code> 得到径流总量，<code>muskingum_route</code> 得到洪峰流量。</li>
+<li><strong>因子准备</strong>：<code>geo-plugin-ecology</code> 复用 RUSLE 侧已算好的 K、LS、C、P。</li>
+<li><strong>产沙估算</strong>：代入 MUSLE，输出场次产沙量。</li>
+</ol>
+<hr>
+<h2 id="五工程意义小结">五、工程意义小结</h2>
+<ul>
+<li>所有 R 因子函数明确标注各自单位约定，并在正文给出选择建议；</li>
+<li><code>compute_l_factor_d8</code> / <code>compute_ls_factor</code> 对 <code>slope_pct</code> 与 <code>flow_acc_cells</code> 均做长度断言；</li>
+<li><code>assess_soil_loss</code> 在入口处前置 <code>check_len</code>，不向调用方泄漏 panic；</li>
+<li><code>compute_c_factor_from_ndvi</code> 对水体与裸土分开处理，NaN 显式返回并由统计层过滤；</li>
+<li><code>compute_k_factor_simple</code> 对纯砂土情形加除零保护；</li>
+<li><code>compute_soil_loss</code> 返回 <code>Result</code>，<code>check_len</code> 提取为私有函数；</li>
+<li><code>resolve_k_factor</code> 返回 <code>Result</code>，与 <code>assess_soil_loss</code> 走同一错误通道；</li>
+<li><code>RusleAssessment</code> 报告 <code>valid_cells</code> 与 <code>nan_cells</code>，NaN 不污染统计；</li>
+<li><code>assess_musle</code> 与 <code>musle_soil_loss</code> 共享 <code>musle_energy_factor</code>，非正乘积归零；</li>
+<li>坡度百分比只算一次，透传给 LS 与 P 因子；</li>
+<li>诺模公式的 <code>100K</code> 必须把 <code>/100</code> 分配到第一项。</li>
+</ul>
+<hr>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.002777777777777778" data-date-updated="2026-09-21 16:56">2026-09-21 16:51</span>&nbsp;
+<a href="https://www.cnblogs.com/miku196">mikuyyds</a>&nbsp;
+阅读(<span id="post_view_count">24</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23064342);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmiku196%2Fp%2F23064342&amp;targetId=23064342&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
