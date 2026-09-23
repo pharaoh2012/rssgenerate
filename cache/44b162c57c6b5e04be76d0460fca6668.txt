@@ -1,0 +1,248 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shenchuanchao/p/23078003/dotnet-project-docker-nginx-reverse-proxy-guide" title="发布于 2026-09-23 10:13">
+    
+
+    <span role="heading" aria-level="2">.NET 项目 Docker 化 + Nginx 反向代理，一篇讲透</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p>大家好，我是码农刚子。前几天帮朋友排查一个 .NET 项目的部署问题，他说「我本地跑得好好的，一上服务器就崩」。</p>
+<p>翻了一下他的 Dockerfile，问题挺典型的——<strong>单阶段构建、镜像 800MB、端口没映射对、Nginx 配置抄了份三年前的老模板</strong>。</p>
+<p>今天把这一套从头到尾理一遍，从 Dockerfile 到 Compose 再到 Nginx 反向代理，每一步讲清楚「为什么这么写」，而不是只给一段能跑的代码。</p>
+<h2 id="section">1. 先搞懂：你到底需要几层构建</h2>
+<p>很多人写 .NET 的 Dockerfile，上来就 <code>FROM mcr.microsoft.com/dotnet/sdk:8.0</code>，然后 build + run 全在一个镜像里。</p>
+<p>结果镜像动不动七八百 MB，部署拉取慢得要死。</p>
+<p>正确的做法是<strong>多阶段构建</strong>——用 SDK 镜像编译，用 ASP.NET Core 运行时镜像跑。</p>
+<p>打个比方，你盖房子的时候需要起重机（SDK），但住进去的时候不需要把起重机也留在家里。</p>
+<blockquote>
+<p><strong>核心思路：</strong> 构建阶段用 SDK 镜像（大而全），运行阶段用运行时镜像（小而精），最终只保留运行时那一层。</p>
+</blockquote>
+<p>来看一份标准的 ASP.NET Core Dockerfile：</p>
+<pre><code class="language-dockerfile"># 第一阶段：构建（publish）
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+
+# 先拷贝 .csproj，利用 Docker 缓存
+COPY *.csproj .
+RUN dotnet restore
+
+# 再拷贝全部源码
+COPY . .
+RUN dotnet publish -c Release -o /app/publish
+
+# 第二阶段：运行（runtime）
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+WORKDIR /app
+COPY --from=build /app/publish .
+
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "YourApp.dll"]
+</code></pre>
+<p>这里有两个细节很多人踩坑。</p>
+<p><strong>第一个，为什么先拷贝 .csproj 再拷贝全部代码？</strong></p>
+<p>因为 Docker 是分层缓存的。如果每次改一行代码就要重新 restore 一次 NuGet 包，那构建速度会慢到怀疑人生。</p>
+<p>先拷贝 .csproj → restore → 再拷贝源码 → publish，这样只要 .csproj 没变，restore 那一层就能直接用缓存。</p>
+<p><strong>第二个，端口到底是 80 还是 8080？</strong></p>
+<p>这是个经典坑。.NET 8 开始，官方 ASP.NET Core 镜像的默认端口从 80 改成了 8080。</p>
+<p>如果你还照着老教程写 EXPOSE 80，容器跑起来之后你会发现怎么都访问不到——不是服务没启动，是端口不对。</p>
+<h2 id="docker-compose">2. Docker Compose：把多服务串起来</h2>
+<p>如果你的项目只有一个 Web 应用，docker run 一下就够了。</p>
+<p>但现实场景里，通常不止一个服务——Web 应用 + 数据库 + Redis + Nginx，四五个容器是常态。</p>
+<p>这时候 Docker Compose 就是标配。</p>
+<p>来看一份典型的 docker-compose.yml：</p>
+<pre><code class="language-yaml">version: '3.8'
+
+services:
+  webapp:
+    build:
+      context: ./YourApp
+      dockerfile: Dockerfile
+    ports:
+      - "5000:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__Default=Host=db;Database=appdb;Username=postgres;Password=secret
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=appdb
+      - POSTGRES_PASSWORD=secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+</code></pre>
+<p>说几个容易忽略的点。</p>
+<p><strong>depends_on 只保证启动顺序，不保证服务就绪。</strong></p>
+<p>很多人以为加了 depends_on，Web 就会等数据库准备好再启动。其实不是，它只等容器启动，不等服务就绪。</p>
+<p>PostgreSQL 容器起来了，但数据库初始化还没完成，这时候 Web 去连就会报错。</p>
+<p>解决办法有两种：一是在程序里加重试逻辑（推荐用 Polly），二是用 healthcheck + condition。</p>
+<pre><code class="language-yaml"># 在 db 服务里加健康检查
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U postgres"]
+  interval: 5s
+  timeout: 5s
+  retries: 5
+
+# 在 webapp 的 depends_on 里指定条件
+depends_on:
+  db:
+    condition: service_healthy
+  redis:
+    condition: service_started
+</code></pre>
+<p><strong>数据一定要挂 volume。</strong></p>
+<p>数据库的数据、Redis 的持久化文件、用户上传的文件，这些都不能放在容器里。</p>
+<p>容器一删数据就没了，到时候哭都来不及。</p>
+<h2 id="nginx">3. Nginx 反向代理：为什么需要它</h2>
+<p>有人会问，Kestrel 本身就是 Web 服务器，直接暴露端口不行吗，为什么还要在前面加一层 Nginx？</p>
+<p>这个问题问得好。</p>
+<p>Kestrel 确实是个不错的服务器，但它的设计目标是<strong>处理动态请求</strong>。静态文件、负载均衡、SSL 终止、限速、压缩这些事，交给 Nginx 效率高得多。</p>
+<p>可以这么理解——Kestrel 是做菜的厨师，Nginx 是前厅的服务员。厨师也能端菜，但专业的事交给专业的人来做，整体效率更高。</p>
+<p>来看一份完整的 Nginx 反向代理配置：</p>
+<pre><code class="language-nginx"># /etc/nginx/conf.d/your-app.conf
+
+server {
+    listen 80;
+    server_name yourdomain.com www.yourdomain.com;
+
+    # 静态文件直接由 Nginx 处理
+    location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff2?)$ {
+        root /var/www/your-app/wwwroot;
+        expires 30d;
+        access_log off;
+    }
+
+    # 动态请求转发给 Kestrel
+    location / {
+        proxy_pass http://webapp:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection keep-alive;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 100s;
+    }
+}
+</code></pre>
+<p>这段配置看起来长，但核心就两件事：<strong>静态文件自己处理，动态请求转发给后端</strong>。</p>
+<p>重点说几个 header 的作用，很多人抄了配置但不知道为什么要加。</p>
+<p><strong>X-Forwarded-For 和 X-Forwarded-Proto</strong>——告诉后端用户的真实 IP 和请求协议（http 还是 https）。没有这两个头，你的 .NET 程序拿到的 IP 永远是 Nginx 容器的 IP，而且会以为所有请求都是 http 的。</p>
+<p><strong>Host</strong>——保留原始域名。不然重定向的时候会跳转到内部地址，用户就懵了。</p>
+<p><strong>Upgrade 和 Connection keep-alive</strong>——支持 WebSocket 和长连接。如果你的应用用了 SignalR，这两行必须有。</p>
+<p>光配置 Nginx 还不够，.NET 这边也要配合一下。在 Program.cs 里加上转发头中间件：</p>
+<pre><code class="language-csharp">// Program.cs 里，在 builder.Build() 之前加
+builder.Services.Configure&lt;ForwardedHeadersOptions&gt;(options =&gt;
+{
+    options.ForwardedHeaders =
+        ForwardedHeaders.XForwardedFor |
+        ForwardedHeaders.XForwardedProto;
+    options.KnownNetworks.Clear();
+    options.KnownProxies.Clear();
+});
+
+// 在 app.UseHttpsRedirection() 之前加
+app.UseForwardedHeaders();
+</code></pre>
+<p>KnownNetworks 和 KnownProxies 清空是因为 Docker 环境里代理 IP 不固定，不清除的话转发头会被忽略——这个坑我踩过两次。</p>
+<h2 id="nginx-compose">4. 把 Nginx 也放进 Compose 里</h2>
+<p>既然所有服务都容器化了，Nginx 当然也不应该单独装在宿主机上。</p>
+<p>把 Nginx 加到 docker-compose.yml 里，整个部署就完整了：</p>
+<pre><code class="language-yaml">services:
+  webapp:
+    build: ./YourApp
+    expose:
+      - "8080"
+    # 注意：这里用 expose 而不是 ports
+    # 因为只需要被 Nginx 访问，不需要暴露到宿主机
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/logs:/var/log/nginx
+    depends_on:
+      - webapp
+    restart: unless-stopped
+</code></pre>
+<p>这里有个细节：<strong>webapp 用 expose，不用 ports</strong>。</p>
+<p>expose 只是声明容器内部用哪个端口，不会映射到宿主机。所有外部请求都走 Nginx，webapp 不直接对外——安全上更干净。</p>
+<p>而且在同一个 Compose 网络里，服务之间可以直接用服务名通信，所以 Nginx 配置里 <code>proxy_pass http://webapp:8080</code> 直接就能通，不需要查 IP。</p>
+<h2 id="section-1">5. 几个踩过的坑</h2>
+<p>最后说几个我自己踩过、也见别人踩过的坑，帮大家省点时间。</p>
+<h3 id="https">坑一：HTTPS 重定向死循环</h3>
+<p>Nginx 做了 SSL 终止，和后端之间走的是 HTTP。但 .NET 里开了 <code>app.UseHttpsRedirection()</code>，它一看请求是 HTTP，就重定向到 HTTPS。</p>
+<p>结果就是用户请求到 Nginx（HTTPS）→ Nginx 转发给后端（HTTP）→ 后端说你应该用 HTTPS → 重定向 → 又到 Nginx → 无限循环。</p>
+<p><strong>解决办法</strong>：确保 UseForwardedHeaders 在 UseHttpsRedirection 之前调用，这样 .NET 就能通过 X-Forwarded-Proto 头知道原始请求是 HTTPS 的，就不会瞎重定向了。</p>
+<h3 id="section-2">坑二：时区不对</h3>
+<p>Docker 容器默认时区是 UTC，国内用户会发现时间差了 8 小时。日志时间不对、定时任务不准，都是这个原因。</p>
+<p>在 docker-compose.yml 里给服务加上环境变量就行：</p>
+<pre><code class="language-yaml">environment:
+  - TZ=Asia/Shanghai
+</code></pre>
+<h3 id="signalr">坑三：SignalR 连接不上</h3>
+<p>如果用了 SignalR 或者 Blazor Server，Nginx 配置里必须加上 WebSocket 支持的那几行 header，而且 <code>proxy_buffering</code> 要关掉。</p>
+<p>还有个容易忽略的点：<code>proxy_read_timeout</code> 默认是 60 秒，WebSocket 连接如果 60 秒没有数据传输就会被断开。建议调到 100 秒以上，或者在应用层加心跳。</p>
+<h3 id="section-3">坑四：文件上传大小限制</h3>
+<p>Nginx 默认请求体大小只有 1MB，传个稍微大一点的文件就 413 报错。</p>
+<p>在 server 块里加一行：</p>
+<pre><code class="language-nginx">client_max_body_size 50M;
+</code></pre>
+<p>同时 .NET 那边也要调 <code>Program.cs</code> 里的 <code>MaxRequestBodySize</code>，两边都要放开才行。</p>
+<h2 id="section-4">6. 收尾</h2>
+<p>把这一套串起来之后，部署就变成了一件很简单的事。</p>
+<p>代码提交了，服务器上 <code>docker compose up -d --build</code> 一下，完事。</p>
+<p>我一直觉得，部署这件事的理想状态是「boring」——不需要什么花活，稳定、可重复、出问题能快速回滚。</p>
+<blockquote>
+<p><strong>一句话总结：</strong> Dockerfile 做多阶段构建控体积，Compose 做多服务编排管依赖，Nginx 做反向代理扛流量——三件套各司其职，部署就稳了。</p>
+</blockquote>
+<p>这篇里提到的所有配置文件都是我在生产环境用过的，可以直接拿去改改用。</p>
+<p>如果有什么我没覆盖到的场景，评论区聊。</p>
+<hr>
+<p>&nbsp;</p>
+<p><strong>关于作者</strong></p>
+<p>码农刚子，六年 ERP / 制造业系统开发，专注 C# / .NET / Blazor。 写 PCB 行业 ERP 与多租户 SaaS 的实战与踩坑，不写面试八股。</p>
+<p>博客：<a href="https://www.coderlog.net/" rel="noopener nofollow">https://www.coderlog.net/</a> | 公众号：CSharp精选营</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-23 10:13">2026-09-23 10:13</span>&nbsp;
+<a href="https://www.cnblogs.com/shenchuanchao">码农刚子</a>&nbsp;
+阅读(<span id="post_view_count">465</span>)&nbsp;
+评论(<span id="post_comment_count">10</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23078003);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshenchuanchao%2Fp%2F23078003%2Fdotnet-project-docker-nginx-reverse-proxy-guide&amp;targetId=23078003&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
