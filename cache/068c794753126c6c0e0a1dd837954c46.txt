@@ -1,0 +1,70 @@
+
+            <div class="postcontent">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>做文件上传，需求方最常说的两句话是「大文件要能传」和「传过的别再传一遍」。</p>
+<p>对应过来就是分片和秒传。这两件事单独看都不复杂，合在一起并且要在真实网络下跑稳，细节相当多。</p>
+<h2 id="分片为什么不能一把梭">分片：为什么不能一把梭</h2>
+<p>直接把 2GB 的文件塞进一个请求，会在三个地方挂掉：</p>
+<ul>
+<li>反向代理和网关有请求体大小限制，默认往往只有几十 MB</li>
+<li>中途断网，整个传输作废，从头再来</li>
+<li>用户看不到任何进度，只能盯着转圈</li>
+</ul>
+<p>分片就是把文件切成固定大小的块，逐块上传，服务端收齐后合并。</p>
+<pre><code class="language-js">const CHUNK = 5 * 1024 * 1024        // 5MB
+const total = Math.ceil(file.size / CHUNK)
+
+for (let i = 0; i &lt; total; i++) {
+  const blob = file.slice(i * CHUNK, (i + 1) * CHUNK)
+  await upload({ fileId, index: i, total, blob })
+}
+</code></pre>
+<p><strong>分片大小怎么定。</strong> 太小则请求数爆炸，握手和鉴权的开销占比变高；太大则单片失败的重传成本高，也容易撞上网关限制。多数场景 2~10MB 是合理区间，网络差的环境往小了调。</p>
+<p><strong>别串行传。</strong> 上面那段是串行的，实际要并发，但并发数不能开太大——浏览器对同域名的并发连接本来就有限制，开到 10 个以上反而会互相排队，而且会把用户的带宽吃光导致页面其他请求卡住。3~5 个是比较稳的。</p>
+<h2 id="秒传靠的是内容指纹">秒传：靠的是内容指纹</h2>
+<p>秒传的原理很朴素：上传前先算文件的哈希，问服务端「这个哈希我这儿有没有」，有就直接返回成功。</p>
+<p>关键在于<strong>哈希怎么算</strong>。</p>
+<p><strong>不能在主线程算。</strong> 2GB 的文件做一次完整 MD5，主线程会卡死十几秒，页面完全无响应。必须放进 Web Worker。</p>
+<p><strong>不能一次性读进内存。</strong> <code>readAsArrayBuffer</code> 整个文件会直接爆内存。要用分片增量计算——读一片、更新一次哈希状态、丢掉这片。</p>
+<pre><code class="language-js">// Worker 里，用支持增量的哈希库
+const hasher = createHasher()
+for (const chunk of chunks) {
+  hasher.update(new Uint8Array(await chunk.arrayBuffer()))
+}
+const hash = hasher.digest()
+</code></pre>
+<p><strong>全量哈希仍然很慢。</strong> 大文件算完整哈希可能要几十秒，用户在这段时间里什么都看不到，体验比直接传还差。</p>
+<p>常见的折中是<strong>抽样哈希</strong>：取文件的头部、尾部、以及中间若干个固定位置的小块，加上文件总大小，一起算一个哈希。速度是毫秒级。</p>
+<p>代价是<strong>理论上会碰撞</strong>——两个不同文件恰好在采样位置一致。实践中概率极低，但如果你的业务是不能出错的（比如涉及合规存证），就只能老实算全量。</p>
+<p>这是个明确的取舍，不要不假思索地抄「抽样秒传」的方案。</p>
+<h2 id="断点续传">断点续传</h2>
+<p>有了分片和文件指纹，续传就是顺带的：上传前先问服务端「这个哈希已经收到哪些分片了」，只传缺的。</p>
+<p>要注意的是<strong>服务端得记录分片状态并设置过期</strong>。用户传了一半再也不回来的情况非常多，这些碎片不清理，存储会一直涨。通常给一个几天的有效期，过期清掉。</p>
+<h2 id="几个真实会遇到的问题">几个真实会遇到的问题</h2>
+<p><strong>合并是个重活。</strong> 收齐分片后要按序合并成完整文件，大文件合并本身就耗时且占 IO。并发上传多个大文件时，合并会成为瓶颈。做法是把合并放进异步任务队列，前端轮询结果，而不是让最后一个分片的请求同步等着合并完成。</p>
+<p><strong>合并后必须校验。</strong> 分片乱序、重复、丢失都可能发生。合并完要重新算一次哈希和客户端对比，不一致就作废重来。省掉这一步，出问题时根本查不出来。</p>
+<p><strong>秒传的权限问题。</strong> 「别人传过这个文件，所以你也能秒传」——这意味着只要知道哈希就能拿到文件。如果业务涉及私密文件，秒传必须限制在用户自己的文件范围内，不能全局共享，否则是个信息泄露。这一条经常被忽略。</p>
+<p><strong>移动端切后台会断。</strong> 手机浏览器切到后台，JS 执行会被挂起，正在传的分片超时失败。要有自动重试，并且在页面重新可见时检查状态继续传。</p>
+<p><strong>文件在上传中被修改。</strong> 用户选了文件之后又在本地编辑了它，后面的分片读出来就和前面对不上。表现是合并后校验失败。这个没法完全避免，只能靠合并校验兜住。</p>
+<h2 id="什么时候不该做这一套">什么时候不该做这一套</h2>
+<p>如果你的文件普遍在几 MB 以内，这整套东西都不值得做。</p>
+<p>一个普通的表单上传加上重试，代码量是这套方案的十分之一，用户也感知不到差别。分片、秒传、续传的复杂度是实打实的，要有对应的文件规模才划得来。</p>
+<p>先看清楚真实的文件大小分布，再决定做到哪一层。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="itemdesc">
+                发表于 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-18 10:47">2026-09-18 10:46</span>&nbsp;
+<a href="https://www.cnblogs.com/zengzhifei">福兮说</a>&nbsp;
+阅读(<span id="post_view_count">17</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23023485);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzengzhifei%2Fp%2F23023485&amp;targetId=23023485&amp;targetType=0" target="_blank">举报</a>
+
+            </div>
+        
