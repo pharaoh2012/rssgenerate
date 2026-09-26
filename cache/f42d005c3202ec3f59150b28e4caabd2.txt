@@ -1,0 +1,287 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ayic/p/23121980" title="发布于 2026-09-26 17:31">
+    
+
+    <span role="heading" aria-level="2">PostgreSQL 的锁：为什么你的 ALTER TABLE 会卡住，以及怎么查</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>上周同事问我，为什么给一张表加个字段，整个表就像被冻住了一样，连普通的 SELECT 都进不来。其实这就是 PostgreSQL 的锁在起作用。</p>
+<p>很多人用 PG，觉得它 MVCC 很厉害，读写互不阻塞。这没错，但 MVCC 主要解决的是“读”和“写”之间的冲突。真到了写和写、DDL 和 DML 之间，还是得靠锁来协调。今天就把 PG 里常见的锁捋一遍，顺便说说怎么排查锁等待和死锁。</p>
+<h2 id="先搞清楚普通-select-到底加不加锁">先搞清楚：普通 SELECT 到底加不加锁？</h2>
+<p>这是最容易误解的地方。在 PostgreSQL 里，普通的 <code>SELECT</code> 只会在表上加一个 <code>ACCESS SHARE</code> 锁，这个锁非常弱，唯一会跟它冲突的就是 <code>ACCESS EXCLUSIVE</code>。也就是说，你平时查询，基本不会阻塞别人，别人也很难阻塞你。</p>
+<p>真正会打架的是写操作和 DDL。比如 <code>ALTER TABLE</code>、<code>DROP TABLE</code>、<code>TRUNCATE</code> 这些通常会加 <code>ACCESS EXCLUSIVE</code>，这个锁一出来，所有其他访问都得排队。</p>
+<p>所以，那个同事遇到的“加字段卡住”，大概率是 <code>ALTER TABLE</code> 在等 <code>ACCESS EXCLUSIVE</code>，而前面有长事务或者慢查询占着表，导致后面所有请求都堵住了。</p>
+<h2 id="表级锁">表级锁</h2>
+<p>PostgreSQL 表级锁有 8 种模式，强度从弱到强排下来是：</p>
+<ol>
+<li>ACCESS SHARE</li>
+<li>ROW SHARE</li>
+<li>ROW EXCLUSIVE</li>
+<li>SHARE UPDATE EXCLUSIVE</li>
+<li>SHARE</li>
+<li>SHARE ROW EXCLUSIVE</li>
+<li>EXCLUSIVE</li>
+<li>ACCESS EXCLUSIVE</li>
+</ol>
+<p>兼容矩阵我贴在下面，<code>X</code> 表示冲突，空白表示兼容：</p>
+<table>
+<thead>
+<tr>
+<th>请求\持有</th>
+<th>ACCESS SHARE</th>
+<th>ROW SHARE</th>
+<th>ROW EXCLUSIVE</th>
+<th>SHARE UPDATE EXCLUSIVE</th>
+<th>SHARE</th>
+<th>SHARE ROW EXCLUSIVE</th>
+<th>EXCLUSIVE</th>
+<th>ACCESS EXCLUSIVE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ACCESS SHARE</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>X</td>
+</tr>
+<tr>
+<td>ROW SHARE</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>ROW EXCLUSIVE</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>SHARE UPDATE EXCLUSIVE</td>
+<td></td>
+<td></td>
+<td></td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>SHARE</td>
+<td></td>
+<td></td>
+<td>X</td>
+<td>X</td>
+<td></td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>SHARE ROW EXCLUSIVE</td>
+<td></td>
+<td></td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>EXCLUSIVE</td>
+<td></td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>ACCESS EXCLUSIVE</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+</tbody>
+</table>
+<p>这张表不用背，记住几个关键就行：</p>
+<ul>
+<li><code>ACCESS SHARE</code> 是最弱的，普通 <code>SELECT</code> 拿的就是它。它只跟 <code>ACCESS EXCLUSIVE</code> 冲突。</li>
+<li><code>ROW EXCLUSIVE</code> 是 <code>INSERT/UPDATE/DELETE</code> 拿的，它跟 <code>SHARE</code>、<code>SHARE ROW EXCLUSIVE</code>、<code>EXCLUSIVE</code>、<code>ACCESS EXCLUSIVE</code> 冲突。</li>
+<li><code>ACCESS EXCLUSIVE</code> 是老大，跟所有锁都冲突。<code>ALTER TABLE</code>、<code>DROP TABLE</code>、<code>TRUNCATE</code>、<code>VACUUM FULL</code>、<code>CLUSTER</code>、<code>REINDEX</code> 这些基本都会拿它。</li>
+<li><code>CREATE INDEX CONCURRENTLY</code> 比较特殊，它拿的是 <code>SHARE UPDATE EXCLUSIVE</code>，所以不会阻塞 DML，这也是大表建索引推荐它的原因。</li>
+</ul>
+<p>我一般会提醒团队：<strong>DDL 之前一定要设 <code>lock_timeout</code></strong>。不然一个 <code>ALTER TABLE</code> 可能因为等锁排到所有查询后面，把整个库拖慢。</p>
+<pre><code class="language-sql">SET lock_timeout = '3s';
+ALTER TABLE users ADD COLUMN age int;
+</code></pre>
+<p>如果 3 秒拿不到锁，它自己就放弃了，不会一直堵着。</p>
+<h2 id="行级锁">行级锁</h2>
+<p>行级锁是写操作在行上加的锁。普通 <code>SELECT</code> 不加行锁。四种行锁：</p>
+<ul>
+<li><code>FOR KEY SHARE</code></li>
+<li><code>FOR SHARE</code></li>
+<li><code>FOR NO KEY UPDATE</code></li>
+<li><code>FOR UPDATE</code></li>
+</ul>
+<p>强度从左到右递增。兼容矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>请求\持有</th>
+<th>FOR KEY SHARE</th>
+<th>FOR SHARE</th>
+<th>FOR NO KEY UPDATE</th>
+<th>FOR UPDATE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FOR KEY SHARE</td>
+<td></td>
+<td></td>
+<td></td>
+<td>X</td>
+</tr>
+<tr>
+<td>FOR SHARE</td>
+<td></td>
+<td></td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>FOR NO KEY UPDATE</td>
+<td></td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+<tr>
+<td>FOR UPDATE</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+<td>X</td>
+</tr>
+</tbody>
+</table>
+<p>几个实际场景：</p>
+<ul>
+<li><code>UPDATE</code> 通常拿 <code>FOR NO KEY UPDATE</code>。如果更新的是唯一键列，可能会升级成 <code>FOR UPDATE</code>。</li>
+<li><code>DELETE</code> 通常拿 <code>FOR UPDATE</code>。</li>
+<li><code>SELECT ... FOR UPDATE</code> 显式拿最强的行锁，用来做悲观锁。</li>
+<li><code>SELECT ... FOR SHARE</code> 拿共享锁，别人可以读，但不能改。</li>
+<li><code>SELECT ... FOR KEY SHARE</code> 最弱，外键检查时经常用。比如子表插入一条记录，会去父表对应行上加 <code>FOR KEY SHARE</code>，防止父表键被删掉或改掉。</li>
+</ul>
+<p>行锁信息存在元组头的 <code>xmax</code> 里。多个事务锁同一行时，PG 会用 <code>MultiXact</code> 来记录。行锁在事务结束时释放，所以长事务会一直占着行锁，这是很多锁等待的根源。</p>
+<p>一个常见坑：<strong>外键会让子表写入阻塞父表键更新</strong>。比如你更新父表的主键，子表可能正在插入，两边就会互相等。设计外键时心里要有数。</p>
+<h2 id="锁等待和死锁怎么查">锁等待和死锁，怎么查？</h2>
+<p>PG 提供了几个视图，最常用的是 <code>pg_locks</code> 和 <code>pg_stat_activity</code>。</p>
+<p>查当前没拿到的锁：</p>
+<pre><code class="language-sql">SELECT pid, locktype, relation::regclass, mode, granted, query
+FROM pg_locks l
+LEFT JOIN pg_stat_activity a USING (pid)
+WHERE NOT granted;
+</code></pre>
+<p>查谁被谁阻塞了：</p>
+<pre><code class="language-sql">SELECT pid, pg_blocking_pids(pid) AS blocking_pids, query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) &gt; 0;
+</code></pre>
+<p><code>pg_blocking_pids</code> 这个函数特别好用，直接告诉你哪个进程堵住了当前查询。</p>
+<p>如果要杀查询，有两个选择：</p>
+<pre><code class="language-sql">SELECT pg_cancel_backend(pid);   -- 取消当前查询，连接还在
+SELECT pg_terminate_backend(pid); -- 直接断开连接
+</code></pre>
+<p>一般先 <code>cancel</code>，不行再 <code>terminate</code>。</p>
+<p>死锁是另一个话题。PG 有 <code>deadlock_timeout</code>，默认 1 秒。如果一个事务等锁超过这个时间，就会触发死锁检测。检测到循环等待，它会杀掉其中一个事务，报 <code>deadlock detected</code>，应用应该捕获这个错误并重试。</p>
+<p>死锁没法完全避免，但可以降低概率：</p>
+<ul>
+<li>事务尽量短，别在事务里等用户输入。</li>
+<li>多个表更新时，固定访问顺序。</li>
+<li>用 <code>SELECT ... FOR UPDATE NOWAIT</code> 或 <code>SKIP LOCKED</code> 避免无限等待。</li>
+</ul>
+<p>比如队列消费场景，<code>SKIP LOCKED</code> 就很好用：</p>
+<pre><code class="language-sql">SELECT * FROM jobs
+WHERE status = 'pending'
+ORDER BY id
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+</code></pre>
+<p>这样多个 worker 可以同时取任务，不会互相等。</p>
+<h2 id="咨询锁应用层的互斥">咨询锁：应用层的互斥</h2>
+<p>除了表锁和行锁，PG 还有咨询锁（Advisory Lock）。它不绑定任何数据库对象，纯粹是应用自己约定的一把锁。</p>
+<p>会话级：</p>
+<pre><code class="language-sql">SELECT pg_advisory_lock(12345);
+SELECT pg_advisory_unlock(12345);
+</code></pre>
+<p>事务级：</p>
+<pre><code class="language-sql">SELECT pg_advisory_xact_lock(12345);
+</code></pre>
+<p>事务级会在事务结束时自动释放，用起来更省心。咨询锁适合做“同一时间只有一个任务跑”这种场景，比如定时任务、分布式锁的简易实现。但注意，它只在同一个数据库集群内有效，跨实例不行。</p>
+<h2 id="几个实践里踩过的坑">几个实践里踩过的坑</h2>
+<ol>
+<li><strong>长事务是万恶之源</strong>。一个事务开着不提交，行锁不释放，VACUUM 也清不掉死元组。监控 <code>pg_stat_activity</code> 里 <code>state = 'idle in transaction'</code> 的会话。</li>
+<li><strong>DDL 一定要加 <code>lock_timeout</code></strong>。尤其是 <code>ALTER TABLE</code>，不加锁超时，它可能排在一个长查询后面，把后面所有请求都堵死。</li>
+<li><strong>大表建索引用 <code>CREATE INDEX CONCURRENTLY</code></strong>。普通 <code>CREATE INDEX</code> 会拿 <code>SHARE</code> 锁，阻塞写。并发建索引虽然慢一点，但不阻塞 DML。</li>
+<li><strong><code>VACUUM FULL</code> 和 <code>CLUSTER</code> 会拿 <code>ACCESS EXCLUSIVE</code></strong>，生产环境慎用，最好在低峰期做。</li>
+<li><strong>隔离级别要心里有数</strong>。<code>READ COMMITTED</code> 是默认，每个语句一个快照。<code>REPEATABLE READ</code> 和 <code>SERIALIZABLE</code> 可能报序列化失败，应用要有重试逻辑。</li>
+<li><strong>监控锁等待</strong>。可以定期查 <code>pg_locks</code> 里 <code>granted = false</code> 的记录，或者用 <code>pg_blocking_pids</code> 看阻塞链。</li>
+</ol>
+<h2 id="最后说一句">最后说一句</h2>
+<p>PostgreSQL 的锁并不复杂，复杂的是不知道谁在等谁。MVCC 让读不阻塞写，但写写冲突、DDL 冲突还是得靠锁。遇到卡顿，先看 <code>pg_locks</code> 和 <code>pg_stat_activity</code>，找到阻塞源头，再决定是等、是取消，还是优化事务。</p>
+<p>锁不是敌人，它只是并发控制的工具。理解它，你就能少踩很多坑。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/ayic/" target="_blank">Y00</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/ayic/p/23121980" target="_blank">https://www.cnblogs.com/ayic/p/23121980</a></p>
+<p style="display:none;">聊聊技术，聊聊人生。欢迎关注我的公众号！^_^</p>
+<img src="https://images.cnblogs.com/cnblogs_com/ayic/2228020/o_221015170948_qr_code_search.png" style="display:none;">
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0020833333333333333" data-date-updated="2026-09-26 17:35">2026-09-26 17:31</span>&nbsp;
+<a href="https://www.cnblogs.com/ayic">Y00</a>&nbsp;
+阅读(<span id="post_view_count">33</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23121980);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fayic%2Fp%2F23121980&amp;targetId=23121980&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

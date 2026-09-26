@@ -1,0 +1,167 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/haliuhome/p/23125666" title="发布于 2026-09-26 08:40">
+    
+
+    <span role="heading" aria-level="2">【FHE】（十）：密文里的 attention——没有 max，softmax 怎么办</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>项目仓库</strong><br>
+Gitee 主仓：<a href="https://gitee.com/pei-xiaoguang/kestrel-llm" target="_blank" rel="noopener nofollow">https://gitee.com/pei-xiaoguang/kestrel-llm</a><br>
+GitHub 镜像：<a href="https://github.com/m13253246268-ship-it/kestrel-llm" target="_blank" rel="noopener nofollow">https://github.com/m13253246268-ship-it/kestrel-llm</a></p>
+<p><strong>相关文档</strong><br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9C%AF%E8%AF%AD%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%8F%A3%E5%BE%84" target="_blank" rel="noopener nofollow">术语与数据口径</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%80%A7%E8%83%BD%E4%B8%8E%E5%9F%BA%E5%87%86" target="_blank" rel="noopener nofollow">性能与基准</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9E%84%E5%BB%BA%E4%B8%8E%E5%A4%8D%E7%8E%B0" target="_blank" rel="noopener nofollow">构建与复现</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B" target="_blank" rel="noopener nofollow">快速上手</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9E%B6%E6%9E%84%E6%80%BB%E8%A7%88" target="_blank" rel="noopener nofollow">架构总览</a></p>
+</blockquote>
+<h2 id="0-一句话结论">0. 一句话结论</h2>
+<p>明文实现 softmax 时，第一件事是<strong>减去最大值</strong>（<code>exp(x − max(x))</code>）——这是防溢出的标准技巧。</p>
+<p><strong>但在密文里，<code>max</code> 是最不该出现的操作</strong>：它不是多项式，要比较，要分支，而密文里"分支"根本不存在。</p>
+<p>我们的替代方案是：<strong>用定标常数把 <code>max-sub</code> 换掉</strong>。</p>
+<pre><code>score 槽 = (q·k / √d)          ← 链内消息已隐式除以 F = 4096²
+num      = EXP_Q(score / F)     ← 对全部 s 求 exp（此时还没有 mask）
+den      = Σ_{s≤t} num          ← 掩码后用求和
+inv      = recip(den)           ← 拟合的倒数多项式
+p        = num · inv
+</code></pre>
+<p>关键在第二行：因为 <code>score</code> 在链内<strong>已经被隐式缩放了 <code>4096²</code> 倍</strong>，所以喂给 <code>exp</code> 的输入天然落在<strong>一个非常窄的区间</strong>里——窄到可以用一条 <strong>6 次多项式</strong>精确覆盖。</p>
+<hr>
+<h2 id="1-明文侧的-softmax-为什么不能照搬">1. 明文侧的 softmax 为什么不能照搬</h2>
+<p>标准 softmax：</p>
+<pre><code>p_i = exp(s_i − max_j s_j) / Σ_j exp(s_j − max_k s_k)
+</code></pre>
+<p>减 max 的唯一目的是：<strong>防止 <code>exp</code> 溢出</strong>。<code>exp(50)</code> 就超过 float32 范围了。</p>
+<p>但这条路径在密文里每一步都走不通：</p>
+<table>
+<thead>
+<tr>
+<th>需要的能力</th>
+<th>明文里有</th>
+<th>密文里有吗</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>求 <code>max</code></td>
+<td>一行代码</td>
+<td>❌ 需要比较 + 分支</td>
+</tr>
+<tr>
+<td>逐元素减同一个数</td>
+<td>广播</td>
+<td>⚠️ 可以做（同态加法/标量乘），但需要先把 max 求出来</td>
+</tr>
+<tr>
+<td><code>exp</code></td>
+<td>库函数</td>
+<td>❌ 只有多项式</td>
+</tr>
+</tbody>
+</table>
+<p><strong>第一行是死结。</strong> 所以我们必须换一个思路。</p>
+<hr>
+<h2 id="2-替代方案用定标把-exp-的输入框进窄区间">2. 替代方案：用定标把 <code>exp</code> 的输入"框"进窄区间</h2>
+<p>思路是<strong>绕开 <code>max</code>，改用已知的、固定的定标</strong>：</p>
+<ol>
+<li><strong>先测</strong>：在明文侧统计真实 <code>score</code> 的取值范围；</li>
+<li><strong>再框</strong>：让链内消息携带一个隐式的大定标（<code>F = 4096²</code>），于是 <code>exp</code> 的输入被压进一个<strong>预先已知的窄区间</strong>；</li>
+<li><strong>后拟合</strong>：在那个窄区间上拟合 <code>exp</code> 为一条 6 次多项式。</li>
+</ol>
+<p>这个方案的代价非常明确：<strong>它依赖"score 分布不会跑出统计区间"</strong>。一旦真实推理时的 score 越界，拟合多项式在区间外的行为<strong>没有任何保证</strong>。</p>
+<p>这就是"用定标换掉 max-sub"的代价：<strong>max-sub 是自适应的（永远安全），定标是预定的（区间外失效）。</strong></p>
+<hr>
+<h2 id="3-拟合的实际做法">3. 拟合的实际做法</h2>
+<p>规划脚本 <code>_cfold_plan.py</code> 里保留了这条流水线的完整语义（注释原文）：</p>
+<pre><code class="language-python"># 折叠语义与 t23_m3p.c C 段一致：
+#   score 槽 = (q·k/√d) [链内消息已隐式除 F=4096²]
+#   num = EXP_Q(score/F)（引擎对全 s 求 exp，再 causal mask）
+#   den = Σ_{s≤t} num；inv = recip(den)；p = num·inv
+</code></pre>
+<p>而 <code>_attn_fit.py</code> 负责实际拟合。它的做法值得逐条看：</p>
+<h3 id="31-exp窄区间--无平移--6-次">3.1 <code>exp</code>：窄区间 + 无平移 + 6 次</h3>
+<pre><code class="language-python">lo, hi = -0.6, 0.5
+z = u            # 直接对 S 拟合（无平移，系数小）
+c = np.polyfit(z, np.exp(z), 6)
+</code></pre>
+<p>三个细节：</p>
+<ul>
+<li><strong>区间 <code>[-0.6, 0.5]</code></strong>：这是<strong>实测</strong>出来的 score 范围（脚本先打印 <code>score range [min, max]</code> 再定区间），不是猜的；</li>
+<li><strong>不做平移</strong>：因为区间本来就窄且靠近 0，直接拟合的系数很小（<code>|c|max</code> 会打印出来核对）——平移反而会引入额外误差；</li>
+<li><strong>6 次足够</strong>：窄区间上的 <code>exp</code> 极其平滑，<code>deg=5/6</code> 都能到很小的误差。</li>
+</ul>
+<h3 id="32-为什么对全-s-求-exp-再-mask">3.2 为什么"对全 s 求 exp 再 mask"</h3>
+<p>注意上面注释里那句：<strong><code>引擎对全 s 求 exp，再 causal mask</code></strong>。</p>
+<p>顺序是 <code>exp → mask</code>，而不是 <code>mask → exp</code>。原因很实际：密文里没有条件分支，你<strong>没法"跳过"</strong>某些位置的计算，只能<strong>全算完再乘 0/1 掩码</strong>。好在"乘 0/1"在同态里是廉价的（标量乘法）。</p>
+<p>而 causal mask 的作用是"位置 <code>t</code> 只能看到 <code>≤ t</code> 的位置"，于是在求和那一步：</p>
+<pre><code>den = Σ_{s≤t} num
+</code></pre>
+<p>求和范围就自然被掩码限制住了。</p>
+<h3 id="33-recip倒数也要拟合">3.3 <code>recip</code>：倒数也要拟合</h3>
+<p>softmax 的分母要取倒数，而 <code>1/x</code> 同样不是多项式。所以倒数也要拟合——而且它的区间是可以<strong>推出来</strong>的：</p>
+<pre><code class="language-python"># den = sum_s exp(S(h,s)) in [4*exp(lo), 4*exp(hi)]
+dlo, dhi = 4*math.exp(lo), 4*math.exp(hi)
+</code></pre>
+<p>因为序列长度是 4（这一层处理 4 个 token），每项落在一个 2 次多项式在区间里的范围，4 项求和后区间就是 <code>[4·exp(lo), 4·exp(hi)]</code>。然后按这个区间标准化、拟合 <code>deg=8</code>。</p>
+<p><code>_cfold_plan.py</code> 里的实现更讲究一点——用 <strong>Chebyshev 拟合</strong>再转成普通多项式：</p>
+<pre><code class="language-python">u = np.cos(np.pi * (np.arange(n) + 0.5) / n)      # Chebyshev 节点
+p = Chebyshev.fit(u, 1.0/den, deg, domain=[-1,1]).convert(kind=Polynomial)
+</code></pre>
+<p>Chebyshev 节点在区间端点附近更密，能压住端点误差——这是数值拟合的标准手法，比等距 <code>linspace</code> 上的普通最小二乘更稳。</p>
+<h3 id="34-拟合的产物直接是-c-数组">3.4 拟合的产物直接是 C 数组</h3>
+<p>这两个脚本<strong>直接打印出可粘贴进 C 源码的系数数组</strong>：</p>
+<pre><code class="language-c">const double EXP_Q[7] = { ... };
+const double RECIP_Q[9] = { ... };
+</code></pre>
+<p>也就是说：<strong>Python 侧负责拟合，C 侧只负责当常量和求值</strong>（Horner 法）。这个分工把"数值优化"与"密文运算"彻底隔开——密文侧一行拟合代码都没有（这就是本系列第 2 篇说的"两个世界"）。</p>
+<p><code>EXP_Q</code> 的实际值（升幂，取自 <code>_cfold_plan.py</code>）：</p>
+<pre><code class="language-python">EXP_Q = [0.0013345331468413693, 0.0084199656748899163, 0.041687167024342969,
+         0.16665574107235029, 0.49999829447852773, 1.0000003483277793, 1.0000000191319709]
+</code></pre>
+<p>注意前几个系数很小、最后两个接近 <code>1.0</code>——这是"在 <code>[-0.6, 0.5]</code> 上拟合 <code>exp</code>"应有的形状（<code>exp(x) ≈ 1 + x + x²/2 + …</code>，且区间关于 0 大致对称）。</p>
+<hr>
+<h2 id="4-一个模型结构上的细节gqa">4. 一个模型结构上的细节：GQA</h2>
+<p>拟合脚本里 <code>NQ = 16, NKV = 8, HD = 128</code>，而代码里映射 head 的方式是：</p>
+<pre><code class="language-python">hk = h % NKV      # 16 个 query head 共享 8 个 KV head
+</code></pre>
+<p>这是 <strong>GQA（分组查询注意力）</strong>：<code>16</code> 个 query head 对应 <code>8</code> 个 KV head，每个 KV head 被两个 query head 复用。</p>
+<p>在密文里这件事的意义是：<strong>KV 侧的密文数量只有一半</strong>，而"多算的一份 K/V"在明文里是免费的（只是索引复用），在密文里是<strong>实打实的密文乘法</strong>。所以 GQA 对我们的性能是<strong>净收益</strong>——这不是我们选的，是模型结构给的便宜。</p>
+<hr>
+<h2 id="5-安全边界务请读完">5. 安全边界（务请读完）</h2>
+<pre><code>本文所述参数为机制验证级，远低于 HE 参数标准的 128-bit 水平，不得用于保护真实数据。
+本文主张的是：密文下 attention 的实现取舍。
+本文不主张：安全强度、性能优越性（本文不含与明文实现的性能对比）。
+</code></pre>
+<hr>
+<h2 id="6-这一篇的未解问题">6. 这一篇的未解问题</h2>
+<ol>
+<li><strong><code>score</code> 越界后没有兜底</strong>。定标方案假定 score 落在统计区间内。如果某个输入让它越界，拟合多项式会给出<strong>无意义</strong>的值——而且不会有任何报错。<strong>这是本文最担心的一处</strong>。可能的缓解：在明文侧统计时留更宽的余量，或在多项式上做区间外的钳制（但钳制本身也需要比较）。</li>
+<li><strong>区间余量取了多大，没有记录</strong>。<code>[-0.6, 0.5]</code> 是实测范围还是加了余量后的范围？这份数据我们没有归档。</li>
+<li><strong>掩码的实现细节我没有在密文侧逐行确认</strong>。本文描述的顺序（<code>exp → mask → 求和</code>）来自规划脚本的注释与仿真代码；<strong>C 侧的实际算子序列以 <code>t23_m3p.c</code> 为准</strong>，这一处需要读者（以及我们自己）对照源码复核。</li>
+<li><strong>拟合精度到整链精度的传递没有量化</strong>。<code>exp</code> 的 <code>max_abs_err</code> 和 <code>recip</code> 的 <code>max_abs_err</code> 脚本里都打印了，但"它贡献了整链 <code>max|err|</code> 的多少"没有做归因。</li>
+</ol>
+<p>下一篇我们回到协议层：<strong>密文链的两条不变式</strong>——<code>lay</code> 与 <code>boot</code> 为什么这样交替，以及 112 与 2100 这两个素数数字是怎么分工的。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-26 08:41">2026-09-26 08:40</span>&nbsp;
+<a href="https://www.cnblogs.com/haliuhome">haliu</a>&nbsp;
+阅读(<span id="post_view_count">36</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23125666);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhaliuhome%2Fp%2F23125666&amp;targetId=23125666&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
