@@ -1,0 +1,188 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/haliuhome/p/23138413" title="发布于 2026-09-28 09:13">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">【FHE】（十二）：为什么我们把 OpenMP 换成了自研线程池</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>项目仓库</strong><br>
+Gitee 主仓：<a href="https://gitee.com/pei-xiaoguang/kestrel-llm" target="_blank" rel="noopener nofollow">https://gitee.com/pei-xiaoguang/kestrel-llm</a><br>
+GitHub 镜像：<a href="https://github.com/m13253246268-ship-it/kestrel-llm" target="_blank" rel="noopener nofollow">https://github.com/m13253246268-ship-it/kestrel-llm</a></p>
+<p><strong>相关文档</strong><br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9C%AF%E8%AF%AD%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%8F%A3%E5%BE%84" target="_blank" rel="noopener nofollow">术语与数据口径</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%80%A7%E8%83%BD%E4%B8%8E%E5%9F%BA%E5%87%86" target="_blank" rel="noopener nofollow">性能与基准</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9E%84%E5%BB%BA%E4%B8%8E%E5%A4%8D%E7%8E%B0" target="_blank" rel="noopener nofollow">构建与复现</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B" target="_blank" rel="noopener nofollow">快速上手</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9E%B6%E6%9E%84%E6%80%BB%E8%A7%88" target="_blank" rel="noopener nofollow">架构总览</a></p>
+</blockquote>
+<h2 id="0-一句话结论">0. 一句话结论</h2>
+<p><code>vllm_tp.c</code> 是一个<strong>自研线程池，用来替换 OpenMP 运行时</strong>（<code>tp</code> = thread pool）。</p>
+<p>动机很具体：OpenMP 每个并行区都要 <strong>fork/join</strong>。而 FHE 的并行粒度往往很小（比如对 112 个素数分别做 NTT），一个并行区可能只有几微秒的活——此时<strong>唤醒开销比干活本身还大</strong>。</p>
+<p>自研池的做法是：<strong>持久化的 worker 线程 + "自旋再等待"的混合等待 + 调用线程自己也干活</strong>。API 刻意做成 1:1 对应 OpenMP，让每个调用点能直接替换。</p>
+<hr>
+<h2 id="1-动机小并行区的唤醒税">1. 动机：小并行区的唤醒税</h2>
+<p>OpenMP 的模型是"进入并行区 → 唤醒线程 → 分发任务 → 汇合"。对粗粒度任务（几百毫秒一段）这完全没问题。</p>
+<p>但 FHE 的并行结构是<strong>嵌套且细碎</strong>的：</p>
+<ul>
+<li>112 个素数 → 每素数一个 NTT；</li>
+<li><code>n = 2048</code> 个系数 → 每系数一次模乘；</li>
+<li>密文分量 × 素数 × 系数，三层循环里处处可并行。</li>
+</ul>
+<p>这些并行区的执行时间可能只有 <strong>微秒级</strong>。而每次进入并行区，OpenMP 都要付一次线程池唤醒/汇合的成本。<strong>结果是：花了大量时间在"叫醒工人"，而不是"干活"。</strong></p>
+<hr>
+<h2 id="2-三条设计决策">2. 三条设计决策</h2>
+<p>头注释把设计讲得很清楚，逐条看：</p>
+<h3 id="21-持久-worker--先自旋再等待">2.1 持久 worker + "先自旋，再等待"</h3>
+<blockquote>
+<p>Persistent worker threads are created once (lazy, on first parallel call) and reuse a spin-then-event wait between jobs, so small parallel regions pay ~µs of dispatch instead of OpenMP's thread-pool wake cost.</p>
+</blockquote>
+<p>关键点：</p>
+<ul>
+<li><strong>只创建一次</strong>（懒初始化：第一次发起并行调用时创建），之后复用；</li>
+<li><strong>等待策略是混合的</strong>：先<strong>自旋</strong>（spin）一小段，如果还没活干再退化成<strong>事件等待</strong>（event wait）。</li>
+</ul>
+<p>这个"spin-then-event"是并行编程里的经典取舍：纯自旋浪费 CPU，纯事件等待延迟高。<strong>先自旋后阻塞</strong>两头兼顾——而这也正是我们在多进程环境下需要用 <code>VLLM_TP_SPIN</code> 之类的开关来调的原因（自旋策略在超订场景下会互相抢核）。</p>
+<h3 id="22-调用线程自己也干活">2.2 调用线程自己也干活</h3>
+<blockquote>
+<p>The CALLING thread participates: it executes its own chunk and joins the workers with a wait, so the common case adds no idle-thread wake latency.</p>
+</blockquote>
+<p>这是一个很实在的优化：<strong>发起并行的那个线程不是"监工"，它自己也分一块活。</strong> 于是常见情况下不需要额外唤醒——本来就醒着的那个线程立刻开始算。</p>
+<p>API 上对应两条规则（头注释原文）：</p>
+<ul>
+<li><code>vllm_tp_parfor</code>：<strong>调用者拿最后一块</strong>（<code>caller takes the last chunk</code>）；</li>
+<li><code>vllm_tp_worker_id</code>：在并行区内 <strong>caller 的 id 是 <code>nthreads-1</code></strong>，在并行区外是 <code>-1</code>。</li>
+</ul>
+<p>第二条尤其重要——它让"我是第几号工人"这件事在区内区外语义一致，避免调用点写出"区内一套、区外一套"的分支。</p>
+<h3 id="23-静态连续分块--绑物理核">2.3 静态连续分块 + 绑物理核</h3>
+<blockquote>
+<p>Static contiguous chunking matches the OpenMP <code>schedule(static)</code> split the codebase already relies on (uniform per-row cost).<br>
+Workers bind to physical cores at creation (NUMA/affinity axioms: skip SMT siblings on x86, pin to the A76 cluster on RK3588).</p>
+</blockquote>
+<p>两点：</p>
+<ul>
+<li><strong>分块策略照抄 <code>schedule(static)</code></strong>：因为 FHE 里"每一行的代价基本一致"（每个素数一个 NTT、每个系数一次模乘），静态连续分块不会有负载不均问题，而且<strong>分块确定 → 结果确定</strong>，这对我们是重要的（本系列第 13 篇）；</li>
+<li><strong>绑核</strong>：x86 上<strong>跳过 SMT 兄弟核</strong>（只绑物理核），RK3588 上绑 <strong>A76 大核簇</strong>。这两个平台策略不同，写在同一个池里。</li>
+</ul>
+<hr>
+<h2 id="3-api刻意做成-openmp-的镜像">3. API：刻意做成 OpenMP 的镜像</h2>
+<p>这个设计选择很值得学习——<strong>不发明新范式，只换实现</strong>。头注释直接给了映射表：</p>
+<table>
+<thead>
+<tr>
+<th>OpenMP</th>
+<th>自研池</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>#pragma omp parallel for schedule(static)</code></td>
+<td><code>vllm_tp_parfor(...)</code></td>
+</tr>
+<tr>
+<td><code>#pragma omp parallel</code>（手工按 tid 拆分）</td>
+<td><code>vllm_tp_parcall(...)</code></td>
+</tr>
+<tr>
+<td><code>omp_get_thread_num()</code></td>
+<td><code>vllm_tp_worker_id()</code></td>
+</tr>
+<tr>
+<td><code>omp_get_max_threads()</code> / <code>omp_set_num_threads()</code></td>
+<td><code>vllm_tp_threads()</code> / <code>vllm_tp_init()</code></td>
+</tr>
+<tr>
+<td><code>omp_get_wtime()</code></td>
+<td><code>vllm_tp_wtime()</code></td>
+</tr>
+</tbody>
+</table>
+<p>好处是<strong>迁移风险极低</strong>：每个调用点都是机械替换，语义一一对应，出问题容易二分定位。</p>
+<p>几个实现细节（都写在头文件里）：</p>
+<pre><code class="language-c">void vllm_tp_parfor(int start, int end, void (*body)(void*, int), void *ctx);
+/* static contiguous chunks，caller 拿最后一块；
+   池只有 1 个线程、或区间小到没必要时，退化成调用者上的串行循环 */
+
+int vllm_tp_worker_id(void);   /* workers 0..nworkers-1；区内 caller = nthreads-1；区外 -1 */
+double vllm_tp_wtime(void);    /* QueryPerformanceCounter / CLOCK_MONOTONIC */
+void vllm_tp_shutdown(void);   /* 幂等 */
+</code></pre>
+<p><code>vllm_tp_wtime()</code> 的两套实现（Windows 用 <code>QueryPerformanceCounter</code>、Linux 用 <code>CLOCK_MONOTONIC</code>）说明这个池是<strong>跨平台</strong>的——这跟项目里"同一源码在 x86-64 与 aarch64 逐系数位级一致"的目标是一致的。</p>
+<hr>
+<h2 id="4-代价与限制必须说清">4. 代价与限制（必须说清）</h2>
+<p>自研的代价写在注释里，而且是<strong>明确的能力削减</strong>：</p>
+<blockquote>
+<p>Thread-safety: <code>vllm_tp_parfor</code>/<code>parcall</code> are NOT re-entrant; nested parallel regions from a worker are not supported (the engine does not use them).</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>限制</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>非可重入</strong></td>
+<td>不能从并行区内再发起一个并行区</td>
+</tr>
+<tr>
+<td><strong>不支持嵌套并行</strong></td>
+<td>引擎里确实没有这种用法，但这条约束<strong>没有编译期检查</strong>，只能靠约定</td>
+</tr>
+<tr>
+<td>默认线程数</td>
+<td>每物理核一个（x86 跳 SMT，RK3588 4×A76）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>"引擎不用嵌套并行"是一句承诺，不是一条保证。</strong> 将来有人写了一个嵌套调用，编译器不会拦，运行时会静默出错。这是这笔交易里最需要警惕的地方。</p>
+<hr>
+<h2 id="5-它与位级可复现的隐秘关联">5. 它与"位级可复现"的隐秘关联</h2>
+<p>我们把 OpenMP 换掉，不只是为了快。<strong>一个确定的线程池，是实现确定性的前提。</strong></p>
+<ul>
+<li>自研池用<strong>静态连续分块</strong>，分块结果是确定的；</li>
+<li>而 OpenMP 的分块策略在不同版本、不同实现（GCC 的 libgomp vs LLVM 的 libomp）之间<strong>可能不同</strong>。</li>
+</ul>
+<p>也就是说：<strong>如果并行分块本身不确定，"位级一致"就无从谈起。</strong></p>
+<p>但要说清楚——<strong>换掉 OpenMP 并没有解决位级一致问题</strong>。真正的根因在别处（RNG 播种），本系列第 13 篇专门讲。这里只是说明：自研池是"位级可复现"这条路上的<strong>必要但不充分</strong>条件。</p>
+<hr>
+<h2 id="6-安全边界务请读完">6. 安全边界（务请读完）</h2>
+<pre><code>本文所述参数为机制验证级，远低于 HE 参数标准的 128-bit 水平，不得用于保护真实数据。
+本文主张的是：并行运行时替换的动机与设计。
+本文不主张：性能优越性。
+</code></pre>
+<p><strong>必须补一句</strong>：绩效上，我们<strong>没有</strong>归档"自研池 vs OpenMP"的同轮交错 A/B 数据。按本项目纪律（跨轮不可比绝对值），本文因此<strong>不给出任何加速比</strong>。这是本文最大的空缺。</p>
+<hr>
+<h2 id="7-这一篇的未解问题">7. 这一篇的未解问题</h2>
+<ol>
+<li><strong>缺少同轮 A/B 的量化证据</strong>。动机（唤醒税）在原理上成立，但"到底省了多少"没有实测归档。这是应该补的第一个实验。</li>
+<li><strong>自旋策略没有自适应</strong>。<code>VLLM_TP_SPIN</code> 这类开关目前是手工设置的经验值。理想情况下应该根据"上一轮等待时长"自动在自旋与阻塞之间切换。</li>
+<li><strong>非可重入是静默失败</strong>。加一个"当前是否已在并行区内"的断言（debug 构建下）成本极低，收益很直接。</li>
+<li><strong>绑核策略没有形成文档化的决策依据</strong>。x86 跳 SMT、RK3588 绑 A76，这两个选择背后的实测数据没有归档。换平台的人只能抄结论，抄不到理由。</li>
+</ol>
+<p>下一篇是本系列里我认为最有价值的一篇：<strong>位级可复现性</strong>——4 线程与 8 线程为什么算出的结果位级不同，以及为什么"修好了"这句话我们到现在都说不出口。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-09-28 09:13">2026-09-28 09:13</span>&nbsp;
+<a href="https://www.cnblogs.com/haliuhome">haliu</a>&nbsp;
+阅读(<span id="post_view_count">90</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23138413);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhaliuhome%2Fp%2F23138413&amp;targetId=23138413&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
