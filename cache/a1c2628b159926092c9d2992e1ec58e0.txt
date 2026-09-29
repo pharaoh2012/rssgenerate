@@ -1,0 +1,187 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yhup/p/23145879" title="发布于 2026-09-28 17:08">
+    
+
+    <span role="heading" aria-level="2">从 epoll 到 Reactor：Redis 单线程与多线程的性能与简洁之衡</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170705028-1875861116.png" alt="从 epoll 到 Reactor：Redis 单线程与多线程的性能与简洁之衡" class="desc_img">
+        Redis 6.0 前为单线程模型，依赖 epoll + Reactor 架构实现高性能，核心优势在于避免锁与上下文切换，保障简洁与原子性。随着网络吞吐量提升，网络 I/O 成为瓶颈。为此，Redis 6.0 引入多线程，仅将网络读写与协议解析交由多个线程处理，命令执行仍由主线程完成，兼顾性能与一致性。此举在不破坏单线程模型的前提下，有效提升高并发场景下的吞吐量，是性能与简洁权衡的典型实践。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="redis-的单线程与多线程一场关于性能与简洁的权衡">Redis 的“单线程”与“多线程”：一场关于性能与简洁的权衡</h1>
+<h2 id="写在前面">写在前面</h2>
+<p>“Redis 是单线程的”——这句话几乎成了面试八股里的标准答案。但如果你追问一句“6.0 之后呢”，很多人就会卡壳。</p>
+<p>事实上，“单线程”这个说法需要加上一个精确的限定词：<strong>Redis 在处理命令时是单线程的</strong>。这个“单线程”指的是从网络读取请求、解析命令、执行命令、返回响应这一整条路径由一个主线程串行完成。至于持久化、异步删除大 key、AOF 重写这些操作，Redis 从一开始就有后台线程在跑。</p>
+<p>Redis 6.0 引入的多线程，也不是把命令执行改成多线程，而是把<strong>网络 I/O 的读写操作</strong>分配给了多个线程。命令的执行、数据的读写，依然牢牢守在主线程手里。</p>
+<p>本文从 epoll 和 Reactor 的基础设施讲起，再到单线程的取舍和多线程的引入，把这条设计演进线梳理清楚。所有数据均有来源标注，不编造。</p>
+<h2 id="一redis-的快从哪来">一、Redis 的“快”从哪来</h2>
+<p>Redis 的高性能可以归结为两个基本面。</p>
+<p><strong>第一，纯内存操作。</strong> 数据全部放在内存里，读写延迟在纳秒到微秒级别。相比磁盘 I/O，这本身就是数量级的优势。</p>
+<p><strong>第二，高效的 I/O 模型。</strong> 在 Linux 上，Redis 采用的是 <strong>epoll + Reactor</strong> 的组合。epoll 负责管理大量的文件描述符，Reactor 负责事件的分发和响应。两者配合，让单个线程也能高效地处理成千上万的并发连接。</p>
+<p>下面分别拆开讲。</p>
+<h2 id="二epoll把轮询变成被动通知">二、epoll：把“轮询”变成“被动通知”</h2>
+<h3 id="21-一句话理解-epoll">2.1 一句话理解 epoll</h3>
+<p>epoll 做的事情，本质上就是<strong>帮你管着一大堆文件描述符（socket），在你需要的时候告诉你哪些是可用的</strong>。</p>
+<p>在 Linux 中“万物皆文件”，网络 socket 也不例外。epoll 的核心工作就是对这些文件描述符做增、删、改、查。</p>
+<h3 id="22-基本结构">2.2 基本结构</h3>
+<p>epoll 内部依赖两个核心数据结构：</p>
+<ul>
+<li><strong>红黑树</strong>：存储所有被监控的文件描述符。红黑树的查找、插入、删除复杂度都是 O(log n)，适合管理大量连接。</li>
+<li><strong>就绪链表</strong>（双向链表）：存储已经满足事件条件的文件描述符。</li>
+</ul>
+<p><img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170522410-1370066643.png" alt="在这里插入图片描述" loading="lazy"></p>
+<h3 id="23-三个系统调用">2.3 三个系统调用</h3>
+<p>epoll 对外暴露三个核心系统调用：</p>
+<ol>
+<li><strong>epoll_create</strong>：创建一个 epoll 实例。</li>
+<li><strong>epoll_ctl</strong>：向 epoll 实例中注册、修改或删除文件描述符及其关注的事件类型（可读、可写等）。</li>
+<li><strong>epoll_wait</strong>：等待事件发生，返回符合条件的文件描述符。</li>
+</ol>
+<pre><code class="language-c">epoll = epoll_create();
+
+// 注册一个 socket，关注读事件
+epoll_ctl(epoll, ADD, fd, READ);
+
+while (1) {
+    // 等待可读的 socket，超时 1000ms
+    fds = epoll_wait(epoll, READ, 1000);
+    // 处理就绪的 fds
+}
+</code></pre>
+<h3 id="24-关键机制就绪队列是被动填充的">2.4 关键机制：就绪队列是“被动填充”的</h3>
+<p>这是 epoll 区别于 select 的核心设计。</p>
+<p><strong>epoll 并不是在你调用 epoll_wait 的时候才去检查哪些文件描述符就绪。</strong> 而是在 epoll 创建之后，只要某个文件描述符满足了注册的事件条件，内核就会主动把它放到就绪队列里。你调用 epoll_wait 时，只是把就绪队列里已有的结果取走。</p>
+<p><img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170523125-2065859672.png" alt="在这里插入图片描述" loading="lazy"></p>
+<h3 id="25-epoll_wait-的三种行为">2.5 epoll_wait 的三种行为</h3>
+<p>调用 epoll_wait 时，根据就绪队列的状态和传入的超时参数，行为不同：</p>
+<ul>
+<li><strong>就绪队列有符合条件的 fd</strong>：立即返回。</li>
+<li><strong>就绪队列为空，超时参数 = -1</strong>：永远阻塞，直到有 fd 就绪。</li>
+<li><strong>就绪队列为空，超时参数 = 0</strong>：立即返回空结果。</li>
+<li><strong>就绪队列为空，超时参数 = 正数</strong>：阻塞直到有 fd 就绪或超时。</li>
+</ul>
+<h3 id="26-谁通知-epoll-的-中断">2.6 谁通知 epoll 的？—— 中断</h3>
+<p>网卡收到数据时，会触发一个硬件中断。网卡的驱动程序在中断处理中，会通过注册在文件描述符等待队列上的回调函数，通知 epoll：“这个 fd 有数据了”。epoll 随即把它移入就绪队列。</p>
+<p>超时机制则是另一条路径。epoll_wait 在睡眠之前会注册一个定时器，时钟中断到来时，内核的定时器子系统检查是否有超时的定时器，如果有，就唤醒对应的线程，epoll_wait 返回超时。</p>
+<h2 id="三select-和-poll一个对比">三、select 和 poll：一个对比</h2>
+<p>理解了 epoll 的“被动通知”机制，再来看 select 的设计，差异就很明显了。</p>
+<p><strong>select 是“主动遍历”的。</strong> 你传入一批文件描述符（readfds、writefds、exceptfds），内核在 select 调用内部逐个检查这些 fd，把符合条件的返回给你。调用一次，遍历一次。poll 的原理与 select 基本一致。</p>
+<p><img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170523864-726099262.png" alt="在这里插入图片描述" loading="lazy"></p>
+<table>
+<thead>
+<tr>
+<th>对比维度</th>
+<th>epoll</th>
+<th>poll</th>
+<th>select</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件描述符上限</td>
+<td>无</td>
+<td>无</td>
+<td>1024</td>
+</tr>
+<tr>
+<td>找就绪 fd 的方式</td>
+<td>内核主动填充就绪队列</td>
+<td>遍历</td>
+<td>遍历</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>最好</td>
+<td>一般</td>
+<td>一般</td>
+</tr>
+<tr>
+<td>fd 拷贝</td>
+<td>epoll_ctl 时拷贝一次</td>
+<td>每次调用拷贝</td>
+<td>每次调用拷贝</td>
+</tr>
+</tbody>
+</table>
+<p>这张表的关键信息是：<strong>epoll 的 fd 拷贝只发生在 epoll_ctl 时，后续的 epoll_wait 不需要重复拷贝。而 select/poll 每次调用都要把整个 fd 集合从用户态拷贝到内核态。</strong> 在连接数很大的时候，这个差异会非常显著。</p>
+<h2 id="四reactor-模式分发器--处理器">四、Reactor 模式：分发器 + 处理器</h2>
+<h3 id="41-核心思想">4.1 核心思想</h3>
+<p>Reactor 模式可以用一句话概括：<strong>一个分发器 + 一堆处理器</strong>。</p>
+<p>网络 I/O 的事件大致分两类：<strong>连接事件</strong>（新客户端接入）和<strong>读写事件</strong>（已有连接上的数据收发）。Reactor 作为分发器，把连接事件交给 Acceptor 处理，把读写事件交给对应的 Handler 处理。</p>
+<p><img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170524440-277922607.png" alt="在这里插入图片描述" loading="lazy"></p>
+<h3 id="42-reactor-的变种">4.2 Reactor 的变种</h3>
+<p>根据多线程的引入方式，Reactor 有几种常见变体：</p>
+<p><strong>变种一：Reactor 主线程只负责连接，其他线程负责读写。</strong></p>
+<p>主线程监听连接事件，收到连接后初始化，然后把连接交给其他线程。其他线程各自监听自己负责的连接上的读写事件，调用 Handler 处理。</p>
+<p><img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170525014-250006115.png" alt="在这里插入图片描述" loading="lazy"></p>
+<p><strong>变种二：IO 线程池。</strong> 命令解析、数据读写由 IO 线程并行处理，命令执行仍由主线程完成。这就是 Redis 6.0 采用的方案。</p>
+<h2 id="五单线程的-redis-是怎么跑-reactor-的">五、单线程的 Redis 是怎么跑 Reactor 的</h2>
+<p>在 Redis 6.0 之前，<strong>Reactor、Acceptor、Handler 在逻辑上是分开的概念，在物理上是同一个线程</strong>。</p>
+<p>整个流程大致如下：</p>
+<ol>
+<li>Reactor（主线程）调用 epoll_wait，拿到就绪的文件描述符。</li>
+<li>如果是可读事件，主线程读取数据、解析命令、执行命令。</li>
+<li>如果是可写事件，主线程把响应写回 socket。</li>
+<li>如果是连接事件，主线程完成连接初始化，然后监听这个连接上的读写事件。</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170525566-1271508223.png" alt="在这里插入图片描述" loading="lazy"></p>
+<p>这种设计的简洁之处在于：<strong>没有线程间通信，没有锁，没有上下文切换</strong>。所有操作串行执行，天然保证了命令的原子性。</p>
+<h2 id="六单线程的取舍为什么-redis-敢这么做">六、单线程的取舍：为什么 Redis 敢这么做</h2>
+<p>Redis 选择单线程，核心原因可以概括为三点。</p>
+<p><strong>第一，CPU 不是瓶颈。</strong> Redis 是基于内存的操作，读写速度极快。官方对此的表述是：Redis 的瓶颈最可能是机器内存大小或网络带宽，而不是 CPU 计算能力。既然 CPU 跑不满，多线程带来的并行收益就有限。</p>
+<p><strong>第二，避免锁和上下文切换。</strong> Redis 的数据结构不止简单的 key-value，还有 list、hash、sorted set 等复杂结构。如果在多线程环境下操作这些结构，就需要加各种锁，同步开销会显著增加。单线程下这些问题都不存在。</p>
+<p><strong>第三，代码简单，容易调试。</strong> 单线程模型的逻辑是线性的，出了问题容易定位，不需要考虑并发场景下的各种边界情况。</p>
+<h3 id="回过头看-memcached">回过头看 Memcached</h3>
+<p>Memcached 选择了多线程路线。它使用多个 worker 线程并发处理客户端请求。为了在并发环境下保护数据结构的一致性，Memcached 需要引入多把锁。</p>
+<p>在 Memcached 中，一个普通的 get/set 操作涉及两层锁：细粒度的 item_locks（在八核机器上大约有 8192 把）和一把全局的 cache_lock。全局锁的存在使得 Memcached 在多核 CPU 上的扩展性受到限制。后来的版本通过引入 item_update_interval 等优化来减少 LRU 锁的争用，但问题并没有被彻底消除。</p>
+<p>Memcached 的多线程确实能更充分地利用多核 CPU，但代价是需要处理锁竞争、上下文切换等并发问题。Redis 单线程的选择，本质上是在“简洁”和“并行”之间做了一个偏向简洁的权衡。</p>
+<h2 id="七redis-60-为什么要引入多线程">七、Redis 6.0 为什么要引入多线程</h2>
+<h3 id="71-原因只有一个网络-io-成了瓶颈">7.1 原因只有一个：网络 I/O 成了瓶颈</h3>
+<p>随着网络硬件的发展（万兆网卡普及）和连接数的增长，单个线程既要处理网络读写，又要执行命令，逐渐力不从心。在连接数超过 8 万时，Redis 单线程模式的吞吐量增长曲线趋于平缓，P99 延迟显著上升。</p>
+<p>网络读写的开销开始侵占本应留给命令执行的 CPU 时间。而机器明明有多核，却只能用一个核来处理网络 I/O。</p>
+<h3 id="72-多线程做了什么没做什么">7.2 多线程做了什么，没做什么</h3>
+<p>Redis 6.0 引入的多线程，<strong>只做了网络 I/O 的读写和协议解析</strong>。命令的执行依然由主线程完成。</p>
+<p>具体流程如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/2428649/202609/2428649-20260928170526159-399768142.png" alt="在这里插入图片描述" loading="lazy"></p>
+<p>主线程负责接收连接、分发事件、执行命令。IO 线程负责从 socket 读取数据、解析命令，以及把响应写回 socket。</p>
+<h3 id="73-性能数据">7.3 性能数据</h3>
+<p>Redis 作者 antirez 在 RedisConf 2019 上分享的数据显示，多线程 I/O 下 GET/SET 命令的性能相比单线程几乎翻倍。</p>
+<p><a href="https://developer.aliyun.com/article/925767#1" target="_blank" rel="noopener nofollow">阿里云开发者社区的一篇测试文章</a>提供了更详细的数据。在 16C + 32GB 的 CentOS 7 环境下，使用 redis-benchmark 本地测试：</p>
+<ul>
+<li><strong>1 线程</strong>（传统单线程模式）：GET 操作 QPS 约 <strong>9 万</strong>。</li>
+<li><strong>2 线程</strong>：GET 操作 QPS 约 <strong>18 万</strong>，相比单线程提升超过 100%。</li>
+<li><strong>4 线程</strong>及以上：提升幅度逐渐趋缓。</li>
+</ul>
+<p>这篇文章还记录了一个值得注意的细节：如果不给 redis-benchmark 加上 <code>--threads</code> 参数，测试结果几乎看不出多线程带来的提升。因为瓶颈转移到了基准测试工具本身，而不是 Redis 服务端。这个细节说明，做性能测试时必须同时关注客户端和服务端，否则很容易得出错误结论。</p>
+<h3 id="74-默认关闭按需开启">7.4 默认关闭，按需开启</h3>
+<p>多线程模式在 Redis 6.0 中<strong>默认是关闭的</strong>。需要在 redis.conf 中显式设置 <code>io-threads</code> 参数来开启。业界比较普遍的看法是，Redis 单线程模式下的性能已经能满足绝大多数场景，多线程模式更多是在极端高并发场景下作为一个可选项。</p>
+<p>另外需要说明的是，<code>io-threads-do-reads</code> 这个参数控制是否用多线程来读 socket。由于主线程本身的多路复用机制已经能高效处理读事件，这个参数对性能的影响并不显著。</p>
+<h2 id="八总结">八、总结</h2>
+<p>回顾整条线索：</p>
+<p><strong>epoll</strong> 提供了高效的文件描述符管理能力——被动填充就绪队列，不需要每次调用都遍历全部 fd。<strong>Reactor</strong> 在这个基础上提供了清晰的架构分层——分发器、连接处理器、读写处理器。<strong>Redis 的单线程设计</strong>把 Reactor 的所有角色压缩到一个线程里，用极致的简洁换取了无锁、无上下文切换的执行效率。<strong>Redis 6.0 的多线程</strong>把网络 I/O 从主线程中剥离出去，让主线程专注于命令执行，在不破坏原有数据一致性的前提下，利用多核弥补了 I/O 层面的不足。</p>
+<p>这条演进线背后的逻辑其实很简单：<strong>哪里是瓶颈，就优化哪里；不是瓶颈的地方，保持不动</strong>。单线程时代，瓶颈在网络 I/O 和内存，CPU 不是问题，所以单线程是最优解。多线程时代，网络 I/O 的吞吐量成为了显性瓶颈，所以把 I/O 分出去。命令执行始终不是瓶颈，所以它始终是单线程。</p>
+<p>理解了这个逻辑，你就不会被“单线程”或“多线程”的标签带偏，而是能根据实际的瓶颈在哪里，做出合适的技术判断。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.006944444444444444" data-date-updated="2026-09-28 17:18">2026-09-28 17:08</span>&nbsp;
+<a href="https://www.cnblogs.com/yhup">yihuiComeOn</a>&nbsp;
+阅读(<span id="post_view_count">51</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23145879);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyhup%2Fp%2F23145879&amp;targetId=23145879&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
