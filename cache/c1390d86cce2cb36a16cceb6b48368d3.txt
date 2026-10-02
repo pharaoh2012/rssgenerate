@@ -1,0 +1,318 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/haliuhome/p/23178401" title="发布于 2026-10-01 09:03">
+    
+
+    <span role="heading" aria-level="2">【FHE 同态加密】我们如何实现同态加密推理（十五）：实测账本——一跳 1.8 小时，钱花在哪（同态加密推理性能剖析）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>关键词</strong>：同态加密 ｜ FHE ｜ 性能剖析 ｜ 实测账本 ｜ 自举 ｜ 域变换 ｜ CPU 推理 ｜ 大模型密文推理 ｜ 耗时分析</p>
+</blockquote>
+<p><strong>导读</strong>：一次同态加密推理的一跳（lay + boot）在 8 核 CPU 上约 1.8 小时，而这个时间绝大部分不在多项式乘法上——自举的两段域变换单独就占了约 80%。本篇是实测账本，讲清钱花在哪，以及为什么"继续优化卷积基本是白费力气"。所有数字都绑定线程数、且只在同轮交错 A/B 下可比。</p>
+<blockquote>
+<p><strong>项目仓库</strong><br>
+Gitee 主仓：<a href="https://gitee.com/pei-xiaoguang/kestrel-llm" target="_blank" rel="noopener nofollow">https://gitee.com/pei-xiaoguang/kestrel-llm</a><br>
+GitHub 镜像：<a href="https://github.com/m13253246268-ship-it/kestrel-llm" target="_blank" rel="noopener nofollow">https://github.com/m13253246268-ship-it/kestrel-llm</a></p>
+<p><strong>相关文档</strong><br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9C%AF%E8%AF%AD%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%8F%A3%E5%BE%84" target="_blank" rel="noopener nofollow">术语与数据口径</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%80%A7%E8%83%BD%E4%B8%8E%E5%9F%BA%E5%87%86" target="_blank" rel="noopener nofollow">性能与基准</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9E%84%E5%BB%BA%E4%B8%8E%E5%A4%8D%E7%8E%B0" target="_blank" rel="noopener nofollow">构建与复现</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B" target="_blank" rel="noopener nofollow">快速上手</a> ｜<br>
+<a href="https://gitee.com/pei-xiaoguang/kestrel-llm/wikis/%E6%9E%B6%E6%9E%84%E6%80%BB%E8%A7%88" target="_blank" rel="noopener nofollow">架构总览</a></p>
+</blockquote>
+<h2 id="0-一句话结论">0. 一句话结论</h2>
+<p>一跳（<code>lay</code> + <code>boot</code>）约 <strong>1.8 小时</strong>（8 核 CPU，纯 CPU、无 GPU/NPU）。而这个时间<strong>绝大部分不在多项式乘法上</strong>：</p>
+<p><strong>自举的两段"域变换"——<code>coeff_to_slot</code> 与 <code>slot_to_coeff</code>——单独就占了自举耗时的约 80%。</strong></p>
+<p>结论直接改变优化方向：<strong>继续优化卷积基本是白费力气。</strong></p>
+<hr>
+<h2 id="1-观测口径先交代前提再上数字">1. 观测口径（先交代前提，再上数字）</h2>
+<p>按本项目《术语与数据口径》§2.5 的纪律：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值 / 说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>平台</td>
+<td>AMD Ryzen 7 9800X3D（8 核 16 线程）</td>
+</tr>
+<tr>
+<td>线程数</td>
+<td><code>T23_NT</code>（<strong>所有数字都绑定线程数</strong>，见本系列第 13 篇）</td>
+</tr>
+<tr>
+<td>比对方式</td>
+<td><strong>同轮交错 A/B</strong>；<strong>不使用跨轮次的绝对耗时</strong></td>
+</tr>
+<tr>
+<td>编译</td>
+<td><code>gcc -O2 -fopenmp</code>，<code>-DCKKS_N=2048</code></td>
+</tr>
+<tr>
+<td>链长</td>
+<td><code>lay</code> 编译期 112；<code>boot</code> 编译期 2100</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>为什么强调"同轮交错"：跨会话/跨轮次的机器状态（频率、缓存、后台负载）不可控，绝对值不可比。这是本文所有数字成立的前提。</p>
+</blockquote>
+<hr>
+<h2 id="2-一跳的账单">2. 一跳的账单</h2>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>耗时</th>
+<th>判据</th>
+<th>内存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lay0</code></td>
+<td><strong>1920 s</strong></td>
+<td><code>RESULT=PASS</code></td>
+<td>工作集 ≈1.0 GB</td>
+</tr>
+<tr>
+<td><code>boot0</code></td>
+<td><strong>4285 s</strong></td>
+<td><code>BOOT=PASS</code>，8× <code>out np=2083</code></td>
+<td>链长 <code>np=2100</code>，建议 ≥8 GB</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>≈ 6205 s ≈ 1.72 h</strong></td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>链尾同数量级（供参照）：<code>boot26</code> 4469 s、<code>boot27</code> 4489 s。</p>
+<p><strong>一眼可见的结构：自举比层内前向贵一倍以上。</strong> 一跳 1.8 小时里，约 1.2 小时花在 <code>boot</code> 上。</p>
+<hr>
+<h2 id="3-自举的钱花在哪本文核心">3. 自举的钱花在哪（本文核心）</h2>
+<p><code>boot0</code> 的 <code>[boot profile]</code> 分段（字段名对应本系列第 7 篇的七段流水线）：</p>
+<table>
+<thead>
+<tr>
+<th>段</th>
+<th>耗时</th>
+<th>占自举比例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>coeff_to_slot</code></td>
+<td><strong>1688 s</strong></td>
+<td>~39%</td>
+</tr>
+<tr>
+<td><code>slot_to_coeff</code></td>
+<td><strong>1716 s</strong></td>
+<td>~40%</td>
+</tr>
+<tr>
+<td><code>sin_fold</code>（实部 + 虚部）</td>
+<td>~850 s</td>
+<td>~20%</td>
+</tr>
+<tr>
+<td><code>modraise</code> / <code>rotate_k</code> / <code>conj_extract</code> / <code>restore_merge</code></td>
+<td>余下</td>
+<td>剩余零头</td>
+</tr>
+<tr>
+<td><strong><code>total</code></strong></td>
+<td><strong>4285.03 s</strong></td>
+<td>100%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>两段域变换合计约 3400 s，占 80%。</strong></p>
+<h3 id="31-这个结论推翻了什么">3.1 这个结论推翻了什么</h3>
+<p>我们最初的优化直觉是"<strong>优化最热的内核</strong>"——也就是 NTT / 多项式乘法，因为它是每次乘法都要跑的东西，profiling 里出现次数最多。</p>
+<p>但<strong>出现次数最多 ≠ 占用时间最多</strong>。在这条链上，真正的成本是：</p>
+<pre><code>coeff_to_slot / slot_to_coeff
+   = 大量 Galois 旋转
+   + 每次旋转都要做 key-switch
+   + key-switch 要消耗那对 3×2 的密钥（每个都是 nprimes × n）
+</code></pre>
+<p>也就是说：<strong>瓶颈在"搬运"（域变换 + 置换 + 密钥切换），不在"计算"（卷积）。</strong></p>
+<p>而 key-switch 的密钥体积是 <code>nprimes × n × 64 bit</code> 量级——链长 2100 时，这些密钥<strong>本身就大到缓存装不下</strong>。所以这里的成本很可能<strong>不是算力，而是内存带宽</strong>。</p>
+<blockquote>
+<p>⚠️ 这一条是<strong>推断，不是结论</strong>。我们只测了"这段花了多少时间"，<strong>没有测它的微架构行为</strong>（缓存命中、带宽、指令数）。要证实"瓶颈是带宽"，需要额外一轮 profiling。按本项目纪律，这里标注为<strong>未验证的假设</strong>。</p>
+</blockquote>
+<hr>
+<h2 id="4-精度账本一并公开">4. 精度账本（一并公开）</h2>
+<p>性能之外，本项目同样需要公开的是<strong>精度</strong>，而且这一份更不能挑数字。</p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>结果</th>
+<th><code>max|err|</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>u0</code>（<code>lay0</code>，<code>np=16</code>）</td>
+<td><strong>PASS 8/8</strong></td>
+<td><code>1.2712e-03</code></td>
+</tr>
+<tr>
+<td><code>u0r112</code>（自举刷新后，<code>np=112</code>）</td>
+<td><strong>PASS 8/8</strong></td>
+<td><code>1.2706e-03</code></td>
+</tr>
+<tr>
+<td><code>u26</code> / <code>u26r112</code>（链尾）</td>
+<td><strong>PASS 8/8</strong></td>
+<td><code>4.4707e-03</code> ~ <code>2.2993e-02</code></td>
+</tr>
+<tr>
+<td><code>u27</code>（链尾）</td>
+<td>⚠️ <strong>6/8</strong></td>
+<td><code>t1h1=3.8216e-02</code>、<code>t3h1=7.9687e-02</code>（<strong>超默认容差 <code>3e-2</code></strong>）</td>
+</tr>
+</tbody>
+</table>
+<p>三个值得注意的点：</p>
+<ol>
+<li><strong>自举几乎不改变数值</strong>：<code>1.2712e-03</code> → <code>1.2706e-03</code>。自举是"加油"，不是"纠错"（本系列第 7 篇）。</li>
+<li><strong>误差随深度增长</strong>：从层 0 的 <code>1.27e-03</code> 到链尾的 <code>2.3e-02</code>，涨了约一个数量级。</li>
+<li><strong>链尾有超阈项</strong>：<code>u27</code> 八项中两项越过 <code>3e-2</code>。我们不调容差把它"变成通过"，而是照实记账。</li>
+</ol>
+<hr>
+<h2 id="5-另外三份账">5. 另外三份账</h2>
+<h3 id="51-位级复现账">5.1 位级复现账</h3>
+<table>
+<thead>
+<tr>
+<th>比对</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>u0</code> × 8 vs 归档</td>
+<td><strong>identical 8 / diff 0</strong></td>
+</tr>
+<tr>
+<td><code>u0r112</code> × 8 vs 归档</td>
+<td><strong>identical 8 / diff 0</strong></td>
+</tr>
+<tr>
+<td><code>lay0.out</code> 日志</td>
+<td>213 / 213 行，差异 4 处<strong>全是耗时行</strong></td>
+</tr>
+<tr>
+<td><code>lay0.err</code> 日志</td>
+<td>1 / 1 行，<strong>完全相同</strong></td>
+</tr>
+<tr>
+<td><code>boot0.out</code> 日志</td>
+<td>19 / 19 行，差异 1 处（profile 总耗时）</td>
+</tr>
+<tr>
+<td><code>boot0.err</code> 日志</td>
+<td>65 / 65 行，62 处差异<strong>全是进度耗时</strong></td>
+</tr>
+</tbody>
+</table>
+<p>（前提：<strong>线程数固定</strong>。）</p>
+<h3 id="52-数据账">5.2 数据账</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自助生成权重 vs 分发物</td>
+<td>各 <strong>9/9 逐字节相同</strong></td>
+</tr>
+<tr>
+<td><code>silu0..25.bin</code>（26 个）</td>
+<td><strong>26/26 逐字节相同</strong></td>
+</tr>
+<tr>
+<td><code>embed4.bin</code> / 参考值 / <code>sk.bin</code></td>
+<td><strong>相同</strong></td>
+</tr>
+<tr>
+<td>归档 manifest 自校验</td>
+<td>主包 <strong>104/104</strong>、链尾 <strong>45/45</strong>、工具包 <strong>6/6</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>这条最重要</strong>：约 7 GB 的数据包不随仓库分发，但<strong>任何人可以用同一个模型把它重新生成出来，且逐字节相同</strong>。</p>
+<h3 id="53-进度账">5.3 进度账</h3>
+<table>
+<thead>
+<tr>
+<th>部分</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>层 0–4（链头）</td>
+<td>✅ 可复现、可独立验证</td>
+</tr>
+<tr>
+<td>层 26–27 + 收尾</td>
+<td>✅ 已跑通并归档</td>
+</tr>
+<tr>
+<td>层 5–25（<strong>21 跳</strong>）</td>
+<td>⏳ 待认领</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="6-安全边界务请读完">6. 安全边界（务请读完）</h2>
+<pre><code>本文所述参数为机制验证级（n=2048、112 素数内层链、2100 素数自举链），
+远低于 HE 参数标准的 128-bit 水平，不得用于保护真实数据。
+本文主张的是：本实现在我们这台机器上的工程量账本。
+本文不主张：安全强度、性能优越性、与任何其他方案的对比。
+</code></pre>
+<p><strong>特别声明</strong>：本文所有耗时都是<strong>我们这份实现、我们这台机器</strong>的数字，<strong>不能</strong>用来推断任何其他系统（包括同态加密推理的商用实现）的性能。按项目纪律，跨轮/跨平台绝对值不可比。</p>
+<hr>
+<h2 id="7-这一篇的未解问题">7. 这一篇的未解问题</h2>
+<ol>
+<li><strong>域变换为什么贵，没有微架构归因</strong>（§3.1 的标注）。这是本项目最该做、收益最大的一块分析。</li>
+<li><strong>没有"最小可用链长"的扫描</strong>。<code>boot</code> 编到 2100、实际用多少、能不能压到 1500——直接决定内存与耗时，却是拍的。</li>
+<li><strong>精度预算没有闭环</strong>。逐层实测 + 逐层定标（第 9 篇），但没有"从 28 层反推每层可用误差"的推导。链尾超阈项是这个问题的一次现形。</li>
+<li><strong>单跳耗时里"内存带宽"的占比未测</strong>。如果瓶颈真是带宽，优化方向应该是减少取数（降链长、减密钥体积），而不是加速计算——但这一点还没被证实。</li>
+</ol>
+<p>下一篇是最后一篇：<strong>未完成清单与已知边界</strong>——把这一路所有"我们知道但没解决"的事一次列清。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-01 09:04">2026-10-01 09:03</span>&nbsp;
+<a href="https://www.cnblogs.com/haliuhome">haliu</a>&nbsp;
+阅读(<span id="post_view_count">55</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23178401);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhaliuhome%2Fp%2F23178401&amp;targetId=23178401&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
