@@ -1,0 +1,458 @@
+
+		<h2>
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/liuziyi1/p/23240850" title="发布于 2026-10-09 17:20">
+    
+
+    <span role="heading" aria-level="2">Linux 性能优化实战：从方法论到 CPU / 内存 / I/O / 网络逐层调优</span>
+    
+
+</a>
+
+		</h2>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>面向有 Linux 使用经验的运维与 DBA。文中命令请在目标环境核实设备名、路径、版本后再执行；涉及内核参数与不可逆操作的步骤，均先说明前提、影响与回退。</p>
+</blockquote>
+<hr>
+<h2 id="一为什么优化常常变成瞎调">一、为什么“优化”常常变成“瞎调”</h2>
+<p>很多性能问题并不是“参数没调好”，而是<strong>一开始就定位错了瓶颈</strong>。典型误判有：</p>
+<ul>
+<li>看到 <code>load average</code> 很高，就认定 CPU 不够——其实大量进程处于 D 状态在等 I/O；</li>
+<li>看到 <code>%util</code> 100%，就认定磁盘打满——在 NVMe/多队列设备上几乎必然如此；</li>
+<li>看到 <code>wa</code>（iowait）下降，就以为 I/O 变好了——可能只是换成了更快的设备；</li>
+<li>把应用问题当成系统问题，或反过来。</li>
+</ul>
+<p>所以性能优化的第一步不是“调参”，而是<strong>用正确的指标把瓶颈层定位准确</strong>，再逐层动手。</p>
+<hr>
+<h2 id="二一句话理解">二、一句话理解</h2>
+<p><strong>性能优化 = 先定位瓶颈层（应用 / 语言框架 / 内核 / 硬件），再在该层做“减少等待、减少拷贝、提高并行度”三件事。</strong></p>
+<p>定位靠的是“从全局到局部、从现象到根因”的工具链；优化靠的是分层框架，而不是盲目堆参数。</p>
+<hr>
+<h2 id="三核心方法论">三、核心方法论</h2>
+<h3 id="31-四层次优化框架">3.1 四层次优化框架</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">层次</th>
+<th style="text-align: left">优化方向</th>
+<th style="text-align: left">常用手段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">第一层：应用层</td>
+<td style="text-align: left">找热点函数、删减逻辑、优化算法</td>
+<td style="text-align: left">火焰图、内存对齐、避免微服务过细</td>
+</tr>
+<tr>
+<td style="text-align: left">第二层：语言与框架</td>
+<td style="text-align: left">选对语言、网络模型、内存分配器</td>
+<td style="text-align: left">C/Rust 做基础软件、Go/Java 做业务；epoll/gnet；tcmalloc/jemalloc</td>
+</tr>
+<tr>
+<td style="text-align: left">第三层：内核</td>
+<td style="text-align: left">减少系统调用、关闭 swap、大页、调度策略</td>
+<td style="text-align: left"><code>taskset</code>、<code>nice</code>、<code>chrt</code>、容器 throttle、离线调度器</td>
+</tr>
+<tr>
+<td style="text-align: left">第四层：硬件</td>
+<td style="text-align: left">主频、缓存、睿频、超线程、硬件卸载</td>
+<td style="text-align: left">选新微架构、SIMD（AVX512）、网卡/存储卸载</td>
+</tr>
+</tbody>
+</table>
+<p><strong>要点</strong>：优化要有先后。应用层的问题，堆再多内核参数也救不回来；反之，应用已经很优，内核层再抠收益也有限。</p>
+<h3 id="32-定位方法先分清负载和利用率">3.2 定位方法：先分清“负载”和“利用率”</h3>
+<ul>
+<li><strong>平均负载</strong>：统计 <strong>R（运行）+ D（不可中断睡眠）</strong> 状态进程数，按指数加权移动平均计算，输出 1/5/15 分钟三个值。多核系统上，<strong>负载值 ÷ 核心数 = 活跃核心比例</strong>。</li>
+<li><strong>关键陷阱</strong>：D 状态进程在等 I/O，不消耗 CPU。所以“负载高”既可能是 CPU 不够，也可能是 I/O 不够。<strong>高负载 + CPU 空闲（id% 高）→ 去查 iowait</strong>。</li>
+<li>负载高不一定有问题，要结合<strong>响应时间</strong>判断。</li>
+</ul>
+<pre><code class="language-bash">uptime                      # 看 1/5/15 分钟平均负载
+nproc                       # 核对核心数，算活跃核心比例
+</code></pre>
+<h3 id="33-标准分析流程">3.3 标准分析流程</h3>
+<pre><code>1) 全局体检：uptime / dmesg / vmstat 1 5 / mpstat -P ALL 1
+2) 判定瓶颈层：
+   - us 高 → CPU（应用/系统调用）
+   - sy 高 → 内核（系统调用、中断、锁）
+   - wa 高 + 磁盘忙 → I/O
+   - 内存 free 低 + swap 活跃 → 内存
+   - si/so 高 → swap 换入换出
+3) 下钻到进程/线程：top -H / pidstat / iotop
+4) 下钻到函数/调用栈：perf / 火焰图 / strace
+5) 定位根因 → 在该层优化 → 复测验证
+</code></pre>
+<hr>
+<h2 id="四性能分析工具总览">四、性能分析工具总览</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">维度</th>
+<th style="text-align: left">工具</th>
+<th style="text-align: left">用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">CPU</td>
+<td style="text-align: left"><code>top</code>、<code>mpstat</code>、<code>pidstat</code>、<code>perf</code></td>
+<td style="text-align: left">全局/单核/进程/函数级 CPU</td>
+</tr>
+<tr>
+<td style="text-align: left">内存</td>
+<td style="text-align: left"><code>free</code>、<code>vmstat</code>、<code>/proc/meminfo</code>、<code>/proc/zoneinfo</code></td>
+<td style="text-align: left">内存、swap、水位线</td>
+</tr>
+<tr>
+<td style="text-align: left">I/O</td>
+<td style="text-align: left"><code>iostat</code>、<code>iotop</code>、<code>sar -d</code>、<code>strace</code>、<code>lsof</code></td>
+<td style="text-align: left">设备/进程/系统调用级 I/O</td>
+</tr>
+<tr>
+<td style="text-align: left">网络</td>
+<td style="text-align: left"><code>ss</code>、<code>netstat</code>、<code>sar -n DEV</code>、<code>tcpdump</code>、<code>ethtool</code></td>
+<td style="text-align: left">连接、流量、丢包、网卡状态</td>
+</tr>
+<tr>
+<td style="text-align: left">综合</td>
+<td style="text-align: left"><code>sar</code>、<code>vmstat</code></td>
+<td style="text-align: left">历史与实时全维度</td>
+</tr>
+<tr>
+<td style="text-align: left">轻量采集</td>
+<td style="text-align: left">IBM <code>nmon</code> + <code>nmonanalyser</code>、<code>collectl</code>+Graphite、Oracle <code>OSWatcher(OSW)</code></td>
+<td style="text-align: left">长期趋势留档</td>
+</tr>
+<tr>
+<td style="text-align: left">追踪</td>
+<td style="text-align: left"><code>perf</code>、<code>ftrace</code>、eBPF（<code>bpftrace</code>/BCC）</td>
+<td style="text-align: left">内核与应用动态追踪</td>
+</tr>
+</tbody>
+</table>
+<p><strong>建议</strong>：生产环境常驻一个轻量采集器（如 OSWatcher/nmon）保留历史数据，故障复盘时才有“案发现场”。</p>
+<hr>
+<h2 id="五cpu-优化">五、CPU 优化</h2>
+<h3 id="51-定位">5.1 定位</h3>
+<pre><code class="language-bash"># 全局与每核
+top -1                       # 看 us/sy/wa/id 分布，按 1 展开每核
+mpstat -P ALL 1 5            # 每核使用率，识别单核打满/负载不均
+uptime; nproc
+
+# 进程/线程级
+pidstat -u 1 5               # 按进程看 CPU
+top -H -p &lt;pid&gt;              # 看进程内线程
+</code></pre>
+<p>判读：</p>
+<ul>
+<li><strong>us 高</strong> → 应用自身逻辑/算法/内存分配；</li>
+<li><strong>sy 高</strong> → 系统调用、上下文切换、中断、锁争用；</li>
+<li><strong>单核打满、其他核空闲</strong> → 并行度不足或中断/软中断集中。</li>
+</ul>
+<h3 id="52-下钻到函数perf--火焰图">5.2 下钻到函数：perf + 火焰图</h3>
+<pre><code class="language-bash"># 采样（交互分析用 -F 99，高精度定位用 -F 999，但必须检查 Lost 计数）
+perf record -F 99 -g -p &lt;pid&gt; sleep 30
+perf report                  # 交互查看热点函数与调用链
+
+# 生成火焰图
+perf script | stackcollapse-perf.pl | flamegraph.pl &gt; cpu.svg
+</code></pre>
+<p><strong>火焰图读法</strong>：</p>
+<ul>
+<li>从<strong>顶部</strong>开始找<strong>宽度最大</strong>的函数——那是 CPU 时间的主要消耗者；</li>
+<li>区分<strong>自身消耗</strong>与<strong>子函数调用消耗</strong>：宽度大但由子函数撑起来的，不是优化重点；顶部自身消耗大的才是目标。</li>
+</ul>
+<p><strong>示例（来自知识库案例）</strong>：某应用 us 达 80%，<code>perf record -g -a sleep 5</code> 后 <code>perf report</code> 显示 <code>__libc_malloc</code> 与某业务函数占比最高，展开调用链确认该函数频繁分配内存；引入内存池后 us 降到约 50%。（示例数据用于说明方法，实际收益以现场复测为准。）</p>
+<h3 id="53-优化手段与命令">5.3 优化手段与命令</h3>
+<pre><code class="language-bash"># 1) 调整调度优先级（对 CPU 密集、需优先调度的进程）
+nice -n -5 &lt;cmd&gt;                       # 提高优先级（普通用户只能调低）
+renice -n 10 -p &lt;pid&gt;
+chrt -f 50 &lt;cmd&gt;                       # 实时调度策略（谨慎，可能饿死其他进程）
+
+# 2) 绑定 CPU（减少跨核迁移、cache 失效）
+taskset -c 0-3 &lt;cmd&gt;
+taskset -cp 0-3 &lt;pid&gt;
+
+# 3) 中断/软中断亲和性（网络高 PPS 场景）
+cat /proc/interrupts                   # 看中断在各核分布
+# 将网卡中断绑定到固定核，避免与业务争抢
+
+# 4) 频率与电源策略
+cpupower frequency-info
+cpupower frequency-set -g performance  # 设为性能模式（关闭节能降频）
+
+# 5) 内核态占用高时，用 perf 看系统调用/上下文切换
+perf stat -e context-switches,cpu-migrations,page-faults -p &lt;pid&gt; sleep 5
+</code></pre>
+<h3 id="54-硬件层方向">5.4 硬件层方向</h3>
+<ul>
+<li>同代 CPU <strong>主频越高越好</strong>，开启<strong>睿频</strong>自动升频；</li>
+<li>新微架构提升 <strong>IPC</strong>（每时钟指令数）；</li>
+<li>核数适合<strong>并行任务</strong>；服务器选“单核强”还是“核多”，取决于<strong>应用并行度</strong>；</li>
+<li>向量计算用 <strong>SIMD（AVX512）</strong> 加速。</li>
+</ul>
+<h3 id="55-注意事项">5.5 注意事项</h3>
+<ul>
+<li><code>chrt</code> 实时调度可能饿死其他进程，生产慎用；</li>
+<li><code>taskset</code> 绑定不当反而破坏负载均衡；</li>
+<li><strong>关闭超线程</strong>要按应用类型评估，不总是收益；</li>
+<li>高 CPU 利用率场景下，<code>wake_affine</code> 可能失效（离线混部尤甚），进程迁移开销增加、吞吐不随 CPU 线性增长——需结合 <code>perf</code> 观察 <code>context-switches</code>。</li>
+</ul>
+<hr>
+<h2 id="六内存优化">六、内存优化</h2>
+<h3 id="61-定位">6.1 定位</h3>
+<pre><code class="language-bash">free -m                      # 总/已用/空闲/buffers/cached，以及 swap
+vmstat 1 5                   # si/so（swap 换入换出）、si/so 高说明内存紧张
+cat /proc/meminfo            # MemAvailable、Dirty、Writeback 等
+cat /proc/zoneinfo           # 各 zone 水位线，判断是否水位过高
+cat /proc/pressure/memory    # PSI：内存 stall 真实程度（较新内核）
+</code></pre>
+<p>判读：</p>
+<ul>
+<li><strong>物理内存接近用满 + swap 使用极少</strong>：不一定是问题（页缓存可回收）；</li>
+<li><strong>si/so 持续非零</strong>：内存真的紧张，性能会因换页显著下降；</li>
+<li><code>MemAvailable</code> 才是判断“可用”的关键，不要只看 <code>MemFree</code>。</li>
+</ul>
+<h3 id="62-优化手段与命令">6.2 优化手段与命令</h3>
+<pre><code class="language-bash"># 1) 调整 swap 倾向（数据库/内存敏感服务常设较小值）
+sysctl vm.swappiness
+sysctl -w vm.swappiness=10
+echo 'vm.swappiness=10' &gt;&gt; /etc/sysctl.conf
+
+# 2) 脏页回写控制（降低突发的写回抖动）
+sysctl vm.dirty_ratio vm.dirty_background_ratio vm.dirty_expire_centisecs
+
+# 3) 透明大页（THP）——数据库场景通常建议按需评估
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# 评估后再决定是否设为 madvise 或 never
+
+# 4) OOM 保护（避免关键进程被杀）
+cat /proc/&lt;pid&gt;/oom_score_adj
+echo -1000 &gt; /proc/&lt;pid&gt;/oom_score_adj   # -1000 尽量不被 OOM 选中
+
+# 5) cgroup 限制（容器/多租户）
+# 通过 memory.max / memory.limit_in_bytes 限制内存上限
+</code></pre>
+<h3 id="63-numa-优化">6.3 NUMA 优化</h3>
+<pre><code class="language-bash">numactl --hardware           # 看 NUMA 节点与内存分布
+numactl --cpunodebind=0 --membind=0 &lt;cmd&gt;   # 绑核绑内存，避免跨节点访问
+numastat -p &lt;pid&gt;            # 看进程内存跨节点分布
+</code></pre>
+<p>跨节点访问内存延迟明显更高，内存密集型应用应尽量本地分配。</p>
+<h3 id="64-注意事项">6.4 注意事项</h3>
+<ul>
+<li><strong>不要盲目关闭 swap</strong>：极端内存压力下没有 swap 会直接 OOM；</li>
+<li>调整 <code>swappiness</code> 需结合工作负载，数据库与桌面场景差异很大；</li>
+<li>大页开启后要评估是否<strong>固定内存、影响内存弹性</strong>；</li>
+<li>内存“看起来用满”不等于有问题，要结合 <code>MemAvailable</code>、<code>si/so</code>、PSI 综合判断。</li>
+</ul>
+<hr>
+<h2 id="七磁盘-io-优化">七、磁盘 I/O 优化</h2>
+<h3 id="71-定位">7.1 定位</h3>
+<pre><code class="language-bash">iostat -xz 1 5               # -x 扩展，-z 隐藏空闲设备
+# 关键列：r_await/w_await（平均延迟）、aqu-sz（队列深度）、%util、r/s w/s
+iotop -o -d 1                # 按进程看谁在读写（-o 只显示有 I/O 的）
+sar -d 1 5                   # 历史/实时设备 I/O
+pidstat -d 1 5               # 进程级 I/O
+</code></pre>
+<p><strong>重要判读</strong>：</p>
+<ul>
+<li><code>%util</code> 在 <strong>RHEL9/NVMe/多队列</strong>设备上，IOPS ≥1000 时几乎必然接近 100%，<strong>不能用它做绝对阈值</strong>；</li>
+<li>判断饱和应改用 <strong><code>await</code>（延迟）+ <code>aqu-sz</code>（队列深度）+ PSI <code>io.full</code> 增量</strong>。</li>
+</ul>
+<h3 id="72-下钻到系统调用">7.2 下钻到系统调用</h3>
+<pre><code class="language-bash">strace -T -tt -p &lt;pid&gt;       # -T 显示每个系统调用耗时
+lsof -p &lt;pid&gt;                # 看进程打开的文件
+</code></pre>
+<p><strong>示例（来自知识库案例）</strong>：某应用 I/O 延迟高，<code>iostat</code> 确认存在 I/O 瓶颈后，用 <code>strace</code> 与 <code>lsof</code> 定位到应用正在疯狂写调试日志，调回日志级别即解决。（示例用于说明方法。）</p>
+<h3 id="73-优化手段与命令">7.3 优化手段与命令</h3>
+<pre><code class="language-bash"># 1) 选择 I/O 调度器（按设备类型）
+cat /sys/block/&lt;dev&gt;/queue/scheduler
+# NVMe/SSD 常用 none(mq-deadline)；HDD 可用 bfq/mq-deadline
+echo mq-deadline &gt; /sys/block/&lt;dev&gt;/queue/scheduler
+
+# 2) 预读调整
+cat /sys/block/&lt;dev&gt;/queue/read_ahead_kb
+echo 4096 &gt; /sys/block/&lt;dev&gt;/queue/read_ahead_kb
+
+# 3) 挂载选项（减少元数据写）
+# noatime：不记录访问时间；data=writeback 等按场景评估
+mount -o remount,noatime /&lt;mp&gt;
+
+# 4) 文件系统与块大小
+# XFS 适合大文件高并发；ext4 通用；按业务选择块大小与 inode 数量
+</code></pre>
+<h3 id="74-压测与验证">7.4 压测与验证</h3>
+<pre><code class="language-bash"># fio 做定向压测（示例参数，按目标调整）
+fio --name=randread --ioengine=libaio --direct=1 --rw=randread \
+    --bs=8k --iodepth=32 --numjobs=4 --size=4G --runtime=60 \
+    --group_reporting --filename=/dev/&lt;dev&gt;
+</code></pre>
+<h3 id="75-注意事项">7.5 注意事项</h3>
+<ul>
+<li><strong>严重缺页中断（major faults）</strong> 也会表现为磁盘 I/O 延迟：内存不足频繁 swap、或首次访问大 mmap 区域时，<code>perf stat</code> 的 <code>major-faults</code> 会升高。此时要解决的是内存，不是磁盘。</li>
+<li>用 <code>dd</code> 做磁盘基准要谨慎，<code>oflag=direct</code> 才绕过缓存；</li>
+<li>改调度器/预读后务必<strong>复测</strong>，不同设备最优值差异很大。</li>
+</ul>
+<hr>
+<h2 id="八网络优化">八、网络优化</h2>
+<h3 id="81-定位">8.1 定位</h3>
+<pre><code class="language-bash">ss -s                        # 连接统计（比 netstat 更快）
+ss -antp                     # 连接详情
+sar -n DEV 1 5               # 网卡收发包、字节、丢包
+sar -n TCP,ETCP 1 5          # TCP 重传、错误
+ethtool -S &lt;nic&gt;             # 网卡硬件计数（drop/error）
+cat /proc/net/dev            # 接口统计原始数据
+cat /proc/net/softnet_stat   # 软中断/backlog 丢包
+</code></pre>
+<p>判读：</p>
+<ul>
+<li><strong>丢包</strong>通常意味着网络拥塞和重传，会放大延迟、降低吞吐；</li>
+<li>区分是<strong>网卡驱动丢包</strong>（<code>ethtool -S</code> 有 error/drop）还是<strong>内核协议栈丢包</strong>（<code>softnet_stat</code> 的 dropped）；</li>
+<li>高并发下内核线程 <strong><code>ksoftirqd</code> CPU 高</strong>，通常是网络收发软中断导致。</li>
+</ul>
+<h3 id="82-下钻">8.2 下钻</h3>
+<pre><code class="language-bash"># 软中断/内核线程 CPU 高时
+sar -n DEV 1 5               # 看流量是否异常
+tcpdump -i &lt;nic&gt; -nn ...     # 抓包确认协议行为
+# 或用 eBPF（bpftrace/BCC）直接追踪内核函数，比 sar+tcpdump 组合更快定位
+</code></pre>
+<h3 id="83-优化手段与命令">8.3 优化手段与命令</h3>
+<pre><code class="language-bash"># 1) 网卡多队列 + 中断绑定（高 PPS 场景）
+ethtool -l &lt;nic&gt;             # 查看队列数
+ethtool -L &lt;nic&gt; combined &lt;N&gt;
+# 将各队列中断分散绑定到不同核
+
+# 2) RPS/RFS（单队列网卡分摊软中断到多核）
+echo &lt;mask&gt; &gt; /sys/class/net/&lt;nic&gt;/queues/rx-0/rps_cpus
+echo &lt;flow_entries&gt; &gt; /sys/class/net/&lt;nic&gt;/queues/rx-0/rps_flow_cnt
+
+# 3) 协议栈与队列参数（按场景评估）
+sysctl net.core.somaxconn
+sysctl net.core.netdev_max_backlog
+sysctl net.ipv4.tcp_max_syn_backlog
+sysctl net.ipv4.tcp_tw_reuse
+sysctl net.ipv4.tcp_fin_timeout
+</code></pre>
+<h3 id="84-注意事项">8.4 注意事项</h3>
+<ul>
+<li><strong>RPS 并非总是提升吞吐</strong>：开启后可能因跨核缓存失效反而下降，需实测；</li>
+<li>中断/软中断绑核要避开业务核，否则会与业务争抢；</li>
+<li>调 TCP 参数前先确认瓶颈是<strong>带宽、连接数、还是延迟</strong>，三者调法不同；</li>
+<li>注意 <strong>RHEL7 内核（3.10）</strong> 上高负载读取 <code>/proc/net/sockstat</code> 可能延迟本 CPU 网络软中断，监控脚本应避免高频读取。</li>
+</ul>
+<hr>
+<h2 id="九常见误区与注意事项重点">九、常见误区与注意事项（重点）</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">误区</th>
+<th style="text-align: left">真相</th>
+<th style="text-align: left">正确做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">负载高 = CPU 不够</td>
+<td style="text-align: left">负载含 D 状态，可能在等 I/O</td>
+<td style="text-align: left">结合 iowait / PSI 判断</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>%util</code> 100% = 磁盘打满</td>
+<td style="text-align: left">RHEL9/NVMe 上几乎必然 100%</td>
+<td style="text-align: left">用 <code>await</code>/<code>aqu-sz</code>/PSI io.full</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>wa</code> 下降 = I/O 变好</td>
+<td style="text-align: left">可能只是换了更快的设备</td>
+<td style="text-align: left">看 <code>r_await/w_await</code> 绝对值</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>free</code> 可用内存少 = 内存不足</td>
+<td style="text-align: left">页缓存可回收</td>
+<td style="text-align: left">看 <code>MemAvailable</code> + <code>si/so</code></td>
+</tr>
+<tr>
+<td style="text-align: left">跨版本工具数值应一致</td>
+<td style="text-align: left">不同版本口径/实现不同</td>
+<td style="text-align: left">同版本内比较，或读源码确认</td>
+</tr>
+<tr>
+<td style="text-align: left"><code>%util</code>、<code>wa</code> 可直接设阈值告警</td>
+<td style="text-align: left">与核数/设备强相关</td>
+<td style="text-align: left">用复合判据与增量趋势</td>
+</tr>
+</tbody>
+</table>
+<p><strong>版本差异提醒</strong>（RHEL7/8/9 常见）：</p>
+<ul>
+<li><code>free</code> 与 <code>sar -r</code> 的可用内存：RHEL7 无内核 <code>MemAvailable</code>，两工具回退策略不同，数值对不上是<strong>预期</strong>；</li>
+<li><code>load average</code>：新版内核把 <code>TASK_IDLE</code> 的 kworker 排除出负载，升级后负载“下降”不一定是变好；</li>
+<li><code>%pK</code> 日志显示 <code>(ptrval)</code>：是新内核指针哈希策略，不是权限问题。</li>
+</ul>
+<hr>
+<h2 id="十优化检查清单">十、优化检查清单</h2>
+<p><strong>动手前</strong></p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 明确优化目标（延迟？吞吐？资源占用？），有可量化的基线</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 保留历史监控数据，便于对比</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 确认瓶颈层，不跨层乱调</label></li>
+</ul>
+<p><strong>CPU</strong></p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>us</code> 高 → 火焰图找热点函数，优化算法/内存分配</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>sy</code> 高 → 看系统调用、上下文切换、锁</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 单核瓶颈 → 评估并行度、中断绑核</label></li>
+</ul>
+<p><strong>内存</strong></p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 看 <code>MemAvailable</code>，不只看 <code>MemFree</code></label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>si/so</code> 持续非零 → 内存紧张</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> NUMA 绑定，避免跨节点</label></li>
+</ul>
+<p><strong>I/O</strong></p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 用 <code>await</code>/<code>aqu-sz</code>/PSI 判饱和，不用 <code>%util</code> 阈值</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> <code>iotop</code>/<code>strace</code> 定位高 I/O 进程与文件</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 调度器、预读、挂载选项按设备实测</label></li>
+</ul>
+<p><strong>网络</strong></p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 区分网卡丢包与协议栈丢包</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 软中断集中时评估多队列/RPS/RFS</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> TCP 参数按瓶颈类型调整</label></li>
+</ul>
+<p><strong>收尾</strong></p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 每次只改一项，改后复测</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 记录变更与回退方案</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 关注副作用（实时调度、绑核、关 swap 的风险）</label></li>
+</ul>
+<hr>
+<h2 id="十一小结">十一、小结</h2>
+<ol>
+<li><strong>先定位，后优化</strong>：用“负载 vs 利用率、延迟 vs 吞吐、设备 vs 进程 vs 调用栈”三层下钻，把瓶颈层找准。</li>
+<li><strong>按四层框架动手</strong>：应用 → 语言框架 → 内核 → 硬件，逐层收益递减，别本末倒置。</li>
+<li><strong>警惕指标陷阱</strong>：<code>%util</code>、<code>wa</code>、<code>load</code>、<code>free</code> 都有各自的适用边界与版本差异，复合判据 + 增量趋势比单一阈值可靠。</li>
+<li><strong>小步验证</strong>：每次只改一项，改后复测，保留回退。</li>
+</ol>
+<p>性能优化不是一次性的“调参”，而是一套<strong>可复现的定位—优化—验证闭环</strong>。工具会随内核版本演进，但“从全局到局部、从现象到根因”的方法论始终适用。</p>
+<hr>
+
+
+</div>
+<div class="clear"></div>
+
+		<p class="postfoot">
+			posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-09 17:21">2026-10-09 17:20</span>&nbsp;
+<a href="https://www.cnblogs.com/liuziyi1">刘子毅</a>&nbsp;
+阅读(<span id="post_view_count">98</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23240850);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fliuziyi1%2Fp%2F23240850&amp;targetId=23240850&amp;targetType=0" target="_blank">举报</a>
+
+		</p>
+	
