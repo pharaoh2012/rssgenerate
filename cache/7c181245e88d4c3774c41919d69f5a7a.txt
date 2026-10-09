@@ -1,0 +1,220 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shenchuanchao/p/23212943/blazor-jwt-expired-user-kicked-during-order" title="发布于 2026-10-09 08:14">
+    
+
+    <span role="heading" aria-level="2">Blazor 里 JWT 过期，用户正下单就被踢</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        用户下单时因JWT过期被踢回登录页，表单数据丢失。文章解析Blazor Server与WebAssembly中令牌存储与刷新的差异，提出通过DelegatingHandler拦截401、自动刷新令牌并重放请求的方案，实现无感续期。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p>大家好，我是码农刚子。</p>
+<blockquote>
+<p>用户在页面里填了一整页表单，点了提交——啪，跳回登录页。JWT 过期了，刷新令牌没接上，所有数据白填。这篇文章讲 Blazor 里怎么正确实现 JWT 刷新令牌，让用户无感续期。</p>
+</blockquote>
+<p>先说为什么 Blazor 里这个问题特别恶心。</p>
+<p>在普通 SPA（React/Vue）里，JWT 存在 localStorage，请求拦截器统一加 header，401 时自动刷新——一套 Axios 拦截器搞定。但 Blazor 不一样：<strong>Blazor Server 跑在服务端，Blazor WebAssembly 跑在浏览器里</strong>，两种模式下 token 的存储位置、刷新时机、信号传递方式完全不同。</p>
+<p>而且 Blazor 的组件状态是活的——用户在页面上操作时，组件不会重新渲染，你没法靠"页面刷新"来触发重新认证。<strong>必须在 HTTP 层静默处理</strong>。</p>
+<h2 id="jwt">01 为什么 JWT 过期会"踢人"</h2>
+<p>JWT 有过期时间（exp claim）。过期后，API 服务器验证失败返回 401。如果你的应用不做刷新，401 的处理就是跳登录页。</p>
+<p>问题是——<strong>JWT 的过期时间通常很短</strong>（15-30 分钟），这是安全设计。长过期时间 = token 被盗后攻击窗口大。所以业界做法是<strong>短 access token + 长 refresh token</strong>：</p>
+<pre><code>Access Token  — 15-30 分钟过期，放 Authorization header
+Refresh Token — 7-30 天过期，存安全位置（httpOnly cookie / protected storage）
+                    ↓ access token 过期时，用 refresh token 换新的
+</code></pre>
+<p>用户无感续期的流程是：</p>
+<p>① 请求 API → 带 access token ② API 返回 401 → access token 过期了 ③ 拦截 401 → 用 refresh token 调 /refresh 端点换新 access token ④ 拿到新 token → 重放原始请求 ⑤ 用户完全无感，表单数据不丢</p>
+<p><strong>坑在哪</strong>？Blazor 的 HttpClient 不是浏览器 fetch，不能简单套 Axios 那套。Blazor Server 的 HttpClient 是 HttpClientFactory 创建的，Blazor WebAssembly 的 HttpClient 是 WASM runtime 里的——<strong>两者拦截 401 的方式完全不同</strong>。</p>
+<h2 id="blazor-serverdelegatinghandler">02 Blazor Server：DelegatingHandler 拦截</h2>
+<p>Blazor Server 跑在服务端，HttpClient 可以套 DelegatingHandler——这是 .NET 原生的 HTTP 管道机制，所有请求经过 handler 链。</p>
+<p>核心思路：自定义一个 <code>AuthTokenHandler</code>，在 SendAsync 里自动加 token，401 时自动刷新。</p>
+<pre><code class="language-csharp">public class AuthTokenHandler : DelegatingHandler
+{
+    private readonly TokenService _tokenService;
+
+    public AuthTokenHandler(TokenService tokenService)
+    {
+        _tokenService = tokenService;
+    }
+
+    protected override async Task&lt;HttpResponseMessage&gt; SendAsync(
+        HttpRequestMessage request, CancellationToken ct)
+    {
+        // 1. 加 access token
+        var token = await _tokenService.GetAccessTokenAsync();
+        if (!string.IsNullOrEmpty(token))
+            request.Headers.Authorization =
+                new AuthenticationHeaderValue("Bearer", token);
+
+        // 2. 发请求
+        var response = await base.SendAsync(request, ct);
+
+        // 3. 401 → 尝试刷新
+        if (response.StatusCode == HttpStatusCode.Unauthorized)
+        {
+            var refreshed = await _tokenService
+                .TryRefreshTokenAsync();
+            if (refreshed)
+            {
+                // 4. 重放原始请求
+                var newToken = await _tokenService
+                    .GetAccessTokenAsync();
+                request.Headers.Authorization =
+                    new AuthenticationHeaderValue(
+                        "Bearer", newToken);
+
+                // 注意：HttpClient 会缓存请求，
+                // 需要克隆一份再发
+                response.Dispose();
+                var retry = await CloneAndSendAsync(
+                    request, ct);
+                return retry;
+            }
+        }
+
+        return response;
+    }
+
+    private async Task&lt;HttpResponseMessage&gt; CloneAndSendAsync(
+        HttpRequestMessage req, CancellationToken ct)
+    {
+        var clone = new HttpRequestMessage(req.Method, req.RequestUri);
+        // 克隆 content（如果有的话）
+        if (req.Content != null)
+        {
+            var bytes = await req.Content.ReadAsByteArrayAsync(ct);
+            clone.Content = new ByteArrayContent(bytes);
+        }
+        foreach (var h in req.Headers)
+            clone.Headers.TryAddWithoutValidation(
+                h.Key, h.Value);
+
+        return await base.SendAsync(clone, ct);
+    }
+}
+</code></pre>
+<p><strong>关键细节</strong>：</p>
+<p><strong>请求克隆</strong>——HttpRequestMessage 发送后不能复用，必须克隆一份再重发。这是最容易漏的一步，漏了直接报"请求已发送"异常。</p>
+<p><strong>并发刷新锁</strong>——多个请求同时 401 会触发多次刷新，refresh token 可能被消耗多次（如果是一次性 token）。加一个 <code>SemaphoreSlim</code> 保证只刷新一次，其他请求等结果。</p>
+<p><strong>刷新失败处理</strong>——refresh token 也过期了，跳登录页。但 Blazor Server 里不能直接 <code>NavigationManager.NavigateTo("/login")</code>（那是客户端导航），需要通过 JS Interop 调 <code>location.href</code> 做整页跳转。</p>
+<pre><code class="language-csharp">// TokenService 里的并发刷新
+private static readonly SemaphoreSlim _refreshLock = new(1, 1);
+
+public async Task&lt;bool&gt; TryRefreshTokenAsync()
+{
+    await _refreshLock.WaitAsync();
+    try
+    {
+        // 双重检查：也许别的线程刚刷过
+        if (IsAccessTokenValid())
+            return true;
+
+        var refreshReq = new { RefreshToken = _refreshToken };
+        var resp = await _httpClient.PostAsJsonAsync(
+            "/api/auth/refresh", refreshReq);
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            // refresh token 也过期 → 强制登出
+            await _jsRuntime.InvokeVoidAsync(
+                "location.replace", "/login?expired=1");
+            return false;
+        }
+
+        var tokens = await resp.Content
+            .ReadFromJsonAsync&lt;TokenResponse&gt;();
+        _accessToken = tokens.AccessToken;
+        _refreshToken = tokens.RefreshToken;
+        return true;
+    }
+    finally
+    {
+        _refreshLock.Release();
+    }
+}
+</code></pre>
+<h2 id="blazor-webassembly-httpmessagehandler">03 Blazor WebAssembly：自定义 HttpMessageHandler</h2>
+<p>WASM 模式下思路一样，但实现有区别——<strong>token 存在浏览器里</strong>，而且没有 <code>SemaphoreSlim</code> 的跨组件同步问题（因为 WASM 是单线程的）。</p>
+<p>存储选择：</p>
+<pre><code class="language-csharp">// Program.cs — 注册带 token 拦截的 HttpClient
+builder.Services.AddScoped&lt;AuthTokenHandler&gt;();
+builder.Services.AddScoped(sp =&gt;
+{
+    var handler = sp.GetRequiredService&lt;AuthTokenHandler&gt;();
+    handler.InnerHandler = new HttpClientHandler();
+
+    return new HttpClient(handler)
+    {
+        BaseAddress = new Uri(builder.HostEnvironment.BaseAddress)
+    };
+});
+
+// Token 存 protected localStorage
+// （Blazor WASM 的 ProtectedLocalStorage 在 Server 端，
+//   WASM 用 IJSRuntime 直接调 localStorage API）
+builder.Services.AddSingleton&lt;ITokenStorage,
+    LocalTokenStorage&gt;();
+</code></pre>
+<p>WASM 里的 handler 和 Server 版几乎一样，区别在<strong>刷新失败时的跳转</strong>——WASM 可以直接用 <code>NavigationManager</code> 做客户端导航，不需要 JS Interop。</p>
+<p><strong>WASM 专属坑</strong>：localStorage 是异步的，但 <code>DelegatingHandler.SendAsync</code> 也是异步的，没问题。但如果你在 <code>OnInitializedAsync</code> 里调 API，刷新 + 重放的延迟会导致组件渲染两次——<strong>务必在组件里处理 Loading 状态</strong>，否则用户会看到一闪而过的错误。</p>
+<h2 id="section">04 两种模式都要注意的三件事</h2>
+<h3 id="refresh-token">① refresh token 的存储位置</h3>
+<p>Blazor Server：存在服务端内存 / Session / Redis。别存 cookie——Blazor Server 用 SignalR 连接，cookie 跟着连接走，断线重连会丢。</p>
+<p>Blazor WASM：存 localStorage。XSS 风险？WASM 默认不做 <code>dangerouslySetInnerHTML</code>，XSS 攻击面比传统 SPA 小。但如果你的 WASM 应用加载了第三方 JS 模块，仍有风险。<strong>折中方案</strong>：access token 存内存，refresh token 存 localStorage，JS 模块拿不到内存里的 access token。</p>
+<h3 id="section-1">② 刷新端点的设计</h3>
+<pre><code>POST /api/auth/refresh
+Body: { "refreshToken": "xxx" }
+Response: {
+    "accessToken": "新 access token",
+    "refreshToken": "新 refresh token"  // 轮换！
+}
+</code></pre>
+<p><strong>refresh token 必须轮换</strong>——每次刷新后旧的失效，返回新的。不轮换 = refresh token 被盗后永久有效。进一步可以加 refresh token rotation + reuse detection：如果检测到旧 token 被使用，说明可能被窃取，立即吊销整个 token 家族。</p>
+<h3 id="section-2">③ 预刷新：别等 401 再刷</h3>
+<p>等 401 再刷的问题是——<strong>那个请求已经失败了</strong>。虽然重放能恢复，但用户可能看到一瞬间的错误状态。更好的做法是<strong>预判过期</strong>：在发请求前检查 access token 的 exp claim，如果快过期了（比如 5 分钟内），先刷新再发请求。</p>
+<pre><code class="language-csharp">// TokenService 里加预判
+public async Task&lt;string&gt; GetAccessTokenAsync()
+{
+    if (_accessToken != null)
+    {
+        var jwt = new JwtSecurityToken(_accessToken);
+        // 过期前 5 分钟刷新
+        if (jwt.ValidTo &gt; DateTime.UtcNow.AddMinutes(5))
+            return _accessToken;
+    }
+
+    // 快过期了 → 主动刷新
+    await TryRefreshTokenAsync();
+    return _accessToken;
+}
+</code></pre>
+<p>这样 <code>AuthTokenHandler</code> 里 <code>GetAccessTokenAsync</code> 自带预判，401 分支只是兜底——正常情况下永远不会走到 401 分支。</p>
+<hr>
+<p>Blazor JWT 刷新令牌，核心就四步： <strong>DelegatingHandler 拦截 → 401 自动刷新 → 请求重放 → 预判过期抢先刷</strong> 用户从头到尾无感，表单数据不丢。</p>
+<hr>
+<p><em>收藏这篇，下次别再让用户填了一半被踢出去。</em> <em>refresh token 接好，用户体验直接上一个台阶。</em></p>
+<p>关注 CSharp精选营，每周二四 get 能直接抄的 C# 实战。</p>
+<p>阅读原文👉：<a href="https://www.coderlog.net/post/blazor-jwt-expired-user-kicked-during-order" rel="noopener nofollow">Blazor 里 JWT 过期，用户正下单就被踢 - 码录集</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-09 08:14">2026-10-09 08:14</span>&nbsp;
+<a href="https://www.cnblogs.com/shenchuanchao">码农刚子</a>&nbsp;
+阅读(<span id="post_view_count">240</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23212943);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshenchuanchao%2Fp%2F23212943%2Fblazor-jwt-expired-user-kicked-during-order&amp;targetId=23212943&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
