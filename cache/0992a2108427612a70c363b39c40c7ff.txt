@@ -1,0 +1,216 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shenchuanchao/p/23212953/two-requests-concurrent-inventory-update-rowversion-rescue" title="发布于 2026-10-10 08:40">
+    
+
+    <span role="heading" aria-level="2">两个请求同时改库存，RowVersion 救了一命</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/1466017/202610/1466017-20261007084022145-110938532.png" alt="两个请求同时改库存，RowVersion 救了一命" class="desc_img">
+        两个并发请求同时读取库存并各自扣减，导致超卖——这是经典的丢失更新问题。RowVersion（行版本）通过乐观锁机制解决该问题：EF Core在UPDATE语句的WHERE子句中加入原始RowVersion值，若数据库中的版本已变，则更新影响0行，抛出DbUpdateConcurrencyException，从而阻止静默覆盖。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p>大家好，我是码农刚子。今天聊 EF Core 的并发控制。两个请求同时改同一条记录，没有并发令牌的话，后写的会直接覆盖前写的，数据就错了。</p>
+<hr>
+<h2 id="section">先说事情经过</h2>
+<p>秦巴牧云有个饲料库存模块。场长在小程序上领料，每次领料扣减库存。这个逻辑写了快一年，一直没事。</p>
+<p>上个月出事了。</p>
+<p>两个饲养员同时领了同一种饲料。一个领 200 公斤，一个领 150 公斤。当时库存还剩 300 公斤。按道理，第一个人领完剩 100，第二个人应该被告知库存不足。</p>
+<p>但实际上两个请求都成功了。库存变成了 150 公斤。</p>
+<p>不是 100，不是 50，是 150。这意味着第一个人领的 200 公斤被直接覆盖掉了。</p>
+<p>多发了 200 公斤饲料。场长找我的时候脸色不太好看。</p>
+<h2 id="section-1">为什么会这样</h2>
+<p>先看没有并发控制的代码长什么样：</p>
+<p><strong>问题代码：</strong></p>
+<pre><code class="language-csharp">// 领料扣减库存
+public async Task DeductStock(int feedId, int quantity)
+{
+    var feed = await db.FeedStocks
+        .FirstAsync(f =&gt; f.Id == feedId);
+
+    if (feed.Quantity &lt; quantity)
+        throw new InvalidOperationException("库存不足");
+
+    feed.Quantity -= quantity;  // 在内存里改
+    await db.SaveChangesAsync(); // 写回数据库
+}
+</code></pre>
+<p>这段代码在单用户场景下没问题。但两个请求同时进来，就会出事。</p>
+<p>两个请求都读到库存 300，各自在内存里算出结果，然后先后写回。第二个写回的时候，数据库里已经是 100 了，但它不知道，直接用自己算的 150 覆盖掉了。</p>
+<p>这就是经典的**「丢失更新」**问题。EF Core 默认的 SaveChanges 不检测这种情况——它只管把你改的值写进去，不管别人有没有中间改过。</p>
+<pre><code>请求 A（领 200）          请求 B（领 150）
+     │                         │
+  读库存 = 300              读库存 = 300
+     │                         │
+ 300 - 200 = 100           300 - 150 = 150
+     │                         │
+  写回 100 ──────→ DB        │
+     │                   写回 150 ──→ DB 覆盖!
+     │                         │
+     └─────────────────────────┘
+              最终库存 = 150
+     应该剩 50，实际剩 150 → 多发了 200
+
+问题：两个请求都读到了 300，各自减各自的，后写的覆盖前写的
+EF Core 默认是「最后一个赢」(Last-Write-Wins) 策略
+解法：加 RowVersion 并发令牌
+</code></pre>
+<h2 id="rowversion">RowVersion 怎么救的</h2>
+<p>EF Core 的并发令牌机制是这样的：你给实体加一个 <code>RowVersion</code> 字段，类型是 <code>byte[]</code>。每次 UPDATE 时，EF Core 会自动把这个字段加到 WHERE 条件里，同时把它更新成新值。</p>
+<p>如果在你读和写之间，别人已经改过这条记录，那 RowVersion 就变了，你的 WHERE 条件匹配不到行，UPDATE 返回 0 行。EF Core 发现 affected rows = 0，就抛 <code>DbUpdateConcurrencyException</code>。</p>
+<p><strong>改造后：</strong></p>
+<pre><code class="language-csharp">// 实体类：加 RowVersion 并发令牌
+public class FeedStock
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public int Quantity { get; set; }
+
+    // 并发令牌：数据库自动维护的版本号
+    public byte[] RowVersion { get; set; }
+}
+
+// EF Core 配置
+modelBuilder.Entity&lt;FeedStock&gt;()
+    .Property(f =&gt; f.RowVersion)
+    .IsRowVersion();  // 标记为并发令牌
+
+// 领料逻辑（带并发冲突处理）
+public async Task&lt;bool&gt; DeductStock(int feedId, int quantity)
+{
+    try
+    {
+        var feed = await db.FeedStocks
+            .FirstAsync(f =&gt; f.Id == feedId);
+
+        if (feed.Quantity &lt; quantity)
+            throw new InvalidOperationException("库存不足");
+
+        feed.Quantity -= quantity;
+        await db.SaveChangesAsync();
+        return true;
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        // 有人抢先改了这条记录
+        // 重新读取，重试
+        db.ChangeTracker.Clear();
+        return await DeductStock(feedId, quantity);
+    }
+}
+</code></pre>
+<p>加了一个字段、一行配置、一个 catch。三个改动，丢失更新的问题就解决了。</p>
+<p>SQL 层面，EF Core 生成的 UPDATE 变成了这样：</p>
+<pre><code class="language-sql">-- 没有 RowVersion 的 UPDATE
+UPDATE FeedStocks SET Quantity = 150 WHERE Id = 1;
+-- 不管别人改没改过，直接覆盖
+
+-- 有 RowVersion 的 UPDATE
+UPDATE FeedStocks
+SET Quantity = 150,
+    RowVersion = @newVersion        -- 更新版本号
+WHERE Id = 1
+  AND RowVersion = @oldVersion;     -- 检查版本号有没有变
+-- 如果别人改过，RowVersion 对不上，0 行受影响 → 抛异常
+</code></pre>
+<p><strong>关键在于 WHERE 条件多了一个 RowVersion 检查。</strong> 你读出来时 RowVersion 是 A，写回去时检查还是不是 A。如果中间有人改过，版本号变成 B 了，你的 A 匹配不上，更新就失败了。</p>
+<h2 id="section-2">数据库层面怎么配</h2>
+<p>EF Core 的 <code>IsRowVersion()</code> 会映射为数据库的 <code>rowversion</code>（SQL Server）或 <code>xmin</code>（PostgreSQL）类型。数据库引擎自己维护这个字段，每次 INSERT/UPDATE 自动更新。你不用管它。</p>
+<p>秦巴牧云用的是 PostgreSQL。PostgreSQL 没有原生的 rowversion 类型，但有 <code>xmin</code> 系统列，每行都有一个隐藏的事务 ID。EF Core PostgreSQL 驱动（Npgsql）会用 <code>xmin</code> 作为并发令牌。</p>
+<p>SQL Server 就更直接了，<code>rowversion</code>（旧名 <code>timestamp</code>）是内置类型，数据库自动维护，零配置。</p>
+<h2 id="section-3">捕获异常之后怎么处理</h2>
+<p>抛了 <code>DbUpdateConcurrencyException</code> 之后怎么办？有三种策略：</p>
+<table>
+<thead>
+<tr><th>策略</th><th>做法</th><th>适用场景</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>重试</strong></td>
+<td>清空 ChangeTracker，重新读、重新算、重新写</td>
+<td>并发量不高，冲突偶发</td>
+</tr>
+<tr>
+<td><strong>报错</strong></td>
+<td>直接返回「数据已被修改，请刷新后重试」</td>
+<td>表单提交、编辑冲突</td>
+</tr>
+<tr>
+<td><strong>合并</strong></td>
+<td>读最新值，和你的修改做字段级合并</td>
+<td>多字段编辑，不同字段改动不冲突</td>
+</tr>
+</tbody>
+</table>
+<p>秦巴牧云的库存扣减用的是重试。因为领料操作本身是幂等的——重新读一次库存，重新判断够不够，重新扣减，结果一样。但要加重试次数限制，不然两个请求互相重试就死循环了：</p>
+<pre><code class="language-csharp">public async Task&lt;bool&gt; DeductStock(
+    int feedId, int quantity, int retry = 0)
+{
+    if (retry &gt;= 3)
+        throw new InvalidOperationException(
+            "库存变动频繁，请稍后重试");
+
+    try
+    {
+        var feed = await db.FeedStocks
+            .FirstAsync(f =&gt; f.Id == feedId);
+
+        if (feed.Quantity &lt; quantity)
+            throw new InvalidOperationException("库存不足");
+
+        feed.Quantity -= quantity;
+        await db.SaveChangesAsync();
+        return true;
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        db.ChangeTracker.Clear();
+        return await DeductStock(feedId, quantity, retry + 1);
+    }
+}
+</code></pre>
+<p>三次重试还冲突，就告诉用户「库存变动频繁」。这比无限重试靠谱，也比直接报错友好。</p>
+<h2 id="section-4">几个容易踩的坑</h2>
+<p><strong>坑一：别忘了 ChangeTracker.Clear()。</strong> 重试时如果不清空 ChangeTracker，旧的实体还在追踪里。你重新查出来的实体和旧的那个冲突，EF Core 会报「同一实体被两个实例追踪」的错。</p>
+<p><strong>坑二：RowVersion 字段不要手动赋值。</strong> 它是数据库维护的，你赋了反而会导致并发检查失效。EF Core 在 SaveChanges 时会自动把读出来的原值放进 WHERE 条件，你不用管。</p>
+<p><strong>坑三：重试不是万能的。</strong> 如果你的操作不是幂等的（比如「加 100」而不是「设为 X」），重试时必须重新读取最新值再算，不能拿着旧的中间结果直接重试。否则你加的就是两次 100。</p>
+<p><strong>坑四：大数据量表要加索引。</strong> RowVersion 检查走的是 <code>WHERE Id = 1 AND RowVersion = @x</code>。Id 是主键有索引，没问题。但如果你用的是非主键的并发令牌（比如用 Name 做令牌），就得确保 Name 上有索引。</p>
+<h2 id="section-5">这件事教给我的</h2>
+<p><strong>并发问题不是「会不会发生」的问题，是「什么时候发生」的问题。</strong> 一年的代码不出事，不代表逻辑是对的。只是并发量没到那个临界点。两个饲养员同时领料，在业务上完全合理——它迟早会发生。</p>
+<p><strong>EF Core 的 SaveChanges 不是原子的。</strong> 它保证了「你改的这些字段会被一起写进去」，但不保证「你读到的数据在写的时候还是那个值」。并发控制得你自己加——EF Core 给了工具（RowVersion、ConcurrencyToken），但不会自动帮你用。</p>
+<p><strong>乐观锁比悲观锁更适合 Web 场景。</strong> 悲观锁（<code>SELECT ... FOR UPDATE</code>）在数据库层面锁行，连接占用时间长，Web 高并发下容易连接池耗尽。乐观锁（RowVersion）不锁行，只在写的时候检测一下版本，冲突了重试就行。</p>
+<hr>
+<h2 id="section-6">最后</h2>
+<p>多发了 200 公斤饲料之后，我花了半天加上 RowVersion 和重试逻辑。代码改动不大，一个字段、一行配置、一个 catch。但如果不加，下一次出事就不是 200 公斤饲料的问题了。</p>
+<blockquote>
+<p><strong>一句话总结</strong>：EF Core 默认 Last-Write-Wins，并发写同一条记录会丢更新。加 <code>RowVersion</code> 并发令牌，WHERE 条件多一个版本检查，冲突抛 <code>DbUpdateConcurrencyException</code>，catch 住重试。</p>
+</blockquote>
+<p>这条你之前用过吗？评论区说说你的场景。</p>
+<p>转发给还在用 EF Core 裸 SaveChanges 的同事，少走我们趟过的弯路。</p>
+<p>关注 CSharp精选营，每周二四 get 能直接抄的 C# 实战。</p>
+<p>下一篇聊：新项目选 Blazor 还是 Razor Pages？我交了学费。</p>
+<hr>
+<p><strong>关于作者</strong></p>
+<p>码农刚子，六年 ERP / 制造业系统开发，专注 C# / .NET / Blazor。</p>
+<p>博客：https://www.coderlog.net/&nbsp; &nbsp; 公众号：CSharp精选营</p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-10 08:40">2026-10-10 08:40</span>&nbsp;
+<a href="https://www.cnblogs.com/shenchuanchao">码农刚子</a>&nbsp;
+阅读(<span id="post_view_count">153</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23212953);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshenchuanchao%2Fp%2F23212953%2Ftwo-requests-concurrent-inventory-update-rowversion-rescue&amp;targetId=23212953&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
