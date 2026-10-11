@@ -1,0 +1,233 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/moonout/p/23260875" title="发布于 2026-10-11 12:42">
+    
+
+    <span role="heading" aria-level="2">LLM | OpenAI 兼容模式 与 Anthropic 协议的区别</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        列举 OpenAI 兼容模式 vs. Anthropic 协议的差异，以及相关踩坑记录。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<br>
+<p>我们在做一套用 Claude Code 自动解 code 题的系统：在一个容器里跑 cc，使用一个外层框架驱动 cc 一轮轮干活。我们想让它除了 Claude 官方模型，也能用第三方托管或自部署的开源模型（比如 GLM、Qwen），结果第一步就卡住了：Claude Code 这个客户端只支持 Anthropic 的 API 协议，而那些模型对外提供的几乎都是"OpenAI 兼容"端点，两边格式对不上，请求没法直接发。</p>
+<p>对于这个问题，有标准的解决办法：在 cc 和模型之间加一个 sidecar 代理（跟主进程跑在同一台机器上、专门做协议翻译的小服务），把 Anthropic 格式的请求翻成 OpenAI 格式再转发。但要把这层翻译接稳，得先搞清楚两套协议到底差在哪。协议只是 HTTP 接口的约定，比如请求打哪个路径、API key 放在哪个请求头里、返回的 JSON 字段叫什么。请求头就是 HTTP 请求里携带元信息的字段，身份凭证、内容格式这类信息都放在这里；这些跟模型本身无关，同一个模型可以同时挂在两套协议下对外。</p>
+<p>这篇文章是一份（经过我们实测的）OpenAI 兼容模式 vs. Anthropic 协议的差异清单，以及相关踩坑记录。</p>
+<h2 id="1-两套协议是什么">1 两套协议是什么</h2>
+<ul>
+<li><strong>Anthropic Messages API</strong>：Anthropic 官方协议，请求路径 <code>POST /v1/messages</code>。</li>
+<li><strong>OpenAI Chat Completions API</strong>（即"OpenAI 兼容模式"）：请求路径 <code>POST /v1/chat/completions</code>。sglang、vLLM 这类推理框架，以及各家的模型托管服务，部署后大多提供这套端点。叫"OpenAI 兼容"是因为它模仿了 OpenAI 的请求/响应格式，跟 OpenAI 自家的模型没有关系。</li>
+<li>另外还有较新的第三套 <strong>OpenAI Responses API</strong>（<code>POST /v1/responses</code>），能直接回传思考内容；本文只在相关的地方顺带提到它。</li>
+</ul>
+<h2 id="2-两套协议的-diff">2 两套协议的 diff</h2>
+<p>逐项列差异之前，先看两个最小的请求实例。同一个任务（带一句 system prompt、一句用户输入），两套协议分别长这样：</p>
+<p>Anthropic 协议，请求打 <code>POST /v1/messages</code>：</p>
+<pre><code class="language-json">{
+  "model": "claude-opus-4-6",
+  "system": "你是一个编程助手",
+  "max_tokens": 64000,
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "你好"}]}
+  ]
+}
+</code></pre>
+<p>OpenAI 兼容，请求打 <code>POST /v1/chat/completions</code>：</p>
+<pre><code class="language-json">{
+  "model": "glm",
+  "messages": [
+    {"role": "system", "content": "你是一个编程助手"},
+    {"role": "user", "content": "你好"}
+  ]
+}
+</code></pre>
+<p>对照看，能直接看出三个区别：</p>
+<ol>
+<li>system prompt 在 Anthropic 侧是顶层的 <code>system</code> 字段，在 OpenAI 侧只是 <code>messages</code> 里 <code>role:"system"</code> 的一条消息；</li>
+<li>user 消息的正文（<code>content</code>）在 Anthropic 侧是一个"内容块"的数组，在 OpenAI 侧就是一串文本；<code>max_tokens</code> 在 Anthropic 侧按规范必填，在 OpenAI 侧可以不写。</li>
+<li>另外 API key 放的位置也不同（在请求头里，不在 JSON 体里）。</li>
+</ol>
+<p>逐项差异见下表，踩过坑的几行，会在后面展开：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Anthropic (<code>/v1/messages</code>)</th>
+<th>OpenAI 兼容 (<code>/v1/chat/completions</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API key 放在哪个请求头</td>
+<td><code>x-api-key</code>（或 <code>Authorization</code>），另带 <code>anthropic-version</code>，可带 <code>anthropic-beta</code></td>
+<td><code>Authorization: Bearer &lt;key&gt;</code></td>
+</tr>
+<tr>
+<td>system prompt 放哪</td>
+<td>顶层独立字段 <code>system</code>，不进 messages</td>
+<td>作为 <code>messages</code> 里 <code>role:"system"</code> 的一条</td>
+</tr>
+<tr>
+<td>输出上限 max_tokens</td>
+<td>官方规范<strong>必填</strong>（实际网关不一定强制，见坑二）</td>
+<td>可选（新版名【】这里的新版是什么意思？<code>max_completion_tokens</code>）</td>
+</tr>
+<tr>
+<td>消息正文长什么样</td>
+<td>"内容块"的数组：<code>text</code>/<code>image</code>/<code>tool_use</code>/<code>tool_result</code>/<code>thinking</code> 各是一种块</td>
+<td>一整串文本，多模态时才是 <code>[{type,...}]</code></td>
+</tr>
+<tr>
+<td>模型要调工具</td>
+<td>回一个 <code>tool_use</code> 内容块</td>
+<td>回 <code>message.tool_calls</code> 数组</td>
+</tr>
+<tr>
+<td>工具结果回传</td>
+<td>塞进 user 消息里的 <code>tool_result</code> 块</td>
+<td>单独一条 <code>role:"tool"</code> 消息</td>
+</tr>
+<tr>
+<td>这轮为什么停了</td>
+<td><code>stop_reason</code>：<code>end_turn</code>/<code>tool_use</code>/<code>max_tokens</code></td>
+<td><code>finish_reason</code>：<code>stop</code>/<code>tool_calls</code>/<code>length</code></td>
+</tr>
+<tr>
+<td>token 用量字段</td>
+<td><code>input_tokens</code>/<code>output_tokens</code></td>
+<td><code>prompt_tokens</code>/<code>completion_tokens</code></td>
+</tr>
+<tr>
+<td>流式输出怎么分段</td>
+<td>细粒度：<code>message_start</code>→<code>content_block_delta</code>→…→<code>message_stop</code> 一串事件</td>
+<td>粗粒度：只有一种 <code>choices[].delta</code> 片段，末尾 <code>data: [DONE]</code> 收尾</td>
+</tr>
+<tr>
+<td>思考过程怎么表示</td>
+<td><code>thinking</code> 块（带签名）；用 <code>budget_tokens</code> 设思考预算</td>
+<td><code>reasoning_content</code> 流式片段；或用 <code>reasoning_effort</code> 调档位</td>
+</tr>
+<tr>
+<td>前缀缓存</td>
+<td>显式打 <code>cache_control</code> 断点【】这个是什么意思？</td>
+<td>自动前缀缓存，无标记</td>
+</tr>
+</tbody>
+</table>
+<p>表里有三个词需要解释。</p>
+<ul>
+<li><strong>内容块</strong>：Anthropic 协议里一条消息的正文不是一整串文本，而是一个数组，每个元素（块）带一个 <code>type</code>，文字、图片、工具调用、工具结果、思考各是一种块，所以一条消息里可以既有文字又有工具调用。</li>
+<li><strong>流式</strong>：模型边生成，边把输出切成小片段陆续推送，客户端收到一段就能显示一段，底层走 SSE（服务端往同一个 HTTP 连接里持续推 <code>data: ...</code> 行）；两套协议都支持流式，只是切事件的粒度不同（见表）。</li>
+<li><strong>思考内容</strong>：Anthropic 用独立的 <code>thinking</code> 内容块装模型的推理过程，块上带服务端签发的签名，多轮对话时要原样回传校验；OpenAI 兼容协议里没有思考块，推理混在流式输出的 <code>reasoning_content</code> 字段里分段返回。注意 <code>reasoning_content</code> 不是 OpenAI 原生的：OpenAI 官方的思考型模型只让你用 <code>reasoning_effort</code> 调思考力度，思考原文不回传，官方文档的原话是 "reasoning tokens are not visible via the API"。这个字段是 DeepSeek 先定义的，DeepSeek-R1 的 API 用它回传思考原文，Qwen 等国产厂商随后沿用了同一个字段名。一个旁证：开源推理框架 vLLM 里解析这类思考输出的解析器就叫 <code>deepseek_r1</code>，连 QwQ 都复用它。</li>
+</ul>
+<h2 id="3-踩坑记录">3 踩坑记录</h2>
+<h3 id="坑一system-prompt-放错位置直接-400">坑一：system prompt 放错位置，直接 400</h3>
+<p>前面的请求示例里已经能看到，两套协议给 system prompt 安排的位置不一样：Anthropic 放在请求体顶层，OpenAI 混在 messages 里。这个位置差异是我们踩过的 400 里最常见的一个。</p>
+<p>当时的现象是：同一个请求，打我们的网关好好的，打自部署的 sglang 就直接 400。查下来发现，Claude Code 有时会把一条 system 指令放进 messages 数组，宽容的实现能收，但 sglang 的 <code>/v1/messages</code> 严格要求 messages 只含 user/assistant，多一个 role 就拒。</p>
+<p>所以我们在翻译层加了一步规范化：把混在 messages 里的 system 抽出来，合并进顶层 <code>system</code> 字段。注意这一步只对 <code>/v1/messages</code> 做，OpenAI 协议里 system 混在消息里本来就合法，不需要动。</p>
+<p>总结：<strong>OpenAI 侧 system 混在消息里合法；Anthropic 侧必须单独放顶层，混在消息里的严格实现会 400。</strong></p>
+<h3 id="坑二任务不报错却卡死不动">坑二：任务不报错，却卡死不动</h3>
+<p>有一次我们用 opencode（一种开源的 scaffold，即包在模型外面、驱动它一轮轮干活的程序）跑题，发现任务既不报错也不结束，就停在那里不动。</p>
+<p>翻代理日志逐条取证才发现：几十次请求的收尾原因几乎全是"输出长度触顶"，其中 16 次的输出 token 数精确顶在 4096 这个整数上。被截断的是半截工具调用 JSON，客户端解析不了也不报错，就一直干等。等我们发现时，任务已经这样静默挂了 7 小时 53 分。问题是 opencode 自己根本不填 max_tokens（输出上限），那这个 4096 是谁填的？</p>
+<p>一开始我们以为是上游强制的，因为 Anthropic 官方规范里 max_tokens 确实是必填字段。但拿 curl 直接打网关实测（每种写法各试 3 次），结果正相反：<strong>完全不带 max_tokens 也能正常返回 200</strong>，带 4096、带 64000 都收得下。真正填上这个值的是中间的翻译层 litellm（一个开源的多后端代理）：它看到请求没带 max_tokens，就按自己的默认实现补了个 4096。</p>
+<p>总结：<strong>规范说必填，不代表网关真强制；输出莫名被截断时，先查中间层是不是替你填了个小默认值。</strong></p>
+<h3 id="坑三报模型不存在多半是打错了入口">坑三：报"模型不存在"，多半是打错了入口</h3>
+<p>预检时我们发现一个现象：同一个模型名 <code>claude-sonnet-4-6</code>，打 <code>/protocol/openai/v1/chat/completions</code> 正常返回（试了 3 次都是 200），打同一个网关的 <code>/protocol/openai/v1/responses</code> 却报 <code>NoAvailableModels</code>（3 次都是 400）。</p>
+<p>原因很简单，但容易忽略：网关上的模型是按协议入口注册的，同一个模型往往只挂在某一个入口下。我们用的托管版 GLM 也一样，只在 compatible-mode 入口注册，打 anthropic 入口就是"不存在"。所以报"模型不存在"时，先别怀疑模型下架了，先核对入口打没打对。</p>
+<p>顺着多说两句。Claude Code 选"1M 上下文变体"靠在模型名末尾拼 <code>[1m]</code> 后缀，这只是 Anthropic 侧的客户端约定，OpenAI 兼容路没有这个概念，把带后缀的名字发过去同样会报"未注册"。另外，不同翻译层对陌生名字的容忍度也不同：litellm 严格校验，模板里忘了替换的占位名会被它当场拒掉；我们 anthropic 侧的代理有默认档兜底，同一个占位名反而能正常通过，排查时这种"一路通一路不通"的现象就是这么来的。</p>
+<p>排查时还要分清两类报错：<strong>400 / NoAvailableModels 这类是名字或入口不对；401 是 key 不对</strong>，服务端认不出你（我们踩过的实际原因：容器里的 claude 拿到的是占位用的假 key，真 key 没传进去）。</p>
+<p>总结：<strong>"模型不存在"先查协议入口，再查模型名；400 和 401 别混。</strong></p>
+<h3 id="坑四思考型模型把输出额度吃光整轮作废">坑四：思考型模型把输出额度吃光，整轮作废</h3>
+<p>先说两套协议怎么表示"模型思考"（给正式答案前的推理过程）：</p>
+<ul>
+<li><strong>Anthropic 侧</strong>用独立的 <code>thinking</code> 内容块装思考，块里带一个 <code>signature</code>（服务端签发的校验串）；多轮工具调用时，带签名的思考块要原样回传、供服务端校验。想控制思考多长，用 <code>budget_tokens</code> 参数给思考单独设预算，花完就停止思考、转入正式作答。</li>
+<li><strong>OpenAI 兼容侧</strong>没有独立的思考块，思考内容混在流式输出里，放在每个片段的 <code>delta.reasoning_content</code> 字段里吐出来。</li>
+<li>这里有个容易混淆的点：<code>reasoning_content</code> <strong>不是 OpenAI 官方协议原生的字段</strong>。OpenAI 官方的思考型模型（o 系列）走 <code>reasoning_effort</code> 参数，选 low/medium/high 档位，而思考过程本身不回传原文；<code>reasoning_content</code> 这个"把思考原文塞进流式片段"的做法是国内厂商的扩展（DeepSeek 首创、Qwen 等跟进），是加在 OpenAI 兼容格式之上的。</li>
+</ul>
+<p>问题：接 GLM 这类"思考型"模型（也就是在给正式输出前先输出一大段推理）时，我们发现思考 + 正式输出的长度，远大于单轮 64K 的输出 length 上限，所以导致输出被截断，解题过程作废。</p>
+<p>问题出在额度分配上。前面提到，这类模型的思考内容也是输出的一部分，和正文共享同一个输出上限。它的推理又特别重，思考长度很长，会导致整轮输出触顶被截断。更麻烦的是，Claude Code 的非交互模式会把"因为触顶而停" <code>stop_reason=max_tokens</code> 判成致命错误，整题直接作废。</p>
+<p>解法是在代理端把思考的额度和正文分开管：总输出上限 64K 不变，单独给思考封 24K 的预算，思考花完自己的额度就必须转入正文。改完之后正文再没被挤掉过。</p>
+<p>总结：<strong>接思考型模型，一定要给思考单独设预算（Anthropic 侧有现成的 <code>budget_tokens</code> 参数），别让它和正文抢同一个输出上限。</strong></p>
+<h3 id="坑五模型思考过久迟迟不返回客户端-300-秒就放弃了">坑五：模型思考过久、迟迟不返回，客户端 300 秒就放弃了</h3>
+<p>思考型模型还有个更隐蔽的问题：上下文一大，它可能要思考好几分钟才开始返回内容。我们实测最久的一次，等了 943.7 秒才收到第一个数据块。而 Claude Code 等第一个数据块最多只等 300 秒，超时就把这一轮判废了。</p>
+<p>解法是代理在等数据的空档往流式连接里插"心跳"（SSE 注释行），让客户端一直能收到东西，不至于判超时。但心跳的位置有讲究：SSE 流由一个个事件组成，每个事件是一条以 <code>data:</code> 开头、以空行结尾的文本块，块里装着一个完整的 JSON。心跳必须插在两个事件之间的空档处，不能插进事件内部。我们最早没注意这点，心跳落进事件内部、把里面的 JSON 劈成两半，客户端解析直接报错，中招率约 20%。</p>
+<p>总结：<strong>慢模型要配心跳保活，且心跳必须插在两段 SSE 事件之间的空档处。</strong></p>
+<h3 id="坑六客户端带了网关不认识的协议头">坑六：客户端带了网关不认识的协议头</h3>
+<p>Anthropic 协议有一个 <code>anthropic-beta</code> 请求头，用来声明要启用哪些测试中的新特性，网关只认它支持的那些值。Claude Code 内置的一个安全扫描工具会往这个头里塞一个较新的特性名，我们的网关不认识，直接 400。</p>
+<p>解法很简单：客户端官方提供了关闭开关，让它别发这个头就行。这类"客户端比网关新"的冲突只会出现在 Anthropic 侧，OpenAI 兼容协议没有这种头。</p>
+<p>总结：<strong>网关 400 且报错提到 <code>anthropic-beta</code>，就是客户端声明了网关不认的特性，关掉对应的客户端功能即可。</strong></p>
+<h2 id="4-举例sidecar-可能会怎么接">4 举例，sidecar 可能会怎么接</h2>
+<p>完整的请求链路长这样（以托管服务上的 GLM 为例）：</p>
+<pre><code>容器内 claude ──(Anthropic /v1/messages)──▶ localhost 上的 sidecar
+                                              │ 翻译 Anthropic → OpenAI
+                                              ▼
+        内部模型网关的 compatible-mode 入口 ──按模型名前缀转发──▶ 托管服务后端
+</code></pre>
+<p>我们的 sidecar 按协议分两个：<code>cc-proxy</code> 收 Anthropic 协议（<code>/v1/messages</code>），是 Claude Code 走的那个；<code>litellm</code> 收 OpenAI 协议（<code>/chat/completions</code> 或 <code>/responses</code>），opencode、codex 这些 scaffold 的 openai 档走它。选哪个由一个 <code>protocol</code> 开关决定。</p>
+<p>这里有个反直觉的坑：我们的接法是<strong>故意不给 claude 设 <code>ANTHROPIC_BASE_URL</code></strong>，让它回落到 localhost 上的 sidecar 地址。一旦注入了这个变量，claude 会绕过 sidecar 直连你填的地址。托管服务的端点只认 OpenAI 兼容协议，直连必失败。只有一种情况该直连：后端本身就是 Anthropic 协议端点（比如自部署 sglang 暴露了 <code>/v1/messages</code>），这时才显式注入 <code>ANTHROPIC_BASE_URL</code> 指过去，不经翻译。</p>
+<p>最后是一张协议对照表：</p>
+<table>
+<thead>
+<tr>
+<th>后端是什么</th>
+<th>走哪套协议</th>
+<th>怎么接</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Claude 官方模型</td>
+<td>Anthropic</td>
+<td>claude 直连，或经 cc-proxy</td>
+</tr>
+<tr>
+<td>托管的开源模型（GLM、Qwen 等）</td>
+<td>OpenAI 兼容</td>
+<td>必须走 sidecar 翻译</td>
+</tr>
+<tr>
+<td>自部署 sglang（暴露 /v1/messages）</td>
+<td>Anthropic</td>
+<td>可直连</td>
+</tr>
+<tr>
+<td>自部署只暴露 /chat/completions</td>
+<td>OpenAI 兼容</td>
+<td>走 litellm sidecar</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5-两个-debug-建议">5 两个 debug 建议</h2>
+<p><strong>1. 接之前先 curl 预检。</strong> 我们的环境里起一个任务要等十几分钟才分到机器，接错很浪费，所以先用一条 curl 确认"模型名 + key + 协议入口"三者对得上：</p>
+<pre><code class="language-bash">API_KEY="&lt;你的 key&gt;"   # 网关颁发的 key
+curl -sS -m 60 \
+  "https://&lt;网关地址&gt;/protocol/openai/compatible-mode/v1/chat/completions" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"&lt;模型名&gt;","messages":[{"role":"user","content":"say pong"}],"max_tokens":20}'
+</code></pre>
+<p>通了会在响应里看到后端的真实模型名；回 <code>NoAvailableModels</code> 就是模型名或协议入口对不上，比如坑三的情况。</p>
+<p><strong>2. 接完后，需要确认真的走了 sidecar。</strong> 两个信号：任务产物里 proxy 的日志目录有一堆请求记录文件，说明确实经过了代理（直连模式没有这个目录）；最后一条结果记录里的 <code>stop_reason</code> 正常应是 <code>end_turn</code>，如果是 <code>max_tokens</code>，就是撞了坑四的截断。另外结果里显示的模型名可能被客户端规整成占位名，别被它骗了，要以网关响应里的真实模型名为准。</p>
+<br>
+<br>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-11 12:42">2026-10-11 12:42</span>&nbsp;
+<a href="https://www.cnblogs.com/moonout">MoonOut</a>&nbsp;
+阅读(<span id="post_view_count">19</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23260875);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmoonout%2Fp%2F23260875&amp;targetId=23260875&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
