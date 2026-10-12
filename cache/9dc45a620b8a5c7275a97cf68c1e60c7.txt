@@ -1,0 +1,269 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/east4ming/p/23267714" title="发布于 2026-10-12 10:09">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">把威联通 NAS 接进 Prometheus 监控</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        记录将 QNAP NAS 接入 Prometheus 监控的完整过程：用 Container Station 跑 node-exporter 与 smartctl-exporter，踩过 SCSI 误判、设备权限、挂载点噪声与固件 DOM 永久误报等坑，并给出可复用的告警规则与运维要点。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="前言">前言</h2>
+<p>终于等来了国庆长假！宅在家折腾自己的 HomeLab、 K8s、 NAS 服务器集群的感觉真爽！这次长假真的是折腾了好多东西，感兴趣的读者请期待后续的爆更，等不及的话也可以直接看我的 repo - <code>east4ming/homelab2</code> 的 PR 和 Commits。</p>
+<p>homelab2 里有一台 QNAP NAS，跑了好几年，一直是块心病：<strong>它不在监控里</strong>。</p>
+<p>集群里的 node、pod、中间件、URL 监控都齐了，偏偏这台 NAS 是个黑盒。它上面躺着我的照片、备份、电视、电影，盘什么时候开始报错、卷什么时候快满了，全靠我偶尔登 Web 控制台瞄一眼。典型的「防御式运维」，出事了才知道。</p>
+<p>这件事放在待办清单里至少快2年了，趁国庆把这套补上。折腾完之后发现，坑比我想的多得多，尤其是那个<strong>「面板有曲线但数据是假的」</strong>的静默失效，说实话有点费劲。</p>
+<p>先交代下对象：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>型号</td>
+<td>QNAP TS-453Bmini（NAS33657A）</td>
+</tr>
+<tr>
+<td>系统</td>
+<td>QTS 5.2.10 / kernel 5.10.60-qnap / x86_64</td>
+</tr>
+<tr>
+<td>内存</td>
+<td>16GB</td>
+</tr>
+<tr>
+<td>LAN</td>
+<td>192.168.3.216</td>
+</tr>
+<tr>
+<td>盘位</td>
+<td>4 个内置 + 1 个 USB 外接盘</td>
+</tr>
+<tr>
+<td>存储卷</td>
+<td>5 个</td>
+</tr>
+</tbody>
+</table>
+<h2 id="最终效果图">最终效果图</h2>
+<p>先放几张最终效果图：</p>
+<p><img alt="NAS Dashboard 1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3034537/202610/3034537-20261012100415332-2005832529.png" class="lazyload"></p>
+<p><img alt="NAS Dashboard 2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3034537/202610/3034537-20261012100415236-2126718747.png" class="lazyload"></p>
+<p><img alt="NAS Prometheus Alertrules" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3034537/202610/3034537-20261012100415148-1121935162.png" class="lazyload"></p>
+<p><img alt="手机收到 NAS 告警" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3034537/202610/3034537-20261012100415194-1576875647.png" class="lazyload"></p>
+<h2 id="方案container-station-跑两个只读-exporter">方案：Container Station 跑两个只读 exporter</h2>
+<p>NAS 上没法装 K8s agent，但 QNAP 有 Container Station（本质是个 docker）。所以思路很直接：</p>
+<ol>
+<li>NAS 侧跑两个 exporter，走 <strong>host 网络</strong>，让集群直接按 IP:Port 抓；</li>
+<li>集群侧在 Prometheus 里加两个静态 job；</li>
+<li>告警和面板都在集群侧统一管理。</li>
+</ol>
+<pre><code class="language-yaml"># metal/nas/docker-compose.yml
+services:
+  nas-node-exporter:
+    image: quay.io/prometheus/node-exporter:v1.8.2
+    container_name: nas-node-exporter
+    network_mode: host
+    restart: unless-stopped
+    pid: host
+    privileged: true
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|mnt/snapshot|share/NFSv=4)($|/)
+    volumes:
+      - /:/host:ro,rslave
+
+  nas-smartctl-exporter:
+    image: docker.io/prometheuscommunity/smartctl-exporter:v0.14.0
+    container_name: nas-smartctl-exporter
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    user: "0:0"
+    command:
+      - --smartctl.device=/dev/sda;sat
+      - --smartctl.device=/dev/sdb;sat
+      - --smartctl.device=/dev/sdc;sat
+      - --smartctl.device=/dev/sdd;sat
+      - --smartctl.device=/dev/sde;sat
+</code></pre>
+<blockquote>
+<p>📝<strong>Notes</strong>: <code>restart: unless-stopped</code> 是必须的，NAS 断电重启后要能自动恢复采集，不然又是一次静默盲区。</p>
+</blockquote>
+<p>实测开销：node-exporter 3101 条序列 / 19.89MiB，镜像 23.3MB；smartctl-exporter 496 条序列 / 6.449MiB，镜像 32.2MB。对 16GB 内存的 NAS 来说基本无感。</p>
+<blockquote>
+<p>🐾 <strong>注意：</strong> 镜像源要挑。实测 <code>quay.io/prometheus-community/smartctl-exporter</code> 返回 <strong>unauthorized</strong>，<code>docker.io/prometheuscommunity/smartctl-exporter</code> 才是可用的。node-exporter 走 quay.io 没问题。</p>
+</blockquote>
+<h2 id="坑一温度恒为-0-的静默失效-">坑一：温度恒为 0 的静默失效 😱</h2>
+<p>这是最阴的一个。</p>
+<p>第一版 compose 里，我偷懒没指定设备，让 exporter 自己扫：</p>
+<pre><code class="language-bash">smartctl --scan-open
+# /dev/sda -d scsi
+# /dev/sdb -d scsi
+# /dev/sdc -d scsi
+# /dev/sdd -d scsi
+</code></pre>
+<p>4 块 SATA 机械盘，全被识别成 <strong>SCSI</strong>。后果是什么？</p>
+<ul>
+<li><code>smartctl_device_temperature</code> <strong>恒为 0</strong>；</li>
+<li>ATA 属性（通电时间、重映射扇区、SMART 各项原始值）<strong>全部缺失</strong>；</li>
+<li>但 exporter 照常输出、Grafana 面板照常画曲线。😑</li>
+</ul>
+<p>这就叫<strong>静默失效</strong>，比没数据危险得多。没数据你会去查，有数据你会信。要是哪天盘真过热了，我的告警规则永远触发不了。</p>
+<p>修法：强制 SAT 类型。</p>
+<pre><code class="language-bash">--smartctl.device=/dev/sda;sat
+</code></pre>
+<blockquote>
+<p>📝<strong>Notes</strong>: <code>&lt;device&gt;;&lt;type&gt;</code> 这个语法要求镜像 <strong>≥ v0.14.0</strong>。我先用 v0.12.0 试的，直接报 <code>No such device</code>，白折腾半小时。</p>
+</blockquote>
+<p>改完之后温度才正常：sda 46°C、sdb 49°C、sdc 45°C、sdd 44°C、sde 44°C，5 块盘 <code>smart_status</code> 全为 1。</p>
+<h2 id="坑二设备不可见--容器跑在-nobody">坑二：设备不可见 + 容器跑在 nobody</h2>
+<p>强制指定 <code>/dev/sdX</code> 之后，第二个坑立刻撞上来：<strong><code>/dev/sd*</code> 在普通容器里根本不存在</strong>。</p>
+<p>加上 <code>privileged: true</code> 才出现。但出现之后还打不开——容器默认 UID 是 <code>nobody</code>，而 <code>/dev/sda</code> 的权限是 <code>brw------- root:root</code>。</p>
+<p>所以这两行<strong>必须同时存在</strong>：</p>
+<pre><code class="language-yaml">privileged: true
+user: "0:0"
+</code></pre>
+<blockquote>
+<p>📝<strong>Notes</strong>: 这是我个人比较不喜欢的那种组合：privileged + root。但 SMART 读取本质上就是特权操作，绕不过去。缓解措施是容器<strong>只读</strong>挂载宿主 <code>/</code>，不挂 docker.sock，不监听公网，端口只开在 LAN IP 上。</p>
+</blockquote>
+<h2 id="坑三挂载点噪声">坑三：挂载点噪声</h2>
+<p>node-exporter 挂宿主根目录，会带出一堆垃圾：</p>
+<ul>
+<li>25 个 <code>/mnt/snapshot/&lt;pool&gt;/&lt;snap&gt;</code> 快照视图</li>
+<li><code>/share/NFSv=4/*</code> 重导出</li>
+<li><code>/share/CACHEDEV*_DATA/.qpkg/*</code> QPKG 沙箱</li>
+<li>宿主自己的 <code>/sys</code>、<code>/proc</code></li>
+</ul>
+<p>不排除的话，容量面板能给你刷出几十行，全是假的。</p>
+<p>排除之后 <code>node_filesystem_size_bytes</code> 恰好剩 <strong>10 个挂载点</strong>，其中真实存储卷 6 个：<code>/share/CACHEDEV1..5_DATA</code> 加上 <code>/share/external/DEV3303_1</code>。</p>
+<pre><code class="language-bash">- --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|mnt/snapshot|share/NFSv=4)($|/)
+- --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|cgroup|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$
+</code></pre>
+<h2 id="盘位标签为什么要硬编码">盘位标签：为什么要硬编码</h2>
+<p>磁盘告警只说 <code>/dev/sdc</code> 没用，我要的是「<strong>bay1 那块盘</strong>」。盘位映射依据实测：</p>
+<pre><code class="language-bash">qcli_storage -d
+# sdc → bay1
+# sdd → bay2
+# sda → bay3
+# sdb → bay4
+</code></pre>
+<p>在 <code>metric_relabel_configs</code> 里逐条静态映射：</p>
+<pre><code class="language-yaml">metric_relabel_configs:
+  - source_labels: [device]
+    regex: /dev/sdc
+    target_label: disk
+    replacement: bay1
+  # ... 其余三块同理
+</code></pre>
+<p>🤔 有同学会问：为什么不用 <code>relabel_configs</code> 的 <code>labelmap</code> 批量映射？</p>
+<p>因为 <code>separator</code> 是全局参数，批量映射出来是 <code>/dev/sdc;bay1</code> 这种，拿不到干净的 <code>disk=bay3</code>。这种小场景，老老实实写四行反而最省事。</p>
+<h2 id="告警两处上线即永久误报">告警：两处「上线即永久误报」</h2>
+<p>6 条规则：卷容量两级阈值、卷被重挂只读、RAID 失去冗余、SMART 健康失败、磁盘高温。抓取中断直接复用既有的 <code>TargetDown</code>，不重复定义。</p>
+<p>但写完跑 <code>promtool check rules</code> 通过，不代表规则能上线。用真实环境样本一评估，<strong>两条规则是永久误报</strong>：</p>
+<p><strong>误报一：<code>/mnt/ext</code></strong></p>
+<p>它是 436MB 的固件 DOM（<code>/dev/md13</code>），实测可用只剩 <strong>7.69%</strong>。这是 QNAP 的固定布局，不可配置。卷容量规则必须限定排除掉固件 DOM：</p>
+<pre><code class="language-yaml">expr: |
+  node_filesystem_avail_bytes{mountpoint=~"/share/.+"}
+    / node_filesystem_size_bytes{mountpoint=~"/share/.+"} &lt; 0.15
+</code></pre>
+<p><strong>误报二：<code>md9</code> / <code>md13</code></strong></p>
+<p>这俩是 32 槽位的固件 DOM 镜像，实际只用 4 槽，所以 <code>node_md_disks{state="active"} &lt; node_md_disks_required</code> <strong>恒成立</strong>。RAID 规则必须硬编码范围，并且用 <code>on (device)</code> 做向量匹配：</p>
+<pre><code class="language-yaml">expr: |
+  node_md_disks{state="active", device=~"md1|md2|md256|md322"}
+    &lt; on (device) node_md_disks_required
+</code></pre>
+<p>修正后，6 条规则在当前环境全部 <strong>inactive</strong>（数据卷可用 29%–90%，SMART 全为 1，最高盘温 49°C）。</p>
+<blockquote>
+<p>📝<strong>Notes</strong>: 这两条属于<strong>领域约束</strong>，不是 bug。你不能改 QNAP 的固件 DOM 设计，只能把范围限制硬编码进规则。写告警的时候，光看语法过没过是远远不够的，必须拿真实样本逐条评估。</p>
+</blockquote>
+<h2 id="gitops-的边界argocd-管不了集群外的容器">GitOps 的边界：ArgoCD 管不了集群外的容器</h2>
+<p>集群侧所有资源（scrape config、rules、dashboard）全部走 ArgoCD，这个没争议。争议在 NAS 侧。</p>
+<p>我逐条否决了几条路：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>否决原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NAS 上装 k3s 当节点</td>
+<td>4 盘位家用 NAS，为了跑两个 exporter 装个 K8s，杀鸡用牛刀</td>
+</tr>
+<tr>
+<td>ArgoCD ConfigManagementPlugin</td>
+<td>还是要落容器到 NAS，问题没解决</td>
+</tr>
+<tr>
+<td>自建 webhook 控制器</td>
+<td>维护成本远超收益</td>
+</tr>
+<tr>
+<td>Entware 非容器安装</td>
+<td>无版本锁定、无回滚、污染 QTS 系统</td>
+</tr>
+</tbody>
+</table>
+<p>最终方案：<strong>compose 入库 + Container Station 人工导入</strong>。</p>
+<p>好处是配置有版本、可追溯、可 review；代价是导入这一步得手动——改了 compose，得去 Container Station 重建应用。</p>
+<p>说实话这个代价我认了。ArgoCD 的管辖边界就是「集群内」，硬要把它伸到集群外的设备上，只会搞出一堆更脆的胶水。NAS 不是集群节点，也不该被塞进 <code>metal/inventories/prod.yml</code>。所以 NAS 的采集定义单独放 <code>metal/nas/</code>，各归各的。</p>
+<h2 id="没采到的指标也交代一下">没采到的指标，也交代一下</h2>
+<ul>
+<li><strong>机箱温度、风扇转速</strong>：QNAP 控制器不通过 hwmon 暴露，<code>/sys/class/hwmon</code> 下只有 CPU <code>coretemp</code>。所以温度监控<strong>只覆盖硬盘</strong>。</li>
+<li><strong><code>qcli_hdd</code></strong>：需要交互式 QCLI 登录，会引入管理员凭据，否决。</li>
+<li><strong><code>get_hd_smartinfo</code></strong>：实测无输出，依赖私有库，否决。</li>
+<li>NAS 上<strong>不存在</strong> <code>smartctl</code> 和 <code>snmpd</code>。</li>
+</ul>
+<p>参考了两个仓库（<code>zottelbeyer/QNAP-collectd-influxdb-grafana</code> 走 collectd 推送 InfluxDB，<code>sandrotosi/qnap-dashboards</code> 依赖 SNMP），跟本仓库的 Prometheus 拉取模型都不兼容，只作指标维度参考，没采用。</p>
+<h2 id="运维要点">运维要点</h2>
+<ol>
+<li><strong>增删硬盘</strong>：要更新 compose 里的 <code>--smartctl.device</code> 列表并在 Container Station 重建应用。显式指定设备后，exporter 不再自动重扫。</li>
+<li><strong>QTS 升级导致盘符变化</strong>：按 <code>qcli_storage -d</code> 复核盘位。</li>
+<li><strong>NAS 换 IP</strong>：更新 <code>values.yaml</code> 里的两个静态目标。</li>
+<li><strong>硬盘休眠</strong>：SMART 读取可能把盘唤醒，介意的话要权衡采集频率。</li>
+</ol>
+<h2 id="总结">总结</h2>
+<p>把 NAS 接进监控只是表面，真正让我长记性的是那些静默失效。</p>
+<p>面板上有曲线、指标有输出，不等于数据是对的。SCSI 误判、UID 打不开设备、挂载点噪声、固件 DOM 的永久误报，每一个都不会报错，只会安安静静地骗你。</p>
+<p>纸上得来终觉浅，绝知此事要躬行。规则语法过了、<code>promtool</code> 过了，都只是第一步；真正让规则可信的，是拿实测样本一条条去跑、去对、去证伪。</p>
+<p>现在这套跑在 homelab2 上：13 个面板的 <code>nas.json</code>，6 条告警规则全 inactive，5 块盘温度 44–49°C，数据卷可用 29%–90%。终于不用再登 Web 控制台了。🎉</p>
+<p>以上。</p>
+<h2 id="️参考文档">📚️参考文档</h2>
+<ul>
+<li><a href="https://github.com/prometheus/node_exporter" target="_blank" rel="noopener nofollow">prometheus/node_exporter</a></li>
+<li><a href="https://github.com/prometheus-community/smartctl_exporter" target="_blank" rel="noopener nofollow">prometheus-community/smartctl_exporter</a></li>
+<li><a href="https://www.smartmontools.org/wiki/TocDoc" target="_blank" rel="noopener nofollow">smartmontools - smartctl 手册</a></li>
+<li><a href="https://www.qnap.com/en/software/container-station" target="_blank" rel="noopener nofollow">QNAP Container Station 官方文档</a></li>
+<li><a href="https://github.com/zottelbeyer/QNAP-collectd-influxdb-grafana" target="_blank" rel="noopener nofollow">zottelbeyer/QNAP-collectd-influxdb-grafana</a></li>
+<li><a href="https://github.com/sandrotosi/qnap-dashboards" target="_blank" rel="noopener nofollow">sandrotosi/qnap-dashboards</a></li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-12 10:09">2026-10-12 10:09</span>&nbsp;
+<a href="https://www.cnblogs.com/east4ming">东风微鸣</a>&nbsp;
+阅读(<span id="post_view_count">84</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23267714);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Feast4ming%2Fp%2F23267714&amp;targetId=23267714&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

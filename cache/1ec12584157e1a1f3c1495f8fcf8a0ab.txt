@@ -1,0 +1,278 @@
+
+	<h1 class="postTitle"><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yennie/p/22276475" title="发布于 2026-10-12 14:38">
+    
+
+    <span role="heading" aria-level="2">Rust 进程假死问题排查（dragonfly+tokio）</span>
+    
+
+</a>
+</h1>
+	<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p><span style="font-size: 18pt"><strong><span style="font-family: &quot;Microsoft YaHei&quot;">背景：</span></strong></span></p>
+<p><span style="font-size: 16px"><strong><span style="font-family: &quot;Microsoft YaHei&quot;">&nbsp; &nbsp;</span></strong><span style="font-family: &quot;Microsoft YaHei&quot;"><span style="font-size: 14px">最近负责Dragonfly Client，一个Rust+tokio框架，用于k8s镜像加速的项目。线上遇到难题，进程在大规模节点（600节点+）拉取大镜像（16G+）时，总是跑几分钟后部分节点（200节点+）的dfdaemon进程进入假死状态。表现形式：1. 进入卡死后不再打印任何日志 2. 在节点拉取镜像失败，containerd不能正常降级。3. 85分钟内4001端口可以连通，kubelet tcpListener liveness探活成功，85分钟后探活开始失败。</span></span></span></p>
+<h2>原因排查：</h2>
+<p>&nbsp; &nbsp;1. dfdemon接收请求的端口是4001端口，该端口请求的tcp全连接队列全满</p>
+<p><img alt="image" width="518" height="141" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2811507/202608/2811507-20260826202246949-1810364576.png" class="lazyload"></p>
+<p><img alt="image" width="599" height="178" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2811507/202608/2811507-20260826202301150-639629392.png" class="lazyload"></p>
+<p>&nbsp;结合4001处理代码：</p>
+<p>&nbsp;</p>
+<div class="cnblogs_Highlighter">
+<pre class="brush:csharp;gutter:true;">    /// run starts the proxy server.
+    pub async fn run(&amp;self, grpc_server_started_barrier: Arc&lt;Barrier&gt;) -&gt; ClientResult&lt;()&gt; {
+        let listener = TcpListener::bind(self.addr).await?;
+        info!("proxy server listening on {}", self.addr);
+
+        loop {
+            // Wait for a client connection.
+            tokio::select! {
+                tcp_accepted = listener.accept() =&gt; {
+                    // A new client connection has been established.
+                    let (tcp, remote_address) = tcp_accepted?;
+
+                    // Spawn a task to handle the connection.
+                    let io = TokioIo::new(tcp);
+                    debug!("accepted connection from {}", remote_address);
+
+                    let context = context.clone();
+                    tokio::task::spawn(async move {
+                        if let Err(err) = ServerBuilder::new()
+                            .keep_alive(true)
+                            .max_buf_size(read_buffer_size)
+                            .preserve_header_case(true)
+                            .title_case_headers(true)
+                            .serve_connection(
+                                io,
+                                service_fn(move |request|{
+                                    let context = context.clone();
+                                    async move {
+                                        handler(context.config, context.task, request, context.dfdaemon_download_client, context.registry_cert, context.server_ca_cert, remote_address.ip()).await
+                                    }
+                                } ),
+                                )
+                            .with_upgrades()
+                            .await
+                        {
+                            collect_proxy_request_failure_metrics();
+                            error!("failed to serve connection from {}: {}", remote_address, err);
+                        }
+                    });
+                }
+                _ = shutdown.recv() =&gt; {
+                    // Proxy server shutting down with signals.
+                    info!("proxy server shutting down");
+                    return Ok(());
+                }
+            }
+        }
+    }
+</pre>
+</div>
+<p>　</p>
+<p>不断从tcp全连接队列拿取任务，调用异步方法handler处理（handler里面会封装task，GRPC调用/dfdaemon.v2.DfdaemonDownload/DownloadTask 下载task，并不堵塞4001处理接口）。handler处理方法放在 tokio::task::spawn里面，由tokio worker线程池处理（顺便提一下，tokio::task::spawn_blocking才是由tokio <span class="qwen-markdown-strong" dir="ltr">Blocking Thread Pool堵塞线程池处理）。</span></p>
+<p><span class="qwen-markdown-strong" dir="ltr">&nbsp; &nbsp;&nbsp;tcp全连接队列全满，说明handler处理未及时拿取任务，但是这个异步方法里面并没有什么可能会被堵塞的处理逻辑，那就只有一种可能，tokio worker线程堵塞了。</span></p>
+<p>&nbsp;</p>
+<p><span class="qwen-markdown-strong" dir="ltr">2. 通过gdb获取线程调用栈情况</span></p>
+<p>使用gdb有个小插曲，dfdaemon进程中并未内置gdb工具。尝试针对宿主机查询pod在宿主机对应的pid进行gdb查询（方法如下），得到的线程调用栈涉及到dfdaemon内部代码时都是？？？网上查询说是因为pod里面dfdaemon的二进制文件并未支持打印内部类导致，还是需要重新编译构建二进制。</p>
+<p>对宿主机查询pod在宿主机对应的pid进行gdb查询：</p>
+<p>2.1 查询dfdaemon的pid：ps -ef | grep dfdaemon | grep -v grep&nbsp;&nbsp;</p>
+<p>2.2 gdb查询线程调用栈：gdb -p [pid] -batch -ex "thread apply all bt" &gt; thread_dump.txt.1</p>
+<p>为了使用gdb工具，并支持追溯打印内部类，对dfdaemon做如下代码调整：</p>
+<p>2.3、 Cargo.toml (右侧为调整后结果）</p>
+<p><img alt="image" width="840" height="500" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2811507/202610/2811507-20261012134729141-1102900725.png" class="lazyload"></p>
+<p>&nbsp;2.4 jdock.Dockerfile 加一行</p>
+<div>
+<pre>RUN dnf install -y gdb strace ltrace perf iotop util-linux glibc libgcc sysstat</pre>
+</div>
+<p>&nbsp;进入dfdaemon容器后，执行gdp指令gdb -p [pid] -batch -ex "thread apply all bt" &gt; thread_dump.txt.1，展示调用栈信息如下：</p>
+<div class="cnblogs_Highlighter">
+<pre class="brush:csharp;gutter:true;">Thread 6 (Thread 0x7f3ee3bfe6c0 (LWP 11) "tokio-runtime-w"):
+#0  0x00007f3ee5884c5d in syscall () from /lib64/libc.so.6
+#1  0x0000564284a767aa in dashmap::lock::RawRwLock::lock_exclusive_slow ()
+#2  0x0000564285381d2a in dashmap::DashMap&lt;K,V,S&gt;::entry ()
+#3  0x00005642854fc11f in dragonfly_client::resource::parent_selector::ParentSelector::register::{{closure}}::{{closure}} ()
+#4  0x00005642855d7dd5 in dragonfly_client::resource::task::Task::download_partial_with_scheduler_from_parent::{{closure}}::{{closure}} ()
+#5  0x00005642855cbbe1 in dragonfly_client::resource::task::Task::download_partial_with_scheduler::{{closure}}::{{closure}} ()
+#6  0x00005642855c2b47 in dragonfly_client::resource::task::Task::download::{{closure}}::{{closure}} ()
+#7  0x00005642855beebd in dragonfly_client::resource::task::Task::download::{{closure}} ()
+#8  0x000056428543414d in &lt;dragonfly_client::grpc::dfdaemon_download::DfdaemonDownloadServerHandler as dragonfly_api::dfdaemon::v2::dfdaemon_download_server::DfdaemonDownload&gt;::download_task::{{closure}}::{{closure}}::{{closure}} ()
+#9  0x00005642853ae431 in &lt;tracing::instrument::Instrumented&lt;T&gt; as core::future::future::Future&gt;::poll ()
+#10 0x00005642853168a9 in tokio::runtime::task::raw::poll ()
+#11 0x000056428612abcc in tokio::runtime::scheduler::multi_thread::worker::Context::run_task ()
+#12 0x0000564286128efe in tokio::runtime::scheduler::multi_thread::worker::run ()
+#13 0x0000564286132dca in tokio::runtime::task::raw::poll ()
+#14 0x000056428610f71c in std::sys::backtrace::__rust_begin_short_backtrace ()
+#15 0x0000564286112524 in core::ops::function::FnOnce::call_once{{vtable.shim}} ()
+#16 0x00005642860c126b in alloc::boxed::{impl#28}::call_once&lt;(), dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#17 alloc::boxed::{impl#28}::call_once&lt;(), alloc::boxed::Box&lt;dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#18 std::sys::pal::unix::thread::{impl#2}::new::thread_start () at library/std/src/sys/pal/unix/thread.rs:106
+#19 0x00007f3ee5807a6e in ?? () from /lib64/libc.so.6
+#20 0x00007f3ee5886cbc in ?? () from /lib64/libc.so.6
+
+Thread 5 (Thread 0x7f3ee3dff6c0 (LWP 10) "tokio-runtime-w"):
+#0  0x00007f3ee5884c5d in syscall () from /lib64/libc.so.6
+#1  0x0000564284a767aa in dashmap::lock::RawRwLock::lock_exclusive_slow ()
+#2  0x0000564285381d2a in dashmap::DashMap&lt;K,V,S&gt;::entry ()
+#3  0x00005642854fc11f in dragonfly_client::resource::parent_selector::ParentSelector::register::{{closure}}::{{closure}} ()
+#4  0x00005642855d7dd5 in dragonfly_client::resource::task::Task::download_partial_with_scheduler_from_parent::{{closure}}::{{closure}} ()
+#5  0x00005642855cbbe1 in dragonfly_client::resource::task::Task::download_partial_with_scheduler::{{closure}}::{{closure}} ()
+#6  0x00005642855c2b47 in dragonfly_client::resource::task::Task::download::{{closure}}::{{closure}} ()
+#7  0x00005642855beebd in dragonfly_client::resource::task::Task::download::{{closure}} ()
+#8  0x000056428543414d in &lt;dragonfly_client::grpc::dfdaemon_download::DfdaemonDownloadServerHandler as dragonfly_api::dfdaemon::v2::dfdaemon_download_server::DfdaemonDownload&gt;::download_task::{{closure}}::{{closure}}::{{closure}} ()
+#9  0x00005642853ae431 in &lt;tracing::instrument::Instrumented&lt;T&gt; as core::future::future::Future&gt;::poll ()
+#10 0x00005642853168a9 in tokio::runtime::task::raw::poll ()
+#11 0x000056428612ad4e in tokio::runtime::scheduler::multi_thread::worker::Context::run_task ()
+#12 0x0000564286128efe in tokio::runtime::scheduler::multi_thread::worker::run ()
+#13 0x0000564286132dca in tokio::runtime::task::raw::poll ()
+#14 0x000056428610f71c in std::sys::backtrace::__rust_begin_short_backtrace ()
+#15 0x0000564286112524 in core::ops::function::FnOnce::call_once{{vtable.shim}} ()
+#16 0x00005642860c126b in alloc::boxed::{impl#28}::call_once&lt;(), dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#17 alloc::boxed::{impl#28}::call_once&lt;(), alloc::boxed::Box&lt;dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#18 std::sys::pal::unix::thread::{impl#2}::new::thread_start () at library/std/src/sys/pal/unix/thread.rs:106
+#19 0x00007f3ee5807a6e in ?? () from /lib64/libc.so.6
+#20 0x00007f3ee5886cbc in ?? () from /lib64/libc.so.6
+
+Thread 4 (Thread 0x7f3ee43fd6c0 (LWP 9) "tokio-runtime-w"):
+#0  0x00007f3ee5884c5d in syscall () from /lib64/libc.so.6
+#1  0x0000564284a767aa in dashmap::lock::RawRwLock::lock_exclusive_slow ()
+#2  0x0000564285381d2a in dashmap::DashMap&lt;K,V,S&gt;::entry ()
+#3  0x00005642854fc11f in dragonfly_client::resource::parent_selector::ParentSelector::register::{{closure}}::{{closure}} ()
+#4  0x00005642855d7dd5 in dragonfly_client::resource::task::Task::download_partial_with_scheduler_from_parent::{{closure}}::{{closure}} ()
+#5  0x00005642855cbbe1 in dragonfly_client::resource::task::Task::download_partial_with_scheduler::{{closure}}::{{closure}} ()
+#6  0x00005642855c2b47 in dragonfly_client::resource::task::Task::download::{{closure}}::{{closure}} ()
+#7  0x00005642855beebd in dragonfly_client::resource::task::Task::download::{{closure}} ()
+#8  0x000056428543414d in &lt;dragonfly_client::grpc::dfdaemon_download::DfdaemonDownloadServerHandler as dragonfly_api::dfdaemon::v2::dfdaemon_download_server::DfdaemonDownload&gt;::download_task::{{closure}}::{{closure}}::{{closure}} ()
+#9  0x00005642853ae431 in &lt;tracing::instrument::Instrumented&lt;T&gt; as core::future::future::Future&gt;::poll ()
+#10 0x00005642853168a9 in tokio::runtime::task::raw::poll ()
+#11 0x000056428612ad4e in tokio::runtime::scheduler::multi_thread::worker::Context::run_task ()
+#12 0x0000564286128efe in tokio::runtime::scheduler::multi_thread::worker::run ()
+#13 0x0000564286132dca in tokio::runtime::task::raw::poll ()
+#14 0x000056428610f71c in std::sys::backtrace::__rust_begin_short_backtrace ()
+#15 0x0000564286112524 in core::ops::function::FnOnce::call_once{{vtable.shim}} ()
+#16 0x00005642860c126b in alloc::boxed::{impl#28}::call_once&lt;(), dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#17 alloc::boxed::{impl#28}::call_once&lt;(), alloc::boxed::Box&lt;dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#18 std::sys::pal::unix::thread::{impl#2}::new::thread_start () at library/std/src/sys/pal/unix/thread.rs:106
+#19 0x00007f3ee5807a6e in ?? () from /lib64/libc.so.6
+#20 0x00007f3ee5886cbc in ?? () from /lib64/libc.so.6
+
+Thread 3 (Thread 0x7f3ee45fe6c0 (LWP 8) "tokio-runtime-w"):
+#0  0x00007f3ee5884c5d in syscall () from /lib64/libc.so.6
+#1  0x0000564284a767aa in dashmap::lock::RawRwLock::lock_exclusive_slow ()
+#2  0x0000564285381d2a in dashmap::DashMap&lt;K,V,S&gt;::entry ()
+#3  0x00005642854fc11f in dragonfly_client::resource::parent_selector::ParentSelector::register::{{closure}}::{{closure}} ()
+#4  0x00005642855d7dd5 in dragonfly_client::resource::task::Task::download_partial_with_scheduler_from_parent::{{closure}}::{{closure}} ()
+#5  0x00005642855cbbe1 in dragonfly_client::resource::task::Task::download_partial_with_scheduler::{{closure}}::{{closure}} ()
+#6  0x00005642855c2b47 in dragonfly_client::resource::task::Task::download::{{closure}}::{{closure}} ()
+#7  0x00005642855beebd in dragonfly_client::resource::task::Task::download::{{closure}} ()
+#8  0x000056428543414d in &lt;dragonfly_client::grpc::dfdaemon_download::DfdaemonDownloadServerHandler as dragonfly_api::dfdaemon::v2::dfdaemon_download_server::DfdaemonDownload&gt;::download_task::{{closure}}::{{closure}}::{{closure}} ()
+#9  0x00005642853ae431 in &lt;tracing::instrument::Instrumented&lt;T&gt; as core::future::future::Future&gt;::poll ()
+#10 0x00005642853168a9 in tokio::runtime::task::raw::poll ()
+#11 0x000056428612ad4e in tokio::runtime::scheduler::multi_thread::worker::Context::run_task ()
+#12 0x0000564286128efe in tokio::runtime::scheduler::multi_thread::worker::run ()
+#13 0x0000564286132dca in tokio::runtime::task::raw::poll ()
+#14 0x000056428610f71c in std::sys::backtrace::__rust_begin_short_backtrace ()
+#15 0x0000564286112524 in core::ops::function::FnOnce::call_once{{vtable.shim}} ()
+#16 0x00005642860c126b in alloc::boxed::{impl#28}::call_once&lt;(), dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#17 alloc::boxed::{impl#28}::call_once&lt;(), alloc::boxed::Box&lt;dyn core::ops::function::FnOnce&lt;(), Output=()&gt;, alloc::alloc::Global&gt;, alloc::alloc::Global&gt; () at library/alloc/src/boxed.rs:1993
+#18 std::sys::pal::unix::thread::{impl#2}::new::thread_start () at library/std/src/sys/pal/unix/thread.rs:106
+#19 0x00007f3ee5807a6e in ?? () from /lib64/libc.so.6
+#20 0x00007f3ee5886cbc in ?? () from /lib64/libc.so.6
+</pre>
+</div>
+<p>　</p>
+<p>tokio线程池worker线程数=pod.spec.template.spec.requests.limit.Cpu（k8s里面）=4</p>
+<p>从👆🏻可以看出，4个tokio-runtime-w（worker线程）都堵塞在 ParentSelector::register方法的DashMap&lt;K,V,S&gt;::entry () 获取读写锁RawRwLock上。当有新的任务出现，tokio调度器因为无worker线程调度，而导致任务被堵塞。</p>
+<p>3. 进一步分析，具体堵塞代码：</p>
+<div class="cnblogs_Highlighter">
+<pre class="brush:csharp;gutter:true;">        for parent in parents {
+            match self.connections.entry(parent_host_id.clone()) {   <br># DashMap是按照分片Shard分配RawRwLock读写锁的，分片数=pod.spec.template.spec.requests.limit.Cpu（k8s里面）=4</pre>
+<pre class="brush:csharp;gutter:true;"># entry方法需要拿到DashMap的RawRwLock读写锁，锁粒度是分片维度</pre>
+<pre class="brush:csharp;gutter:true;"># 当某个task下载候选peer足够多，4个tokio worker线程撞击在同一个分片锁里面的概率就很大，继而所有tokio worker线程被锁住导致4001端口handler不处理。<br>## 这也就解释了，为什么dfdaemon线程hang死现象出现在集群内大面积节点同时拉取某个镜像时，而只有几个节点下载镜像时并未出现过。</pre>
+<pre class="brush:csharp;gutter:true;">                dashmap::mapref::entry::Entry::Occupied(entry) =&gt; {
+                    entry.get().increment_request();
+                    continue;
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) =&gt; {
+                    let dfdaemon_upload_client = DfdaemonUploadClient::new( #跟候选peer建立grpc连接
+                        self.config.clone(),
+                        format_url(
+                            "http",
+                            IpAddr::from_str(&amp;parent_host.ip)?,
+                            parent_host.port as u16,
+                        ),
+                        false,
+                    )
+                    .await?;
+# .await会挂起任务，直至new完成后，tokio调度器才会再次调度worker线程池来执行后面的步骤
+                    let connection = Connection::new();
+                    connection.increment_request();
+                    let shutdown = connection.shutdown.clone();
+                    entry.insert(connection);<br># insert方法里面，针对VacantEntry（也就是空entry）会重新new entry，并重新生成读写锁，分配分片，之前再Entry()方法里面占用的RWLock自然也会被释放掉（rust来说，变量在后续代码<br>未被用到，自然就会被回收掉，锁自然也消失）。
+                }
+            }
+        }</pre>
+</div>
+<h2><span style="font-size: 18px">&nbsp;复盘总结一下导致tokio线程hang住场景：</span></h2>
+<p>3.1 一个线程调用DashMap.entry方法，占用了该分片的RWLock同步写锁A，因为是VacantEntry，异步调用了New方法B与候选peer建立grpc连接，同时通过.await将任务挂起，但是RWLock写锁A未释放。</p>
+<p>3.2 其他候选peer建连过程，也纷纷调用了DashMap.entry方法。因为候选人足够多，就4个分片锁，导致4个tokio worker线程都在调用该方法时卡住，等待获取RWLock同步写锁A。</p>
+<p>3.3 New方法B执行成功，.await唤醒，需要tokio调度器调用新的worker线程处理接下来的代码逻辑，从而将RWLock同步写锁A释放。但是因为4个tokio worker线程全部都hang在等待RWLock同步写锁A上，导致无多余tokio线程可调度。</p>
+<p>3.4 大家彻底死锁。</p>
+<p>这里面就是犯了一个常见错误：</p>
+<p>&nbsp; &nbsp; .await方法不能挟持同步锁跑路！！！</p>
+<p><img alt="image" width="932" height="328" loading="lazy" data-src="https://img2024.cnblogs.com/blog/2811507/202610/2811507-20261012143410599-1480208696.png" class="lazyload"></p>
+<p>&nbsp;</p>
+<h2>解决方法：&nbsp;</h2>
+<p>把<em id="__mceDel" style="font-family: &quot;Courier New&quot;; font-size: 12px">DfdaemonUploadClient::new().await方法挪出DashMap：：entry()作用域，提前处理了。</em></p>
+<div class="cnblogs_Highlighter">
+<pre class="brush:csharp;gutter:true;">        for parent in parents {
+            if let Some(connection) = self.connections.get(&amp;parent_host_id) {
+                connection.increment_request();
+                continue;
+            }
+
+            let dfdaemon_upload_client = match DfdaemonUploadClient::new(  ##挪出entry作用域
+                self.config.clone(),
+                format_url(
+                    "http",
+                    IpAddr::from_str(&amp;parent_host.ip)?,
+                    parent_host.port as u16,
+                ),
+                false,
+            )
+                .await
+            {
+                Ok(client) =&gt; client,
+                Err(err) =&gt; {
+                    error!("failed to connect to parent {}: {}", parent_host_id, err);
+                    continue;
+                }
+            };
+
+            match self.connections.entry(parent_host_id.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(entry) =&gt; {
+                    entry.get().increment_request();
+                    continue;
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) =&gt; {
+                    let connection = Connection::new();
+                    connection.increment_request();
+                    let shutdown = connection.shutdown.clone();
+                    entry.insert(connection);
+              }
+            }
+</pre>
+</div>
+<p>　　</p>
+<p>&nbsp; 上线后观测几个月，再未出现hang死现象，问题得解！</p>
+
+</div>
+<div class="clear"></div>
+
+	<div class="postDesc">posted on 
+<span id="post-date" data-last-update-days="0.005555555555555556" data-date-updated="2026-10-12 14:46">2026-10-12 14:38</span>&nbsp;
+<a href="https://www.cnblogs.com/yennie">月影缤纷</a>&nbsp;
+阅读(<span id="post_view_count">23</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(22276475);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyennie%2Fp%2F22276475&amp;targetId=22276475&amp;targetType=0" target="_blank">举报</a>
+</div>
