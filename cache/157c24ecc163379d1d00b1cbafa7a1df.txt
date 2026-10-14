@@ -1,0 +1,296 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/KubeExplorer/p/23297995" title="发布于 2026-10-14 11:13">
+    
+
+    <span role="heading" aria-level="2">KServe 工作流程：从 InferenceService 到 vLLM 服务</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="KServe 工作流程：从 InferenceService 到 vLLM 服务" loading="lazy" data-src="https://img.lixueduan.com/ai/cover/kserve-p2-architecture.jpg" class="lazyload"></p>
+<p>上一篇完成了 KServe 的安装，并通过 InferenceService 跑通了一个 Qwen 模型服务。</p>
+<p>当时提交的 InferenceService 只包含模型格式、存储地址、GPU 资源和启动参数，KServe 却创建出了 Deployment、Service 和 HTTPRoute。这份 YAML 中没有容器镜像，那么 KServe 如何选中 HuggingFaceServer，Pod 中又为什么会运行 vLLM？</p>
+<p>这一篇先看 KServe 的整体架构和核心 CRD，再结合上一篇的 <code>qwen-llm</code>，梳理从提交 InferenceService 到请求进入 vLLM 的完整流程。</p>
+<blockquote>
+<p>以下内容基于 KServe 0.18，部署模式为 Standard。</p>
+</blockquote>
+
+<h2 id="1-kserve-整体架构">1. KServe 整体架构</h2>
+<p>KServe 是一个构建在 Kubernetes 之上的 AI 推理平台：<br>
+<img alt="KServe AI 推理平台架构概览" loading="lazy" data-src="https://img.lixueduan.com/ai/kserve/quickstart/kserve_new.png" class="lazyload"></p>
+<p>整体分为控制面和数据面：</p>
+<p><img alt="KServe Standard 模式控制面与数据面架构" loading="lazy" data-src="https://img.lixueduan.com/ai/kserve/arch/kserve-arch.jpg?v=20260802" class="lazyload"></p>
+<h3 id="11-控制面从-inferenceservice-到推理服务">1.1 控制面：从 InferenceService 到推理服务</h3>
+<p>控制面负责创建和维护推理服务。整个过程从用户提交 InferenceService 开始：</p>
+<ol>
+<li>用户通过 <code>kubectl apply</code> 将 InferenceService 提交到 Kubernetes API Server。</li>
+<li>Admission Webhook 对配置进行默认化和校验。例如补充默认部署模式，并拒绝不符合 API 约束的配置。</li>
+<li>InferenceService 写入集群后，KServe Controller 通过 Watch 感知对象变化，开始执行调谐。</li>
+<li>Controller 根据 <code>modelFormat</code> 匹配 ServingRuntime，从 Runtime 中取得模型服务器镜像和默认启动参数，再与 InferenceService 中的模型地址、运行参数和资源需求合并。</li>
+<li>在 Standard 模式下，Controller 根据合并后的配置创建 Deployment、Service 和 HTTPRoute。Pod 创建时，KServe Pod Mutating Webhook 根据存储注解注入 PVC volume 和 volumeMount；接下来由 Kubernetes 负责调度 Pod、挂载存储和分配 GPU，Gateway Controller 负责让 HTTPRoute 生效。</li>
+<li>Controller 持续观察 Deployment 和 HTTPRoute 的状态。当 Predictor 可用、路由被 Gateway 接受后，会更新 <code>PredictorReady</code>、<code>IngressReady</code> 和最终的 <code>Ready</code> 状态。</li>
+</ol>
+<p>所以，控制面管理的是推理服务的生命周期：创建、更新、状态同步，以及配置变更后的持续调谐。</p>
+<h3 id="12-数据面访问已经创建的推理服务">1.2 数据面：访问已经创建的推理服务</h3>
+<p>数据面由实际运行模型和处理请求的资源组成。上一篇的环境使用 Envoy Gateway 作为 Gateway API 的实现。模型服务 Ready 后，客户端就可以通过数据面访问推理服务。</p>
+<p>客户端访问模型域名时，请求先到达 Envoy Gateway 管理的 Envoy Proxy。Envoy Proxy 应用 <code>HTTPRoute/qwen-llm</code> 的规则，并根据其中指向 <code>Service/qwen-llm-predictor</code> 的 <code>backendRef</code>，将请求发送到 Ready 的 Predictor Pod。这里的 Service 用于标识和发现后端，并不是一个独立的代理进程。Pod 中运行的是 HuggingFaceServer，当前配置使用 vLLM 作为推理后端。vLLM 完成推理后，响应沿原链路返回客户端。</p>
+<pre><code class="language-text">Client
+  -&gt; Envoy Proxy（匹配 HTTPRoute）
+  -&gt; Predictor Pod（后端由 Predictor Service 标识）
+  -&gt; HuggingFaceServer
+  -&gt; vLLM Backend
+  -&gt; NVIDIA GPU
+</code></pre>
+<p>控制面决定服务应该如何部署，并保证它处于期望状态；数据面负责服务创建后的请求转发和模型推理。在线请求不会经过 KServe Controller。</p>
+<h2 id="2-核心-crd">2. 核心 CRD</h2>
+<p>KServe 通过 CRD 描述模型服务、运行时、推理图和模型存储初始化方式。对于上一篇的 Qwen Demo，最核心的是 InferenceService 和 ClusterServingRuntime。</p>
+<p>二者之间的关系如下：</p>
+<pre><code class="language-text">InferenceService
+  ├── 模型格式
+  ├── 模型地址
+  ├── 启动参数
+  └── 资源需求
+          |
+          | 根据 modelFormat 匹配
+          v
+ServingRuntime / ClusterServingRuntime
+  ├── 模型服务器镜像
+  ├── 默认启动参数
+  ├── 支持的模型格式
+  └── 推理协议
+</code></pre>
+<h3 id="21-inferenceservice">2.1 InferenceService</h3>
+<p>InferenceService 用于描述一个模型服务需要什么，包括模型格式、模型地址、运行参数、副本数和资源需求。</p>
+<p>一个最小的 InferenceService 如下：</p>
+<pre><code class="language-yaml">apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen-llm
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: huggingface
+      storageUri: pvc://qwen-model
+</code></pre>
+<p>InferenceService 的 Spec 可以包含以下三个逻辑部分：</p>
+<table>
+<thead>
+<tr>
+<th>组成部分</th>
+<th>是否必需</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Predictor</td>
+<td>是</td>
+<td>加载模型并执行预测或生成</td>
+</tr>
+<tr>
+<td>Transformer</td>
+<td>否</td>
+<td>请求预处理和响应后处理</td>
+</tr>
+<tr>
+<td>Explainer</td>
+<td>否</td>
+<td>生成模型解释</td>
+</tr>
+</tbody>
+</table>
+<p>对于大模型推理，通常只需要 Predictor。上一篇的 Qwen 服务也只配置了 Predictor。</p>
+<p>这里的 Predictor 是一个逻辑角色。到了 Standard 模式下，它最终会变成名为 <code>qwen-llm-predictor</code> 的 Deployment 和 Service。</p>
+<h3 id="22-servingruntime-和-clusterservingruntime">2.2 ServingRuntime 和 ClusterServingRuntime</h3>
+<p>InferenceService 描述要运行什么模型，ServingRuntime 描述使用什么模型服务器运行。</p>
+<p>Runtime API 按作用范围分为两种：</p>
+<ul>
+<li>ServingRuntime 只在当前 Namespace 中生效</li>
+<li>ClusterServingRuntime 则可以被整个集群中的 InferenceService 使用</li>
+</ul>
+<p>一个简化后的 HuggingFace Runtime 如下：</p>
+<pre><code class="language-yaml">apiVersion: serving.kserve.io/v1alpha1
+kind: ClusterServingRuntime
+metadata:
+  name: kserve-huggingfaceserver
+spec:
+  containers:
+    - name: kserve-container
+      image: kserve/huggingfaceserver:v0.18.0
+  supportedModelFormats:
+    - name: huggingface
+      version: "1"
+      autoSelect: true
+</code></pre>
+<p><code>containers</code> 定义模型服务器的镜像和启动方式，<code>supportedModelFormats</code> 声明它支持哪些模型格式。</p>
+<p>当 InferenceService 没有显式指定 Runtime 时，KServe 会根据 <code>modelFormat</code>、版本、协议以及 Runtime 的 <code>autoSelect</code> 和 <code>priority</code> 自动匹配。</p>
+<p>因此：</p>
+<pre><code class="language-yaml">modelFormat:
+  name: huggingface
+</code></pre>
+<p>表示模型格式为 <code>huggingface</code>，KServe 会选择支持该格式的 Runtime。它并不表示 Pod 中只能使用 Hugging Face Transformers 进行推理。</p>
+<h3 id="23-其他-crd">2.3 其他 CRD</h3>
+<p>除了 InferenceService 和 Runtime，KServe 还提供了一些面向特定场景的 CRD：</p>
+<ul>
+<li>InferenceGraph 编排多个 InferenceService，实现路由、分支和服务组合</li>
+<li>ClusterStorageContainer 定义不同模型存储协议对应的初始化容器和匹配规则</li>
+<li>TrainedModel 在 ModelMesh 场景中声明需要加载或卸载的模型</li>
+</ul>
+<p>上一篇的 Demo 没有使用这些资源，后续遇到对应场景时再单独分析。</p>
+<h2 id="3-核心组件">3. 核心组件</h2>
+<p>CRD 只描述期望状态，真正读取这些对象并创建模型服务的是 KServe 控制面。</p>
+<h3 id="31-webhook">3.1 Webhook</h3>
+<p>Webhook 位于资源写入 Kubernetes API 的入口。InferenceService Admission Webhook 负责补充默认值，并拒绝不符合 API 约束的配置；Pod Mutating Webhook 则会在 Pod 创建时注入模型存储相关配置。</p>
+<p>在当前环境中，Webhook 和 Controller 运行在同一个 <code>kserve-controller-manager</code> Pod 中，但承担不同职责。</p>
+<h3 id="32-kserve-controller">3.2 KServe Controller</h3>
+<p>KServe Controller 持续 Watch InferenceService，并通过 Reconcile 循环让实际状态与期望状态保持一致。</p>
+<p>它主要负责：</p>
+<ul>
+<li>匹配 ServingRuntime 或 ClusterServingRuntime</li>
+<li>合并 Runtime 与 InferenceService 中的容器配置</li>
+<li>创建工作负载、Service 和网络入口</li>
+<li>处理模型存储和健康检查配置</li>
+<li>观察底层资源状态并回写 InferenceService Status</li>
+</ul>
+<p>Controller 只负责资源编排。Deployment 创建以后，Pod 由 Kubernetes Scheduler 调度，GPU 由 NVIDIA Device Plugin 分配；Gateway Controller 负责让 HTTPRoute 生效，实际流量由 Envoy Proxy 转发。</p>
+<h3 id="33-predictor-pod-内部结构">3.3 Predictor Pod 内部结构</h3>
+<p>以上一篇的 Qwen 服务为例，Predictor Pod 内部的层次如下：</p>
+<pre><code class="language-text">Predictor Pod
+  └── HuggingFaceServer（容器主进程）
+        └── vLLM Backend
+              └── NVIDIA GPU
+</code></pre>
+<p>Predictor Pod 是模型服务的运行载体，容器主进程是 HuggingFaceServer。它负责启动模型服务并提供 OpenAI 兼容接口。</p>
+<p>当前模型使用 vLLM 作为 HuggingFaceServer 的推理后端。HuggingFaceServer 会在同一个容器中创建 vLLM 引擎，由 vLLM 使用 GPU 执行推理。</p>
+<h2 id="4-qwen-demo-工作流程">4. Qwen Demo 工作流程</h2>
+<p>前面介绍的 CRD 和组件，最终会通过 Controller 的调谐过程串起来。</p>
+<p>上一篇的 <code>qwen-llm</code> 使用 Standard 模式，下面只分析该模式下的资源创建和请求流程。</p>
+<p>上一篇使用的核心配置如下：</p>
+<pre><code class="language-yaml">apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen-llm
+  namespace: kserve-test
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: huggingface
+      storageUri: pvc://qwen-model
+      args:
+        - --model_name=qwen
+        - --max_model_len=4096
+        - --max-num-seqs=32
+        - --gpu-memory-utilization=0.8
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+</code></pre>
+<p><code>qwen-model</code> PVC 是上一篇提前创建的，InferenceService 只负责引用它。</p>
+<h3 id="41-控制面资源创建流程">4.1 控制面资源创建流程</h3>
+<p>从提交 InferenceService 到服务 Ready，完整流程如下：</p>
+<pre><code class="language-text">1. 用户提交 InferenceService/qwen-llm
+                     |
+2. Webhook 默认化并校验配置
+                     |
+3. Controller 根据 huggingface 匹配 ClusterServingRuntime
+                     |
+4. 合并启动参数、镜像和 GPU 资源，并写入模型存储注解
+                     |
+5. 创建 Deployment、Service 和 HTTPRoute
+                     |
+6. Pod Mutating Webhook 注入 PVC volume 和 volumeMount
+                     |
+7. Kubernetes 调度 Pod、挂载 PVC 并分配 GPU
+                     |
+8. Pod 启动并加载模型，Controller 汇总状态并回写 InferenceService
+</code></pre>
+<p>可以从 InferenceService Status 查看最终选择结果：</p>
+<pre><code class="language-bash">kubectl get inferenceservice qwen-llm -n kserve-test \
+  -o jsonpath='{.status.deploymentMode}{"\n"}{.status.clusterServingRuntimeName}{"\n"}'
+</code></pre>
+<pre><code class="language-text">Standard
+kserve-huggingfaceserver
+</code></pre>
+<p>Controller 选择 <code>kserve-huggingfaceserver</code>，再把 InferenceService 中的参数和 GPU 资源合并到 Runtime 提供的容器模板中。最终 Deployment 使用 GPU 版本的 HuggingFaceServer 镜像：</p>
+<pre><code class="language-text">docker.m.daocloud.io/kserve/huggingfaceserver:v0.18.0-gpu
+</code></pre>
+<p>Standard 模式下创建的资源关系如下：</p>
+<pre><code class="language-text">InferenceService/qwen-llm
+├── Deployment/qwen-llm-predictor
+│   └── ReplicaSet
+│       └── Pod
+├── Service/qwen-llm-predictor
+├── HTTPRoute/qwen-llm
+└── HTTPRoute/qwen-llm-predictor
+</code></pre>
+<p>Deployment 可用、HTTPRoute 就绪后，Controller 会把底层状态汇总到 InferenceService：</p>
+<pre><code class="language-yaml">status:
+  conditions:
+    - type: IngressReady
+      status: "True"
+    - type: PredictorReady
+      status: "True"
+    - type: Ready
+      status: "True"
+</code></pre>
+<h3 id="42-模型-pod-启动流程">4.2 模型 Pod 启动流程</h3>
+<p><code>storageUri</code> 描述模型的来源，不是容器内的最终路径，也不是 HuggingFaceServer 的启动参数。Controller 会将 <code>pvc://qwen-model</code> 写入 Pod 模板注解；ReplicaSet 创建 Pod 时，KServe Pod Mutating Webhook 读取该注解，将 <code>qwen-model</code> 解析为 PVC 名称，并向模型容器注入 PVC volume 和挂载到 <code>/mnt/models</code> 的 volumeMount。</p>
+<p>如果这里使用 <code>hf://</code> 地址，Webhook 则会注入 Storage Initializer init container，先从 Hugging Face Hub 下载模型，再通过共享的 EmptyDir volume 将模型提供给模型容器。</p>
+<p>HuggingFaceServer 启动后，<code>backend</code> 默认为 <code>auto</code>。GPU 镜像中包含 vLLM；当 vLLM 可用且模型架构在 vLLM 的支持列表中时，HuggingFaceServer 会创建 vLLM 后端并从 <code>/mnt/models</code> 加载模型。</p>
+<p>实际日志如下：</p>
+<pre><code class="language-text">Initializing a V1 LLM engine (v0.19.0)
+device_config=cuda
+Starting to load model /mnt/models...
+</code></pre>
+<p><code>kserve-huggingfaceserver</code> 是本次部署选择的 Runtime，vLLM 是 HuggingFaceServer 容器内自动选择的推理后端。因此，这次部署不需要单独指定 vLLM Runtime；集群中是否还存在其他自定义 vLLM Runtime，与这条执行链路无关。</p>
+<h3 id="43-在线请求流程">4.3 在线请求流程</h3>
+<p>服务 Ready 后，上一篇的 OpenAI Chat Completions 请求沿着下面的路径进入模型：</p>
+<pre><code class="language-text">Client
+  -&gt; Envoy Proxy（匹配 HTTPRoute/qwen-llm）
+  -&gt; Predictor Pod:8080（backendRef: Service/qwen-llm-predictor:80）
+  -&gt; HuggingFaceServer
+  -&gt; vLLM Backend
+  -&gt; NVIDIA GPU
+</code></pre>
+<p>这条请求链路属于数据面。KServe Controller 会继续维护 Deployment 和 InferenceService 状态，但不会参与请求转发。</p>
+<h2 id="5-总结">5. 总结</h2>
+<p>结合上一篇的 Qwen Demo，KServe 的整个工作过程可以概括为：</p>
+<p><img alt="KServe Standard 模式控制面与数据面架构" loading="lazy" data-src="https://img.lixueduan.com/ai/kserve/arch/kserve-arch.jpg?v=20260802" class="lazyload"></p>
+<ul>
+<li>InferenceService 描述模型服务需要什么
+<ul>
+<li><code>modelFormat</code> 声明模型格式，供 KServe 匹配 Runtime</li>
+<li><code>storageUri</code> 指定模型存储地址</li>
+<li><code>args</code> 设置模型服务器和推理引擎的启动参数</li>
+<li><code>resources</code> 声明 CPU、内存和 GPU 等资源需求</li>
+</ul>
+</li>
+<li><code>ClusterServingRuntime/kserve-huggingfaceserver</code> 提供模型服务器镜像和启动方式</li>
+<li>KServe Controller 匹配 Runtime、合并配置，并创建 Deployment、Service 和 HTTPRoute</li>
+<li>Kubernetes 负责调度 Pod、挂载 PVC 和分配 GPU</li>
+<li>Envoy Proxy 应用 HTTPRoute 规则，通过 Predictor Service 标识的后端将请求发送到 Ready Pod</li>
+<li>HuggingFaceServer 使用 vLLM Backend，由 vLLM 通过 GPU 执行推理</li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-14 11:13">2026-10-14 11:13</span>&nbsp;
+<a href="https://www.cnblogs.com/KubeExplorer">探索云原生</a>&nbsp;
+阅读(<span id="post_view_count">72</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23297995);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FKubeExplorer%2Fp%2F23297995&amp;targetId=23297995&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
