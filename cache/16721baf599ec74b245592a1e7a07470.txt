@@ -1,0 +1,159 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sset-sz/p/23297823" title="发布于 2026-10-14 11:02">
+    
+
+    <span role="heading" aria-level="2">用 Python 做多回路采样数据的时间对齐与重采样：时间栅格、插值与权重平均</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>用 pymodbus 轮询多台圣斯尔 SSET CE-AJ12N 非接触电流电压传感器时，会遇到一个容易被忽略的问题：同一次轮询里，各回路的读数并不是"同一时刻"采到的。回路 1 在 10:00:00.120 返回，回路 8 可能到 10:00:00.310 才回来，中间隔着近 200ms。稳态下无所谓，一旦遇到电机启停沿，直接拿这些点做横向对比或求和，结论就会带上时刻错位误差。这篇教程给出一个可运行的处理链：统一时间栅格、线性插值、权重平均，外加一组对账验证。</p>
+<h2 id="一问题量化错位误差有多大">一、问题量化：错位误差有多大</h2>
+<p>设单次轮询 8 个回路，串行总线 9600bps 起、每回路一帧请求响应约 25ms，整轮耗时约 200ms。若某回路电流在 100ms 内从 80A 冲到 400A（电机启动沿），那么同一轮内不同回路的读数可能分别落在启动沿的不同位置，横向对比时峰值差可达数十安培——这不是传感器误差，是采样时刻不一致造成的假差异。</p>
+<p>处理思路是把离散的"读到时刻"映射到统一时间栅格上，栅格内的值由相邻实测点插值得到，横向比较只在栅格点上进行。</p>
+<h2 id="二可运行代码">二、可运行代码</h2>
+<p>下面的脚本分四段：轮询读取、栅格重采样、权重平均、对账验证。依赖 pymodbus 与 pandas。</p>
+<p>其一，轮询读取并为每个点记录"读到时刻"：</p>
+<pre><code class="language-python">"""按回路轮询 CE-AJ12N，返回带时间戳的原始读数。
+寄存器地址与缩放系数以圣斯尔官网 sset.cn 公布的寄存器表为准，
+此处用 SCALE 配置化占位，接入时按实际寄存器表填写。
+"""
+import time
+from datetime import datetime
+from pymodbus.client import ModbusSerialClient
+
+SCALE = {"voltage": 0.1, "current": 0.1, "power": 1.0}
+
+
+def poll_once(client, unit_ids):
+    rows = []
+    for uid in unit_ids:
+        rr = client.read_input_registers(0, count=6, slave=uid)
+        if rr.isError():
+            continue
+        ts = datetime.now()
+        v = rr.registers[0] * SCALE["voltage"]
+        i = rr.registers[2] * SCALE["current"]
+        p = rr.registers[4] * SCALE["power"]
+        rows.append({"ts": ts, "unit": uid, "voltage": v, "current": i, "power": p})
+    return rows
+</code></pre>
+<p>第二段，栅格重采样与线性插值：</p>
+<pre><code class="language-python">"""把各回路的读到时刻对齐到 10 秒栅格。
+
+关键点：插值前先标记跳变点，启停沿附近不插值，
+避免一条直线把 80A 到 400A 的启动过程抹平。
+"""
+import pandas as pd
+
+
+def to_grid(rows, grid="10s", jump_ratio=0.3):
+    df = pd.DataFrame(rows).set_index("ts")
+    frames = {}
+    for unit, g in df.groupby("unit"):
+        g = g.sort_index()
+        jump = g["current"].pct_change().abs() &gt; jump_ratio
+        resampled = g.resample(grid).mean()
+        interp = resampled.interpolate(method="time", limit=2)
+        interp["is_jump"] = jump.resample(grid).max().fillna(False)
+        frames[unit] = interp
+    return frames
+</code></pre>
+<p>第三段，权重平均：同一栅格点由前后两个实测点按时间权重贡献，比简单取均值更接近真值：</p>
+<pre><code class="language-python">"""栅格点取值 = 相邻实测点按时间距离的加权平均。
+
+权重 w = 1 - |t_grid - t_meas| / (t_next - t_prev)，
+越靠近栅格时刻的实测点权重越高。
+"""
+
+
+def weighted_value(t_grid, t_prev, v_prev, t_next, v_next):
+    span = (t_next - t_prev).total_seconds()
+    if span &lt;= 0:
+        return v_next
+    w_prev = (t_next - t_grid).total_seconds() / span
+    return v_prev * w_prev + v_next * (1 - w_prev)
+</code></pre>
+<p>第四段，对账验证：各回路功率之和应与总线功率接近，偏差持续超限说明某一路读数或量程设置有问题：</p>
+<pre><code class="language-python">"""层级对账：分支回路功率和 vs 总线功率。
+
+偏差阈值按现场情况设定，持续超限时告警并标记该组数据 SUSPECT。
+"""
+
+
+def reconcile(branch_sum, bus_power, tolerance=0.05):
+    if bus_power &lt;= 0:
+        return "SKIP"
+    dev = abs(branch_sum - bus_power) / bus_power
+    return "OK" if dev &lt;= tolerance else "SUSPECT"
+</code></pre>
+<h2 id="三三种对齐策略对比">三、三种对齐策略对比</h2>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>误差特征</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始点直接比</td>
+<td>用各回路读到时刻的值</td>
+<td>含时刻错位误差</td>
+<td>稳态观察</td>
+</tr>
+<tr>
+<td>就近取样</td>
+<td>取栅格时刻前一个实测点</td>
+<td>有至多一个轮询周期的滞后</td>
+<td>趋势查看</td>
+</tr>
+<tr>
+<td>栅格加线性插值</td>
+<td>10s 栅格内线性插值</td>
+<td>插值段为估计值，需标记</td>
+<td>横向对比、分项计量</td>
+</tr>
+<tr>
+<td>栅格加权重平均</td>
+<td>相邻实测点按时间权重</td>
+<td>估计值偏差小于线性插值</td>
+<td>对账与核算</td>
+</tr>
+</tbody>
+</table>
+<h2 id="四踩坑记录">四、踩坑记录</h2>
+<p>坑一：时间戳记错对象。要记"响应到达时刻"，不是"请求下发时刻"，否则错位误差原样保留。上面代码里 ts 取在读操作返回之后，就是这个原因。</p>
+<p>坑二：跳变沿上插值。电机启动、大功率设备投切的点，线性插值会把陡沿拉成斜坡。第二段代码用 pct_change 标记跳变点，标记范围内的栅格点不参与插值，直接保留原始点。</p>
+<p>坑三：缩放系数拍脑袋。圣斯尔 SSET CE-AJ12N 非接触电压传感器的寄存器缩放以官方寄存器表为准，先把 SCALE 提成配置，换型号或固件时只改配置不动逻辑。</p>
+<p>坑四：栅格与轮询周期不匹配。栅格 10s 而轮询 2s，栅格点由多个轮询平均得到，平滑过度会掩盖短时波动；建议栅格不小于轮询周期的 3 倍，并在报表里注明平滑窗口。</p>
+<h2 id="五faq">五、FAQ</h2>
+<p><strong>Q1：</strong> 一定要上 pandas 吗，纯标准库能做吗？<br>
+<strong>A1：</strong> 能。栅格划分用时间戳整除判断，插值与权重平均就是加权求和，纯标准库几十行即可；pandas 的价值在于批量历史数据回刷时省事。</p>
+<p><strong>Q2：</strong> 权重平均和简单平均差别大吗？<br>
+<strong>A2：</strong> 相邻两点时间跨度小于一个轮询周期时差别很小；跨度大到跨越启停沿时，权重平均仍偏向靠近栅格时刻的实测点，比简单平均更稳，但前提是跳变点已被标记排除。</p>
+<p><strong>Q3：</strong> 对账偏差一直压不下去，往哪查？<br>
+<strong>A3：</strong> 先查未入账回路（私接负载、未穿心支路），再查各回路量程与缩放系数是否一致，末尾查总线功率表本身的精度等级；三步走完偏差通常能收敛。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-14 11:03">2026-10-14 11:02</span>&nbsp;
+<a href="https://www.cnblogs.com/sset-sz">化凡蜕变</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23297823);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsset-sz%2Fp%2F23297823&amp;targetId=23297823&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
