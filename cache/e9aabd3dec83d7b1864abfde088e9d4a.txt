@@ -1,0 +1,543 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/dotnet-org-cn/p/23303551" title="发布于 2026-10-14 17:26">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">SimdYolo：纯 C# YOLO 推理实现，CPU SIMD / Vulkan 架构与 PyTorch、ORT 实测</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        我实现了一个面向 .NET 应用的 YOLO 推理库 SimdYolo：C# 直接解析支持范围内的 .pt 和 ONNX，CPU 使用 SIMD/intrinsics，GPU 通过系统 Vulkan、Metal API 执行嵌入着色器。目前已验证常见 YOLOv8、YOLOv9、YOLOv10、YOLO11 的检测模型，以及 YOLOv8、YOLO11 的分割和姿态模型。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171224908-1519604021.png" class="lazyload"></p>
+<p><strong>项目仓库：</strong> <a href="https://github.com/hnlyf168/SimdYolo" target="_blank" rel="noopener nofollow">https://github.com/hnlyf168/SimdYolo</a></p>
+<p>我实现了一个面向 .NET 应用的 YOLO 推理库 <strong>SimdYolo</strong>：C# 直接解析支持范围内的 <code>.pt</code> 和 ONNX，CPU 使用 SIMD/intrinsics，GPU 通过系统 Vulkan、Metal API 执行嵌入着色器。目前已验证常见 YOLOv8、YOLOv9、YOLOv10、YOLO11 的检测模型，以及 YOLOv8、YOLO11 的分割和姿态模型。</p>
+<p>本文介绍模型加载、CPU/GPU 执行路径、同机性能排名和复测方法。项目主库为纯托管 C# 程序集，没有外部 NuGet 运行依赖；GPU 路径会调用系统原生图形 API。Python、PyTorch 和 ORT 用于开发时的导出与对照，主库推理不调用它们。</p>
+<p><strong>当前发布版本为 0.7.1，性能表对应 0.7.0 冻结 DLL。</strong> 0.7.1 增补中文注释与 XML 文档；方法签名和 IL 共 1,636 个与 0.7.0 一致。本文沿用已有正式测量数据，不把旧测量写成新一轮基准。</p>
+<h2 id="1-模型兼容范围">1. 模型兼容范围</h2>
+<p>已验证范围如下，其他尺寸和自训练模型应结合模块、算子及导出结构单独验证：</p>
+<table>
+<thead>
+<tr>
+<th>模型系列</th>
+<th>已验证检测模型</th>
+<th>已验证分割/姿态</th>
+<th>已验证格式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>YOLOv8</td>
+<td>yolov8n</td>
+<td>yolov8n-seg、yolov8n-pose</td>
+<td><code>.pt</code>、opset 17 ONNX</td>
+</tr>
+<tr>
+<td>YOLOv9</td>
+<td>Ultralytics yolov9t</td>
+<td>当前未验证</td>
+<td><code>.pt</code>、opset 17 ONNX</td>
+</tr>
+<tr>
+<td>YOLOv10</td>
+<td>yolov10n</td>
+<td>当前未验证</td>
+<td><code>.pt</code>、opset 17 ONNX</td>
+</tr>
+<tr>
+<td>YOLO11</td>
+<td>yolo11n</td>
+<td>yolo11n-seg、yolo11n-pose</td>
+<td><code>.pt</code>、opset 17 ONNX</td>
+</tr>
+</tbody>
+</table>
+<p>YOLOv9 这里特指实际参与测试的 Ultralytics YOLOv9t。原 YOLOv9 仓库的部分模块也有实现，但原仓库检查点仍需单独验证，不能按模型文件名推断兼容性。</p>
+<h3 id="pt恢复执行结构再读取权重"><code>.pt</code>：恢复执行结构，再读取权重</h3>
+<p><code>PtModel</code> 与 <code>PickleReader</code> 在 C# 中读取 Torch ZIP 的元数据和 storage，恢复支持的模块连接与权重。GLOBAL、REDUCE 按数据或符号对象处理，不导入或执行 Python。支持 FP32、FP16、BF16 storage，内部计算使用 FP32。</p>
+<p>检查点需要保存完整 YOLO <code>nn.Module</code>，例如 <code>model</code> 或 <code>ema</code>，也支持直接保存完整模型。<strong>只有 <code>state_dict</code> 时缺少执行结构，当前加载器不能自动推断任意自定义网络。</strong> TorchScript、旧式非 ZIP pickle、未知自定义模块和量化图不在当前支持范围内。</p>
+<h3 id="onnx在-c-中解析图而后执行已支持算子">ONNX：在 C# 中解析图，而后执行已支持算子</h3>
+<p><code>OnnxReader</code> 解析 protobuf，<code>OnnxModel</code> 构建和执行算子图，支持动态输入及相对模型目录解析的 external data。普通 <code>ai.onnx</code> 域中已实现的算子覆盖主要 YOLO 路径；opset 的版本范围不等于该版本内所有算子均受支持。</p>
+<p>包含未知算子、其他域、内嵌 NonMaxSuppression 的导出，以及分类/OBB 等任务需要按当前实现范围判断。Resize 主要覆盖 YOLO 常用的 nearest/asymmetric/floor 路径。通用 shape/index 运算使用 FP32，也有精确整数范围限制。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171246520-954128351.png" class="lazyload"></p>
+<h2 id="2-cpu-优化算力与数据访问要一起处理">2. CPU 优化：算力与数据访问要一起处理</h2>
+<p>源码可以从以下入口读起：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>主要职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/hnlyf168/SimdYolo/blob/main/src/SimdYolo/CpuConvolution.cs" target="_blank" rel="noopener nofollow">CpuConvolution.cs</a></td>
+<td>通用卷积空间面板打包与实际地址对齐调度</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hnlyf168/SimdYolo/blob/main/src/SimdYolo/CpuGemm.cs" target="_blank" rel="noopener nofollow">CpuGemm.cs</a></td>
+<td>AVX/FMA 分块 GEMM 与回退路径</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hnlyf168/SimdYolo/blob/main/src/SimdYolo/CpuPackedGemm.cs" target="_blank" rel="noopener nofollow">CpuPackedGemm.cs</a></td>
+<td>固定权重布局缓存</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hnlyf168/SimdYolo/blob/main/src/SimdYolo/CpuActivation.cs" target="_blank" rel="noopener nofollow">CpuActivation.cs</a></td>
+<td>向量指数、Sigmoid 和 SiLU</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hnlyf168/SimdYolo/blob/main/src/SimdYolo/CpuExecutor.cs" target="_blank" rel="noopener nofollow">CpuExecutor.cs</a></td>
+<td>后端专属工作线程、任务发布和休眠交接</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hnlyf168/SimdYolo/blob/main/src/SimdYolo/CpuTensorPool.cs" target="_blank" rel="noopener nofollow">CpuTensorPool.cs</a></td>
+<td>临时张量复用与输出所有权</td>
+</tr>
+</tbody>
+</table>
+<h3 id="21-通用卷积按需打包空间面板">2.1 通用卷积按需打包空间面板</h3>
+<p>通用卷积每次物化当前微内核需要的 16 个空间位置，将输入打包成 K×16 面板，再执行矩阵乘法。这样可以减少完整 im2col 中间矩阵的分配和内存往返。</p>
+<p>适用的固定权重可缓存打包布局。微内核写入结果后补加 bias，并在需要时融合 SiLU，减少单独遍历输出。适用的 Concat→1×1 Conv 还可以从多个输入直接打包，省去完整拼接张量。</p>
+<p>矩阵块宽度需要结合寄存器、尾部和调度成本选择。项目保留适用的 16/24/48 列等路径；某些更宽内核、F6 或分块调参没有表现出稳定收益，没有设为默认发布路径。</p>
+<h3 id="22-适用卷积与激活使用-simd">2.2 适用卷积与激活使用 SIMD</h3>
+<p>适用的 3×3 卷积使用 F2/F4 Winograd；输入、输出变换与边界有 SIMD 路径。depthwise、池化、转置和常见激活也有专用实现。</p>
+<p><code>CpuActivation</code> 的常见有限值指数路径使用 FP32 范围缩减、多项式近似和 AVX2/FMA。极值、NaN 或硬件条件不满足时保留原有回退行为；数值误差由输出对照测试约束。CPU 计算仍为 FP32，没有把结果当作 FP16/INT8 加速成绩。</p>
+<p>.NET 提供 <code>Vector&lt;T&gt;</code>、固定宽度向量和硬件 intrinsics 等层次的 SIMD API。项目根据具体路径选择 API，并检查硬件支持；不同 CPU 上的实际性能仍需测量。<a href="https://learn.microsoft.com/en-us/dotnet/standard/simd" target="_blank" rel="noopener nofollow">Microsoft 的 SIMD 文档</a>介绍了这些 API 的分工。</p>
+<h3 id="23-实际地址对齐与线程预算">2.3 实际地址对齐与线程预算</h3>
+<p>并行写入时，相邻任务可能竞争同一缓存行。通用卷积的适用路径会在 <code>fixed</code> 作用域中读取输出数组的实际地址，按 64 字节边界划分任务，并把首尾碎片交给同一线程。</p>
+<p>数组索引按 16 个 float 对齐，仍需考虑底层数组地址。实现以实际地址为准，并通过固定作用域维持地址有效性。</p>
+<p>CPU 后端拥有专属执行器，调用线程也参与计算、计入线程上限；工作线程在有界自旋后休眠。任务发布、休眠和唤醒之间使用完整内存屏障，并通过强制休眠压力测试检查交接行为。内部嵌套计算也要避免扩张线程数量。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171315246-572767500.png" class="lazyload"></p>
+<p><em>图中展示实现思路，各优化项没有在本文中被单独测量收益。历史版本耗时变化也不能全部归因于某个内核。</em></p>
+<h3 id="24-临时池与公开输出的生命周期">2.4 临时池与公开输出的生命周期</h3>
+<p>中间张量按计算图存活引用及时回收。固定权重与形状计划可缓存，但缓存受到适用条件和保留上限约束。</p>
+<p>公开输出需要脱离临时池：下一帧不能覆盖上一帧的返回结果，调用方修改输出也不能破坏模型常量。内部设备分片可以共享底层存储，但必须遵守帧、后端和偏移约束；这种内部借用视图与公开结果的所有权不同。</p>
+<h2 id="3-为什么-gpu-选择-vulkan部署可移植性与执行成本">3. 为什么 GPU 选择 Vulkan：部署、可移植性与执行成本</h2>
+<p>性能通过实测评估，部署依赖和设备覆盖也是选择后端时的重要因素。SimdYolo 的 Vulkan 路径直接调用系统 API，配合嵌入的 SPIR-V，减少额外计算运行库的分发与配置。</p>
+<h3 id="31-运行不依赖-cuda-toolkitcudnn-或-cublas">3.1 运行不依赖 CUDA Toolkit、cuDNN 或 cuBLAS</h3>
+<p><strong>使用本库的 Vulkan GPU 推理，无需安装 CUDA Toolkit，也无需打包 cuDNN、cuBLAS 等 CUDA 计算库。</strong> 模型解析、计算调度由 C# 实现，GPU 算子由项目自己的着色器执行，省去维护 CUDA 计算库版本组合的成本。</p>
+<p>库已包含预编译 SPIR-V，普通构建和运行无需 Vulkan SDK。只有修改 GLSL 着色器并重新编译时，才需要 glslang 等开发工具。Vulkan loader 与兼容显卡驱动仍然是必要条件；Windows 通常随显卡驱动提供 Vulkan 支持，Linux 则需确保 loader 与设备驱动已安装。<a href="https://developer.nvidia.com/vulkan-driver" target="_blank" rel="noopener nofollow">NVIDIA 的驱动说明</a>也列出了 Windows/Linux 的 Vulkan 支持。</p>
+<p>0.7.1 的 NuGet 包为 <strong>726,875 字节，约 710 KiB</strong>，包含库、中文文档和嵌入着色器；模型、.NET 运行时及显卡驱动不包含在这个数字里。具体文件和依赖清单见 <a href="https://github.com/hnlyf168/SimdYolo/blob/main/artifacts/validation/0.7.1/package-audit.json" target="_blank" rel="noopener nofollow">包审计</a>。</p>
+<p>需要准确区分 CUDA 的开发与运行环境：CUDA 应用可以分发所需运行库，部分框架也会携带依赖，因此“每个 CUDA 程序都必须安装完整 Toolkit”并不成立。这里描述的是 SimdYolo 自身的部署优势——Vulkan 路径没有这些 CUDA 运行依赖。</p>
+<h3 id="32-vulkan-api-跨平台跨厂商">3.2 Vulkan API 跨平台、跨厂商</h3>
+<p>Vulkan 是面向多平台、多厂商的标准 API。支持所需计算队列和着色器能力的 NVIDIA、AMD、Intel 等设备可以沿用同一后端设计，减少对单一厂商计算库的依赖；核函数、设备能力、内存类型和工作组限制仍需按设备检查与验证。<a href="https://www.vulkan.org/" target="_blank" rel="noopener nofollow">Khronos Vulkan 官网</a>介绍了标准的可移植性方向。</p>
+<p>Windows、Linux、Android 等平台提供 Vulkan 生态，计算逻辑与 SPIR-V 内核具有复用基础。API 的跨平台能力与项目完成的平台验证分别说明：</p>
+<table>
+<thead>
+<tr>
+<th>平台</th>
+<th>本项目的后端情况</th>
+<th>验证状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Windows</td>
+<td>Vulkan，加载 <code>vulkan-1.dll</code></td>
+<td>已在 GTX 1050 Ti 上实测</td>
+</tr>
+<tr>
+<td>Linux</td>
+<td>Vulkan 加载路径使用 <code>libvulkan.so.1</code></td>
+<td>尚未实机验证</td>
+</tr>
+<tr>
+<td>macOS</td>
+<td>使用独立 Metal 后端</td>
+<td>尚未实机验证</td>
+</tr>
+<tr>
+<td>Android 等移动平台</td>
+<td>Vulkan API 有生态支持；本库仍需平台适配与验证</td>
+<td>尚未验证</td>
+</tr>
+</tbody>
+</table>
+<p>macOS 的路径需要单独考虑；本项目选择 Metal，不能把 Windows/Vulkan 结果直接外推到该平台。<a href="https://docs.vulkan.org/guide/latest/platforms.html" target="_blank" rel="noopener nofollow">Khronos 的平台说明</a>区分了原生 Vulkan 与可移植层的情况。<br>
+<img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014172506541-687540986.png" class="lazyload"></p>
+<h2 id="4-基准条件与统计方式">4. 基准条件与统计方式</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>配置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>测量日期</td>
+<td>2026-10-14，北京时间</td>
+</tr>
+<tr>
+<td>CPU</td>
+<td>Intel Core i7-8700K，12 个逻辑处理器</td>
+</tr>
+<tr>
+<td>GPU</td>
+<td>NVIDIA GeForce GTX 1050 Ti</td>
+</tr>
+<tr>
+<td>系统 / SDK</td>
+<td>Windows 11、.NET SDK 10.0.401</td>
+</tr>
+<tr>
+<td>输入</td>
+<td>同一张示例图预处理后的 FP32 张量，batch=1、640×640</td>
+</tr>
+<tr>
+<td>CPU 线程预算</td>
+<td>12</td>
+</tr>
+<tr>
+<td>测量安排</td>
+<td>独立进程，配置串行执行，两轮</td>
+</tr>
+<tr>
+<td>预热与窗口</td>
+<td>30 次预热；每窗口至少 8 秒且至少 40 次推理</td>
+</tr>
+<tr>
+<td>总量</td>
+<td>8 模型 × 8 配置 × 2 轮，128 个窗口、57,628 次计时推理</td>
+</tr>
+</tbody>
+</table>
+<p>PyTorch 使用原版 <code>model.fuse()</code>；ORT 开启图优化、默认自旋及自动 CUDA 算法。ORT 对照使用 .NET 宿主，输入、输出在主机，结果复制为托管数组，与本库公开返回方式对应。</p>
+<p>此机器的 NuGet ORT GPU 原生构建存在 Pascal 内核兼容问题，对照通过 .NET 调用官方 GPU wheel 中同版本、已验证的原生 DLL。DLL 哈希保存在 JSON。ORT 模型执行由 .NET 调用完成，没有用 Python 进程执行这条对照路径。</p>
+<p>计时包含网络前向和输出头解码；GPU 包含上传与全部回读。排除图片预处理、NMS、最终 mask 后处理和冷首帧。</p>
+<p>每个独立窗口先求单帧中位耗时，再对两轮窗口中位数求中位数。<strong>按未舍入值排名，展示值保留两位小数。</strong> 两轮不足以证明小差距具有统计显著性；图中的细线是窗口中位数范围，不是置信区间。</p>
+<p>测量数据保留了模型、输入和 DLL 哈希，以及每次计时、资源采样和输出对照。它们适合核对本次实现，也为后续复测提供条件记录。</p>
+<h2 id="5-cpu-完整排名">5. CPU 完整排名</h2>
+<p>每格为中位耗时 ms + 名次，①最快、④最慢，粗体为数值上的第一名。</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th style="text-align: right">PyTorch CPU</th>
+<th style="text-align: right">C# .pt CPU</th>
+<th style="text-align: right">C# ONNX CPU</th>
+<th style="text-align: right">ORT CPU（.NET）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>yolov8n</td>
+<td style="text-align: right">44.87 ④</td>
+<td style="text-align: right"><strong>21.99 ①</strong></td>
+<td style="text-align: right">22.64 ②</td>
+<td style="text-align: right">24.25 ③</td>
+</tr>
+<tr>
+<td>yolov9t</td>
+<td style="text-align: right">77.42 ④</td>
+<td style="text-align: right">29.80 ②</td>
+<td style="text-align: right">31.45 ③</td>
+<td style="text-align: right"><strong>28.48 ①</strong></td>
+</tr>
+<tr>
+<td>yolov10n</td>
+<td style="text-align: right">60.57 ④</td>
+<td style="text-align: right"><strong>22.33 ①</strong></td>
+<td style="text-align: right">22.74 ③</td>
+<td style="text-align: right">22.36 ②</td>
+</tr>
+<tr>
+<td>yolo11n</td>
+<td style="text-align: right">51.45 ④</td>
+<td style="text-align: right"><strong>22.21 ①</strong></td>
+<td style="text-align: right">22.94 ②</td>
+<td style="text-align: right">23.34 ③</td>
+</tr>
+<tr>
+<td>yolov8n-seg</td>
+<td style="text-align: right">56.83 ④</td>
+<td style="text-align: right"><strong>28.41 ①</strong></td>
+<td style="text-align: right">28.81 ②</td>
+<td style="text-align: right">33.84 ③</td>
+</tr>
+<tr>
+<td>yolov8n-pose</td>
+<td style="text-align: right">47.69 ④</td>
+<td style="text-align: right"><strong>23.14 ①</strong></td>
+<td style="text-align: right">23.95 ②</td>
+<td style="text-align: right">25.17 ③</td>
+</tr>
+<tr>
+<td>yolo11n-seg</td>
+<td style="text-align: right">63.39 ④</td>
+<td style="text-align: right"><strong>28.29 ①</strong></td>
+<td style="text-align: right">29.21 ②</td>
+<td style="text-align: right">33.03 ③</td>
+</tr>
+<tr>
+<td>yolo11n-pose</td>
+<td style="text-align: right">54.54 ④</td>
+<td style="text-align: right"><strong>23.80 ①</strong></td>
+<td style="text-align: right">24.91 ③</td>
+<td style="text-align: right">24.81 ②</td>
+</tr>
+</tbody>
+</table>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171328015-1628306099.png" class="lazyload"></p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171335295-832292187.png" class="lazyload"></p>
+<p><code>.pt</code> CPU 比 PyTorch CPU 更快 8/8 个模型，按汇总数值比 ORT 更快 7/8 个；C# ONNX CPU 比 ORT 更快 5/8 个。</p>
+<p>YOLOv9t 的 ORT 为 28.48 ms，C# <code>.pt</code> 为 29.80 ms，仍有差距。YOLOv10n 的 C# <code>.pt</code> 与 ORT 未舍入差值只有 0.030775 ms，约 0.138%，两轮排名交换，应视为接近持平。</p>
+<h2 id="6-gpu-完整排名">6. GPU 完整排名</h2>
+<p>比较 PyTorch CUDA、两条 C# Vulkan 路径与 ORT CUDA；仍包含输入上传和全部输出回读。</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th style="text-align: right">PyTorch CUDA</th>
+<th style="text-align: right">C# .pt Vulkan</th>
+<th style="text-align: right">C# ONNX Vulkan</th>
+<th style="text-align: right">ORT CUDA（.NET）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>yolov8n</td>
+<td style="text-align: right"><strong>9.89 ①</strong></td>
+<td style="text-align: right">10.46 ②</td>
+<td style="text-align: right">10.55 ③</td>
+<td style="text-align: right">12.69 ④</td>
+</tr>
+<tr>
+<td>yolov9t</td>
+<td style="text-align: right">21.76 ④</td>
+<td style="text-align: right"><strong>12.86 ①</strong></td>
+<td style="text-align: right">14.12 ②</td>
+<td style="text-align: right">17.73 ③</td>
+</tr>
+<tr>
+<td>yolov10n</td>
+<td style="text-align: right">12.80 ③</td>
+<td style="text-align: right"><strong>10.08 ①</strong></td>
+<td style="text-align: right">10.24 ②</td>
+<td style="text-align: right">13.53 ④</td>
+</tr>
+<tr>
+<td>yolo11n</td>
+<td style="text-align: right">10.61 ②</td>
+<td style="text-align: right">10.64 ③</td>
+<td style="text-align: right"><strong>10.60 ①</strong></td>
+<td style="text-align: right">13.72 ④</td>
+</tr>
+<tr>
+<td>yolov8n-seg</td>
+<td style="text-align: right"><strong>12.89 ①</strong></td>
+<td style="text-align: right">13.72 ③</td>
+<td style="text-align: right">13.58 ②</td>
+<td style="text-align: right">16.53 ④</td>
+</tr>
+<tr>
+<td>yolov8n-pose</td>
+<td style="text-align: right"><strong>10.17 ①</strong></td>
+<td style="text-align: right">10.52 ②</td>
+<td style="text-align: right">10.78 ③</td>
+<td style="text-align: right">13.05 ④</td>
+</tr>
+<tr>
+<td>yolo11n-seg</td>
+<td style="text-align: right">13.79 ③</td>
+<td style="text-align: right"><strong>13.52 ①</strong></td>
+<td style="text-align: right">13.65 ②</td>
+<td style="text-align: right">17.56 ④</td>
+</tr>
+<tr>
+<td>yolo11n-pose</td>
+<td style="text-align: right"><strong>10.95 ①</strong></td>
+<td style="text-align: right">11.05 ②</td>
+<td style="text-align: right">11.21 ③</td>
+<td style="text-align: right">14.23 ④</td>
+</tr>
+<tr>
+<td><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171414819-720470579.png" class="lazyload"></td>
+<td style="text-align: right"></td>
+<td style="text-align: right"></td>
+<td style="text-align: right"></td>
+<td style="text-align: right"></td>
+</tr>
+<tr>
+<td><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171420757-465419799.png" class="lazyload"></td>
+<td style="text-align: right"></td>
+<td style="text-align: right"></td>
+<td style="text-align: right"></td>
+<td style="text-align: right"></td>
+</tr>
+</tbody>
+</table>
+<p>两条 Vulkan 路径在本次 8 模型汇总中均低于 ORT CUDA。相对 PyTorch CUDA，<code>.pt</code> Vulkan 数值更快 3/8 个，ONNX Vulkan 更快 4/8 个。</p>
+<p>其中 YOLO11n 的 ONNX Vulkan 与 PyTorch CUDA 只有 0.008325 ms 的差值，约 0.079%，两轮名次交换。同样不能据此宣称稳定领先。</p>
+<p>CUDA 与 Vulkan 是不同实现路径；这些结果应结合算子、融合、缓存及传输处理理解，不能直接推导为语言本身的快慢。</p>
+<h2 id="7-cpu-时间与内存成本">7. CPU 时间与内存成本</h2>
+<p>CPU% 按全机逻辑核心归一化。CPU ms/帧来自测量窗口内进程累计 CPU 时间除以帧数；并行执行时，它可能大于单帧墙钟时间。</p>
+<p>以下是逐模型比值的范围：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th style="text-align: right">CPU ms/帧 ÷ PyTorch</th>
+<th style="text-align: right">CPU ms/帧 ÷ ORT</th>
+<th style="text-align: right">RSS ÷ PyTorch</th>
+<th style="text-align: right">RSS ÷ ORT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.pt</code> CPU</td>
+<td style="text-align: right">0.33～0.45×</td>
+<td style="text-align: right">0.73～0.96×</td>
+<td style="text-align: right">1.24～1.45×</td>
+<td style="text-align: right">2.04～3.60×</td>
+</tr>
+<tr>
+<td>ONNX CPU</td>
+<td style="text-align: right">0.32～0.45×</td>
+<td style="text-align: right">0.73～0.98×</td>
+<td style="text-align: right">0.75～1.24×</td>
+<td style="text-align: right">1.51～3.09×</td>
+</tr>
+</tbody>
+</table>
+<p>RSS 包含运行库、模型、常量和缓存，不等于算子工作区。在当前测量里，C# CPU 相对 ORT 的内存成本更高，后续仍需优化。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/542536/202610/542536-20261014171432934-1563063784.png" class="lazyload"></p>
+<p>GPU 使用率与显存是整卡采样，包含桌面和其他进程，不能当作本库的单进程显存或功耗。速度、累计 CPU 时间和内存分别反映不同成本，应一起评估。</p>
+<h2 id="8-在-net-项目中使用">8. 在 .NET 项目中使用</h2>
+<h3 id="81-获取源码与模型">8.1 获取源码与模型</h3>
+<p>需要 .NET 10 SDK。使用 Git LFS 下载：</p>
+<pre><code class="language-powershell">git lfs install
+git clone https://github.com/hnlyf168/SimdYolo.git
+cd SimdYolo
+git lfs pull
+dotnet build -c Release
+</code></pre>
+<p>Release 也提供源码下载与独立模型 ZIP。模型目录有 8 个 <code>.pt</code> 和 16 个 ONNX；通常静态 opset-17 模型为 640×640，动态模型另有标记，<code>*-opset12.onnx</code> 则是固定 128×128。</p>
+<p>应用可引用仓库中的 <code>src/SimdYolo/SimdYolo.csproj</code>。也可从 Release 下载 <code>SimdYolo.0.7.1.nupkg</code> 并使用本地 NuGet 源；当前文章提供的是 GitHub 包下载，不假设 NuGet.org 已有同名包。</p>
+<h3 id="82-先检查原始推理结果">8.2 先检查原始推理结果</h3>
+<p>以下为控制台顶层代码，使用常量张量演示 API 调用和输出形状；它不验证真实图片的检测效果。</p>
+<pre><code class="language-csharp">using SimdYolo;
+
+using var detector = new YoloDetector("models/pt/yolov8n.pt",
+    new DetectorOptions
+    {
+        Device = ComputeDevice.Cpu,
+        CpuThreads = 12
+    });
+
+var input = new Tensor(1, 3, 640, 640);
+Array.Fill(input.Data, 0.5f);
+
+// 复用同一会话，先预热。
+for (int i = 0; i &lt; 3; i++) detector.PredictRaw(input);
+
+Tensor[] outputs = detector.PredictRaw(input);
+foreach (Tensor output in outputs)
+    Console.WriteLine(string.Join(" × ", output.Shape));
+</code></pre>
+<p>支持的 ONNX 只需更换模型路径。显式选择 <code>Vulkan</code> 或 <code>Metal</code> 时，初始化失败会报错；<code>Auto</code> 允许在已知初始化失败条件下回退 CPU，可通过 <code>FallbackReason</code> 查看原因。</p>
+<p><code>PredictRaw</code> 输入按 NCHW、RGB、0～1 排列，batch 取决于模型支持范围；<code>.pt</code> 输入宽高必须是 32 的倍数。</p>
+<h3 id="83-图像检测分割和姿态">8.3 图像检测、分割和姿态</h3>
+<p>下面假定调用方已解码 RGB24 字节，并得到图像宽高：</p>
+<pre><code class="language-csharp">using SimdYolo;
+
+using var detector = new YoloDetector("models/pt/yolo11n-seg.pt",
+    new DetectorOptions
+    {
+        Device = ComputeDevice.Cpu,
+        CpuThreads = 12,
+        Confidence = 0.25f,
+        IouThreshold = 0.45f
+    });
+
+IReadOnlyList&lt;YoloInstance&gt; instances =
+    detector.Predict(rgbBytes, imageWidth, imageHeight);
+
+foreach (YoloInstance instance in instances)
+{
+    Detection box = instance.Box;
+    InstanceMask? mask = instance.Mask;
+    IReadOnlyList&lt;Keypoint&gt; points = instance.Keypoints;
+    Console.WriteLine($"类别={box.ClassId}, 置信度={box.Confidence:F3}");
+}
+</code></pre>
+<p><code>Predict</code> 返回任务实例；<code>Detect</code> 只返回框并跳过 mask 解码；<code>PredictRaw</code> 返回原始张量。换成姿态模型可以获取关键点，换成检测模型可以获取框。</p>
+<p><code>InstanceMask</code> 是原图坐标中的裁剪掩码：<code>X/Y</code> 为起点，<code>Width/Height</code> 为尺寸，概率按行保存在 <code>Probabilities</code>，可用阈值生成二值掩码。关键点也使用原图坐标。</p>
+<p>会话应复用并提前预热，最终调用 <code>Dispose</code> 或使用 <code>using</code>。公开输出保留独立存储，但同一会话串行执行推理；多路并发场景还需按工作负载规划会话和线程预算。</p>
+<h2 id="9-复测与正确性检查">9. 复测与正确性检查</h2>
+<p>先用单模型 CLI 检查 CPU 与 Vulkan：</p>
+<pre><code class="language-powershell">dotnet run --project src/SimdYolo.Cli -c Release -- bench models/pt/yolov8n.pt cpu 640 40 12 30
+dotnet run --project src/SimdYolo.Cli -c Release -- bench models/onnx/yolov8n.onnx vulkan 640 40 12 30
+</code></pre>
+<p>这是上手检查。完整比较需要另外准备开发环境，包含 NumPy、psutil、Ultralytics、CPU/CUDA PyTorch、ONNX 及对应 ORT/CUDA 原生库；脚本的缓存目录和依赖要求见仓库 README。以下命令不会自动安装整套对照环境。</p>
+<p>准备一张 P6 RGB PPM 图片，生成共同的输入张量，再运行两轮正式口径的比较。新结果写到独立目录，以保留已有测量：</p>
+<pre><code class="language-powershell">dotnet build -c Release
+dotnet build tools/OrtBenchmark/OrtBenchmark.csproj -c Release
+
+New-Item -ItemType Directory -Force artifacts/local-retest | Out-Null
+
+dotnet src/SimdYolo.Cli/bin/Release/net10.0/SimdYolo.Cli.dll preprocess image.ppm artifacts/local-retest/input.f32 640
+
+python tools/compare-runtimes.py `
+  --model-dir models/pt --onnx-dir models/onnx `
+  --vision --threads 12 --warmup 30 --iterations 40 `
+  --duration 8 --repeats 2 `
+  --engines torch-cpu net-cpu net-onnx-cpu ort-net-cpu net-vulkan net-onnx-vulkan torch-cuda ort-net-cuda `
+  --input artifacts/local-retest/input.f32 `
+  --output artifacts/local-retest/comparison.json
+</code></pre>
+<p>复测时运行的是当前源码，输入图片、驱动和环境也可能变化，应以新 JSON 为准。0.7.0 的原始结果继续保持冻结。用于对照的 Python/ORT 依赖不会变成 SimdYolo 主库的运行依赖。</p>
+<p>当前 0.7.1 的回归命令：</p>
+<pre><code class="language-powershell">dotnet run --project tests/SimdYolo.Tests -c Release -- --vulkan --models models/pt
+</code></pre>
+<p>验证记录包括：</p>
+<ul>
+<li>0.7.1 Release 构建零警告、零错误；CPU/Vulkan 与 4 个真实模型共 90 项回归通过。</li>
+<li>0.7.0 正式比较的 160 个输出校验通过，其中 20 个是 PyTorch CPU 自对照，140 个是跨实现对照。</li>
+<li>另有真实图片、改输入、多帧重放、动态形状、输出所有权、SIMD 尾部及特殊值等记录。</li>
+<li>中文文档覆盖主库 625 个声明、测试 144 个声明；包内 XML 含 1,064 个中文成员说明。</li>
+</ul>
+<h2 id="10-资料与下载">10. 资料与下载</h2>
+<p>当前实现的优势，是在 .NET 中提供模型加载、CPU 算子和任务解码的一条完整路径，同时保留可检查的性能与正确性证据。继续优化的重点包括 YOLOv9 CPU、内存成本、更多模型变体和 Metal 实机验证。</p>
+<ul>
+<li><a href="https://github.com/hnlyf168/SimdYolo" target="_blank" rel="noopener nofollow">SimdYolo 仓库与使用说明</a></li>
+<li><a href="https://github.com/hnlyf168/SimdYolo/releases/tag/v0.7.1" target="_blank" rel="noopener nofollow">0.7.1 发布包与模型 ZIP</a></li>
+<li><a href="https://github.com/hnlyf168/SimdYolo/blob/main/models/README.md" target="_blank" rel="noopener nofollow">模型清单、输入尺寸与来源</a></li>
+<li><a href="https://github.com/hnlyf168/SimdYolo/blob/main/artifacts/optimized-runtime-comparison.md" target="_blank" rel="noopener nofollow">CPU/GPU 完整报告</a></li>
+<li><a href="https://github.com/hnlyf168/SimdYolo/blob/main/artifacts/optimized-runtime-comparison.json" target="_blank" rel="noopener nofollow">原始 JSON</a></li>
+<li><a href="https://github.com/hnlyf168/SimdYolo/blob/main/VALIDATION.md" target="_blank" rel="noopener nofollow">验证记录</a></li>
+<li><a href="https://github.com/hnlyf168/SimdYolo/blob/main/artifacts/validation/0.7.1/chinese-documentation.json" target="_blank" rel="noopener nofollow">0.7.1 文档覆盖数据</a></li>
+<li><a href="https://github.com/hnlyf168/SimdYolo/blob/main/artifacts/validation/0.7.1/il-audit.json" target="_blank" rel="noopener nofollow">方法 IL 一致性审计</a></li>
+</ul>
+<p>模型保留上游 AGPL-3.0 许可证和来源，项目源码当前未新增许可证，详见仓库的 <a href="https://github.com/hnlyf168/SimdYolo/blob/main/THIRD_PARTY_NOTICES.md" target="_blank" rel="noopener nofollow">第三方说明</a>。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    中国.NET协会（<a href="http://www.dotnet.org.cn" target="_blank">http://www.dotnet.org.cn</a>）<br>
+腾讯企鹅群：45132984<a target="_blank" href="http://wp.qq.com/wpa/qunwpa?idkey=70cd6c09355ad0beae9424fc818c26b5cdc2c57bd6ceac797a3fce483cddb069"><img border="0" src="http://pub.idqqimg.com/wpa/images/group.png" alt="中国.NET协会" title="中国.NET协会"></a><br>
+博客园地址：<a href="http://http://www.cnblogs.com/dotnet-org-cn">http://http://www.cnblogs.com/dotnet-org-cn</a><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;国内唯一一个以非盈利的.NET协会，致力打造国内具有权威性、价值性的.NET协会。
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-14 17:27">2026-10-14 17:26</span>&nbsp;
+<a href="https://www.cnblogs.com/dotnet-org-cn">中国.NET研究协会</a>&nbsp;
+阅读(<span id="post_view_count">162</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23303551);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fdotnet-org-cn%2Fp%2F23303551&amp;targetId=23303551&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
