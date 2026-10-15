@@ -1,0 +1,694 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zrui-xyu/p/23310465" title="发布于 2026-10-15 09:53">
+    
+
+    <span role="heading" aria-level="2">10 万人抢 2000 个座位，电影票选座系统怎么防超卖？一文讲透大厂高频场景题</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        10 万人抢 2000 座位的电影票选座系统，大厂面试高频场景。四层漏斗架构，Redis Lua 原子批量锁座，MySQL 乐观锁 + 唯一索引兜底；Bitmap 压缩座位图，延迟消息释放锁，状态机保障幂等，完整解决超卖、多座位锁冲突、缓存一致性等痛点，面试可直接背诵。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="10-万人抢-2000-个座位电影票选座系统怎么防超卖一文讲透大厂高频场景题">10 万人抢 2000 个座位，电影票选座系统怎么防超卖？一文讲透大厂高频场景题</h1>
+<p>春节档热门场次，3 秒钟 10 万人抢 2000 个座位。这道题出现在面试里，考的不是你画图快不快，而是五硬功夫：防超卖、原子性、延迟任务、幂等、缓存一致性。我把整理过的 7 个版本的答题思路合并成这一篇，从架构到代码一次讲透，适合面试前直接背，也适合做秒杀、库存类系统时参考。</p>
+<h2 id="一别急着画图先对齐口径反问才是加分项">一、别急着画图：先对齐口径，反问才是加分项</h2>
+<p>面试官笑着说"来，设计一个类似猫眼/淘票票的选座购票系统"，90% 的人上来就画架构图。其实最加分的第一步是反问，把边界问清楚——边界不同，方案完全是两个样子。</p>
+<table>
+<thead>
+<tr>
+<th>反问项</th>
+<th>典型回答</th>
+<th>对设计的影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用户选座还是系统分配</td>
+<td>用户自主选座</td>
+<td>必须精确到 <code>seatId</code>，不是扣一个库存数字</td>
+</tr>
+<tr>
+<td>规模与并发</td>
+<td>单场次 2000 座，峰值 QPS 5w+</td>
+<td>典型读多写少 + 强并发</td>
+</tr>
+<tr>
+<td>一场能买几张</td>
+<td>限购 4~6 张，支持连座/情侣座</td>
+<td>一人一锁 + 限购校验 + 防黄牛</td>
+</tr>
+<tr>
+<td>锁座多久</td>
+<td>15 分钟</td>
+<td>超时释放机制是刚需</td>
+</tr>
+<tr>
+<td>一致性要求</td>
+<td>绝不超卖，允许少卖</td>
+<td>宁可拒单，不可重单</td>
+</tr>
+<tr>
+<td>支付形态</td>
+<td>第三方支付异步回调</td>
+<td>可能重复、延迟回调，要状态机</td>
+</tr>
+<tr>
+<td>是否对接第三方票务</td>
+<td>是（专资/影院系统）</td>
+<td>出票、退票都要幂等 + 对账</td>
+</tr>
+</tbody>
+</table>
+<p>问完这一圈，系统的轮廓就出来了：<strong>读多写少、强并发、状态有生命周期</strong>。核心矛盾只有一个词——超卖。</p>
+<blockquote>
+<p>关键认知：千万用户不等于千万并发下单。真正的压力是"一个场次、几百个座位、开售瞬间几十万个请求"。所以设计的第一性原理不是"扛住所有流量"，而是<strong>尽早把无效请求挡在外面，让最终落到数据库的写并发收敛到接近真实座位数</strong>。</p>
+</blockquote>
+<p>这句话建议背下来，面试官听到基本会点头。口径对齐了，再看架构怎么分层——这套架构有个很形象的比喻：四层漏斗。</p>
+<h2 id="二整体架构四层漏斗越往后越贵">二、整体架构：四层漏斗，越往后越"贵"</h2>
+<p>架构不是堆组件，而是一个漏斗：请求一层层往下走，越往下数量越少、代价越高。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261015095125435-2114170363.png" class="lazyload"></p>
+<p>每一层各干一件事：</p>
+<ul>
+<li><strong>网关层</strong>：限流、鉴权、风控、幂等校验，先把黄牛脚本和无效请求挡掉；</li>
+<li><strong>缓存层</strong>：Caffeine 本地缓存扛秒级的座位图读，Redis 做座位状态的裁决，扛住绝大部分并发；</li>
+<li><strong>数据库层</strong>：MySQL 是数据的最终权威，唯一索引 + 乐观锁做兜底；</li>
+<li><strong>消息层</strong>：延迟消息管 15 分钟超时释放，事务消息/本地消息表管出票的最终一致；</li>
+<li><strong>对账层</strong>：定期比对 Redis、MySQL、第三方票务三方数据，专门收拾各种不一致。</li>
+</ul>
+<p>一句话概括设计原则：</p>
+<blockquote>
+<p><strong>Redis 做高速裁决，MySQL 做最终权威，消息做最终一致，对账做兜底。</strong></p>
+</blockquote>
+<p>可能有人问：搞这么多层，是不是过度设计？这个场景里，冗余就是正义。一次超卖带来的客诉成本和品牌损失，远高于多几台机器的钱。<strong>架构上宁可用三层冗余换零超卖</strong>，这笔账划得来。</p>
+<p>骨架有了，接下来是血肉——数据模型。这一步不少人会翻车。</p>
+<h2 id="三数据模型静态模板和动态状态必须拆开">三、数据模型：静态模板和动态状态必须拆开</h2>
+<p>先说个坑：别把座位塞进一个大 JSON 字段里。影厅改布局和卖票改状态会互相打架，想加索引都没地方加，我见过的几个线上事故就是这么来的。</p>
+<p>正确姿势是拆两半：<strong>静态模板几乎不变，可以长缓存；动态状态高频写，是热点所在</strong>。</p>
+<pre><code class="language-sql">-- 1. 影厅座位模板（静态：一个影厅一份，几乎不变）
+CREATE TABLE hall_seat_template (
+    id        BIGINT PRIMARY KEY,
+    hall_id   BIGINT NOT NULL,
+    seat_no   VARCHAR(16) NOT NULL,      -- 'A01'
+    row_no    INT, col_no INT,           -- 行 / 列
+    x INT, y INT,                        -- 前端渲染坐标
+    seat_type TINYINT DEFAULT 0,         -- 0普通 1VIP 2情侣 3无障碍 4维修
+    group_id  BIGINT DEFAULT NULL,       -- 情侣座分组，选座时校验组完整性
+    UNIQUE KEY uk_hall_seat (hall_id, seat_no)
+);
+
+-- 2. 场次座位状态（动态：每个场次 x 每个座位一条，热点表）
+CREATE TABLE show_seat (
+    id               BIGINT PRIMARY KEY,
+    show_id          BIGINT NOT NULL,
+    seat_no          VARCHAR(16) NOT NULL,
+    status           TINYINT NOT NULL DEFAULT 0,   -- 0可选 1锁定 2已售
+    lock_user_id     BIGINT DEFAULT NULL,
+    order_no         VARCHAR(32) DEFAULT NULL,
+    lock_expire_time DATETIME DEFAULT NULL,
+    version          INT NOT NULL DEFAULT 0,
+    UNIQUE KEY uk_show_seat (show_id, seat_no)     -- 防超卖的最后一道防线
+);
+
+-- 3. 订单
+CREATE TABLE ticket_order (
+    order_no VARCHAR(32) PRIMARY KEY,
+    user_id  BIGINT NOT NULL,
+    show_id  BIGINT NOT NULL,
+    seat_nos VARCHAR(255),
+    status   TINYINT NOT NULL DEFAULT 0,           -- 0待支付 1已支付 2已关闭
+    UNIQUE KEY uk_idem (user_id, show_id, seat_nos) -- 防多端重复下单
+);
+</code></pre>
+<p>三个设计点值得单独说：</p>
+<p><strong>① 状态必须跟着场次走。</strong> 同一个影厅，不同场次的座位状态是独立的，所以状态必须挂在 <code>show_id</code> 下面，不能放在影厅座位模板上。<code>show_seat</code> 每个场次每个座位一条记录，座位（物理存在）和场次（业务维度）彻底解耦。</p>
+<p><strong>② 唯一索引是防超卖的最后一根救命稻草。</strong> <code>uk_show_seat (show_id, seat_no)</code> 意味着哪怕缓存、代码全部失守，数据库也保证一个场次的一个座位只有一条记录，第二个人根本插不进来。</p>
+<p><strong>③ 特殊座位要提前建模。</strong> 情侣座、无障碍座用 <code>seat_type</code> 标记，情侣座再挂一个 <code>group_id</code>，选座时校验分组完整性，防止把情侣座拆卖。订单表上的 <code>uk_idem</code> 则负责拦住手机 + PC 同时提交的多端重复下单。</p>
+<p>表有了，状态就得有人管。下一节的状态机，是画出来面试官眼睛会亮的东西。</p>
+<h2 id="四座位状态机整个系统的灵魂">四、座位状态机：整个系统的灵魂</h2>
+<p>座位的状态流转其实就是一个有限状态机。锁定是中间态，而且必须有时效——不然用户选了不付款，座位就被"钉死"了。</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261015095143334-801730686.png" class="lazyload"></p>
+<p>配一条铁律：</p>
+<blockquote>
+<p>任何状态迁移都走 <code>UPDATE ... WHERE status = ? AND version = ?</code>，<strong>影响行数不等于预期就判定操作失败</strong>。这一条既是幂等的根基，也是防超卖的最后一道闸。</p>
+</blockquote>
+<p>别小看这一招。重复的支付回调、重复的 MQ 消费，只要状态机 UPDATE 返回 0 行，就全部无害化。</p>
+<p>状态机定了，主链路就自然推出来了。不过看代码之前，先带着一个问题：用户一次选 4 个座位，锁到第 2 个时发现被人抢了，怎么办？锁了一半的中间状态，是最麻烦的事。</p>
+<h2 id="五核心锁座链路锁前置把并发挡在数据库外面">五、核心锁座链路：锁前置，把并发挡在数据库外面</h2>
+<p>完整的锁座链路长这样：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261015095200952-380138002.png" class="lazyload"></p>
+<p>拆成步骤就六步：</p>
+<ol>
+<li>用户提交选座请求，前端带上本次生成的 <code>clientToken</code>；</li>
+<li>后端先做幂等校验，再校验座位合法性（属于该场次、状态空闲）；</li>
+<li><strong>Redis + Lua 批量原子锁座</strong>，所有座位都锁成功才算成功；</li>
+<li>锁成功：数据库 CAS 落库，生成"待支付"预订单，发 15 分钟延迟消息；</li>
+<li>锁失败：直接返回"座位被占"，根本不碰数据库；</li>
+<li>支付成功：状态机把座位推进到已售；延迟消息到期检查，未支付就释放锁、回滚座位。</li>
+</ol>
+<p>整条链路的设计思想就四个字：<strong>锁前置</strong>。在写数据库之前，先用 Redis 的原子操作把座位占住，让数据库只处理真正有可能成功的请求。</p>
+<p>下面进入硬货代码环节，上面每个点都有对应实现。</p>
+<h2 id="六核心代码硬货">六、核心代码硬货</h2>
+<h3 id="61-redis-lua-原子锁座一次解决全成或全败">6.1 Redis Lua 原子锁座：一次解决"全成或全败"</h3>
+<p>为什么必须用 Lua？一个订单可能选 4 个座位，必须"要么全占、要么全不占"。逐个 SET 会出现锁了一半的中间态；而且"检查"和"锁定"两步之间本身就有并发窗口。Redis 单线程执行 Lua 脚本是原子的，一次 RTT 搞定，检查和加锁之间插不进任何请求。</p>
+<pre><code class="language-lua">-- KEYS: 每个座位的锁 key，seat:lock:{showId}:{seatId}
+-- ARGV[1] = lockToken（订单号或用户ID，用于校验锁归属）
+-- ARGV[2] = 过期秒数（15 分钟 = 900）
+
+-- 第一步：先校验全部座位
+for i, key in ipairs(KEYS) do
+    local holder = redis.call('GET', key)
+    if holder ~= false then
+        -- 座位被占，返回具体冲突的是哪一个
+        return {0, key}
+    end
+end
+
+-- 第二步：全部通过，批量写入
+-- 脚本在 Redis 单线程中原子执行，不存在中间状态
+for i, key in ipairs(KEYS) do
+    redis.call('SET', key, ARGV[1], 'EX', tonumber(ARGV[2]))
+end
+return {1, #KEYS}
+</code></pre>
+<p>Java 侧调用：</p>
+<pre><code class="language-java">@Service
+public class SeatLockService {
+
+    private static final DefaultRedisScript&lt;List&gt; LOCK_SCRIPT =
+            new DefaultRedisScript&lt;&gt;(LOCK_LUA, List.class);
+
+    /**
+     * 批量锁座：原子操作，要么全部成功，要么全部失败
+     */
+    public boolean batchLockSeats(Long showId, List&lt;Long&gt; seatIds,
+                                  String lockToken, int lockSeconds) {
+        List&lt;String&gt; keys = seatIds.stream()
+                .map(id -&gt; "seat:lock:" + showId + ":" + id)
+                .collect(Collectors.toList());
+
+        List&lt;?&gt; result = redisTemplate.execute(
+                LOCK_SCRIPT, keys, lockToken, String.valueOf(lockSeconds));
+
+        return result != null &amp;&amp; Long.valueOf(1L).equals(result.get(0));
+    }
+}
+</code></pre>
+<blockquote>
+<p><strong>技术亮点</strong></p>
+<ul>
+<li><strong>无锁化</strong>：不引入分布式锁，Redis 单线程执行 Lua 天然原子，省掉一次 RTT 和锁等待，也没有忘解锁、锁续期的烦恼；</li>
+<li><strong>先全校验、再全写入</strong>：多座位订单要么全锁、要么一个不锁，不会留下半成品；</li>
+<li><strong>锁自带 TTL</strong>：服务宕机锁也会自动过期，从根上防死锁；</li>
+<li><strong>锁值存归属标识</strong>：锁里存订单号或用户 ID，解锁时校验归属、只删自己的锁，避免误删别人刚锁上的新锁。</li>
+</ul>
+</blockquote>
+<p>再给两个进阶技巧，面试时说出来明显高一个段位：</p>
+<ul>
+<li><strong>过期锁可抢占</strong>：校验时如果发现座位处于锁定状态但已过期，直接视为可抢占。这样"占座不付钱"的座位能被后来者回收，不用干等清理任务；</li>
+<li><strong>stock 计数器快速拦截</strong>：在 Lua 之外维护一个余票 key，余票不足直接返回失败，能挡掉 90% 的无效流量，Lua 脚本不必每次都遍历。</li>
+</ul>
+<p>顺带一提，如果业务简单到只选单座，一句 <code>SET key token NX EX 900</code> 就够了，SETNX 加过期时间一条命令保证原子。但失败时记得二次判断：key 可能是自己之前锁的（重试场景），比对锁值，是自己锁的就直接放行。</p>
+<h3 id="62-数据库乐观锁兜底redis-说了不算db-说了算">6.2 数据库乐观锁兜底：Redis 说了不算，DB 说了算</h3>
+<p>可能有人问：Redis 都挡住了，还要数据库干嘛？因为 <strong>Redis 主从切换可能丢锁</strong>，缓存只是加速器，不是最终权威。</p>
+<p>数据库层就靠一条 SQL：</p>
+<pre><code class="language-sql">UPDATE show_seat
+   SET status = 1,
+       lock_user_id = #{userId},
+       order_no     = #{orderNo},
+       lock_expire_time = DATE_ADD(NOW(), INTERVAL 15 MINUTE),
+       version = version + 1
+ WHERE show_id = #{showId}
+   AND seat_no IN (...)
+   AND status = 0;          -- CAS 条件：只有可选才能被锁
+</code></pre>
+<p>乐观锁的精髓就在 <code>AND status = 0</code>：只有"可选"的座位才能被改成"锁定"，天然防并发。Java 侧判断影响行数是否等于座位数，不等就说明有人抢先落库了。再配合前面的唯一索引，双保险。</p>
+<p>把 Redis 和数据库串起来的主流程代码如下，重点看幂等和补偿两处：</p>
+<pre><code class="language-java">@Service
+public class SeatService {
+
+    @Transactional(rollbackFor = Exception.class)
+    public SeatLockResult lockSeats(Long showId, List&lt;Long&gt; seatIds,
+                                    Long userId, String clientToken) {
+        // ① 幂等：同一个 clientToken 只产生一个业务结果
+        //    前端连点、网关重试、弱网重发全部挡住
+        IdemRecord idem = idemMapper.selectByToken(clientToken);
+        if (idem != null &amp;&amp; idem.isSuccess()) {
+            return idem.getResult();          // 重复请求直接返回原结果
+        }
+        idemMapper.insertIgnore(clientToken, userId);   // 唯一索引兜底
+
+        // ② Redis Lua 原子锁座：挡住 99% 的并发请求
+        boolean locked = seatLockService.batchLockSeats(
+                showId, seatIds, clientToken, 900);
+        if (!locked) {
+            return SeatLockResult.fail("手慢了，座位被抢走了");
+        }
+
+        try {
+            // ③ 数据库乐观锁落库：影响行数必须等于座位数
+            int rows = seatMapper.casLock(showId, seatIds, userId);
+            if (rows != seatIds.size()) {
+                throw new BizException("座位状态异常，请重选");
+            }
+            // ④ 生成待支付订单 + 发 15 分钟延迟消息
+            Order order = orderService.createPreOrder(showId, seatIds, userId);
+            mqProducer.sendDelay(new SeatReleaseMsg(order), 15, TimeUnit.MINUTES);
+            return SeatLockResult.success(order);
+        } catch (Exception e) {
+            // ⑤ 补偿：任何失败都要回滚 Redis 锁，不留孤儿锁
+            seatLockService.batchUnlockSeats(showId, seatIds, clientToken);
+            throw e;
+        }
+    }
+}
+</code></pre>
+<p>这里藏着两条救命经验，我都真实踩过：</p>
+<blockquote>
+<p><strong>踩坑提醒</strong></p>
+<ol>
+<li><strong>补偿回滚必须写</strong>。Redis 锁成功、数据库落库失败，如果不回滚 Redis，就会出现孤儿锁——座位在缓存里被锁着，数据库里却没有订单，用户选不了，排查半天找不到原因。任何异常路径都要反扣 Redis。</li>
+<li><strong>幂等要靠唯一索引，不要靠代码</strong>。<code>insertIgnore</code> 配合 <code>(user_id, client_token)</code> 唯一索引才算数。靠"先查一下再插入"的写法，查和插之间有并发窗口，连点两下照样两单。</li>
+</ol>
+</blockquote>
+<blockquote>
+<p><strong>双保险逻辑</strong>：Redis 挂了，数据库唯一索引 + <code>status = 0</code> 条件挡住；数据库慢，Redis 挡住大流量。<strong>任何一层挂掉，都不会超卖。</strong></p>
+</blockquote>
+<h3 id="63-座位图渲染bitmap-把-100kb-压成-250-字节">6.3 座位图渲染：Bitmap 把 100KB 压成 250 字节</h3>
+<p>座位图是读多写少的大头。2000 个座位用 JSON 返回，一次请求 100KB 起步，QPS 5w 直接打爆带宽。看一组对比：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>2000 座数据量</th>
+<th>点评</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JSON 数组</td>
+<td>约 100 KB</td>
+<td>带宽杀手</td>
+</tr>
+<tr>
+<td>压缩字符串</td>
+<td>约 2 KB</td>
+<td>中规中矩</td>
+</tr>
+<tr>
+<td><strong>Bitmap</strong></td>
+<td><strong>250 字节</strong></td>
+<td><strong>缩小 400 倍</strong></td>
+</tr>
+</tbody>
+</table>
+<p>实现也很简单：</p>
+<pre><code class="language-java">// 座位图：2000 个座位 = 2000 bit = 250 字节，一次 GET 拿走
+public String getSeatMap(Long showId) {
+    byte[] bitmap = redisTemplate.opsForValue().get("seat:map:" + showId);
+    return Base64.getEncoder().encodeToString(bitmap);   // 前端解码渲染
+}
+
+// 标记已售：idx = 行号 * 列数 + 列号
+public void markSold(Long showId, List&lt;Integer&gt; seatIndexes) {
+    for (Integer idx : seatIndexes) {
+        redisTemplate.opsForValue().setBit("seat:map:" + showId, idx, true);
+    }
+}
+</code></pre>
+<p>存储选型上也有个对比表，面试被追问"为什么不直接查 MySQL"时甩出来：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL 行锁</td>
+<td>可靠</td>
+<td>并发锁竞争严重，性能差</td>
+</tr>
+<tr>
+<td>纯 Redis BitMap</td>
+<td>极快，内存操作</td>
+<td>需要持久化兜底</td>
+</tr>
+<tr>
+<td><strong>BitMap + MQ 异步落库</strong></td>
+<td><strong>高并发 + 可靠</strong></td>
+<td>架构稍复杂</td>
+</tr>
+</tbody>
+</table>
+<p>想表达更多状态，可以升级到 2bit 编码：<code>00</code>=不可用、<code>01</code>=可选、<code>10</code>=锁定、<code>11</code>=已售。一个 300 座的影厅只要 75 字节，一次 GET 拿全厅，比查 300 次数据库香太多。</p>
+<blockquote>
+<p><strong>展示用 Bitmap，裁决用 Hash + Lua</strong>——Bitmap 负责"看得快"，座位的状态明细（锁 token、过期时间、版本号）放 Hash，锁座裁决走 Hash + Lua。职责分开，不要混用。</p>
+</blockquote>
+<p>Redis 的 key 设计可以参考这张表：</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>类型</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>show:{showId}:seat</code></td>
+<td>Hash</td>
+<td>座位明细：状态、lockToken、过期时间、版本</td>
+</tr>
+<tr>
+<td><code>show:{showId}:bitmap</code></td>
+<td>Bitmap</td>
+<td>2bit/座，一次 GET 返回整个影厅座位图</td>
+</tr>
+<tr>
+<td><code>show:{showId}:locker:{userId}</code></td>
+<td>Set</td>
+<td>一人一锁 + 限购校验</td>
+</tr>
+<tr>
+<td><code>show:{showId}:stock</code></td>
+<td>String</td>
+<td>余票数，只做快速拦截，不做最终裁决</td>
+</tr>
+</tbody>
+</table>
+<p>热点场次的座位图读路径还要叠多级缓存：</p>
+<pre><code class="language-java">@Cacheable(cacheNames = "seatMap", key = "#showId", sync = true)
+public SeatMapVO seatMap(Long showId) {
+    byte[] bits = redisBitmapService.getAll(showId);     // 一次 GET 拿全厅
+    return SeatMapVO.decode(bits, hallLayout(showId));
+}
+// 读路径：Caffeine（5~30s 随机 TTL）→ Redis（分钟级随机 TTL）→ DB
+// 写路径：Cache Aside，先更新数据库，再删缓存
+</code></pre>
+<p><code>sync = true</code> 让同一个 key 只有一个请求穿透到后层（单飞），缓存击穿解决；随机 TTL 防雪崩；写路径采用 Cache Aside 模式——<strong>先更新数据库，再删除缓存</strong>。座位状态最终以数据库为准，缓存只做访问加速，这个主次要分清。</p>
+<h3 id="64-超时释放延迟消息为主定时扫描兜底">6.4 超时释放：延迟消息为主，定时扫描兜底</h3>
+<p>锁座之后用户不付钱，座位必须还回去。这部分是典型的"看起来简单，做起来全是坑"。</p>
+<p>主方案用延迟消息，下单成功时投递（前面主流程已发），消费端做双重校验：</p>
+<pre><code class="language-java">@Component
+@RocketMQMessageListener(topic = "SEAT_RELEASE_TOPIC",
+                         consumerGroup = "seat-release-group")
+public class SeatReleaseConsumer implements RocketMQListener&lt;SeatReleaseMsg&gt; {
+
+    @Override
+    public void onMessage(SeatReleaseMsg msg) {
+        // 先查幂等：订单已支付或已关闭，直接跳过
+        Order order = orderMapper.selectByOrderNo(msg.getOrderNo());
+        if (order == null || order.getStatus() != OrderStatus.UNPAID) {
+            return;
+        }
+        // CAS 关单：只有 待支付 → 已关闭 能成功，重复消费天然被挡
+        int rows = orderMapper.casUpdateStatus(order.getOrderNo(), UNPAID, CLOSED);
+        if (rows == 0) return;
+
+        // 释放座位：带 lock_user_id 条件，只释放本订单锁的座位
+        seatMapper.releaseByOrder(order.getShowId(), order.getOrderNo(),
+                                  order.getUserId());
+        seatLockService.batchUnlockSeats(order.getShowId(), order.getSeatIds(),
+                                         order.getLockToken());
+        cacheService.evictSeatMap(order.getShowId());
+    }
+}
+</code></pre>
+<p>两个细节值得注意：</p>
+<ul>
+<li><strong>先查支付状态再释放</strong>：MQ 可能重复消费，已支付的订单必须直接跳过，否则就是把付过钱的座位放出去卖第二次；</li>
+<li><strong>释放 SQL 带 <code>lock_user_id</code> 条件</strong>：只释放自己锁的座位，防止误释放别人刚重新锁上的座位。</li>
+</ul>
+<pre><code class="language-sql">UPDATE show_seat
+   SET status = 0, lock_user_id = NULL, order_no = NULL
+ WHERE show_id = #{showId}
+   AND order_no = #{orderNo}
+   AND lock_user_id = #{userId};   -- 只释放自己锁的座位
+</code></pre>
+<p>延迟消息也可能丢（MQ 故障、消费异常），所以还要一个定时任务兜底，每 5 分钟扫一次 <code>status = 1 AND lock_expire_time &lt; NOW()</code> 的脏数据强制释放：</p>
+<pre><code class="language-java">@Scheduled(fixedDelay = 5_000)
+public void releaseExpiredSeats() {
+    // 按实例取模分片扫描，避免多实例重复处理
+    List&lt;ShowSeat&gt; expired = seatMapper.scanExpired(instanceId, SHARD_TOTAL, 500);
+    for (ShowSeat seat : expired) {
+        // 带版本号校验：防止误释放"释放后又被别人买走"的座位
+        int n = seatMapper.releaseWithVersion(
+                seat.getShowId(), seat.getSeatId(), seat.getVersion());
+        if (n == 1) {
+            seatLockService.unlock(seat.getShowId(), seat.getSeatId(),
+                                   seat.getLockToken());
+        }
+    }
+}
+</code></pre>
+<p>最后一个坑必须单独提醒，不少人在线上栽过：</p>
+<blockquote>
+<p><strong>千万别用 Redis 的 keyspace notification（过期事件）来释放座位！</strong><br>
+官方文档写得很清楚：过期事件<strong>不保证在 TTL 归零时立即触发</strong>（惰性删除 + 渐进式回收），而且 Cluster 模式下事件不会广播到所有节点。用它做释放 = 延迟释放 + 漏释放。<br>
+正解是三保险：<strong>Redis TTL 让座位在前端"看起来没了"，数据库 <code>expire_at</code> 定时扫描让座位"真的放回去"，延迟消息在中间加速</strong>。</p>
+</blockquote>
+<p>顺带补一句：如果担心"用户正在付钱、锁却到期了"的误释放，可以给锁加看门狗续期；但更稳的做法还是释放时带版本号和用户校验，把误伤挡在 SQL 层。</p>
+<h3 id="65-支付回调与出票状态机就是最好的幂等">6.5 支付回调与出票：状态机就是最好的幂等</h3>
+<p>支付渠道最多会重试 10 次，回调可能重复、可能乱序（先收到失败、后收到成功）。幂等一行 CAS 就够：</p>
+<pre><code class="language-java">public void handlePayNotify(PayNotify notify) {
+    // 先验签、再解密（如微信支付 AES-256-GCM），然后才进业务
+    // CAS 状态机：只有 待支付 → 已支付 能成功，天然幂等
+    int rows = orderMapper.casUpdateStatus(notify.getOrderNo(), UNPAID, PAID);
+    if (rows == 0) {
+        return;   // 重复回调或状态不允许，直接吞掉，给渠道回成功
+    }
+    seatMapper.confirmSold(notify.getShowId(), notify.getSeatIds()); // 座位 1 → 2
+    cacheService.evictSeatMap(notify.getShowId());
+    mqProducer.sendTxMessage(ISSUE_TICKET_TOPIC, notify.getOrderNo());
+}
+</code></pre>
+<p>注意两点：<strong>不要写"先查再改"</strong>，查和改之间有并发窗口，要靠状态机 UPDATE 的原子性；回调接口必须快速返回，拖久了渠道认为超时，又会重试一轮。</p>
+<p>支付成功之后，出票是跟第三方票务系统打交道的跨系统动作，不能塞进支付事务里，用事务消息或本地消息表做最终一致：</p>
+<pre><code class="language-java">@Component
+@RocketMQMessageListener(topic = ISSUE_TICKET_TOPIC, consumerGroup = "ticket-cg")
+public class TicketIssueConsumer implements RocketMQListener&lt;TicketMsg&gt; {
+
+    @Override
+    public void onMessage(TicketMsg msg) {
+        TicketTask task = ticketTaskMapper.selectByOrderNo(msg.getOrderNo());
+        if (task.getStatus() == TaskStatus.SUCCESS) return;   // 幂等短路
+        try {
+            // 用 orderNo 做幂等键，重试绝不会重复出票
+            String code = thirdPartyTicketing.issue(msg.getOrderNo(), task.getSeatIds());
+            ticketTaskMapper.markSuccess(task.getId(), code);
+        } catch (Exception e) {
+            if (task.getRetryCount() &gt;= 3) {
+                ticketTaskMapper.toManual(task.getId());   // 进人工差错池 + 触发自动退款
+            } else {
+                ticketTaskMapper.nextRetry(task.getId(), backoff(task.getRetryCount()));
+            }
+        }
+    }
+}
+</code></pre>
+<p>指数退避重试，3 次失败进人工差错池并自动退款——<strong>绝不能让用户停在"钱付了、票没出"的悬挂状态</strong>。事务消息只保证消息一定投出去，消费端的一致性还是要靠自己幂等，这点别指望中间件。</p>
+<h3 id="66-实时座位图websocket-推送">6.6 实时座位图：WebSocket 推送</h3>
+<p>多人同时盯一个场次，别人锁了座位，这边得立刻看到变化，不然用户体验是"我刚点的座位怎么没了"。用 WebSocket 推送：</p>
+<pre><code class="language-java">@Component
+@ServerEndpoint("/ws/seat/{showId}")
+public class SeatWebSocket {
+
+    private static final ConcurrentHashMap&lt;Long, Set&lt;Session&gt;&gt; SESSIONS =
+            new ConcurrentHashMap&lt;&gt;();
+
+    @OnOpen
+    public void onOpen(Session session, @PathParam("showId") Long showId) {
+        SESSIONS.computeIfAbsent(showId, k -&gt; ConcurrentHashMap.newKeySet())
+                .add(session);
+    }
+
+    @OnClose
+    public void onClose(Session session, @PathParam("showId") Long showId) {
+        Set&lt;Session&gt; sessions = SESSIONS.get(showId);
+        if (sessions != null) sessions.remove(session);
+    }
+
+    /** 座位状态变更时，推送给同场次所有在线用户 */
+    public static void broadcast(Long showId, Long seatId, int status) {
+        Set&lt;Session&gt; sessions = SESSIONS.getOrDefault(showId, Set.of());
+        String msg = String.format("{\"seatId\":%d,\"status\":%d,\"ts\":%d}",
+                seatId, status, System.currentTimeMillis());
+        for (Session s : sessions) {
+            try {
+                if (s.isOpen()) s.getBasicRemote().sendText(msg);
+            } catch (IOException e) {
+                sessions.remove(s);
+            }
+        }
+    }
+}
+</code></pre>
+<p>多实例部署记得补一步：座位状态变更后，通过 Redis Pub/Sub 广播给其他实例，由各实例推给自己持有的连接。前端收到推送局部刷新座位图，用户不需要手动刷新。</p>
+<p>代码讲完，把这套系统里所有可能翻车的地方汇总一下——这张表面试前值得存下来。</p>
+<h2 id="七技术难点汇总表">七、技术难点汇总表</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>难点</th>
+<th>本质问题</th>
+<th>解决方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>高并发超卖</td>
+<td>两人同时锁定同一座位</td>
+<td>Redis Lua 原子裁决 → 数据库 <code>status</code> CAS → 唯一索引，三层兜底</td>
+</tr>
+<tr>
+<td>2</td>
+<td>多座位部分成功</td>
+<td>选 4 个座锁上了 2 个</td>
+<td>Lua 先全校验再全写入，全成或全败；失败只回滚自己的锁</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Redis 成功但 DB 失败</td>
+<td>孤儿锁、两层状态不一致</td>
+<td>try-catch 补偿回滚；对账任务扫"Redis 有锁、DB 无单"</td>
+</tr>
+<tr>
+<td>4</td>
+<td>超时未支付不释放</td>
+<td>座位被恶意占用</td>
+<td>延迟消息为主 + 数据库 <code>expire_at</code> 定时扫描兜底，不用 keyspace 事件</td>
+</tr>
+<tr>
+<td>5</td>
+<td>锁超时误释放</td>
+<td>用户正在支付，锁却到期</td>
+<td>看门狗续期；释放时带版本号 / <code>lock_user_id</code> 校验</td>
+</tr>
+<tr>
+<td>6</td>
+<td>重复提交 / 连点</td>
+<td>一次点击生成多单</td>
+<td>前端按钮置灰防抖 + <code>clientToken</code> 幂等表 + 唯一索引</td>
+</tr>
+<tr>
+<td>7</td>
+<td>支付回调重复 / 乱序</td>
+<td>渠道最多重试 10 次</td>
+<td>状态机原子 UPDATE，rows=0 直接回成功；<code>outTradeNo</code> 唯一</td>
+</tr>
+<tr>
+<td>8</td>
+<td>MQ 消息重复消费</td>
+<td>已支付订单被释放</td>
+<td>消费者幂等：先查订单状态，再条件更新</td>
+</tr>
+<tr>
+<td>9</td>
+<td>出票失败悬挂</td>
+<td>钱付了票没出</td>
+<td>事务消息/本地消息表 + 指数退避重试 + 3 次失败自动退款 + 人工差错池</td>
+</tr>
+<tr>
+<td>10</td>
+<td>热点场次流量冲击</td>
+<td>开售瞬间 QPS 打穿数据库</td>
+<td>座位数据提前预热进 Redis + 网关按场次限流 + 前端排队 + Redis 分片，必要时按座位分段 / <code>SKIP LOCKED</code></td>
+</tr>
+<tr>
+<td>11</td>
+<td>座位图带宽爆炸</td>
+<td>每次拉全量 JSON 100KB+</td>
+<td>Bitmap 压缩到 250 字节 + 只推增量变更 + CDN / 本地缓存</td>
+</tr>
+<tr>
+<td>12</td>
+<td>缓存击穿 / 穿透 / 雪崩</td>
+<td>热点 key 失效打穿数据库</td>
+<td><code>sync=true</code> 单飞 + 空值缓存 + 随机 TTL + 本地缓存降级</td>
+</tr>
+<tr>
+<td>13</td>
+<td>黄牛恶意占座</td>
+<td>脚本批量锁座</td>
+<td>限流（IP / uid / 设备）+ 限购 + 验证码 + 风控异步评分，不进主链路</td>
+</tr>
+<tr>
+<td>14</td>
+<td>缓存与数据库一致性</td>
+<td>双写不一致、座位状态错乱</td>
+<td>Cache Aside：先更新数据库再删缓存，数据库为最终权威</td>
+</tr>
+</tbody>
+</table>
+<p>这张表基本覆盖了这道题的全部追问方向。如果你最近在准备面试，可以先关注我，这个系列会继续拆大厂高频场景题，下一篇是同样经典的秒杀系统，思路和这篇的"漏斗 + 兜底"一脉相承，连着看更容易通透。</p>
+<h2 id="八面试官追问答出这些就是高分线">八、面试官追问：答出这些就是高分线</h2>
+<p>真正的分水岭在追问。挑 8 个最高频的，把答题要点给你。</p>
+<p><strong>Q1：为什么不用 Redisson 分布式锁来锁座？</strong><br>
+因为我要的原子性 Redis 已经给了。分布式锁解决的是"谁能进临界区"，Lua 直接解决"谁抢到座位"，少一次 RTT、少一次锁等待，还没有忘解锁、锁续期的问题。分布式锁我只用在低频协调上：初始化场次库存、管理员锁座、全场补偿迁移。</p>
+<p><strong>Q2：那 Redlock 呢？</strong><br>
+Redisson 官方已经把旧的 <code>RedLock</code> 对象标记为 deprecated，转向 <code>RLock</code> + 副本同步检查 + fencing token 的方向。更关键的是，锁解决不了重复提交和脏写，<strong>幂等最终还得靠唯一键和状态机</strong>。所以这题我不上 Redlock。</p>
+<p><strong>Q3：Redis 挂了怎么办？</strong><br>
+降级预案：热点场次切到数据库乐观锁 CAS + 强限流，牺牲体验保正确性；座位图读走本地 Caffeine 兜底；Redis 恢复后从 MySQL 全量加载重建。原则就一句：<strong>绝不能让"Redis 不可用 = 卖不了票"，也绝不能让"Redis 不可用 = 超卖"</strong>。</p>
+<p><strong>Q4：一次锁 3 张，第 3 张被抢了怎么办？</strong><br>
+Lua 里先全校验再全写入，要么 3 张全锁，要么一张不锁。如果是数据库 CAS 阶段失败，还要执行反扣 Lua，把 Redis 里已经锁上的 2 张放回去——<strong>补偿路径必须写，这是最容易被追问到的地方</strong>。</p>
+<p><strong>Q5：热门电影几十万人同时抢呢？</strong><br>
+前端加排队页（令牌桶），后端用 Sentinel 按场次限流，Redis 按场次分片打散热点，极端情况做"预售 + 排队"策略。</p>
+<p><strong>Q6：怎么保证最终一致性？</strong><br>
+靠对账任务：每 5 分钟比对 Redis 和 MySQL 的座位状态，不一致以 MySQL 为准修复；同时扫"Redis 有锁、数据库无单"的孤儿锁清理掉。订单、支付、第三方票务三方也要定期对账，差错进补偿池。</p>
+<p><strong>Q7：能不能留"单个空座"？</strong><br>
+可以做成规则引擎：不允许留单座、连座优先、情侣座不拆卖。但记住，这类规则放在<strong>选座校验层</strong>，不进锁座主链路，别为了体验规则拖慢热点路径。</p>
+<p><strong>Q8：QPS 数字能报吗？</strong><br>
+我不背网传的"Lua 十万 / 数据库两千"这类数字，它随机器规格、脚本复杂度、索引情况浮动很大。我报<strong>架构收敛比</strong>："10 万 QPS 打进来，Lua 层挡掉 99%，落到数据库的写并发收敛到几百，等于真实座位数。"这个说法经得起追问。</p>
+<p>除了追问，还有几个加分点可以主动抛出来：</p>
+<ul>
+<li><strong>状态机收口</strong>：只允许合法跳转，用枚举 + CAS 保证，禁止任何野路径；</li>
+<li><strong>灰度与压测</strong>：热点场次提前用 JMeter 压 10w QPS，验证 Lua 脚本和数据库连接池的瓶颈；</li>
+<li><strong>可观测性</strong>：锁座成功率、超时释放量、数据库冲突率打点，出问题能秒定位；</li>
+<li><strong>座位推荐</strong>：按"黄金观影区"评分，优先推荐中间偏后的位置，顺带提升连座率；</li>
+<li><strong>削峰手段</strong>：RateLimiter 限流 + 请求排队 + 座位分段锁，减少锁竞争。</li>
+</ul>
+<p>面试官的评分标准其实很清晰：</p>
+<ul>
+<li><strong>及格线</strong>：能答出"分布式锁防超卖"；</li>
+<li><strong>良好线</strong>：能答出"Lua 原子锁多座位 + 延迟消息释放"；</li>
+<li><strong>高分线</strong>："Redis 扛并发 + 数据库乐观锁双保险 + 幂等 CAS + 对账兜底"的完整闭环。</li>
+</ul>
+<h2 id="九总结">九、总结</h2>
+<p>回头看这套系统，其实就三条线：</p>
+<ul>
+<li><strong>热点读</strong>：多级缓存 + Bitmap 座位图，解决"多人看"；</li>
+<li><strong>热点写</strong>：Redis Lua 无锁预扣 + MySQL 版本 CAS 双层裁决，解决"多人抢"；</li>
+<li><strong>最终一致</strong>：事务消息驱动出票，状态机保幂等，延迟消息 + 定时扫描管超时，对账兜底。</li>
+</ul>
+<p>再给两条落地建议。第一，<strong>分阶段实施</strong>：普通场次先用数据库乐观锁就够了，压测真的出现热点行，再上 Lua 预扣和分片。过早引入 Redis 预扣，是在为不存在的并发付出一致性的代价，不划算。第二，想深挖热点行处理，可以去翻 MySQL 官方博客，<code>SKIP LOCKED</code> / <code>NOWAIT</code> 的示例用的就是票务预订场景；Redis 官方的 Eval intro 和 Keyspace Notifications 文档也建议读原文，别背二手博客。</p>
+<p>说到底，选座系统就是<strong>库存扣减问题的一个变体</strong>：座位锁不是"用哪个锁"的问题，而是一套资源状态控制协议。最后送大家一句口诀，面试时脱口而出：</p>
+<blockquote>
+<p><strong>读走缓存、锁靠 Lua、超时靠消息、乐观锁兜底、对账做保险。</strong></p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-15 09:53">2026-10-15 09:53</span>&nbsp;
+<a href="https://www.cnblogs.com/zrui-xyu">Rain的Java大神实战圈</a>&nbsp;
+阅读(<span id="post_view_count">365</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23310465);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzrui-xyu%2Fp%2F23310465&amp;targetId=23310465&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
