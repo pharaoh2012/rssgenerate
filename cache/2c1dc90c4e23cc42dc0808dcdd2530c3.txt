@@ -1,0 +1,226 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/east4ming/p/23341258" title="发布于 2026-10-17 17:12">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">K8s 最佳实践已更新：请使用 Node Swap！</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        记录在 k3s 集群中通过 kubelet drop-in 将 memorySwap.swapBehavior 从 NoSwap 调整为  LimitedSwap，并用 Ansible 固化、逐节点
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="概述">概述</h2>
+<p>K8s 最佳实践已更新：</p>
+<p>满足以下条件：</p>
+<ul>
+<li>K8s 1.34 及以上版本</li>
+<li>Node 的系统盘使用的是本地 SSD 或 NVME 高速存储</li>
+<li>cgroup v2</li>
+</ul>
+<p>请使用 node swap！</p>
+<p>要启用，推荐 kubelet config 添加如下配置：</p>
+<pre><code class="language-yaml">failSwapOn: false
+memorySwap:
+  swapBehavior: LimitedSwap
+</code></pre>
+<h2 id="收益">👍收益</h2>
+<p>👍️优点</p>
+<ul>
+<li><strong>省钱</strong>：符合条件的工作负载能在内存压力下把空闲匿名页换出去，Pod 密度会提高很多；</li>
+<li><strong>稳定性提高</strong>：内存尖峰有了缓冲，不再只有被 OOM 杀掉这一条路；</li>
+<li><strong>改动小</strong>：宿主 swap 文件、分区、<code>/etc/fstab</code> 一行没改，改动面就一个 kubelet 配置项；</li>
+<li><strong>可观测能力已经就绪</strong>：可使用 <code>node.status.nodeInfo.swap.capacity</code> 和 <code>kubectl top nodes --show-swap</code> 检查 swap。</li>
+</ul>
+<p>📝备忘：</p>
+<ul>
+<li>只有 Burstable 且 request &lt; limit 的容器吃到红利，Guaranteed 工作负载完全无感；</li>
+<li>调度器并不会感知 swap，容量规划还是按 node 物理内存规划，不能把它算进去；</li>
+<li>换出的是匿名页，落到磁盘上就是 I/O，系统盘不是本地 SSD 或 NVME 高速存储请勿开启。</li>
+</ul>
+<p>社区普遍的看法是：把 swap 当内存尖峰的保险，不当 RAM 的替代。</p>
+<hr>
+<p>接下来是我在 Homelab 的实战总结：</p>
+<h2 id="homelab-集群概况">Homelab 集群概况</h2>
+<p>4 台 N100 小主机，cgroup v2，宿主机 <code>/swap.img</code> 早就 <code>swapon</code> 起来了（swap没开的实战时还需要开下swap）。上面跑的是 k3s <code>v1.36.5+k3s1</code>。</p>
+<p>NodeSwap 在 Kubernetes v1.34 已经 GA，我们来启用看看。</p>
+<h2 id="swap-默认情况">Swap 默认情况</h2>
+<p>kubelet 的 <code>memorySwap.swapBehavior</code> 默认值是 <code>NoSwap</code>。</p>
+<p>这个默认值下，即使宿主机开了 swap、即使你写了 <code>failSwapOn: false</code>，容器 cgroup 的 <code>memory.swap.max</code> 依然是 <code>0</code>。</p>
+<blockquote>
+<p>📝<strong>Notes</strong>: <code>failSwapOn: false</code> 管的是「节点有 swap 时 kubelet 要不要拒绝启动」，<code>swapBehavior</code> 管的是「容器能不能用 swap」。两个开关，两件事。</p>
+</blockquote>
+<p>宿主机层面的 swapon、分区、<code>/etc/fstab</code>，在我的 Homelab 集群上都是现成的。缺的只是 kubelet 里的那一行。</p>
+<h2 id="动手前先确认三件事">动手前先确认三件事</h2>
+<ol>
+<li>cgroup v2：<code>stat -fc %T /sys/fs/cgroup</code> 返回 <code>cgroup2fs</code>；</li>
+<li>宿主已启用 swap：<code>swapon --show</code> 有输出，我的 Homelab 集群是 <code>/swap.img</code>；</li>
+<li>k3s 版本对应的 Kubernetes 版本已经包含 NodeSwap GA（&gt;=1.34)。</li>
+</ol>
+<p>前置条件不满足，改 kubelet 配置也没意义。</p>
+<h2 id="limitedswap-到底给了哪种-pod">LimitedSwap 到底给了哪种 Pod</h2>
+<p>上游推荐的值是 <code>LimitedSwap</code>。它不是一个「全部放开」的策略。</p>
+<p>适用边界由上游确定：</p>
+<ol>
+<li>只对 Burstable 的容器生效；</li>
+<li>且要求 memory request != limit；</li>
+<li>Guaranteed、BestEffort 一律 NoSwap；</li>
+<li>关键 Pod（<code>IsCriticalPod</code>）也是 NoSwap，不看 QoS。</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Pod QoS</th>
+<th>request vs limit</th>
+<th>能否用 swap</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Burstable</td>
+<td>request != limit</td>
+<td>✓ LimitedSwap</td>
+</tr>
+<tr>
+<td>Burstable</td>
+<td>request == limit</td>
+<td>✗ NoSwap</td>
+</tr>
+<tr>
+<td>Guaranteed</td>
+<td>request == limit</td>
+<td>✗ NoSwap</td>
+</tr>
+<tr>
+<td>BestEffort</td>
+<td>都没设</td>
+<td>✗ NoSwap</td>
+</tr>
+<tr>
+<td>任意</td>
+<td>IsCriticalPod</td>
+<td>✗ NoSwap</td>
+</tr>
+</tbody>
+</table>
+<p>额度按这个公式算：</p>
+<pre><code>containerSwapLimit = (containerMemoryRequest / nodeTotalMemory) × totalPodsSwapAvailable
+</code></pre>
+<p>request 越小，能换出去的空间越小。这是刻意的设计：swap 只用来兜住内存尖峰，不参与容量规划。</p>
+<blockquote>
+<p>🐾 <strong>注意：</strong> 调度器不感知 swap。它看到的内存还是节点物理 RAM。不要把 swap 当成「多出来的内存」去超卖，节点迟早会抖。</p>
+</blockquote>
+<h2 id="落地修改-k3s-的-kubelet-config">落地：修改 k3s 的 kubelet config</h2>
+<p>k3s 每次启动都会重写 <code>/var/lib/rancher/k3s/agent/etc/kubelet.conf.d/00-k3s-defaults.conf</code>。</p>
+<p>要覆盖默认值，就得往同一个目录里放一个排在后边的文件。</p>
+<p>文件名必须以 <code>.conf</code> 结尾，按字典序加载。这里用的是 <code>90-swap.conf</code>。</p>
+<pre><code class="language-yaml">apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+failSwapOn: false
+memorySwap:
+  swapBehavior: LimitedSwap
+</code></pre>
+<p><code>failSwapOn: false</code> 显式写进去，别依赖默认。</p>
+<p><code>00-k3s-defaults.conf</code> 不要覆盖、不要删除，那是 k3s 自己管的。</p>
+<h2 id="实施">实施</h2>
+<p>重启 kubelet, 对于 k3s 就是重启 k3s 服务。</p>
+<p>上线顺序：worker 先，master 逐台来。</p>
+<p>每台之间确认 <code>kubectl get nodes</code> 全部 Ready、etcd 成员健康，再动下一台。多台 master 同时重启，etcd quorum 会短暂丢失。</p>
+<p>整个过程不重启节点，不驱逐 Pod。</p>
+<h2 id="验证清单">验证清单</h2>
+<p>配置写完不算完，四条命令逐条过。</p>
+<ol>
+<li>kubelet 实际生效的配置：</li>
+</ol>
+<pre><code class="language-bash">kubectl get --raw "/api/v1/nodes/&lt;node&gt;/proxy/configz" \
+  | jq '.kubeletconfig | {failSwapOn, memorySwap}'
+</code></pre>
+<p>期望 <code>memorySwap.swapBehavior == "LimitedSwap"</code>。</p>
+<p>示例如下：</p>
+<pre><code class="language-shell">❯ kubectl get --raw "/api/v1/nodes/n100-cheshi-0/proxy/configz" | jq '.kubeletconfig | {failSwapOn, memorySwap}'
+{
+  "failSwapOn": false,
+  "memorySwap": {
+    "swapBehavior": "LimitedSwap"
+  }
+}
+</code></pre>
+<ol start="2">
+<li>节点 swap 容量有上报，不是 <code>unknown</code>：</li>
+</ol>
+<pre><code class="language-shell">❯ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.swap.capacity}{"\n"}{end}'
+n100-cheshi-0	8589930496
+n100-jumper-0	4294963200
+n100-jumper-1	4294963200
+n100-jumper-2	4294963200
+</code></pre>
+<p>4 台节点都应有值。</p>
+<ol start="3">
+<li>swap 用量能看：</li>
+</ol>
+<pre><code class="language-bash">❯ kubectl top nodes --show-swap
+NAME            CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)   SWAP(bytes)   SWAP(%)
+n100-cheshi-0   671m         16%      11088Mi         35%         0Mi           0%
+n100-jumper-0   853m         21%      8065Mi          53%         0Mi           0%
+n100-jumper-1   759m         18%      6317Mi          41%         0Mi           0%
+n100-jumper-2   466m         11%      7270Mi          47%         0Mi           0%
+</code></pre>
+<p>在最后两列 - <code>SWAP(bytes)   SWAP(%)</code>。</p>
+<ol start="4">
+<li>最关键的一条，进容器看 cgroup：</li>
+</ol>
+<pre><code class="language-bash">kubectl exec &lt;pod&gt; -- cat /sys/fs/cgroup/memory.swap.max
+</code></pre>
+<p>拿两个 Pod 对比：</p>
+<ul>
+<li>request <code>64Mi</code> / limit <code>256Mi</code> 的 Burstable Pod，<code>memory.swap.max &gt; 0</code>；</li>
+<li>request == limit 的 Pod，以及 request/limit 都没设的 Pod，<code>memory.swap.max == 0</code>。</li>
+</ul>
+<p>这两组数字对得上，说明边界按预期生效了。示例如下：</p>
+<p>Burstable Pod:</p>
+<pre><code class="language-shell">cat /sys/fs/cgroup/memory.swap.max
+36200448
+</code></pre>
+<p>request/limit 都没设的 Pod:</p>
+<pre><code class="language-shell">cat /sys/fs/cgroup/memory.swap.max
+0
+</code></pre>
+<p>我的 homelab 集群一时间没找到 request == limit 的 Pod，这里就不展示了。</p>
+<h2 id="总结">总结</h2>
+<ol>
+<li>NodeSwap 在 v1.34 GA，默认 <code>swapBehavior</code> 还是 <code>NoSwap</code>，单独写 <code>failSwapOn: false</code> 不会让容器拿到 swap 额度；</li>
+<li>需要动的配置只有一处：<code>memorySwap.swapBehavior: LimitedSwap</code>；</li>
+<li>生效范围限定在 Burstable 且 request != limit，额度按 request 占节点内存的比例分；</li>
+<li>k3s 走 drop-in 目录下发，<code>.conf</code> 后缀 + 字典序排在 <code>00-k3s-defaults.conf</code> 之后；</li>
+</ol>
+<p>以上。</p>
+<h2 id="️参考文档">📚️参考文档</h2>
+<ul>
+<li><a href="https://kubernetes.io/docs/concepts/cluster-administration/swap-memory-management/" target="_blank" rel="noopener nofollow">Kubernetes 文档：Node swap 管理</a></li>
+<li><a href="https://kubernetes.io/blog/" target="_blank" rel="noopener nofollow">Kubernetes v1.34 发布说明（NodeSwap GA）</a></li>
+<li><a href="https://docs.k3s.io/" target="_blank" rel="noopener nofollow">k3s 文档</a></li>
+<li>上游 KEP 与 kubelet 配置中 <code>memorySwap</code> 字段定义</li>
+</ul>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-17 17:12">2026-10-17 17:12</span>&nbsp;
+<a href="https://www.cnblogs.com/east4ming">东风微鸣</a>&nbsp;
+阅读(<span id="post_view_count">74</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23341258);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Feast4ming%2Fp%2F23341258&amp;targetId=23341258&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
