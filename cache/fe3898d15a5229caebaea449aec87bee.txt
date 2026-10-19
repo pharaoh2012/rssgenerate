@@ -1,0 +1,1288 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/joy99/p/23337615" title="发布于 2026-10-19 09:06">
+    
+
+    <span role="heading" aria-level="2">Koog(6)——会话记忆、历史压缩与执行恢复</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="前言">前言</h1>
+<p>上一篇文章讲了 Strategy Graph，最后用一个天气出行建议的例子，把节点、子图、条件分支、并行执行和 storage 串了起来。到这里，我们已经能把 Agent 的流程组织清楚了。</p>
+<p>但程序能顺着图跑完，和它能长期稳定地工作，是两回事。</p>
+<p>比如，用户前一轮刚说完“我喜欢室内活动”，下一轮问“那北京有什么推荐”，Agent 还知道他的偏好吗？工具查了很多资料，消息历史越来越长，什么时候该清理？如果流程已经跑了好几个步骤，程序突然退出，下次启动还要不要从头来一遍？</p>
+<p>这篇就来讲这些问题。先把几个容易混淆的概念分开，再分别看 ChatMemory、History Compression 和 Persistence。最后补充 LongTermMemory，说明它为什么又是另一种“记忆”。</p>
+<p>本文继续以 <strong>Koog 1.3.0 的 Kotlin API</strong> 为基准。LongTermMemory 属于 <strong>1.3.0-beta</strong>，涉及它的地方会单独说明。例子分为模型调用代码和离线验证代码：离线测试替身只用于确认历史、节点和存储的行为，不代表真实模型的回答质量。</p>
+<h1 id="一我们到底要保存什么">一、我们到底要保存什么</h1>
+<h2 id="11-聊天记录业务数据和执行进度">1.1 聊天记录、业务数据和执行进度</h2>
+<p>假设有一个出行助手，用户说：</p>
+<pre><code class="language-text">我准备去北京，预算 500 元，喜欢博物馆，不想去户外。
+</code></pre>
+<p>它可能需要保留三类信息：</p>
+<table>
+<thead>
+<tr>
+<th>信息</th>
+<th>例子</th>
+<th>通常放在哪里</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>对话消息</td>
+<td>用户的原话、助手回答、工具调用及结果</td>
+<td>当前 prompt；跨运行时通过 ChatMemory 保存</td>
+</tr>
+<tr>
+<td>业务状态</td>
+<td>城市、预算、天气、已选方案</td>
+<td>节点输入输出、AIAgentStorage 或业务数据库</td>
+</tr>
+<tr>
+<td>执行位置</td>
+<td>已查完天气，接下来生成方案</td>
+<td>Persistence checkpoint</td>
+</tr>
+</tbody>
+</table>
+<p>这三个东西不能互相替代。</p>
+<p>把“预算 500 元”存进 storage，并不意味着下次调用模型时它就会自动出现在 prompt 里。把聊天消息存进数据库，也不意味着程序知道上次执行到了哪个节点。</p>
+<p>第五篇介绍过 <code>AIAgentStorage</code>：它适合在工作流上下文中按类型存取数据。它不是完整的聊天记忆系统，也不会在未配置持久化时自动保存到磁盘。本文不重复 storage 的全部 API，只在恢复示例里看它如何进入 checkpoint。</p>
+<h2 id="12-llm-session先把当前上下文管清楚">1.2 LLM Session：先把当前上下文管清楚</h2>
+<h3 id="121-两种-session不是一回事">1.2.1 两种 session，不是一回事</h3>
+<p>前面的代码中经常出现：</p>
+<pre><code class="language-kotlin">llm.readSession {
+    println(prompt.messages.size)
+}
+
+llm.writeSession {
+    appendPrompt {
+        user("请根据当前资料生成建议")
+    }
+}
+</code></pre>
+<p>这里的 <code>llm</code> 是当前 Agent 的 <code>AIAgentLLMContext</code>。它管理 prompt、可用工具、模型等信息，session 则是访问这些信息的作用域。</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>主要用途</th>
+<th>是否将修改写回当前上下文</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>readSession</code></td>
+<td>查看 prompt、工具和模型等当前状态</td>
+<td>不会</td>
+</tr>
+<tr>
+<td><code>writeSession</code></td>
+<td>修改 prompt、工具或模型，并按需请求 LLM</td>
+<td>正常结束时写回</td>
+</tr>
+</tbody>
+</table>
+<p>“读会话”不等于“不能请求模型”。1.3.0 的读会话也提供请求方法，但不会像写会话那样自动把响应追加回上下文。通常需要让对话继续推进时，使用写会话更合适。</p>
+<p><strong>写回当前上下文，不等于保存到文件或数据库。</strong></p>
+<p>而 ChatMemory 所说的 session ID，是用来区分“这是谁的哪一段对话”的标识。它控制去历史存储中加载、保存哪组消息。两个地方都叫 session，但解决的问题不同。</p>
+<p>另外，会话标识也不是权限凭据。后端不能因为客户端传来一个 session ID，就允许它读取对应用户的历史；归属与授权仍然要由业务系统检查。</p>
+<h3 id="122-生命周期只在作用域内使用">1.2.2 生命周期：只在作用域内使用</h3>
+<p>一次 session 的生命周期很短：</p>
+<pre><code class="language-text">进入 readSession / writeSession
+    → 在 lambda 中访问状态或执行请求
+    → lambda 结束，自动关闭 session
+</code></pre>
+<p>不需要在 lambda 结束后再手动调用 <code>close()</code>，但也不能把 session 对象保存到外面，等以后继续请求。对已经关闭的 session 调用请求方法，会触发 <code>IllegalStateException</code>，日志中对应的错误信息是 <code>Cannot use session after it was closed</code>。</p>
+<p>这里要区分“session 对象”和“从 session 中返回的数据”。例如，可以把消息条数返回给外层：</p>
+<pre><code class="language-kotlin">// 自定义节点内部的片段。
+val messageCount = llm.readSession {
+    prompt.messages.size
+}
+println(messageCount)
+</code></pre>
+<p>返回一个数值没有问题；不能继续使用的是已经关闭的 session 本身。</p>
+<p>写会话还存在一个提交边界：在 1.3.0 中，lambda 正常返回后，框架才把会话内的 prompt、工具和模型写回外层 LLM 上下文。如果异常或取消直接传播出 lambda，这一步不会执行。若在内部捕获异常后正常返回，仍会按正常路径写回。</p>
+<p>这只是当前上下文的提交行为，不是外部操作的事务回滚。模型请求已经消耗的费用、工具已经写入的数据，不会因为 lambda 抛错就自动恢复。</p>
+<h3 id="123-读写锁为什么不要嵌套开启会话">1.2.3 读写锁：为什么不要嵌套开启会话</h3>
+<p>针对同一个 LLM 上下文，session 使用读写锁协调访问：</p>
+<ul>
+<li>多个读会话可以同时存在。</li>
+<li>写会话需要独占访问，等待已有读写会话结束。</li>
+<li>写会话执行期间，其他读写会话需要等待。</li>
+</ul>
+<p>因此，写会话里不要夹杂与模型上下文无关的长时间任务，比如等待人工审批。模型请求可以在写会话中执行，但请求等待期间也占用这把锁。</p>
+<p>还有一个容易忽略的问题：不要在同一个上下文的写会话中，再调用 <code>llm.readSession</code> 或 <code>llm.writeSession</code>；也不要在读会话中升级为写会话。写锁不可重入，这类嵌套会等待自己释放锁，导致死锁。已经进入会话时，直接使用当前作用域提供的 <code>prompt</code>、<code>tools</code> 和请求方法即可。</p>
+<p>这把锁保护的是同一个 LLM 上下文，不是整个业务系统。它不能替代跨实例的会话并发控制，也不能解决下一章提到的“两个请求同时加载、覆盖聊天历史”的问题。</p>
+<h3 id="124-追加消息不会自动请求模型">1.2.4 追加消息，不会自动请求模型</h3>
+<p>下面两个动作要分开理解：</p>
+<pre><code class="language-kotlin">// 自定义节点内部的片段。
+llm.writeSession {
+    appendPrompt {
+        user("请根据当前资料生成建议")
+    }
+
+    // 追加消息之后，只有显式调用请求方法才会请求模型。
+    val response = requestLLMWithoutTools()
+}
+</code></pre>
+<p><code>appendPrompt</code> 只修改当前会话的消息列表。真正调用 <code>requestLLM()</code>、<code>requestLLMWithoutTools()</code> 等方法时，才会发起模型请求，并挂起等待结果；不是等 session 关闭后统一发送。</p>
+<p>对于这里的普通请求，写会话会自动把返回的 assistant 消息加入历史。正常结束后，外层上下文就同时包含新 user 消息和模型响应，不需要再手动追加同一个 <code>response</code>，否则会出现重复记录。</p>
+<p><code>requestLLM()</code> 允许模型使用当前工具，<code>requestLLMWithoutTools()</code> 用于本次不调用工具的请求。结构化、流式请求有各自的处理方式，后续再单独展开，不能把普通请求的规则直接套到所有返回类型上。</p>
+<h3 id="125-手动替换历史修改后要写回-prompt">1.2.5 手动替换历史：修改后要写回 prompt</h3>
+<p>除了追加消息，也可以重新组织当前历史。下面的片段只用于不含工具调用的简单文本对话，保留 system 消息与最后一条 user 消息：</p>
+<pre><code class="language-kotlin">import ai.koog.prompt.message.Message
+
+// 自定义节点内部的片段，不是完整应用。
+llm.writeSession {
+    val systems = prompt.messages.filterIsInstance&lt;Message.System&gt;()
+    val latestUser = prompt.messages.filterIsInstance&lt;Message.User&gt;().takeLast(1)
+
+    prompt = prompt.withMessages {
+        systems + latestUser
+    }
+}
+</code></pre>
+<p>重点在最后的赋值。只计算一个过滤后的列表，却不赋给 <code>prompt</code>，并不会改变当前历史。正常退出写会话后，新的 prompt 才会回到 LLM 上下文中。</p>
+<p>这个规则会删除旧回答和其他用户消息，只适合说明修改方式，不是通用的聊天窗口实现。工具型对话还必须维护工具调用与结果的对应关系，不能照搬。它也只改变当前上下文，不会在此刻直接删除 ChatMemory 后端里的历史；后端何时更新，要看 ChatMemory 的保存时机。</p>
+<h3 id="126-验证这些行为的离线实验">1.2.6 验证这些行为的离线实验</h3>
+<p>上一节提到提交边界、响应追加和关闭后不可复用，这些不是想当然，可以用附录的 <code>OfflineExecutor</code> 直接验证。保存为 <code>src/main/kotlin/SessionsDemo.kt</code>，执行 <code>./gradlew run -PmainClass=SessionsDemoKt</code>：</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.agent.session.AIAgentLLMReadSession
+import ai.koog.agents.core.dsl.builder.*
+import ai.koog.prompt.executor.clients.openai.OpenAIModels
+import ai.koog.prompt.message.Message
+import kotlinx.coroutines.runBlocking
+
+fun main(args: Array&lt;String&gt;) = runBlocking {
+    val executor = OfflineExecutor()
+    val graph = strategy&lt;String, String&gt;("sessions-check") {
+        val inspect by node&lt;String, String&gt; { input -&gt;
+            // 单独追加消息，不发起模型请求。
+            llm.writeSession { appendPrompt { user(input) } }
+            check(executor.prompts.isEmpty())
+            val before = llm.readSession { prompt.messages.size }
+            // 写会话中的普通请求，会自动把响应追加进历史。
+            llm.writeSession {
+                requestLLMWithoutTools()
+                check(prompt.messages.size == before + 1)
+            }
+            check(llm.readSession { prompt.messages.size } == before + 1)
+            println("PASS appendPrompt does not request; write request appends response")
+            val committed = llm.readSession { prompt.messages }
+            // 读会话也可以请求，但响应不会追加回上下文。
+            llm.readSession { requestLLMWithoutTools() }
+            check(llm.readSession { prompt.messages } == committed)
+            println("PASS read request does not append response")
+            // 异常传播出写会话，本次修改不会提交。
+            runCatching {
+                llm.writeSession {
+                    appendPrompt { user("不应提交") }
+                    error("test failure")
+                }
+            }
+            check(llm.readSession { prompt.messages } == committed)
+            println("PASS failed write scope does not commit prompt changes")
+            // session 关闭后再用，触发 IllegalStateException。
+            lateinit var expired: AIAgentLLMReadSession
+            llm.readSession { expired = this }
+            val failure = runCatching { expired.requestLLMWithoutTools() }.exceptionOrNull()
+            check(failure is IllegalStateException)
+            println("PASS request through closed session rejected")
+            // 手动替换历史，并确认确实写回。
+            llm.writeSession {
+                val systems = prompt.messages.filterIsInstance&lt;Message.System&gt;()
+                val latestUser = prompt.messages.filterIsInstance&lt;Message.User&gt;().takeLast(1)
+                prompt = prompt.withMessages { systems + latestUser }
+            }
+            check(llm.readSession { prompt.messages.size } == 2)
+            println("PASS manual history replacement committed")
+            input
+        }
+        nodeStart then inspect then nodeFinish
+    }
+    val agent = AIAgent(executor, OpenAIModels.Chat.GPT4o, strategy = graph, systemPrompt = "系统指令")
+    try { agent.run("新问题") } finally { agent.close(); executor.close() }
+    Unit
+}
+</code></pre>
+<p>实际输出：</p>
+<pre><code class="language-text">PASS appendPrompt does not request; write request appends response
+PASS read request does not append response
+PASS failed write scope does not commit prompt changes
+PASS request through closed session rejected
+PASS manual history replacement committed
+</code></pre>
+<p>本实验同样使用离线测试替身，没有调用真实模型。它验证的是 1.3.0 的会话语义，不涉及回答质量。</p>
+<h2 id="13-几种能力先对号入座">1.3 几种能力先对号入座</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>主要解决的问题</th>
+<th>不应该把它理解成</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ChatMemory</td>
+<td>多次运行之间延续聊天历史</td>
+<td>运行到一半的执行检查点</td>
+</tr>
+<tr>
+<td>History Compression</td>
+<td>历史太长，缩减模型上下文</td>
+<td>自动保存长期记忆</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>保存执行状态，从指定位置继续</td>
+<td>整个外部世界的事务快照</td>
+</tr>
+<tr>
+<td>LongTermMemory（Beta）</td>
+<td>按相关性检索记忆记录，并可写入新记录</td>
+<td>原样回放整段会话历史</td>
+</tr>
+</tbody>
+</table>
+<p>接下来先看最容易遇到的需求：让第二轮对话接上第一轮。</p>
+<h2 id="14-featureagent-的能力安装机制">1.4 Feature：Agent 的能力安装机制</h2>
+<p>先补一块背景。本文要讲的 ChatMemory、Persistence、LongTermMemory，在 Koog 里都属于 feature。如果用过 Ktor，看到 <code>install(X) { ... }</code> 会立刻觉得眼熟——Koog 的 feature 机制和 Ktor 的插件机制确实是同一个思路：能力按需装配，不装就没有。</p>
+<p>安装位置就在创建 Agent 的尾 lambda 里：</p>
+<pre><code class="language-kotlin">// 片段：install 写在 AIAgent 的配置块中。
+val agent = AIAgent(
+    promptExecutor = executor,
+    llmModel = DeepSeekModels.DeepSeekV4Flash
+) {
+    install(ChatMemory)
+    install(Persistence) {
+        storage = JVMFilePersistenceStorageProvider(Path.of("state"))
+    }
+}
+</code></pre>
+<p><code>install</code> 接收 feature 本身，后面的 lambda 是它的配置块。和 Ktor 对照着看更清楚：</p>
+<pre><code class="language-kotlin">// Ktor：给服务装一个内容协商插件。
+install(ContentNegotiation) {
+    json()
+}
+
+// Koog：给 Agent 装一个聊天记忆特性。
+install(ChatMemory) {
+    windowSize(20)
+}
+</code></pre>
+<p>结构一致：插件名加配置块。配置块的 receiver 就是该 feature 的配置类，比如 <code>ChatMemoryConfig</code>、Persistence 的配置类，它们都继承自框架的 <code>FeatureConfig</code> 基类。</p>
+<p>差别在拦截的对象。Ktor 的插件工作在 HTTP 请求/响应管道上；Koog 的 feature 挂在 Agent 执行生命周期的钩子点上——策略开始、节点完成、LLM 调用前、Agent 结束等。1.2.2 说 ChatMemory 在 <code>strategyStarting</code> 加载、<code>strategyCompleted</code> 保存，指的就是它占住了两个生命周期点；第四章会看到 Persistence 在同类钩子上做自动存档。</p>
+<p>两个对本文最重要的语义，后面各章都会反复用到：</p>
+<ol>
+<li><strong>不装就没有。</strong> 不 install ChatMemory，多轮之间历史不会延续；不 install Persistence，不会有任何检查点。feature 不是默认能力，依赖在 classpath 上也不等于已安装，2.1 会再提到这个区别。</li>
+<li><strong>每次安装相互独立。</strong> install 会为当前 Agent 创建独立的 feature 实例和配置。两个 Agent 各自 install(ChatMemory)，得到的是两个互不相通的内存 Provider，2.3 有实测验证。</li>
+</ol>
+<p>本文用到三个 feature，分别由不同模块提供：ChatMemory 来自 <code>agents-features-memory</code>，Persistence 来自 snapshot 相关模块，LongTermMemory 属于 <code>1.3.0-beta</code> 的 additions 模块。前两者已包含在本系列使用的聚合依赖里，Beta 模块的边界见第六章。</p>
+<h1 id="二chatmemory让多次运行接上同一段对话">二、ChatMemory：让多次运行接上同一段对话</h1>
+<h2 id="21-基本工作方式">2.1 基本工作方式</h2>
+<p>ChatMemory 的流程可以粗略理解为：</p>
+<div class="mermaid">flowchart LR
+    input["本轮输入 + 会话标识"] --&gt; load["加载对应历史"]
+    load --&gt; run["执行 Agent"]
+    run --&gt;|"成功完成"| save["保存更新后的历史"]
+    save --&gt; output["返回结果"]
+</div><p>一次运行里，模型可以连续请求工具、查看结果、继续回答；ChatMemory 则负责把前一轮的消息接到下一轮。</p>
+<p>它是可选 feature（安装机制见 1.4），需要安装后才启用。模块依赖可以显式写为：</p>
+<pre><code class="language-kotlin">implementation("ai.koog:agents-features-memory:1.3.0")
+</code></pre>
+<p>本系列使用的 <code>ai.koog:koog-agents:1.3.0</code> 已经传递引入这个模块，不需要重复添加。依赖在 classpath 上与 feature 已经安装，是两件事。</p>
+<p>如果新建工程验证本文示例，可以先使用下面的 <code>build.gradle.kts</code>。各节的完整程序分开运行，不要把所有 <code>main</code> 函数拼成一个文件：</p>
+<pre><code class="language-kotlin">plugins {
+    kotlin("jvm") version "2.4.10"
+    kotlin("plugin.serialization") version "2.4.10"
+    application
+}
+repositories { mavenCentral() }
+dependencies {
+    implementation("ai.koog:koog-agents:1.3.0")
+    // 仅第六章 LongTermMemory 需要；不使用时可以删掉。
+    implementation("ai.koog:koog-agents-additions:1.3.0-beta")
+}
+kotlin { jvmToolchain(21) }
+application {
+    mainClass.set(providers.gradleProperty("mainClass").orElse("MemoryDemoKt"))
+}
+</code></pre>
+<p>Kotlin 版本和 JDK 是本文校验环境，不是在声明 Koog 只能使用这两个版本。下文代码省略重复导包的地方会标为片段；完整示例则给出所需导包。</p>
+<h2 id="22-最小的多轮调用">2.2 最小的多轮调用</h2>
+<p>先不用真实模型，而是让执行器返回“实际收到了几条用户消息”。这样可以直接验证历史有没有接上，不受模型回答方式影响。</p>
+<p>把下面的程序保存为 <code>src/main/kotlin/MemoryDemo.kt</code>。<code>OfflineExecutor</code> 是本文编写的离线测试替身，完整代码放在文末附录；将它放进同一工程后就能运行。它不读取密钥，也不发送网络请求。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.chatMemory.feature.ChatMemory
+import ai.koog.agents.core.agent.AIAgent
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekModels
+import kotlinx.coroutines.runBlocking
+
+fun main() = runBlocking {
+    val promptExecutor = OfflineExecutor()
+    val agent = AIAgent(
+        promptExecutor = promptExecutor,
+        llmModel = DeepSeekModels.DeepSeekV4Flash,
+        systemPrompt = "你是中文助手。"
+    ) {
+        install(ChatMemory) // 默认 InMemoryChatHistoryProvider，进程内存，不是磁盘持久化
+    }
+    try {
+        println(agent.run("我叫 SharpCJ。", sessionId = "chat-1"))
+        println(agent.run("我叫什么？", sessionId = "chat-1"))
+        println(agent.run("我叫什么？", sessionId = "chat-2"))
+    } finally {
+        agent.close()
+        promptExecutor.close()
+    }
+}
+</code></pre>
+<p>执行 <code>./gradlew run</code>，实际业务输出如下（省略构建和框架日志）：</p>
+<pre><code class="language-text">[离线测试替身] 当前历史包含 1 条用户消息
+[离线测试替身] 当前历史包含 2 条用户消息
+[离线测试替身] 当前历史包含 1 条用户消息
+</code></pre>
+<p>前两次调用使用 <code>chat-1</code>，第二次拿到了上一轮的消息；第三次改成 <code>chat-2</code>，历史重新开始。这里验证的是历史续接和会话隔离，不能据此声称真实模型已经回答出了“SharpCJ”。接入前文的真实 <code>PromptExecutor</code> 后，才是在测试模型如何利用这些历史。</p>
+<p>这段代码的重点不在问答内容，而在三件事：安装 <code>ChatMemory</code>、为历史选择存储提供者、用一致的对话标识关联多轮消息。</p>
+<p>默认 <code>InMemoryChatHistoryProvider</code> 把历史保存在内存中。它适合先跑通例子，进程退出后数据就没有了。不要因为关掉一次窗口再打开还能看到旧消息，就认定应用已经具备了跨进程记忆；得看实际使用的历史后端。</p>
+<p><code>run</code> 的签名是：</p>
+<pre><code class="language-kotlin">suspend fun run(agentInput: Input, sessionId: String? = null): Output
+</code></pre>
+<p>在 1.3.0 中，传入的 <code>sessionId</code> 会成为本轮的 <code>runId</code>，ChatMemory 用它查询历史。参数的默认值是 <code>null</code>，框架内部会立刻把它转成随机 UUID（源码等价于 <code>sessionId ?: Uuid.random().toString()</code>），所以省略时每轮都拿到一个全新会话。也就是说，<strong>复用同一个 Agent 实例，但不传相同的 session ID，并不会自动续聊。</strong> 离线校验里专门断言过：两次不传 sessionId 的调用，生成了两个不同的 ID。</p>
+<p>还有一层结构值得说清：同一个 Agent 对象只安装一份 ChatMemory、一个 Provider 实例。不同 sessionId 并不是多份 ChatMemory，而是同一个 Provider 内部按 conversationId 分桶：</p>
+<pre><code class="language-text">Agent
+ └── ChatMemory（一份）
+      └── Provider（一个实例）
+           ├── "chat-1" → 一段历史
+           └── "chat-2" → 另一段历史
+</code></pre>
+<p>效果上等价于隔离：<code>chat-1</code> 的对话对 <code>chat-2</code> 完全不可见，与 Agent 实例、executor 都无关。同一个 Agent 同时处理多个会话也没有问题，不同桶互不干扰；但同一个 sessionId 被两个请求并发调用时，下一节讲的覆盖风险就出现了。</p>
+<p>同一个 Agent 可以连续调用 <code>run</code>。但不同 Agent 想共享历史，还需要使用共享的 Provider 或相同的持久后端，下一节用一个可运行的例子验证；各自创建一个内存 Provider，并不会自动共享数据。</p>
+<h2 id="23-chathistoryprovider消息到底保存在哪里">2.3 ChatHistoryProvider：消息到底保存在哪里</h2>
+<p>要把聊天历史存进自己的数据库，需要实现 <code>ChatHistoryProvider</code>。它的核心方法很简单：</p>
+<pre><code class="language-kotlin">interface ChatHistoryProvider {
+    suspend fun store(conversationId: String, messages: List&lt;Message&gt;)
+    suspend fun load(conversationId: String): List&lt;Message&gt;
+}
+</code></pre>
+<p>这是接口职责摘录，业务代码应导入框架接口，不需要自己重新声明一个同名接口。</p>
+<p><code>load</code> 返回某段对话已有的消息，查不到就返回空列表；<code>store</code> 保存本轮处理后的消息列表。文件、数据库、缓存都可以是后端，但接口本身不会替你决定保存多久、如何加密、多个请求同时修改时如何协调。</p>
+<p>这里尤其容易踩一个坑：Provider 内部即使能保证单次 <code>load</code>、<code>store</code> 的线程安全，也不代表整个“加载 → 执行 → 保存”具有原子性。两个请求同时读到旧历史，各自生成新历史，再先后写回，就可能互相覆盖。生产服务通常需要按对话串行执行，或者设计版本检查、冲突重试。</p>
+<p>还有一个常见疑问：ChatMemory 存的数据和 Prompt 是什么关系？答案在接口签名里——<code>store</code> 和 <code>load</code> 操作的都是 <code>List&lt;Message&gt;</code>。它保存的就是消息列表，和 Prompt 里的 <code>messages</code> 是同一种类型：System、User、Assistant，工具调用与结果也都在消息里。而 Prompt 是发给模型的完整请求，1.3.0 的定义如下（源码摘录）：</p>
+<pre><code class="language-kotlin">@Serializable
+public data class Prompt(
+    val messages: List&lt;Message&gt;,
+    val id: String,
+    val params: LLMParams
+)
+</code></pre>
+<p>区别就在 <code>params</code> 这一层：温度、工具选择等调用参数属于 Prompt，不进 ChatMemory。历史只记“聊过什么内容”，不记“当时怎么调的模型”；参数每次都来自 Agent 配置和当前 prompt，运行中修改 <code>LLMParams</code> 也不会随历史延续，需要长期保留的调用配置应写入业务 storage。两者由存取两端连接：<code>load</code> 把消息列表装进 prompt，<code>store</code> 把 prompt 里的消息（经过预处理器处理后的版本，见 2.4）写回去。</p>
+<p>顺着 Provider 再解决一个跨 Agent 的问题：两个不同的 Agent 实例，能否读到同一段历史？可以，前提是它们使用<strong>同一个 Provider 实例</strong>或连接同一个持久后端。下面是可运行的验证，两个 Agent 共享同一个内存 Provider，再配一组各自独立 Provider 的对照：</p>
+<pre><code class="language-kotlin">import ai.koog.agents.chatMemory.feature.ChatMemory
+import ai.koog.agents.chatMemory.feature.InMemoryChatHistoryProvider
+import ai.koog.agents.core.agent.AIAgent
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekModels
+import kotlinx.coroutines.runBlocking
+
+fun main(args: Array&lt;String&gt;) = runBlocking {
+    val executor = OfflineExecutor()
+    // 两个 Agent 共享同一个 Provider 实例。
+    val shared = InMemoryChatHistoryProvider()
+    fun sharedAgent(): AIAgent&lt;String, String&gt; = AIAgent(
+        promptExecutor = executor,
+        llmModel = DeepSeekModels.DeepSeekV4Flash,
+        systemPrompt = "你是中文助手。"
+    ) {
+        install(ChatMemory) { chatHistoryProvider = shared }
+    }
+
+    val agentA = sharedAgent()
+    val agentB = sharedAgent()
+    println(agentA.run("我叫 SharpCJ。", sessionId = "shared-1"))
+    println(agentB.run("我叫什么？", sessionId = "shared-1"))
+
+    // 对照组：只写 install(ChatMemory)，各自获得独立的默认 Provider。
+    fun isolatedAgent(): AIAgent&lt;String, String&gt; = AIAgent(
+        promptExecutor = executor,
+        llmModel = DeepSeekModels.DeepSeekV4Flash,
+        systemPrompt = "你是中文助手。"
+    ) { install(ChatMemory) }
+    println(isolatedAgent().run("我叫 SharpCJ。", sessionId = "shared-1"))
+    println(isolatedAgent().run("我叫什么？", sessionId = "shared-1"))
+    Unit
+}
+</code></pre>
+<p>实际输出（省略构建和框架日志）：</p>
+<pre><code class="language-text">[离线测试替身] 当前历史包含 1 条用户消息
+[离线测试替身] 当前历史包含 2 条用户消息
+[离线测试替身] 当前历史包含 1 条用户消息
+[离线测试替身] 当前历史包含 1 条用户消息
+</code></pre>
+<p>第二行是重点：<code>agentB</code> 与 <code>agentA</code> 是两个不同的 Agent 实例，仅因为共享了同一个 Provider 实例、传了相同的 sessionId，就读到了上一轮的历史。对照组两次都是 1 条：只写 <code>install(ChatMemory)</code> 时，每次安装都会创建独立的默认 Provider，sessionId 相同也读不到对方。需要跨 Agent 且跨进程共享时，换成连接同一持久后端的自定义 Provider，分桶语义不变。</p>
+<h2 id="24-预处理器窗口和过滤">2.4 预处理器：窗口和过滤</h2>
+<p>保存全部历史并不总是合适。Koog 提供了预处理器，对加载、保存的消息列表做转换。</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>windowSize(n)</code></td>
+<td>只保留最近 n 条消息</td>
+</tr>
+<tr>
+<td><code>filterMessages { ... }</code></td>
+<td>保留符合条件的消息</td>
+</tr>
+<tr>
+<td><code>addPreProcessor(...)</code></td>
+<td>加入自定义转换</td>
+</tr>
+</tbody>
+</table>
+<p>配置片段如下，放在 <code>install(ChatMemory) { }</code> 中：</p>
+<pre><code class="language-kotlin">windowSize(20)
+filterMessages { message -&gt;
+    message is Message.User || message is Message.Assistant
+}
+</code></pre>
+<p>这个片段用来说明接口，不是推荐所有工具型 Agent 都照搬过滤条件。消息可能包含工具调用、工具结果等内容，按角色裁剪时要检查完整的调用关系，不能删掉必要的上下文。</p>
+<p>这里的 <code>n</code> 是消息条数，不是对话轮数，也不是 token 数。一轮包含工具调用的对话，可能产生多条消息。</p>
+<p>还有一个更隐蔽的问题：1.3.0 加载到非空历史时，会用它替换初始 prompt 消息，并非总是把构造时的 system prompt 再拼接一次。如果 <code>windowSize</code> 已经把 system 消息裁掉，下次运行不会自动补回。因此生产配置通常需要自定义预处理，保留系统指令及完整的工具调用关系，不能只做 <code>takeLast(n)</code>。</p>
+<p>有两个时序细节值得单独说。</p>
+<p><strong>第一，预处理在加载、保存时都会执行。</strong> 这意味着某次保存时丢掉的消息，下次不会因为把窗口调大就自动回来。如果需要完整审计记录，应该另设原始消息存储，不要拿裁剪后的聊天窗口代替审计日志。</p>
+<p><strong>第二，处理顺序有影响。</strong> 例如：</p>
+<pre><code class="language-kotlin">// 先取最后 10 条，再从这 10 条里过滤。
+windowSize(10)
+filterMessages { it is Message.User }
+</code></pre>
+<p>与：</p>
+<pre><code class="language-kotlin">// 先过滤整个列表，再从剩余消息里取最后 10 条。
+filterMessages { it is Message.User }
+windowSize(10)
+</code></pre>
+<p>得到的列表不一定一样。它们不是配置项的无序集合，而是一条按顺序执行的转换链。</p>
+<h2 id="25-运行失败时聊天历史会怎样">2.5 运行失败时，聊天历史会怎样</h2>
+<p>ChatMemory 的常规保存点在成功完成时。如果本轮执行中途失败，不会按节点把这轮新消息逐步提交为完整历史。</p>
+<p>可以把一轮对话想成一次“读旧记录、处理、写新记录”。但这只是解释成功/失败行为的类比，不表示框架给任意历史后端附加了数据库事务。</p>
+<p>这个行为可以实际验证，不用凭印象猜测。实验的做法：自定义一个历史 Provider，再装两个预处理器，命名为 A 和 B。它们不做任何实际裁剪，只负责记录自己“什么时候被调用了”。这样，ChatMemory 内部的加载、保存时机，就变成一条可以直接阅读的事件流水。</p>
+<p>一轮对话正常跑完，事件顺序是：</p>
+<pre><code class="language-text">load:same -&gt; A -&gt; B -&gt; A -&gt; B -&gt; store:same
+</code></pre>
+<p>从头读一遍：<code>load:same</code> 表示开始执行时，从存储加载了 "same" 这个会话的历史；第一个 <code>A -&gt; B</code> 是两个预处理器对这批旧消息各处理了一次；中间是 Agent 正常执行、模型回答；执行成功后，框架准备保存，此时 <code>A -&gt; B</code> 再对“旧历史 + 本轮新消息”处理一次；最后 <code>store:same</code> 把处理完的列表写回存储。加载后一次、保存前一次，预处理确实执行了两轮。</p>
+<p>接下来让策略图在执行中途故意抛出异常，再跑一轮。事件只剩：</p>
+<pre><code class="language-text">load:same -&gt; A -&gt; B
+</code></pre>
+<p>加载了，旧消息也预处理了，然后就没有然后了——保存前的第二个 <code>A -&gt; B</code> 和 <code>store</code> 都没有出现。旧记录原封不动，这一轮的新消息整批丢弃，没有“存一半”这回事。</p>
+<p>由此可以精确定位：ChatMemory 在 <code>strategyStarting</code> 阶段加载，在 <code>strategyCompleted</code> 阶段保存，两个点之间隔着整个策略执行。保存不是逐节点提交。也因此，不要把它推广成“任何环节失败都会回滚”，更不能理解成外部工具操作也会被撤销。</p>
+<p>下一章要讲的是另一个问题：即使历史加载正确，把它全部发给模型也可能太长。截窗口与生成摘要，正是在这里分开了。</p>
+<h1 id="三history-compression历史太长怎么办">三、History Compression：历史太长怎么办</h1>
+<h2 id="31-窗口裁剪和历史压缩的区别">3.1 窗口裁剪和历史压缩的区别</h2>
+<p><code>windowSize(20)</code> 保留的是最后 20 条消息。最早那条“不能吃花生”的约束一旦出窗，就不在这组历史里了。</p>
+<p>历史压缩则会尝试从历史中提取有用的信息，用较少的消息代替原始内容。它可能保留下“用户对花生过敏”，但摘要也可能遗漏或写错。</p>
+<p>所以，历史压缩不是无损压缩，更不是无限上下文。订单金额、权限、已确认的操作状态等必须准确的业务数据，仍应保存在结构化状态或业务系统中，不能只留在模型摘要里。</p>
+<h2 id="32-在图里加入压缩节点">3.2 在图里加入压缩节点</h2>
+<p>第五篇出现过 <code>nodeLLMCompressHistory</code>。下面先用一张简单的图看它的位置：写入用户任务，压缩历史，然后基于压缩后的上下文回答。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.dsl.builder.*
+import ai.koog.agents.core.dsl.extension.*
+import ai.koog.prompt.message.MessagePart
+
+fun compressionGraph() = strategy&lt;String, String&gt;("compress-then-answer") {
+    val prepare by node&lt;String, String&gt; { input -&gt;
+        llm.writeSession {
+            appendPrompt { user(input) }
+        }
+        input
+    }
+    val compressHistory by nodeLLMCompressHistory&lt;String&gt;(
+        strategy = HistoryCompressionStrategy.WholeHistory,
+        preserveMemory = true
+    )
+    val answer by node&lt;String, String&gt; {
+        llm.writeSession {
+            requestLLMWithoutTools().parts.filterIsInstance&lt;MessagePart.Text&gt;()
+                .joinToString("\n") { it.text }
+        }
+    }
+    nodeStart then prepare then compressHistory then answer then nodeFinish
+}
+</code></pre>
+<p>这个函数返回一张 <code>String → String</code> 策略图，创建 Agent 时将它作为 <code>strategy</code> 传入，并配置真实执行器、模型和 system prompt。它是流程定义，不包含独立的 <code>main</code>。</p>
+<p>理解这段代码：</p>
+<ol>
+<li><code>prepare</code> 把输入加入 prompt，并把原始 String 传给下一个节点。</li>
+<li><code>compressHistory</code> 修改 LLM 上下文，但节点输入输出类型不变；流程中传递的数据和 prompt 消息是两套东西。</li>
+<li><code>answer</code> 发起不调用工具的模型请求，再从响应中取出文本。</li>
+</ol>
+<p>这里为了看清连接方式，每次都执行压缩。生产流程通常在资料收集结束后压缩一次，或者用条件边判断历史预算，避免短对话也额外支付摘要调用的成本。上述流程已编译核对，但没有调用真实模型，所以这里不提供虚构的摘要和最终回答。</p>
+<p>用消息数量做阈值时也要小心：一条工具结果可能包含很长的文本，“只有几条消息”不代表一定没有超过 token 限制。预算需要同时考虑模型窗口、输入长度和输出预留。</p>
+<p>如果任务阶段很清楚，也可以在两个子图之间固定插入压缩节点：</p>
+<pre><code class="language-kotlin">val compressHistory by nodeLLMCompressHistory&lt;String&gt;()
+
+nodeStart then collectInformation then compressHistory then makeDecision then nodeFinish
+</code></pre>
+<p>这里的 <code>collectInformation</code>、<code>makeDecision</code> 是已定义的 String → String 子图。片段只展示连接位置，不是另一份完整程序。</p>
+<h2 id="33-在自定义节点里压缩">3.3 在自定义节点里压缩</h2>
+<p>如果压缩时机依赖业务逻辑，可以在写会话中直接调用：</p>
+<pre><code class="language-kotlin">llm.writeSession {
+    replaceHistoryWithTLDR(
+        strategy = HistoryCompressionStrategy.WholeHistory,
+        preserveMemory = true
+    )
+}
+</code></pre>
+<p>两种写法最终都在处理当前 LLM 历史。区别在于：预定义节点把压缩明确画在流程里；会话内调用则可以与自定义逻辑放在一起。</p>
+<p>最后一个容易混淆的问题：压缩和 sessionId 有什么关系？答案是：没有直接关系。压缩只操作当前运行内存里的 prompt，<code>nodeLLMCompressHistory</code> 和 <code>replaceHistoryWithTLDR</code> 都不感知 sessionId；不安装 ChatMemory 它们照样能用，只是结果随本次运行结束消失。</p>
+<p>sessionId 的关联发生在 ChatMemory 的存取两端：</p>
+<pre><code class="language-text">[strategyStarting] 按 sessionId 读取会话记录
+        ↓
+组装成 prompt（非空历史替换初始消息）
+        ↓
+运行：请求 → 工具 → 再请求……prompt 持续增长
+        ↓ （压缩节点的位置由开发者决定，可以多次）
+[strategyCompleted] 成功后：预处理（截窗/过滤）→ 写回同一 sessionId
+   失败：什么都不写
+</code></pre>
+<p>由此有三个推论。第一，压缩的影响范围是本次运行的后续 LLM 调用，加上保存成功后同一 sessionId 的未来轮次；其他 sessionId 不受影响。第二，压缩之后、保存之前程序中断，压缩结果随整轮一起丢弃，存储里还是上一轮的旧历史。第三，最终存入的内容是“压缩后再预处理”的结果，不等于压缩节点刚产出时的样子。</p>
+<h2 id="34-常用的压缩策略">3.4 常用的压缩策略</h2>
+<h3 id="341-wholehistory对整个历史生成摘要">3.4.1 WholeHistory：对整个历史生成摘要</h3>
+<pre><code class="language-kotlin">val compressHistory by nodeLLMCompressHistory&lt;String&gt;(
+    strategy = HistoryCompressionStrategy.WholeHistory
+)
+</code></pre>
+<p>这是默认策略。适合把一段已经完成的过程整理成后续阶段需要的上下文，比如资料收集结束后保留主要发现。</p>
+<p>不要把“摘要整个历史”理解成“每个细节都不会丢”。它只是让摘要考虑的输入范围覆盖整个历史。</p>
+<h3 id="342-fromlastnmessages只摘要最近一段">3.4.2 FromLastNMessages：只摘要最近一段</h3>
+<pre><code class="language-kotlin">val compressHistory by nodeLLMCompressHistory&lt;String&gt;(
+    strategy = HistoryCompressionStrategy.FromLastNMessages(10)
+)
+</code></pre>
+<p>它先选择最近 N 条消息进行摘要，更早的普通历史不参与这次摘要。与 <code>windowSize(10)</code> 的区别在于：后者保留原消息，前者会进一步生成摘要。</p>
+<p>如果重要约束只出现在更早的历史中，这个策略就不合适。它比较适合旧过程已经无用、只需要最近进展的任务。</p>
+<h3 id="343-fromtimestamp从指定时间开始摘要">3.4.3 FromTimestamp：从指定时间开始摘要</h3>
+<pre><code class="language-kotlin">val compressHistory by nodeLLMCompressHistory&lt;String&gt;(
+    strategy = HistoryCompressionStrategy.FromTimestamp(
+        timestamp = kotlin.time.Instant.parse("2026-01-01T00:00:00Z")
+    )
+)
+</code></pre>
+<p>选择指定时间及之后的消息参与摘要，适合只关注某个阶段之后的进展。这里使用的是 <code>kotlin.time.Instant</code>，不要直接混用同名的 Java 类型。</p>
+<h3 id="344-chunked分块摘要">3.4.4 Chunked：分块摘要</h3>
+<pre><code class="language-kotlin">val compressHistory by nodeLLMCompressHistory&lt;String&gt;(
+    strategy = HistoryCompressionStrategy.Chunked(10)
+)
+</code></pre>
+<p>它把历史拆成固定大小的块，每块独立处理，得到多段摘要。相较只保留一段总摘要，这种方式更容易留下各阶段的信息，但也可能产生更多模型调用。块数量、摘要长度都会影响实际开销。</p>
+<p>上面四种策略并不是简单截断后原样回传，而是调用模型生成 TLDR。1.3.0 的合成过程还会保留全部 system 消息、首个包含文本的 user 消息、传入的记忆消息，以及末尾尚未完成的工具调用消息（如果存在）。所以 <code>FromLastNMessages</code> 不能按字面理解成“所有更早的消息都会彻底消失”；较早的普通过程消息不参与摘要，但存在这些保留例外。</p>
+<p>分块大小按消息条数计算，不按 token。块间缺少上下文可能影响摘要质量，分得越细也不一定越好。</p>
+<h3 id="345-factretrievalhistorycompressionstrategy只找指定事实">3.4.5 FactRetrievalHistoryCompressionStrategy：只找指定事实</h3>
+<p>有时我们不需要“把过程概括一遍”，只想知道几个明确的事实，比如用户偏好、预算、问题是否已解决。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.dsl.extension.Concept
+import ai.koog.agents.core.dsl.extension.FactType
+import ai.koog.agents.core.dsl.extension.FactRetrievalHistoryCompressionStrategy
+import ai.koog.agents.core.dsl.extension.HistoryCompressionStrategy
+
+val factStrategy = FactRetrievalHistoryCompressionStrategy(
+    concepts = listOf(
+        Concept("budget", "用户已经确认的出行预算", FactType.SINGLE),
+        Concept("preferences", "用户的活动偏好和明确禁忌", FactType.MULTIPLE)
+    ),
+    fallback = HistoryCompressionStrategy.WholeHistory
+)
+</code></pre>
+<p>在图中可以把 <code>factStrategy</code> 传给 <code>nodeLLMCompressHistory&lt;String&gt;(strategy = factStrategy)</code>。这个片段只配置提取规则，没有执行模型调用。</p>
+<p><code>Concept</code> 描述要找什么，<code>FactType.SINGLE</code> / <code>MULTIPLE</code> 表示按单项或多项事实提取。框架会针对各个 concept 发起结构化提取；concept 越多，潜在调用开销越大。</p>
+<p>本例显式配置了 <code>fallback = WholeHistory</code>。不配置时默认是 <code>NoCompression</code>，没有提取出事实就可能保留原历史，并不保证一定变短。这仍然是在整理当前历史，不是向长期记忆库自动写入记录。</p>
+<p>可以按下面的方式选择：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>优先考虑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>需要整体进展摘要</td>
+<td>WholeHistory</td>
+</tr>
+<tr>
+<td>只关心最近进展，旧历史可以丢弃</td>
+<td>FromLastNMessages</td>
+</tr>
+<tr>
+<td>各阶段都需要留下摘要</td>
+<td>Chunked</td>
+</tr>
+<tr>
+<td>已经清楚后续需要哪些事实</td>
+<td>FactRetrievalHistoryCompressionStrategy</td>
+</tr>
+</tbody>
+</table>
+<h2 id="35-preservememory-究竟保留什么">3.5 preserveMemory 究竟保留什么</h2>
+<p>这个参数很容易被名字误导。</p>
+<p>它保留的是框架识别出的“记忆相关消息”，例如特定记忆功能注入的事实消息；不是把 ChatMemory 加载的整段历史全部保留，也不会顺带把摘要写进数据库。</p>
+<p><code>nodeLLMCompressHistory</code> 与 <code>replaceHistoryWithTLDR</code> 的默认值都是 <code>true</code>。在 1.3.0 中，框架从文本消息中匹配 <code>Here are the relevant facts from memory</code> 或 <code>Memory feature is not enabled</code> 这类标记，将匹配消息作为 <code>memoryMessages</code> 传入压缩策略。</p>
+<p>这是当前发布版本的实现细节，不是“任意记忆 feature 都天然兼容”的承诺。自定义策略仍要主动使用 <code>memoryMessages</code>；框架不会强制把它们拼回结果。反过来，<code>false</code> 也只是关闭这一步额外选择，不代表所有含该文本的 system 或 user 消息都一定被删除。</p>
+<p>保留 system 指令、保留某类记忆消息、保留所有聊天历史，是三种不同的要求。选择压缩策略时应该分别检查，不能看见 <code>preserveMemory = true</code> 就认为“重要信息肯定还在”。</p>
+<h2 id="36-自定义策略记得真正写回-prompt">3.6 自定义策略：记得真正写回 prompt</h2>
+<p>内置策略不能满足业务规则时，可以继承 <code>HistoryCompressionStrategy</code>，实现 <code>compress</code>。官方的自定义策略扩展面向 Kotlin。</p>
+<p>下面是一个完整的离线过滤实验，复用附录的 <code>OfflineExecutor</code>。保存为 <code>CompressionDemo.kt</code>，执行 <code>./gradlew run -PmainClass=CompressionDemoKt</code>。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.agent.session.AIAgentLLMWriteSession
+import ai.koog.agents.core.dsl.builder.*
+import ai.koog.agents.core.dsl.extension.*
+import ai.koog.prompt.executor.clients.openai.OpenAIModels
+import ai.koog.prompt.message.Message
+import kotlinx.coroutines.runBlocking
+
+// 纯过滤演示，不调用 LLM，不产生摘要。必须显式把结果写回 prompt。
+class DemoFilterCompression : HistoryCompressionStrategy() {
+    var preservedMemories = 0
+    override suspend fun compress(llmSession: AIAgentLLMWriteSession, memoryMessages: List&lt;Message&gt;) {
+        preservedMemories = memoryMessages.size
+        val original = llmSession.prompt.messages
+        val retained = original.filterIsInstance&lt;Message.System&gt;() + memoryMessages + original.takeLast(1)
+        llmSession.prompt = llmSession.prompt.withMessages { retained.distinct() }
+    }
+}
+
+fun main() = runBlocking {
+    val compression = DemoFilterCompression()
+    val graph = strategy&lt;String, String&gt;("filter-demo") {
+        val seed by node&lt;String, String&gt; { input -&gt;
+            llm.writeSession {
+                appendPrompt {
+                    user("旧问题")
+                    assistant("Here are the relevant facts from memory: name=SharpCJ")
+                    assistant("可以丢弃的中间回答")
+                    user(input)
+                }
+            }
+            input
+        }
+        val shrink by nodeLLMCompressHistory&lt;String&gt;(strategy = compression)
+        val inspect by node&lt;String, String&gt; { input -&gt;
+            llm.readSession {
+                check(prompt.messages.size == 3)
+                check(prompt.messages.last() is Message.User)
+                check(compression.preservedMemories == 1)
+                "$input | 压缩后消息数=${prompt.messages.size}，保留记忆=${compression.preservedMemories}"
+            }
+        }
+        nodeStart then seed then shrink then inspect then nodeFinish
+    }
+    val executor = OfflineExecutor()
+    val agent = AIAgent(executor, OpenAIModels.Chat.GPT4o, strategy = graph, systemPrompt = "系统规则")
+    try {
+        println(agent.run("当前问题"))
+        check(executor.prompts.isEmpty())
+        println("LLM 调用次数=${executor.prompts.size}（纯过滤，不是 LLM 摘要）")
+    } finally { agent.close(); executor.close() }
+}
+</code></pre>
+<p>这个例子按确定规则处理消息，不会调用 LLM 生成摘要。它的用途是展示扩展接口，以及检查“转换后的消息确实写回当前 prompt”。如果改成模型摘要，也要完成同样的写回步骤，不能只是构造一个局部 <code>compressedMessages</code> 变量后就结束。</p>
+<p>实际输出为：</p>
+<pre><code class="language-text">当前问题 | 压缩后消息数=3，保留记忆=1
+LLM 调用次数=0（纯过滤，不是 LLM 摘要）
+</code></pre>
+<p>三条消息分别是 system、带记忆标记的 assistant，以及当前 user。这里特意没有工具调用；这个过滤规则不是面向任意工具对话的通用裁剪器。官网自定义策略示例中有只计算 <code>compressedMessages</code> 而未写回的代码，使用时需要补上 <code>llmSession.prompt = ...</code>，否则历史不会真的变化。</p>
+<p>到这里，我们已经知道怎样延续对话、怎样缩减历史。可这两种能力都不能回答“程序上次执行到哪里了”。接下来再看执行恢复。</p>
+<h1 id="四persistence让任务从保存的位置继续">四、Persistence：让任务从保存的位置继续</h1>
+<h2 id="41-chatmemory-为什么不够">4.1 ChatMemory 为什么不够</h2>
+<p>假设一个报告生成任务有三个步骤：</p>
+<div class="mermaid">flowchart LR
+    collect["收集资料"] --&gt; analyze["整理分析"] --&gt; publish["生成报告"]
+</div><p>如果“整理分析”已经完成，最后一步失败，下一次还要不要重新收集资料？</p>
+<p>ChatMemory 即使保存了前几轮聊天，也不负责告诉图执行器跳过哪个节点。Persistence 保存的则是执行检查点，也就是 checkpoint。</p>
+<p>一个 checkpoint 主要包含：</p>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>消息历史</td>
+<td>恢复模型当时的上下文</td>
+</tr>
+<tr>
+<td>最后成功执行的节点及其输出</td>
+<td>确定后续从哪里继续、拿什么作为输入</td>
+</tr>
+<tr>
+<td>模型、常见参数和工具选择</td>
+<td>恢复相关调用配置</td>
+</tr>
+<tr>
+<td>AIAgentStorage 中可序列化的数据</td>
+<td>恢复工作流中的辅助状态</td>
+</tr>
+<tr>
+<td>标识、版本、时间戳等元数据</td>
+<td>查找和区分检查点</td>
+</tr>
+</tbody>
+</table>
+<p>这里的“恢复”不是把协程堆栈、数据库连接和整个进程搬到磁盘。它保存的是框架理解的执行状态。闭包里的局部变量、第三方客户端对象，不能因为启用了 Persistence 就自动恢复。</p>
+<h2 id="42-安装-feature-之后还要选择后端">4.2 安装 feature 之后，还要选择后端</h2>
+<p>Persistence 的默认后端不实际保存数据；自动保存开关与是否落盘，也要分开看。</p>
+<p>1.3.0 的默认值为：</p>
+<pre><code class="language-kotlin">storage = NoPersistencyStorageProvider()
+enableAutomaticPersistence = true
+rollbackToolRegistry = RollbackToolRegistry.EMPTY
+</code></pre>
+<p>这里是配置默认值摘录，不是完整应用。注意类名使用 <code>Persistency</code> 拼写。自动开关默认打开，但空后端不保存数据；仅写 <code>install(Persistence)</code>，并不等于已经获得了磁盘恢复能力。</p>
+<p>JVM 文件后端可以这样配置：</p>
+<pre><code class="language-kotlin">import ai.koog.agents.snapshot.feature.Persistence
+import ai.koog.agents.snapshot.providers.file.JVMFilePersistenceStorageProvider
+import java.nio.file.Path
+
+// 放在创建 AIAgent 时的配置块中。
+install(Persistence) {
+    storage = JVMFilePersistenceStorageProvider(Path.of("state"))
+    enableAutomaticPersistence = true
+}
+</code></pre>
+<p>通用的 <code>FilePersistenceStorageProvider&lt;Path&gt;</code> 也存在，但需要额外传入文件系统实现；JVM 示例直接使用上面的便捷类型。</p>
+<p>从用途看，主要有三类：</p>
+<table>
+<thead>
+<tr>
+<th>后端</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>空实现</td>
+<td>不保存检查点</td>
+</tr>
+<tr>
+<td>内存实现</td>
+<td>验证保存、恢复流程，进程退出后丢失</td>
+</tr>
+<tr>
+<td>文件或自定义持久后端</td>
+<td>在进程退出后仍能读取检查点</td>
+</tr>
+</tbody>
+</table>
+<p>自定义后端需要实现 <code>PersistenceStorageProvider</code>，负责保存和查询 checkpoint。可以对接数据库，但接口不会自动替你提供分布式锁、版本迁移或安全清理策略。</p>
+<h2 id="43-自动保存与手动恢复">4.3 自动保存与手动恢复</h2>
+<p><code>enableAutomaticPersistence</code> 控制是否在节点完成后自动创建检查点。关闭它后，可以在明确的位置手动保存，例如一个阶段已经完成、后面将要执行高成本步骤的时候。</p>
+<p>几个 API 的职责如下：</p>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>主要用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>createCheckpointAfterNode</code></td>
+<td>手动记录某个节点之后的状态</td>
+</tr>
+<tr>
+<td><code>rollbackToCheckpoint</code></td>
+<td>在执行上下文中回到指定检查点</td>
+</tr>
+<tr>
+<td><code>rollbackToLatestCheckpoint</code></td>
+<td>回到查询到的最新检查点</td>
+</tr>
+<tr>
+<td><code>setExecutionPointAfterNode</code></td>
+<td>显式设置节点后的执行位置，属于更底层控制</td>
+</tr>
+</tbody>
+</table>
+<p>这些方法通过上下文中的 <code>persistence()</code> 获取已安装实例后调用。手动创建检查点的签名摘录如下：</p>
+<pre><code class="language-kotlin">suspend fun createCheckpointAfterNode(
+    agentContext: AIAgentContext,
+    nodePath: String,
+    lastOutput: Any?,
+    lastOutputType: TypeToken,
+    version: Long,
+    checkpointId: String? = null
+): AgentCheckpointData?
+</code></pre>
+<p><code>lastOutputType</code> 可以通过 <code>ai.koog.serialization.typeToken&lt;T&gt;()</code> 提供，<code>version</code> 也必须传入。不要只看到方法名就省略输出类型和版本参数。它是低层 API，记录的路径、类型和输出必须确实对应那个已经完成的节点。</p>
+<p>恢复方法接收当前执行上下文：<code>rollbackToCheckpoint(checkpointId, agentContext)</code> 或 <code>rollbackToLatestCheckpoint(agentContext)</code>。它们安排恢复，由图执行过程应用恢复上下文，不应理解成在任意线程里调用后立刻倒放所有步骤。</p>
+<p>对于本文这种 graph 策略，启动时会检查最新 checkpoint。关闭 <code>enableAutomaticPersistence</code> 只是关闭节点后的自动保存，并不会一并关闭启动恢复。</p>
+<p>不建议把“每次启动时直接回滚到最新记录”当作所有任务的通用模板。必须先弄清楚要恢复的是哪个任务、检查点是否属于相容的策略版本，以及是不是应该恢复而不是启动新任务。</p>
+<h2 id="44-序列化为什么有些值能存进去却恢复不出来">4.4 序列化：为什么有些值能存进去，却恢复不出来</h2>
+<p>第五篇说过，<code>storage.set</code> 保存的是内存对象。保存 checkpoint 时，框架才需要把这些对象编码成可持久化的数据。</p>
+<p>默认使用 kotlinx.serialization 时，可以这样定义业务状态：</p>
+<pre><code class="language-kotlin">import kotlinx.serialization.Serializable
+
+@Serializable
+data class ReportState(
+    val topic: String,
+    val sourceCount: Int
+)
+</code></pre>
+<p>它的字段也需要被序列化器支持。若切换为其他 <code>JSONSerializer</code>，则按该实现的要求处理。</p>
+<p><strong>进入 checkpoint 的节点输出和 storage 值都要检查，不要只给其中一个加注解。</strong> 1.3.0 对两者的失败处理还不一样：</p>
+<ul>
+<li>storage 某个字段无法序列化时，该字段会被跳过，其余可编码数据仍可能保存。</li>
+<li>节点输出无法序列化时，这一次 checkpoint 会被跳过，方法返回 <code>null</code>，并产生警告日志。</li>
+</ul>
+<p>所以，能正常 <code>storage.set/get</code>，不能证明它已经进入 checkpoint；应用也不能只因为“没有抛异常”，就认定最新执行进度保存成功。</p>
+<p>反过来，数据库连接、文件句柄、执行器等对象，本来就不应该作为可恢复的业务状态保存。可以保存连接所需的业务标识或路径，再在新进程中重新创建资源。</p>
+<h2 id="45-实际跑一次中断进程再恢复">4.5 实际跑一次：中断进程，再恢复</h2>
+<p>下面是本文自建的最小实验，不调用 LLM。保留节点图和文件 checkpoint，避免把模型生成的不确定性混入恢复验证。</p>
+<p>把下面的代码保存为 <code>src/main/kotlin/PersistenceArticle.kt</code>，保留包名。<code>NoModelExecutor</code> 只满足 Agent 构造所需的模型元数据解析，不注册厂商客户端；图里没有 LLM 节点，因此不会请求模型。</p>
+<pre><code class="language-kotlin">package recoverydemo
+
+import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.agent.entity.createStorageKey
+import ai.koog.agents.core.dsl.builder.*
+import ai.koog.agents.snapshot.feature.*
+import ai.koog.agents.snapshot.providers.file.JVMFilePersistenceStorageProvider
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekModels
+import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
+import ai.koog.prompt.executor.model.*
+import ai.koog.prompt.llm.LLModel
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.Serializable
+import java.nio.file.Path
+
+@Serializable data class SavedState(val customer: String, val count: Int)
+class Ephemeral(val value: String)
+class NoModelExecutor : MultiLLMPromptExecutor(llmClients = emptyMap()) {
+    override suspend fun resolveModel(model: LLModel, promptExecutorOperation: PromptExecutorOperation) = ResolvedModel(effectiveModel = model)
+}
+fun main(args: Array&lt;String&gt;) = runBlocking {
+    val mode = args.firstOrNull() ?: "save"
+    val sessionId = args.getOrNull(1) ?: "persistent-session"
+    val agentId = args.getOrNull(2) ?: "agent-$mode"
+    val disk = JVMFilePersistenceStorageProvider(Path.of("state"))
+    val savedKey = createStorageKey&lt;SavedState&gt;("business-state")
+    val ephemeralKey = createStorageKey&lt;Ephemeral&gt;("ephemeral")
+    var firstExecuted = false
+    val graph = strategy&lt;String, String&gt;("persist-demo") {
+        val prepare by node&lt;String, String&gt; { input -&gt;
+            firstExecuted = true
+            println("PREPARE pid=${ProcessHandle.current().pid()} agent=$agentId run=$runId input=$input")
+            storage.set(savedKey, SavedState("Alice", 42))
+            storage.set(ephemeralKey, Ephemeral("not serializable"))
+            "prepared:$input"
+        }
+        val consume by node&lt;String, String&gt; { previous -&gt;
+            if (mode == "save") {
+                val checkpoint = disk.getLatestCheckpoint(runId)!!
+                check(checkpoint.storage!!.entries.containsKey("business-state"))
+                check(!checkpoint.storage!!.entries.containsKey("ephemeral"))
+                println("SAVED node=${checkpoint.graphProperties!!.nodePath} keys=${checkpoint.storage!!.entries.keys}")
+                // Exit the whole JVM after the first node's automatic checkpoint has reached disk.
+                Runtime.getRuntime().halt(0)
+            }
+            check(storage.getValue(createStorageKey&lt;SavedState&gt;("business-state")) == SavedState("Alice", 42))
+            check((storage.get(ephemeralKey) == null) == !firstExecuted)
+            if (mode == "fresh") check(firstExecuted)
+            println("RESTORED pid=${ProcessHandle.current().pid()} agent=$agentId run=$runId state=${storage.getValue(savedKey)} previous=$previous firstExecuted=$firstExecuted")
+            previous
+        }
+        nodeStart then prepare then consume then nodeFinish
+    }
+    val executor = NoModelExecutor()
+    val agent = AIAgent(promptExecutor = executor, llmModel = DeepSeekModels.DeepSeekV4Flash,
+        strategy = graph, id = agentId, maxIterations = 30) {
+        install(Persistence) { storage = disk; enableAutomaticPersistence = true }
+    }
+    try {
+        val result = agent.run(if (mode == "save") "ORIGINAL" else "NEW-IGNORED", sessionId = sessionId)
+        if (mode == "resume") {
+            check(!firstExecuted)
+            check(result == "prepared:ORIGINAL")
+        }
+        println("RESULT $result")
+    } finally { agent.close(); executor.close() }
+}
+</code></pre>
+<p>先说明两个实验设计：</p>
+<ul>
+<li><code>SavedState</code> 可以序列化，<code>Ephemeral</code> 故意不加序列化声明。保存时直接检查 checkpoint，确认前者存在、后者未写入。</li>
+<li><code>save</code> 模式进入第二个节点后，先确认第一个节点的 checkpoint 已落盘，再调用 <code>Runtime.halt(0)</code> 终止整个 JVM。这是独立演示进程中的故障注入，<strong>不要把这种退出方式放进生产服务</strong>。</li>
+</ul>
+<p>在独立的演示工程中按顺序运行，首次运行前确认没有旧的 <code>state</code> 数据；若已有数据，换一个新的目录做实验，不要直接删除业务检查点：</p>
+<pre><code class="language-bash">./gradlew run -PmainClass=recoverydemo.PersistenceArticleKt --args=save
+./gradlew run -PmainClass=recoverydemo.PersistenceArticleKt --args=resume
+</code></pre>
+<p>每条命令启动一个新的应用 JVM。第二次必须保持相同的工作目录和 <code>sessionId</code>，让文件 Provider 查询同一组检查点。</p>
+<p>这段代码先看三个点：</p>
+<ol>
+<li>保存的是框架可识别的节点输出与 storage 业务数据，不是捕获整个运行现场。</li>
+<li>第二次启动重新构建同一张图，但通过已保存的 checkpoint 继续，不能随意修改节点名称和类型。</li>
+<li>测试明确记录恢复进程是否重新执行了首个节点，而不是只看最后有没有得到一个字符串。</li>
+</ol>
+<p>本地两个独立 JVM 的实际输出摘录如下，省略构建和框架日志；PID 只表示这次运行的进程标识，每次都会变化：</p>
+<pre><code class="language-text">PREPARE pid=19648 agent=agent-save run=persistent-session input=ORIGINAL
+SAVED node=agent-save/persist-demo/prepare keys=[business-state]
+RESTORED pid=19819 agent=agent-resume run=persistent-session state=SavedState(customer=Alice, count=42) previous=prepared:ORIGINAL firstExecuted=false
+RESULT prepared:ORIGINAL
+</code></pre>
+<p>注意三个结果：</p>
+<ol>
+<li>保存端与恢复端 PID 不同，确实重新启动了进程；恢复不依赖旧内存。</li>
+<li><code>firstExecuted=false</code> 说明恢复进程没有重跑 <code>prepare</code>。它拿到已保存的 <code>prepared:ORIGINAL</code>，继续执行 <code>consume</code>，没有从新的 <code>NEW-IGNORED</code> 输入重新跑整张图。</li>
+<li><code>SavedState</code> 通过重新创建的同名、同类型 key 读取成功，<code>Ephemeral</code> 在恢复后不存在。</li>
+</ol>
+<p>这里还特意用了不同的 Agent ID：<code>agent-save</code> 与 <code>agent-resume</code>。在 1.3.0 中，寻找文件检查点依赖的是存储位置和 <code>runId/sessionId</code>，并不要求 Agent ID 相同；但策略、子图、节点路径及输出类型必须兼容。省略 <code>sessionId</code> 产生新 UUID，就不会因为 Agent ID 一样而自动找到旧任务。</p>
+<p>正常完成后会保存 tombstone，表示这次执行已经结束。再用同一个 session 运行，不会一直回到旧的中间节点；本地额外验证了完成后重跑和更换 session，两者都从头执行。</p>
+<p>本例验证的是一次受控中断后的跨进程恢复，不等于证明任意 kill 时机、任意并行图都可以无损续跑。模型流式调用、外部副作用、状态版本升级，都需要额外测试。</p>
+<h2 id="46-检查点与代码版本需要一起管理">4.6 检查点与代码版本需要一起管理</h2>
+<p>checkpoint 记录了节点位置、类型与配置。今天保存的状态，下周升级代码后不一定还能直接使用。</p>
+<p>下面这些修改都应该格外小心：</p>
+<ul>
+<li>节点或子图改名，导致原执行位置找不到。</li>
+<li>输出从 <code>String</code> 改为新的 data class，旧数据无法按新类型解码。</li>
+<li>storage 的 key 名称或值类型改变。</li>
+<li>工具行为改变，相同参数执行出了不同的业务含义。</li>
+</ul>
+<p>简单系统可以限制任务在同一策略版本内恢复；复杂系统则需要明确的兼容策略和状态迁移。不要把 checkpoint 当作永久兼容的序列化存档。</p>
+<p>接下来还剩一个更现实的问题：框架状态恢复了，已经对外执行的操作怎么办？</p>
+<h1 id="五恢复-agent-状态能不能撤销工具操作">五、恢复 Agent 状态，能不能撤销工具操作</h1>
+<h2 id="51-先看一个创建用户的例子">5.1 先看一个创建用户的例子</h2>
+<p>假设 Agent 依次做了这些事：</p>
+<pre><code class="language-text">创建 Alex
+保存 checkpoint-1
+创建 Daniel
+创建 Maria
+</code></pre>
+<p>现在回退到 <code>checkpoint-1</code>，消息历史和执行位置回去了，但数据库中的 Daniel、Maria 会不会自动消失？</p>
+<p>不会。框架的执行状态与数据库中的业务状态，是两套东西。</p>
+<p>官方 Persistence 文档正是用这个例子介绍 <code>RollbackToolRegistry</code>：为正向工具配置对应的回滚工具，在回滚时执行补偿动作。</p>
+<h2 id="52-给工具配一个回滚工具">5.2 给工具配一个回滚工具</h2>
+<p>下面根据官方场景写一个 Kotlin 版本。为了把注意力放在映射关系上，示例使用内存集合，不连接数据库：</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.tools.annotations.Tool
+import ai.koog.agents.core.tools.annotations.LLMDescription
+import ai.koog.agents.snapshot.feature.RollbackToolRegistry
+
+private val users = mutableSetOf&lt;String&gt;()
+
+@Tool
+@LLMDescription("创建演示用户")
+fun createUser(name: String): String {
+    check(users.add(name)) { "用户已存在：$name" }
+    return "Created $name"
+}
+
+@Tool
+@LLMDescription("删除本次演示创建的用户")
+fun removeUser(name: String): String {
+    users.remove(name)
+    return "Removed $name"
+}
+
+fun rollbackMapping() = RollbackToolRegistry {
+    registerRollback(::createUser, ::removeUser)
+}
+</code></pre>
+<p>随后，在创建 Agent 时注册正向工具，并在 Persistence 配置中传入回滚映射。下面是配置片段，<code>executor</code> 是调用方已创建的执行器：</p>
+<pre><code class="language-kotlin">val agent = AIAgent(
+    promptExecutor = executor,
+    llmModel = OpenAIModels.Chat.GPT4oMini,
+    toolRegistry = ToolRegistry { tool(::createUser) }
+) {
+    install(Persistence) {
+        storage = InMemoryPersistenceStorageProvider()
+        enableAutomaticPersistence = true
+        rollbackToolRegistry = rollbackMapping()
+    }
+}
+</code></pre>
+<p>这段里使用内存 checkpoint 后端，只是为了展示配置；需要跨进程恢复时，仍应替换成文件或其他持久后端。</p>
+<p>映射的含义是：对于需要撤销的 <code>createUser(name)</code>，使用相同参数调用 <code>removeUser(name)</code>。官方说明补偿按相反顺序执行，因此前面的场景在业务上需要先撤销 Maria，再撤销 Daniel，保留 Alex。</p>
+<p>注意，这段代码只定义了映射，没有在 <code>main</code> 中完整触发一次工具执行与回滚。本文对映射关系做了编译和查找校验，不把它当作已经验证的数据库补偿事务。</p>
+<h3 id="521-130-中哪种恢复会触发补偿">5.2.1 1.3.0 中，哪种恢复会触发补偿</h3>
+<p>这里要区分两个名字接近、行为不同的方法：</p>
+<table>
+<thead>
+<tr>
+<th>恢复路径</th>
+<th>是否构造这套工具补偿动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rollbackToCheckpoint(id, context)</code></td>
+<td>会，在满足历史比较条件时构造</td>
+</tr>
+<tr>
+<td><code>rollbackToLatestCheckpoint(context)</code></td>
+<td>不会</td>
+</tr>
+<tr>
+<td>启动时自动恢复最新 checkpoint</td>
+<td>不会，走的是上一行路径</td>
+</tr>
+</tbody>
+</table>
+<p><code>rollbackToCheckpoint</code> 比较当前历史和 checkpoint 历史，后者需要是前者的完整前缀。满足条件后，框架提取 checkpoint 之后的工具调用，按逆序安排已注册的补偿工具，并传入原调用参数。不是方法刚返回就全部撤销，而是在图应用恢复上下文时执行。</p>
+<p>本文另外用人工构造的工具调用历史做离线断言，两个调用编号为 1、2。下面两行输出分别对应“用 <code>rollbackToCheckpoint</code> 恢复”和“用 <code>rollbackToLatestCheckpoint</code> 恢复”两种调用方式：</p>
+<pre><code class="language-text">PASS rollbackToCheckpoint undo=[2, 1] (after graph applies restored context)
+PASS rollbackToLatestCheckpoint undo=[] (after graph applies restored context)
+</code></pre>
+<p>这些是框架控制流测试，不是真实模型响应，也不是对数据库做了回滚。它们说明：<strong>不能把“自动恢复 checkpoint”写成“自动撤销 checkpoint 之后的工具副作用”。</strong> 未注册补偿的工具也不会凭空获得逆操作。</p>
+<p>补偿的时机还剩最后一层：安排和执行分在两个时刻。<code>rollbackToCheckpoint</code> 调用时只做比较和排队，图执行器应用恢复上下文的那一刻，才真正按逆序执行补偿：</p>
+<pre><code class="language-text">运行中某个节点里调用 rollbackToCheckpoint(id, context)
+        ↓
+① 此刻：比较历史前缀 → 提取 checkpoint 之后的工具调用 → 逆序排队
+        ↓
+② 方法返回：什么都没撤销（实测返回后 undo 列表仍为空）
+        ↓
+③ 图应用恢复上下文：补偿真正执行
+        ↓
+④ 从 checkpoint 记录的位置继续执行
+</code></pre>
+<p>所以它不是调用瞬间生效，不是后台线程异步做，也不是 Agent 结束时统一算账——这三个直觉都不对。前缀不匹配时不补偿（diff 为空，框架不会去猜该撤销什么）。</p>
+<p>最后把 <code>install(Persistence)</code> 的语义收拢一下：它打开的是“自动存档 + 启动时自动续最新档”的基础设施。恢复到哪个点，默认由“最新非 tombstone checkpoint”这条规则决定，不由用户指定；用户控制的是存档策略（自动开关或手动 <code>createCheckpointAfterNode</code>）、任务身份（sessionId）和特殊情况下的手动 <code>rollbackToCheckpoint(id)</code>。源码层面，<code>interceptStrategyStarting</code> 里的恢复拦截器不受 <code>enableAutomaticPersistence</code> 控制，保存与 tombstone 拦截器受控——这就是“关自动保存不关启动恢复”的代码依据。</p>
+<h2 id="53-能配回滚工具不等于所有操作都能撤销">5.3 能配回滚工具，不等于所有操作都能撤销</h2>
+<p>上面的集合例子比较理想，真实业务要再多想一步。</p>
+<ul>
+<li>用户可能本来就存在，删除工具不能误删其他流程创建的数据。</li>
+<li>邮件已经发出去、第三方接口已经产生费用，未必存在真正的逆操作。</li>
+<li>回滚工具也可能超时或失败，需要记录处理进度、支持重试或人工处置。</li>
+<li>外部操作已经成功，而 checkpoint 还没写成功时进程退出，恢复后仍可能重复执行。</li>
+</ul>
+<p>因此，工具参数中通常需要稳定的业务标识或幂等键。补偿函数是否安全、能否重复执行、失败后如何继续，都属于业务设计。</p>
+<blockquote>
+<p>Persistence 帮我们保存和调整执行状态；RollbackToolRegistry 让工具补偿有一个明确入口，但它们不会自动把多个外部系统变成同一个数据库事务。</p>
+</blockquote>
+<h1 id="六longtermmemory为什么还有一种长期记忆">六、LongTermMemory：为什么还有一种长期记忆</h1>
+<h2 id="61-它和-chatmemory-的区别">6.1 它和 ChatMemory 的区别</h2>
+<p>讲到这里，可能会有一个疑问：ChatMemory 都能把历史保存到数据库了，为什么还需要 LongTermMemory？</p>
+<p>区别主要在于下一次怎么使用数据。</p>
+<p>ChatMemory 按会话标识加载一组历史消息。LongTermMemory 则根据当前问题，从存储里查找相关记录，再把找到的内容加入提示词。前者更接近“把这段对话接着聊”，后者更接近“从已有资料中找出这次需要的内容”。</p>
+<p>比如，用户上周在另一段对话中提过不吃海鲜。今天重新开一段对话，问去某地吃什么，长期记忆可以检索这条偏好，而不必把上周所有聊天原样加载进来。</p>
+<p>这只是使用场景，不表示框架能够自动判断哪些偏好真实、有没有过期、是否允许跨会话读取。记录抽取、检索范围与权限仍需设计。</p>
+<p><strong>LongTermMemory 当前属于 <code>1.3.0-beta</code> 模块，API 可能变化。</strong> 本节只讲配置关系，不展开向量数据库和完整 RAG 工程。</p>
+<h2 id="62-retrieval-和-ingestion-是两组独立配置">6.2 Retrieval 和 ingestion 是两组独立配置</h2>
+<table>
+<thead>
+<tr>
+<th>部分</th>
+<th>职责</th>
+<th>启用自动行为后的执行时机</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>retrieval</code></td>
+<td>检索相关记录，增强 prompt</td>
+<td>每次 LLM 调用前</td>
+</tr>
+<tr>
+<td><code>ingestion</code></td>
+<td>将历史转换为记录，写入存储</td>
+<td>Agent 成功完成时，把累积历史交给提取器</td>
+</tr>
+</tbody>
+</table>
+<p>默认 <code>retrievalSettings</code> 和 <code>ingestionSettings</code> 都为空；配置对应部分后，自动行为的开关默认打开。检索在普通及流式 LLM 请求前执行，写入挂在 Agent completed 钩子，并不是每追加一条消息就立刻保存，也不是失败后的无条件清理钩子。</p>
+<p>安装 feature 后，还需要显式配置对应部分及存储。<strong>只配置 retrieval，不代表新消息会自动写入记忆库。</strong></p>
+<p>可以使用只有检索的模式接已有知识库，也可以只写入记录供后续处理，或者组合使用。下面是已编译的双向配置示例：</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.longtermmemory.feature.LongTermMemory
+import ai.koog.agents.longtermmemory.storage.InMemoryRecordStorage
+import ai.koog.agents.longtermmemory.retrieval.search.SimilaritySearchStrategy
+import ai.koog.prompt.executor.clients.openai.OpenAIModels
+import ai.koog.prompt.executor.model.PromptExecutor
+
+fun longMemoryAgent(executor: PromptExecutor) = AIAgent(
+    promptExecutor = executor,
+    llmModel = OpenAIModels.Chat.GPT4oMini,
+    systemPrompt = "你是一名出行助手，根据用户偏好给出建议。"
+) {
+    val memoryStorage = InMemoryRecordStorage()
+    install(LongTermMemory) {
+        retrieval {
+            storage = memoryStorage
+            namespace = "travel-demo"
+            searchStrategy = SimilaritySearchStrategy(topK = 3)
+        }
+        ingestion {
+            storage = memoryStorage
+            namespace = "travel-demo"
+        }
+    }
+}
+</code></pre>
+<p>这是配置和工厂函数示例，已经编译核对，但没有运行真实模型检索、摘要提取或偏好记忆效果，不提供模拟成真实结果的问答输出。</p>
+<p>函数返回 Agent，调用方负责运行并关闭它。这里两个部分使用同一个存储和 namespace，是为了让写入的数据能在后续检索中访问；这个内存实例仍然会在进程退出后丢失。</p>
+<p>默认查询来源是最后一条用户消息，可以通过 <code>searchQueryProvider</code> 自定义。检索结果可以由 <code>SystemPromptAugmenter</code>、<code>UserPromptAugmenter</code> 或自定义逻辑加入 prompt。比如默认的 system 增强器依赖 system 消息存在，所以不能连 system prompt 都没配置，就假定一定完成了增强。</p>
+<p>自动行为也可以关闭：在相应配置中设置 <code>enableAutomaticRetrieval = false</code> 或 <code>enableAutomaticIngestion = false</code>。这时可在节点中通过 <code>withLongTermMemory { }</code> 访问存储，按自己的流程搜索和写入。关闭自动行为不等于把存储能力删除。</p>
+<h2 id="63-内存相似度检索不代表已经用了向量模型">6.3 内存相似度检索，不代表已经用了向量模型</h2>
+<p><code>InMemoryRecordStorage</code> 很适合测试，但要看清它的实现边界：</p>
+<ul>
+<li>数据保存在内存中，重启后丢失。</li>
+<li>关键词请求使用不区分大小写的子串匹配。</li>
+<li>相似度请求使用单词集合的 Jaccard 系数，不会调用 embedding 模型生成向量。</li>
+</ul>
+<p>因此，上面的 <code>SimilaritySearchStrategy(topK = 3)</code> 不能用来证明“已经接通向量数据库”。它只是向存储发起相似度检索请求，真正怎么实现相似度由存储后端决定。</p>
+<p>要接真实检索服务，需要实现或接入 <code>SearchStorage</code>、<code>WriteStorage</code> 等接口，考虑 embedding、索引、过滤和权限。这个话题可以单独展开，本篇先把它与 ChatMemory、Persistence 的职责分清。</p>
+<p><code>namespace</code> 只是传给存储的集合或命名空间标识，不是用户权限校验。跨会话偏好还需要处理归属、删除、过期和纠错，不能因为检索到了记录就默认它可信且永远有效。</p>
+<h1 id="七这些能力怎么组合">七、这些能力怎么组合</h1>
+<h2 id="71-按场景选择不必全部装上">7.1 按场景选择，不必全部装上</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>建议的起点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>普通多轮问答</td>
+<td>ChatMemory，选择合适的历史后端与窗口</td>
+</tr>
+<tr>
+<td>单次任务中工具调用很多</td>
+<td>在适当阶段加入 History Compression</td>
+</tr>
+<tr>
+<td>任务执行昂贵，不能轻易从头开始</td>
+<td>Persistence，使用可恢复的存储后端</td>
+</tr>
+<tr>
+<td>需要回退外部工具动作</td>
+<td>评估 RollbackToolRegistry 与业务补偿</td>
+</tr>
+<tr>
+<td>跨会话查找用户偏好或知识</td>
+<td>LongTermMemory（Beta），明确检索范围与权限</td>
+</tr>
+</tbody>
+</table>
+<p>它们可以组合，但不要仅凭都能 <code>install</code> 就认定组合行为没有问题。</p>
+<p>例如同时安装 ChatMemory 和 Persistence，重新启动任务时，一边可能加载聊天历史，另一边可能恢复 checkpoint 中的消息历史。到底恢复了哪个版本、是否重复追加消息、同一个标识是否还关联原来的任务，都应该通过实际调用路径验证。</p>
+<h2 id="72-截窗压缩和审计记录分别保留什么">7.2 截窗、压缩和审计记录分别保留什么</h2>
+<p>如果 Provider 保存的是经过截窗、压缩的消息，那么被删掉的历史不一定还能从 ChatMemory 中找回来。</p>
+<p>这里我更建议先明确三个数据用途：</p>
+<pre><code class="language-text">给模型看的上下文：可以裁剪、压缩，以当前任务为目标。
+用于恢复的检查点：记录执行需要的状态和位置。
+业务审计记录：保留真实操作、标识和结果，按合规要求管理。
+</code></pre>
+<p>一份数据可以服务多个用途，但生命周期不必相同。不能因为模型不需要再看旧工具结果，就把排查事故所需的操作记录也一并删掉。</p>
+<h2 id="73-遇到问题如何排查">7.3 遇到问题如何排查</h2>
+<p><strong>第二轮像没聊过一样：</strong> 先看会话标识是否一致、是否使用同一个历史后端、Provider 是否真的加载到了旧消息。不要先怪模型。</p>
+<p><strong>历史有，但关键约束消失了：</strong> 检查窗口大小、过滤顺序和压缩策略。<code>FromLastNMessages</code> 不会替你找回被排除的早期约束。</p>
+<p><strong>重启后没有 checkpoint：</strong> 确认没有停留在默认空后端或内存后端，确认文件路径和任务标识没有变化，并检查保存阶段是否实际成功。</p>
+<p><strong>恢复后某项 storage 数据缺失：</strong> 检查对应类型能否被配置的序列化器编码、恢复时 key 名称与类型是否一致。第五篇已经说明过，键名冲突也会破坏类型约束。</p>
+<p><strong>恢复后又执行了一次外部操作：</strong> 检查上次操作和检查点保存之间的故障窗口，补上幂等或结果核对。恢复执行不保证业务动作恰好执行一次。</p>
+<p><strong>并行分支的记忆没有出现在主流程里：</strong> 回到第五篇的上下文合并规则。<code>fold</code> 聚合输出，不会自动把所有分支的 history 和 storage 写入都合并起来。</p>
+<h1 id="八后记">八、后记</h1>
+<p>前几篇从模型调用讲到工具，再把它们放进工作流。这篇又补上了一层：数据如何在多轮对话和长任务中延续。</p>
+<p>最后再用一张表收一下：</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>我们需要记住的边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ChatMemory</td>
+<td>按对话标识加载、保存历史；默认内存后端不能跨进程保留数据</td>
+</tr>
+<tr>
+<td>History Compression</td>
+<td>减小当前历史，可能有损，也可能额外调用模型</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>保存可恢复的执行状态；不是保存整个进程和外部系统</td>
+</tr>
+<tr>
+<td>RollbackToolRegistry</td>
+<td>为工具配置补偿关系，补偿正确性仍由业务负责</td>
+</tr>
+<tr>
+<td>LongTermMemory（Beta）</td>
+<td>检索与写入分开配置，测试存储不等于向量数据库</td>
+</tr>
+</tbody>
+</table>
+<p>判断该用哪一种能力时，先问一句：我现在要保存的是“聊过什么”“任务做到哪里”，还是“以后还要检索的知识”？把这个问题想清楚，配置就不会混在一起。</p>
+<p>后续再继续讲 Agent 的工程化：如何处理流式和结构化输出，以及如何观察、测试它的执行过程。</p>
+<h2 id="附录离线测试执行器">附录：离线测试执行器</h2>
+<p>第二章和第三章的离线实验共用这份代码，保存为 <code>src/main/kotlin/OfflineExecutor.kt</code>。它记录实际收到的 prompt，然后返回用户消息数量；<code>fail</code> 用于失败路径测试。没有任何语义理解、摘要生成或真实模型调用。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.tools.ToolDescriptor
+import ai.koog.prompt.Prompt
+import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
+import ai.koog.prompt.executor.model.PromptExecutorOperation
+import ai.koog.prompt.executor.model.ResolvedModel
+import ai.koog.prompt.llm.LLModel
+import ai.koog.prompt.message.Message
+import ai.koog.prompt.message.MessagePart
+import ai.koog.prompt.message.ResponseMetaInfo
+import kotlin.time.Clock
+
+// 纯离线测试替身：不注册任何厂商客户端，不发送网络请求，不生成真实摘要。
+class OfflineExecutor : MultiLLMPromptExecutor(llmClients = emptyMap()) {
+    val prompts = mutableListOf&lt;Prompt&gt;()
+    var fail = false
+    override suspend fun resolveModel(model: LLModel, promptExecutorOperation: PromptExecutorOperation) =
+        ResolvedModel(effectiveModel = model)
+    override suspend fun execute(prompt: Prompt, model: ResolvedModel, tools: List&lt;ToolDescriptor&gt;): Message.Assistant {
+        prompts += prompt
+        check(!fail) { "Expected offline failure" }
+        val count = prompt.messages.count { it is Message.User }
+        return Message.Assistant(
+            parts = listOf(MessagePart.Text("[离线测试替身] 当前历史包含 $count 条用户消息")),
+            metaInfo = ResponseMetaInfo(timestamp = Clock.System.now())
+        )
+    }
+}
+</code></pre>
+<p>本文的会话和过滤实验、跨进程恢复，以及独立的补偿顺序测试都已实际运行。标准 LLM 摘要、事实提取与 LongTermMemory 示例做了 API/编译核对，未验证真实模型效果；接入自己的服务时仍需分别验证这些路径。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Chat memory: <a href="https://docs.koog.ai/features/chat-memory/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/features/chat-memory/</a></li>
+<li>Build a chat agent with memory: <a href="https://docs.koog.ai/features/chat-memory/chat-agent-with-memory/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/features/chat-memory/chat-agent-with-memory/</a></li>
+<li>Chat backend with memory: <a href="https://docs.koog.ai/features/chat-memory/chat-backend-with-memory/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/features/chat-memory/chat-backend-with-memory/</a></li>
+<li>LLM sessions and manual history management: <a href="https://docs.koog.ai/sessions/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/sessions/</a></li>
+<li>History compression: <a href="https://docs.koog.ai/history-compression/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/history-compression/</a></li>
+<li>Agent persistence: <a href="https://docs.koog.ai/features/agent-persistence/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/features/agent-persistence/</a></li>
+<li>Long-term memory: <a href="https://docs.koog.ai/features/long-term-memory/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/features/long-term-memory/</a></li>
+<li>Serialization: <a href="https://docs.koog.ai/serialization/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/serialization/</a></li>
+<li>Module versioning: <a href="https://docs.koog.ai/module-versioning/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/module-versioning/</a></li>
+</ul>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div>作者：<a href="http://joy99.cnblogs.com/" target="_blank">SharpCJ</a></div>
+　　　　<div>作者博客：<a href="http://joy99.cnblogs.com/" target="_blank">http://joy99.cnblogs.com/</a></div>
+        <a href="#">
+　　　　<div>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须保留此段声明，且在文章页面明显位置给出原文连接。 </div></a>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-19 09:06">2026-10-19 09:06</span>&nbsp;
+<a href="https://www.cnblogs.com/joy99">SharpCJ</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23337615);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjoy99%2Fp%2F23337615&amp;targetId=23337615&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

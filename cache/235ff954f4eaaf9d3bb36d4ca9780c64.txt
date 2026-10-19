@@ -1,0 +1,239 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zhenl/p/23344681" title="发布于 2026-10-18 09:47">
+    
+
+    <span role="heading" aria-level="2">OCR认字全对，读起来稀碎？—— 从"逐行识别"到"成段可读"：照片说明文字的段落级识别实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>一次真实的工程迭代：当 OCR 已经能准确认字，为什么输出的文字还是没法读？<br>
+本文记录我们在博物馆展柜照片上的完整解题过程——两种互补的段落重组方案，<br>
+以及一次差点被忽略的内存事故。所有模型均在本地离线运行，代码与数据可复现。</p>
+</blockquote>
+<h2 id="一问题认得出字读不成文">一、问题：认得出字，读不成文</h2>
+<p>我们的场景很典型：一张照片里有多个文物，每件文物下方挂着一块说明牌，牌上是分块排列的中英双语说明（名称、年代、材质、馆藏号、简介）。</p>
+<img src="https://img2024.cnblogs.com/blog/4131/202610/4131-20261018094046089-959036828.jpg" width="500">
+<img src="https://img2024.cnblogs.com/blog/4131/202610/4131-20261018094101542-128678424.jpg" width="500">
+<p>前期的行级 OCR（PaddleOCR PP-OCRv5 与 Qwen2.5-VL）已经把"认字"解决得很好——<br>
+字符准确率相当高。但产出的文本是这样的：</p>
+<pre><code>9
+10
+8
+200-900年）
+博物馆
+CE)
+MRACPC 1650 PJ 652 A-0620
+Ceramic
+Late Classical Period (600-900 C.E.)
+...
+</code></pre>
+<p>两个致命问题：</p>
+<ol>
+<li><strong>换行即断裂</strong>。"古典晚期（公元600-900年）"被识别成<br>
+"古典晚期（公元" + "200-900年）"两个碎片，段落结构完全丢失；</li>
+<li><strong>列排列失去连贯性</strong>。五块说明牌横向并列，行级结果按全局坐标排序后，<br>
+不同牌的行互相穿插，A 牌的标题接上了 B 牌的年代。</li>
+</ol>
+<p>本质上，行级 OCR 缺少两个中间层级：<strong>行 → 段落 → 版面（列）</strong>。<br>
+补上这一层，有两条路：一条纯算法（几何规则），一条用模型（版面分析）。<br>
+我们把两条路都走通了。</p>
+<h2 id="二方案一几何规则后处理零新模型的可解释解法">二、方案一：几何规则后处理——零新模型的可解释解法</h2>
+<h3 id="21-核心思想">2.1 核心思想</h3>
+<p>文字的"段落归属"在几何上有强先验：</p>
+<ul>
+<li><strong>同一段落的行</strong>：行距小（通常小于 1.5 倍行高）、字号相近、水平对齐；</li>
+<li><strong>同一列（同一块牌）的行</strong>：水平区间大量重叠；</li>
+<li><strong>不同列</strong>：水平区间基本错开。</li>
+</ul>
+<p>只用坐标运算，不需要任何新模型。</p>
+<h3 id="22-列检测水平区间重叠聚类">2.2 列检测：水平区间重叠聚类</h3>
+<p>按 y 序逐行扫描，新行与已有列中任一行的水平重叠超过窄行宽的 35%，<br>
+即归入该列（近邻传递，天然兼容标题短、正文宽的宽度差异）：</p>
+<pre><code class="language-python">def detect_columns(lines, overlap_ratio=0.35):
+    cols = []
+    for ln in sorted(lines, key=lambda l: (l.box[1], l.box[0])):
+        placed = False
+        for col in cols:
+            for other in col:
+                ov = min(ln.box[2], other.box[2]) - max(ln.box[0], other.box[0])
+                if ov &gt; overlap_ratio * min(ln.w, other.w):
+                    col.append(ln); placed = True; break
+            if placed: break
+        if not placed:
+            cols.append([ln])
+    cols.sort(key=lambda c: sum(l.cx for l in c) / len(c))   # 列间左→右
+    return [sorted(c, key=lambda l: (l.box[1], l.box[0]))     # 列内上→下
+            for c in cols]
+</code></pre>
+<p>一个细节：新行不能远高于列内已有行的顶部（防跨列误吸）。<br>
+古籍竖排场景把列间排序改为右→左即可，一行代码的事。</p>
+<h3 id="23-行聚段三级裁决">2.3 行聚段：三级裁决</h3>
+<p>相邻行是否同段，依次看三件事：</p>
+<pre><code class="language-python">def _same_paragraph(a, b):
+    gap = b.box[1] - a.box[3]           # 行间距
+    h = max(a.h, b.h)
+    if 字号突变(&gt;1.8倍):        return False   # ① 标题/正文字号跳变
+    if gap &gt; 1.5 * h:           return False   # ② 行距过大（视觉分段）
+    if gap &lt; 0.4 * h:           return True    # ③ 行距紧密，必是同段
+    # 模糊区间 [0.4h, 1.5h]：用文本连续性裁决
+    if 上行末尾是句读标点 or 下行以括号引号开头:  return False
+    if 英文小写连续(如 "the" + "vessel"):      return True
+    return gap &lt; 0.9 * h                       # 默认按行距
+</code></pre>
+<p>几何证据给不了答案的地方（0.4–1.5 倍行高的模糊带），交给语言证据兜底——<br>
+这是纯规则方案里最值得设计的一段。</p>
+<h3 id="24-效果与边界">2.4 效果与边界</h3>
+<p>实测 59 行 → 14 段，每块说明牌聚成一段流式文本：</p>
+<pre><code>浅浮雕陶杯古典时期（公元200-900年）陶墨西哥国家人类学博物馆
+Cup with Relief Classical Period (200-900 C.E.) Ceramic MNA 05.0-0116610-77413
+</code></pre>
+<p>优点：快、可解释、每个阈值都能按业务调整、零新依赖。<br>
+边界：OCR 本身断行产生的孤儿碎片（如被反光切断的 "勿攀爬"+"imbing"）<br>
+几何上无从判断归属，会被粘进相邻段；倾斜、密集重叠的版面规则也会失效。</p>
+<h2 id="三方案二pp-structurev3让模型学习段落这个概念">三、方案二：PP-StructureV3——让模型学习"段落"这个概念</h2>
+<h3 id="31-版面分析是什么">3.1 版面分析是什么</h3>
+<p>PaddleOCR 的 PP-StructureV3 流水线在 OCR 之前先跑一个 <strong>RT-DETR 版面检测器</strong>：<br>
+把页面划分为 text / paragraph_title / image / table 等区域，并输出<strong>官方阅读顺序</strong>；<br>
+区域内部再做行级 OCR 与段落合并。段落边界不再是规则推断，而是模型从大量文档中学来的。</p>
+<p>用法出奇地简单：</p>
+<pre><code class="language-python">from paddleocr import PPStructureV3
+
+pipe = PPStructureV3(use_doc_orientation_classify=False,
+                     use_doc_unwarping=False,
+                     use_textline_orientation=True,
+                     enable_mkldnn=False)
+result = list(pipe.predict("photo.jpg"))[0]
+for block in result["parsing_res_list"]:        # 已按阅读顺序排列
+    print(block.label, block.bbox, block.content)
+</code></pre>
+<p>在我们的样张上，九个版面块依次是：五块说明牌（text）、"鸟纹陶盆"（paragraph_title）、<br>
+文物区域（image）……每个 text 块的 content 就是<strong>整段多行文本</strong>：</p>
+<pre><code>象征性纹饰陶瓶
+古典晚期（公元600-900年）
+陶
+卡洛斯·裴里瑟·卡马拉人类学博物馆藏
+Vessel with Symbolic Decoration
+Late Classical Period (800-900 C.E.)
+...
+</code></pre>
+<p>段内保留换行结构，比方案一的流式拼接更贴近原件版式；速度也更快（约 30s 对 55s，CPU）。</p>
+<h3 id="32-两个工程坑">3.2 两个工程坑</h3>
+<p><strong>其一，依赖与 API 版本。</strong> paddlepaddle 3.0 的 PIR 图在新版模型上直接崩溃，<br>
+需升到 3.3+；CPU 的 oneDNN 路径另有 PIR 转换 bug，必须 <code>enable_mkldnn=False</code>；<br>
+paddlex 还会往 <code>~/.paddlex</code> 写缓存，受限环境要重定向 <code>HOME</code>。<br>
+另外 paddleocr 3.7 的返回是 <code>LayoutBlock</code> 对象（<code>.label/.bbox/.content</code>），<br>
+网上的 dict 写法全部对不上——接口文档要认最新版。</p>
+<p><strong>其二，就是下文要讲的那次内存事故。</strong></p>
+<h2 id="四插曲一次-oom-如何掀翻整个-wsl">四、插曲：一次 OOM 如何掀翻整个 WSL</h2>
+<p>方案二首次在 3648×2736 原图上运行时，WSL 整体退出退回了 Windows 命令行。<br>
+排查 <code>dmesg</code>：</p>
+<pre><code>Out of memory: Killed process 41862 (python)
+total-vm:60058268kB, anon-rss:28114268kB   ← 28GB 常驻内存
+</code></pre>
+<p>一个"只是跑跑 OCR"的进程吃掉 28GB，触发全局 OOM，连累整个虚拟机。<br>
+更隐蔽的是：paddle 流水线<strong>多图串行还会累积内存</strong>——单图约 3GB，两图就能冲破 12GB。</p>
+<p>我们做了三层防护，每层都独立有效：</p>
+<ol>
+<li><strong>缩图</strong>：版面分析不需要原始分辨率，长边缩到 1600px 足够，坐标等比放大还原。<br>
+内存峰值从 28GB 降到约 3.3GB——这一刀砍掉了 90%；</li>
+<li><strong>cgroup 硬顶</strong>：重型任务一律经 <code>systemd-run --user --scope -p MemoryMax=12G</code> 启动。<br>
+实测触发上限时只终止目标进程，WSL 稳如泰山。这层是"保险丝"——<br>
+哪怕将来再出现内存异常，崩的也只是那一个进程；</li>
+<li><strong>每图一进程</strong>：用进程生命周期换取确定性的内存释放，规避累积。</li>
+</ol>
+<pre><code class="language-bash">HOME=$PWD/models/paddle_home systemd-run --user --scope \
+  -p MemoryMax=12G .venv/bin/python -m plans.plan_f_structure 图.jpg
+</code></pre>
+<p>给所有在 WSL 里跑本地大模型的同学一条经验：<strong>"模型能跑"和"跑起来不炸系统"是两件事，<br>
+cgroup 限制应当在第一次运行时就加上，而不是在第一次事故之后。</strong><br>
+Windows 侧还可以用 <code>.wslconfig</code> 的 <code>memory=24GB</code> 给 vmmem 封顶，双保险。</p>
+<h2 id="五两方案对比与选型">五、两方案对比与选型</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>方案一 几何规则</th>
+<th>方案二 PP-StructureV3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>段落数（两样张）</td>
+<td>14 / 14</td>
+<td>9 / 9</td>
+</tr>
+<tr>
+<td>速度（CPU，每张）</td>
+<td>~55s（含行级 OCR）</td>
+<td>~30s</td>
+</tr>
+<tr>
+<td>内存峰值</td>
+<td>&lt;3GB</td>
+<td>~3.3GB</td>
+</tr>
+<tr>
+<td>新增模型</td>
+<td>无</td>
+<td>版面检测器等 ~300MB</td>
+</tr>
+<tr>
+<td>段落形态</td>
+<td>流式整段（换行合并）</td>
+<td>段内保留换行、区分 title/text</td>
+</tr>
+<tr>
+<td>可控性</td>
+<td>阈值全部可调、可解释</td>
+<td>黑盒，靠模型泛化</td>
+</tr>
+<tr>
+<td>失败模式</td>
+<td>碎片粘连、倾斜失效</td>
+<td>版面分布外（非文档场景）可能漏块</td>
+</tr>
+</tbody>
+</table>
+<p>我们的结论：</p>
+<ul>
+<li><strong>默认选方案二</strong>：更快、段落边界更准、阅读顺序有官方保证；</li>
+<li><strong>方案一做补充</strong>：不想引依赖、需要向业务方解释"为什么这两行算一段"、<br>
+或者要处理竖排古籍（改列排序方向）时，规则方案无可替代；</li>
+<li>两者的召回上限都受制于行级 OCR 的质量。<br>
+若要语义级纠错（错字、粘连段落的拆分），可在段落输出之上再叠一层 LLM 后处理——<br>
+这也是我们下一步的实验方向：几何定结构、模型定边界、LLM 定语义，各司其职。</li>
+</ul>
+<h2 id="六写在最后">六、写在最后</h2>
+<p>这次迭代给我们最大的启发是：<strong>OCR 的"最后一公里"不在认字，而在重组。</strong><br>
+识别率从 95% 提到 99% 很难，而把已经认对的字排成人能读的段落，<br>
+对可用性的提升是立竿见影的。</p>
+<p>工程上，"规则 vs 模型"也从来不是二选一：<br>
+规则方案当天就能上线且每一处行为可解释，模型方案上限更高但需要防住资源风险——<br>
+两条腿走路，用一个 12GB 的"保险丝"兜底，是一套可以放心复制的组合拳。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/zhenl/" target="_blank">寻找无名的特质</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/zhenl/p/23344681" target="_blank">https://www.cnblogs.com/zhenl/p/23344681</a></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.008333333333333333" data-date-updated="2026-10-18 09:59">2026-10-18 09:47</span>&nbsp;
+<a href="https://www.cnblogs.com/zhenl">寻找无名的特质</a>&nbsp;
+阅读(<span id="post_view_count">150</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23344681);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzhenl%2Fp%2F23344681&amp;targetId=23344681&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
