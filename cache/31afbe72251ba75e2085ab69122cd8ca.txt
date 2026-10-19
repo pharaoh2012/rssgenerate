@@ -1,0 +1,290 @@
+
+    <h2 class="postTitle"><a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ChineseLiao/p/23359070" title="发布于 2026-10-19 16:00">
+    
+
+    <span role="heading" aria-level="2">三维 GIS 离线缓存实战：逆向 CesiumOfflineCache，并亲手为它补上"自动更新"能力</span>
+    
+
+</a>
+</h2>
+    <div class="postText"><div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="三维-gis-离线缓存实战逆向-cesiumofflinecache并亲手为它补上自动更新能力">三维 GIS 离线缓存实战：逆向 CesiumOfflineCache，并亲手为它补上"自动更新"能力</h1>
+<blockquote>
+<p>场景：某政务大屏项目，基于 LSGlobe（Cesium 深度封装的国产三维 GIS SDK）做全域三维可视化。客户要求：大屏断网后仍能打开，且二次打开要"秒开"。方案是引入配套的 <code>CesiumOfflineCache.min.js</code> 离线缓存插件——但接入后我们发现，这个插件比想象中"简陋"，于是有了这篇从逆向到改造的完整记录。</p>
+</blockquote>
+<h2 id="一背景三维场景为什么需要专门的离线缓存">一、背景：三维场景为什么需要专门的离线缓存</h2>
+<p>三维 GIS 场景的资源加载和普通 Web 应用完全不是一个量级：</p>
+<ul>
+<li>一个区县级场景，影像瓦片 + 地形瓦片 + 白模/精模，<strong>首次加载轻松几百 MB</strong>；</li>
+<li>瓦片是海量小文件（单张 256×256 的 JPEG，几十 KB），HTTP 请求数动辄上千；</li>
+<li>模型 glb 单文件可能几十 MB，且加载后还要解析。</li>
+</ul>
+<p>浏览器默认的 HTTP 磁盘缓存对三维场景基本无效：瓦片 URL 常带随机参数、缓存策略由服务端 <code>Cache-Control</code> 决定、大文件（glb）经常被直接排除。所以三维场景"每次打开都重新下载"是常态。</p>
+<p><code>CesiumOfflineCache</code> 的思路很直接：<strong>在 Cesium 资源加载管线里加一层 IndexedDB 旁路</strong>，所有资源请求先查本地库，命中直接返回，未命中走网络并顺手落库。IndexedDB 的三个特性正好匹配需求：</p>
+<ol>
+<li>容量大（配额通常为磁盘的百分比，GB 级）；</li>
+<li>原生支持结构化克隆，可直接存 <code>Blob</code> / <code>ArrayBuffer</code>；</li>
+<li>异步 API，不阻塞渲染主线程。</li>
+</ol>
+<h2 id="二逆向33kb-混淆包里到底藏了什么">二、逆向：33KB 混淆包里到底藏了什么</h2>
+<p>插件是一个 webpack UMD 单文件包，33KB，压缩成一行。直接读是不可能的，但混淆只做了压缩（mangle + 压平），没有做字符串加密，所以<strong>标准 API 名都是明文</strong>——这就是突破口。</p>
+<h3 id="21-摸清骨架">2.1 摸清骨架</h3>
+<p>先全局搜关键 API 名，立刻能画出依赖图：</p>
+<pre><code class="language-text">UMD 入口
+├── 模块 483: browserify 运行时 + localforage（IndexedDB 封装库）
+│   └── 内嵌依赖: promise-polyfill（异步调度 + Promise 实现）
+└── 主模块: CesiumOfflineCache 插件本体
+    └── 加载即自执行: initLicence() → initCacheProxy()
+</code></pre>
+<p>两个有意思的细节：</p>
+<ul>
+<li>它<strong>内嵌了一整个 promise-polyfill</strong>（<code>MutationObserver</code> / <code>MessageChannel</code> / <code>setImmediate</code> 三级回退的异步调度器），说明打包时目标是兼容老浏览器；</li>
+<li>加载后向 <code>window</code> 挂了两个全局：<code>CesiumOfflineCache</code>（插件 API）和 <code>localforage</code>（它的内部依赖，<strong>全局泄漏</strong>，这是个隐患）。</li>
+</ul>
+<h3 id="22-核心机制重写-loadwithxhr">2.2 核心机制：重写 loadWithXhr</h3>
+<p><code>initCacheProxy</code> 的关键一行（还原后）：</p>
+<pre><code class="language-js">LSGlobe.Resource._Implementations.loadWithXhr = function(url, responseType, method, data, headers, deferred, overrideMimeType) { ... }
+</code></pre>
+<p><code>Resource._Implementations.loadWithXhr</code> 是 Cesium 体系<strong>所有资源请求的底层 XHR 通道</strong>——影像瓦片、地形、glb 模型、geojson，最终都汇到这里。重写它，等于在管线的最底部装了一个旁路，上层所有 Provider（ImageryProvider、TerrainProvider、Model）完全无感知。这是整个插件最聪明的设计：<strong>零业务侵入</strong>。</p>
+<p>还原后的核心逻辑：</p>
+<pre><code class="language-js">loadWithXhr(url, responseType, method, data, headers, deferred, overrideMimeType) {
+  // 缓存 key = 完整请求描述的 JSON 序列化
+  const key = JSON.stringify({ url, responseType, method, data, headers, deferred, overrideMimeType });
+
+  // data URI 直接解析返回，不缓存（复刻原生逻辑）
+  if (dataUriRE.test(url)) return deferred.resolve(parseDataUri(url, responseType));
+
+  const xhr = new XMLHttpRequest();
+
+  // ★ 缓存读路径：规则命中 → 查 IndexedDB → 命中直接 resolve，连接都不建
+  if (judgeUrl(url)) {
+    getItem(key).then(cached =&gt; cached ? deferred.resolve(cached) : xhr.send(data));
+  }
+
+  // 以下全部复刻 Cesium 原生行为
+  TrustedServers.contains(url) &amp;&amp; (xhr.withCredentials = true);  // 跨域凭证
+  xhr.open(method, url, true);
+  /* headers / responseType / overrideMimeType / file:// 特判 */
+
+  xhr.onload = function() {
+    /* 非 2xx → reject；HEAD/OPTIONS → 返回响应头；204 → resolve() */
+    // 成功分支（按 responseType 分 json/text/document/arraybuffer/blob）：
+    //   ★ 每个分支在 resolve 前插入 setItem(key, response) —— 写缓存
+    setItem(key, response).then(() =&gt; deferred.resolve(response));
+  };
+
+  // ★ 规则未命中 → 直接发请求，不缓存
+  judgeUrl(url) || xhr.send(data);
+  return xhr;
+}
+</code></pre>
+<p>注意它复刻了原生 <code>loadWithXhr</code> 的<strong>全部</strong>响应分支（HEAD/OPTIONS 返回头解析、204 空响应、<code>file://</code> 协议下 status 0 视为成功、json 手动 parse 回退），只在成功分支前插了一句 <code>setItem</code>。这种"复刻 + 插桩"的写法保证了与 Cesium 行为完全兼容，但也埋了个雷——后面会讲。</p>
+<h3 id="23-rulelist默认关死的总开关">2.3 ruleList：默认关死的总开关</h3>
+<pre><code class="language-js">ruleList: new Set,   // 默认空集合！
+
+judgeUrl(url) {
+  let hit = false;
+  [...this.ruleList].forEach(rule =&gt; hit = hit || url.indexOf(rule) &gt; -1 || rule === '*');
+  return hit;   // 子串匹配，'*' 全通配
+}
+</code></pre>
+<p><code>ruleList</code> 默认是<strong>空 Set</strong>，<code>judgeUrl</code> 恒返回 <code>false</code>——也就是说，<strong>插件加载后什么都不缓存，静默地什么都不做</strong>。必须手动：</p>
+<pre><code class="language-js">CesiumOfflineCache.ruleList.add('*');   // 或 add('http://your-tile-server') 只缓存特定服务
+</code></pre>
+<p>这是个非常坑的设计：不报错、不警告、控制台干干净净，你以为接入了，实际上它一行缓存都没写。我们最初接入时就栽在这里——刷新页面、断网测试，发现"离线"完全无效，回头逆向源码才看到这个空 Set。</p>
+<h3 id="24-授权机制硬编码的-2099-年">2.4 授权机制：硬编码的 2099 年</h3>
+<pre><code class="language-js">let o = []; o[0] = 2099;               // 年
+async initLicence() {
+  o[1] = 4; o[2] = 1;                  // 月、日 → 到期日 2099-04-01
+  await localforage.setDriver(localforage.INDEXEDDB);  // 强制 IndexedDB，禁用降级
+}
+async initCacheProxy() {
+  const days = (new Date(o.join('-')) - new Date()) / 864e5;
+  if (days &lt;= 0) {
+    console.warn('CesiumOfflineCache 数据高速缓存插件，使用期已结束，请获取授权。');
+    return this.clear();               // 过期 → 清空缓存库，且不安装代理
+  }
+  // 安装代理...
+}
+</code></pre>
+<p>所谓"授权"就是硬编码日期 2099-04-01，约等于永久。但注意过期后的行为是<strong>先清库再罢工</strong>——如果哪天你拿到一个试用版插件，过期瞬间你的离线缓存会被无声无息地清掉。</p>
+<h3 id="25-缓存-key-的脆弱设计">2.5 缓存 key 的脆弱设计</h3>
+<p>再看一眼 key 的生成：</p>
+<pre><code class="language-js">const key = JSON.stringify({ url, responseType, method, data, headers, deferred, overrideMimeType });
+</code></pre>
+<p><strong><code>deferred</code>（when.js 的 Deferred 对象）被序列化进了 key</strong>。函数会被 <code>JSON.stringify</code> 忽略，promise 对象恰好没有可枚举属性、序列化成 <code>{}</code>，所以 key 目前是稳定的——但这完全靠 when.js 的内部实现"配合"。一旦 deferred 上出现任何可枚举的可变属性，key 就会漂移，<strong>缓存永远无法命中</strong>。这是一个能工作、但踩在钢丝上的设计，也提醒我们：给第三方库的内部结构做序列化，本身就是脆弱耦合。</p>
+<h2 id="三接入三行代码与一个隐藏前提">三、接入：三行代码与一个隐藏前提</h2>
+<pre><code class="language-html">&lt;!-- 顺序是硬约束：插件读 window.LSGlobe，必须在 SDK 之后 --&gt;
+&lt;script src="&lt;%= BASE_URL %&gt;SDK/LSGlobe/LSGlobe.js"&gt;&lt;/script&gt;
+&lt;script src="&lt;%= BASE_URL %&gt;js/CesiumOfflineCache.min.js"&gt;&lt;/script&gt;  &lt;!-- 自初始化 --&gt;
+&lt;script&gt;
+  window.CesiumOfflineCache &amp;&amp; window.CesiumOfflineCache.ruleList.add('*');  &lt;!-- 启用开关 --&gt;
+&lt;/script&gt;
+</code></pre>
+<p><code>ruleList.add</code> 与异步的 <code>initCacheProxy</code> 没有顺序依赖（<code>judgeUrl</code> 在每次请求时实时读 Set），同步内联脚本远早于 Vue 挂载后的第一个瓦片请求，时序天然安全。</p>
+<p>影响面也干净：<code>loadWithXhr</code> 只服务 <code>LSGlobe.Resource</code> 加载的三维资源，业务 axios 请求不经过这条通道，<code>'*'</code> 不会误伤接口。</p>
+<h2 id="四踩坑两个-indexeddb-的深坑">四、踩坑：两个 IndexedDB 的深坑</h2>
+<h3 id="41-清理模型按钮清不掉缓存">4.1 "清理模型"按钮清不掉缓存</h3>
+<p>项目原有的清理逻辑：</p>
+<pre><code class="language-js">handleClearIndexDb() {
+  window.indexedDB.deleteDatabase('GlbOfflineCache');
+  window.indexedDB.deleteDatabase('CesiumOfflineCache');
+}
+</code></pre>
+<p>看起来没毛病，实际<strong>清不掉</strong>。IndexedDB 规范：<code>deleteDatabase</code> 遇到<strong>仍打开的连接</strong>时不会报错、不会失败，而是触发 <code>blocked</code> 事件，<strong>挂起等待所有连接关闭</strong>——而插件启动后一直持有打开的连接，页面不刷新，连接永不关闭。结果就是：用户点了"清理成功"，库原封不动。</p>
+<p>修复：走插件自己的 <code>clear()</code>（localforage 在连接内清空，立即生效），<code>deleteDatabase</code> 只作为插件未加载时的回退：</p>
+<pre><code class="language-js">if (window.CesiumOfflineCache &amp;&amp; window.CesiumOfflineCache.clear) {
+  window.CesiumOfflineCache.clear();          // 连接内清空，立即生效
+} else {
+  window.indexedDB.deleteDatabase('CesiumOfflineCache');  // 回退
+}
+</code></pre>
+<p>这是 IndexedDB 最经典的坑之一：<strong>删除操作是"协商"而非"强制"</strong>。</p>
+<h3 id="42-永远读旧数据缺失的失效机制">4.2 永远读旧数据：缺失的失效机制</h3>
+<p>逆向完源码，最失望的发现是：这个插件<strong>没有任何新老数据对比机制</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>常见失效手段</th>
+<th>插件实现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP 协商缓存（存 ETag，回源 <code>If-None-Match</code>）</td>
+<td>✗ 不存校验头，不回源</td>
+</tr>
+<tr>
+<td>TTL 过期</td>
+<td>✗ 无时间戳</td>
+</tr>
+<tr>
+<td>版本号 / 内容 hash</td>
+<td>✗ 无</td>
+</tr>
+</tbody>
+</table>
+<p>缓存 key 只含请求描述（URL/method/headers），URL 不变 → key 不变 → 永远命中同一条旧数据。命中后<strong>连 HTTP 连接都不建立</strong>，服务端有没有更新根本无从得知。</p>
+<p>于是"数据更新"的实际流程变成了：</p>
+<pre><code class="language-text">服务端更新模型 → 客户端无感知（读旧缓存）
+→ 用户肉眼发现数据不对 → 手动点"清理模型" → 全量重新下载
+</code></pre>
+<p><strong>对比环节由人完成</strong>。对"模型偶尔更新"的场景勉强够用，但大屏是 7×24 挂着的，指望值班员发现"这块底图好像旧了"再跑来点按钮，不现实。</p>
+<h2 id="五增强给插件补上-stale-while-revalidate">五、增强：给插件补上 stale-while-revalidate</h2>
+<p>目标：命中缓存<strong>先返回旧数据（保住秒开和离线）</strong>，同时后台发条件请求校验，变了就更新缓存，下次请求生效。这正是 HTTP 语义里的 <strong>stale-while-revalidate</strong> 模式。</p>
+<h3 id="51-设计决策不改-minjs外挂补丁">5.1 设计决策：不改 min.js，外挂补丁</h3>
+<p>直接改 33KB 的压缩文件？改得动，但插件一升级就全丢。选择外挂补丁：在 min.js 之后加载一个 <code>swr.js</code>，把插件安装好的 <code>loadWithXhr</code> 再包一层。</p>
+<p>这里有个关键洞察：插件把 <code>localforage</code> 挂到了 <code>window</code>，而 localforage 的 <code>createInstance({ name })</code> 是<strong>同名共享</strong>的——用同样的参数再建一个实例，拿到的是<strong>同一个 IndexedDB store 的句柄</strong>，可以直接读写插件的所有缓存条目。不需要 hack 闭包，不需要改一行 min.js：</p>
+<pre><code class="language-js">const store = window.localforage.createInstance({ name: 'CesiumOfflineCache' });  // 与插件共享
+</code></pre>
+<h3 id="52-补丁核心逻辑">5.2 补丁核心逻辑</h3>
+<pre><code class="language-js">impls.loadWithXhr = function(url, responseType, method, data, headers, deferred, overrideMimeType) {
+  // key 生成逻辑与 min.js 保持一致（已知耦合点）
+  const key = JSON.stringify({ url, responseType, method, data, headers, deferred, overrideMimeType });
+
+  // 规则外 / 非 GET：完全走原逻辑
+  if (!C.judgeUrl(url) || method !== 'GET') {
+    return rawLoadWithXhr.apply(this, arguments);
+  }
+
+  store.getItem(key).then(entry =&gt; {
+    if (!entry) return rawLoadWithXhr.apply(this, arguments);  // 未命中：原逻辑
+    deferred.resolve(isWrapped(entry) ? entry.body : entry);   // ① 立即返回旧数据
+    revalidate(key, url, responseType, headers);               // ② 后台校验
+  });
+};
+</code></pre>
+<p>后台校验是标准的 HTTP 条件请求：</p>
+<pre><code class="language-js">function revalidate(key, url, responseType, headers) {
+  const xhr = new XMLHttpRequest();   // 裸 XHR：不经过 loadWithXhr，避免递归！
+  xhr.open('GET', url, true);
+  xhr.responseType = responseType || 'text';
+  if (meta.etag)         xhr.setRequestHeader('If-None-Match', meta.etag);
+  if (meta.lastModified) xhr.setRequestHeader('If-Modified-Since', meta.lastModified);
+  xhr.onload = () =&gt; {
+    if (xhr.status === 304) {
+      store.setItem(key, { body: oldBody, __cocSwrMeta: metaFrom(xhr) });  // 仅刷新校验时间
+    } else if (xhr.status &gt;= 200 &amp;&amp; xhr.status &lt; 300) {
+      store.setItem(key, { body: alignBody(...), __cocSwrMeta: metaFrom(xhr) });  // 更新数据
+    }
+  };
+  xhr.onerror = () =&gt; {};  // 离线/断网：静默，缓存照用——离线可用性的关键
+  xhr.send();
+}
+</code></pre>
+<p>四个必须处理的细节：</p>
+<p><strong>① 防递归</strong>。校验请求如果走 <code>LSGlobe.Resource</code>，会再次进入被包装的 <code>loadWithXhr</code>——死循环。必须用裸 <code>XMLHttpRequest</code>。</p>
+<p><strong>② 格式兼容</strong>。插件存量缓存存的是裸 body（<code>ArrayBuffer</code>/<code>Blob</code>/字符串/parse 后的对象），补丁的新格式是 <code>{ body, __cocSwrMeta }</code>。读取时用 <code>META in v</code> 判断——注意 <code>in</code> 操作符对 <code>Blob</code>/<code>ArrayBuffer</code> 也安全（都是 object），字符串被 <code>typeof</code> 前置挡掉。<strong>存量缓存无需清库，平滑升级</strong>。</p>
+<p><strong>③ 类型对齐</strong>。<code>responseType</code> 为空时，插件原函数可能存的是 <code>JSON.parse</code> 后的对象或 <code>XMLDocument</code>，而校验请求的 <code>xhr.response</code> 是字符串。直接存会导致下次命中时下游拿到类型不一致的数据。解法：按<strong>旧缓存值的类型</strong>归一化新响应——旧值是普通对象就对新字符串尝试 <code>JSON.parse</code>，旧值是字符串就保持字符串。</p>
+<p><strong>④ 节流与去重</strong>。每次命中都发校验请求等于每个瓦片每次都回源，请求数爆炸。两层防护：meta 里存 <code>checkedAt</code>，10 分钟内不重复校验；内存里维护 inflight Set，同一 key 的并发校验只发一个。304 响应体为空，流量开销可忽略。</p>
+<h3 id="53-一个绕不开的前提cors">5.3 一个绕不开的前提：CORS</h3>
+<p>JS 读取跨域响应头受 <code>Access-Control-Expose-Headers</code> 限制——服务端不显式暴露 <code>ETag</code> / <code>Last-Modified</code>，<code>getResponseHeader</code> 返回 <code>null</code>，条件请求就无从谈起。所以跨域部署时，瓦片/模型服务的 CORS 配置必须加：</p>
+<pre><code class="language-text">Access-Control-Expose-Headers: ETag, Last-Modified
+</code></pre>
+<p>拿不到校验头时补丁退化为定期无条件 GET（功能可用、流量增大），同源或代理部署则无此问题。</p>
+<h3 id="54-改造前后对比">5.4 改造前后对比</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>改造前</th>
+<th>改造后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>首次加载</td>
+<td>网络 + 写缓存</td>
+<td>不变</td>
+</tr>
+<tr>
+<td>命中且未变</td>
+<td>直接用旧缓存</td>
+<td>先用旧缓存；超 10 分钟发条件请求，304 开销极小</td>
+</tr>
+<tr>
+<td><strong>命中且服务端已变</strong></td>
+<td><strong>永远旧数据</strong></td>
+<td>当次显示旧数据，后台拉新，<strong>下次请求生效</strong></td>
+</tr>
+<tr>
+<td>离线命中</td>
+<td>用缓存</td>
+<td>相同（校验失败静默）</td>
+</tr>
+<tr>
+<td>存量缓存</td>
+<td>—</td>
+<td>自动兼容，无需清库</td>
+</tr>
+</tbody>
+</table>
+<h2 id="六总结缓存失效终究要有人做对比">六、总结：缓存失效，终究要有人做"对比"</h2>
+<p>回顾整个链路，最有意思的其实是一个架构问题：<strong>缓存的新老数据对比，到底由谁做？</strong></p>
+<ul>
+<li>浏览器 HTTP 缓存：HTTP 协商（ETag/304），协议层解决；</li>
+<li>CDN：源站主动失效 + TTL；</li>
+<li>这个插件：<strong>谁都不做</strong>——key 是 URL，命中即用，把对比环节完全甩给了用户的眼睛；</li>
+<li>我们的补丁：把对比搬回 HTTP 协商层，同时用 SWR 保住"先展示、后校验"的体验。</li>
+</ul>
+<p>三维 GIS 的离线缓存比普通 Web 缓存更棘手的地方在于：资源是海量小文件 + 大文件的混合体，且"数据更新"在政务场景里往往意味着"底图换了、模型改了"这种<strong>整批失效</strong>。SWR 解决的是"自动感知"，而"清理模型"按钮作为整批失效的兜底手段依然值得保留——两者是互补而非替代。</p>
+<p>最后留三个逆向第三方混淆包的实用心得：</p>
+<ol>
+<li><strong>标准 API 名不会被混淆</strong>——<code>indexedDB</code>、<code>createObjectStore</code>、<code>getResponseHeader</code> 这些明文就是最好的路标，全局搜一遍，架构立刻浮出水面；</li>
+<li><strong>先跑通数据流，再抠实现</strong>——用 DevTools 的 Application 面板看 IndexedDB 实际结构（库名、key 格式、存的值类型），比硬读压缩代码快得多；</li>
+<li><strong>警惕"能工作"背后的巧合</strong>——把 Deferred 对象序列化进缓存 key 还能命中，靠的是 when.js 恰好没有可枚举属性。能跑的代码不等于正确的代码，升级第三方依赖前，先想想哪些行为是"巧合"在撑着。</li>
+</ol>
+
+
+</div>
+<div class="clear"></div>
+</div>
+    <p class="postfoot">posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-19 16:01">2026-10-19 16:00</span>&nbsp;
+<a href="https://www.cnblogs.com/ChineseLiao">中文还在写码</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23359070);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FChineseLiao%2Fp%2F23359070&amp;targetId=23359070&amp;targetType=0" target="_blank">举报</a>
+</p>
