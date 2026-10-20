@@ -1,0 +1,940 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/joy99/p/23341378" title="发布于 2026-10-20 11:26">
+    
+
+    <span role="heading" aria-level="2">Koog(7)——模型调用的输入与输出：多模态、参数、流式与结构化</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="前言">前言</h1>
+<p>上一篇文章解决了"上下文从哪来、任务从哪继续"。但一次模型调用本身还有两个问题没有讲完：输入只能是一段文字吗？输出只能拿到完整结果吗？</p>
+<p>这篇把这两个问题补齐，同时兑现前面留下的三个承诺。第三篇讲提示词参数时说过"详细内容将在后面的文章讲解"；第三篇讲流式响应时说过"流式 API 后面的文章单独讲解"；第六篇 1.2.4 也预告了"结构化、流式请求有各自的处理方式"。</p>
+<p>所以本文的顺序就是一次调用的完整过程：</p>
+<ul>
+<li>输入：user 消息里可以带图片、音频、视频和文件（第一章）。</li>
+<li>控制：LLMParams 的八个字段、三种使用位置（第二章）。</li>
+<li>输出：流式拿增量（第三章），或直接拿结构化对象（第四章）。</li>
+<li>组合：怎么选、两种缓存怎么区分（第五章）。</li>
+</ul>
+<p>本文继续以 <strong>Koog 1.3.0 的 Kotlin API</strong> 为基准；DeepSeek 客户端与模型定义还使用 <code>koog-agents-additions:1.3.0-beta</code>，这部分仍是预览依赖。文中的完整程序采用 Kotlin 2.4.10、JDK 21 编译运行，第三章的流式与第四章的结构化、修复请求均直接调用真实 DeepSeek。模型生成内容每次可能不同；消息构造、schema 生成、参数校验和缓存配置等本地操作则不额外请求模型。局部片段会明确标注用途；官方页面与发布版本有出入时，以 1.3.0 源码为准。</p>
+<h1 id="一多模态消息user-消息里不只有文本">一、多模态消息：user 消息里不只有文本</h1>
+<h2 id="11-四类附件">1.1 四类附件</h2>
+<p>user 消息的大多数内容是纯文本，但 Koog 允许在 user 消息中把多媒体内容与文本一起发给模型。四类附件函数与常见格式：</p>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>用途</th>
+<th>常见格式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>image()</code></td>
+<td>附加图像</td>
+<td>JPG、PNG、WebP、GIF</td>
+</tr>
+<tr>
+<td><code>audio()</code></td>
+<td>附加音频</td>
+<td>MP3、WAV、FLAC</td>
+</tr>
+<tr>
+<td><code>video()</code></td>
+<td>附加视频</td>
+<td>MP4、AVI、MOV</td>
+</tr>
+<tr>
+<td><code>file()</code> / <code>binaryFile()</code> / <code>textFile()</code></td>
+<td>附加文档</td>
+<td>PDF、TXT、MD 等，需提供 MIME 类型</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>注意：<strong>多模态支持因 provider 而异，且与具体模型的能力声明绑定</strong>。Koog 侧能把消息构造出来，不代表你选的模型真的能读它——校验发生在发起请求前。实测 DeepSeek V4 Flash 不支持 document 附件，带上 <code>file()</code> 附件的真实调用会直接抛出：</p>
+<pre><code class="language-text">IllegalArgumentException: Model deepseek-v4-flash does not support document
+</code></pre>
+<p>接入前要确认所用模型声明了对应附件类型的能力。</p>
+</blockquote>
+<h2 id="12-自动配置的附件">1.2 自动配置的附件</h2>
+<p>最省事的用法是把 URL 或文件路径直接传给附件函数，Koog 按扩展名推断格式和 MIME 类型：</p>
+<pre><code class="language-kotlin">// 片段：写在 prompt 构建的 user { } 块中。
+user {
+    +"描述这些图片："
+    image("https://example.com/test.png")
+    +"关注主体。"
+}
+</code></pre>
+<p><code>+</code> 运算符把文本与附件按书写顺序混排在同一条 user 消息里，顺序会保留到最终发给模型的消息中。</p>
+<p>一个 1.3.0 特有的细节：<strong><code>image(path)</code> 的参数是 <code>kotlinx.io.files.Path</code>，不是 <code>java.nio.file.Path</code></strong>。从字符串构造用 <code>kotlinx.io.files.Path("/path/to/image.png")</code>；从已有的 <code>java.nio.file.Path</code> 转换用 <code>kotlinx.io.files.Path(nioPath.toString())</code>。直接传 java 类型编译不过。</p>
+<p>还有一个行为值得知道：本地路径的附件在<strong>构建消息时就读入内存</strong>。下面的离线实验可以看到，路径附件变成了 <code>Bytes</code> 内容。</p>
+<h2 id="13-实际构造一条消息看看">1.3 实际构造一条消息看看</h2>
+<p>不调模型也能验证消息结构——构建 prompt 本身不需要 executor。保存为 <code>src/main/kotlin/MultimodalDemo.kt</code>（package 为 <code>multimodaldemo</code>），执行 <code>./gradlew run -PmainClass=multimodaldemo.MultimodalDemoKt</code>：</p>
+<pre><code class="language-kotlin">package multimodaldemo
+
+import ai.koog.prompt.dsl.prompt
+import ai.koog.prompt.message.AttachmentContent
+import ai.koog.prompt.message.AttachmentSource
+import ai.koog.prompt.message.Message
+import ai.koog.prompt.message.MessagePart
+import java.nio.file.Files
+
+fun describe(parts: List&lt;MessagePart&gt;): String = parts.joinToString(" | ") { part -&gt;
+    when (part) {
+        is MessagePart.Text -&gt; "Text(${part.text.take(12)}...)"
+        is MessagePart.Attachment -&gt; {
+            val s = part.source
+            "Attachment(${s::class.simpleName}, format=${s.format}, mime=${s.mimeType}, content=${s.content::class.simpleName})"
+        }
+        else -&gt; part::class.simpleName ?: "?"
+    }
+}
+
+fun main(args: Array&lt;String&gt;) {
+    // 自动配置：URL 与本地路径，按扩展名推断 format 与 mimeType。
+    val tmp = Files.createTempFile("demo", ".png")
+    // 仅用四个字节验证消息构造，不是可交给视觉模型识别的完整 PNG。
+    Files.write(tmp, byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47))
+
+    val autoPrompt = prompt("auto") {
+        system("你是图像分析助手。")
+        user {
+            +"描述这些图片："
+            image("https://example.com/test.png")
+            image(kotlinx.io.files.Path(tmp.toString()))
+            +"关注主体。"
+        }
+    }
+    val userMsg = autoPrompt.messages.filterIsInstance&lt;Message.User&gt;().first()
+    println("AUTO parts=${userMsg.parts.size}")
+    println(describe(userMsg.parts))
+
+    // 自定义配置：显式构造 AttachmentSource.Image。
+    val customPrompt = prompt("custom") {
+        user {
+            +"描述这张图"
+            image(
+                AttachmentSource.Image(
+                    content = AttachmentContent.URL("https://example.com/capture.png"),
+                    format = "png",
+                    fileName = "capture.png"
+                )
+            )
+        }
+    }
+    println(describe(customPrompt.messages.filterIsInstance&lt;Message.User&gt;().first().parts))
+
+    // 混合附件：纯文本文件 + 图片（URL 来源）。
+    val mixedPrompt = prompt("mixed") {
+        system("You are a helpful assistant.")
+        user {
+            +"Compare the image with the document content."
+            file(
+                AttachmentSource.File(
+                    content = AttachmentContent.PlainText("这是一份纯文本文档的内容。"),
+                    format = "txt",
+                    mimeType = "text/plain",
+                    fileName = "notes.txt"
+                )
+            )
+            image(AttachmentSource.Image(content = AttachmentContent.URL("https://example.com/mix.png"), format = "png"))
+            +"Structure the result as a table"
+        }
+    }
+    println(describe(mixedPrompt.messages.filterIsInstance&lt;Message.User&gt;().first().parts))
+    Files.deleteIfExists(tmp)
+}
+</code></pre>
+<p>实际输出：</p>
+<pre><code class="language-text">AUTO parts=4
+Text(描述这些图片：...) | Attachment(Image, format=png, mime=image/png, content=URL) | Attachment(Image, format=png, mime=image/png, content=Bytes) | Text(关注主体。...)
+Text(描述这张图...) | Attachment(Image, format=png, mime=image/png, content=URL)
+Text(Compare the ...) | Attachment(File, format=txt, mime=text/plain, content=PlainText) | Attachment(Image, format=png, mime=image/png, content=URL) | Text(Structure th...)
+</code></pre>
+<p><code>AUTO parts=4</code> 后的三行分别对应自动配置、自定义配置和混合附件。看第一个：四个部分按书写顺序排列，文本、URL 附件、本地文件附件、文本；本地文件的 <code>content=Bytes</code> 证实了 1.2 说的"构建时读入内存"。</p>
+<h2 id="14-自定义配置与来源类型">1.4 自定义配置与来源类型</h2>
+<p>需要显式控制附件参数时，直接构造 <code>AttachmentSource</code> 的实现传给对应函数。下面列出四种内容来源，其中二进制来源分为原始字节与 Base64 两种形式：</p>
+<pre><code class="language-kotlin">// 片段：四种内容来源（其中 PlainText 仅用于文件附件）。
+AttachmentContent.URL("https://example.com/image.png")
+AttachmentContent.Binary.Bytes(byteArrayOf(/* ... */))
+AttachmentContent.Binary.Base64("iVBORw0KGgoAAAANS...")
+AttachmentContent.PlainText("This is the file content.")
+</code></pre>
+<p><code>AttachmentSource.Image</code> / <code>Audio</code> / <code>Video</code> / <code>File</code> 都接受四个参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>必填</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>content</code></td>
+<td>AttachmentContent</td>
+<td>是</td>
+<td>内容来源，见上</td>
+</tr>
+<tr>
+<td><code>format</code></td>
+<td>String</td>
+<td>是</td>
+<td>文件格式，通常是扩展名，如 <code>png</code></td>
+</tr>
+<tr>
+<td><code>mimeType</code></td>
+<td>String</td>
+<td>仅 File 必填</td>
+<td>其余类型默认为 <code>&lt;type&gt;/&lt;format&gt;</code>，如 <code>image/png</code></td>
+</tr>
+<tr>
+<td><code>fileName</code></td>
+<td>String?</td>
+<td>否</td>
+<td>文件名，含扩展名</td>
+</tr>
+</tbody>
+</table>
+<p>在 1.3.0 中，<code>Image</code>、<code>Audio</code>、<code>Video</code> 都不能使用 <code>PlainText</code> 内容，构造时会直接抛异常；<code>File</code> 则要求显式提供 <code>mimeType</code>。</p>
+<h2 id="15-混合附件">1.5 混合附件</h2>
+<p>单个 user 消息里可以混排任意多个、任意类型的附件，1.3 的第三个例子就是图片加文本文档，再要求模型以表格形式输出比较结果。这里不再贴第二遍。</p>
+<p>一个要提醒的坑：官方文档的这一页写的是 <code>ContentPart.Image</code> 这组类名，与本文核对的发布版本不一致。<strong>1.3.0 里对应的是 <code>AttachmentSource.Image</code>，消息里表现为 <code>MessagePart.Attachment</code></strong>。将这组类名直接用于 1.3.0 的工程会编译不过，本文代码都以 1.3.0 实测为准。</p>
+<h1 id="二llm-参数控制模型行为的八个字段">二、LLM 参数：控制模型行为的八个字段</h1>
+<h2 id="21-三个使用位置">2.1 三个使用位置</h2>
+<p>LLMParams 在三个层级生效：</p>
+<pre><code class="language-kotlin">import ai.koog.agents.ext.agent.subgraphWithTask
+
+// 以下是三个不同作用域中的局部片段，不是一份完整程序。
+// 位置一：创建 prompt 时。
+val prompt = prompt(
+    id = "dev-assistant",
+    params = LLMParams(temperature = 0.7, maxTokens = 500)
+) {
+    system("You are a helpful assistant.")
+    user("Tell me about Kotlin")
+}
+
+// 位置二：创建子图时（子图体系见第五篇）。
+
+val processQuery by subgraphWithTask&lt;String, String&gt;(
+    tools = listOf(searchTool, calculatorTool, weatherTool),
+    llmModel = OpenAIModels.Chat.GPT4o,
+    llmParams = LLMParams(temperature = 0.7, maxTokens = 500),
+    parallelTools = false
+) { userQuery -&gt; "Please help with: $userQuery" }
+
+// 位置三：写会话中动态修改。
+llm.writeSession {
+    changeLLMParams(LLMParams(temperature = 0.7, maxTokens = 500))
+}
+</code></pre>
+<p>位置二来自官方示例，<code>searchTool</code> 等是已注册的工具，片段只展示参数位置。位置三值得和第六篇 1.2 的提交语义连起来看：params 是 Prompt 对象的一部分，所以 <code>changeLLMParams</code> 的修改同样遵循"lambda 正常结束才提交回上下文"的规则。离线实验证实了这一点——写会话里改成 <code>temperature=0.9, maxTokens=777</code>，会话结束后在外层上下文读到：</p>
+<pre><code class="language-text">after scope: temperature=0.9, maxTokens=777
+</code></pre>
+<p>也就是说，参数修改和消息修改走同一条提交路径，异常传播同样会导致修改丢失。</p>
+<h2 id="22-参数表与校验">2.2 参数表与校验</h2>
+<p>LLMParams 共八个字段，这张表逐字段对照过 1.3.0 源码：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>temperature</code></td>
+<td>Double?</td>
+<td>控制输出随机性，高值更多样、低值更确定</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td>Int?</td>
+<td>响应的最大 token 数</td>
+</tr>
+<tr>
+<td><code>numberOfChoices</code></td>
+<td>Int?</td>
+<td>生成的备选响应数量，必须大于 0</td>
+</tr>
+<tr>
+<td><code>speculation</code></td>
+<td>String?</td>
+<td>推测性配置，仅部分模型支持</td>
+</tr>
+<tr>
+<td><code>schema</code></td>
+<td>Schema?</td>
+<td>响应的 JSON 结构定义，见 2.4</td>
+</tr>
+<tr>
+<td><code>toolChoice</code></td>
+<td>ToolChoice?</td>
+<td>控制工具调用行为，见 2.3</td>
+</tr>
+<tr>
+<td><code>user</code></td>
+<td>String?</td>
+<td>发起请求的用户标识，用于跟踪</td>
+</tr>
+<tr>
+<td><code>additionalProperties</code></td>
+<td>Map&lt;String, JsonElement&gt;?</td>
+<td>provider 特有的自定义参数，见 2.6</td>
+</tr>
+</tbody>
+</table>
+<p>八个字段默认均为 <code>null</code>，表示不显式设置该参数；字段是否受支持，还要看 provider 与模型。构造期校验涉及 <code>temperature</code>、<code>numberOfChoices</code>、<code>speculation</code>、<code>user</code> 和 <code>toolChoice</code>，其中最后一项检查 <code>Named</code> 的名称；<code>Named</code> 自身构造时也会校验名称。temperature 超范围的实测输出：</p>
+<pre><code class="language-text">temperature=2.5 -&gt; IllegalArgumentException: Temperature must be between 0.0 and 2.0, but was 2.5
+</code></pre>
+<p>其余规则：<code>numberOfChoices</code> 必须大于 0；<code>speculation</code> 和 <code>user</code> 不能是空白字符串；<code>ToolChoice.Named</code> 的工具名不能为空。这些是本地构造期校验，不必等到模型请求时才暴露；它们不替代 provider 对参数范围、组合和模型能力的进一步检查。基础 <code>LLMParams</code> 并没有在构造期校验 <code>maxTokens</code> 的范围。</p>
+<h2 id="23-toolchoice控制模型用不用工具">2.3 ToolChoice：控制模型用不用工具</h2>
+<p>五个选项：</p>
+<ul>
+<li><code>Auto</code>：模型自行决定是否调用工具、调用哪个。</li>
+<li><code>Named(name)</code>：强制调用指定工具。</li>
+<li><code>All</code>：调用所有工具。（在 1.3.0 版本中不存在，官方文档有描述）</li>
+<li><code>None</code>：不调用工具，仅生成文本。</li>
+<li><code>Required</code>：至少调用一个工具。</li>
+</ul>
+<pre><code class="language-kotlin">val specificToolParams = LLMParams(
+    toolChoice = LLMParams.ToolChoice.Named(name = "calculator")
+)
+</code></pre>
+<p>和第六篇 1.2.4 串起来：<code>requestLLMWithoutTools()</code> 不只是把本次请求的 <code>toolChoice</code> 置为 <code>null</code>，还会在准备 prompt 和执行请求时传入<strong>空工具列表</strong>。它不清空 Agent 注册的工具，也不永久改写会话参数。</p>
+<p>三种写法不能混为一谈：<code>toolChoice = null</code> 表示不显式指定工具选择策略，并不等于禁用工具；<code>ToolChoice.None</code> 是发送“不调用工具”的选择约束；<code>requestLLMWithoutTools()</code> 则让本次请求不提供工具，并清除相关选择约束。临时不需要工具时，用便捷方法更直接。</p>
+<h2 id="24-schema给响应定结构">2.4 Schema：给响应定结构</h2>
+<p><code>LLMParams.schema</code> 字段接受一个 JSON schema，让模型按结构输出。1.3.0 支持两种：</p>
+<ul>
+<li><code>LLMParams.Schema.JSON.Basic</code>：基础 JSON schema 表示，用于声明支持该能力的模型。</li>
+<li><code>LLMParams.Schema.JSON.Standard</code>：标准 JSON Schema 表示，但具体可用的关键字与约束仍取决于 provider 和模型。</li>
+</ul>
+<p>不能简单理解成“OpenAI 只接受 Basic”：1.3.0 也提供 <code>OpenAIStandardJsonSchemaGenerator</code>。选择哪一种，要结合模型能力声明和 provider 的 schema 方言。</p>
+<p>第四章的结构化输出会看到：手动构造 schema 就是用相应的 <code>Schema.JSON</code> 类型包装 <code>JsonObject</code>，再赋给 <code>LLMParams.schema</code>；而 <code>requestLLMStructured</code> 会从 data class 自动生成这些 schema，通常不需要手写。所以这一节只需要记住两条路径的存在和区别，细节留给第四章。</p>
+<h2 id="25-provider-特定参数">2.5 Provider 特定参数</h2>
+<p>基础 LLMParams 之外，各 provider 有自己的参数类，继承并扩展基础字段：</p>
+<ul>
+<li><code>OpenAIChatParams</code> / <code>OpenAIResponsesParams</code>（OpenAI 两种 API）</li>
+<li><code>GoogleParams</code>、<code>AnthropicParams</code>、<code>MistralAIParams</code>、<code>DeepSeekParams</code>、<code>OpenRouterParams</code>、<code>DashscopeParams</code>、<code>OllamaParams</code></li>
+</ul>
+<p>推理控制是最常用的场景。使用 OpenAI Chat API 且模型支持推理时，用 <code>reasoningEffort</code> 控制推理 token 量：</p>
+<pre><code class="language-kotlin">import ai.koog.prompt.executor.clients.openai.OpenAIChatParams
+import ai.koog.prompt.executor.clients.openai.base.models.ReasoningEffort
+
+val openAIReasoningEffortParams = OpenAIChatParams(
+    reasoningEffort = ReasoningEffort.MEDIUM
+)
+</code></pre>
+<p>无状态下使用 OpenAI Responses API 时，可以通过 <code>include</code> 请求加密的推理内容，供后续对话轮次传回：</p>
+<pre><code class="language-kotlin">import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
+import ai.koog.prompt.executor.clients.openai.models.OpenAIInclude
+
+val openAIStatelessReasoningParams = OpenAIResponsesParams(
+    include = listOf(OpenAIInclude.REASONING_ENCRYPTED_CONTENT)
+)
+</code></pre>
+<p>5.2 的提示词缓存也是 provider 参数——<code>AnthropicParams</code> 的缓存开关，到那一节再看。</p>
+<h2 id="26-additionalproperties兜底的自定义参数">2.6 additionalProperties：兜底的自定义参数</h2>
+<p>Koog 开箱不支持的 provider 特有参数，用 <code>additionalProperties</code> 透传：</p>
+<pre><code class="language-kotlin">val customParams = LLMParams(
+    additionalProperties = additionalPropertiesOf(
+        "top_p" to 0.95,
+        "frequency_penalty" to 0.5,
+        "presence_penalty" to 0.5
+    )
+)
+</code></pre>
+<h2 id="27-default参数组的部分覆盖">2.7 .default()：参数组的部分覆盖</h2>
+<p>定义一组通用参数，再按场景覆盖其中几项，不用每次重复公共值：</p>
+<pre><code class="language-kotlin">// 通用参数组。
+val base = LLMParams(temperature = 0.7, maxTokens = 150, toolChoice = LLMParams.ToolChoice.Auto)
+
+// 覆盖组：只写要改的字段，空位自动用 base 补齐。
+val overridden = LLMParams(temperature = 0.2, numberOfChoices = 3).default(base)
+
+// 手写一份完整参数组，验证合并结果与它相等。
+val handwritten = LLMParams(
+    temperature = 0.2,
+    maxTokens = 150,
+    toolChoice = LLMParams.ToolChoice.Auto,
+    numberOfChoices = 3
+)
+println("default() merge equals handwritten: ${overridden == handwritten}")
+</code></pre>
+<p><code>default()</code> 的语义是"当前实例里为 null 的字段用 default 补齐"。实测它与手写完整参数组相等：</p>
+<pre><code class="language-text">default() merge equals handwritten: true
+</code></pre>
+<p>注意 <code>default()</code> 是"按字段补空"，不是深合并——<code>additionalProperties</code> 整个字段要么用覆盖组的、要么用默认组的，不会按键合并。</p>
+<h1 id="三流式-api以-frame-为单位的增量响应">三、流式 API：以 Frame 为单位的增量响应</h1>
+<h2 id="31-两个入口先分清">3.1 两个入口，先分清</h2>
+<p>第三篇 §3.1 提过流式的存在：executor 层的 <code>executeStreaming()</code>，直接对 prompt 发起流式调用。本章是另一个入口——<strong>Agent 会话层</strong>的 <code>requestLLMStreaming()</code>，在写会话内调用，返回 <code>Flow&lt;StreamFrame&gt;</code>。两者的 frame 体系相同，但会话层入口能和 prompt 修改、工具调用放在一起用，是 Agent 开发中的主要用法。</p>
+<h2 id="32-frame-体系">3.2 Frame 体系</h2>
+<p>StreamFrame 分三类：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>Frame</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Delta（增量）</td>
+<td><code>TextDelta</code></td>
+<td>增量文本，实时渲染用</td>
+</tr>
+<tr>
+<td>Delta</td>
+<td><code>ReasoningDelta</code></td>
+<td>增量推理文本与摘要（仅支持推理的模型）</td>
+</tr>
+<tr>
+<td>Delta</td>
+<td><code>ToolCallDelta</code></td>
+<td>部分工具调用</td>
+</tr>
+<tr>
+<td>Complete（完整）</td>
+<td><code>TextComplete</code></td>
+<td>完整文本</td>
+</tr>
+<tr>
+<td>Complete</td>
+<td><code>ReasoningComplete</code></td>
+<td>完整推理内容</td>
+</tr>
+<tr>
+<td>Complete</td>
+<td><code>ToolCallComplete</code></td>
+<td>完整工具调用（含参数 JSON）</td>
+</tr>
+<tr>
+<td>结束标记</td>
+<td><code>End</code></td>
+<td>finishReason + 响应元信息</td>
+</tr>
+</tbody>
+</table>
+<p>分工原则：<strong>delta 用于实时显示，complete 用于取最终数据</strong>。<code>End</code> 是流结束的标记，带 <code>finishReason</code>，可以据此判断流为什么结束。</p>
+<h2 id="33-收集一个流">3.3 收集一个流</h2>
+<p>下面直接使用 DeepSeek 的真实客户端。完整程序保存为 <code>StreamingDemo.kt</code>，填入自己的密钥后运行。程序只发起一次流式请求：用 <code>onEach</code> 观察并打印 frame，再由 <code>collectText()</code> 消费同一条流，得到完整文本，不会为了展示两种用法而重复请求。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.dsl.builder.*
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekLLMClient
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekModels
+import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
+import ai.koog.prompt.streaming.StreamFrame
+import ai.koog.prompt.streaming.collectText
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.runBlocking
+
+fun main() = runBlocking {
+    val executor = MultiLLMPromptExecutor(DeepSeekLLMClient(apiKey = "xxxxxxx"))
+    val graph = strategy&lt;String, String&gt;("streaming-demo") {
+        val streamNode by node&lt;String, String&gt; { input -&gt;
+            val before = llm.readSession { prompt.messages.size }
+            val fullText = llm.writeSession {
+                appendPrompt { user(input) }
+                // 只发起一次请求：onEach 观察 frame，collectText 拼接同一条流。
+                requestLLMStreaming().onEach { frame -&gt;
+                    when (frame) {
+                        is StreamFrame.TextDelta -&gt; print(frame.text)
+                        is StreamFrame.End -&gt; println("\n[END] reason=${frame.finishReason}")
+                        else -&gt; {}
+                    }
+                }.collectText()
+            }
+            val after = llm.readSession { prompt.messages.size }
+            check(after == before + 1)
+            println("prompt messages: $before -&gt; $after")
+            println("collectText: $fullText")
+            fullText
+        }
+        nodeStart then streamNode then nodeFinish
+    }
+    val agent = AIAgent(
+        executor, DeepSeekModels.DeepSeekV4Flash, strategy = graph,
+        systemPrompt = "你是中文助手。回答简洁，不超过80个汉字。"
+    )
+    try {
+        agent.run("用一句话介绍 Kotlin 协程。")
+    } finally {
+        agent.close()
+        executor.close()
+    }
+    Unit
+}
+</code></pre>
+<p>一次真实运行的输出如下；模型措辞和 chunk 划分可能变化，不能把这段内容当成固定断言：</p>
+<pre><code class="language-text">Kotlin 协程是一种轻量级并发方案，用挂起函数以同步写法实现异步任务，减少线程开销和回调嵌套。
+[END] reason=stop
+prompt messages: 1 -&gt; 2
+collectText: Kotlin 协程是一种轻量级并发方案，用挂起函数以同步写法实现异步任务，减少线程开销和回调嵌套。
+</code></pre>
+<p><code>TextDelta</code> 按到达顺序打印，<code>End</code> 给出服务端结束原因。消息数从 1 变为 2，只增加了 <code>appendPrompt</code> 追加的 user 消息：<strong>流式响应不会自动写回 prompt 历史</strong>，与第六篇写会话内的普通 <code>requestLLM()</code> 不同。要继续多轮对话，需要按自己的历史策略显式追加最终响应；只打印或返回 <code>fullText</code> 不等于保存它。</p>
+<p><code>filterTextOnly()</code> 将 frame 流转换为仅包含 <code>TextDelta.text</code> 的文本块流；<code>collectText()</code> 则内部提取这些增量并拼接为完整文本。已有 UI 如果只消费字符串，可以选择 <code>frames.filterTextOnly().collect { ... }</code>，作为上面终端消费方式的替代，而不是在同一响应后再次调用 <code>requestLLMStreaming()</code>。对模型返回的冷流重新收集也可能重新发起网络请求，不要把它当成可重复读取的缓存。</p>
+<h2 id="34-流式结构化markdown-流解析">3.4 流式结构化：Markdown 流解析</h2>
+<p>如果模型的输出天然是 Markdown（比如列表），可以在流式过程中边收边解析成对象。1.3.0 提供三件套：</p>
+<ol>
+<li><code>MarkdownStructureDefinition</code>：定义输出应遵循的 Markdown 结构，带 schema 和 examples。</li>
+<li><code>markdownStreamingParser { }</code>：注册各类处理器——<code>onHeader(level)</code>、<code>onBullet</code>、<code>onCodeBlock</code>、<code>onLineMatching(Regex)</code>、<code>onFinishStream</code>。</li>
+<li><code>parseStream(文本流)</code>：把文本流喂给解析器，解析器闭包内可以 <code>emit</code> 结果对象。</li>
+</ol>
+<p>下面的 <code>MarkdownStreamDemo.kt</code> 同样调用真实 DeepSeek。结构说明用于引导模型，解析器负责从增量文本中提取对象，并检查每本书恰好有作者、简介两个非空列表项。要求不满足时抛异常，不用空字符串掩盖缺字段。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.dsl.builder.*
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekLLMClient
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekModels
+import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
+import ai.koog.prompt.markdown.markdown
+import ai.koog.prompt.streaming.StreamFrame
+import ai.koog.prompt.streaming.filterTextOnly
+import ai.koog.prompt.structure.markdown.MarkdownStructureDefinition
+import ai.koog.prompt.structure.markdown.markdownStreamingParser
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class Book(val title: String, val author: String, val description: String)
+
+fun markdownBookDefinition(): MarkdownStructureDefinition {
+    return MarkdownStructureDefinition(
+        "bookList",
+        schema = {
+            markdown {
+                header(1, "title")
+                bulleted {
+                    item("author")
+                    item("description")
+                }
+            }
+        },
+        examples = {
+            markdown {
+                header(1, "The Great Gatsby")
+                bulleted {
+                    item("F. Scott Fitzgerald")
+                    item("A novel set in the Jazz Age.")
+                }
+            }
+        }
+    )
+}
+
+fun parseMarkdownStreamToBooks(markdownStream: Flow&lt;StreamFrame&gt;): Flow&lt;Book&gt; = flow {
+    markdownStreamingParser {
+        var currentBookTitle = ""
+        val bulletPoints = mutableListOf&lt;String&gt;()
+        onHeader(1) { headerText -&gt;
+            // 收到新标题时，先把上一本书发出去。
+            if (currentBookTitle.isNotBlank()) {
+                require(bulletPoints.size == 2 &amp;&amp; bulletPoints.all { it.isNotBlank() }) {
+                    "Book '$currentBookTitle' requires nonblank author and description"
+                }
+                emit(Book(currentBookTitle, bulletPoints[0], bulletPoints[1]))
+            }
+            currentBookTitle = headerText
+            bulletPoints.clear()
+        }
+        onBullet { bulletText -&gt;
+            require(currentBookTitle.isNotBlank()) { "Bullet found before book title" }
+            bulletPoints.add(bulletText)
+        }
+        onFinishStream {
+            if (currentBookTitle.isNotBlank()) {
+                require(bulletPoints.size == 2 &amp;&amp; bulletPoints.all { it.isNotBlank() }) {
+                    "Book '$currentBookTitle' requires nonblank author and description"
+                }
+                emit(Book(currentBookTitle, bulletPoints[0], bulletPoints[1]))
+            }
+        }
+    }.parseStream(markdownStream.filterTextOnly())
+}
+
+fun main(args: Array&lt;String&gt;) = runBlocking {
+    val executor = MultiLLMPromptExecutor(DeepSeekLLMClient(apiKey = "xxxxxxx"))
+    val graph = strategy&lt;String, List&lt;Book&gt;&gt;("md-stream-demo") {
+        val streamNode by node&lt;String, List&lt;Book&gt;&gt; { input -&gt;
+            val books = mutableListOf&lt;Book&gt;()
+            llm.writeSession {
+                appendPrompt { user(input) }
+                val mdStream = requestLLMStreaming(markdownBookDefinition())
+                parseMarkdownStreamToBooks(mdStream).collect { book -&gt;
+                    books.add(book)
+                    println("Parsed Book: ${book.title} by ${book.author}")
+                }
+            }
+            books
+        }
+        nodeStart then streamNode then nodeFinish
+    }
+    val agent = AIAgent(executor, DeepSeekModels.DeepSeekV4Flash, strategy = graph, systemPrompt = "你是图书推荐助手。严格使用要求的 Markdown 格式：每本书一个一级标题，恰好两个列表项，分别是作者和一句话简介。不要前言、结语、字段标签或代码围栏。")
+    try {
+        val result = agent.run("推荐两本科幻小说，作者和简介用中文，每本简介不超过30个汉字。")
+        check(result.size == 2)
+        println("RESULT books=$result")
+    } finally { agent.close(); executor.close() }
+}
+</code></pre>
+<p><code>requestLLMStreaming(markdownBookDefinition())</code> 会把结构说明带入请求，但不保证模型始终遵守。一次真实运行得到：</p>
+<pre><code class="language-text">Parsed Book: 三体 by 刘慈欣
+Parsed Book: 流浪地球 by 刘慈欣
+RESULT books=[Book(title=三体, author=刘慈欣, description=地球文明与三体文明展开生死博弈。), Book(title=流浪地球, author=刘慈欣, description=人类推动地球逃离太阳系寻找新家园。)]
+</code></pre>
+<p>这次模型输出满足了格式与数量检查；其他响应仍可能缺字段、增加列表项或使用不同标题层级，业务侧需要处理解析失败，并对书籍信息做进一步校验。生成的书目和简介也不能因为已经变成 <code>Book</code> 就视为事实已核实。</p>
+<p>解析器会拼接不同 chunk，真实网络增量不必按行对齐。<code>onFinishStream</code> 在这份实现中负责发出最后一本书；1.3.0 的 Markdown 解析器按章节缓冲，因此“边收边解析”不等于每个 token 都立即产生一个对象，也不保证下一个标题刚到达时上一本书就立刻发出。</p>
+<h2 id="35-流式与工具组合">3.5 流式与工具组合</h2>
+<p>解析出的对象可以直接喂给工具：在解析器的 collect 里调用 <code>callToolRaw(BookTool.NAME, book)</code>，或者用 <code>toParallelToolCallsRaw(BookTool::class)</code> 并行调用。官方文档的 Book 工具示例演示了这条路：流式产出结构化对象 → 立即触发工具执行，不用等整个响应结束。</p>
+<p>工具定义与注册见第四篇，本篇不再展开完整组合代码。离线预置流同样可以驱动解析器并触发测试工具，不必依赖真实模型；不过本文没有验证这条组合路径。生产中还需考虑解析失败、重复执行与工具副作用：如果末尾解析失败，前面已执行的工具不会因此自动回滚。</p>
+<h2 id="36-事件钩子里的流">3.6 事件钩子里的流</h2>
+<p>Agent 的事件处理器能监听流本身：<code>onLLMStreamingFrameReceived</code>（每个 frame 到达）、<code>onLLMStreamingFailed</code>、<code>onLLMStreamingCompleted</code>。这属于事件体系的用法，第六篇 1.4 的 feature 机制正是它们的挂载点，第八篇讲可观测性时一并展开。</p>
+<h1 id="四结构化输出让响应变成可解析的对象">四、结构化输出：让响应变成可解析的对象</h1>
+<h2 id="41-定义数据结构">4.1 定义数据结构</h2>
+<p>结构化输出的第一步是用 data class 描述你要的对象：</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.tools.annotations.LLMDescription
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+
+@Serializable
+@SerialName("SimpleWeatherForecast")
+@LLMDescription("Simple weather forecast for a location")
+data class SimpleWeatherForecast(
+    @property:LLMDescription("Location name")
+    val location: String,
+    @property:LLMDescription("Temperature in Celsius")
+    val temperature: Int,
+    @property:LLMDescription("Weather conditions (e.g., sunny, cloudy, rainy)")
+    val conditions: String
+)
+</code></pre>
+<p>三个注解各司其职：<code>@Serializable</code> 是 kotlinx.serialization 的要求；<code>@SerialName</code> 指定序列化名称；<code>@LLMDescription</code> 给模型看的类与字段说明——字段上要用 <code>@property:LLMDescription</code>（注解目标是 property 而非字段）。</p>
+<p>支持的结构远比这个例子丰富：嵌套类、List/Map 集合、枚举、sealed class 多态都可以；还可以提供 examples 帮模型理解格式。</p>
+<h2 id="42-离线生成一次-schema">4.2 离线生成一次 Schema</h2>
+<p><code>JsonStructure.create</code> 能从 data class 直接生成 JSON Schema，这一步不需要模型。下面是解释生成过程的局部片段；4.4 会给出包含这些内容的完整 <code>StructuredDemo.kt</code>，运行时使用完整版本即可，不要重复拼接两份定义：</p>
+<pre><code class="language-kotlin">import ai.koog.prompt.structure.json.JsonStructure
+import ai.koog.prompt.structure.json.generator.BasicJsonSchemaGenerator
+
+// 局部片段：使用 4.1 的数据类；这些内容也会包含在 4.4 的完整程序中。
+val exampleForecasts = listOf(
+    SimpleWeatherForecast("Amsterdam", 15, "Rainy"),
+    SimpleWeatherForecast("Paris", 12, "Cloudy")
+)
+val structure = JsonStructure.create&lt;SimpleWeatherForecast&gt;(
+    schemaGenerator = BasicJsonSchemaGenerator.Default,
+    examples = exampleForecasts
+)
+println("SCHEMA: ${structure.schema}")
+</code></pre>
+<p>实际输出（关键部分）：</p>
+<pre><code class="language-text">SCHEMA: Basic(name=SimpleWeatherForecast, schema={"type":"object","properties":{"location":{"type":"string","description":"Location name"},"temperature":{"type":"integer","description":"Temperature in Celsius"},"conditions":{"type":"string","description":"Weather conditions (e.g., sunny, cloudy, rainy)"}},"required":["location","temperature","conditions"],"additionalProperties":false})
+</code></pre>
+<p>注意 <code>@property:LLMDescription</code> 的文字被逐字段写进了 schema 的 <code>description</code>，三个字段全部进入 <code>required</code>。这说明类型与注解可以转换为结构约束，但上面的输出特指 Basic generator。高层 API 会按模型能力和 provider 选择相应 generator 与 native/manual 模式，不保证直接使用与此完全相同的 schema。</p>
+<h2 id="43-三个使用层">4.3 三个使用层</h2>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>API</th>
+<th>场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>executor 层</td>
+<td><code>promptExecutor.executeStructured&lt;T&gt;(prompt, model, ...)</code></td>
+<td>独立的单次请求，不经过 Agent</td>
+</tr>
+<tr>
+<td>会话层</td>
+<td><code>requestLLMStructured&lt;T&gt;()</code>（写会话内）</td>
+<td>Agent 流程中的某个点需要结构化数据</td>
+</tr>
+<tr>
+<td>节点层</td>
+<td><code>nodeLLMRequestStructured&lt;T&gt;()</code>（by 委托）</td>
+<td>可复用的结构化节点</td>
+</tr>
+</tbody>
+</table>
+<p>三层的返回值统一为 <code>Result&lt;StructuredResponse&lt;T&gt;&gt;</code>，用 <code>isSuccess</code> / <code>getOrNull()?.data</code> 取值。会话层和节点层都在图流程内，与第五篇的策略体系衔接。</p>
+<p><strong>返回 <code>Result</code> 不代表调用过程中不会直接抛异常。</strong> 1.3.0 的 executor 实现将解析与修复放在 <code>runCatching</code> 内，而 schema/config 准备和初次 <code>execute</code> 位于其外。因此，配置或首次模型请求失败仍可能直接抛出；解析失败通常表现为 <code>Result.failure</code>，修复调用中的异常也可能落入这个失败结果。业务调用方既要处理返回的 <code>Result</code>，也要处理调用本身抛出的异常；协程取消应继续传播。</p>
+<h2 id="44-解析失败怎么办structurefixingparser">4.4 解析失败怎么办：StructureFixingParser</h2>
+<p>JSON 可能语法正确，却无法反序列化为目标类型，例如把整数写成“不是数字”。<code>StructureFixingParser</code> 在遇到 <code>SerializationException</code> 时，会将原内容和解析异常交给修复模型，最多额外尝试 <code>retries</code> 次；其他异常不会一律进入修复循环。修复模型可以与初次请求使用同一个模型。</p>
+<p>下面是完整的 <code>StructuredDemo.kt</code>，全部请求使用真实 DeepSeek，不需要任何替身类。为方便直接运行，代码重复列出了 4.1 的数据类，并包含 4.2 的 schema 生成过程。</p>
+<p>程序演示两条路径：先用 <code>executeStructured</code> 请求一个虚构天气对象，并配置解析失败时的自动修复；再显式传入一段人为写坏的 JSON，调用 <code>StructureFixingParser.parse</code>，让真实模型执行修复。第二条路径不用等模型偶然出错，也没有伪造模型返回内容。</p>
+<pre><code class="language-kotlin">import ai.koog.agents.core.tools.annotations.LLMDescription
+import ai.koog.prompt.dsl.prompt
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekLLMClient
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekModels
+import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
+import ai.koog.prompt.executor.model.StructureFixingParser
+import ai.koog.prompt.executor.model.executeStructured
+import ai.koog.prompt.structure.json.JsonStructure
+import ai.koog.prompt.structure.json.generator.BasicJsonSchemaGenerator
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+
+@Serializable
+@SerialName("SimpleWeatherForecast")
+@LLMDescription("Simple weather forecast for a location")
+data class SimpleWeatherForecast(
+    @property:LLMDescription("Location name")
+    val location: String,
+    @property:LLMDescription("Temperature in Celsius")
+    val temperature: Int,
+    @property:LLMDescription("Weather conditions (e.g., sunny, cloudy, rainy)")
+    val conditions: String
+)
+
+val exampleForecasts = listOf(
+    SimpleWeatherForecast("Amsterdam", 15, "Rainy"),
+    SimpleWeatherForecast("Paris", 12, "Cloudy")
+)
+
+fun main() = runBlocking {
+    val model = DeepSeekModels.DeepSeekV4Flash
+    val executor = MultiLLMPromptExecutor(DeepSeekLLMClient(apiKey = "xxxxxxx"))
+    try {
+        // schema 的生成是本地操作；下面的请求和修复才会调用真实模型。
+        val structure = JsonStructure.create&lt;SimpleWeatherForecast&gt;(
+            schemaGenerator = BasicJsonSchemaGenerator.Default,
+            examples = exampleForecasts
+        )
+        println("SCHEMA: ${structure.schema}")
+
+        val result = executor.executeStructured&lt;SimpleWeatherForecast&gt;(
+            prompt = prompt("structured") {
+                system("Return a fictional weather forecast, not live weather data.")
+                user("Give a fictional weather forecast for Paris, using Celsius.")
+            },
+            model = model,
+            examples = exampleForecasts,
+            fixingParser = StructureFixingParser(model = model, retries = 2)
+        )
+        println("Forecast: ${result.getOrThrow().data}")
+
+        // 不靠运气等模型出错：明确使用人为写坏的 JSON，演示真实修复调用。
+        val badJson = """{"location":"Paris","temperature":"不是数字","conditions":"Cloudy"}"""
+        println("Repair input: $badJson")
+        val repaired = StructureFixingParser(model = model, retries = 2)
+            .parse(executor, structure, badJson)
+        println("Repaired: $repaired")
+    } finally {
+        executor.close()
+    }
+    Unit
+}
+</code></pre>
+<p>一次真实运行的结果如下（省略与 4.2 相同的 <code>SCHEMA</code> 行）：</p>
+<pre><code class="language-text">Forecast: SimpleWeatherForecast(location=Paris, France, temperature=18, conditions=Partly cloudy)
+Repair input: {"location":"Paris","temperature":"不是数字","conditions":"Cloudy"}
+Repaired: SimpleWeatherForecast(location=Paris, temperature=12, conditions=Cloudy)
+</code></pre>
+<p>第一条路径已经返回了可解析对象，但仅凭这行输出不能判断内部有没有发生自动修复。第二条路径的 <code>Repair input</code> 是程序明确写入的错误样本，<code>Repaired</code> 才是真实模型修复后的解析结果。这个字符串只说明原值不是数字，没有给出真实温度，所以输出中的 <code>12</code> 是模型补出的值，不是恢复了一个已经存在的正确答案。不同运行可能得到不同值，不能对它做固定数值断言。</p>
+<p>需要记住两个边界：</p>
+<ul>
+<li><strong>修复会增加模型调用与费用</strong>。本程序除了首次结构化请求，还额外演示了一条真实修复路径；每条路径都可能重试。<code>retries = 2</code> 表示最多额外尝试两次，不是整段程序只调用两次。</li>
+<li><strong>修复数据不等于替换原响应</strong>。若在 <code>executeStructured</code> 内触发了自动修复，<code>StructuredResponse.data</code> 可以来自修复后的文本，但 <code>message</code> 仍是初次响应。写会话成功时追加的也是这个原始 message，历史中的坏 JSON 不会因此自动被替换。本例显式调用的 <code>parse</code> 只返回对象，本身不负责保存会话历史。</li>
+</ul>
+<p>这里的天气请求已明确要求虚构数据，没有接入天气工具或外部数据源；它演示的是类型解析，不是实时天气查询。<code>getOrThrow()</code> 用来让示例在失败时直接暴露问题，业务代码仍需按 4.3 区分调用异常与失败结果，并校验字段的业务含义。</p>
+<h2 id="45-自动选择与手动控制">4.5 自动选择与手动控制</h2>
+<p>上面用的都是简化 API：框架根据模型能力自动决定用哪种 schema（Basic/Standard）和哪种模式（native——provider 原生结构化输出；manual——把 schema 说明注入 prompt）。需要精细控制时用 <code>StructuredRequestConfig</code>：按 provider 指定不同配置、手动选择 schema 生成器（<code>StandardJsonSchemaGenerator</code> / <code>BasicJsonSchemaGenerator</code> / provider 特定生成器）、设置回退策略。</p>
+<p>第二章 2.4 的 <code>LLMParams.schema</code> 与这一章的关系至此可以收拢：<code>schema</code> 字段是"手动把 schema 塞进参数"的底层路径；<code>requestLLMStructured</code> 是"从 data class 自动生成 schema 并处理解析"的高层路径。日常业务用后者，需要对齐特定 provider 的 schema 方言时才下沉到前者。</p>
+<h1 id="五选型与成本一次调用怎么组合">五、选型与成本：一次调用怎么组合</h1>
+<h2 id="51-输出方式的决策表">5.1 输出方式的决策表</h2>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>选择</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>完整文本即可</td>
+<td>普通 <code>requestLLM()</code></td>
+<td>最简单，响应自动入历史</td>
+</tr>
+<tr>
+<td>界面逐字显示</td>
+<td><code>requestLLMStreaming</code> + TextDelta</td>
+<td>用户体验取决于首字延迟</td>
+</tr>
+<tr>
+<td>流式产出结构化对象</td>
+<td>流式 + MarkdownDefinition + parser</td>
+<td>边收边处理，适合列表型内容</td>
+</tr>
+<tr>
+<td>后续流程要读字段</td>
+<td><code>requestLLMStructured</code></td>
+<td>拿类型安全的对象，可能触发修复调用</td>
+</tr>
+<tr>
+<td>临时不要工具</td>
+<td><code>requestLLMWithoutTools()</code></td>
+<td>不提供工具；与 <code>ToolChoice.None</code> 的区别见 2.3</td>
+</tr>
+</tbody>
+</table>
+<p>输入是否带附件与输出如何消费是两个设计维度，但具体组合能否使用，仍要核对 provider、模型及 API 路径是否同时支持相应能力。</p>
+<h2 id="52-两种缓存别混">5.2 两种缓存，别混</h2>
+<p>第三章的调用可能很贵，缓存能省钱，但 Koog 里"缓存"有两个完全不同的东西：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>响应缓存（第 3 篇 §7）</th>
+<th>提示词缓存（本节）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>存什么</td>
+<td>完整的 LLM 响应</td>
+<td>prompt 前缀（provider 侧存储）</td>
+</tr>
+<tr>
+<td>在哪存</td>
+<td>本地，包装 executor</td>
+<td>provider 服务器</td>
+</tr>
+<tr>
+<td>命中条件</td>
+<td>按缓存键规则匹配 prompt 与工具等信息；消息元信息会被清理</td>
+<td>相同可缓存前缀，并满足服务端缓存条件</td>
+</tr>
+<tr>
+<td>收益</td>
+<td>相同请求跳过网络调用</td>
+<td>重复前缀省 token 计费与延迟</td>
+</tr>
+<tr>
+<td>典型场景</td>
+<td>固定任务的重复调用</td>
+<td>多轮对话、超长 system prompt、固定工具定义</td>
+</tr>
+</tbody>
+</table>
+<p>响应缓存已经在第三篇讲过（<code>CachedPromptExecutor</code> 包装）。提示词缓存是 provider 侧能力。1.3.0 为 Anthropic 和 Amazon Bedrock 提供了相应集成，但开启路径与缓存标记类型并不通用。下面先讲 Anthropic；Bedrock 的区别在本节末尾说明。</p>
+<p>Anthropic 有两种方式。请求级自动缓存通过 <code>AnthropicParams.cacheControl</code> 配置，由 Anthropic 服务端按自动缓存规则管理断点，适合多轮对话：</p>
+<pre><code class="language-kotlin">import ai.koog.prompt.dsl.prompt
+import ai.koog.prompt.executor.clients.anthropic.AnthropicParams
+import ai.koog.prompt.executor.clients.anthropic.AnthropicCacheControl
+
+fun autoCachePrompt() {
+    val params = AnthropicParams(cacheControl = AnthropicCacheControl.Default)
+    val prompt = prompt("assistant", params = params) {
+        system("You are a helpful assistant with a very long system prompt...")
+        user("What can you help me with?")
+    }
+    println("params=${prompt.params}")
+}
+</code></pre>
+<p>实测输出（节选）：</p>
+<pre><code class="language-text">params=AnthropicParams(..., automaticCacheControl=Default)
+</code></pre>
+<p>逐块手动缓存——把断点放在指定消息上，其前所有内容都可缓存，可为 system 指定一小时 TTL：</p>
+<pre><code class="language-kotlin">fun manualCachePrompt() {
+    val prompt = prompt("assistant") {
+        system("You are a knowledgeable assistant...", cache = AnthropicCacheControl.OneHour)
+        user("Summarize the latest AI research.")
+    }
+    println("parts=${prompt.messages.first().parts}")
+}
+</code></pre>
+<p>实测输出：</p>
+<pre><code class="language-text">parts=[Text(text=You are a knowledgeable assistant..., cacheControl=OneHour)]
+</code></pre>
+<p>这里有一个容易误读的输出细节：1.3.0 的构造参数和公开属性都叫 <strong><code>cacheControl</code></strong>，只是 <code>toString()</code> 使用了 <code>automaticCacheControl</code> 这个标签。这不是 API 改名，也不能据此认定文档使用了新版参数。</p>
+<p>块级标记落在消息部件上：<code>MessagePart.Text</code> 和附件部件都可以带 <code>cacheControl</code>，Anthropic 的图片、文档等内容也可以设置缓存断点。标记表示请求使用缓存，并不证明已经命中；最低可缓存长度、可用模型、TTL 和计费等规则仍以服务端文档为准。这里的短 prompt 仅验证配置构造，不是缓存命中或节省费用的实验。</p>
+<p>Bedrock 要按具体调用路径区分：其 <strong>Converse</strong> API 可以将消息部件和工具上的 <code>BedrockCacheControl</code> 转换成 cache point，并非照搬 Anthropic 的请求级开关。Anthropic 使用 <code>AnthropicCacheControl</code>，Bedrock Converse 使用 <code>BedrockCacheControl</code>；标记类型与客户端不匹配会抛异常，不能把带 Anthropic 标记的 prompt 原样交给另一 provider。</p>
+<h2 id="53-叠加的代价">5.3 叠加的代价</h2>
+<p>这些能力可以在支持相应组合的 provider、模型与 API 路径上按需搭配，不能默认任意组合都可用。每叠一层，验证成本都在涨：流式里做结构化解析要处理跨 chunk 边界；结构化加修复要多付模型调用；多模态要让每个 provider 确认附件支持。建议按需逐层引入，每加一层就把对应路径重新验证一遍。</p>
+<h1 id="后记">后记</h1>
+<p>到这里，模型调用层的全部内容讲完了：第三篇的骨架（Prompt、Client、Executor），加上本篇的输入形态、控制参数和三种输出方式。</p>
+<p>一张表收一下：</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>记住什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>多模态消息</td>
+<td>四类附件函数；1.3.0 用 <code>AttachmentSource</code>，path 是 <code>kotlinx.io.files.Path</code>；支持因 provider 而异</td>
+</tr>
+<tr>
+<td>LLMParams</td>
+<td>八个字段，构造期校验；写会话内 <code>changeLLMParams</code> 随会话提交</td>
+</tr>
+<tr>
+<td>流式</td>
+<td>delta 实时显示、complete 取最终数据；响应不自动入历史</td>
+</tr>
+<tr>
+<td>流式结构化</td>
+<td>Markdown 三件套，边收边解析成对象</td>
+</tr>
+<tr>
+<td>结构化输出</td>
+<td>三层返回 <code>Result&lt;StructuredResponse&lt;T&gt;&gt;</code>，但准备与首次调用仍可能抛异常；修复数据不等于替换原响应</td>
+</tr>
+<tr>
+<td>缓存</td>
+<td>响应缓存省重复请求，提示词缓存省重复前缀，别混用</td>
+</tr>
+</tbody>
+</table>
+<p>选择困难时回到那个基本问题：这次调用，输入要带什么、输出给谁看、要不要能被程序读。答案定了，API 就定了。</p>
+<p>下一篇进入工程化主题：如何观察 Agent 的执行过程（事件、tracing、OpenTelemetry），以及如何测试一个包含模型调用的流程。</p>
+<p>本文第三章的两个流式程序和第四章的结构化、显式修复程序均已使用 DeepSeek 实际执行，文中输出来自这些程序的一次运行，不是预置响应。第一章只构造附件消息：当前示例模型不支持其中的附件类型，不能把消息构造成功说成完成了多模态识别。schema 生成、参数校验与缓存配置构造仍属于本地操作，不需要为了演示而发送模型请求；Anthropic/Bedrock 的服务端缓存命中和流式加工具的组合不在本次验证范围内。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Streaming API: <a href="https://docs.koog.ai/streaming-api/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/streaming-api/</a></li>
+<li>Structured output: <a href="https://docs.koog.ai/structured-output/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/structured-output/</a></li>
+<li>Multimodal content: <a href="https://docs.koog.ai/prompts/prompt-creation/multimodal-content/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/prompts/prompt-creation/multimodal-content/</a></li>
+<li>LLM parameters: <a href="https://docs.koog.ai/llm-parameters/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/llm-parameters/</a></li>
+<li>Prompt caching control: <a href="https://docs.koog.ai/prompts/prompt-creation/cache-control/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/prompts/prompt-creation/cache-control/</a></li>
+<li>LLM response caching: <a href="https://docs.koog.ai/prompts/llm-response-caching/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/prompts/llm-response-caching/</a></li>
+<li>Module versioning: <a href="https://docs.koog.ai/module-versioning/" target="_blank" rel="noopener nofollow">https://docs.koog.ai/module-versioning/</a></li>
+</ul>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div>作者：<a href="http://joy99.cnblogs.com/" target="_blank">SharpCJ</a></div>
+　　　　<div>作者博客：<a href="http://joy99.cnblogs.com/" target="_blank">http://joy99.cnblogs.com/</a></div>
+        <a href="#">
+　　　　<div>本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须保留此段声明，且在文章页面明显位置给出原文连接。 </div></a>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.11180555555555556" data-date-updated="2026-10-20 14:07">2026-10-20 11:26</span>&nbsp;
+<a href="https://www.cnblogs.com/joy99">SharpCJ</a>&nbsp;
+阅读(<span id="post_view_count">25</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23341378);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjoy99%2Fp%2F23341378&amp;targetId=23341378&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

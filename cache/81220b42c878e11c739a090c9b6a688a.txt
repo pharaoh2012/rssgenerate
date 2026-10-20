@@ -1,0 +1,1244 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zrui-xyu/p/23367975" title="发布于 2026-10-20 10:11">
+    
+
+    <span role="heading" aria-level="2">百万并发直播弹幕系统设计全解：看懂了扇出，你就看懂了高并发的八成</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        拆解百万并发直播弹幕架构，核心攻克扇出爆炸难题，通过节点扇出 + 本地房间表 + 时间窗聚合，将百万次网络调用降至百次。覆盖 Netty 百万长连接、CAS 环形缓冲削峰、推拉结合下发、冷热分离降本，附带全套核心代码、四层限流与分级可靠方案。文末 14 个难点速查表，面试 / 生产可直接复用。互动讨论直播间百万在线扩容思路，下一篇拆解秒杀系统。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>📌 <strong>本文速览｜建议先收藏再看</strong></p>
+<p>主播一句“来波 666”，背后是每秒十万级写入、一条弹幕送达百万人的残酷现实。逐条推送？<strong>10 万 QPS × 100 万在线 = 100 亿次/秒，物理上不可能</strong>。这篇文章不画空架构图，从真实口径算账开始，把百万并发弹幕系统拆成五层：接入层扛百万长连接，业务层做校验过滤，分发层用“<strong>节点级扇出 + 本地房间表 + 时间窗聚合</strong>”把 100 万次网络调用降到约 100 次，存储层冷热分离降成本。核心代码全带：Netty 网关调优、Kafka 独立 consumer group 广播语义、CAS 环形缓冲削峰、脏连接队列批量 flush、推 offset 拉消息体、房间 seq 号段、Redis Stream ACK 可靠通道、四层限流与加权采样。文末还有 <strong>14 个难点速查表 + 性能指标</strong>，面试和实战都能直接抄作业。</p>
+<p><strong>一句话戳破本质：弹幕系统的核心矛盾不是“写不写得进”，而是“扇出降不降得下来”。看懂了扇出，你就看懂了高并发的八成。</strong></p>
+<p><strong>本文亮点，先睹为快：</strong></p>
+<ul>
+<li><strong>扇出降 4 个数量级</strong>：节点级扇出 + 本地房间表 + 时间窗聚合，100 万次 socket write 变约 100 次节点投递；</li>
+<li><strong>百万长连接</strong>：Netty Epoll、堆外池化、心跳踢死连接，HyperLogLog 用 12KB 统计百万 UV；</li>
+<li><strong>上行三级削峰</strong>：本地环形缓冲背压 → MQ 按 roomId 分区 → 消费端批量聚合，附无锁 CAS 核心代码；</li>
+<li><strong>下行最硬核</strong>：脏连接队列、MPSC 无锁入队、背压丢慢客户端、一次编码百万人共享；</li>
+<li><strong>推拉结合</strong>：小房间纯推，超大房间推 offset 指针 + 客户端拉消息体，O(N) 广播变 O(1)；</li>
+<li><strong>可靠分级</strong>：普通弹幕可丢，礼物/系统通知走 Redis Stream ACK，一条不能丢；</li>
+<li><strong>保命符</strong>：四层限流、热度采样、加权采样、L1-L3 降级与故障兜底；</li>
+<li><strong>冷热分离</strong>：Redis 只留最近 5 分钟热弹幕，历史异步落 ClickHouse/HBase，存储成本降 80%。</li>
+</ul>
+<p><strong>适合谁读</strong>：做系统设计、准备面试、负责直播/IM/实时消息的你。读完能带走一套可落地的架构骨架、核心代码思路和面试表达。</p>
+<p><strong>一句话记忆：推拉结合保实时，异步批量抗洪峰，背压隔离护全局。</strong></p>
+<p>最后留个互动话题：<strong>如果你的直播间突然涌入 100 万在线，你第一步会先扩容哪一层？为什么？</strong> 评论区聊聊，我会逐条回复。觉得文章有用，<strong>点赞、在看、收藏、转发</strong>走一波；下一篇拆秒杀系统，关注不迷路。</p>
+<h1 id="百万并发直播弹幕系统设计全解看懂了扇出你就看懂了高并发的八成">百万并发直播弹幕系统设计全解：看懂了扇出，你就看懂了高并发的八成</h1>
+<p>主播在直播间喊一句"来波 666"，弹幕瞬间刷屏——这背后是每秒十万级的写入，和一条弹幕要送达百万人的残酷现实。逐条推送？系统三秒就得趴下。这篇文章从真实场景出发，把弹幕系统的五层架构、推拉结合、批量聚合、分级降级一次讲透，核心代码全部带上。做系统设计、准备面试的朋友，值得收藏细看。</p>
+<h2 id="一先算笔账我们到底在怕什么">一、先算笔账：我们到底在怕什么</h2>
+<p>实际开发中，接到"设计一个弹幕系统"这种需求，很多人上来就开始画架构图：Netty + Kafka + Redis，一套组合拳打出去。且慢，先问清楚几个口径，因为量级差一个数量级，方案就完全是两回事：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>需要确认的点</th>
+<th>典型假设</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>规模</td>
+<td>单房间在线人数？弹幕峰值 QPS？</td>
+<td>单房间 100 万在线，全局 10 万条/秒</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>端到端可接受延迟？</td>
+<td>≤ 200ms，超过用户就觉得"卡住了"</td>
+</tr>
+<tr>
+<td>一致性</td>
+<td>弹幕能不能丢？要不要落库？</td>
+<td>普通弹幕允许丢；礼物、系统通知不能丢</td>
+</tr>
+<tr>
+<td>合规</td>
+<td>要不要实时审核？</td>
+<td>必须审核，本地词库同步拦 + 模型异步审</td>
+</tr>
+<tr>
+<td>地域</td>
+<td>单机房还是多机房？</td>
+<td>多机房，按地域就近接入</td>
+</tr>
+</tbody>
+</table>
+<p>其中"弹幕能不能丢"是整道题的分水岭——它直接决定了系统走"可靠消息队列"还是"尽力而为的流式广播"。</p>
+<h3 id="弹幕不是-im是高频短命的广播流">弹幕不是 IM，是"高频短命的广播流"</h3>
+<p>很多同学会下意识套用 IM 的思路，这是方向性错误。弹幕和微信消息完全是两个物种：</p>
+<ul>
+<li><strong>写扩散比极高</strong>：万人直播间里，一条弹幕的读扩散比是 1 : 10000，而 IM 是点对点；</li>
+<li><strong>生命周期极短</strong>：一条弹幕的价值窗口通常只有 3~5 秒，过了这个窗口再到达，用户根本感知不到；</li>
+<li><strong>流量是脉冲式的</strong>：平时几千 QPS，进球、明星出场、主播喊口号的瞬间，几秒内暴增几十倍。</li>
+</ul>
+<p>所以设计的第一原则不是"把所有消息可靠地存下来"，而是：<strong>在百毫秒内把当前屏幕该看到的弹幕送到，过期的该丢就丢。</strong></p>
+<h3 id="真正的难点扇出爆炸">真正的难点：扇出爆炸</h3>
+<p>来算一笔让人头皮发麻的账：</p>
+<pre><code class="language-text">写入：10 万 QPS 弹幕
+下发：10 万 QPS × 100 万在线 = 100 亿次/秒  ❌ 物理上不可能
+</code></pre>
+<p><strong>一句话戳破本质：弹幕系统的核心矛盾不是"写不写得进"，而是"扇出降不降得下来"。</strong> 海量写入、实时分发、低成本存储，三者不可兼得，必须分层取舍。</p>
+<p>后面所有的设计决策，都从这句话推导出来。</p>
+<h2 id="二整体架构五层各司其职">二、整体架构：五层各司其职</h2>
+<p>围绕"写入削峰、分发降量"八个字，系统拆成五层，全链路异步化，每层独立水平扩容：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261020100704316-874307177.png" class="lazyload"></p>
+<p>每层的职责边界划得很干净：</p>
+<ul>
+<li><strong>接入层只管长连接保活</strong>，不碰复杂业务；</li>
+<li><strong>业务层只管校验过滤</strong>，无状态随便扩容；</li>
+<li><strong>分发层只管消息路由推送</strong>；</li>
+<li><strong>存储层冷热分离</strong>，热数据扛并发，冷数据省成本。</li>
+</ul>
+<p>这样拆的好处是故障隔离性强：业务层挂了连接不断，某个房间炸了不影响全平台，哪层不够就扩哪层。</p>
+<h3 id="一个最容易踩的坑kafka-消费组">一个最容易踩的坑：Kafka 消费组</h3>
+<p>这里埋一个面试和实战中都极容易翻车的点：</p>
+<blockquote>
+<p><strong>如果每个网关节点用同一个 consumer group 消费 Kafka，分区会被负载均衡给不同节点，一条弹幕只会被一个节点消费——其他节点上的用户就收不到弹幕了。</strong></p>
+<p>正确姿势是：每个网关节点用<strong>独立的 consumer group</strong>（或者直接 <code>assign</code> 全部分区），实现"广播语义"，保证消息到达所有持有该房间连接的节点。</p>
+</blockquote>
+<p>类似的选型问题还有一个高频追问：<strong>为什么用 Kafka 而不是 Redis Pub/Sub？</strong> 答案很直接——Pub/Sub 无持久化、无削峰能力，断线就丢消息；Kafka 有堆积能力，洪峰时消费端可以"慢慢追"，天然削峰填谷。</p>
+<p>那 MQ 能不能直接把消息推给客户端？也不行。MQ 是面向存储与可靠的，不擅长百万长连接的扇出和协议处理。<strong>Kafka 负责跨节点可靠广播，网关负责最后一公里的聚合投递</strong>，各司其职。</p>
+<p>架构骨架搭好了，接下来从接入层开始，逐层往里拆。</p>
+<h2 id="三接入层百万长连接怎么扛">三、接入层：百万长连接怎么扛</h2>
+<p>百万用户在线 = 百万条 TCP 连接。Tomcat 这种一连接一线程的模型直接出局，必须上 Netty + WebSocket。</p>
+<h3 id="选型为什么是-netty而不是-spring-websocket">选型：为什么是 Netty，而不是 Spring WebSocket</h3>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>Netty</th>
+<th>Spring WebSocket</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单机连接数</td>
+<td>调优后轻松 10 万+</td>
+<td>默认配置 1 万都费劲</td>
+</tr>
+<tr>
+<td>协议自定义</td>
+<td>编解码器完全可控</td>
+<td>封装太重，定制困难</td>
+</tr>
+<tr>
+<td>内存调优</td>
+<td>堆外池化内存随便调</td>
+<td>不方便</td>
+</tr>
+<tr>
+<td>心跳/空闲检测</td>
+<td>原生 <code>IdleStateHandler</code></td>
+<td>支持较弱</td>
+</tr>
+</tbody>
+</table>
+<h3 id="网关启动配置几个参数调对了才能扛量">网关启动配置：几个参数调对了才能扛量</h3>
+<pre><code class="language-java">public class DanmakuGateway {
+
+    public void start(int port) throws InterruptedException {
+        // boss 只负责 accept，worker 负责读写，主从 Reactor 互不阻塞
+        EventLoopGroup boss = new NioEventLoopGroup(1);
+        EventLoopGroup worker = new NioEventLoopGroup(
+                Runtime.getRuntime().availableProcessors() * 2);
+
+        new ServerBootstrap()
+            .group(boss, worker)
+            .channel(NioServerSocketChannel.class)   // Linux 上换 EpollServerSocketChannel
+            .option(ChannelOption.SO_BACKLOG, 2048)
+            .childOption(ChannelOption.TCP_NODELAY, true)    // 关闭 Nagle，低延迟
+            .childOption(ChannelOption.SO_KEEPALIVE, true)
+            .childOption(ChannelOption.SO_RCVBUF, 32 * 1024)
+            .childOption(ChannelOption.SO_SNDBUF, 32 * 1024)
+            // 堆外池化内存：减少 GC、转发时避免内核态/用户态拷贝
+            .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+            .childHandler(new ChannelInitializer&lt;SocketChannel&gt;() {
+                @Override
+                protected void initChannel(SocketChannel ch) {
+                    ChannelPipeline p = ch.pipeline();
+                    p.addLast(new HttpServerCodec());
+                    p.addLast(new HttpObjectAggregator(64 * 1024));
+                    p.addLast(new WebSocketServerProtocolHandler("/danmaku"));
+                    // 读空闲 30s 心跳检测，自动剔除僵尸连接
+                    p.addLast(new IdleStateHandler(30, 60, 0, TimeUnit.SECONDS));
+                    p.addLast(new DanmakuServerHandler());
+                }
+            }).bind(port).sync();
+    }
+}
+</code></pre>
+<p>配置之外，单机扛 10 万+ 连接还需要一整套系统级调优，这些都是踩过坑才知道的：</p>
+<ul>
+<li><strong>文件描述符</strong>：<code>ulimit -n</code> 调到百万级，否则连接数上不去；</li>
+<li><strong>内核参数</strong>：<code>tcp_mem</code>、<code>wmem</code> 调优，不然内存先炸；</li>
+<li><strong>Epoll 模式 + ET 边沿触发</strong>，比 NIO 性能更好；</li>
+<li><strong>自定义二进制协议</strong>：消息头带房间 ID、消息类型，比 JSON 省解析开销，Protobuf 编码比 JSON 体积压缩 60% 以上；</li>
+<li><strong>GC 三件套</strong>：池化堆外内存减少堆内 GC、弹幕对象走对象池复用、所有耗时业务逻辑丢业务线程池——<strong>千万别在 IO 线程做任何重活</strong>。</li>
+</ul>
+<p>网关本身要做<strong>无状态化</strong>（连接信息可重建），这样宕机后客户端能自动重连到其他节点。入口还要做连接维度限流和单机连接数熔断，慢连接及时检测断开。</p>
+<h3 id="冷知识在线人数用-hyperloglog-统计">冷知识：在线人数用 HyperLogLog 统计</h3>
+<p>直播间"10 万+ 人在看"这个数字，千万别用 Set 存——100 万个 userId 要几十 MB 内存。用 Redis 的 <code>HyperLogLog</code>：</p>
+<pre><code class="language-java">// 进房
+redis.opsForHyperLogLog().add("danmu:online:room:" + roomId, userId);
+// 统计：近似值，百万 UV 只占 12KB 内存，误差 &lt; 1%
+Long onlineCount = redis.opsForHyperLogLog().size("danmu:online:room:" + roomId);
+</code></pre>
+<p>12KB 统计百万级 UV，误差不到 1%，用户完全感知不到。这种"用精度换内存"的思路，在高并发场景里到处都是。</p>
+<p>连接扛住了，弹幕消息进来之后该怎么处理？往下看。</p>
+<h2 id="四上行链路三级削峰把洪峰变细流">四、上行链路：三级削峰，把洪峰变细流</h2>
+<p>用户发一条弹幕，网关<strong>既不能同步写库，也不能同步广播</strong>。正确的链路是：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261020100727379-1023457986.png" class="lazyload"></p>
+<p>注意第 ⑤ 步：<strong>校验通过写入 MQ 后接口立即返回，不等下发结果</strong>。前端配合做本地回显——用户看到自己的弹幕"发出去了"，体验无损。哪怕这条弹幕后面被限流丢弃，用户也无感知。这是个很便宜但极其好用的体验优化。</p>
+<h3 id="上行核心代码频控--过滤--保序投递">上行核心代码：频控 → 过滤 → 保序投递</h3>
+<pre><code class="language-java">@Service
+public class DanmakuSendService {
+    @Autowired private RocketMQTemplate rocketMQTemplate;
+    @Autowired private SensitiveWordFilter sensitiveWordFilter;
+    @Autowired private RateLimiterService rateLimiterService;
+
+    public void sendDanmaku(DanmakuDTO dto) {
+        // 1. 频控校验：用户 + 房间双维度，防恶意刷屏
+        if (!rateLimiterService.tryAcquire(dto.getUserId(), dto.getRoomId())) {
+            throw new BusinessException("发送太频繁，请稍后再试");
+        }
+        // 2. DFA 敏感词实时过滤
+        if (sensitiveWordFilter.containsSensitiveWord(dto.getContent())) {
+            throw new BusinessException("内容包含违规词汇");
+        }
+        // 3. 按房间 ID 哈希分区发送，保证同房间消息顺序；失败重试
+        rocketMQTemplate.asyncSendOrderly("danmaku_topic", dto, dto.getRoomId(),
+            new SendCallback() {
+                @Override public void onSuccess(SendResult r) {}
+                @Override public void onException(Throwable e) { retrySend(dto); }
+            });
+    }
+}
+</code></pre>
+<p>（Kafka 还是 RocketMQ 看团队技术栈，思路完全一致：<code>MessageQueueSelector</code> / partition key 按 <code>roomId</code> 哈希。）</p>
+<h3 id="三级削峰光有-mq-还不够">三级削峰：光有 MQ 还不够</h3>
+<p>弹幕峰值每秒几十万条，直接写 MQ 也可能被打懵。工业级的做法是三级削峰：</p>
+<ol>
+<li><strong>网关本地环形缓冲</strong>：先入本地队列，<strong>满了就丢最老的</strong>（背压机制，宁可丢消息也不能阻塞 IO 线程）；</li>
+<li><strong>MQ 按 roomId 分区</strong>：同房间消息进同一分区，既削峰又保序；</li>
+<li><strong>消费端批量聚合</strong>：不是来一条推一条，而是攒够一批再推。</li>
+</ol>
+<p>第一级的本地聚合器是整个写入链路的亮点，直接上代码：</p>
+<pre><code class="language-java">/**
+ * 弹幕本地聚合器（Disruptor 思想）：
+ * 把单条写 Kafka 的 10 万 QPS，聚合成 200 批/秒
+ * 环形数组 + CAS + 批量 flush，全程无锁，近乎零 GC
+ */
+public class DanmakuAggregator {
+    private final DanmakuMsg[] ring = new DanmakuMsg[8192];  // 环形缓冲
+    private final AtomicInteger writeIndex = new AtomicInteger(0);
+    private final AtomicInteger flushedIndex = new AtomicInteger(0);
+    private final KafkaTemplate&lt;String, String&gt; kafka;
+
+    private static final int BATCH = 512;
+    private static final long FLUSH_INTERVAL_MS = 10;
+
+    public boolean offer(DanmakuMsg msg) {
+        while (true) {
+            int idx = writeIndex.get();
+            int next = (idx + 1) &amp; (ring.length - 1);   // 位运算取模
+            if (next == flushedIndex.get()) {           // 满了直接丢，保实时性
+                metrics.increment("danmaku_dropped");
+                return false;
+            }
+            if (writeIndex.compareAndSet(idx, next)) {  // CAS 无锁
+                ring[idx] = msg;
+                return true;
+            }
+        }
+    }
+
+    /** 定时批量 flush：一次网络 IO 发送 512 条 */
+    @Scheduled(fixedDelay = FLUSH_INTERVAL_MS)
+    public void flush() {
+        int end = writeIndex.get();
+        int start = flushedIndex.get();
+        if (end == start) return;
+
+        List&lt;ProducerRecord&lt;String, String&gt;&gt; batch = new ArrayList&lt;&gt;(BATCH);
+        for (int i = start; i != end; i = (i + 1) &amp; (ring.length - 1)) {
+            DanmakuMsg m = ring[i];
+            batch.add(new ProducerRecord&lt;&gt;("danmaku_topic", m.getRoomId(), JsonUtil.write(m)));
+            ring[i] = null;   // 及时置 null，避免跨代引用导致 GC 问题
+        }
+        kafka.send(batch);
+        flushedIndex.set(end);
+    }
+}
+</code></pre>
+<blockquote>
+<p><strong>亮点拆解</strong>：位运算取模、CAS 无锁、满了直接丢保实时性、批量 IO、及时置 null 防 GC 泄漏。面试时把这五个点主动说出来，基本就是加分项。</p>
+</blockquote>
+<h3 id="分区与优先级kafka-的两个关键设计">分区与优先级：Kafka 的两个关键设计</h3>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261020100743099-1308659136.png" class="lazyload"></p>
+<ul>
+<li>按 <code>roomId</code> 哈希分片，同一直播间消息落同一分区，<strong>天然有序</strong>，消费端无需额外排序；</li>
+<li>分区数随流量水平扩容，吞吐线性增长。</li>
+</ul>
+<p>另外，不是所有弹幕都平等。建议按消息类型拆 Topic 分级：</p>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>消息类型</th>
+<th>消费优先级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>danmaku-normal</code></td>
+<td>普通弹幕</td>
+<td>低</td>
+</tr>
+<tr>
+<td><code>danmaku-gift</code></td>
+<td>礼物弹幕</td>
+<td>高</td>
+</tr>
+<tr>
+<td><code>danmaku-system</code></td>
+<td>系统公告</td>
+<td>最高</td>
+</tr>
+</tbody>
+</table>
+<p>高级消息优先消费，确保付费用户体验不受洪峰影响——这是实打实的"成本意识"。</p>
+<p>消费端拿到批量消息后，按房间分组喂给聚合器：</p>
+<pre><code class="language-java">@KafkaListener(topics = "live-danmu",
+        containerFactory = "batchKafkaListenerContainerFactory")
+public void consume(List&lt;ConsumerRecord&lt;String, Danmu&gt;&gt; records) {
+    records.stream()
+           .map(ConsumerRecord::value)
+           .collect(Collectors.groupingBy(Danmu::getRoomId))
+           .forEach((roomId, list) -&gt; list.forEach(aggregator::add));
+}
+</code></pre>
+<h3 id="幂等防重复的最后防线">幂等：防重复的最后防线</h3>
+<p>客户端弱网重发、MQ 重复消费都会产生重复消息。服务端用 Redis 存 <code>弹幕ID + 用户ID</code> 的短时效 Key（5 秒过期）做幂等校验；客户端上行时带 <code>clientMsgId</code>，重复消息直接返回成功，不再入队。</p>
+<p>消息进了 MQ，洪峰算是稳住了。但真正的硬仗才刚开始——这些弹幕怎么送到百万人手上？</p>
+<h2 id="五内容审核dfa-同步拦截--异步模型复审">五、内容审核：DFA 同步拦截 + 异步模型复审</h2>
+<p>弹幕是 UGC 重灾区，审核必须做，但 50 万 QPS 同步调审核模型等于自杀。方案是<strong>两层防线</strong>：</p>
+<h3 id="第一层dfa-本地过滤微秒级">第一层：DFA 本地过滤，微秒级</h3>
+<p>为什么用 DFA（确定有限状态自动机）而不是正则？正则每来一条弹幕都要把所有敏感词全匹配一遍，1000 个词就是 1000 次匹配；DFA 把所有词构建成一棵前缀树，<strong>一次扫描完成，时间复杂度 O(n)，只和文本长度有关，跟敏感词数量无关</strong>。实测比正则快 100 倍以上。</p>
+<pre><code class="language-java">public class SensitiveWordFilter {
+    private final TrieNode root = new TrieNode();
+
+    /** 构建前缀树：逐字符插入，词尾打标 */
+    public void addWord(String word) {
+        TrieNode p = root;
+        for (char c : word.toCharArray()) {
+            p = p.next.computeIfAbsent(c, k -&gt; new TrieNode());
+        }
+        p.end = true;
+    }
+
+    /** 匹配：一次扫描完成；fail 失败指针处理后缀重叠（AC 自动机） */
+    public boolean hit(String text) {
+        TrieNode p = root;
+        for (int i = 0; i &lt; text.length(); i++) {
+            char c = text.charAt(i);
+            while (p != root &amp;&amp; p.next.get(c) == null) p = p.fail;  // 失败指针跳转
+            p = p.next.getOrDefault(c, root);
+            if (p.end) return true;
+        }
+        return false;
+    }
+}
+</code></pre>
+<p>工程上还有三个细节：</p>
+<ul>
+<li><strong>词库全量加载到本地内存</strong>，单条匹配 &lt; 1ms，扛住几十万 QPS 同步过滤；</li>
+<li><strong>后台异步增量更新词库</strong>，热更新无需重启服务；</li>
+<li>流量峰值时启动分级策略：<strong>只匹配高危词库</strong>，普通词库降级为异步审核。</li>
+</ul>
+<h3 id="第二层先发后审--撤回指令">第二层：先发后审 + 撤回指令</h3>
+<p>本地 DFA 只能拦词库里的东西，变体字、阴阳怪气它管不了。所以完整链路是：</p>
+<pre><code class="language-text">DFA 同步拦截(μs) → 弹幕先下发 → Kafka → 异步模型审核(~200ms) → 违规则下发撤回指令 + 账号惩罚
+</code></pre>
+<p>配合内容指纹缓存（相同内容只审一次），审核成本又能降一大截。这套"先发后审"是用极小的违规曝光窗口，换来了全链路不被审核拖慢，是典型的工程权衡。</p>
+<h2 id="六下行分发这道题的胜负手">六、下行分发：这道题的胜负手</h2>
+<p>前面说过，扇出才是核心矛盾。这一章是全文最硬核的部分，也是面试和实战中最能拉开差距的地方。</p>
+<h3 id="61-分层扇出从-100-万次网络调用到-100-次">6.1 分层扇出：从 100 万次网络调用到 100 次</h3>
+<p>先看朴素方案错在哪：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261020100758012-1154271531.png" class="lazyload"></p>
+<p>关键思路是三级降压：</p>
+<ol>
+<li><strong>节点级扇出</strong>：消息只投递到"持有该房间观众连接的网关节点"（100 个节点，而不是 100 万个连接）；</li>
+<li><strong>本地房间表</strong>：网关内存维护 <code>roomId → 本地 Channel 集合</code>，精准投递而非全量扫描；</li>
+<li><strong>时间窗聚合</strong>：一个窗口内的弹幕合并成一个包发出，系统调用数降低 1~2 个数量级。</li>
+</ol>
+<p>网络开销从 100 万次降到 100 次，<strong>下降 4 个数量级</strong>。</p>
+<h3 id="62-房间路由先回答推给谁">6.2 房间路由：先回答"推给谁"</h3>
+<p>弹幕是房间内广播，不是全局广播，所以必须有一张路由表。两种模式都常见：</p>
+<p><strong>模式 A：网关直接消费</strong>。每个网关节点独立消费组订阅 MQ，消息广播到所有节点，节点查本地房间表决定是否下发。链路最短，延迟最低。</p>
+<p><strong>模式 B：独立分发服务</strong>。分发服务消费 MQ，查 Redis 路由表，把消息推给对应网关。路由表的典型结构：</p>
+<pre><code class="language-text">room:1001:gateways = [gateway-1, gateway-2, gateway-7]   # 正向：房间在哪些网关
+gateway:gateway-1:rooms = [1001, 2003, ...]              # 反向：网关持有哪些房间
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>网关直接消费</th>
+<th>独立分发服务</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>链路延迟</td>
+<td>最短</td>
+<td>多一跳</td>
+</tr>
+<tr>
+<td>路由复杂度</td>
+<td>无需路由表</td>
+<td>需维护路由表 + 心跳续期</td>
+</tr>
+<tr>
+<td>灵活性</td>
+<td>消费逻辑耦合在网关</td>
+<td>分发策略可独立演进</td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>网关数量可控</td>
+<td>网关极多、需集中调度</td>
+</tr>
+</tbody>
+</table>
+<p>路由表有几个容易忽略的运维细节：<strong>心跳续期 + TTL</strong>（防止网关宕机后路由残留）、网关上下线事件同步、反向索引便于节点下线时快速清理。</p>
+<p>而网关本地房间表，是精准投递的基石：</p>
+<pre><code class="language-java">@Component
+public class RoomRegistry {
+    /** roomId -&gt; 本机该房间的连接集合 */
+    private final ConcurrentHashMap&lt;Long, Set&lt;Channel&gt;&gt; roomChannels = new ConcurrentHashMap&lt;&gt;();
+
+    public void join(long roomId, Channel ch) {
+        roomChannels.computeIfAbsent(roomId, k -&gt; ConcurrentHashMap.newKeySet()).add(ch);
+        // 本机首次有人进这个房间 -&gt; 订阅该房间，避免无效扇出
+        MqSubscriber.subscribeIfAbsent(roomId);
+    }
+
+    public void leave(long roomId, Channel ch) {
+        Set&lt;Channel&gt; set = roomChannels.get(roomId);
+        if (set == null) return;
+        set.remove(ch);
+        // 空房间必须移除，否则百万房间累积 -&gt; 内存泄漏
+        // CAS 双参删除，避免并发下误删新加入的连接集合
+        if (set.isEmpty()) {
+            roomChannels.remove(roomId, set);
+            MqSubscriber.unsubscribe(roomId);
+        }
+    }
+
+    public Set&lt;Channel&gt; localViewers(long roomId) {
+        return roomChannels.getOrDefault(roomId, Collections.emptySet());
+    }
+}
+</code></pre>
+<blockquote>
+<p><strong>亮点</strong>：<code>remove(roomId, set)</code> 这个 CAS 双参删除，防的是"判断为空"和"删除"之间恰好有新连接加入导致误删的并发问题；空房间及时移除 + 取消订阅，防内存泄漏和无效扇出。这两个细节，没踩过坑的人写不出来。</p>
+</blockquote>
+<p>连接集合也可以用 Netty 的 <code>DefaultChannelGroup</code> 管理，配合 <code>closeFuture()</code> 监听自动清理断开的连接。但注意：<strong>百万连接下更推荐 <code>ConcurrentHashMap.newKeySet()</code> 或分片 Set</strong>，<code>CopyOnWriteArraySet</code> 在写多的场景会有复制开销。</p>
+<h3 id="63-批量聚合整个系统最核心的一段代码">6.3 批量聚合：整个系统最核心的一段代码</h3>
+<p>很多方案写到 <code>channelGroup.writeAndFlush(msg)</code> 就交卷了，但 <code>DefaultChannelGroup</code> 的 <code>writeAndFlush</code> 是<strong>同步遍历所有 channel 逐个写入</strong>——在线超过 5000、弹幕频率一高，IO 线程直接阻塞，EventLoop 积压到抛 <code>RejectedExecutionException</code>。</p>
+<p>正确的聚合下发器长这样：</p>
+<pre><code class="language-java">/**
+ * 弹幕聚合下发：把时间窗内的弹幕合并成 1 次 write
+ * 三大亮点：
+ *   ① 脏连接队列 —— 只遍历"有数据"的连接，百万连接下从 O(总连接) 降到 O(活跃数)
+ *   ② MPSC 无锁入队 —— 业务线程不加锁（jctools 单消费者队列）
+ *   ③ 背压感知 —— 慢客户端直接丢弃，绝不拖垮服务端
+ */
+public class DanmuFlusher {
+    static final AttributeKey&lt;MpscArrayQueue&lt;Danmu&gt;&gt; QUEUE = AttributeKey.valueOf("dq");
+    static final AttributeKey&lt;AtomicBoolean&gt; DIRTY = AttributeKey.valueOf("dirty");
+    private static final int MAX_BATCH = 64;
+
+    private final ConcurrentLinkedQueue&lt;Channel&gt; dirtyQueue = new ConcurrentLinkedQueue&lt;&gt;();
+
+    /** 入队 O(1)；队列满则丢——弹幕允许丢，绝不能 OOM */
+    public boolean offer(Channel ch, Danmu d) {
+        MpscArrayQueue&lt;Danmu&gt; q = ch.attr(QUEUE).get();
+        if (!q.offer(d)) return false;
+        // CAS 保证同一连接在脏队列中只出现一次
+        if (ch.attr(DIRTY).get().compareAndSet(false, true)) {
+            dirtyQueue.offer(ch);
+        }
+        return true;
+    }
+
+    /** 每 30ms flush 一次 */
+    @Scheduled(fixedDelay = 30)
+    public void flush() {
+        Channel ch;
+        while ((ch = dirtyQueue.poll()) != null) {
+            ch.attr(DIRTY).get().set(false);
+            if (!ch.isActive()) continue;
+
+            // 背压：TCP 发送缓冲区积压 = 客户端慢/弱网 -&gt; 清空队列保命
+            if (!ch.isWritable()) {
+                ch.attr(QUEUE).get().clear();
+                continue;
+            }
+            List&lt;Danmu&gt; batch = new ArrayList&lt;&gt;(MAX_BATCH);
+            ch.attr(QUEUE).get().drain(batch::add, MAX_BATCH);
+            if (!batch.isEmpty()) {
+                // 1 次 syscall 发 N 条：Protobuf 批量编码
+                ch.writeAndFlush(new BinaryWebSocketFrame(
+                        Unpooled.wrappedBuffer(Codec.encode(batch))));
+            }
+        }
+    }
+}
+</code></pre>
+<p><strong>窗口时间怎么选？</strong> 10ms、30ms、100ms 都有人用。人眼对 100ms 以内的延迟基本无感，所以窗口开到 100ms 体验都还能接受；窗口越大，聚合效果越好。一般小房间 10~30ms 保体验，热点房间拉到 100ms 甚至更长保吞吐。也可以用 <code>HashedWheelTimer</code> 做时间轮触发，配合 <code>AtomicBoolean</code> CAS 防止重复调度：</p>
+<pre><code class="language-java">private final HashedWheelTimer mergeTimer = new HashedWheelTimer(10, TimeUnit.MILLISECONDS, 512);
+private final ConcurrentLinkedQueue&lt;DanmakuMsg&gt; pendingQueue = new ConcurrentLinkedQueue&lt;&gt;();
+private final AtomicBoolean flushScheduled = new AtomicBoolean(false);
+
+public void onDanmakuReceived(DanmakuMsg msg) {
+    pendingQueue.offer(msg);
+    // 每个窗口只提交一次 flush 任务
+    if (flushScheduled.compareAndSet(false, true)) {
+        mergeTimer.newTimeout(t -&gt; flushBatch(), 10, TimeUnit.MILLISECONDS);
+    }
+}
+</code></pre>
+<p>聚合带来的收益是数量级的：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>朴素逐条推</th>
+<th>聚合下发</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>write 次数/秒</td>
+<td>千亿级</td>
+<td>~1000 万</td>
+</tr>
+<tr>
+<td>单条网络开销</td>
+<td>每条独占 TCP 头 + 帧头</td>
+<td>N 条共用一个包头</td>
+</tr>
+<tr>
+<td>服务端 CPU</td>
+<td>sys 态打满</td>
+<td>下降 70%+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="64-写入保序与字节复用两个教科书写法">6.4 写入保序与字节复用：两个教科书写法</h3>
+<p>Netty 只保证<strong>单个 channel 内</strong>写入有序，多个业务线程并发调 <code>channel.write()</code> 顺序就乱了。解法是强制所有写入走该 channel 所属的 EventLoop，天然串行：</p>
+<pre><code class="language-java">public void safeBroadcast(Channel ch, ByteBuf payload) {
+    ch.eventLoop().submit(() -&gt; {
+        if (!ch.isActive()) return;
+        ch.writeAndFlush(new BinaryWebSocketFrame(payload));
+    });
+}
+</code></pre>
+<p>另一个是<strong>一次编码、百万人共享</strong>：同一批弹幕只序列化一次，所有连接复用同一份字节，用引用计数控制生命周期：</p>
+<pre><code class="language-java">public void push(Long roomId, DanmakuMsg msg) {
+    Set&lt;Channel&gt; channels = roomChannels.get(roomId);
+    if (channels == null) return;
+
+    ByteBuf buf = encode(msg);   // 只编码一次，百万人共享同一份字节
+    for (Channel ch : channels) {
+        if (ch.isWritable()) {
+            ch.writeAndFlush(buf.duplicate().retain());   // 引用计数复用
+        } else {
+            metrics.increment("slow_client");
+            if (ch.bytesBeforeUnwritable() == 0) {
+                ch.close();   // 宁可踢掉一人，不拖垮一个房间
+            }
+        }
+    }
+    buf.release();
+}
+</code></pre>
+<p>写广播时还可以用 <code>voidPromise()</code> 替代默认 promise，省掉 listener 对象分配的开销。这些细节单个看不起眼，叠加起来就是 70% 的 CPU。</p>
+<h3 id="65-推拉结合不要无脑对所有房间写扩散">6.5 推拉结合：不要无脑对所有房间写扩散</h3>
+<p>纯推模式在超大房间会遇到物理瓶颈：一条弹幕复制 N 份写出去，CPU 和带宽随在线数线性增长。工业界按房间规模分级处理：</p>
+<table>
+<thead>
+<tr>
+<th>房间规模</th>
+<th>策略</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>小房间（&lt; 5 万在线）</td>
+<td>纯推，WebSocket 直接广播</td>
+<td>延迟最低，实现简单</td>
+</tr>
+<tr>
+<td>中大房间</td>
+<td>批量推送 + 客户端定时拉取补偿</td>
+<td>平衡延迟与扇出成本</td>
+</tr>
+<tr>
+<td>超大房间（10 万+）</td>
+<td>推 offset 指针 + 客户端拉消息体</td>
+<td>O(N) 广播变 O(1) 指针推送</td>
+</tr>
+</tbody>
+</table>
+<p>超大房间的"推信号、拉消息体"是这样的：</p>
+<pre><code class="language-java">// 网关只推 offset 指针，不推全量弹幕
+public void pushOffsetSignal(String roomId, long latestOffset) {
+    OffsetSignal signal = OffsetSignal.newBuilder()
+            .setRoomId(roomId)
+            .setOffset(latestOffset)
+            .build();
+    roomChannels.get(roomId).writeAndFlush(
+            new BinaryWebSocketFrame(Unpooled.wrappedBuffer(signal.toByteArray())));
+}
+// 客户端收到信号后按需拉取：
+// GET /danmaku/pull?roomId=1001&amp;sinceSeq=10234&amp;limit=50
+</code></pre>
+<p>即使 50 万人在线，网关每秒也只需推几十个 offset 信号，真正的消息体由客户端自己拉——带宽和 CPU 都从 O(N) 降到 O(1)。</p>
+<p>拉取接口直接打在 Redis 上，服务端<strong>不维护任何客户端进度</strong>，天然无状态、可水平扩展：</p>
+<pre><code class="language-java">/**
+ * 断线补漏 / 增量拉取
+ * Redis ZSet 按 seq 存最近 5 分钟弹幕，O(logN) 范围查询
+ */
+@GetMapping("/danmaku/pull")
+public List&lt;DanmakuMsg&gt; pull(@RequestParam Long roomId,
+                             @RequestParam Long sinceSeq,
+                             @RequestParam(defaultValue = "200") int limit) {
+    return redis.opsForZSet()
+                .rangeByScore("dm:buf:" + roomId, sinceSeq + 1, "+inf", 0, limit)
+                .stream().map(JsonUtil::read).toList();
+}
+</code></pre>
+<p>新进直播间的用户也走这套：直接从 Redis 拉最近的热弹幕，100ms 内完成画面补全，不用查历史库。热弹幕缓存的维护：</p>
+<pre><code class="language-java">@Service
+public class DanmakuCacheService {
+    @Resource private StringRedisTemplate redisTemplate;
+
+    private static final int MAX_HOT_COUNT = 1000;   // 单房间最多 1000 条热弹幕
+    private static final int MAX_FETCH_COUNT = 50;   // 单次最多拉 50 条，控制前端渲染压力
+
+    /** 增量拉取：客户端传上次拉到的位置 */
+    public List&lt;DanmakuVO&gt; fetchIncrementDanmaku(String roomId, long lastIndex) {
+        String key = "danmaku:hot:" + roomId;
+        Long totalLen = redisTemplate.opsForList().size(key);
+        if (totalLen == null || totalLen &lt;= lastIndex) {
+            return Collections.emptyList();
+        }
+        long endIndex = Math.min(lastIndex + MAX_FETCH_COUNT - 1, totalLen - 1);
+        return redisTemplate.opsForList().range(key, lastIndex, endIndex).stream()
+                .map(json -&gt; JSON.parseObject(json, DanmakuVO.class))
+                .collect(Collectors.toList());
+    }
+
+    /** 写入热缓存：rightPush + trim 固定长度，内存占用恒定 */
+    public void addHotDanmaku(String roomId, DanmakuVO danmaku) {
+        String key = "danmaku:hot:" + roomId;
+        redisTemplate.opsForList().rightPush(key, JSON.toJSONString(danmaku));
+        redisTemplate.opsForList().trim(key, -MAX_HOT_COUNT, -1);
+    }
+}
+</code></pre>
+<blockquote>
+<p><strong>亮点</strong>：<code>LPUSH/LTRIM</code>（或 <code>rightPush + trim</code>）把 Redis 变成一个定长环形缓冲，热数据内存恒定不膨胀；拉取接口无状态，集群随便加机器。轮询间隔按房间热度调，200ms~2s 都可以。</p>
+</blockquote>
+<p>到这里，"怎么推"讲完了。但还有两个问题悬着：弹幕乱了怎么办？礼物消息丢了怎么办？</p>
+<h2 id="七顺序去重与分级可靠">七、顺序、去重与分级可靠</h2>
+<h3 id="71-房间维度的单调-seq一石三鸟">7.1 房间维度的单调 seq：一石三鸟</h3>
+<p>给每条弹幕发一个房间维度单调递增的序列号，能同时解决三件事：<strong>客户端按 seq 排序渲染</strong>（不依赖到达顺序，网络轻微乱序无感知）、<strong>断线重连按 seq 去重补帧</strong>、<strong>推拉结合按 seq 补漏</strong>。</p>
+<p>发号器推荐号段模式，批量借号，把 Redis 的 QPS 降 1000 倍：</p>
+<pre><code class="language-java">/**
+ * 房间维度递增 seq：批量借号段（1000 个/次），
+ * 避免每条弹幕都打一次 Redis
+ */
+public class SegmentSeqGenerator {
+    private final ConcurrentHashMap&lt;Long, long[]&gt; roomSeg = new ConcurrentHashMap&lt;&gt;();
+    private final StringRedisTemplate redis;
+
+    public long next(long roomId) {
+        long[] seg = roomSeg.computeIfAbsent(roomId, k -&gt; new long[]{0, 0}); // {cursor, end}
+        long cur = ++seg[0];
+        if (cur &gt;= seg[1]) {
+            synchronized (seg) {                    // 只锁单个房间，粒度极细
+                if (cur &gt;= seg[1]) {
+                    long end = redis.opsForValue().increment("seq:" + roomId, 1000);
+                    seg[0] = end - 1000;
+                    seg[1] = end;
+                }
+            }
+            cur = ++seg[0];
+        }
+        return cur;
+    }
+}
+</code></pre>
+<p>（也可以用简化版 Snowflake：<code>时间戳 &lt;&lt; 22 | 机器位 | 序列</code>，好处是去中心化，坏处是跨机器不严格连续，按场景选。）</p>
+<p>顺序性上还有一个容易被忽略的点：多节点并发下发时，消费端可以按 <code>serverTime + seq</code> 做归并（小顶堆），保证合流后依然有序；同一房间统一 seq 体系，Web / App / TV 多端各自按 seq 补拉，天然对齐。</p>
+<h3 id="72-去重服务端幂等--客户端幂等窗口">7.2 去重：服务端幂等 + 客户端幂等窗口</h3>
+<p>重复投递的来源很多：网络重试、ACK 超时重发、MQ 重复消费。对策是双保险——服务端 <code>clientMsgId</code> 幂等（前面讲过），客户端按 <code>msgId / seq</code> 维护一个去重窗口，重复到达的直接丢弃。</p>
+<h3 id="73-分级可靠普通弹幕尽力而为礼物一条不能丢">7.3 分级可靠：普通弹幕尽力而为，礼物一条不能丢</h3>
+<p>普通文本弹幕可以"尽力而为"，但礼物、系统通知、付费弹幕必须不丢不重。让它们走独立的可靠通道，核心组合是 <strong>Redis Stream 的 Consumer Group + ACK + 客户端 seq 去重</strong>：</p>
+<pre><code class="language-text">Producer → XADD stream:room:1001 * uid 20345 content "666" ts ...
+Consumer → XREADGROUP GROUP live CONSUMER gateway-1 COUNT 50 BLOCK 2000
+           STREAMS stream:room:1001 &gt;
+成功     → XACK stream:room:1001 live &lt;msgId&gt;
+失败     → XCLAIM 转移 / 延迟重试，pending 消息不丢
+</code></pre>
+<p>Redis Stream 的 ID 本身是"毫秒时间戳 + 序号"，单 Stream 内天然递增有序。这套"<strong>确认 + 重试 + 幂等</strong>"是可靠投递的标准三件套。</p>
+<p>消息的优先级分级建议直接固化成表：</p>
+<table>
+<thead>
+<tr>
+<th>消息类型</th>
+<th>优先级</th>
+<th>处理策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>系统公告</td>
+<td>P0</td>
+<td>永不丢弃，可靠通道</td>
+</tr>
+<tr>
+<td>礼物 / 上舰</td>
+<td>P0</td>
+<td>永不丢弃，可靠通道</td>
+</tr>
+<tr>
+<td>房管 / 主播发言</td>
+<td>P0~P1</td>
+<td>优先保障</td>
+</tr>
+<tr>
+<td>付费 / 等级用户弹幕</td>
+<td>P1</td>
+<td>高权重保留</td>
+</tr>
+<tr>
+<td>普通用户弹幕</td>
+<td>P2</td>
+<td>采样下发</td>
+</tr>
+<tr>
+<td>点赞 / 进场动画 / 重复刷屏</td>
+<td>P3</td>
+<td>带宽紧张时优先丢</td>
+</tr>
+</tbody>
+</table>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261020100827241-2067471222.png" class="lazyload"></p>
+<p>知道"普通弹幕和礼物走不同的可靠性等级"，说明你有分级保障的成本意识——这一点在面试里是明确的加分项。</p>
+<h2 id="八限流与降级系统的保命符">八、限流与降级：系统的保命符</h2>
+<p>写这篇的时候我反复想强调一句话：<strong>降级预案是架构的一部分，不是出事后的补救。</strong> 弹幕系统的稳定性，一半靠正常链路的设计，另一半靠极端场景下"优雅地丢东西"。</p>
+<h3 id="81-四层限流从用户到集群">8.1 四层限流：从用户到集群</h3>
+<table>
+<thead>
+<tr>
+<th>限流层级</th>
+<th>限流维度</th>
+<th>典型阈值</th>
+<th>降级策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用户级</td>
+<td>单用户发送频率</td>
+<td>5 条/10 秒</td>
+<td>返回"发送太快了"</td>
+</tr>
+<tr>
+<td>房间级</td>
+<td>单房间总 QPS</td>
+<td>按直播间热度动态调整</td>
+<td>丢弃低优先级弹幕</td>
+</tr>
+<tr>
+<td>网关级</td>
+<td>单机总连接数</td>
+<td>10 万/台</td>
+<td>新连接排队或返回"系统繁忙"</td>
+</tr>
+<tr>
+<td>全局级</td>
+<td>集群总 QPS</td>
+<td>按压测结果设定</td>
+<td>非核心接口降级，只保弹幕通路</td>
+</tr>
+</tbody>
+</table>
+<p>用户级限流推荐 <strong>Redis ZSet + Lua 滑动窗口</strong>，毫秒级精度，原子执行：</p>
+<pre><code class="language-lua">-- KEYS[1]: danmaku:limit:{roomId}:{userId}
+-- ARGV: now(毫秒), window(窗口毫秒), max(上限)
+local key    = KEYS[1]
+local now    = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local max    = tonumber(ARGV[3])
+
+-- 清理窗口外的过期数据
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+
+if count &lt; max then
+    -- 写入当前请求，随机后缀避免同毫秒 member 冲突
+    redis.call('ZADD', key, now, now .. ':' .. math.random(100000))
+    redis.call('PEXPIRE', key, window)
+    return 1    -- 放行
+end
+return 0        -- 限流
+</code></pre>
+<p>三种常见限流算法的取舍，一张表说清：</p>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>优点</th>
+<th>缺点</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>固定窗口（INCR + EXPIRE）</td>
+<td>实现最简单</td>
+<td>窗口边界有突刺</td>
+<td>粗粒度房间级统计</td>
+</tr>
+<tr>
+<td>滑动窗口（ZSet + Lua）</td>
+<td>毫秒级精准，无边界突刺</td>
+<td>内存略高</td>
+<td>用户级频控（推荐）</td>
+</tr>
+<tr>
+<td>令牌桶</td>
+<td>允许一定突发流量</td>
+<td>实现稍复杂</td>
+<td>网关入口平滑限流</td>
+</tr>
+</tbody>
+</table>
+<p>令牌桶可以用 Redis Lua 原子实现（Hash 存 <code>tk/ts</code>，按时间补令牌），也可以在网关本地做 JVM 版预限流，把明显超频的请求在入口就丢掉，连 Redis 都不用打：</p>
+<pre><code class="language-java">// 网关本地令牌桶：超频弹幕直接丢，用户无感知
+public class TokenBucket {
+    private final int capacity = 5;       // 桶容量
+    private final double rate = 1.0;      // 每秒补 1 个令牌
+    private long tokens = capacity;
+    private long lastRefill = System.currentTimeMillis();
+
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        tokens = Math.min(capacity, tokens + (long) ((now - lastRefill) * rate / 1000));
+        lastRefill = now;
+        if (tokens &gt; 0) { tokens--; return true; }
+        return false;
+    }
+}
+</code></pre>
+<p>顺带一个体验细节：被限流的弹幕，服务端丢弃的同时前端保持"已发送"的本地回显——用户爽了，系统也没压力，双赢。</p>
+<h3 id="82-热度采样百万房间的救命稻草">8.2 热度采样：百万房间的救命稻草</h3>
+<p>热门房间不可能给每个人全量下发，带宽不允许。按房间热度做采样，关键是<strong>稳定分桶</strong>——同一个用户始终看同一个桶的弹幕，画面不会忽闪忽现：</p>
+<pre><code class="language-java">/** 稳定分桶：用户只收到属于自己桶的弹幕 */
+public boolean shouldDeliver(Danmu d, long uid, int sampleRate) {
+    if (d.priority() &gt;= PRIORITY_GIFT) return true;   // 礼物/舰长/主播：永不丢弃
+    if (sampleRate &lt;= 1) return true;                 // 小房间全量
+    return (d.seq() % sampleRate) == ((uid &amp; 0x7FFF_FFFF) % sampleRate);
+}
+
+/** 房间热度 -&gt; 采样率（房间服务定时计算，推送到各节点本地缓存） */
+static int sampleRate(long viewers) {
+    if (viewers &lt; 1_000)   return 1;    // 小房间：全量，聊天氛围最重要
+    if (viewers &lt; 10_000)  return 2;
+    if (viewers &lt; 100_000) return 5;
+    return 20;                          // 百万房间：1/20，反正用户也看不过来
+}
+</code></pre>
+<p>客户端也可以配合做采样展示（比如每秒最多渲染 20 条），服务端和客户端两头一起削。</p>
+<h3 id="83-加权采样既控量又保付费体验">8.3 加权采样：既控量，又保付费体验</h3>
+<p>峰值场景下单房间每秒上万条弹幕，屏幕根本展示不完。服务端按 100ms 窗口做加权随机采样，把下游流量压到原来的 1/10：</p>
+<pre><code class="language-java">/**
+ * 100ms 窗口加权采样：
+ * 高等级弹幕 100% 保底，普通弹幕按权重抽样，总量控制在 maxCount
+ */
+public List&lt;Danmaku&gt; weightSampling(List&lt;Danmaku&gt; list, int maxCount) {
+    if (list.size() &lt;= maxCount) return list;
+
+    Map&lt;Integer, Integer&gt; levelWeight = Map.of(
+        0, 1,     // 普通用户
+        1, 5,     // 贵族用户
+        2, 20,    // 礼物弹幕
+        3, 100    // 系统公告
+    );
+
+    List&lt;Danmaku&gt; result = new ArrayList&lt;&gt;(maxCount);
+    List&lt;Danmaku&gt; normalPool = new ArrayList&lt;&gt;();
+    for (Danmaku d : list) {
+        if (d.getLevel() &gt;= 2) result.add(d);   // 高优先级 100% 保留
+        else normalPool.add(d);
+    }
+
+    int remainSlot = maxCount - result.size();
+    int totalWeight = normalPool.stream()
+            .mapToInt(d -&gt; levelWeight.getOrDefault(d.getLevel(), 1)).sum();
+    Random random = new Random();
+    for (int i = 0; i &lt; remainSlot &amp;&amp; !normalPool.isEmpty(); i++) {
+        int rand = random.nextInt(totalWeight);
+        int acc = 0;
+        Iterator&lt;Danmaku&gt; it = normalPool.iterator();
+        while (it.hasNext()) {
+            Danmaku d = it.next();
+            int w = levelWeight.getOrDefault(d.getLevel(), 1);
+            acc += w;
+            if (acc &gt; rand) {
+                result.add(d);
+                totalWeight -= w;
+                it.remove();
+                break;
+            }
+        }
+    }
+    return result;
+}
+</code></pre>
+<blockquote>
+<p><strong>亮点</strong>：分层保底（礼物、公告 100% 保留，不伤付费体验）+ 加权随机（严格控制输出数量，又保证高等级用户曝光权重）+ 100ms 批量窗口（降低 CPU 计算频次）。</p>
+</blockquote>
+<p>还有个顺手的优化：热点重复弹幕合并。万人刷"666"的时候，与其推一万条，不如合并成"666 x82"，前端一次渲染，氛围还在，流量没了。</p>
+<h3 id="84-多级降级与故障兜底">8.4 多级降级与故障兜底</h3>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261020100844545-1915855128.png" class="lazyload"></p>
+<p>功能降级按压力分级执行：</p>
+<ul>
+<li><strong>L1</strong>：聚合窗口从 30ms 拉到 100ms~3s，牺牲少量延迟换吞吐；</li>
+<li><strong>L2</strong>：采样下发，只推 10%~20% 的普通弹幕；</li>
+<li><strong>L3</strong>：客户端关闭弹幕通道，只收礼物和系统消息；</li>
+<li><strong>负载 &gt; 80%</strong>：关闭弹幕特效、历史弹幕查询等非核心功能。</li>
+</ul>
+<p>故障兜底预案也要提前写好：</p>
+<table>
+<thead>
+<tr>
+<th>故障场景</th>
+<th>兜底方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Redis 故障</td>
+<td>网关直接透传弹幕，降级为纯实时分发，暂不缓存、不落库</td>
+</tr>
+<tr>
+<td>MQ 积压</td>
+<td>临时扩容消费组，或直接丢弃低优先级弹幕保核心链路</td>
+</tr>
+<tr>
+<td>单机房故障</td>
+<td>多机房多活，直播间按地域调度到就近机房，自动切流</td>
+</tr>
+<tr>
+<td>网关宕机</td>
+<td>网关无状态水平扩展，客户端指数退避重连到其他节点</td>
+</tr>
+</tbody>
+</table>
+<p>说到重连，还有个必须防的坑：<strong>重连风暴</strong>。网关一宕机，百万连接同时重连，能把新集群直接打垮。客户端必须做<strong>指数退避 + 随机抖动（jitter）</strong>；网关下线要走优雅下线流程——先摘流量，等存量连接迁移完再停进程。</p>
+<p>写到这里，系统的"攻"和"防"都齐了。最后聊聊数据怎么存。</p>
+<h2 id="九存储层热数据要快冷数据要省">九、存储层：热数据要快，冷数据要省</h2>
+<p>弹幕每天几十亿条，<strong>千万别直接写 MySQL</strong>。冷热分离是唯一出路：</p>
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/739056/202610/739056-20261020100900367-1290401301.png" class="lazyload"></p>
+<table>
+<thead>
+<tr>
+<th>数据类型</th>
+<th>存储选型</th>
+<th>核心作用</th>
+<th>设计考量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>热弹幕（最近 5 分钟）</td>
+<td>Redis List / Stream</td>
+<td>进房拉取、增量轮询、断线补齐</td>
+<td>定长环形缓冲，单房间 200~1000 条</td>
+</tr>
+<tr>
+<td>历史弹幕</td>
+<td>ClickHouse</td>
+<td>回放、数据分析、弹幕报表</td>
+<td>列存压缩比高，查询毫秒级</td>
+</tr>
+<tr>
+<td>历史弹幕（回放索引）</td>
+<td>HBase</td>
+<td>按"房间ID+时间戳"行键 + 二级索引</td>
+<td>任意时间段回放加载 &lt; 1s</td>
+</tr>
+<tr>
+<td>弹幕检索</td>
+<td>Elasticsearch（可配 MongoDB 分片）</td>
+<td>关键词检索、运营查询</td>
+<td>与主链路异步解耦</td>
+</tr>
+<tr>
+<td>超冷数据</td>
+<td>OSS / S3</td>
+<td>合规归档、长尾需求</td>
+<td>成本极低，按需回源</td>
+</tr>
+<tr>
+<td>用户/房间基础数据</td>
+<td>MySQL + 本地缓存</td>
+<td>基础业务查询</td>
+<td>缓存降低查询压力</td>
+</tr>
+</tbody>
+</table>
+<p>核心逻辑一句话：<strong>只有最近 5 分钟的热弹幕存 Redis 供实时拉取，历史弹幕全部异步落冷存储，只有回放、审计场景才查冷库</strong>——避免热库被历史请求打穿。实测存储成本能降 80%，回溯查询依然是毫秒级。</p>
+<p>落库必须异步批量，把万级 QPS 的写库压到百级：</p>
+<pre><code class="language-java">@Component
+public class DanmakuBatchWriter {
+    private final BlockingQueue&lt;DanmakuMsg&gt; buffer = new LinkedBlockingQueue&lt;&gt;(10000);
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    @PostConstruct
+    public void init() {
+        // 每 200ms 定时刷盘
+        scheduler.scheduleAtFixedRate(this::flush, 200, 200, TimeUnit.MILLISECONDS);
+    }
+
+    public void add(DanmakuMsg msg) {
+        buffer.offer(msg);
+        if (buffer.size() &gt;= 500) flush();   // 满 500 条立即刷盘
+    }
+
+    private void flush() {
+        List&lt;DanmakuMsg&gt; batch = new ArrayList&lt;&gt;();
+        buffer.drainTo(batch, 500);          // 原子批量取出，无并发问题
+        if (!batch.isEmpty()) {
+            danmakuMapper.batchInsert(batch);
+        }
+    }
+}
+</code></pre>
+<p>内存缓冲 + 定时/定量双触发，DB IO 次数直接降两个数量级。回放场景再按时间分片存储，进度条拖到哪加载到哪。</p>
+<h2 id="十难点速查表与性能指标">十、难点速查表与性能指标</h2>
+<p>把全文的硬仗汇总成一张速查表，建议截图保存：</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>技术难点</th>
+<th>根因</th>
+<th>解决方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>广播扇出爆炸</td>
+<td>一条弹幕复制 N 份，CPU/带宽随在线数线性涨</td>
+<td>节点级扇出 + 本地房间表 + 时间窗聚合 + 推拉结合 + 热度采样</td>
+</tr>
+<tr>
+<td>2</td>
+<td>百万长连接</td>
+<td>句柄、内存、GC 三座大山</td>
+<td>Netty Epoll + 堆外池化 + 对象复用 + ZGC；<code>ulimit -n</code> 百万级；<code>tcp_mem</code> 调优；心跳踢死连接</td>
+</tr>
+<tr>
+<td>3</td>
+<td>写入突发洪峰</td>
+<td>脉冲式流量瞬间几十倍</td>
+<td>三级削峰：本地环形缓冲背压 → MQ 分区 → 消费端批量聚合</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Netty 广播阻塞 IO 线程</td>
+<td><code>ChannelGroup.writeAndFlush</code> 同步遍历</td>
+<td>时间窗批量合并 + 异步写（<code>voidPromise</code> / <code>ChannelPromise</code>）</td>
+</tr>
+<tr>
+<td>5</td>
+<td>弹幕乱序</td>
+<td>多线程并发写、跨节点无全局序</td>
+<td>roomId 分区保序 + 同一 EventLoop 串行写 + 单调 seq，客户端按 seq 渲染</td>
+</tr>
+<tr>
+<td>6</td>
+<td>重复投递</td>
+<td>网络重试 / ACK 重发 / MQ 重复消费</td>
+<td><code>clientMsgId</code> 服务端幂等 + 客户端 <code>msgId/seq</code> 去重窗口</td>
+</tr>
+<tr>
+<td>7</td>
+<td>慢客户端拖垮服务</td>
+<td>弱网写不动，缓冲区积压 OOM</td>
+<td><code>isWritable</code> 水位背压 → 清空队列 → 连续超时主动断开</td>
+</tr>
+<tr>
+<td>8</td>
+<td>重连风暴</td>
+<td>网关宕机，百万连接同时重连</td>
+<td>客户端指数退避 + 随机抖动；网关优雅下线</td>
+</tr>
+<tr>
+<td>9</td>
+<td>热点房间单点</td>
+<td>单房间百万人，单节点/单分区扛不住</td>
+<td>房间分片 + 独立集群 + 房间内再分片（按用户哈希拆子流）+ 多级分发树</td>
+</tr>
+<tr>
+<td>10</td>
+<td>实时审核</td>
+<td>同步模型审核直接雪崩</td>
+<td>本地 DFA 微秒拦截 → 异步模型审核 → 先发后审 + 撤回指令</td>
+</tr>
+<tr>
+<td>11</td>
+<td>垃圾刷屏</td>
+<td>恶意带节奏、机器刷屏</td>
+<td>四层限流 + DFA/AC 自动机 + 异步 AI 复审，违规拦截率 99.9%</td>
+</tr>
+<tr>
+<td>12</td>
+<td>历史弹幕回放</td>
+<td>数据量大查询慢</td>
+<td>HBase "房间ID+时间戳" 行键 + 二级索引；ClickHouse 列存，回放加载 &lt; 1s</td>
+</tr>
+<tr>
+<td>13</td>
+<td>Redis 大 Key</td>
+<td>房间在线集合巨大，读写阻塞</td>
+<td>拆成多个小 Set 分段存储 + 网关本地维护子集</td>
+</tr>
+<tr>
+<td>14</td>
+<td>跨机房延迟</td>
+<td>跨地域投递慢</td>
+<td>就近接入 + 同机房优先消费 + 专线 Topic 复制，同机房延迟 &lt; 100ms</td>
+</tr>
+</tbody>
+</table>
+<p>再说性能指标。面试和汇报时，能说出具体数字，可信度直接拉满：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>目标值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>弹幕端到端延迟</td>
+<td>平均 &lt; 150ms，99 分位 &lt; 300ms</td>
+<td>从发送到别人看到</td>
+</tr>
+<tr>
+<td>单机长连接数</td>
+<td>10 万+（4 核 8G），内存 &lt; 800M</td>
+<td>Netty + 系统调优</td>
+</tr>
+<tr>
+<td>单机消费推送 QPS</td>
+<td>5 万+</td>
+<td>批量推送模式</td>
+</tr>
+<tr>
+<td>削峰效果</td>
+<td>削峰 80%，核心消息零丢失</td>
+<td>MQ + 批量聚合</td>
+</tr>
+<tr>
+<td>消息丢失率</td>
+<td>&lt; 0.1%</td>
+<td>极端峰值下可接受</td>
+</tr>
+<tr>
+<td>下行流量</td>
+<td>推拉结合降低 90%+</td>
+<td>对比全量推送</td>
+</tr>
+<tr>
+<td>存储成本</td>
+<td>冷热分离降低 80%</td>
+<td>Redis 只留热数据</td>
+</tr>
+<tr>
+<td>集群扩展性</td>
+<td>线性扩容</td>
+<td>加机器就能扛量</td>
+</tr>
+</tbody>
+</table>
+<h2 id="十一还能继续深挖的方向">十一、还能继续深挖的方向</h2>
+<p>如果你以为到这就结束了，其实还有几个值得深挖的坑，也是面试时体现技术判断力的好素材：</p>
+<ul>
+<li><strong>边缘节点推送</strong>：把接入网关下沉到 CDN 边缘，用户就近接入，中心网关压力骤降；</li>
+<li><strong>QUIC 替代 WebSocket</strong>：弱网下比 TCP 表现更好，断线重连更快，适合移动直播场景；</li>
+<li><strong>JDK 21 虚拟线程</strong>：在消费端批量拉取这类场景有收益，但要注意 <code>synchronized</code> 的 pinning 问题；</li>
+<li><strong>弹幕智能分级</strong>：AI 识别高质量弹幕优先展示，水弹幕自动合并（"666"刷屏合并成"×233"）；</li>
+<li><strong>回放弹幕对齐</strong>：按时间分片存储，回放时按播放进度精准加载；</li>
+<li><strong>前端轨道分配算法</strong>：服务端预分配轨道号，分层渲染避免弹幕重叠，降低前端计算量；</li>
+<li><strong>实时风控反作弊</strong>：内容相似度 + 用户行为特征，识别机器刷屏；</li>
+<li><strong>Flink 实时热度统计</strong>：弹幕关键词统计、直播间实时热度值计算；</li>
+<li><strong>多机房多活</strong>：单元化部署 + 跨区域同步，设计"区域弹幕 + 全局精选"双层体验；</li>
+<li><strong>弹幕撤回、弹幕置顶</strong>等进阶玩法，本质都是"消息指令 + 客户端状态机"。</li>
+</ul>
+<p>这些方向每一个都能单独写一篇，感兴趣的可以在评论区告诉我，点赞高的优先安排。</p>
+<h2 id="写在最后">写在最后</h2>
+<p>回头看，弹幕系统的设计哲学其实就一句话：<strong>在实时性、可靠性、成本三者之间做 trade-off</strong>。</p>
+<pre><code class="language-text">实时性
+        /\
+       /  \
+      /    \
+ 完整性 —— 吞吐量
+</code></pre>
+<p>直播弹幕场景选的是<strong>实时性 + 吞吐量</strong>，牺牲完整性——所以全链路都围绕"可丢弃"三个字做优化：环形缓冲满了就丢、慢客户端踢掉、极端房间采样。而 seq + 推拉补漏机制保证了"丢得起，也补得回"。</p>
+<p>落地建议给三条：</p>
+<ol>
+<li><strong>先压测再上线</strong>，四层限流的阈值全部来自压测数据，拍脑袋的阈值都是定时炸弹；</li>
+<li><strong>降级预案写进发布检查单</strong>，演练过才算数；</li>
+<li><strong>监控先行</strong>：单机连接数、MQ 堆积、端到端延迟、丢弃率，这四个指标必须有大盘和告警。</li>
+</ol>
+<p>一句话记忆：<strong>推拉结合保实时，异步批量抗洪峰，背压隔离护全局。</strong></p>
+<p>如果这篇拆解对你有帮助，点个关注不迷路，公众号后续还会持续拆解更多高并发经典场景（下一篇预告：秒杀系统）。</p>
+<p>最后留个互动话题：<strong>如果你的直播间突然涌入 100 万在线，你第一步会先扩容哪一层？为什么？</strong> 评论区聊聊，我会逐条回复。觉得文章有用，点赞、在看、转发走一波，你的支持是我肝长文的最大动力。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-20 10:11">2026-10-20 10:11</span>&nbsp;
+<a href="https://www.cnblogs.com/zrui-xyu">Rain的Java大神实战圈</a>&nbsp;
+阅读(<span id="post_view_count">105</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23367975);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzrui-xyu%2Fp%2F23367975&amp;targetId=23367975&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
