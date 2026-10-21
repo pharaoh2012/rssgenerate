@@ -1,0 +1,213 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/catchadmin/p/23383680" title="发布于 2026-10-21 10:24">
+    
+
+    <span role="heading" aria-level="2">PHP 8.7 协程新提案 让跨协程代码共享请求身份</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="php-87-协程新提案-让跨协程代码共享请求身份">PHP 8.7 协程新提案 让跨协程代码共享请求身份</h1>
+<p>一个 HTTP 请求可能只对应一个业务操作，却在多个 Fiber 中执行：一个协程查询数据库，另一个处理响应流，还有一个执行响应结束后仍需继续的后台任务。这些代码属于同一个请求，但 PHP 目前缺少统一的语言机制来表达这种归属。</p>
+<p><a href="https://fiber-interop.github.io/rfc-scope.html" target="_blank" rel="noopener nofollow">Scope RFC</a> 试图补上这一层。它提出用 <code>Scope</code> 标识逻辑操作，让操作身份在协程和生成器之间保持一致。服务容器、日志组件和追踪工具可以依赖这个身份，未来部分 PHP 隐式状态也可以以它为归属单元。</p>
+<p>本文依据页面正文标注的 0.7 版草案整理，日期为 2026 年 10 月 19 日，目标版本为 PHP 8.7。截至本文整理时，该页面明确说明 RFC 尚未发布到 wiki.php.net，也尚未进入正式讨论；目标版本和设计都不代表已经获批。页面顶部仍保留较早的 0.6 版提示，以下以正文中的提案内容为准。</p>
+<h2 id="一个请求为什么不能直接用-fiber-标识">一个请求为什么不能直接用 Fiber 标识</h2>
+<p>在传统 php-fpm 模式下，请求级状态通常依赖 PHP 的请求生命周期完成隔离和清理。进入常驻服务器后，一个进程会持续处理多个请求；如果还要并发处理请求，就必须明确每段代码属于哪次操作。</p>
+<p>一个看似直接的办法，是用 <code>Fiber::getCurrent()</code> 作为请求级服务的索引。但这会把“当前执行单元”和“当前业务操作”混为一谈。</p>
+<p>假设一个请求已经从容器中取得数据库连接，随后又创建协程执行并行查询。子协程拥有不同的 Fiber 对象，如果容器按 Fiber 建立索引，就可能在同一个请求里再创建一条连接、一个会话或一个工作单元。请求原本希望共享的服务，反而被拆开了。</p>
+<p>日志中的请求 ID、链路追踪上下文、请求级缓存也有同样的问题。它们需要关联整个请求，而请求可能横跨多个执行单元。对于不使用协程的常驻服务器，<code>Fiber::getCurrent()</code> 更无法提供所需的请求身份。</p>
+<p>事件循环已经在各自解决这类问题。例如，phasync 通过 <code>phasync::getContext()</code> 暴露上下文，但依赖它的库也就绑定了 phasync。换一个事件循环，同一个库可能又需要适配另一套接口。</p>
+<p>Scope RFC 的出发点，就是为这些组件提供共同的语言级依据。</p>
+<h2 id="scope-标识工作单元fiber-负责执行">Scope 标识工作单元，Fiber 负责执行</h2>
+<p>提案对两个概念作了区分：Fiber 是执行单元，Scope 是一个或多个执行单元所属的工作单元。这个工作单元可以是 HTTP 请求、队列任务，也可以是事务等其他逻辑操作。</p>
+<p>核心 API 很小。下面是草案提出的 <code>Scope</code> 接口签名，以及对 <code>Fiber</code> 和 <code>Generator</code> 的新增方法；它们属于提案中的接口，并非可直接复制运行的用户态实现。</p>
+<pre><code class="language-php">final class Scope
+{
+    public function __construct() {}
+
+    public function run(callable $callback, mixed ...$args): mixed {}
+
+    public static function getCurrent(): Scope {}
+
+    public static function getRootScope(): Scope {}
+}
+
+// Fiber 新增的方法
+// public function getScope(): Scope {}
+
+// Generator 新增的方法
+// public function getScope(): Scope {}
+</code></pre>
+<p><code>$scope-&gt;run($callback)</code> 会在回调执行期间将该对象设为当前作用域，返回回调结果，并在回调返回或抛出异常时恢复此前的作用域。嵌套调用时，内层 <code>run()</code> 暂时替换当前作用域，结束后再恢复外层。</p>
+<p><code>Scope::getCurrent()</code> 返回当前作用域。没有显式进入操作作用域的代码，则处于 <code>Scope::getRootScope()</code> 返回的根作用域中，因此 <code>getCurrent()</code> 不会返回 <code>null</code>。</p>
+<p>根作用域让调用方始终能够取得一个有效的对象。需要判断当前是否处于显式操作中，可以比较当前作用域与根作用域；需要暂时在操作之外执行代码，也可以使用 <code>Scope::getRootScope()-&gt;run($callback)</code>。</p>
+<p>根作用域不意味着系统自动将每个 HTTP 请求变成独立作用域。对于常驻服务器，请求入口仍需要负责创建 <code>Scope</code>，并在其中调用应用程序。</p>
+<h2 id="服务容器只需要一个稳定的键">服务容器只需要一个稳定的键</h2>
+<p>Scope 本身不提供存取业务数据的 API。需要按作用域保存状态的库，可以使用以 Scope 对象为键的 <code>WeakMap</code>。这样，容器、日志组件和其他库都能维护自己的状态，而无需约定一套共享键名。</p>
+<p>下面的示例来自 RFC。容器先取得当前作用域，再从该作用域对应的服务集合中解析实例。</p>
+<pre><code class="language-php">final class RequestServices
+{
+    private static ?WeakMap $services = null;
+
+    public static function get(string $id): object
+    {
+        $scope = Scope::getCurrent();
+        if ($scope === Scope::getRootScope()) {
+            throw new LogicException('Not running inside a request scope');
+        }
+        self::$services ??= new WeakMap();
+        self::$services[$scope] ??= [];
+        return self::$services[$scope][$id] ??= self::create($id);
+    }
+
+    private static function create(string $id): object
+    {
+        // application-specific
+    }
+}
+
+// In the server, for each request:
+$scope = new Scope();
+$scope-&gt;run(function () {
+    $db = RequestServices::get('db');             // created for this request
+    $fiber = new Fiber(function () {
+        RequestServices::get('db');               // the same instance: same scope
+    });
+    $fiber-&gt;start();
+});
+</code></pre>
+<p>这里的 <code>create()</code> 需要由应用程序补充实际服务创建逻辑。示例的关键是，子协程取得的当前作用域与请求入口一致，因此可以取回同一个服务实例。</p>
+<p>如果容器原本已经用 <code>Fiber::getCurrent()</code> 为作用域服务建立索引，这种设计允许它将索引依据改为 <code>Scope::getCurrent()</code>。这样，请求级服务的归属便可以跨协程保持一致，也不必依赖特定事件循环提供的上下文接口。</p>
+<p>当作用域不再可达时，对应的 <code>WeakMap</code> 条目可以被清理。草案特别指出，自 PHP 8.3 起，即使条目的值反向引用了作为键的作用域，例如服务对象持有自己的 Scope，也可以回收这种引用关系。但“请求处理函数已经返回”和“作用域可以释放”并不等价：仍然存活的协程、排队回调或请求对象，都可能继续持有作用域。</p>
+<h2 id="归属在创建时确定恢复执行不会改变它">归属在创建时确定，恢复执行不会改变它</h2>
+<p>这份提案最重要的语义，是协程在构造时就确定作用域归属，并在整个生命周期内保留该归属。决定因素是 <code>new Fiber(...)</code> 发生在哪里，而不是 <code>start()</code> 在哪里调用。</p>
+<p>例如，下面的协程在根作用域中构造，即使随后在另一个作用域内启动，协程内部看到的仍然是根作用域：</p>
+<pre><code class="language-php">$scope = new Scope();
+
+$fiber = new Fiber(fn() =&gt; var_dump(Scope::getCurrent() === Scope::getRootScope()));
+$scope-&gt;run(fn() =&gt; $fiber-&gt;start());   // bool(true): the fiber was constructed outside any scope
+</code></pre>
+<p>这样的规则保证了一个稳定性约束：函数因为 <code>Fiber::suspend()</code> 暂停，又被其他作用域中的代码恢复后，仍能看到原先的当前作用域。函数自身调用 <code>run()</code> 时，才会在相应调用期间切换作用域。</p>
+<p>协程内部也可以通过 <code>run()</code> 进入另一个作用域，因此需要区分两个问题：<code>Fiber::getScope()</code> 表示协程构造时的归属，<code>Scope::getCurrent()</code> 表示此刻代码实际运行所在的作用域。两者在嵌套 <code>run()</code> 期间可以不同。</p>
+<p>生成器采用相同原则，归属在调用生成器函数、创建生成器对象时确定，而非在首次迭代时确定。否则，生成器每经过一次 <code>yield</code>，都有可能因为消费方不同而看到另一个作用域，进而取得不同的数据库连接或请求状态。</p>
+<p>这对于流式响应尤其重要：应用程序在请求作用域中创建生成器，服务器随后在自己的循环中消费响应体，生成器仍然应该保留原请求的归属。使用 <code>yield from</code> 时，内层生成器也在自身创建时的作用域中执行。</p>
+<p>普通函数和闭包则遵循调用方的作用域，不捕获创建时的作用域。路由处理器、中间件和容器工厂通常在启动时创建，却在不同请求中重复调用；如果它们固定绑定启动时的作用域，就无法看到当前请求。</p>
+<p>因此，延迟回调需要事件循环显式保存作用域，再在执行时恢复：</p>
+<pre><code class="language-php">// When the callback is registered:
+$this-&gt;queue[] = [Scope::getCurrent(), $callback];
+
+// When it is due:
+[$scope, $callback] = array_shift($this-&gt;queue);
+$scope-&gt;run($callback);
+</code></pre>
+<p>这也划出了自动传播的边界：协程和生成器按提案规则保留归属；排队后稍后执行的普通回调，需要事件循环采用上面的模式。持有回调的队列也会持有作用域，从而延长相关状态的存活时间。</p>
+<h2 id="两项附加表决尝试隔离真实请求状态">两项附加表决尝试隔离真实请求状态</h2>
+<p>只有操作身份，还不能自动解决 PHP 所有全局状态的隔离。草案主提案提供 Scope 及相关方法，另外通过两项附加表决，决定是否让一部分现有状态随作用域切换。</p>
+<table>
+<thead>
+<tr>
+<th>表决</th>
+<th>涉及内容</th>
+<th>核心变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主表决</td>
+<td><code>Scope</code>、<code>Fiber::getScope()</code>、<code>Generator::getScope()</code></td>
+<td>建立逻辑操作身份与执行归属</td>
+</tr>
+<tr>
+<td>附加表决 A</td>
+<td><code>$_GET</code>、<code>$_POST</code>、<code>$_COOKIE</code>、<code>$_FILES</code>、<code>$_REQUEST</code></td>
+<td>这些请求输入数组按作用域隔离</td>
+</tr>
+<tr>
+<td>附加表决 B</td>
+<td>默认区域设置、默认时区</td>
+<td>这些隐式设置按作用域隔离</td>
+</tr>
+</tbody>
+</table>
+<p>草案规定主表决需要三分之二多数通过；两项附加表决各需 <code>50%+1</code>，且仅在主表决通过后计票，B 不依赖 A。</p>
+<p>对于附加表决 A，根作用域继续使用 SAPI 填充的数组；新作用域继承创建它的作用域中五个数组的当前值，并利用数组的写时复制机制，在实际写入前避免复制开销。通过这些变量名读写时，访问的是当前作用域的数组，同一作用域内的协程和生成器则共享这些数组。</p>
+<p>这里隔离的是变量名的绑定。如果切换前已经取得引用，例如 <code>$g = &amp;$_GET</code>，切换后 <code>$g</code> 仍然指向原先绑定的数组，不会随当前作用域自动改指向。<code>$GLOBALS['_GET']</code> 和 <code>global $_GET</code> 对变量名的访问则遵循当前作用域。</p>
+<p>常驻服务器仍然需要根据接收到的请求填充数据。RFC 给出的方式如下：</p>
+<pre><code class="language-php">$scope = new Scope();
+$scope-&gt;run(function () use ($request, $handler) {
+    $_GET    = $request-&gt;query;
+    $_POST   = $request-&gt;parsedBody;
+    $_COOKIE = $request-&gt;cookies;
+    $_FILES  = $request-&gt;uploads;
+    $handler-&gt;handle();        // every fiber of this request sees these; no other request does
+});
+</code></pre>
+<p>这里没有为 <code>$_REQUEST</code> 赋值，需要结合实际应用处理。草案明确规定，<code>$_REQUEST</code> 是独立快照，不会因为 <code>$_GET</code>、<code>$_POST</code> 或 <code>$_COOKIE</code> 变化而自动重新合并。应用程序如果依赖它，就需要自行同步填充。</p>
+<p>隔离也有明确边界。<code>$_SERVER</code> 混合了环境与请求信息，未被纳入本次附加表决；其中的 <code>REQUEST_URI</code>、<code>REQUEST_METHOD</code> 和 <code>HTTP_*</code> 条目仍然共享。因此，即使 A 通过，也不能宣称 HTTP 请求已经完全隔离。<code>$_ENV</code> 和 <code>$_SESSION</code> 同样不在 A 的范围内。</p>
+<p>附加表决 B 面向 <code>Locale::getDefault()</code> / <code>Locale::setDefault()</code> 和默认时区相关函数。规则也是继承创建方的值，随后在本作用域内修改。这样，同一进程中的两个请求就能分别使用不同的区域设置和时区。</p>
+<p>参考实现还区分了默认时区与 <code>ini_set('date.timezone')</code>：后者仍然作用于整个 PHP 请求；已经显式设置自身时区的作用域会忽略它，从未设置过的则继续使用该 ini 回退值。不能据此推断所有 ini 配置都已经按作用域隔离。</p>
+<h2 id="作用域不会自动变成完整的并发运行时">作用域不会自动变成完整的并发运行时</h2>
+<p>Scope 不负责调度，不会等待子协程，也不会在 <code>run()</code> 返回时自动取消后台工作。它没有“开始”和“结束”的任务状态，同一个对象可以被多次进入。生命周期取决于引用，而不是某次 <code>run()</code> 的调用范围。</p>
+<p>这意味着 Scope 能够为服务提供归属，但不会自动为共享服务增加并发安全保障。如果多个协程共同持有一个服务对象，该服务在挂起点之间如何协调访问，仍然是库和应用程序需要处理的问题。</p>
+<p>它也不会把所有全局变量变成请求局部变量。草案的原则是隔离属于逻辑操作的状态。类静态属性、函数静态变量和 <code>$GLOBALS</code> 中有意共享的应用状态，仍然保持共享；像 <code>chdir()</code>、<code>umask()</code>、环境变量和 C 库层面的 <code>setlocale()</code> 这类进程或操作系统状态，也不能简单套用相同机制。</p>
+<p>还有两类容易被高估的能力，目前都留待后续 RFC。</p>
+<p><strong>输出缓冲。</strong> 同一请求中的协程通常需要共享请求的输出栈，但模板渲染中的局部输出捕获又与具体代码执行有关。草案将这两种需求分开讨论，并把设计留给后续提案。引入 Scope 本身不会让现有 <code>ob_*</code> 调用自动获得隔离。</p>
+<p><strong>持久连接。</strong> 持久资源可能让不同 PDO 对象取得相同的底层连接。在并发操作中，这会造成事务状态相互干扰。草案设想由后续 RFC 规定，持久资源不能同时借给不同的活动作用域；本次提案尚未实现这一规则。对于并发作用域，草案建议每个作用域使用独立的非持久连接，例如由连接池管理。</p>
+<p>Scope 对象也不能序列化。需要把操作标识传给队列消费者或远端服务时，应传递请求 ID 等数据，由接收方建立自己的作用域并关联该标识。</p>
+<h2 id="原型已经可用原生支持仍需讨论和验证">原型已经可用，原生支持仍需讨论和验证</h2>
+<p>根据草案，<code>fiber-interop/ext-scope</code> 0.3.0 已为 PHP 8.2 至 8.5 提供扩展实现，包含两项附加表决的功能；<code>fiber-interop/scope</code> 0.3.0 则提供用户态兼容实现。扩展代码和安装说明可见 <a href="https://github.com/fiber-interop/ext-scope" target="_blank" rel="noopener nofollow">GitHub 仓库</a>。</p>
+<p>两者的能力边界需要区分。用户态实现依赖事件循环报告作用域变化，能否观察到每次切换取决于循环的集成方式；扩展则借助引擎 observer API 追踪执行。相关对比见项目的<a href="https://fiber-interop.github.io/conformance.html" target="_blank" rel="noopener nofollow">一致性报告</a>。</p>
+<p>草案给出了 PHP 8.5、x86-64 环境下的原型测量：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>未加载扩展</th>
+<th>加载扩展</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>函数调用</td>
+<td>约 25 ns</td>
+<td>约 29 ns</td>
+</tr>
+<tr>
+<td>生成器单步执行</td>
+<td>约 38 ns</td>
+<td>约 79 ns</td>
+</tr>
+<tr>
+<td>协程恢复与挂起</td>
+<td>约 108 ns</td>
+<td>约 163 ns</td>
+</tr>
+</tbody>
+</table>
+<p>这些数据反映的是扩展原型。由于扩展不能直接为引擎的协程和生成器对象增加字段，需要使用 <code>WeakMap</code> 保存归属并追踪执行，不能把这组数字当成未来原生实现的最终成本。</p>
+<p>草案设想，原生实现可直接在协程和生成器中保存作用域指针，每次执行切换时更新当前作用域；状态隔离则通过切换时交换已纳入管理的状态实现。对应的 php-src 补丁、正确性验证和性能测量仍需要在表决前提供。</p>
+<p>一个直接的兼容性影响是全局类名冲突：如果 PHP 原生加入 <code>Scope</code>，应用程序就不能再在全局命名空间声明同名类。位于其他命名空间中的 <code>Scope</code> 类不受这一命名冲突影响。</p>
+<p>线程也没有被排除在设计之外。ZTS 下，每个线程拥有自己的根作用域、当前作用域和协程；一个工作线程可以用多个 Scope 承载多个请求，多个线程再利用不同 CPU 核心。Scope 自身不会增加并发或跨线程共享 PHP 对象的能力。</p>
+<p>对于框架和基础库，值得关注的是“当前请求”的定义有机会从各自的运行时约定，变成一个可共同识别的操作身份。容器可以据此解析请求级服务，日志与追踪组件可以附加相同操作的数据，服务器则可以明确划定请求入口。它能否最终进入 PHP，以及哪些引擎状态会随之迁移，仍取决于后续正式 RFC 的讨论、实现和表决。</p>
+<p><a href="https://catchadmin.com/post/2026-10/php-scope-rfc-unifies-cross-fiber-operations" target="_blank" rel="noopener nofollow">PHP 8.7 协程新提案 让跨协程代码共享请求身份</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-21 10:24">2026-10-21 10:24</span>&nbsp;
+<a href="https://www.cnblogs.com/catchadmin">JaguarJack</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23383680);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fcatchadmin%2Fp%2F23383680&amp;targetId=23383680&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
