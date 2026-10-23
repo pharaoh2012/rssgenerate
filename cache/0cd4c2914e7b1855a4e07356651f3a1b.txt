@@ -1,0 +1,631 @@
+
+		<h2>
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/liuziyi1/p/23411433" title="发布于 2026-10-23 11:22">
+    
+
+    <span role="heading" aria-level="2">Oracle LogMiner 日志挖掘：原理、步骤、可执行脚本与结果解析</span>
+    
+
+</a>
+
+		</h2>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<hr>
+<h2 id="一logminer-原理">一、LogMiner 原理</h2>
+<h3 id="11-本质">1.1 本质</h3>
+<p>Oracle 的 Redo 日志记录的是<strong>物理变更向量（Change Vector）</strong>：数据块地址（RDBA）、操作码、列偏移、前后镜像、SCN、事务 ID（XID）等，本身是二进制，人不可读。</p>
+<p>LogMiner 做的是<strong>"物理 → 逻辑"的翻译</strong>：</p>
+<pre><code>Redo/归档日志（二进制 change vector）
+        │  ① 按 SCN / 事务顺序读取
+        │  ② 用数据字典把 OBJ# / COL# 翻译成 表名 / 列名
+        │  ③ 按事务重组、拼接行变更
+        ▼
+V$LOGMNR_CONTENTS（可读的逻辑 SQL）
+        ├── SQL_REDO  → 原始操作（重放用，如 DELETE FROM T WHERE ...）
+        └── SQL_UNDO  → 反向操作（回滚用，如 INSERT INTO T VALUES (...)）
+</code></pre>
+<h3 id="12-三个必备要素">1.2 三个必备要素</h3>
+<table>
+<thead>
+<tr>
+<th>要素</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>日志文件</strong></td>
+<td>在线 Redo 或归档日志（生产挖掘建议只用<strong>归档日志</strong>）</td>
+</tr>
+<tr>
+<td><strong>数据字典</strong></td>
+<td>三种来源：①在线目录 <code>DICT_FROM_ONLINE_CATALOG</code>（最常用，须在源库执行）②提取到 Redo 流 <code>STORE_IN_REDO_LOGS</code> ③平面文件 <code>STORE_IN_FLAT_FILE</code>（跨库分析用）</td>
+</tr>
+<tr>
+<td><strong>分析会话</strong></td>
+<td>挖掘结果存放在<strong>发起会话的 PGA</strong> 中，会话断开即丢失</td>
+</tr>
+</tbody>
+</table>
+<h3 id="13-关键机制与限制">1.3 关键机制与限制</h3>
+<ul>
+<li><strong>必须开启补充日志</strong>：只开归档、不开 <code>SUPPLEMENTAL LOG DATA</code> 时，DML 记录会缺失（例如 delete 10 条只挖到 6 条），且 <code>SQL_UNDO</code> 可能为 NULL。最小补充日志即可，主键补充日志能让 <code>SQL_UNDO</code> 的 WHERE 条件更精准。</li>
+<li><strong>DDL 只能看到 <code>SQL_REDO</code></strong>，没有 <code>SQL_UNDO</code>，DDL 回滚需人工处理。</li>
+<li><strong>不支持/不完整</strong>：部分 LOB、LONG、XMLType、ADT、链式行/迁移行的 DML 可能 <code>SQL_REDO</code>/<code>SQL_UNDO</code> 为 NULL 或 <code>Unsupported</code>。</li>
+<li><strong>跨库分析</strong>：分析库的 <code>DB_BLOCK_SIZE</code> 必须 ≥ 源库，平台、字符集需一致，且必须使用<strong>源库</strong>生成的字典。</li>
+<li><strong>12c 及以上 CDB</strong>：LogMiner 必须在 <strong>CDB$ROOT</strong> 下执行，PDB 内执行会报错。</li>
+<li><strong>不要把当前在线日志加入挖掘列表</strong>，否则 CTAS/查询 <code>V$LOGMNR_CONTENTS</code> 时容易触发 <code>ORA-00310</code> / <code>ORA-00334</code>（递归重做导致日志切换，问题反复重演）。</li>
+</ul>
+<hr>
+<h2 id="二标准步骤与命令手工版">二、标准步骤与命令（手工版）</h2>
+<pre><code class="language-sql">-- 0. 环境检查
+ARCHIVE LOG LIST;
+SELECT supplemental_log_data_min, supplemental_log_data_pk FROM v$database;
+
+-- 1. 开启补充日志（只需做一次，持续生效）
+ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+ALTER DATABASE ADD SUPPLEMENTAL LOG DATA (PRIMARY KEY) COLUMNS;   -- 可选，回滚更精准
+
+-- 2. 定位误操作时间窗内的归档日志
+SELECT thread#, sequence#, first_time, next_time, name
+  FROM v$archived_log
+ WHERE name IS NOT NULL AND status = 'A'
+   AND next_time  &gt; TO_DATE('2026-10-23 10:00:00','YYYY-MM-DD HH24:MI:SS')
+   AND first_time &lt; TO_DATE('2026-10-23 10:30:00','YYYY-MM-DD HH24:MI:SS')
+ ORDER BY thread#, sequence#;
+
+-- 3. 添加日志（第一个用 NEW，后续用 ADDFILE）
+EXEC DBMS_LOGMNR.ADD_LOGFILE('/arch/.../1_10506.dbf', DBMS_LOGMNR.NEW);
+EXEC DBMS_LOGMNR.ADD_LOGFILE('/arch/.../1_10507.dbf', DBMS_LOGMNR.ADDFILE);
+
+-- 4. 启动挖掘（同一会话内执行）
+EXEC DBMS_LOGMNR.START_LOGMNR( -
+       STARTTIME =&gt; TO_DATE('2026-10-23 10:00:00','YYYY-MM-DD HH24:MI:SS'), -
+       ENDTIME   =&gt; TO_DATE('2026-10-23 10:30:00','YYYY-MM-DD HH24:MI:SS'), -
+       OPTIONS   =&gt; DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG + -
+                    DBMS_LOGMNR.COMMITTED_DATA_ONLY + -
+                    DBMS_LOGMNR.PRINT_PRETTY_SQL + -
+                    DBMS_LOGMNR.SKIP_CORRUPTION);
+
+-- 5. 查询结果（务必带过滤条件，否则极慢）
+SELECT scn, timestamp, xid, username, operation, seg_owner, seg_name,
+       sql_redo, sql_undo
+  FROM v$logmnr_contents
+ WHERE seg_owner = 'SCOTT' AND seg_name = 'EMP'
+   AND operation IN ('INSERT','UPDATE','DELETE');
+
+-- 6. 结束挖掘，释放 PGA
+EXEC DBMS_LOGMNR.END_LOGMNR;
+</code></pre>
+<p>常用 <code>START_LOGMNR</code> 选项：</p>
+<table>
+<thead>
+<tr>
+<th>选项</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DICT_FROM_ONLINE_CATALOG</code></td>
+<td>使用在线字典（源库执行）</td>
+</tr>
+<tr>
+<td><code>COMMITTED_DATA_ONLY</code></td>
+<td>只返回<strong>已提交</strong>事务，自动过滤回滚掉的事务</td>
+</tr>
+<tr>
+<td><code>PRINT_PRETTY_SQL</code></td>
+<td>输出带换行/缩进的可读 SQL</td>
+</tr>
+<tr>
+<td><code>SKIP_CORRUPTION</code></td>
+<td>跳过损坏的 redo 块，避免中断</td>
+</tr>
+<tr>
+<td><code>NO_ROWID_IN_STMT</code></td>
+<td>WHERE 条件用主键代替 ROWID（需主键补充日志）</td>
+</tr>
+<tr>
+<td><code>DDL_ONLY</code> / <code>CONTINUOUS_MINE</code></td>
+<td>只挖 DDL / 持续挖掘（12c 后不推荐）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>权限要求：<code>LOGMINING</code>（12c+）、<code>SELECT ANY TRANSACTION</code>、<code>EXECUTE_CATALOG_ROLE</code>，或直接 <code>sysdba</code>。</p>
+</blockquote>
+<hr>
+<h2 id="三可执行脚本复制保存为-logminer_minesh">三、可执行脚本（复制保存为 <code>logminer_mine.sh</code>）</h2>
+<p>脚本自动完成：环境检查 → 按时间窗自动收集归档日志 → 添加并启动挖掘 → 结果落表 → 多维统计解析 → <strong>自动拼接生成回滚脚本</strong>（处理 CSF 续行）→ 结束挖掘。</p>
+<pre><code class="language-bash">#!/usr/bin/env bash
+###############################################################################
+# logminer_mine.sh —— Oracle LogMiner 归档日志挖掘 + 结果解析 + 回滚脚本生成
+# 适用：Oracle 11gR2 / 12c / 18c / 19c / 21c（CDB 请在 CDB$ROOT 执行）
+# 用法：
+#   ./logminer_mine.sh "user/pass@tns" "2026-10-23 10:00:00" "2026-10-23 10:30:00"
+#   ./logminer_mine.sh "/ as sysdba"  "2026-10-23 10:00:00" "2026-10-23 10:30:00" "SCOTT.EMP"
+# 参数：
+#   $1 连接串   $2 起始时间   $3 结束时间
+#   $4 可选：对象过滤 OWNER.TABLE
+#   $5 可选：输出目录（默认 $HOME/logminer_out）
+###############################################################################
+set -euo pipefail
+
+CONN="${1:?用法: $0 \"user/pass@tns\" \"开始时间\" \"结束时间\" [OWNER.TABLE] [输出目录]}"
+START_TIME="${2:?缺少开始时间}"
+END_TIME="${3:?缺少结束时间}"
+OBJ="${4:-}"
+OUT_DIR="${5:-$HOME/logminer_out}"
+
+mkdir -p "$OUT_DIR"
+TS=$(date +%Y%m%d_%H%M%S)
+STAGE="LOGMNR_STAGE_${TS}"
+UNDO_TAB="LOGMNR_UNDO_${TS}"
+LOG_FILE="$OUT_DIR/logminer_${TS}.log"
+REPORT_FILE="$OUT_DIR/report_${TS}.txt"
+UNDO_FILE="$OUT_DIR/undo_${TS}.sql"
+
+# 对象过滤条件
+OBJ_WHERE=""
+if [ -n "$OBJ" ]; then
+  case "$OBJ" in
+    *.*) O="${OBJ%%.*}"; T="${OBJ##*.}" ;;
+    *)   O="";           T="$OBJ" ;;
+  esac
+  if [ -n "$O" ]; then
+    OBJ_WHERE=" AND SEG_OWNER='${O^^}' AND SEG_NAME='${T^^}'"
+  else
+    OBJ_WHERE=" AND SEG_NAME='${T^^}'"
+  fi
+fi
+
+echo "[INFO] 时间窗 : ${START_TIME} ~ ${END_TIME}"
+echo "[INFO] 对象过滤: ${OBJ:-&lt;全部用户对象&gt;}"
+echo "[INFO] 输出目录: ${OUT_DIR}"
+
+sqlplus -s "$CONN" &lt;&lt;SQLEOF &gt; "$LOG_FILE" 2&gt;&amp;1
+SET ECHO OFF
+SET FEEDBACK ON
+SET VERIFY OFF
+SET DEFINE OFF
+SET PAGESIZE 300
+SET LINESIZE 400
+SET TRIMSPOOL ON
+SET LONG 1000000
+SET LONGCHUNKSIZE 1000000
+SET SERVEROUTPUT ON SIZE UNLIMITED FORMAT WRAPPED
+WHENEVER SQLERROR EXIT FAILURE
+
+ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS';
+ALTER SESSION SET NLS_DATE_LANGUAGE='AMERICAN';
+
+SPOOL "${REPORT_FILE}"
+
+PROMPT ################ 1. 环境检查 ################
+SELECT NAME AS DB_NAME, LOG_MODE, DATABASE_ROLE, CDB,
+       SUPPLEMENTAL_LOG_DATA_MIN AS SUP_MIN,
+       SUPPLEMENTAL_LOG_DATA_PK  AS SUP_PK
+  FROM V\$DATABASE;
+
+SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, STATUS
+  FROM DBA_OBJECTS
+ WHERE OBJECT_NAME IN ('DBMS_LOGMNR','DBMS_LOGMNR_D')
+   AND OWNER = 'SYS';
+
+PROMPT ################ 2. 待分析归档日志 ################
+SELECT THREAD#, SEQUENCE#, FIRST_TIME, NEXT_TIME, NAME
+  FROM V\$ARCHIVED_LOG
+ WHERE NAME IS NOT NULL AND STATUS = 'A'
+   AND NEXT_TIME  &gt; TO_DATE('${START_TIME}','YYYY-MM-DD HH24:MI:SS')
+   AND FIRST_TIME &lt; TO_DATE('${END_TIME}','YYYY-MM-DD HH24:MI:SS')
+ ORDER BY THREAD#, SEQUENCE#;
+
+PROMPT ################ 3. 添加日志并启动挖掘 ################
+DECLARE
+  v_first BOOLEAN := TRUE;
+  v_cnt   PLS_INTEGER := 0;
+BEGIN
+  FOR r IN (
+    SELECT DISTINCT name, thread#, sequence#
+      FROM V\$ARCHIVED_LOG
+     WHERE NAME IS NOT NULL AND STATUS = 'A'
+       AND NEXT_TIME  &gt; TO_DATE('${START_TIME}','YYYY-MM-DD HH24:MI:SS')
+       AND FIRST_TIME &lt; TO_DATE('${END_TIME}','YYYY-MM-DD HH24:MI:SS')
+     ORDER BY thread#, sequence#
+  ) LOOP
+    BEGIN
+      IF v_first THEN
+        DBMS_LOGMNR.ADD_LOGFILE(LOGFILENAME =&gt; r.name, OPTIONS =&gt; DBMS_LOGMNR.NEW);
+        v_first := FALSE;
+      ELSE
+        DBMS_LOGMNR.ADD_LOGFILE(LOGFILENAME =&gt; r.name, OPTIONS =&gt; DBMS_LOGMNR.ADDFILE);
+      END IF;
+      v_cnt := v_cnt + 1;
+    EXCEPTION
+      WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('跳过 ' || r.name || ' : ' || SQLERRM);
+    END;
+  END LOOP;
+
+  IF v_cnt = 0 THEN
+    RAISE_APPLICATION_ERROR(-20001, '指定时间窗内没有可用归档日志，请检查归档保留策略或时间范围');
+  END IF;
+  DBMS_OUTPUT.PUT_LINE('已添加归档日志数量: ' || v_cnt);
+END;
+/
+
+BEGIN
+  DBMS_LOGMNR.START_LOGMNR(
+    STARTTIME =&gt; TO_DATE('${START_TIME}','YYYY-MM-DD HH24:MI:SS'),
+    ENDTIME   =&gt; TO_DATE('${END_TIME}','YYYY-MM-DD HH24:MI:SS'),
+    OPTIONS   =&gt; DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG
+               + DBMS_LOGMNR.COMMITTED_DATA_ONLY
+               + DBMS_LOGMNR.PRINT_PRETTY_SQL
+               + DBMS_LOGMNR.SKIP_CORRUPTION
+  );
+  DBMS_OUTPUT.PUT_LINE('START_LOGMNR 完成');
+END;
+/
+
+PROMPT ---- 当前分析参数 ----
+SELECT START_SCN, START_DATE, END_SCN, END_DATE, OPTIONS
+  FROM V\$LOGMNR_PARAMETERS;
+
+PROMPT ---- 已注册日志清单 ----
+SELECT THREAD#, SEQUENCE#, LOW_SCN, NEXT_SCN, FILENAME
+  FROM V\$LOGMNR_LOGS
+ ORDER BY THREAD#, SEQUENCE#;
+
+PROMPT ################ 4. 结果落地（同一会话内） ################
+CREATE TABLE ${STAGE} AS
+SELECT SCN,
+       COMMIT_SCN,
+       "TIMESTAMP"      AS CHANGE_TIME,
+       START_TIMESTAMP  AS START_TIME,
+       XID,
+       USERNAME,
+       SESSION#         AS SESSION_ID,
+       OPERATION,
+       SEG_OWNER,
+       SEG_NAME,
+       SEG_TYPE_NAME,
+       SQL_REDO,
+       SQL_UNDO,
+       CSF,
+       RS_ID,
+       SSN,
+       ROLLBACK         AS IS_ROLLBACK,
+       SESSION_INFO,
+       THREAD#          AS THREAD_ID,
+       ROW_ID
+  FROM V\$LOGMNR_CONTENTS
+ WHERE OPERATION IN ('INSERT','UPDATE','DELETE','DDL')
+   AND (SEG_OWNER IS NULL OR SEG_OWNER NOT IN
+        ('SYS','SYSTEM','SYSMAN','DBSNMP','OUTLN','AUDSYS','XDB','MDSYS',
+         'CTXSYS','ORDSYS','OLAPSYS','WMSYS','LBACSYS','APPQOSSYS',
+         'GSMADMIN_INTERNAL','DVSYS','DVF','OJVMSYS','PUBLIC'))
+${OBJ_WHERE};
+
+BEGIN
+  DBMS_LOGMNR.END_LOGMNR;
+  DBMS_OUTPUT.PUT_LINE('END_LOGMNR 完成，PGA 已释放');
+END;
+/
+
+PROMPT ################ 5. 挖掘结果解析 ################
+PROMPT ---- 5.1 总览 ----
+SELECT COUNT(*) AS TOTAL_ROWS,
+       COUNT(DISTINCT XID) AS TX_COUNT,
+       MIN(CHANGE_TIME) AS MIN_TIME,
+       MAX(CHANGE_TIME) AS MAX_TIME
+  FROM ${STAGE};
+
+PROMPT ---- 5.2 按操作类型 ----
+SELECT OPERATION, COUNT(*) AS CNT
+  FROM ${STAGE}
+ GROUP BY OPERATION
+ ORDER BY CNT DESC;
+
+PROMPT ---- 5.3 按对象 TOP 20 ----
+SELECT * FROM (
+  SELECT SEG_OWNER, SEG_NAME, OPERATION, COUNT(*) AS CNT
+    FROM ${STAGE}
+   GROUP BY SEG_OWNER, SEG_NAME, OPERATION
+   ORDER BY CNT DESC
+) WHERE ROWNUM &lt;= 20;
+
+PROMPT ---- 5.4 按数据库用户 ----
+SELECT USERNAME, COUNT(*) AS CNT
+  FROM ${STAGE}
+ GROUP BY USERNAME
+ ORDER BY CNT DESC;
+
+PROMPT ---- 5.5 按小时分布 ----
+SELECT TO_CHAR(CHANGE_TIME,'YYYY-MM-DD HH24') AS HOUR,
+       OPERATION, COUNT(*) AS CNT
+  FROM ${STAGE}
+ GROUP BY TO_CHAR(CHANGE_TIME,'YYYY-MM-DD HH24'), OPERATION
+ ORDER BY 1, 2;
+
+PROMPT ---- 5.6 事务清单（按提交顺序）----
+SELECT XID, USERNAME, COUNT(*) AS ROW_CNT,
+       MIN(CHANGE_TIME) AS FIRST_TIME,
+       MAX(CHANGE_TIME) AS LAST_TIME,
+       MAX(COMMIT_SCN)  AS COMMIT_SCN
+  FROM ${STAGE}
+ GROUP BY XID, USERNAME
+ ORDER BY COMMIT_SCN;
+
+PROMPT ---- 5.7 变更明细（前 200 条）----
+SELECT SCN, CHANGE_TIME, XID, USERNAME, OPERATION,
+       SEG_OWNER, SEG_NAME, SQL_REDO
+  FROM (SELECT * FROM ${STAGE} ORDER BY SCN, RS_ID, SSN)
+ WHERE ROWNUM &lt;= 200;
+
+PROMPT ################ 6. 生成回滚脚本 ################
+CREATE TABLE ${UNDO_TAB} (SEQ NUMBER, STMT CLOB);
+
+DECLARE
+  v_buf  CLOB;
+  v_seq  PLS_INTEGER := 0;
+  v_cnt  PLS_INTEGER := 0;
+BEGIN
+  FOR r IN (
+    SELECT SQL_UNDO, CSF
+      FROM ${STAGE}
+     WHERE SQL_UNDO IS NOT NULL
+       AND OPERATION IN ('INSERT','UPDATE','DELETE')
+     ORDER BY COMMIT_SCN DESC, RS_ID DESC, SSN DESC   -- 逆序回滚
+  ) LOOP
+    IF v_buf IS NULL THEN
+      v_buf := r.SQL_UNDO;
+    ELSE
+      v_buf := v_buf || r.SQL_UNDO;                    -- 拼接 CSF 续行
+    END IF;
+
+    IF NVL(r.CSF, 0) = 0 THEN
+      v_seq := v_seq + 1;
+      INSERT INTO ${UNDO_TAB}(SEQ, STMT)
+      VALUES (v_seq,
+              v_buf || CASE WHEN SUBSTR(v_buf, -1, 1) = ';' THEN '' ELSE ';' END);
+      v_buf := NULL;
+      v_cnt := v_cnt + 1;
+    END IF;
+  END LOOP;
+  COMMIT;
+  DBMS_OUTPUT.PUT_LINE('生成回滚语句条数: ' || v_cnt);
+END;
+/
+
+SPOOL OFF
+
+SET PAGESIZE 0
+SET HEADING OFF
+SET FEEDBACK OFF
+SPOOL "${UNDO_FILE}"
+PROMPT -- ==========================================================
+PROMPT -- LogMiner 回滚脚本（请务必完整审核后再执行）
+PROMPT -- 生成时间: ${TS}
+PROMPT -- 源时间窗: ${START_TIME} ~ ${END_TIME}
+PROMPT -- 建议: 先备份相关表；SET AUTOCOMMIT OFF；分批执行并校验
+PROMPT -- 注意: DDL 无 SQL_UNDO，需人工处理
+PROMPT -- ==========================================================
+PROMPT
+SELECT STMT FROM ${UNDO_TAB} ORDER BY SEQ;
+SPOOL OFF
+
+PROMPT ################ 7. 完成 ################
+PROMPT 明细表: ${STAGE}
+PROMPT 回滚表: ${UNDO_TAB}
+PROMPT 回滚脚本: ${UNDO_FILE}
+PROMPT 报告: ${REPORT_FILE}
+SQLEOF
+
+echo "[OK] 日志: $LOG_FILE"
+echo "[OK] 报告: $REPORT_FILE"
+echo "[OK] 回滚脚本: $UNDO_FILE"
+echo "[HINT] 明细表 ${STAGE} 保留用于复核，确认后可手工 DROP"
+</code></pre>
+<h3 id="使用示例">使用示例</h3>
+<pre><code class="language-bash">chmod +x logminer_mine.sh
+
+# 全库挖掘
+./logminer_mine.sh "sys/Oracle_123@orcl" "2026-10-23 10:00:00" "2026-10-23 10:30:00"
+
+# 只挖某张表
+./logminer_mine.sh "/ as sysdba" "2026-10-23 10:00:00" "2026-10-23 10:30:00" "SCOTT.EMP"
+</code></pre>
+<hr>
+<h2 id="四挖掘后数据解析">四、挖掘后数据解析</h2>
+<h3 id="41-vlogmnr_contents-核心字段解读">4.1 <code>V$LOGMNR_CONTENTS</code> 核心字段解读</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>解析要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SCN</code></td>
+<td>变更发生时的 SCN</td>
+<td>定位误操作精确时点的第一依据</td>
+</tr>
+<tr>
+<td><code>COMMIT_SCN</code></td>
+<td>事务提交 SCN</td>
+<td>仅 <code>COMMITTED_DATA_ONLY</code> 下有意义，回滚排序用它</td>
+</tr>
+<tr>
+<td><code>TIMESTAMP</code></td>
+<td>变更时间</td>
+<td>与业务日志时间对齐</td>
+</tr>
+<tr>
+<td><code>XID</code></td>
+<td>事务 ID</td>
+<td>同一事务的所有行变更 <code>XID</code> 相同，用于按事务分组</td>
+</tr>
+<tr>
+<td><code>USERNAME</code></td>
+<td>执行用户</td>
+<td>判断是应用账号还是人为操作</td>
+</tr>
+<tr>
+<td><code>SESSION_INFO</code></td>
+<td>会话信息（含终端、OS 用户等）</td>
+<td>追溯"谁、从哪台机器"操作</td>
+</tr>
+<tr>
+<td><code>OPERATION</code></td>
+<td><code>INSERT/UPDATE/DELETE/DDL/...</code></td>
+<td>统计与过滤主维度</td>
+</tr>
+<tr>
+<td><code>SEG_OWNER</code> / <code>SEG_NAME</code></td>
+<td>对象属主 / 对象名</td>
+<td>定位被改的表</td>
+</tr>
+<tr>
+<td><code>SQL_REDO</code></td>
+<td>原始操作 SQL</td>
+<td>还原"当时做了什么"</td>
+</tr>
+<tr>
+<td><code>SQL_UNDO</code></td>
+<td>反向 SQL</td>
+<td><strong>生成回滚脚本的来源</strong>，DDL 为 NULL</td>
+</tr>
+<tr>
+<td><code>CSF</code></td>
+<td>续行标志（0/1）</td>
+<td>1 表示该行 SQL 超 4000 字节，后续行继续，必须拼接</td>
+</tr>
+<tr>
+<td><code>RS_ID</code> / <code>SSN</code></td>
+<td>记录集 ID / 序号</td>
+<td>与 SCN 一起保证同一事务内变更的<strong>精确顺序</strong></td>
+</tr>
+<tr>
+<td><code>ROLLBACK</code></td>
+<td>是否被回滚</td>
+<td>1 表示该事务最终回滚，不应恢复</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42-判读顺序建议">4.2 判读顺序（建议）</h3>
+<ol>
+<li><strong>看总览</strong>：<code>TOTAL_ROWS</code>、<code>TX_COUNT</code>、时间范围是否落在误操作窗口内。
+<ul>
+<li>若为 0 → 时间窗不对、归档缺失、或补充日志未开导致记录不全。</li>
+</ul>
+</li>
+<li><strong>看对象 TOP</strong>：确认被影响的是不是目标表；若出现大量非预期表，说明时间窗过宽。</li>
+<li><strong>看事务清单</strong>：找到 <code>LAST_TIME</code> 与误操作时间吻合、<code>ROW_CNT</code> 与影响行数吻合的 <code>XID</code>。</li>
+<li><strong>看明细</strong>：核对 <code>SQL_REDO</code> 是否就是误操作语句；确认 <code>USERNAME</code>、<code>SESSION_INFO</code>。</li>
+<li><strong>看 <code>SQL_UNDO</code> 是否为空</strong>：
+<ul>
+<li>大量为 NULL → 检查 <code>SUPPLEMENTAL_LOG_DATA_MIN</code> 是否为 YES；主键补充日志是否开启。</li>
+</ul>
+</li>
+<li><strong>生成并审核回滚脚本</strong>：脚本已按 <code>COMMIT_SCN DESC, RS_ID DESC, SSN DESC</code> 逆序排列，保证同一事务内"后做的先回滚"。</li>
+</ol>
+<h3 id="43-回滚执行原则">4.3 回滚执行原则</h3>
+<ul>
+<li><strong>先备份</strong>：<code>CREATE TABLE T_BAK AS SELECT * FROM T;</code></li>
+<li><strong>先小批量验证</strong>：挑 1～2 条 <code>SQL_UNDO</code> 手工执行，确认 WHERE 条件命中的是目标行。</li>
+<li><strong>关闭自动提交</strong>：<code>SET AUTOCOMMIT OFF;</code>，核对行数后再 <code>COMMIT</code>。</li>
+<li><strong>注意唯一约束/触发器</strong>：回滚 INSERT 可能触发业务触发器，必要时先禁用。</li>
+<li><strong>DDL 无 <code>SQL_UNDO</code></strong>：被 drop/truncate 的表需用 Flashback Drop、RMAN 时间点恢复或手工重建。</li>
+</ul>
+<h3 id="44-补充分析-sql可直接在明细表上跑">4.4 补充分析 SQL（可直接在明细表上跑）</h3>
+<pre><code class="language-sql">-- 某张表在时间窗内的完整变更时间线
+SELECT scn, change_time, xid, username, operation, sql_redo
+  FROM LOGMNR_STAGE_xxxxxx
+ WHERE seg_owner='SCOTT' AND seg_name='EMP'
+ ORDER BY scn, rs_id, ssn;
+
+-- 找出影响行数最多的 10 个事务
+SELECT * FROM (
+  SELECT xid, username, seg_owner, seg_name, COUNT(*) cnt,
+         MIN(change_time) first_time, MAX(change_time) last_time
+    FROM LOGMNR_STAGE_xxxxxx
+   GROUP BY xid, username, seg_owner, seg_name
+   ORDER BY cnt DESC
+) WHERE ROWNUM &lt;= 10;
+
+-- 导出某事务的回滚语句（手工指定 XID）
+SELECT sql_undo FROM LOGMNR_STAGE_xxxxxx
+ WHERE xid = '01001B00...' AND sql_undo IS NOT NULL
+ ORDER BY commit_scn DESC, rs_id DESC, ssn DESC;
+</code></pre>
+<hr>
+<h2 id="五常见报错与规避">五、常见报错与规避</h2>
+<table>
+<thead>
+<tr>
+<th>报错</th>
+<th>原因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ORA-01306</code></td>
+<td>未 <code>START_LOGMNR</code> 就查 <code>V$LOGMNR_CONTENTS</code>，或已 <code>END_LOGMNR</code></td>
+<td>必须在<strong>同一会话</strong>先启动再查</td>
+</tr>
+<tr>
+<td><code>ORA-01307</code></td>
+<td>当前没有活动的 LogMiner 会话</td>
+<td>检查是否已 <code>END_LOGMNR</code> 或会话断开</td>
+</tr>
+<tr>
+<td><code>ORA-00310/ORA-00334</code></td>
+<td>把<strong>当前在线日志</strong>加入挖掘，CTAS 产生递归重做</td>
+<td>只挖归档日志；先 <code>SWITCH LOGFILE</code> 并确认该组为 <code>INACTIVE</code></td>
+</tr>
+<tr>
+<td><code>ORA-01284</code></td>
+<td>归档文件不存在/权限不足（字典文件权限需 ≥ 750）</td>
+<td>检查路径与文件权限</td>
+</tr>
+<tr>
+<td><code>ORA-01308</code></td>
+<td>用了 <code>DICT_FROM_REDO_LOGS</code> 但未设置 <code>UTIL_FILE_DIR</code></td>
+<td>改用在线目录或配置目录</td>
+</tr>
+<tr>
+<td><code>SQL_UNDO</code> 为 NULL / 记录缺失</td>
+<td>未开启补充日志</td>
+<td><code>ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;</code></td>
+</tr>
+<tr>
+<td>挖掘极慢</td>
+<td>未加时间/SCN/表名过滤</td>
+<td>在 <code>START_LOGMNR</code> 指定 <code>STARTTIME/ENDTIME</code>，查询再加 <code>SEG_OWNER/SEG_NAME</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>生产环境提示：LogMiner 是 CPU/IO 密集型操作，建议在业务低峰执行；有条件时在 Data Guard 备库或独立分析库上进行（备库需具备相应字典与日志）。归档日志必须尚未被删除或覆盖，挖掘前先确认 <code>V$ARCHIVED_LOG</code> 中目标时段记录状态为 <code>A</code>。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+		<p class="postfoot">
+			posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-23 11:22">2026-10-23 11:22</span>&nbsp;
+<a href="https://www.cnblogs.com/liuziyi1">刘子毅</a>&nbsp;
+阅读(<span id="post_view_count">77</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23411433);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fliuziyi1%2Fp%2F23411433&amp;targetId=23411433&amp;targetType=0" target="_blank">举报</a>
+
+		</p>
+	
