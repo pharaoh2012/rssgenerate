@@ -1,0 +1,185 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/wang_yb/p/23409507" title="发布于 2026-10-23 09:56">
+    
+
+    <span role="heading" aria-level="2">让 LLM 输出不再失控：用 Pydantic 校验大模型输出</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>你在 <code>prompt</code> 里写了 <strong>"请返回 JSON"</strong>，模型返回的大概率不是一段干净的 <code>JSON</code>，而是一段话：开头一句"好的，这是抽取结果"，中间一个 ```json 围栏，结尾还跟一句"希望对你有帮助"。</p>
+<p>字段本身也未必靠谱，比如工作年限写成"五年"，期望薪资写成"15k左右"，偶尔还漏掉一两个 key。</p>
+<p>这些毛病里最贵的不是报错的那几种，是不报错的那种：字符串 <code>"15k"</code> 被当成数字一路写进库，等你三个月后在报表里发现异常，已经查不出是哪条数据混进去的了。</p>
+<p>下面我们拿"从简历文本里抽结构化信息"当例子，把不加校验和加校验两条路各跑一遍，看差别到底在哪里，然后给一套能直接搬走的写法：抠 JSON、定义 schema、类型与范围校验、跨字段核对、失败后重试。</p>
+<p>全程用模拟数据，不需要 API Key，<code>pip install pydantic[email]</code> 就能跑。</p>
+<h1 id="1-不校验的时候问题藏在哪">1. 不校验的时候，问题藏在哪</h1>
+<p>同一段模型返回，用最朴素的写法处理，会连着遇到四种情况：</p>
+<pre><code class="language-python">json.loads(llm_text)              # ① 外层裹了话
+data["years_experience"] + 1      # ② 值是 "五年"
+len(data["skills"])               # ③ 压根没这个 key
+"15k左右" * 12                    # ④ 算年薪
+</code></pre>
+<p>实际输出：</p>
+<pre><code class="language-plain">JSONDecodeError: Expecting value: line 2 column 1 (char 1)
+TypeError: can only concatenate str (not "int") to str
+KeyError: 'skills'
+'15k左右' * 12 = 15k左右15k左右15k左右…（重复 12 次）
+</code></pre>
+<p>①②③还算运气好，程序当场炸给你看，顶多是离出错的地方有点远——<code>KeyError</code> 往往是在下游生成报表的那一行才冒出来，跟解析这段代码隔着好几个函数。</p>
+<p>真正麻烦的是④：字符串乘法在 Python 里是完全合法的操作，不抛异常、不写日志，结果是一串谁都没见过的东西，然后它就这么进了你的年薪字段。</p>
+<p>共同点是：<strong>问题要么发现得太晚，要么根本发现不了</strong>。</p>
+<p><code>json.loads</code> 只保证"这是合法的 <code>JSON</code> 语法"，它对"字段有没有、类型对不对、数值合不合理"一句话都不说。</p>
+<h1 id="2-补上校验其实是两道关">2. 补上校验，其实是两道关</h1>
+<p>把校验加进来之后，链路从"一段文本直接进业务"变成两道关：先把 JSON 从一堆话里抠出来，再按 schema 逐字段验证。</p>
+<img src="https://img2024.cnblogs.com/blog/83005/202610/83005-20261023095411937-1360297944.svg" width="800" alt="" title="" crop="0,0,1,1" id="ud1ff90cd" class="ne-image">
+<p>第一道关很朴素：去掉 markdown 围栏，再用正则抓最外层那对花括号。</p>
+<pre><code class="language-python">def extract_json_from_llm_response(response: str) -&gt; dict:
+    text = re.sub(r"```(?:json)?", "", response)      # 去掉 ``` 围栏
+    match = re.search(r"\{.*\}", text, re.DOTALL)     # 取最外层花括号
+    if not match:
+        raise ValueError("响应里没找到 JSON")
+    return json.loads(match.group())
+</code></pre>
+<p>第二道关交给 <code>Pydantic</code>。</p>
+<p>两层分开的价值在于报错信息——<code>JSONDecodeError</code> 说明"模型没按格式说话"，<code>ValidationError</code> 说明"格式对了但内容不对"，这两种情况的处理方式完全不同（后面第 5 节会用到这个区别），所以别把它们塞进同一个 <code>except Exception</code>。</p>
+<h1 id="3-契约长什么样类型范围格式">3. 契约长什么样：类型、范围、格式</h1>
+<p>定义一个 <code>Resume</code>，字段和约束写在一起：</p>
+<pre><code class="language-python">class Resume(BaseModel):
+    name: str
+    email: EmailStr
+    phone: str
+    city: str
+    expected_salary: int = Field(..., gt=0, le=100_000)
+    skills: List[str] = Field(..., min_length=1)
+    experiences: List[WorkExperience] = Field(..., min_length=1)
+    years_experience: float = Field(..., ge=0, le=40)
+</code></pre>
+<p><code>EmailStr</code> 直接验证邮箱格式（要装 <code>email-validator</code>，也就是 <code>pydantic[email]</code> 那个 extra）；</p>
+<p><code>Field(gt=0, le=100_000)</code> 把取值范围写进类型提示；</p>
+<p>字段默认必填，少了任何一个当场报 <code>Field required</code>，再加上 <code>min_length=1</code> 保证列表不为空。</p>
+<p>这几行就把第 1 节里的 ③ 挡住了：缺字段在入口就失败，不会等到下游才抛 <code>KeyError</code>。</p>
+<p>有意思的是自定义校验器。<strong>能确定地转换的值就别让它报错，顺手规整掉</strong>：</p>
+<pre><code class="language-python">@field_validator("phone")
+@classmethod
+def normalize_phone(cls, v: str) -&gt; str:
+    digits = re.sub(r"\D", "", v)                      # 去掉 "-"、空格
+    if digits.startswith("86") and len(digits) == 13:  # 去掉 +86 前缀
+        digits = digits[2:]
+    if len(digits) != 11 or not digits.startswith("1"):
+        raise ValueError(f"不是有效的手机号：{v!r}")
+    return digits
+
+@field_validator("expected_salary", mode="before")
+@classmethod
+def parse_salary(cls, v):
+    """把 '15k' / '1.5万' 先转成数字，再交给 int 校验。"""
+    ...
+</code></pre>
+<p><code>mode="before"</code> 的意思是"在类型校验之前先跑我"，所以它能吃到原始字符串。</p>
+<p>跑一遍看效果：</p>
+<pre><code class="language-plain">手机号 '138-0013-8000' -&gt; 13800138000
+薪资   '15k左右'       -&gt; 15000
+</code></pre>
+<p>格式乱七八糟但语义明确的输入被救回来了，库里存的永远是规整的 11 位手机号和整数金额。</p>
+<hr>
+<p><strong>救不回来的才报错</strong>，比如"五年"——你没法也不能替模型猜它是 5 还是 5.5，那就让它失败：</p>
+<pre><code class="language-plain">Input should be a valid number, unable to parse string as a number [input_value='五年']
+</code></pre>
+<p>这条信息里字段名、原因、原始值都在，正好可以直接回喂给模型（后面第 5 节）。</p>
+<p>判断标准就一条：<strong>转换规则是不是唯一确定的</strong>——是，就转成规范值；不是，就报错。</p>
+<h1 id="4-嵌套和跨字段抓编出来的数">4. 嵌套和跨字段：抓"编"出来的数</h1>
+<p>真实数据很少是扁平的。</p>
+<p>简历里有工作经历列表，那就再定义一个子模型，主模型里写 <code>List[WorkExperience]</code>：</p>
+<img src="https://img2024.cnblogs.com/blog/83005/202610/83005-20261023095411905-793326770.svg" width="800" alt="" title="" crop="0,0,1,1" id="u7cc59a7b" class="ne-image">
+<p><code>Pydantic</code> 会递归构造子对象，哪一条的哪个字段出错，报错信息会精确到"第 2 条经历的 start"。</p>
+<p>但范围和格式校验只能挡住"格式错"，挡不住模型一本正经地编数据。比如三段经历加起来才 7 年，它却在总年限里写了 9。</p>
+<p>这时候要跨字段核对：</p>
+<pre><code class="language-python">@field_validator("years_experience")
+@classmethod
+def check_years_match(cls, v: float, info) -&gt; float:
+    experiences = info.data.get("experiences") or []
+    if experiences:
+        total = sum(_years_of(e.start, e.end) for e in experiences)
+        if abs(total - v) &gt; 0.5:                       # 留 0.5 年的容差
+            raise ValueError(f"总工作年限 {v} 年与各段经历合计 {total:.2f} 年对不上")
+    return v
+</code></pre>
+<p>跑出来是这样：</p>
+<pre><code class="language-plain">Value error, 总工作年限 9.0 年与各段经历合计 7.00 年对不上
+</code></pre>
+<p>这种"自己跟自己对不上"的问题，是 LLM 输出里最需要盯的一类——单看每个字段都合法，合起来是假的。</p>
+<p>同样的思路可以用在很多地方：订单明细金额之和要等于订单总额、日报里的客单价要等于营业额除以订单数、抽取的日期区间不能倒过来。</p>
+<p>写的时候有个坑：<strong>校验器只能读到它前面已经校验过的字段</strong>，所以 <code>years_experience</code> 必须声明在 <code>experiences</code> 后面，否则 <code>info.data</code> 里是空的。</p>
+<p>另外容差别设成 0，模型算出来的合计经常差个零点几。</p>
+<h1 id="5-失败之后把错误原样回喂给模型">5. 失败之后：把错误原样回喂给模型</h1>
+<p>校验失败了怎么办？最省事也最有效的办法是<strong>把上一次的错误信息塞进 prompt 让它重答</strong>。</p>
+<img src="https://img2024.cnblogs.com/blog/83005/202610/83005-20261023095411918-183446255.svg" width="800" alt="" title="" crop="0,0,1,1" id="uf18bd870" class="ne-image">
+<pre><code class="language-python">def extract_with_retry(llm_call_function, max_retries: int = 3):
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return Resume(**extract_json_from_llm_response(llm_call_function(last_error)))
+        except ValidationError as e:
+            last_error = str(e)                        # schema 错：带上具体字段问题
+        except json.JSONDecodeError:
+            last_error = "返回不是合法 JSON，请只输出 JSON，不要任何解释文字。"
+        if attempt == max_retries - 1:
+            return None                                # 用尽次数，交给上层降级
+</code></pre>
+<p><code>llm_call_function(last_error)</code> 负责把错误拼进 <code>prompt</code>，模型因此知道该改哪里。</p>
+<p>同一份简历文本跑三轮的真实输出：</p>
+<pre><code class="language-plain">第 1 次失败：Input should be a valid number …（"五年"）
+第 2 次失败：总工作年限 9.0 年与各段经历合计 7.00 年对不上
+成功：陈舒雅，7.0 年经验，期望 15000 元，技能 ['Python', 'SQL', 'FineBI']
+</code></pre>
+<p>三个细节要注意：</p>
+<ol>
+<li><strong>JSON 错和 schema 错用不同的提示语</strong>，前者是"你没按格式说话"，后者是"某个字段不对"；</li>
+<li><strong>一定要设上限</strong>，用完次数返回 <code>None</code> 让上层降级（写人工审核队列、打日志告警），而不是让整个流程崩掉；</li>
+<li>调用时把 <code>temperature</code> 设成 0，否则同样的 prompt 每次错的地方都不一样，重试就白做了。</li>
+</ol>
+<h1 id="6-接到真实的模型调用上">6. 接到真实的模型调用上</h1>
+<p>前面的例子用的是模拟返回，换成真实 API 只多两步：把 <code>schema</code> 塞进 <code>prompt</code>，把返回值交给同一个 <code>parse_resume</code>。</p>
+<pre><code class="language-python">schema_hint = json.dumps(Resume.model_json_schema(), ensure_ascii=False)
+response = client.chat.completions.create(
+    model="gpt-4o-mini", temperature=0,
+    messages=[{"role": "user", "content": f"按这个 JSON Schema 抽取：\n{schema_hint}\n\n{text}"}])
+return parse_resume(response.choices[0].message.content)
+</code></pre>
+<p>用框架的话还更省事：<code>LangChain</code> 有 <code>llm.with_structured_output(Resume)</code>（走原生 function calling，推荐）和 <code>PydanticOutputParser</code>（靠 prompt 引导，任何模型都能用）；</p>
+<p>LlamaIndex 有 <code>LLMTextCompletionProgram.from_defaults(output_cls=Resume)</code>。</p>
+<p>但<strong>框架帮忙约束的是"结构"，不是"业务口径"</strong>。<code>function calling</code> 能保证字段和类型对，保证不了"总年限等于各段经历之和"这种你们业务自己的规则；</p>
+<p>而且结构化输出在极端情况下照样会不合规。</p>
+<p>所以最后那层 Pydantic 校验建议一直留着，它同时也是你接任何一家模型供应商时的统一出口——换模型不用改下游。</p>
+<h1 id="7-完整代码">7. 完整代码</h1>
+<p>完整可运行脚本共享在：<code>resume_extraction_demo.py</code> <a href="https://url11.ctfile.com/f/45455611-17569905548293-8f906d?p=6872" target="_blank" rel="noopener nofollow">https://url11.ctfile.com/f/45455611-17569905548293-8f906d?p=6872</a></p>
+<p>里面所有"模型返回"都是模拟字符串，装好 <code>pydantic[email]</code> 直接 <code>python resume_extraction_demo.py</code> 就能看到这篇文章里的每一组输出。</p>
+<p>模拟的代码执行结果如下：</p>
+<img src="https://img2024.cnblogs.com/blog/83005/202610/83005-20261023095411972-1264966590.png" width="1187" alt="" title="" crop="0,0,1,1" id="ue349eefc" class="ne-image">
+<p>想替换自己的场景也简单：</p>
+<p><strong>第一步，换模型。</strong> 把 <code>Resume</code> 的字段换成你的：单据日期、金额、类别、ID、负责人。先分清"必须有"和"可能有"，后者写 <code>Optional[str] = None</code>，别一股脑都设成必填，否则模型每次都被你打回来。数值字段一律加 <code>gt</code> / <code>ge</code> / <code>le</code>，这类约束最便宜也最有效。</p>
+<p><strong>第二步，换解析。</strong> <code>extract_json_from_llm_response</code> 和分层异常直接照抄，prompt 里带上 <code>model_json_schema()</code> 的输出，<code>temperature=0</code>。</p>
+<p><strong>第三步，换兜底。</strong> 失败 → 重试 2~3 次 → 还不行返回 <code>None</code> 走人工或降级。别让一次解析失败把整个批处理任务搞挂。</p>
+<p>回到开头那段 <strong>"返回 JSON"</strong> 的承诺。模型会不会出错，你控制不了；但"出错之后是当场被拦下、还是安静地流进数据库"，这一层完全在你手里。</p>
+<p>差别就是有没有把契约写成代码，写下来，它就变成每次调用都会执行的检查，而不是一句只在 <code>prompt</code> 里生效的口头约定。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-23 09:56">2026-10-23 09:56</span>&nbsp;
+<a href="https://www.cnblogs.com/wang_yb">wang_yb</a>&nbsp;
+阅读(<span id="post_view_count">108</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23409507);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fwang_yb%2Fp%2F23409507&amp;targetId=23409507&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
