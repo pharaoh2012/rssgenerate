@@ -1,0 +1,397 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/eventhorizon/p/23434966" title="发布于 2026-10-26 05:32">
+    
+
+    <span role="heading" aria-level="2">RequestBatcher 0.3.x 版本，优雅升级</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="更新概览">更新概览</h2>
+<ol>
+<li><a href="#%E5%A7%94%E6%89%98-handler%E5%9C%A8%E8%B0%83%E7%94%A8%E5%A4%84%E7%BB%84%E7%BB%87%E5%A4%84%E7%90%86%E9%80%BB%E8%BE%91" rel="noopener nofollow">委托 Handler</a></li>
+<li><a href="#named-requestbatcher" rel="noopener nofollow">Named RequestBatcher</a></li>
+<li><a href="#%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7" rel="noopener nofollow">可观测性</a></li>
+</ol>
+<p>项目地址：</p>
+<p><a href="https://github.com/eventhorizon-cli/RequestBatcher" target="_blank" rel="noopener nofollow">https://github.com/eventhorizon-cli/RequestBatcher</a></p>
+<p>NuGet：</p>
+<p><a href="https://www.nuget.org/packages/RequestBatcher/" target="_blank" rel="noopener nofollow">https://www.nuget.org/packages/RequestBatcher/</a></p>
+<p>本文基于正式发布的 RequestBatcher v0.3.4 源码和中文 README 编写：</p>
+<p><a href="https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4" target="_blank" rel="noopener nofollow">https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4</a></p>
+<h2 id="前言">前言</h2>
+<p>RequestBatcher 是一个进程内请求批处理库。调用方可以独立提交请求，RequestBatcher 将已经排队的请求合并成批次，交给应用的 Handler 处理，再将结果分别返回给对应的调用方。</p>
+<p>基本用法和处理语义见<a href="https://www.cnblogs.com/eventhorizon/p/23320338" target="_blank">前一篇文章</a>，本文介绍委托 Handler、Named RequestBatcher 和可观测性。</p>
+<p>现有内存 Benchmark 中，委托 Handler 与 Handler 类的稳定调用性能几乎没有差别；这组结果不包含首次绑定的编译开销，测试条件和原始数据见：</p>
+<p><a href="https://github.com/eventhorizon-cli/RequestBatcher/blob/core-v0.3.4/docs/evaluations/delegate-handlers/README.md" target="_blank" rel="noopener nofollow">https://github.com/eventhorizon-cli/RequestBatcher/blob/core-v0.3.4/docs/evaluations/delegate-handlers/README.md</a></p>
+<h2 id="委托-handler在调用处组织处理逻辑">委托 Handler：在调用处组织处理逻辑</h2>
+<p>以批量查询商品价格为例，原来的写法需要实现并注册 <code>IRequestBatchHandler</code>。示例中的 <code>IPriceStore.FindAsync</code> 接收商品 ID 和取消令牌，返回价格字典，缺失商品不出现在字典中：</p>
+<pre><code class="language-csharp">public sealed class PriceByIdHandler(
+    [FromKeyedServices("catalog")] IPriceStore store)
+    : IRequestBatchHandler&lt;int, decimal?&gt;
+{
+    public async ValueTask HandleAsync(
+        IReadOnlyList&lt;RequestBatchEntry&lt;int, decimal?&gt;&gt; entries,
+        CancellationToken cancellationToken = default)
+    {
+        var ids = entries.Select(entry =&gt; entry.Request).Distinct().ToArray();
+        var pricesById = await store.FindAsync(ids, cancellationToken).ConfigureAwait(false);
+        entries.SetResponses(id =&gt;
+            pricesById.TryGetValue(id, out var price) ? price : (decimal?)null);
+    }
+}
+</code></pre>
+<p>注册时指定 Handler 类型，并通过 <code>handlerLifetime</code> 设置 Handler 的生命周期：</p>
+<pre><code class="language-csharp">services.AddRequestBatcher&lt;int, decimal?, PriceByIdHandler&gt;(
+    batcherName: "price",
+    handlerLifetime: ServiceLifetime.Scoped);
+</code></pre>
+<p>使用委托 Handler 后，<strong>可以省去 <code>PriceByIdHandler</code> 类，把相同的查询与回填逻辑直接写在 <code>ExecuteAsync</code> 调用处</strong>：</p>
+<pre><code class="language-csharp">using Microsoft.Extensions.DependencyInjection;
+using RequestBatcher;
+
+public sealed class PriceLookup(
+    [FromKeyedServices("price")] IRequestBatcher&lt;int, decimal?&gt; batcher)
+{
+    public Task&lt;IReadOnlyList&lt;decimal?&gt;&gt; FindAsync(
+        IEnumerable&lt;int&gt; productIds,
+        CancellationToken cancellationToken = default) =&gt;
+        batcher.ExecuteAsync(
+            productIds,
+            static async ValueTask (
+                IReadOnlyList&lt;RequestBatchEntry&lt;int, decimal?&gt;&gt; entries,
+                [FromKeyedServices("catalog")] IPriceStore store,
+                CancellationToken batchCancellation) =&gt;
+            {
+                var ids = entries.Select(entry =&gt; entry.Request).Distinct().ToArray();
+                var pricesById = await store.FindAsync(ids, batchCancellation)
+                    .ConfigureAwait(false);
+
+                entries.SetResponses(id =&gt;
+                    pricesById.TryGetValue(id, out var price) ? price : (decimal?)null);
+            },
+            cancellationToken);
+}
+</code></pre>
+<p>委托方式改用 <code>AddDelegateRequestBatcher</code> 注册，与上面的 Handler 类注册二选一：</p>
+<pre><code class="language-csharp">services.AddDelegateRequestBatcher&lt;int, decimal?&gt;(batcherName: "price");
+services.AddScoped&lt;PriceLookup&gt;();
+</code></pre>
+<p><strong>委托方式无需指定 <code>handlerLifetime</code>，处理委托由 RequestBatcher 实例绑定并跨批次复用。</strong></p>
+<p>委托所需的服务在每个批次执行时解析，仍遵循各自注册的 DI 生命周期。</p>
+<p>提交请求时，通过 <code>ExecuteAsync</code> 的 <code>handler</code> 参数传入处理委托。它支持单个请求和显式列表提交，也支持有返回值、无返回值两种形式。</p>
+<h3 id="参数注入">参数注入</h3>
+<p><strong>Handler 类通过构造函数注入服务，委托 Handler 则通过方法参数注入服务。</strong></p>
+<p>RequestBatcher 执行批次时，从 DI 容器解析参数所需的服务。</p>
+<p>上面的委托参数分别是：</p>
+<ul>
+<li><code>entries</code>：由 RequestBatcher 提供本次实际处理的请求批次，必须放在第一个参数。</li>
+<li><code>store</code>：通过 <code>[FromKeyedServices("catalog")]</code> 注入指定 Key 的 <code>IPriceStore</code>；普通服务参数无需该属性，直接按类型解析。</li>
+<li><code>batchCancellation</code>：由 RequestBatcher 提供批次处理的取消令牌，可以省略这个参数。</li>
+</ul>
+<p>上面的 Keyed 服务需注册到 DI 容器：</p>
+<pre><code class="language-csharp">services.AddKeyedScoped&lt;IPriceStore, PriceStore&gt;("catalog");
+</code></pre>
+<p>这里的 <code>"catalog"</code> 选择存储服务，<code>PriceLookup</code> 构造函数中的 <code>"price"</code> 选择 RequestBatcher 实例。</p>
+<p><strong>使用 Lambda 时，需要显式加上 <code>static</code>，不能捕获外部局部变量或实例状态；所需服务通过委托参数注入。</strong></p>
+<p>调用方传入请求、处理委托和自己的取消令牌；委托参数由 RequestBatcher 填充。</p>
+<p><strong>有服务参数时，每个实际执行批次都会创建独立的异步 DI Scope。</strong></p>
+<p>Scoped 服务在批次内共享，Singleton 服务在容器内共享，Transient 服务按每个参数分别解析。服务来自批次自己的 Scope，即使一个批次合并了多个 HTTP 请求，也不会使用其中某个请求的 Scope。</p>
+<p>处理委托和调用器会被缓存，服务实例按批次解析。调用方收到完成结果前，批次 Scope 的异步释放已经完成；没有服务参数时，无需创建 Scope。</p>
+<p><code>batchCancellation</code> 属于 RequestBatcher 自身的处理生命周期。正常调用 <code>DisposeAsync</code> 时，会先停止接收新请求、等待已接收的请求和执行中的批次完成，最后取消这个令牌以停止消费循环。</p>
+<p><code>ExecuteAsync</code> 最后的 <code>cancellationToken</code> 属于调用方，只能在分发前取消自己的请求。</p>
+<p><strong>一旦请求已经交给 Handler，就继续返回实际处理结果，单个调用方取消不会中止共享批次。</strong></p>
+<h3 id="静态实现与委托绑定">静态实现与委托绑定</h3>
+<p>传入的处理委托必须使用静态实现。除了上面的静态 Lambda，还支持静态匿名方法、显式声明为 <code>static</code> 的局部函数，以及指向普通或泛型静态方法的方法组。</p>
+<p>也可以在首次提交前选用下面的静态方法写法，替代前面的 Lambda 实现：</p>
+<pre><code class="language-csharp">public sealed class PriceLookup(
+    [FromKeyedServices("price")] IRequestBatcher&lt;int, decimal?&gt; batcher)
+{
+    public Task&lt;IReadOnlyList&lt;decimal?&gt;&gt; FindAsync(
+        IEnumerable&lt;int&gt; productIds,
+        CancellationToken cancellationToken = default) =&gt;
+        batcher.ExecuteAsync(productIds, HandlePricesAsync, cancellationToken);
+
+    private static async ValueTask HandlePricesAsync(
+        IReadOnlyList&lt;RequestBatchEntry&lt;int, decimal?&gt;&gt; entries,
+        [FromKeyedServices("catalog")] IPriceStore store,
+        CancellationToken batchCancellation)
+    {
+        var ids = entries.Select(entry =&gt; entry.Request).Distinct().ToArray();
+        var pricesById = await store.FindAsync(ids, batchCancellation).ConfigureAwait(false);
+        entries.SetResponses(id =&gt;
+            pricesById.TryGetValue(id, out var price) ? price : (decimal?)null);
+    }
+}
+</code></pre>
+<p><strong>同一个 RequestBatcher 实例只绑定一次处理委托，后续提交需要传入相等的委托。</strong></p>
+<p>相等性按委托对应的方法和目标对象判断，无需始终传入同一个委托对象。</p>
+<p>重复调用 <code>PriceLookup</code> 实例的 <code>FindAsync</code>，使用的是同一处 Lambda 或同一个静态方法。已经绑定 Lambda 的实例改传其他方法组，会在入队前报错。</p>
+<p>不同位置的 Lambda 即使代码相同，也可能对应不同的 Handler 目标。多处业务共用一个 RequestBatcher 实例时，可以统一通过 <code>PriceLookup</code> 提交，或统一使用同一个静态方法；不同处理逻辑则使用不同的 <code>batcherName</code>。</p>
+<p>委托可以通过变量、字段、参数、属性或工厂传递；每次 <code>ExecuteAsync</code> 都需要传入 Handler。</p>
+<h3 id="签名与编译期检查">签名与编译期检查</h3>
+<p>无返回值模式使用 <code>AddDelegateRequestBatcher&lt;TRequest&gt;()</code> 注册，委托首参数为 <code>IReadOnlyList&lt;TRequest&gt;</code>。</p>
+<p>有返回值模式使用 <code>IReadOnlyList&lt;RequestBatchEntry&lt;TRequest, TResponse&gt;&gt;</code>，<strong>每个条目都需要设置响应，包括表示未找到的 <code>null</code>。</strong></p>
+<p>委托支持同步 <code>void</code>、<code>Task</code> 和 <code>ValueTask</code> 返回类型，不支持 <code>async void</code>、<code>Task&lt;T&gt;</code> 或 <code>ValueTask&lt;T&gt;</code>。响应通过条目回填。</p>
+<p>参数必须是必需参数，不支持 <code>ref</code>、<code>out</code> 等按引用参数。Handler 可以省略整个 <code>CancellationToken</code> 参数；声明时最多一个，而且不能写 <code>= default</code>。</p>
+<p>前例中 <code>PriceLookup.FindAsync</code> 的调用方令牌可以有默认值，委托 Handler 的注入参数则不能有默认值。</p>
+<p>NuGet 包内置两个默认按编译错误报告的 Analyzer 诊断：</p>
+<ul>
+<li><code>RB0001</code>：对能够确定来源的 Handler，检查其是否使用静态实现。</li>
+<li><code>RB0002</code>：检查能够确定的委托签名，包括首参数类型、返回类型、参数修饰符、默认值及注入属性等。</li>
+</ul>
+<p>当委托经过属性、工厂或参数传递时，Analyzer 可能无法确定最终目标；这类传递仍然允许，调用方需要保证实际使用静态实现。运行时继续检查实际签名、服务绑定和委托一致性，无法可靠区分源码中的静态 Lambda 与不捕获变量的普通 Lambda。</p>
+<p>委托自动绑定依赖动态代码和反射元数据，<strong>当前不支持 NativeAOT 或裁剪。</strong></p>
+<h2 id="named-requestbatcher">Named RequestBatcher</h2>
+<p>价格查询和库存查询都接收商品 ID，可以分别注册为 <code>"price"</code> 和 <code>"stock"</code>。以下代码替换前面的单独注册：</p>
+<pre><code class="language-csharp">services.AddDelegateRequestBatcher&lt;int, decimal?&gt;(
+    batcherName: "price",
+    configure: options =&gt;
+    {
+        options.BatchSize = 100;
+        options.MaxConcurrency = 4;
+    });
+
+services.AddDelegateRequestBatcher&lt;int, int?&gt;(
+    batcherName: "stock",
+    configure: options =&gt;
+    {
+        options.BatchSize = 200;
+        options.MaxConcurrency = 2;
+    });
+</code></pre>
+<p><code>"price"</code> 返回价格，<code>"stock"</code> 返回库存数量。</p>
+<p><strong>两个实例分别持有自己的 Handler、队列、容量和并发限制。</strong></p>
+<h3 id="解析与注入">解析与注入</h3>
+<p>可以直接从应用的 Service Provider 解析指定名称的 RequestBatcher 实例：</p>
+<pre><code class="language-csharp">var priceBatcher = serviceProvider
+    .GetRequiredKeyedService&lt;IRequestBatcher&lt;int, decimal?&gt;&gt;("price");
+
+var stockBatcher = serviceProvider
+    .GetRequiredKeyedService&lt;IRequestBatcher&lt;int, int?&gt;&gt;("stock");
+</code></pre>
+<p>在应用服务构造函数中，可以通过 <code>[FromKeyedServices("price")]</code> 注入对应的 RequestBatcher 实例，前面的 <code>PriceLookup</code> 就采用这种方式。</p>
+<p>ASP.NET Core Controller Action 和 Minimal API Endpoint 参数也支持使用同一属性注入对应实例。</p>
+<p>无名称的注册继续提供默认服务，通过普通的 <code>GetRequiredService</code> 或构造函数注入解析。默认实例和命名实例可以共存。</p>
+<h3 id="名称配置与路由">名称、配置与路由</h3>
+<p>名称区分大小写，不能为 <code>null</code>、空字符串或空白。</p>
+<p><strong>同一请求类型与名称只能注册一个 RequestBatcher 实例</strong>，即使返回类型不同，也不能复用同一个名称再次注册。</p>
+<p>例如，价格查询的 <code>MaxConcurrency</code> 为 4、库存查询为 2，两者访问同一下游时，应考虑合计的并发量。</p>
+<p><strong>各个 RequestBatcher 的参数通过注册回调配置，注册后固定，当前不支持运行时调整。</strong></p>
+<p><code>batcherName</code> 用于选择实例，<code>UsePartitionKey</code> 配置实例内部的请求路由。以下代码替换 <code>"price"</code> 的注册，按商品 ID 路由：</p>
+<pre><code class="language-csharp">services.AddDelegateRequestBatcher&lt;int, decimal?&gt;(
+    batcherName: "price",
+    configure: options =&gt;
+    {
+        options.BatchSize = 100;
+        options.MaxConcurrency = 4;
+        options.UsePartitionKey(id =&gt; id, partitionCount: 8);
+    });
+</code></pre>
+<p>相同商品 ID 进入同一个 Partition，8 个 Partition 共享实例的 4 个 Handler 执行名额。</p>
+<p>相同 ID 的请求仍可能分到多个并发执行的批次。批次内去重由 Handler 完成，执行顺序和跨批次缓存由业务控制。</p>
+<p>请求合并仍采用机会式攒批：有执行名额时处理当前已经排队的请求，不等待固定的收集窗口。队列容量、异常回传、分发前取消和容器释放时排空请求等规则同样适用。RequestBatcher 在进程内工作，进程故障后无法恢复尚未完成的请求。</p>
+<h2 id="可观测性">可观测性</h2>
+<h3 id="opentelemetry-集成">OpenTelemetry 集成</h3>
+<p>核心 <a href="https://www.nuget.org/packages/RequestBatcher" target="_blank" rel="noopener nofollow"><code>RequestBatcher</code></a> 包通过 .NET 内置 API 提供名为<br>
+<code>RequestBatcher</code> 的 ActivitySource 和 Meter，不依赖 OpenTelemetry。可选的<br>
+<a href="https://www.nuget.org/packages/RequestBatcher.OpenTelemetry" target="_blank" rel="noopener nofollow"><code>RequestBatcher.OpenTelemetry</code></a> 包提供注册扩展，<br>
+并根据请求提交的采样结果决定 Handler 批次是否采样。两个包独立维护版本号。</p>
+<p>安装集成包，以及应用需要的 Hosting、Instrument 和 Exporter 包：</p>
+<pre><code class="language-bash">dotnet add package RequestBatcher
+dotnet add package RequestBatcher.OpenTelemetry
+dotnet add package OpenTelemetry.Extensions.Hosting
+dotnet add package OpenTelemetry.Instrumentation.AspNetCore
+dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+</code></pre>
+<p>在应用现有的 OpenTelemetry Provider 中注册 Tracing 和 Metrics：</p>
+<pre><code class="language-csharp">using Microsoft.Extensions.DependencyInjection;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
+
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing =&gt; tracing
+        .AddAspNetCoreInstrumentation()
+        .AddRequestBatcherInstrumentation()
+        .AddOtlpExporter())
+    .WithMetrics(metrics =&gt; metrics
+        .AddRequestBatcherInstrumentation()
+        .AddOtlpExporter());
+</code></pre>
+<p><strong>仅安装包不会自动开始采集；需要在使用的 Provider 中注册对应扩展。</strong></p>
+<h3 id="链路追踪">链路追踪</h3>
+<table>
+<thead>
+<tr>
+<th>Span</th>
+<th>关注内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RequestBatcher.Execute</code></td>
+<td>一次 <code>ExecuteAsync</code> 提交，有调用方当前的 Span 时作为它的子 Span，否则自身为根 Span。耗时包含容量等待、排队、Handler 处理和结果完成。</td>
+</tr>
+<tr>
+<td><code>RequestBatcher.Handle</code></td>
+<td>一次 Handler 批次，是独立链路的根 Span；Handler 内通过 Instrument 采集的数据库和 HTTP 调用显示为它的子 Span。</td>
+</tr>
+</tbody>
+</table>
+<p>查看链路时，从 <code>Execute</code> 沿 Link 跳转到实际处理其请求的 <code>Handle</code>。一次提交可以跨多个 Handler 批次，<br>
+一个 Handler 批次也可以合并多次提交的请求。Link 用于在这些链路之间跳转，不会改变 Span 的父子关系，也不保证执行顺序。</p>
+<p>Named RequestBatcher 会在操作名后追加注册名称，例如 <code>RequestBatcher.Execute pricing-queries</code> 和<br>
+<code>RequestBatcher.Handle pricing-queries</code>。过滤和查看 Span 时，可以关注这些属性：</p>
+<ul>
+<li><code>requestbatcher.name</code>：配置的 Batcher 名称，未配置时省略。</li>
+<li><code>requestbatcher.request.type</code>：公开请求类型的短名，例如 <code>Int32</code>，不含命名空间。</li>
+<li><code>requestbatcher.batch.size</code>：一个 Handler 批次中的请求数。</li>
+<li><code>requestbatcher.batch.submission.count</code>：该 Handler 批次合并了多少次不同的 <code>ExecuteAsync</code> 提交。<br>
+同一次提交的多项请求，在每个批次中只计一次。</li>
+</ul>
+<p><strong>Handler 不会继承调用方的 HTTP Span、日志 Scope、Baggage 或其他 <code>AsyncLocal</code> 值。</strong></p>
+<p>租户标识等业务数据应通过请求显式传递；Handler 内创建的 Activity 会正常关联到当前批次 Span。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1201123/202610/1201123-20261026053026764-1090919904.png" alt="RequestBatcher 可观测性模型" loading="lazy"></p>
+<h4 id="采样">采样</h4>
+<p>注册 Tracing 扩展后，应用的 Sampler 决定每个 <code>Execute</code> Span 是否采样。<br>
+集成包根据进入当前 Handler 批次的请求所对应的 <code>Execute</code> Span，决定 <code>Handle</code> 是否采样：</p>
+<table>
+<thead>
+<tr>
+<th>当前批次对应的 Execute Span</th>
+<th>Handle 采样行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>至少一个已采样</td>
+<td>采样该 Handler 批次。</td>
+</tr>
+<tr>
+<td>全部未采样</td>
+<td>不采样该 Handler 批次。</td>
+</tr>
+</tbody>
+</table>
+<p><img src="https://img2024.cnblogs.com/blog/1201123/202610/1201123-20261026054218943-963211401.png" alt="RequestBatcher 采样与上下文传递流程" loading="lazy"></p>
+<p>Handler 内数据库和 HTTP 子 Span 仍使用应用的 Sampler。<code>ParentBasedSampler</code> 表示子 Span 跟随父 Span 的采样决定，<br>
+没有父 Span 时使用指定的根采样器。例如 <code>ParentBasedSampler(new AlwaysOnSampler())</code> 会采样根 Span，<br>
+子 Span 则跟随父级。集成包对独立的 <code>Handle</code> 根 Span 使用上表中的规则。</p>
+<p>也可以选择不安装集成包，直接注册 <code>AddSource("RequestBatcher")</code>。此时应用的 Sampler 会独立决定 <code>Handle</code><br>
+是否采样，因此即使 <code>Execute</code> 已采样，对应的 Handler 处理链路仍可能缺失。采样、导出及 Link 数量限制也可能导致<br>
+关联不完整；大批次需要保留更多关联时，应调整 SDK 的 Span Link 上限。0% 采样不等于完全关闭 Instrument。</p>
+<p>上下文与 Link 的实现，以及性能评估，见<a href="https://github.com/eventhorizon-cli/RequestBatcher/blob/core-v0.3.4/docs/observability-design.md" target="_blank" rel="noopener nofollow">可观测性设计</a>。</p>
+<h3 id="metrics">Metrics</h3>
+<p>如果只需要 Metrics，可以选择不安装集成包，直接监听 Meter：</p>
+<pre><code class="language-csharp">builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics =&gt; metrics.AddMeter("RequestBatcher"));
+</code></pre>
+<p>也可以安装 <a href="https://www.nuget.org/packages/RequestBatcher.OpenTelemetry" target="_blank" rel="noopener nofollow"><code>RequestBatcher.OpenTelemetry</code></a>，<br>
+使用前面示例中的 Metrics <code>AddRequestBatcherInstrumentation()</code> 扩展。</p>
+<table>
+<thead>
+<tr>
+<th>指标名称</th>
+<th>类型</th>
+<th>单位</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>requestbatcher.requests.submitted</code></td>
+<td><code>Counter&lt;long&gt;</code></td>
+<td><code>{request}</code>（请求）</td>
+<td>已接收的请求数。</td>
+</tr>
+<tr>
+<td><code>requestbatcher.requests.processed</code></td>
+<td><code>Counter&lt;long&gt;</code></td>
+<td><code>{request}</code>（请求）</td>
+<td>Handler 已处理的请求数，包含失败的处理。</td>
+</tr>
+<tr>
+<td><code>requestbatcher.batches.processed</code></td>
+<td><code>Counter&lt;long&gt;</code></td>
+<td><code>{batch}</code>（批次）</td>
+<td>已处理的 Handler 批次数。</td>
+</tr>
+<tr>
+<td><code>requestbatcher.batch.size</code></td>
+<td><code>Histogram&lt;long&gt;</code></td>
+<td><code>{request}</code>（请求）</td>
+<td>每个 Handler 批次的请求数。</td>
+</tr>
+<tr>
+<td><code>requestbatcher.batch.duration</code></td>
+<td><code>Histogram&lt;double&gt;</code></td>
+<td><code>ms</code>（毫秒）</td>
+<td>Handler 批次耗时，包含 Handler 作用域释放。</td>
+</tr>
+</tbody>
+</table>
+<p>维度只包含请求类型短名（<code>requestbatcher.request.type</code>）和可选的 Batcher 名称（<code>requestbatcher.name</code>）。<br>
+同名类型会共享请求类型维度，需要区分时可以配置不同的 Batcher 名称。不记录请求内容、租户值或 Partition Key。</p>
+<p>指标名称已包含 <code>requestbatcher.</code>；示例的 Prometheus Exporter 会生成<br>
+<code>requestbatcher_batches_processed_total</code>。导出端不要重复添加 <code>requestbatcher</code> 命名空间/前缀，<br>
+以免出现 <code>requestbatcher_requestbatcher_*</code>。</p>
+<p>自行使用 <code>System.Diagnostics.Metrics.MeterListener</code> 采集时，<strong>需要显式订阅想采集的指标</strong>：</p>
+<pre><code class="language-csharp">listener.InstrumentPublished = (instrument, meterListener) =&gt;
+{
+    if (instrument.Meter.Name == "RequestBatcher")
+    {
+        meterListener.EnableMeasurementEvents(instrument);
+    }
+};
+</code></pre>
+<ul>
+<li>发现指标或注册测量值回调都不等于订阅。每个监听者对想采集的每个指标调用一次 <code>EnableMeasurementEvents</code>；<br>
+如需只采集部分指标，可以按 <code>instrument.Name</code> 筛选。</li>
+<li>为计数和批次大小注册 <code>long</code> 回调，为耗时注册 <code>double</code> 回调。在提交请求前调用 <code>Start()</code>，<br>
+并让监听者存活到 Batcher 关闭完成后。订阅前的测量值不会补发。</li>
+<li>回调同步执行，也可能被多个线程并发调用，应保持轻量、线程安全，避免阻塞 I/O 和异常向外传播。<br>
+回调返回后仍要使用的标签需要复制。聚合和导出由自定义 Listener 自行实现。</li>
+</ul>
+<h3 id="logs">Logs</h3>
+<p>内置日志通过应用现有的 <code>Microsoft.Extensions.Logging</code> 管道输出，无需安装 OpenTelemetry 集成包。<br>
+日志类别前缀为 <code>RequestBatcher.RequestBatchCoordinator</code>；可以在 <code>appsettings.json</code> 中用 <code>RequestBatcher</code> 前缀统一调整级别：</p>
+<pre><code class="language-json">{
+  "Logging": {
+    "LogLevel": {
+      "RequestBatcher": "Warning"
+    }
+  }
+}
+</code></pre>
+<p>该配置保留 Warning 及以上级别；Debug 可查看启动和停止日志，Trace 还会记录每批处理的开始与完成。<br>
+Handler 失败日志包含原始异常，库本身不会记录请求内容。</p>
+<h2 id="可运行示例">可运行示例</h2>
+<p>委托 Handler 和 Handler 类各有一套独立的 PostgreSQL 示例。委托版在提交处使用静态 Lambda，注入批次 Scope 中的 Keyed <code>PriceStore</code>，包括价格写入和 <code>POST /prices/query</code> 批量查询：</p>
+<p><a href="https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4/samples/RequestBatcher.Delegates" target="_blank" rel="noopener nofollow">https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4/samples/RequestBatcher.Delegates</a></p>
+<p>Handler 类版本使用名为 <code>"price"</code> 的 RequestBatcher 实例，直接接收商品 ID，返回可空价格：</p>
+<p><a href="https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4/samples/RequestBatcher.Deduplication" target="_blank" rel="noopener nofollow">https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4/samples/RequestBatcher.Deduplication</a></p>
+<p>此外，可观测性示例通过 Docker Compose 启动 Cart、Pricing、PostgreSQL 和 Grafana OTel LGTM，并持续生成请求，展示合批后的跨服务链路及指标：</p>
+<p><a href="https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4/samples/RequestBatcher.Observability" target="_blank" rel="noopener nofollow">https://github.com/eventhorizon-cli/RequestBatcher/tree/core-v0.3.4/samples/RequestBatcher.Observability</a></p>
+<p>完整的参数约定与使用说明见中文 README：</p>
+<p><a href="https://github.com/eventhorizon-cli/RequestBatcher/blob/core-v0.3.4/README.zh-CN.md" target="_blank" rel="noopener nofollow">https://github.com/eventhorizon-cli/RequestBatcher/blob/core-v0.3.4/README.zh-CN.md</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.007638888888888889" data-date-updated="2026-10-26 05:44">2026-10-26 05:32</span>&nbsp;
+<a href="https://www.cnblogs.com/eventhorizon">黑洞视界</a>&nbsp;
+阅读(<span id="post_view_count">2</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23434966);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Feventhorizon%2Fp%2F23434966&amp;targetId=23434966&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
