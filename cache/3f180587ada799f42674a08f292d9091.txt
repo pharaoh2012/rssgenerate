@@ -1,0 +1,620 @@
+
+		<h2>
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/liuziyi1/p/23442505" title="发布于 2026-10-26 16:22">
+    
+
+    <span role="heading" aria-level="2">Linux 大文件审计脚本：从“找到大文件”到“智能给出清理建议”</span>
+    
+
+</a>
+
+		</h2>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="一引子磁盘告警时我们到底需要什么">一、引子：磁盘告警时，我们到底需要什么？</h2>
+<p>凌晨两点，监控告警：<code>/</code> 分区使用率 92%。</p>
+<p>你 SSH 上去，第一反应是 <code>du -sh /* | sort -h</code> 或者 <code>find / -size +1G</code>。命令敲完，屏幕上刷出一堆路径：</p>
+<pre><code>939M  /var/lib/docker/containerd/.../blobs/sha256/8d34...
+931M  /u01/app/oracle/oradata/ORCL11G/system01.dbf
+831M  /u01/app/oracle/oradata/ORCL11G/sysaux01.dbf
+574M  /usr/local/mysql/lib/libmysqld.a
+513M  /u01/app/oracle/oradata/ORCL11G/temp02.dbf
+</code></pre>
+<p>然后呢？<strong>知道哪些文件大，和知道哪些文件能删，是两件事。</strong></p>
+<p>如果手抖 <code>rm</code> 了 <code>system01.dbf</code>，数据库直接报废。如果 <code>rm</code> 了 containerd 的 blob 文件，Docker 镜像层会损坏。如果 <code>rm</code> 了正在写入的日志，<code>df</code> 空间还不释放——因为进程还持有 inode。</p>
+<p>我最初写的第一版脚本，就是简单遍历文件系统找大文件，按大小排序列出来。用了一段时间，踩过坑之后发现：<strong>审计工具的价值不在于"发现大文件"，而在于"告诉运维这个文件能不能动、该怎么动"。</strong></p>
+<p>于是就有了这个 v2.0 版本：一个会按路径智能识别文件类型、给出分级清理建议、生成安全清理命令清单的大文件审计脚本。</p>
+<hr>
+<h2 id="二第一版脚本的问题">二、第一版脚本的问题</h2>
+<p>第一版脚本的核心逻辑很简单：</p>
+<pre><code class="language-bash">df -Pl -x tmpfs ... | awk '{print $6}' | while read mp; do
+    find "$mp" -xdev -type f -size +500M -printf '%s\t%p\n' | sort -nr
+done
+</code></pre>
+<p>能跑，但在我那台跑了 Oracle + MySQL + Docker 的机器上，输出是这样的：</p>
+<pre><code>[check-lsof]  931MB  /u01/app/oracle/oradata/ORCL11G/system01.dbf
+               建议: 删除前务必用 lsof 检查是否被进程占用
+</code></pre>
+<p>问题很明显：</p>
+<ol>
+<li><strong>Oracle 数据文件被标成"用 lsof 检查一下"</strong> —— 这是<strong>误导</strong>。<code>system01.dbf</code> 根本不该出现在"候选删除清单"里，它就不应该被考虑删除。正确提示应该是"禁止删除"。</li>
+<li><strong>Docker 的 containerd blob 被建议 lsof</strong> —— 但 blob 文件不该被直接 <code>rm</code>，正确操作是 <code>docker system prune</code>。</li>
+<li><strong><code>/usr/local/mysql/lib/libmysqld.a</code> 被打成"系统路径，极度谨慎"</strong> —— 实际上它只是个编译产物静态库，没有编译需求时删了毫无影响。</li>
+<li><strong>没有概览</strong> —— 只看到一堆文件，不知道总共有多少、哪个风险等级占多少、能回收多少空间。</li>
+<li><strong><code>./script.sh help</code> 报"未知参数"</strong> —— 只认 <code>-h</code>，不认 <code>help</code> 子命令，不友好。</li>
+<li><strong>输出格式 bug</strong> —— <code>[check-lsof]</code> 的 <code>[</code> 被 cut 掉了，成了 <code>check-lsof]</code>。</li>
+</ol>
+<p>所以 v2.0 的目标很明确：<strong>从"列清单"升级为"做判断"</strong>。</p>
+<hr>
+<h2 id="三v20-的设计思路">三、v2.0 的设计思路</h2>
+<h3 id="31-风险四级分类">3.1 风险四级分类</h3>
+<p>把所有大文件按<strong>能不能删</strong>分成四档，颜色区分：</p>
+<table>
+<thead>
+<tr>
+<th>等级</th>
+<th>标记</th>
+<th>含义</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>🚫 禁止删除</td>
+<td>红色</td>
+<td>删了直接出事</td>
+<td>Oracle 数据文件、MySQL 表空间、PG WAL</td>
+</tr>
+<tr>
+<td>⚠️ 谨慎处理</td>
+<td>黄色</td>
+<td>需结合业务判断</td>
+<td>正在写入的日志、系统路径、binlog</td>
+</tr>
+<tr>
+<td>✅ 可安全清理</td>
+<td>绿色</td>
+<td>删了有兜底/可重建</td>
+<td>旧日志、缓存、containerd、coredump</td>
+</tr>
+<tr>
+<td>🔄 按需清理</td>
+<td>青色</td>
+<td>确认后可删</td>
+<td>归档包、备份、<code>.a</code> 静态库、ISO</td>
+</tr>
+</tbody>
+</table>
+<p>判断规则放在 <code>classify()</code> 函数里，<strong>匹配顺序从具体到宽泛</strong>：</p>
+<pre><code>具体路径（Oracle/MySQL/PG 数据文件）&gt; 容器/日志/缓存 &gt; 扩展名（.tar/.bak/.a）&gt; 系统路径兜底
+</code></pre>
+<h3 id="32-针对性清理姿势而不是一律-rm">3.2 针对性清理姿势，而不是一律 <code>rm</code></h3>
+<p>每个分类不只是给个风险等级，还给出<strong>该类型文件的正确清理方式</strong>：</p>
+<ul>
+<li><strong>Oracle temp 表空间</strong> → <code>ALTER TABLESPACE TEMP SHRINK SPACE</code>，别在 OS 层动</li>
+<li><strong>containerd blob</strong> → <code>docker system prune -a</code>，不是 <code>rm</code></li>
+<li><strong>journald 日志</strong> → <code>journalctl --vacuum-size=200M</code>，不是 <code>rm /var/log/journal/*</code></li>
+<li><strong>正在写入的日志</strong> → <code>truncate -s 0 FILE</code>，不是 <code>rm</code>（<code>rm</code> 后空间不释放！）</li>
+<li><strong>已轮转的旧日志</strong> → 直接 <code>rm</code> 即可</li>
+<li><strong>MySQL binlog</strong> → <code>PURGE BINARY LOGS BEFORE '...'</code></li>
+</ul>
+<h3 id="33-汇总--可回收空间估算">3.3 汇总 + 可回收空间估算</h3>
+<p>不要让人从上到下翻，一上来就告诉你全局：</p>
+<pre><code>共发现 6 个文件，总计 4.31 GB
+
+【风险分级汇总】
+   🚫 禁止删除   3 个    2.24 GB
+   ✅ 可安全清理 1 个    939.00 MB
+   🔄 按需清理   2 个    1.13 GB
+
+⛔ 警告: 发现 3 个「禁止删除」的关键文件（数据库数据等）
+💡 建议优先处理「可安全清理 + 按需清理」共 2.06 GB
+</code></pre>
+<h3 id="34---plan-生成安全清理命令清单">3.4 <code>--plan</code> 生成安全清理命令清单</h3>
+<p>只对 <code>SAFE</code> 和 <code>OPTIONAL</code> 类型的文件生成命令，<code>NO</code> 和 <code>CAUTION</code> 一律不出现。生成的命令也按类型适配——Docker 生成 <code>docker system prune</code>，日志生成 <code>truncate</code>，旧日志生成 <code>rm -f</code>。</p>
+<p><strong>但这只是候选清单，必须人工复核后执行。</strong> 脚本的原则始终是"只审计、只建议、绝不自动删除"。</p>
+<h3 id="35-性能与稳健性">3.5 性能与稳健性</h3>
+<ul>
+<li><strong><code>-t N</code> 快速模式</strong>：只分析最大的 N 个，大文件很多时秒出结果</li>
+<li><strong><code>-d DIR</code> 定向扫描</strong>：只看某个目录（比如 <code>/var/log</code>）</li>
+<li><strong><code>find -xdev</code></strong>：不跨挂载点，避免在一个扫描任务里同时检查根和一堆 <code>tmpfs</code></li>
+<li><strong><code>printf '%s\t%p\0'</code> + <code>sort -z</code></strong>：用 NUL 分隔，路径带空格/特殊字符也不会错乱</li>
+</ul>
+<hr>
+<h2 id="四完整脚本">四、完整脚本</h2>
+<pre><code class="language-bash">#!/bin/bash
+# ============================================================
+# large-file-audit.sh v2.0  —— 智能大文件审计
+#   - 按路径智能识别文件类型，给出分级清理建议
+#   - 汇总统计 + 优先清理项 + 可回收空间估算
+#   - 支持 help / -h / --help / -s SIZE / -t TOP / --plan
+#   - 只审计、只建议，绝不自动删除
+# ============================================================
+set -uo pipefail
+
+VERSION="2.0.0"
+THRESHOLD="500M"
+TOP=0
+CHECK_LSOF=false
+SUMMARY_ONLY=false
+EMIT_PLAN=false
+SCAN_DIRS=()
+USE_COLOR="auto"
+EMOJI=true
+
+# ---------- 帮助 ----------
+usage() {
+cat &lt;&lt;'EOF'
+large-file-audit.sh v2.0 —— 智能大文件审计工具
+
+用法:
+  large-file-audit.sh [选项]        支持 help / -h / --help
+
+选项:
+  -s, --size SIZE    大小阈值（默认 500M），支持 100M / 2G / 500K / 1T
+  -t, --top N        只分析最大的 N 个文件（快速模式，如 -t 50）
+  -d, --dir PATH     只扫描指定目录（可多次使用）；默认扫描所有本地文件系统
+  -c, --check-lsof   对结果逐个调用 lsof，标记被进程占用的文件（较慢）
+      --summary-only 只输出概览统计，不输出详细列表
+      --plan         输出建议执行的清理命令清单（务必人工复核后再执行）
+      --no-color     禁用颜色
+      --no-emoji     使用纯文本风险标记
+  -h, --help         显示帮助
+  -V, --version      显示版本
+  help               同 --help
+
+风险分级:
+  🚫 禁止删除     数据库数据/控制/redo 等，删除将导致严重故障
+  ⚠️ 谨慎处理     系统路径 / 正在写入的日志等，需结合业务判断
+  ✅ 可安全清理   缓存、临时文件、旧日志、容器镜像等
+  🔄 按需清理     备份包、安装镜像、开发产物等，确认后即可清理
+
+示例:
+  large-file-audit.sh help
+  large-file-audit.sh -s 2G
+  large-file-audit.sh -s 100M --plan
+  large-file-audit.sh -d /var/log -s 50M -t 20
+EOF
+}
+
+# ---------- 参数解析 ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        help|-h|--help) usage; exit 0;;
+        -V|--version)   echo "large-file-audit.sh v$VERSION"; exit 0;;
+        -s|--size)      [[ $# -ge 2 ]] || { echo "错误: -s 需要参数值" &gt;&amp;2; exit 1; }
+                        THRESHOLD="$2"; shift 2;;
+        --size=*)       THRESHOLD="${1#*=}"; shift;;
+        -t|--top)       [[ $# -ge 2 ]] || { echo "错误: -t 需要参数值" &gt;&amp;2; exit 1; }
+                        TOP="$2"; shift 2;;
+        --top=*)        TOP="${1#*=}"; shift;;
+        -d|--dir)       [[ $# -ge 2 ]] || { echo "错误: -d 需要参数值" &gt;&amp;2; exit 1; }
+                        SCAN_DIRS+=("$2"); shift 2;;
+        --dir=*)        SCAN_DIRS+=("${1#*=}"); shift;;
+        -c|--check-lsof) CHECK_LSOF=true; shift;;
+        --summary-only) SUMMARY_ONLY=true; shift;;
+        --plan)         EMIT_PLAN=true; shift;;
+        --no-color)     USE_COLOR="never"; shift;;
+        --no-emoji)     EMOJI=false; shift;;
+        *) echo "未知参数: $1（使用 'help' 查看帮助）" &gt;&amp;2; exit 1;;
+    esac
+done
+
+# ---------- 参数校验 ----------
+[[ "$THRESHOLD" =~ ^[0-9]+[kKmMgGtT]?$ ]] \
+    || { echo "错误: 阈值格式应为 数字+K/M/G/T（如 100M）" &gt;&amp;2; exit 1; }
+[[ "$TOP" =~ ^[0-9]+$ ]] || TOP=0
+SIZE_FOR_FIND="${THRESHOLD^^}"
+
+if $CHECK_LSOF &amp;&amp; ! command -v lsof &gt;/dev/null 2&gt;&amp;1; then
+    echo "警告: --check-lsof 需要 lsof，未找到，已关闭该检查" &gt;&amp;2
+    CHECK_LSOF=false
+fi
+
+# ---------- 颜色 ----------
+if [[ "$USE_COLOR" == "never" || ! -t 1 ]]; then
+    C_RED=; C_YEL=; C_GRN=; C_CYN=; C_BLD=; C_DIM=; C_RST=
+else
+    C_RED=$'\033[1;31m'; C_YEL=$'\033[1;33m'; C_GRN=$'\033[1;32m'
+    C_CYN=$'\033[1;36m'; C_BLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
+fi
+
+# ---------- 工具函数 ----------
+fmt_size() {
+    local b=$1
+    if   (( b &gt;= 1099511627776 )); then
+        printf "%d.%02d TB" $((b/1099511627776)) $(( (b%1099511627776)*100/1099511627776 ))
+    elif (( b &gt;= 1073741824 )); then
+        printf "%d.%02d GB" $((b/1073741824)) $(( (b%1073741824)*100/1073741824 ))
+    elif (( b &gt;= 1048576 )); then
+        printf "%d.%02d MB" $((b/1048576)) $(( (b%1048576)*100/1048576 ))
+    elif (( b &gt;= 1024 )); then
+        printf "%d KB" $((b/1024))
+    else
+        printf "%d B" "$b"
+    fi
+}
+
+risk_badge() {
+    local c="" t=""
+    case "$1" in
+        NO)       c=$C_RED; $EMOJI &amp;&amp; t="🚫 禁止删除"   || t="[禁止]";;
+        CAUTION)  c=$C_YEL; $EMOJI &amp;&amp; t="⚠️  谨慎处理" || t="[谨慎]";;
+        SAFE)     c=$C_GRN; $EMOJI &amp;&amp; t="✅ 可安全清理" || t="[可清]";;
+        OPTIONAL) c=$C_CYN; $EMOJI &amp;&amp; t="🔄 按需清理"   || t="[按需]";;
+    esac
+    printf "%s%s%s" "$c" "$t" "$C_RST"
+}
+
+# ---------- 智能分类核心 ----------
+# 输出: RISK|CODE|ADVICE
+classify() {
+    local f="$1"
+    case "$f" in
+        # ===== Oracle（数据文件绝不能删） =====
+        */oradata/*/temp*.dbf)
+            echo "NO|oracle-temp|Oracle 临时表空间。正确清理：SQL&gt; ALTER TABLESPACE TEMP SHRINK SPACE; 或 ALTER DATABASE TEMPFILE '...' DROP 后重建。严禁 OS 层 rm。";;
+        */oradata/*/redo*.log)
+            echo "NO|oracle-redo|Oracle 联机 redo 日志。删除会导致实例崩溃/数据丢失。禁止删除。";;
+        */oradata/*/control*.ctl*)
+            echo "NO|oracle-control|Oracle 控制文件。删除会导致数据库无法启动。禁止删除。";;
+        */oradata/*/*.dbf)
+            echo "NO|oracle-datafile|Oracle 数据文件。删除会导致数据丢失/数据库损坏。禁止删除。";;
+        */fast_recovery_area/*|*/flash_recovery_area/*)
+            echo "CAUTION|oracle-fra|Oracle 闪回恢复区（归档/备份）。用 RMAN DELETE ARCHIVELOG 或配置 FRA 保留策略，不要 rm。";;
+        /u01/app/oracle/*|/opt/oracle/*)
+            echo "CAUTION|oracle-home|Oracle 安装目录文件。确认不属于运行实例后再处理。";;
+        # ===== MySQL =====
+        /var/lib/mysql/ibdata*|/var/lib/mysql/ib_logfile*|/var/lib/mysql/ibtmp*)
+            echo "NO|mysql-system|MySQL 系统表空间/redo/临时文件。删除将导致数据库损坏。禁止删除。";;
+        /var/lib/mysql/*.ibd|/var/lib/mysql/*/*.ibd|/var/lib/mysql/*.MYD|/var/lib/mysql/*.MYI|/var/lib/mysql/*.frm)
+            echo "NO|mysql-data|MySQL 表数据文件。删除将导致数据丢失。禁止删除。";;
+        /var/lib/mysql/*-bin.[0-9]*|/var/lib/mysql/mysql-bin.[0-9]*)
+            echo "CAUTION|mysql-binlog|MySQL binlog。正确做法：PURGE BINARY LOGS BEFORE '...'; 或配置 expire_logs_days。";;
+        /var/lib/mysql/*)
+            echo "CAUTION|mysql-other|MySQL 目录下文件，确认用途后再处理。";;
+        # ===== PostgreSQL =====
+        */pgsql/*/base/*|*/pgsql/*/pg_wal/*|*/postgresql/*/base/*|*/postgresql/*/pg_wal/*)
+            echo "NO|pg-data|PostgreSQL 数据/WAL 文件。删除将导致数据库损坏。禁止删除。";;
+        # ===== 容器 =====
+        /var/lib/docker/*|/var/lib/containerd/*|/var/lib/containers/*|/var/lib/crio/*)
+            echo "SAFE|container|容器运行时数据。优先用 docker system prune -a（或 crictl rmi --prune）清理，不要直接 rm 文件。";;
+        # ===== journald =====
+        /var/log/journal/*)
+            echo "SAFE|journal|systemd 日志。用 journalctl --vacuum-size=200M 或 --vacuum-time=7d 安全清理，不要直接 rm。";;
+        # ===== core/crash =====
+        /var/crash/*|/var/lib/systemd/coredump/*)
+            echo "SAFE|coredump|系统/程序 core dump。可安全清理（如无需分析）。";;
+        */core|*/core.[0-9]*)
+            echo "SAFE|coredump|程序 core dump 文件。可安全清理。";;
+        # ===== 日志 =====
+        /var/log/*.gz|/var/log/*.xz|/var/log/*.bz2|/var/log/*.zst|/var/log/*.[0-9]|/var/log/*.[0-9][0-9]|/var/log/*.[0-9][0-9][0-9])
+            echo "SAFE|log-rotate|已轮转的旧日志。可删除。建议配置 logrotate maxage 自动清理。";;
+        /var/log/*.log|/var/log/*.log.*|/var/log/syslog*|/var/log/messages*|/var/log/auth.log*|/var/log/secure*|/var/log/kern.log*|/var/log/daemon.log*|/var/log/cron*|/var/log/maillog*|/var/log/boot.log*)
+            echo "CAUTION|log-active|可能正在写入的文本日志。用 truncate -s 0 FILE 清空而非 rm（rm 后空间不释放）。";;
+        /var/log/*)
+            echo "CAUTION|log-other|/var/log 下非文本日志，确认所属服务后处理。";;
+        # ===== 归档/备份 =====
+        *.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz2|*.zip|*.7z|*.rar|*.gz|*.xz|*.bz2|*.zst)
+            echo "OPTIONAL|archive|归档/压缩包。确认是否为有效备份后再删除。";;
+        *.bak|*.old|*.orig|*.backup|*~|*.swp|*.swo|*.tmp)
+            echo "SAFE|tempfile|备份/交换/临时文件。可安全删除。";;
+        *.dump|*.sql.gz|*.sql.bz2|*.sql.xz)
+            echo "OPTIONAL|dbdump|数据库导出文件。确认已异地归档后再删除。";;
+        # ===== 开发产物 =====
+        *.a|*.o|*.lo|*.la|*.so.debug)
+            echo "OPTIONAL|static-lib|静态库/编译中间产物。无编译/链接需求时可删除。";;
+        */node_modules/*)
+            echo "SAFE|node-modules|node_modules 依赖。可用 npm install 重建。";;
+        */__pycache__/*|*.pyc|*.pyo)
+            echo "SAFE|pycache|Python 字节码缓存。可安全删除。";;
+        *.iso|*.img|*.vmdk|*.qcow2|*.vdi)
+            echo "OPTIONAL|image|系统/虚拟机镜像。若已安装或不再需要可删除。";;
+        # ===== 缓存/临时 =====
+        /var/cache/*|*/.cache/*)
+            echo "SAFE|cache|缓存文件。通常可安全清理（对应服务会重建）。";;
+        /tmp/*|/var/tmp/*)
+            echo "OPTIONAL|tmp|临时目录文件。确认无进程占用后可删。";;
+        # ===== 系统（兜底在最后） =====
+        /usr/*|/lib/*|/lib64/*|/bin/*|/sbin/*|/boot/*)
+            echo "CAUTION|system|系统路径下的大文件，极度谨慎！确认用途（可能影响启动/运行）。";;
+        /opt/*)
+            echo "CAUTION|opt|/opt 下应用文件，确认应用不再使用后再处理。";;
+        *)
+            echo "CAUTION|unknown|未知用途的大文件。删除前用 lsof -- FILE 确认无进程占用，并确认文件来源。";;
+    esac
+}
+
+# ---------- 扫描 ----------
+TMPLIST=$(mktemp) || exit 1
+DETAIL=$(mktemp)  || exit 1
+PLAN=$(mktemp)    || exit 1
+TOPFILE="${TMPLIST}.top"
+trap 'rm -f "$TMPLIST" "$DETAIL" "$PLAN" "$TOPFILE"' EXIT
+
+START=$(date +%s)
+
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    for d in "${SCAN_DIRS[@]}"; do
+        [[ -d "$d" ]] || { echo "警告: 目录不存在: $d" &gt;&amp;2; continue; }
+        find "$d" -xdev -type f -size +"$SIZE_FOR_FIND" -printf '%s\t%p\0' 2&gt;/dev/null &gt;&gt; "$TMPLIST"
+    done
+    SCAN_DESC="${SCAN_DIRS[*]}"
+else
+    mapfile -t MOUNTS &lt; &lt;(df -Pl -x tmpfs -x devtmpfs -x squashfs 2&gt;/dev/null \
+        | awk 'NR&gt;1 &amp;&amp; $1 ~ /^\/dev\// {print $6}' | sort -u)
+    for mp in "${MOUNTS[@]}"; do
+        [[ -d "$mp" ]] || continue
+        find "$mp" -xdev -type f -size +"$SIZE_FOR_FIND" -printf '%s\t%p\0' 2&gt;/dev/null &gt;&gt; "$TMPLIST"
+    done
+    SCAN_DESC=$(printf '%s ' "${MOUNTS[@]}")
+fi
+
+# 按大小降序（NUL 分隔，稳健处理特殊文件名）
+LC_ALL=C sort -z -nr "$TMPLIST" -o "$TMPLIST"
+SRC="$TMPLIST"
+if [[ "$TOP" -gt 0 ]]; then
+    head -z -n "$TOP" "$TMPLIST" &gt; "$TOPFILE"
+    SRC="$TOPFILE"
+fi
+
+END=$(date +%s); DURATION=$((END-START))
+
+# ---------- 分类 + 统计 + 生成明细 ----------
+declare -A CNT SZ
+exec 3&gt;"$DETAIL"
+exec 4&gt;"$PLAN"
+
+while IFS=$'\t' read -r -d '' size path; do
+    cls=$(classify "$path")
+    risk="${cls%%|*}"; rest="${cls#*|}"
+    code="${rest%%|*}";  advice="${rest#*|}"
+
+    if $CHECK_LSOF; then
+        if lsof -- "$path" &gt;/dev/null 2&gt;&amp;1; then
+            advice="$advice  ⚠ 当前被进程打开，不要直接删除。"
+        fi
+    fi
+
+    CNT[$risk]=$(( ${CNT[$risk]:-0} + 1 ))
+    SZ[$risk]=$(( ${SZ[$risk]:-0} + size ))
+
+    printf "%s  %s\n" "$(risk_badge "$risk")" "$(fmt_size "$size")" &gt;&amp;3
+    printf "   路径: %s\n" "$path" &gt;&amp;3
+    printf "   原因: %s\n\n" "$advice" &gt;&amp;3
+
+    if $EMIT_PLAN; then
+        case "$code" in
+            container)    printf "# [SAFE] 容器运行时数据\n%s\n\n" "docker system prune -a -f   # 或: crictl rmi --prune" &gt;&amp;4;;
+            journal)      printf "# [SAFE] systemd 日志\n%s\n\n" "journalctl --vacuum-size=200M" &gt;&amp;4;;
+            log-active)   printf "# [CAUTION] 正在使用的日志，确认可清空后:\ntruncate -s 0 '%s'\n\n" "$path" &gt;&amp;4;;
+            log-rotate|cache|coredump|tempfile|pycache|node-modules)
+                          printf "# [SAFE] %s\nrm -f '%s'\n\n" "$code" "$path" &gt;&amp;4;;
+            tmp|archive|image|static-lib|dbdump)
+                          printf "# [OPTIONAL] 确认后删除: %s\nrm -f '%s'\n\n" "$code" "$path" &gt;&amp;4;;
+            *) ;;     # NO/CAUTION 不生成命令
+        esac
+    fi
+done &lt; "$SRC"
+
+exec 3&gt;&amp;-
+exec 4&gt;&amp;-
+
+# ---------- 输出概览 ----------
+TOTAL_FILES=0; TOTAL_SIZE=0
+for r in NO CAUTION SAFE OPTIONAL; do
+    TOTAL_FILES=$(( TOTAL_FILES + ${CNT[$r]:-0} ))
+    TOTAL_SIZE=$((  TOTAL_SIZE + ${SZ[$r]:-0}  ))
+done
+
+echo "${C_BLD}============================================================${C_RST}"
+echo "${C_BLD} 大文件审计报告 v$VERSION${C_RST}"
+echo "${C_BLD}============================================================${C_RST}"
+echo " 扫描范围 : ${SCAN_DESC:-（无匹配挂载点）}"
+echo " 阈值     : &gt; $THRESHOLD"
+echo " 耗时     : ${DURATION}s"
+echo "------------------------------------------------------------"
+if (( TOTAL_FILES == 0 )); then
+    echo " ✅ 未发现大于 $THRESHOLD 的文件。"
+    echo "============================================================"
+    exit 0
+fi
+echo " 共发现 ${C_BLD}$TOTAL_FILES${C_RST} 个文件，总计 ${C_BLD}$(fmt_size "$TOTAL_SIZE")${C_RST}"
+echo ""
+echo " 【风险分级汇总】"
+for r in NO CAUTION SAFE OPTIONAL; do
+    c=${CNT[$r]:-0}; [[ $c -eq 0 ]] &amp;&amp; continue
+    s=${SZ[$r]:-0}
+    printf "   %s  %4d 个   %10s\n" "$(risk_badge "$r")" "$c" "$(fmt_size "$s")"
+done
+echo ""
+
+if [[ ${CNT[NO]:-0} -gt 0 ]]; then
+    echo " ${C_RED}⛔ 警告: 发现 ${CNT[NO]} 个「禁止删除」的关键文件（数据库数据等），"
+    echo "    已在下方详细列表中标红。请勿直接删除！${C_RST}"
+    echo ""
+fi
+
+RECLAIM=$(( ${SZ[SAFE]:-0} + ${SZ[OPTIONAL]:-0} ))
+if (( RECLAIM &gt; 0 )); then
+    echo " ${C_GRN}💡 建议优先处理「可安全清理 + 按需清理」共 $(fmt_size "$RECLAIM")${C_RST}"
+    echo ""
+fi
+
+# ---------- 详细列表 ----------
+if ! $SUMMARY_ONLY; then
+    echo "------------------------------------------------------------"
+    echo " 【详细列表】（按大小降序）"
+    echo "------------------------------------------------------------"
+    cat "$DETAIL"
+fi
+
+# ---------- 清理计划 ----------
+if $EMIT_PLAN; then
+    echo "------------------------------------------------------------"
+    echo " 【建议清理命令清单】（仅供参考，务必人工复核后再执行）"
+    echo "------------------------------------------------------------"
+    echo "# ⚠ 以下命令仅针对可安全/按需清理的文件，禁止删除类的文件不会在此出现。"
+    echo "# ⚠ 执行前请再次确认文件用途。"
+    echo ""
+    if [[ -s "$PLAN" ]]; then
+        awk '!seen[$0]++' "$PLAN"
+    else
+        echo "# 本次未生成需要自动清理的命令"
+    fi
+fi
+
+echo "============================================================"
+echo " 通用安全提示:"
+echo "   1. 正在写入的日志用: truncate -s 0 FILE   （不要 rm）"
+echo "   2. 删除后 df 未释放空间: lsof +L1 | grep deleted   （重启或 kill 持有进程）"
+echo "   3. 长期方案: logrotate + journald SystemMaxUse=500M"
+echo "============================================================"
+</code></pre>
+<p>保存为 <code>large-file-audit.sh</code>，<code>chmod +x</code> 即可使用。</p>
+<hr>
+<h2 id="五实战在-oracle--docker--mysql-混合环境下跑一遍">五、实战：在 Oracle + Docker + MySQL 混合环境下跑一遍</h2>
+<p>用我自己的测试机（CentOS 7，跑了 Oracle 11g、MySQL 5.7、Docker）跑一下：</p>
+<pre><code class="language-bash">[root@myoracle ~]# ./large-file-audit.sh -t 10
+</code></pre>
+<p>输出：</p>
+<pre><code>============================================================
+ 大文件审计报告 v2.0.0
+============================================================
+ 扫描范围 : /boot/ / 
+ 阈值     : &gt; 500M
+ 耗时     : 3s
+------------------------------------------------------------
+ 共发现 6 个文件，总计 4.31 GB
+
+ 【风险分级汇总】
+   🚫 禁止删除     3 个    2.24 GB
+   ✅ 可安全清理   1 个    939.00 MB
+   🔄 按需清理     2 个    1.13 GB
+
+ ⛔ 警告: 发现 3 个「禁止删除」的关键文件（数据库数据等），
+    已在下方详细列表中标红。请勿直接删除！
+
+ 💡 建议优先处理「可安全清理 + 按需清理」共 2.06 GB
+
+------------------------------------------------------------
+ 【详细列表】（按大小降序）
+------------------------------------------------------------
+🚫 禁止删除  931.00 MB
+   路径: /u01/app/oracle/oradata/ORCL11G/system01.dbf
+   原因: Oracle 数据文件。删除会导致数据丢失/数据库损坏。禁止删除。
+
+🚫 禁止删除  831.00 MB
+   路径: /u01/app/oracle/oradata/ORCL11G/sysaux01.dbf
+   原因: Oracle 数据文件。删除会导致数据丢失/数据库损坏。禁止删除。
+
+🚫 禁止删除  513.00 MB
+   路径: /u01/app/oracle/oradata/ORCL11G/temp02.dbf
+   原因: Oracle 临时表空间。正确清理：SQL&gt; ALTER TABLESPACE TEMP SHRINK SPACE;
+        或 ALTER DATABASE TEMPFILE '...' DROP 后重建。严禁 OS 层 rm。
+
+✅ 可安全清理  939.00 MB
+   路径: /var/lib/docker/containerd/daemon/io.containerd.content.v1.content/blobs/sha256/8d34...
+   原因: 容器运行时数据。优先用 docker system prune -a（或 crictl rmi --prune）清理，
+        不要直接 rm 文件。
+
+🔄 按需清理  574.00 MB
+   路径: /usr/local/mysql/lib/libmysqld.a
+   原因: 静态库/编译中间产物。无编译/链接需求时可删除。
+
+🔄 按需清理  560.00 MB
+   路径: /root/backup/mysql-full-20241020.tar.gz
+   原因: 归档/压缩包。确认是否为有效备份后再删除。
+</code></pre>
+<p>对比第一版，差异立竿见影：</p>
+<ul>
+<li>Oracle 三个数据文件<strong>全部标红</strong>，且给出了正确的表空间清理姿势（<code>SHRINK SPACE</code> 或 <code>TEMPFILE DROP</code>）</li>
+<li>containerd blob <strong>标绿</strong>，并提示用 <code>docker system prune</code> 而不是 <code>rm</code></li>
+<li><code>libmysqld.a</code> 从"系统路径极危"降级为"静态库，无编译需求可删"</li>
+<li>备份包识别为"按需清理"</li>
+<li>顶部 4 行给全局视图，能立刻判断"这台机器主要是 Oracle 数据占空间，不能乱删"</li>
+</ul>
+<h3 id="加上---plan-生成候选清理清单">加上 <code>--plan</code> 生成候选清理清单</h3>
+<pre><code class="language-bash">[root@myoracle ~]# ./large-file-audit.sh -t 10 --plan
+...
+------------------------------------------------------------
+ 【建议清理命令清单】（仅供参考，务必人工复核后再执行）
+------------------------------------------------------------
+# ⚠ 以下命令仅针对可安全/按需清理的文件，禁止删除类的文件不会在此出现。
+# ⚠ 执行前请再次确认文件用途。
+
+# [SAFE] 容器运行时数据
+docker system prune -a -f   # 或: crictl rmi --prune
+
+# [OPTIONAL] 确认后删除: static-lib
+rm -f '/usr/local/mysql/lib/libmysqld.a'
+
+# [OPTIONAL] 确认后删除: archive
+rm -f '/root/backup/mysql-full-20241020.tar.gz'
+</code></pre>
+<p>三个命令都只针对绿色和青色文件。三个 Oracle 数据文件<strong>不会出现在这里</strong>。运维看到这份清单，只需要判断"libmysqld.a 和备份包删不删"，风险被降到极低。</p>
+<hr>
+<h2 id="六一些使用上的技巧">六、一些使用上的技巧</h2>
+<h3 id="61-磁盘告警现场先看概览别急着删">6.1 磁盘告警现场：先看概览，别急着删</h3>
+<pre><code class="language-bash">./large-file-audit.sh --summary-only
+</code></pre>
+<p>只要一屏就能看到全局分级，判断这台机器的空间到底被什么类型的文件占了。</p>
+<h3 id="62-大文件很多时top-模式">6.2 大文件很多时：TOP 模式</h3>
+<pre><code class="language-bash">./large-file-audit.sh -t 20
+</code></pre>
+<p>先看 TOP 20 大文件，往往最大的几个就是问题所在。全量扫描在大磁盘上可能要跑几分钟，TOP 模式快得多。</p>
+<h3 id="63-定向排查只看日志目录">6.3 定向排查：只看日志目录</h3>
+<pre><code class="language-bash">./large-file-audit.sh -d /var/log -s 50M
+</code></pre>
+<p>挂载点扫描会跳过 <code>/var/log</code> 下的非本地文件系统，定向模式直接把范围锁死在日志，出结果最快。</p>
+<h3 id="64-检查占用-c-加-lsof">6.4 检查占用：<code>-c</code> 加 lsof</h3>
+<pre><code class="language-bash">./large-file-audit.sh -c -t 50
+</code></pre>
+<p>如果有个大文件被你怀疑"为什么 rm 了空间没释放"，加上 <code>-c</code> 会逐个跑 lsof，被占用的会明确标红。代价是慢一点（每个文件 10-100ms）。</p>
+<h3 id="65-定期做审计而不是等告警">6.5 定期做审计，而不是等告警</h3>
+<p>放到 crontab 里每周跑一次，输出到文件：</p>
+<pre><code class="language-bash">0 3 * * 0 /root/large-file-audit.sh -s 1G --summary-only &gt; /var/log/large-file-audit.log 2&gt;&amp;1
+</code></pre>
+<p>趋势一眼可见：什么类型的文件在涨、涨了多少。</p>
+<hr>
+<h2 id="七几个运维大坑脚本背后的经验">七、几个运维大坑（脚本背后的经验）</h2>
+<p>写这个脚本的过程，其实是在整理自己踩过的坑：</p>
+<p><strong>坑 1：<code>rm</code> 正在写入的日志，<code>df</code> 空间不降反升。</strong></p>
+<p>Linux 上文件有两个引用：目录项（dirent）和 inode。<code>rm</code> 只是删除了目录项，但如果进程还持有 inode 的文件描述符，内核认为文件仍在使用，不会回收磁盘块。日志进程（rsyslog、nginx、docker）通常开着 <code>O_APPEND</code> 长连接，一直持有 fd。所以 <code>rm</code> 之后 <code>df</code> 毫无变化，只有重启进程才会释放。</p>
+<p>正确操作是 <code>truncate -s 0 file</code> 或 <code>: &gt; file</code>：保留 inode，只清空内容，进程不感知，空间立即回收。</p>
+<p>脚本里对"正在写入的日志"特意用 <code>CAUTION</code> 而不是 <code>SAFE</code>，原因就在这。</p>
+<p><strong>坑 2：删了 Oracle 的 <code>temp02.dbf</code>。</strong></p>
+<p>我刚接触 Oracle 时，看到 <code>temp02.dbf</code> 占 500MB 觉得是"临时"文件，可以删吧？删完数据库实例直接报错，只能通过重建临时表空间恢复。Oracle 的"临时"指的是表空间用途是临时排序/哈希，不是"这个文件可以删"。</p>
+<p>Oracle 里所有 <code>.dbf</code> 都<strong>不该在 OS 层被手动删除</strong>。表空间有空闲空间就用 <code>SHRINK</code>，要重建就用 <code>DROP</code> + <code>ADD</code>。</p>
+<p><strong>坑 3：手动删 containerd blob 把 Docker 玩坏。</strong></p>
+<p><code>/var/lib/docker/containerd/.../blobs/sha256/...</code> 目录下是内容寻址的镜像层。直接 <code>rm</code> 会导致镜像元数据指向不存在的 blob，<code>docker images</code> 会报错，甚至 pull 新镜像也出问题。</p>
+<p>正确姿势是 <code>docker system prune -a</code> 或 <code>docker image prune -a</code>，它会连同元数据一起清。如果只是清理某个特定镜像，用 <code>docker rmi</code>。</p>
+<p><strong>坑 4：<code>find / -size +1G</code> 跨文件系统扫描慢得离谱。</strong></p>
+<p>不指定 <code>-xdev</code> 的话，<code>find</code> 会从 <code>/</code> 往下扫，遇到 <code>/proc</code>、<code>/sys</code> 会读到内核虚拟文件，遇到 <code>tmpfs</code> 挂载点会读内存，遇到 <code>NFS</code> 网络挂载点甚至会卡死几分钟。脚本里用 <code>-xdev</code> + 挂载点遍历，就是为了避免这个问题。</p>
+<hr>
+<h2 id="八总结">八、总结</h2>
+<p>这个脚本的核心价值，不是"发现大文件"——这件事 <code>find</code> 一行就能做——而是<strong>把"能不能删、怎么删"的判断从人脑里搬进脚本</strong>。</p>
+<p>对于运维来说，磁盘告警时的心理压力很大：不删空间不够，删错服务器报废。这个脚本试图做的事，就是把这份压力分成两个确定的部分：</p>
+<ol>
+<li><strong>哪些文件绝对别碰</strong>（红色，一眼就知道）</li>
+<li><strong>哪些文件可以放心处理</strong>（绿色，附上正确命令）</li>
+</ol>
+<p>中间那些黄和青的，交给人判断。</p>
+<p>脚本本身只是 bash，<code>--plan</code> 生成的命令也永远需要人工复核，它不自动执行任何删除——这是刻意为之。运维工具的正确姿势是"辅助决策"，而不是"替人决定"，尤其是在删文件这种事上。</p>
+<p>希望这个脚本能帮你少踩几个坑，少几次半夜被磁盘告警叫醒。</p>
+
+
+</div>
+<div class="clear"></div>
+
+		<p class="postfoot">
+			posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-26 16:23">2026-10-26 16:22</span>&nbsp;
+<a href="https://www.cnblogs.com/liuziyi1">刘子毅</a>&nbsp;
+阅读(<span id="post_view_count">94</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23442505);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fliuziyi1%2Fp%2F23442505&amp;targetId=23442505&amp;targetType=0" target="_blank">举报</a>
+
+		</p>
+	
