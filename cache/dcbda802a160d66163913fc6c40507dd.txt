@@ -1,0 +1,711 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zw-awa/p/23437718" title="发布于 2026-10-26 10:44">
+    
+
+    <span role="heading" aria-level="2">一只按键不只“按下”：短按、长按和连按如何共存</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3791643/202610/3791643-20261026103503571-1504507525.png" alt="一只按键不只“按下”：短按、长按和连按如何共存" class="desc_img">
+        同一颗按键，轻点、按住、连敲，可以代表三种不同的命令。程序怎样从一段电平变化里分清这些动作，而组合键又为什么偏偏进不了那张表？
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="经典三问">经典三问</h2>
+<p>Q: 按键事件是什么？<br>
+A: 它是程序根据电平变化和持续时间整理出的单击、长按或多击等一次性结果。</p>
+<p>Q: 为什么要把电平转换成事件？<br>
+A: 业务代码关心的是“用户完成了什么动作”，不应该重复处理抖动、计时和多击窗口。</p>
+<p>Q: 按键事件常见使用场景？<br>
+A: 菜单确认与返回、模式切换、参数调整、急停和组合按键操作。</p>
+<hr>
+<p>上一回的按键还是老写法：按下、消抖、等松手，那一段 <code>while</code> 把主循环冻在原地。灯已经躲进 1ms 节拍里不受影响了，可按键自己还堵着路——按住不放的时候，主循环什么都不做。</p>
+<p>这一回把它也拆开。我不会一次写完一大坨代码，而是<strong>从最小的一版开始，每加一个功能就把改过的函数重新放一遍</strong>。第一版只认单击，之后依次加上“松开”、双击、长按、组合键。每一版都能单独烧进板子跑起来，做到哪一版就能停在哪一版。</p>
+<h2 id="非阻塞的第二种形状事件">非阻塞的第二种形状：事件</h2>
+<p>上一回的形状是<strong>周期任务</strong>：记起点、保持状态、短节拍反复来、到点动一小步。它擅长处理“过一段时间做一次”的事。</p>
+<p>按键不是这类事。什么时候被按、按多久、按几次，全看手指，没有固定周期。它需要另一种形状：</p>
+<ol>
+<li>底层专心盯电平，把连续变化整理成一次性结果——按下、松开、单击、双击、长按；</li>
+<li>结果不立刻决定做什么，先放进一个小队列；</li>
+<li>应用层从队列里取出来，自己决定每个结果对应什么动作。</li>
+</ol>
+<p>分层之后，底层只回答“发生了什么”，应用层只回答“这该做什么”。按键模块不需要知道车上有没有呼吸灯，业务代码也不用再管抖动、计时和几次点击的窗口。</p>
+<p>后面每一版都只动其中一层：要么动驱动（多认出一种事件），要么动应用层（给新事件接上动作）。层级清楚了，加功能才不会牵一发动全身。</p>
+<h2 id="接线和读引脚">接线和读引脚</h2>
+<p>两个按键用内部上拉、按下接地的接法：A 接 <code>PB11</code>，B 接 <code>PB1</code>，松开读到高电平，按下读到低电平。先给它们起好名字，再把引脚读出来：</p>
+<pre><code class="language-c">typedef enum
+{
+    KEY_A = 0,
+    KEY_B,
+    KEY_COUNT
+} KeyId;
+
+static const uint16_t key_pins[KEY_COUNT] =
+{
+    GPIO_Pin_11, GPIO_Pin_1
+};
+
+static uint8_t Key_ReadPin(uint8_t id)
+{
+    return (uint8_t)(GPIO_ReadInputDataBit(GPIOB, key_pins[id]) == 0U);
+}
+</code></pre>
+<p><code>Key_ReadPin(KEY_A)</code> 返回 1 表示 A 此刻正被按着，返回 0 表示松着。它读的是<strong>瞬时电平</strong>，带着抖动——这一层的输出不能直接当动作使用，这正是后面要处理的东西。</p>
+<p><code>GPIO_ReadInputDataBit()</code> 是前面用过的标准库函数，读一个引脚当前的电平。</p>
+<h2 id="第一版只认单击">第一版：只认单击</h2>
+<p>先把最小的骨架立起来：按键能被稳定地读出来，一次按下产生一个事件，应用层照着表执行动作。</p>
+<h3 id="事件和状态">事件和状态</h3>
+<p>驱动层要交出去的是“一次性结果”，那就先给它一个名字。</p>
+<pre><code class="language-c">typedef enum
+{
+    KEY_EVENT_CLICK = 0,
+    KEY_EVENT_COUNT
+} KeyEventType;
+
+typedef struct
+{
+    uint8_t id;
+    uint8_t type;
+} KeyEvent;
+</code></pre>
+<p><code>KeyEvent</code> 里两样东西：是谁（<code>id</code>）、发生了什么（<code>type</code>）。这一版只会产生 <code>KEY_EVENT_CLICK</code> 一种事件。</p>
+<p>每个按键各自记一份状态，互不干扰：</p>
+<pre><code class="language-c">#define KEY_SCAN_MS   20U      /* 每 20ms 采一次，消抖就靠这个采样 */
+
+typedef struct
+{
+    uint8_t  down;      /* 消抖之后的状态：1 按着，0 松着 */
+    uint8_t  raw;       /* 上一拍采到的原始值，和 down 不一样就说明还在抖 */
+    uint32_t edge_ms;   /* down 是哪一刻变成现在这样的 */
+} KeyRuntime;
+
+static KeyRuntime key_runtime[KEY_COUNT];
+static uint8_t key_div = 0U;           /* 1ms 计数，到 20 清零再扫 */
+
+void Key_PushEvent(uint8_t id, uint8_t type);   /* 入队，定义见下面的队列一节 */
+</code></pre>
+<h3 id="消抖20ms-采一次两拍一致才算数">消抖：20ms 采一次，两拍一致才算数</h3>
+<p>按键模块不“延时 20ms 再读一次”。它挂在 1ms 节拍上，但每 20 次才真正扫一遍——<strong>采样本身就是消抖</strong>：一个电平要连续两次采样都读到它，才算真的变了。这样既没有延时，也不用再单独数一个“稳定了多久”的计数器。</p>
+<pre><code class="language-c">void Key_Tick(void)
+{
+    uint8_t i;
+    uint32_t now;
+
+    if (++key_div &lt; KEY_SCAN_MS)
+    {
+        return;                     /* 还没到 20ms，这一毫秒什么也不做 */
+    }
+    key_div = 0U;
+
+    now = Timer_Millis();
+
+    for (i = 0U; i &lt; KEY_COUNT; i++)
+    {
+        KeyRuntime *k = &amp;key_runtime[i];
+        uint8_t pin = Key_ReadPin(i);
+
+        if (pin == k-&gt;down)         /* 和稳定状态一致，没有新变化 */
+        {
+            continue;
+        }
+
+        if (pin != k-&gt;raw)          /* 第一拍看到它变了，先记下，再等一拍 */
+        {
+            k-&gt;raw = pin;
+            continue;
+        }
+
+        k-&gt;down = pin;              /* 第二拍还是它：认这个新状态 */
+        k-&gt;edge_ms = now;
+
+        if (k-&gt;down == 0U)          /* 松手就是一次点击 */
+        {
+            Key_PushEvent(i, KEY_EVENT_CLICK);
+        }
+    }
+}
+</code></pre>
+<p><code>Key_Tick()</code> 挂在 1ms 中断里，和上一回的 <code>Mode_Tick()</code> 并排——不过它每 20 次才真正扫一遍键。扫描频率降下来了，等待仍然是零。</p>
+<p>那个 1ms 中断现在是这样：</p>
+<pre><code class="language-c">void TIM1_UP_IRQHandler(void)
+{
+    if (TIM_GetITStatus(TIM1, TIM_IT_Update) != RESET)
+    {
+        TIM_ClearITPendingBit(TIM1, TIM_IT_Update);
+
+        Mode_Tick();        /* 上一回的灯 */
+        Key_Tick();         /* 这一回的键 */
+    }
+}
+</code></pre>
+<h3 id="事件先排队应用层再来取">事件先排队，应用层再来取</h3>
+<p>事件产生后先进队列，应用层从队列里取。队列是一块小环形缓冲，两个指针一进一出：</p>
+<pre><code class="language-c">#define KEY_QUEUE_SIZE  8U
+
+static KeyEvent key_queue[KEY_QUEUE_SIZE];
+static uint8_t key_queue_head = 0U;
+static uint8_t key_queue_tail = 0U;
+
+void Key_PushEvent(uint8_t id, uint8_t type)
+{
+    uint8_t next = (uint8_t)((key_queue_head + 1U) % KEY_QUEUE_SIZE);
+
+    if (next == key_queue_tail)
+    {
+        return;                 /* 队列满，丢掉新事件 */
+    }
+
+    key_queue[key_queue_head].id = id;
+    key_queue[key_queue_head].type = type;
+    key_queue_head = next;
+}
+
+uint8_t Key_GetEvent(KeyEvent *event)
+{
+    if (key_queue_head == key_queue_tail)
+    {
+        return 0U;
+    }
+
+    *event = key_queue[key_queue_tail];
+    key_queue_tail = (uint8_t)((key_queue_tail + 1U) % KEY_QUEUE_SIZE);
+    return 1U;
+}
+</code></pre>
+<p>为什么不让按键驱动直接调用业务函数？因为那样驱动就得知道“按下 A 要切模式”这种业务规则。加了队列以后，驱动只负责报告，业务只负责决定——中间隔着一块缓冲，两边谁都不用认识对方。</p>
+<p>顺带还换来一点缓冲能力：一次主循环可以把积压的几个事件都取干净，短暂的处理不过来不会立刻丢动作。缓冲不是无限的——队列一共 8 格，满了以后新事件会被丢掉，所以真正的小车里要按事件重要性决定取舍：长按的重复事件可以丢，停止和急停不能静默丢掉。</p>
+<h3 id="应用层一张动作表">应用层：一张动作表</h3>
+<p>应用层不再写一长串 <code>if</code>，而是列一张表：<strong>哪个键的哪种事件，对应哪个动作函数</strong>。这和上一回的模式表是同一种做法。</p>
+<p>先写动作函数，每个只做一件小事：</p>
+<pre><code class="language-c">void Action_NextMode(void)
+{
+    next_mode = (uint8_t)((next_mode + 1U) % LED_MODE_COUNT);
+}
+
+void Action_PrevMode(void)
+{
+    next_mode = (uint8_t)((next_mode + LED_MODE_COUNT - 1U) % LED_MODE_COUNT);
+}
+</code></pre>
+<p><code>next_mode</code>、<code>LED_MODE_COUNT</code> 都来自上一回的模式框架：<strong>改一个变量就等于换一档模式</strong>，动作函数里不需要出现任何模式内部的东西。</p>
+<p>再写表本身和分发函数：</p>
+<pre><code class="language-c">typedef struct
+{
+    uint8_t id;              /* 哪个按键 */
+    uint8_t type;            /* 哪种事件 */
+    void (*Action)(void);    /* 对应的动作 */
+} KeyAction_TypeDef;
+
+#define ACTION_COUNT  (sizeof(action_table) / sizeof(action_table[0]))
+
+static const KeyAction_TypeDef action_table[] =
+{
+    { KEY_A, KEY_EVENT_CLICK, Action_NextMode }
+};
+
+static void HandleEvent(const KeyEvent *event)
+{
+    uint8_t index;
+
+    for (index = 0; index &lt; ACTION_COUNT; index++)
+    {
+        if ((action_table[index].id == event-&gt;id) &amp;&amp;
+            (action_table[index].type == event-&gt;type))
+        {
+            action_table[index].Action();
+            return;
+        }
+    }
+}
+</code></pre>
+<p><code>ACTION_COUNT</code> 用 <code>sizeof</code> 算出来，所以表里加一行，循环次数自己就跟着变——不用手改任何数字。这和上一回 <code>mode_table</code> 的做法一样：<strong>表变了，框架不用动</strong>。</p>
+<h3 id="屏幕上的证据和主循环">屏幕上的证据和主循环</h3>
+<p>事件有没有按预期产生，靠屏幕看。三行显示用一个小函数刷出来：</p>
+<pre><code class="language-c">static const char *event_names[] =
+{
+    "CLICK", "HOLD", "RELEASE", "DOUBLE", "LONG"
+};
+
+static uint8_t led_selected = 0U;   /* 当前被操作的那颗灯 */
+static uint32_t event_count = 0;
+
+void OLED_ShowEvent(const KeyEvent *event, uint32_t count)
+{
+    OLED_ShowString(0, 0, (char *)event_names[event-&gt;type], OLED_6X8);
+    OLED_ShowNum(0, 8, count, 4, OLED_6X8);
+    OLED_ShowNum(0, 16, led_selected, 1, OLED_6X8);
+    OLED_Update();
+}
+</code></pre>
+<p><code>event_names[]</code> 的顺序要和事件枚举一一对应。这里一次把后面几版要用到的名字都排好，扩展时这个数组不用再动。<code>led_selected</code> 记录“模式现在写给哪一颗灯”，第三版会给它加上换值的动作。</p>
+<p>主循环只剩三件事：</p>
+<pre><code class="language-c">static KeyEvent event;
+static uint32_t event_count = 0;
+
+while (1)
+{
+
+    while (Key_GetEvent(&amp;event) != 0U)
+    {
+        event_count++;
+        HandleEvent(&amp;event);
+        OLED_ShowEvent(&amp;event, event_count);
+    }
+
+    Mode_Loop();
+}
+</code></pre>
+<p><code>Key_Tick()</code> 和 <code>Mode_Tick()</code> 都挂在 1ms 中断里，主循环只剩收事件和跑模式两步，每一步都不等待。</p>
+<h3 id="第一版的接线和现象">第一版的接线和现象</h3>
+<p>按键不变，LED 沿用上一回的三颗灯。第一版的完整现象是：按一下 A，模式切到下一档，屏幕第一行出现 <code>CLICK</code>，第二行的计数加一。</p>
+<p>骨架到这里就搭好了。接下来每加一个功能，需要改的地方都不会超过两个函数。</p>
+<h2 id="第二版把按下和松开分开">第二版：把“按下”和“松开”分开</h2>
+<p>第一版只在松手时报一次 <code>CLICK</code>，按下那一刻什么也不说。可很多事需要知道手指什么时候按下去、什么时候离开：长按要从按下开始算，而“按住不放”这件事本身也得能报出来。所以先把驱动层说清楚：<strong>电平从松到按是 HOLD，从按到松是 RELEASE</strong>。</p>
+<p>事件类型多两个名字：</p>
+<pre><code class="language-c">typedef enum
+{
+    KEY_EVENT_CLICK = 0,
+    KEY_EVENT_HOLD,
+    KEY_EVENT_RELEASE,
+    KEY_EVENT_COUNT
+} KeyEventType;
+</code></pre>
+<p><code>Key_Tick()</code> 里，按下和松开分成两条路。整个函数重新放一遍（和第一版相比，只多了中间那几行）：</p>
+<pre><code class="language-c">void Key_Tick(void)
+{
+    uint8_t i;
+    uint32_t now;
+
+    if (++key_div &lt; KEY_SCAN_MS) { return; }      /* 每 20ms 才扫一遍 */
+    key_div = 0U;
+    now = Timer_Millis();
+
+    for (i = 0U; i &lt; KEY_COUNT; i++)
+    {
+        KeyRuntime *k = &amp;key_runtime[i];
+        uint8_t pin = Key_ReadPin(i);
+
+        if (pin == k-&gt;down) { continue; }            /* 没变化 */
+        if (pin != k-&gt;raw) { k-&gt;raw = pin; continue; }/* 第一拍先记下，再等一拍 */
+
+        k-&gt;down = pin;                               /* 两拍一致，认了 */
+        k-&gt;edge_ms = now;
+
+        if (k-&gt;down != 0U)
+        {
+            Key_PushEvent(i, KEY_EVENT_HOLD);
+        }
+        else
+        {
+            Key_PushEvent(i, KEY_EVENT_CLICK);
+            Key_PushEvent(i, KEY_EVENT_RELEASE);
+        }
+    }
+}
+</code></pre>
+<p>按下发 <code>HOLD</code>，松开时一次产生两个事件：<code>CLICK</code> 在前、<code>RELEASE</code> 在后。屏幕第一行只显示最近一个，所以松手后停在 <code>RELEASE</code>，而事件计数会一次加二——两个事件都确实产生过。<code>CLICK</code> 暂时还在松开这一支里直接发，第三版会把它挪出去。<code>KeyRuntime</code> 这一版不用加字段，所以结构体的定义保持原样。</p>
+<p>应用层的表加两行，顺便给 HOLD 和 RELEASE 各接一个能看见的动作：</p>
+<pre><code class="language-c">static const KeyAction_TypeDef action_table[] =
+{
+    { KEY_A, KEY_EVENT_CLICK,   Action_NextMode },
+    { KEY_B, KEY_EVENT_CLICK,   Action_PrevMode },
+    { KEY_A, KEY_EVENT_HOLD,    Action_AllOn    },
+    { KEY_A, KEY_EVENT_RELEASE, Action_AllOff   }
+};
+</code></pre>
+<p>两个新动作也都是一行：</p>
+<pre><code class="language-c">void Action_AllOn(void)
+{
+    LED_WriteAll(1);
+}
+
+void Action_AllOff(void)
+{
+    LED_WriteAll(0);
+}
+</code></pre>
+<p>现象变成：按住 A 不松，屏幕先显示 <code>HOLD</code>、三颗灯全亮；松手时事件计数一次加二（先 <code>CLICK</code> 后 <code>RELEASE</code>），屏幕停在 <code>RELEASE</code>，灯全灭，模式同时切到下一档。</p>
+<p>按住 A 的过程里仍然没有任何等待——<code>HOLD</code> 是在按下那一刻产生的，之后主循环照常运转，另一个按键的动作照样能被处理。</p>
+<h2 id="第三版双击和一个绕不开的延迟">第三版：双击，和一个绕不开的延迟</h2>
+<p>现在“松开就发 CLICK”有个问题：如果紧接着又按了一次，那第一次的 <code>CLICK</code> 已经发出去了，等到发现是双击时已经晚了。双击要认出来，就不能在第一次松手时急着下结论。</p>
+<p>所以 <code>CLICK</code> 从松手那一刻搬出去，改成“松手只记一次点击，等一小段时间看看还有没有下一次”。</p>
+<p>状态里多两个字段：</p>
+<pre><code class="language-c">typedef struct
+{
+    uint8_t  down;          /* 消抖后的状态 */
+    uint8_t  raw;           /* 上一拍原始值 */
+    uint8_t  taps;          /* 这一组里松手了几次，最多记到 2 */
+    uint32_t edge_ms;       /* 状态变过来的时刻 */
+} KeyRuntime;
+
+#define KEY_CLICK_WIN_MS  400U
+</code></pre>
+<p>事件类型多一个 <code>DOUBLE_CLICK</code>（枚举里加在 <code>RELEASE</code> 之后）：</p>
+<pre><code class="language-c">typedef enum
+{
+    KEY_EVENT_CLICK = 0,
+    KEY_EVENT_HOLD,
+    KEY_EVENT_RELEASE,
+    KEY_EVENT_DOUBLE_CLICK,
+    KEY_EVENT_COUNT
+} KeyEventType;
+</code></pre>
+<p><code>Key_Tick()</code> 也要重放一遍：松手那一支改成只累加 <code>taps</code>，等窗口到期再下结论；活着的那一支多了“看窗口”这一步。</p>
+<pre><code class="language-c">void Key_Tick(void)
+{
+    uint8_t i;
+    uint32_t now;
+    uint32_t elapsed;
+
+    if (++key_div &lt; KEY_SCAN_MS) { return; }
+    key_div = 0U;
+    now = Timer_Millis();
+
+    for (i = 0U; i &lt; KEY_COUNT; i++)
+    {
+        KeyRuntime *k = &amp;key_runtime[i];
+        uint8_t pin = Key_ReadPin(i);
+
+        if (pin == k-&gt;down)
+        {
+            if (k-&gt;down == 0U)                       /* 松着，看窗口到期没有 */
+            {
+                elapsed = now - k-&gt;edge_ms;
+
+                if ((k-&gt;taps &gt; 0U) &amp;&amp; (elapsed &gt;= KEY_CLICK_WIN_MS))
+                {
+                    Key_PushEvent(i, (k-&gt;taps &gt;= 2U) ? KEY_EVENT_DOUBLE_CLICK
+                                                     : KEY_EVENT_CLICK);
+                    k-&gt;taps = 0U;
+                }
+            }
+            continue;
+        }
+
+        if (pin != k-&gt;raw) { k-&gt;raw = pin; continue; }
+
+        k-&gt;down = pin;
+        k-&gt;edge_ms = now;
+
+        if (k-&gt;down != 0U)
+        {
+            Key_PushEvent(i, KEY_EVENT_HOLD);
+        }
+        else
+        {
+            if (k-&gt;taps &lt; 2U) { k-&gt;taps++; }         /* 松手只记一次，先不下结论 */
+            Key_PushEvent(i, KEY_EVENT_RELEASE);
+        }
+    }
+}
+</code></pre>
+<p><code>Timer_Millis()</code> 是那个 1ms 中断一直维护的毫秒计数，和上一回的 <code>tick_ms</code> 是同一个时间轴。</p>
+<p>窗口的规则是：<strong>每次松手重新计时 400ms</strong>（<code>edge_ms</code> 就在那一刻更新），这 400ms 之内没有再按下来，就按 <code>taps</code> 结算 <code>CLICK</code> 或 <code>DOUBLE_CLICK</code>，然后清零、下一组重新开始。</p>
+<p>注意这一版只用了“整组 400ms”这一个门槛，并没有单独限制“相邻两次点击最多隔多久”。想再加一条“两次点击间隔超过 200ms 就算两组”的规则，得在松开那一支里比较这次点击和上次点击的时间差——那是更细的一层规则，先不往代码里叠。</p>
+<p>这里有个真实的代价：<strong>单击要等 400ms 才被确认</strong>。按下去到看见模式切换，手上会有明显的停顿感。这不是写错了，是“允许双击”必然要付的钱——程序必须留出一段时间来观察“还会不会再来一次”。要更快的单击响应，可以减少点击级数或缩短窗口，或者改用“先发单击、后撤回”的交互规则，那是另一套取舍。</p>
+<p>表里那个 <code>{ KEY_A, KEY_EVENT_CLICK, Action_NextMode }</code> 一行都不用改——它还是在等 <code>CLICK</code>，只不过这个事件现在晚 400ms 才到。</p>
+<p>应用层给双击接上动作，顺便让双击做点单击做不到的事：换“被操作的那一颗灯”。</p>
+<pre><code class="language-c">void Action_NextLed(void)
+{
+    led_selected = (uint8_t)((led_selected + 1U) % 3U);
+}
+
+void Action_PrevLed(void)
+{
+    led_selected = (uint8_t)((led_selected + 2U) % 3U);
+}
+</code></pre>
+<p>上一回的六档模式里，点闪、慢闪、快闪、呼吸都是写给三颗的（<code>LED_WriteAll</code>）。这一版把它们的输出对象换成选中的那一颗，例如慢闪那一句：</p>
+<pre><code class="language-c">LED_WriteOne(led_selected, (uint8_t)((elapsed % 1000U) &lt; 500U));
+</code></pre>
+<p>模式输出要改对象，就再补一个设置接口：</p>
+<pre><code class="language-c">void LED_SetSingle(uint8_t index)
+{
+    if (index &lt; 3U)
+    {
+        led_selected = index;
+    }
+}
+</code></pre>
+<p>整组的“全亮、全灭”仍然用 <code>LED_WriteAll()</code>，留给下面长按那一版要用到的动作。表变成：</p>
+<pre><code class="language-c">static const KeyAction_TypeDef action_table[] =
+{
+    { KEY_A, KEY_EVENT_CLICK,        Action_NextMode },
+    { KEY_B, KEY_EVENT_CLICK,        Action_PrevMode },
+    { KEY_A, KEY_EVENT_HOLD,         Action_AllOn    },
+    { KEY_A, KEY_EVENT_RELEASE,      Action_AllOff   },
+    { KEY_A, KEY_EVENT_DOUBLE_CLICK, Action_NextLed  },
+    { KEY_B, KEY_EVENT_DOUBLE_CLICK, Action_PrevLed  }
+};
+</code></pre>
+<p>现象：单击 A，等大约 400ms，屏幕出现 <code>CLICK</code>，模式换一档；两次单击 A 的间隔小于 200ms，屏幕最终停的是 <code>DOUBLE</code>，模式不动，而是换了被操作的那颗灯。</p>
+<h2 id="第四版长按和动作搬家">第四版：长按，和“动作搬家”</h2>
+<p>单击、双击都有了，还差一种最常用的操作：按住不放。它的规则和前两种不同——不是“某件事发生一次”，而是“持续按住之后<strong>每隔一段时间</strong>报一次”。</p>
+<p>事件类型加 <code>LONG_HOLD</code>：</p>
+<pre><code class="language-c">typedef enum
+{
+    KEY_EVENT_CLICK = 0,
+    KEY_EVENT_HOLD,
+    KEY_EVENT_RELEASE,
+    KEY_EVENT_DOUBLE_CLICK,
+    KEY_EVENT_LONG_HOLD,
+    KEY_EVENT_COUNT
+} KeyEventType;
+</code></pre>
+<p>状态里加三个字段记录长按的进度：</p>
+<pre><code class="language-c">typedef struct
+{
+    uint8_t  down;          /* 消抖后的状态 */
+    uint8_t  raw;           /* 上一拍原始值 */
+    uint8_t  taps;          /* 这一组里松手了几次，最多记到 2 */
+    uint8_t  long_sent;     /* 这次按压的长按报过没有 */
+    uint32_t edge_ms;       /* down 是哪一刻变成现在这样的 */
+} KeyRuntime;
+
+#define KEY_LONG_MS    800U
+#define KEY_REPEAT_MS  100U
+</code></pre>
+<p><code>Key_Tick()</code> 重放一遍：按下时记下时刻、把长按标记清掉；松开时<strong>如果这次按压已经被长按用掉了，就不再算一次点击</strong>。</p>
+<pre><code class="language-c">void Key_Tick(void)
+{
+    uint8_t i;
+    uint32_t now;
+    uint32_t elapsed;
+
+    if (++key_div &lt; KEY_SCAN_MS) { return; }
+    key_div = 0U;
+    now = Timer_Millis();
+
+    for (i = 0U; i &lt; KEY_COUNT; i++)
+    {
+        KeyRuntime *k = &amp;key_runtime[i];
+        uint8_t pin = Key_ReadPin(i);
+
+        if (pin != k-&gt;down)
+        {
+            if (pin != k-&gt;raw) { k-&gt;raw = pin; continue; }
+
+            k-&gt;down = pin;
+            k-&gt;edge_ms = now;
+
+            if (k-&gt;down != 0U)
+            {
+                k-&gt;long_sent = 0U;
+                Key_PushEvent(i, KEY_EVENT_HOLD);
+            }
+            else
+            {
+                if (k-&gt;long_sent == 0U)              /* 没被长按用掉，才算一次点击 */
+                {
+                    if (k-&gt;taps &lt; 2U) { k-&gt;taps++; }
+                }
+                Key_PushEvent(i, KEY_EVENT_RELEASE);
+            }
+            continue;
+        }
+
+        elapsed = now - k-&gt;edge_ms;
+
+        if (k-&gt;down != 0U)
+        {
+            if (k-&gt;taps != 0U) { continue; }         /* 还有点没结算，先归点击那一组 */
+
+            if (k-&gt;long_sent == 0U)
+            {
+                if (elapsed &gt;= KEY_LONG_MS)
+                {
+                    k-&gt;long_sent = 1U;
+                    k-&gt;edge_ms = now;
+                    Key_PushEvent(i, KEY_EVENT_LONG_HOLD);
+                }
+            }
+            else if (elapsed &gt;= KEY_REPEAT_MS)
+            {
+                k-&gt;edge_ms = now;
+                Key_PushEvent(i, KEY_EVENT_LONG_HOLD);
+            }
+        }
+        else if ((k-&gt;taps &gt; 0U) &amp;&amp; (elapsed &gt;= KEY_CLICK_WIN_MS))
+        {
+            Key_PushEvent(i, (k-&gt;taps &gt;= 2U) ? KEY_EVENT_DOUBLE_CLICK : KEY_EVENT_CLICK);
+            k-&gt;taps = 0U;
+        }
+    }
+}
+</code></pre>
+<p>没有后面那个 <code>long_sent</code> 判断会怎样？按住 A 超过 800ms 再松手，程序会先发 <code>LONG_HOLD</code>（灯全亮），紧接着再发一个 <code>CLICK</code>（模式切下一档）——一次按压冒出两个动作。加上判断以后，一次按压只归一类：要么是一次点击，要么是一次长按。</p>
+<p>长按的检查函数单独一个，规则是“到 800ms 报第一次，之后每 100ms 再报一次”：</p>
+<p>那个 <code>if (k-&gt;taps != 0U) { continue; }</code> 是长按和点击的分界线：上一组点击还没结算（<code>taps</code> 不是 0），这一次按压就先不报长按。手指一直压着、而且从没点过时，<code>taps</code> 是 0，程序才会去比对 <code>KEY_LONG_MS</code>。</p>
+<p>还有一种夹在中间的情形：先点一下、松手，紧接着又按住不放。这时手指是按着的，但上一组的点击还没结算（<code>taps</code> 还是 1）——这一下按压会被算作“这一组的后续点击”，等窗口结算、<code>taps</code> 清零以后，长按才从头开始计时。反过来说，<strong>一次按压要么属于一组点击，要么属于一次长按，不会两边都算</strong>。</p>
+<p>现在说“动作搬家”。第二版里，<code>HOLD</code> 和 <code>RELEASE</code> 被接成了“全亮”和“全灭”。那是当时的临时安排——按住就全亮，其实更像“长按”该干的事。现在长按有了名字，这两个动作就该挪过去：</p>
+<pre><code class="language-c">static const KeyAction_TypeDef action_table[] =
+{
+    { KEY_A, KEY_EVENT_CLICK,        Action_NextMode },
+    { KEY_B, KEY_EVENT_CLICK,        Action_PrevMode },
+    { KEY_A, KEY_EVENT_DOUBLE_CLICK, Action_NextLed  },
+    { KEY_B, KEY_EVENT_DOUBLE_CLICK, Action_PrevLed  },
+    { KEY_A, KEY_EVENT_LONG_HOLD,    Action_AllOn    },
+    { KEY_B, KEY_EVENT_LONG_HOLD,    Action_AllOff   }
+};
+</code></pre>
+<p>表里 <code>HOLD</code> 和 <code>RELEASE</code> 两行被删掉了。事件本身还在产生（屏幕上照样显示 <code>HOLD</code> 和 <code>RELEASE</code>），只是暂时没有动作接它们——这正是分层的用处：<strong>驱动层照旧报告，应用层想接就接、想撤就撤</strong>。</p>
+<p>现象：按住 A 不松，屏幕先显示 <code>HOLD</code>，约 800ms 后开始每隔 100ms 显示一次 <code>LONG_HOLD</code>，三颗灯保持全亮；松手出现 <code>RELEASE</code>，灯灭，而且不会再补一个 <code>CLICK</code>。</p>
+<h2 id="第五版组合键为什么它进不了表">第五版：组合键，为什么它进不了表</h2>
+<p>最后一种操作：按住一个键的同时单击另一个键。上一版那张表只能表达“某键的某事件”，表达不了“另一个键现在还按着”——表里没有位置放这个条件。</p>
+<p>所以组合判断写在查表之前，单独一段：</p>
+<pre><code class="language-c">static void HandleEvent(const KeyEvent *event)
+{
+    uint8_t index;
+
+    if ((event-&gt;id == KEY_A) &amp;&amp; (event-&gt;type == KEY_EVENT_CLICK) &amp;&amp;
+        (Key_IsDown(KEY_B) != 0U))
+    {
+        next_mode = LED_MODE_BREATH;        /* 按住 B，单击 A：进呼吸档 */
+        return;
+    }
+
+    for (index = 0; index &lt; ACTION_COUNT; index++)
+    {
+        if ((action_table[index].id == event-&gt;id) &amp;&amp;
+            (action_table[index].type == event-&gt;type))
+        {
+            action_table[index].Action();
+            return;
+        }
+    }
+}
+</code></pre>
+<p><code>Key_IsDown()</code> 读的是稳定之后的状态，专门给这种组合判断用：</p>
+<pre><code class="language-c">uint8_t Key_IsDown(uint8_t id)
+{
+    return (id &lt; KEY_COUNT) ? key_runtime[id].down : 0U;
+}
+</code></pre>
+<p>关键是顺序：<strong>组合判断必须在查表之前</strong>。如果先查表，A 的 <code>CLICK</code> 已经按表把模式切走了，再想“其实是组合键”就晚了。这和第三版里“单击要等窗口结束才确认”是同一个道理——条件没集齐之前不能先动手。</p>
+<p>现象：按住 B 不松，单击 A，屏幕出现 <code>CLICK</code>，程序直接进呼吸档；A 的长按、B 的长按各走各的路，互不干扰。松开 B 再单击 A，A 恢复成“切下一档模式”。</p>
+<h2 id="五版下来的全貌">五版下来的全貌</h2>
+<p>驱动层每次都只是多认一种事件：</p>
+<table>
+<thead>
+<tr>
+<th>版本</th>
+<th>驱动层多出来的东西</th>
+<th>应用层多出来的东西</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第一版</td>
+<td>消抖 + 松手产生 <code>CLICK</code></td>
+<td>动作表；A 单击切下一档</td>
+</tr>
+<tr>
+<td>第二版</td>
+<td><code>HOLD</code>、<code>RELEASE</code></td>
+<td>A 按住全亮、松手全灭（临时）</td>
+</tr>
+<tr>
+<td>第三版</td>
+<td>点击计数 + 400ms 窗口；<code>DOUBLE_CLICK</code></td>
+<td>A/B 双击换选中灯</td>
+</tr>
+<tr>
+<td>第四版</td>
+<td><code>LONG_HOLD</code>（800ms + 100ms 重复）</td>
+<td>长按接管全亮/全灭，<code>HOLD</code> 退出表</td>
+</tr>
+<tr>
+<td>第五版</td>
+<td><code>Key_IsDown()</code>（读稳定状态，给组合判断用）</td>
+<td>按住 B + 单击 A 进呼吸档</td>
+</tr>
+</tbody>
+</table>
+<p><code>next_mode</code>、<code>LED_MODE_COUNT</code>、<code>Mode_Loop()</code> 都来自上一回的六档模式框架与那张 <code>mode_table</code>——应用层始终只改 <code>next_mode</code> 这一个变量，模式内部怎么点灯、点哪一颗，都由上一回那套写法负责。</p>
+<p>最终的事件与动作对照：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>事件</th>
+<th>应用动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 单击</td>
+<td><code>CLICK</code></td>
+<td>切到下一档模式</td>
+</tr>
+<tr>
+<td>B 单击</td>
+<td><code>CLICK</code></td>
+<td>切到上一档模式</td>
+</tr>
+<tr>
+<td>A 双击</td>
+<td><code>DOUBLE_CLICK</code></td>
+<td>选中下一颗灯</td>
+</tr>
+<tr>
+<td>B 双击</td>
+<td><code>DOUBLE_CLICK</code></td>
+<td>选中上一颗灯</td>
+</tr>
+<tr>
+<td>A 长按</td>
+<td><code>LONG_HOLD</code></td>
+<td>全部 LED 亮</td>
+</tr>
+<tr>
+<td>B 长按</td>
+<td><code>LONG_HOLD</code></td>
+<td>全部 LED 灭</td>
+</tr>
+<tr>
+<td>按住 B + 单击 A</td>
+<td><code>CLICK</code>（带条件）</td>
+<td>进入呼吸档</td>
+</tr>
+</tbody>
+</table>
+<h2 id="三个可以复现的操作">三个可以复现的操作</h2>
+<h3 id="单击与双击的边界">单击与双击的边界</h3>
+<p>单击 A 一次并等到屏幕出现 <code>CLICK</code>，模式换到下一档；两次单击 A 的间隔保持在 200ms 内，屏幕最终停在 <code>DOUBLE</code>，模式不变、选中的灯换一颗。点击间隔不要超过 400ms：超过以后上一组窗口已经结算，两次点击会各自确认，模式连换两档。</p>
+<h3 id="长按与长按的重复">长按与长按的重复</h3>
+<p>按住 A 不松：先看到 <code>HOLD</code>，约 800ms 后开始每 100ms 出现一次 <code>LONG_HOLD</code>，灯保持全亮；松手出现 <code>RELEASE</code>，不会再出现 <code>CLICK</code>。</p>
+<h3 id="按住-b-单击-a">按住 B 单击 A</h3>
+<p>按住 B 不松，单击 A。B 一直是按着的，A 的 <code>CLICK</code> 被组合判断截住，程序进入呼吸档。松开 B 之后再单击 A，A 恢复成“切下一档”。</p>
+<h2 id="一个常见的代码错误">一个常见的代码错误</h2>
+<p>把单击直接写在松开那一支里：</p>
+<pre><code class="language-c">            else
+            {
+                Key_PushEvent(index, KEY_EVENT_CLICK);
+                Key_PushEvent(index, KEY_EVENT_RELEASE);
+            }
+</code></pre>
+<p>这正是第二版的样子。在这一版里它是对的——那时还不认双击。等加上双击以后，如果这里不改，双击一定会先换两次模式，等 400ms 窗口结束时再想补救已经晚了。<strong>驱动层每多认一种事件，都要回头检查旧事件产生的位置还合不合适</strong>，这也是为什么单击那一行要从这里搬到窗口检查里。</p>
+<h2 id="最后橘猫说">最后橘猫说</h2>
+<p>输入这一层现在的样子是：电平每 1ms 被读一次，抖动被时间过滤掉，剩下的变化被整理成一次性事件，事件进队列，应用层取出来决定动作。五种事件、一张动作表、一处组合判断，就是全部。</p>
+<p>和上一回的周期任务放在一起看，非阻塞只有两种形状——一种是“每段时间做一次”，一种是“有事发生就报一次”。按键属于后一种，而它内部的每一次扩展都没有引入等待：识别双击靠的是一个时间窗口在 1ms 节拍上被反复检查，认长按靠的是另一个时间点被反复比较。<strong>小车上要处理的输入输出，绝大多数落在这两种形状里</strong>：定时器负责让时间往前走，输入层负责把外部世界的变化翻译成事件，应用层只做决定，谁也不替谁等。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-26 10:45">2026-10-26 10:44</span>&nbsp;
+<a href="https://www.cnblogs.com/zw-awa">Zw-awa</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23437718);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzw-awa%2Fp%2F23437718&amp;targetId=23437718&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
