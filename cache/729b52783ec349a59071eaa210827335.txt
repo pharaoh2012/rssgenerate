@@ -1,0 +1,186 @@
+
+		<h1 class="postTitle">
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/wsss/p/23452291" title="发布于 2026-10-27 11:38">
+    
+
+    <span role="heading" aria-level="2">一把空锁卡死整个服务：虚拟线程 pinning 问题实战</span>
+    
+
+</a>
+
+		</h1>
+		<div class="clear"></div>
+		<div class="postBody">
+			<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="锁没人持有288-个线程却排了-13-小时的队一次虚拟线程-pinning-假死的排查">锁没人持有，288 个线程却排了 13 小时的队：一次虚拟线程 pinning 假死的排查</h1>
+<blockquote>
+<p>JDK 21 的服务，日志不写了，接口全超时，jstack 里还找不到谁持有锁。最后发现问题出在虚拟线程的调度器上，和锁本身关系不大。</p>
+</blockquote>
+<hr>
+<h2 id="现象">现象</h2>
+<p>测试环境有个服务（JDK 21，8 核机器）晚上突然假死了：</p>
+<ul>
+<li>应用日志停在某个时间点，之后 13 小时一行都没写</li>
+<li>进程还在，GC 正常，arthas 也能连上</li>
+<li>对外的 Dubbo 查询接口全部超时</li>
+<li>jstack 里一大堆线程卡在同一把 <code>ReentrantLock</code> 上，但整份 dump 里找不到谁持有这把锁</li>
+</ul>
+<p>卡住的线程都在打日志，栈长这样：</p>
+<pre><code>at java.util.concurrent.locks.ReentrantLock.lock(ReentrantLock.java:322)
+at java.util.concurrent.ArrayBlockingQueue.remainingCapacity(ArrayBlockingQueue.java:485)
+at ch.qos.logback.core.AsyncAppenderBase.append(AsyncAppenderBase.java:162)
+...
+</code></pre>
+<p>线程是卡在 logback <code>AsyncAppender</code> 内部队列的锁上。所有要打日志的线程都在这排队，业务代码跑不下去，整个服务就停了。</p>
+<hr>
+<h2 id="先补点背景">先补点背景</h2>
+<p>后面会用到三个概念，先说一下。</p>
+<p><strong>虚拟线程要借载体线程（carrier）才能跑。</strong> 虚拟线程不是 OS 线程，它得被调度到载体线程上才能执行。载体线程在一个 <code>ForkJoinPool</code> 里，默认数量等于 CPU 核数，8 核就是 8 条。</p>
+<p><strong><code>ReentrantLock</code> 阻塞会让出载体线程，<code>synchronized</code> 阻塞不会。</strong> 虚拟线程在 <code>lock.lock()</code> 上等的时候会 park，载体线程腾出来给别人用。但在 <code>synchronized</code> 上等的时候（JDK 21 的实现），虚拟线程是被钉在载体线程上的，载体线程跟着一起阻塞，调度器没办法。这就是 pinning。</p>
+<p><strong>虚拟线程变成 <code>RUNNABLE</code>，不等于它在跑。</strong> 锁释放之后，<code>ReentrantLock</code> 会 <code>unpark</code> 队头的线程。对虚拟线程来说，<code>unpark</code> 只是把它重新丢回调度器的队列里，它还得等分到一条载体线程才能真的执行。</p>
+<hr>
+<h2 id="结论">结论</h2>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>答案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>卡在哪</td>
+<td>logback <code>AsyncAppender</code> 队列的 <code>ReentrantLock</code>，状态是 <code>Unlocked</code>，却有 288 个线程在排队</td>
+</tr>
+<tr>
+<td>锁是空的，为什么没人能拿到</td>
+<td>队头的虚拟线程被唤醒了，但分不到载体线程，没法执行去拿锁</td>
+</tr>
+<tr>
+<td>载体线程为什么分不出来</td>
+<td>8 条载体线程都被 pin 住了：有虚拟线程在 <code>synchronized</code> 里等这把日志锁，它占着载体线程不放，其他线程也被它堵在 <code>synchronized</code> 外面</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="排查过程">排查过程</h2>
+<h3 id="第一步线程-dump-看不到持锁的线程">第一步：线程 dump 看不到持锁的线程</h3>
+<p>最直接的想法是在 dump 里找谁持有这把锁。第一份 jstack 没带 <code>-l</code>，白看了。重新抓了带 <code>-l</code> 的，还是没有。</p>
+<p>原因是 jstack 不会列出虚拟线程。换成 <code>jcmd Thread.dump_to_file</code> 倒是能看到虚拟线程，可这次抓到的 json 和 text 两种格式里都没有锁信息。</p>
+<p>所以线程 dump 在这个场景下回答不了"谁持有锁"，得换个办法。</p>
+<h3 id="第二步直接问这把锁">第二步：直接问这把锁</h3>
+<p>arthas 想反射读 <code>exclusiveOwnerThread</code>，被模块封装挡了（<code>java.util.concurrent</code> 没开 <code>--add-opens</code>）。</p>
+<p>换个思路。<code>ReentrantLock.toString()</code> 是公开方法，会打印 <code>[Locked by thread xxx]</code> 或者 <code>[Unlocked]</code>。用 <code>vmtool</code> 把全堆的 <code>ReentrantLock</code> 扫一遍，挑出排队最长的：</p>
+<pre><code class="language-bash">vmtool --action getInstances --className java.util.concurrent.locks.ReentrantLock --limit 999999 \
+  --express "instances.{? #this.getQueueLength() &gt; 10}.{#this.toString() + ' qlen=' + #this.getQueueLength()}"
+</code></pre>
+<p>结果：</p>
+<pre><code>java.util.concurrent.locks.ReentrantLock@7ced673d[Unlocked] qlen=288
+</code></pre>
+<p>全堆 27221 个 <code>ReentrantLock</code>，排队超过 10 个的只有这一把，而且是 Unlocked。没人占着锁，却有 288 个线程在排队，这就怪了。</p>
+<h3 id="第三步怀疑载体线程不够用">第三步：怀疑载体线程不够用</h3>
+<p>锁是空的，排队的里面又有大量虚拟线程，我想到两种可能：</p>
+<ol>
+<li>队头的虚拟线程被 <code>unpark</code> 了，但等不到载体线程，一直没能去拿锁</li>
+<li>载体线程被 <code>synchronized</code> 里的线程钉住了</li>
+</ol>
+<p>先看虚拟线程的状态。同一批任务的 614 个虚拟线程：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>数量</th>
+<th>占比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RUNNABLE</td>
+<td>439</td>
+<td>73%</td>
+</tr>
+<tr>
+<td>WAITING</td>
+<td>156</td>
+<td>25%</td>
+</tr>
+<tr>
+<td>BLOCKED</td>
+<td>7</td>
+<td>1%</td>
+</tr>
+</tbody>
+</table>
+<p>439 个 <code>RUNNABLE</code> 却没一个在推进，说明它们是被唤醒了，在等载体线程。</p>
+<p>再看那 7 个 <code>BLOCKED</code>，全卡在同一个地方：</p>
+<pre><code>java.util.concurrent.ConcurrentHashMap.compute
+  ← Caffeine BoundedLocalCache.computeIfAbsent
+  ← LocalLoadingCache.get
+  ← UserService.get(UserService.java:229)
+  ← ... 业务批处理逻辑 ...
+  ← VirtualThread.run
+</code></pre>
+<p><code>ConcurrentHashMap.compute</code> 内部是 <code>synchronized</code>。这 7 个线程在等别人手里的监视器，那持有监视器的是谁？</p>
+<p>翻线程栈能看到，持有者也是一个虚拟线程，它正在 <code>compute</code> 的加载逻辑里打日志，等的就是那把日志锁。它在 <code>synchronized</code> 里等锁，所以载体线程被钉死了，那 7 个等监视器的线程也一样，各占一条载体线程动不了。</p>
+<p>最后直接读虚拟线程默认调度器 <code>VirtualThread.DEFAULT_SCHEDULER</code> 的状态：</p>
+<pre><code>ForkJoinPool[Running, parallelism = 8, size = 30, active = 8, running = 0, ...]
+</code></pre>
+<p><code>active = 8</code>、<code>running = 0</code>。8 条载体线程全被占着，真正在跑代码的一条都没有。</p>
+<hr>
+<h2 id="串起来看">串起来看</h2>
+<div class="mermaid">flowchart TD
+    A[批量任务：一下子产生几百个虚拟线程] --&gt; B[大量虚拟线程打日志，争抢 AsyncAppender 队列锁]
+    A --&gt; C[虚拟线程进入缓存加载的 synchronized]
+    C --&gt; D[持有监视器的线程在里面打日志，等日志锁]
+    D --&gt; E[它被 pin 在载体线程上；等监视器的线程也被 pin 住]
+    E --&gt; F[8 条载体线程被占满，active=8 running=0]
+    B --&gt; G[日志锁释放，AQS unpark 队头的虚拟线程]
+    G --&gt; H[变成 RUNNABLE，但要等载体线程才能执行]
+    F --&gt; H
+    H --&gt; I[没有载体线程，队头拿不到锁，锁空着，队列越排越长]
+    I --&gt; J[平台线程、Dubbo 查询线程也要打日志，全排进这把锁]
+    J --&gt; K[日志冻结，接口超时，持续 13 小时]
+</div><p>这是跨了两层的死锁：</p>
+<ul>
+<li>应用层：持有监视器的线程要先拿到日志锁，才能退出 <code>synchronized</code></li>
+<li>调度层：日志锁队头的线程要先有载体线程，才能去拿这把锁，而载体线程正被上面那些线程占着</li>
+</ul>
+<p>单看哪一层都没毛病，所以 jstack 看不出死锁，JVM 自己也不会报死锁。</p>
+<hr>
+<h2 id="这次的问题是我和ai一起排查的">这次的问题是我和ai一起排查的</h2>
+<p>我觉得，查问题难的找线索，验证假设。假设随时能想出几个，但每个都要花时间去扫堆、查状态、对数字。AI 把验证这一步压得很短，一条命令几分钟就有结果。</p>
+<p>但证据不够的时候，ai会顺手编一个说得通的故事补上，并且经常跑偏。这次它给过好几个解释，听着都合理，其实一个都没验证过。</p>
+<p>所以我主要做两件事：它下结论时问一句"凭什么"；它没方向时，用我的知识给它方向，载体线程被占满这个假设就是这么来的。</p>
+<p>我给方向，它去验证，没证据的结论不算数。</p>
+<h3 id="强大的ai是顺风帆能让船提速但航线始终由舵手来定">强大的AI是顺风帆，能让船提速，但航线始终由舵手来定</h3>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/wsss/" target="_blank">无所事事O_o</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/wsss/p/23452291" target="_blank">https://www.cnblogs.com/wsss/p/23452291</a></p>
+<br>
+<h1>推荐一下我的微信小程序 - “二次验证码TOTP”</h1>
+<section class="container" style="...">
+    <ul class="ul" style="...">
+      <li>有任何建议或需求可以直接联系我</li>
+      <li>免费云端加密备份 ：换机不丢失，安全又便捷</li>
+      <li>API快速集成 ：提供开放API，实现自动化验证码获取</li>
+      <li>多端共享：基于微信小程度，可同时在手机，PC端共同使用，一键复制</li>
+      <li>扫描二维码试用,或微信小程序搜索"二次验证码TOTP"</li>
+    </ul>
+    <p><img src="https://img2024.cnblogs.com/blog/863355/202511/863355-20251121163135011-468158823.png" alt="微信小程序"></p>
+  </section>
+</div>
+<div class="clear"></div>
+
+		</div>
+		<div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-27 11:39">2026-10-27 11:38</span>&nbsp;
+<a href="https://www.cnblogs.com/wsss">无所事事O_o</a>&nbsp;
+阅读(<span id="post_view_count">93</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23452291);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fwsss%2Fp%2F23452291&amp;targetId=23452291&amp;targetType=0" target="_blank">举报</a>
+</div>
+	
