@@ -1,0 +1,83 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zhangs1986/p/23209171" title="发布于 2026-10-28 08:06">
+    
+
+    <span role="heading" aria-level="2">Flink实时同步Oracle到StarRocks的几个踩坑经验分享</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img src="https://img2024.cnblogs.com/blog/273387/202610/273387-20261006160539478-468093156.png" alt="5049e0950ebe25bf29320fa275402b66_nuudQ+y7ZOxeYx3zji6juxuhOrh0J1y9dWXGXJVZaAmqys+MpaqG74Gvi4uNJWqB7lGsflxkm9d94c3qz3TxvDG83R+f8FnLnCRioQfXsAAAAASUVORK5CYII=" loading="lazy"></p>
+<p>最近在搞数据实时同步的活，把Oracle的业务数据实时同步到StarRocks给分析用。用的阿里云Flink最新版本 vvr-11.7-jdk11-flink-1.20。</p>
+<p>选型没什么好说的，Flink CDC 读 Oracle，写 StarRocks，方案很成熟。但阿里云原生不带 Oracle CDC 的 Connector，得自己上传开源社区的 <code>flink-sql-connector-oracle-cdc-3.0.1</code> 上去，这个倒还好，早有心理准备。</p>
+<p>结果一上手就是连环坑。</p>
+<p><strong>先说第一个，JDBC 驱动的问题。</strong> SQL 写好了，建好表，点启动，直接报错——说无法解析 Oracle 数据库版本，找不到 JDBC 驱动。测试环境我们是自建Flink，所以版本没问题。我当时想这还不简单，传个 ojdbc 上去呗。传了，还是报。换了个版本，报了另一个错，ClassNotFound。再换，又来个方法找不到。</p>
+<p>来来回回试了好几个版本的组合才跑通。阿里云官方也没个明确的依赖推荐列表，这东西就是靠试。最后用的ojdbc8-19.3.0.0 版本，后面建任务直接复制，不想再折腾第二遍。</p>
+<p>反正就是一句话，<strong>用阿里云 Flink 跑 Oracle CDC，驱动这块一定要提前留出时间来调试，别想着一把过。</strong></p>
+<p><strong>然后第二个问题比较头疼，从 Savepoint 恢复任务的时候特别慢。</strong></p>
+<p>任务跑起来之后同步是没问题的，但有次需要重启一下，从 Savepoint 恢复，等了好几分钟才真正开始跑数据。一开始以为是偶发的，没在意，后来手动停了再重启，还是慢。试了几次都这样，那就不是运气问题了。</p>
+<p>后来排查下来，原因是 Savepoint 的状态文件存在 OSS 上，恢复的时候要从远程把这些文件拉回来再重建状态引擎。全量快照阶段的状态文件挺大的，好几个 G，光下载就要好一会儿。</p>
+<p>解决思路有两个。一个是开 Local Recovery，TaskManager 本地会保留一份状态副本，Failover 的时候读本地的，不走远程下载，速度很快。但这玩意有个坑——<strong>它只对 Failover 和动态参数更新有效，手动停任务再启动它是不管的</strong>，还是老老实实走远程。</p>
+<p>另一个是用 GeminiStateBackend 的懒加载，这个对手动重启也管用。原理是状态文件异步下载，不用等全加载完作业就能跑起来。代价是刚起来那一阵性能会差一点，状态是边用边拉的。不过对于同步任务来说，起步慢一点总比卡在那里干等强。</p>
+<p>最后在部署详情的运行参数配置里加了 Gemini 懒加载的参数，恢复时间确实压下来了，从好几分钟降到几十秒。</p>
+<p><strong>这两个方案的适用场景不一样，别搞混了。Local Recovery 管意外挂掉的情况，Gemini 懒加载管你主动重启的情况。</strong></p>
+<p><strong>第三个坑比较隐蔽，VARCHAR2 的长度映射。</strong></p>
+<p>Oracle 那边字段类型是 <code>VARCHAR2(100)</code>，我在 StarRocks 建表的时候直接写了 <code>VARCHAR(100)</code>，数字一样嘛，觉得没问题。</p>
+<p>跑了一段时间之后发现有些记录写入 StarRocks 报错了，提示字段超长。一开始还纳闷，100 对 100 怎么就不够了？</p>
+<p>后来想明白了。Oracle 的 VARCHAR2 长度是按字节算的，StarRocks 的 VARCHAR 是按字符算的。一个中文字在 UTF-8 下占 3 个字节，所以这里面的换算关系不是 1:1。简单粗暴的做法就是：<strong>映射的时候 StarRocks 那边长度直接乘 3，Oracle 的 VARCHAR2(100) 在 StarRocks 建 VARCHAR(300)</strong>，省得后面一个个去排查。</p>
+<p>这种事不踩一次还真不知道。</p>
+<p><strong>第四个坑是最狠的，归档日志过期。</strong></p>
+<p>有天任务突然挂了，报错信息里有个 <code>offset scn not found</code>，大概意思是 CDC 上次记录的那个读取位点，对应的 Oracle 归档日志已经被清掉了。去问了下 DBA，归档日志只保留了 2 天。偏偏这次任务停了两天多才恢复，日志早就没了，LogMiner 没法接着读。</p>
+<p>增量链路断了，没别的办法，只能清掉 Checkpoint 状态重新跑全量。数据量大，全量跑了好久，但那会儿也只能等着。</p>
+<p>事后做了两件事。一是让 DBA 把归档保留策略从 2 天延到了 7 天：</p>
+<pre><code class="language-SQL">CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 7 DAYS;
+</code></pre>
+<p>二是给 CDC 任务加了 SCN 回退参数，留点容错空间：</p>
+<pre><code class="language-Plain">'debezium.log.mining.scn.rewind.distance' = '50000'
+'debezium.log.mining.scn.rewind.time.ms' = '300000'
+</code></pre>
+<p><strong>这个坑的教训就是，用 CDC 读 Oracle，归档保留时间一定要比任务可能的最长中断时间长，不然断了就只能全量重来，很痛苦。但还是有个隐患，归档保留策略从2天延到了7天会导致服务器磁盘占用很大 后期一定要注意磁盘使用的增量问题否则会导致整个库异常。</strong></p>
+<p>搞完之后回头看，这些问题单个拿出来都不算什么大事，但堆在一起确实磨人。尤其是一些细节上的东西，像 Local Recovery 只管 Failover 不管手动重启、VARCHAR2 按字节不算字符、归档日志默认只留 2 天，这种事不看文档不踩坑根本不会注意。</p>
+<p>就记这么多吧，下次再搞类似的同步任务直接翻这篇，省得重复踩坑。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div style="background: rgb(230, 250, 230); padding: 10px 10px 10px 10px; border: 1px dashed rgb(224, 224, 224); font-family: 微软雅黑; font-size: 13px">
+作者：<a href="http://www.cnblogs.com/zhangs1986/" target="_blank">一个码农的日常</a>
+<br>公众号【一个码农的日常】
+
+<br>
+出处：<a href="http://zhangs1986.cnblogs.com/" target="_blank">http://zhangs1986.cnblogs.com/</a>
+<br>
+码云：<a href="https://gitee.com/huanzui" target="_blank">https://gitee.com/huanzui</a>
+<br>
+本文版权归作者和博客园共有，欢迎转载，但未经作者同意必须保留此段声明，且在文章页面明显位置给出原文连接，否则保留追究法律责任的权利。
+
+ 
+<div style="position: fixed; right: 140px; bottom: 40px" id="div_diggc">            
+    <div class="diggit" style="height: 25px; background-image: none; color: #FFFFFF; background-color: #2DAEBF; border: medium none; font-weight: bold; text-decoration: none">
+        <span class="diggnum"><a style="color: #FFFFFF; font-size: 12pt" href="#top">Top</a></span>         
+    </div>            
+</div>
+ 
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-28 08:06">2026-10-28 08:06</span>&nbsp;
+<a href="https://www.cnblogs.com/zhangs1986">一个码农的日常</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23209171);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzhangs1986%2Fp%2F23209171&amp;targetId=23209171&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
