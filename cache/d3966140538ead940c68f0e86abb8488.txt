@@ -1,0 +1,428 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shenchuanchao/p/23481724/dotnet-api-800ms-to-60ms-production-optimization" title="发布于 2026-10-30 08:02">
+    
+
+    <span role="heading" aria-level="2">.NET 接口从 800ms 干到 60ms：生产环境这几个优化点最关键</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>大家好，我是码农刚子。上周三下午，计划主管直接打电话过来：「订单列表打不开了，点一下转半分钟，计划文员等着投料排产。」</p>
+<p>我打开监控看了一眼：P95 800ms，峰值 1.2 秒。再看服务器，数据库 CPU 40%，应用 CPU 20%——两边都不忙，但它就是慢。</p>
+<p>这种「谁都不忙、接口就是慢」的情况，九成不是服务器性能不够，而是<strong>你在用最贵的方式拿数据</strong>。具体到 .NET 项目，绝大多数时候问题出在 EF Core 的查询姿势上。</p>
+<p>这篇里的排查顺序和改法，我整理进了《.NET 生产环境避坑手册》第二章，一共三篇 EF Core 事故复盘，文末可以自取。先看结论：下面几个点，任何一个单独做都能砍掉一大截耗时，全做完是 800ms 到 60ms。</p>
+<h2 id="一先别改代码把-800ms-拆开看">一、先别改代码，把 800ms 拆开看</h2>
+<p>我见过太多人一上来就加缓存、加 Redis、换 ORM，最后发现根本没找对地方。</p>
+<p>改代码之前，先拿三个数：</p>
+<table>
+<thead>
+<tr>
+<th>要拿的数</th>
+<th>怎么拿</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>接口总耗时</td>
+<td>在 Action 里 <code>Stopwatch</code> 包一层，或者看 APM / 日志里的耗时字段</td>
+</tr>
+<tr>
+<td>SQL 执行总耗时</td>
+<td>EF Core 日志 <code>LogTo</code>，或数据库侧 Extended Events</td>
+</tr>
+<tr>
+<td><strong>一次请求发了几条 SQL</strong></td>
+<td>同上，数日志条数——这个数最容易被忽略，也最能说明问题</td>
+</tr>
+</tbody>
+</table>
+<p>第三个数是关键。我当时数出来是 <strong>217 条</strong>。</p>
+<p>一个「查订单列表」的接口，发了 217 条 SQL。这就不是快慢的问题了，这是设计问题。</p>
+<p>打开 EF Core 日志的办法（开发环境够用）：</p>
+<pre><code class="language-csharp">optionsBuilder
+    .UseSqlServer(conn)
+    .LogTo(Console.WriteLine, new[] { DbLoggerCategory.Database.Command.Name },
+            LogLevel.Information)
+    .EnableSensitiveDataLogging();   // 仅开发环境！
+</code></pre>
+<blockquote>
+<p>⚠️ <code>EnableSensitiveDataLogging()</code> 会把参数值打进日志，生产环境千万别开——里面可能有客户名、价格、身份证号。</p>
+</blockquote>
+<p>如果要看某条 LINQ 最终翻译成了什么 SQL，不用连数据库：</p>
+<pre><code class="language-csharp">var sql = query.ToQueryString();
+</code></pre>
+<p>这一步只花十分钟，但决定了后面所有优化有没有意义。</p>
+<h2 id="二优化点-1n1-查询这是最贵的一刀">二、优化点 1：N+1 查询，这是最贵的一刀</h2>
+<h3 id="现场复现">现场复现</h3>
+<p>代码长这样，看着一点问题都没有：</p>
+<pre><code class="language-csharp">// 一页 50 条订单
+var orders = await _db.Orders
+    .Where(o =&gt; o.Status == OrderStatus.InProduction)
+    .OrderByDescending(o =&gt; o.CreatedAt)
+    .Skip((page - 1) * 50).Take(50)
+    .ToListAsync();
+
+foreach (var o in orders)
+{
+    // 每条订单查客户
+    o.CustomerName = (await _db.Customers.FindAsync(o.CustomerId))?.Name;
+
+    // 每条订单查明细条数
+    o.ItemCount = await _db.OrderItems.CountAsync(i =&gt; i.OrderId == o.Id);
+
+    // 每条订单查最新报工记录
+    o.LastReportTime = await _db.WorkReports
+        .Where(r =&gt; r.OrderId == o.Id)
+        .MaxAsync(r =&gt; (DateTime?)r.ReportedAt) ?? DateTime.MinValue;
+
+    // 每条订单查是否有待处理异常
+    o.HasIssue = await _db.OrderIssues.AnyAsync(x =&gt; x.OrderId == o.Id &amp;&amp; !x.Resolved);
+}
+</code></pre>
+<p>50 条订单 × 4 次查询 = 200 次，加主查询 1 次，<strong>201 次往返</strong>。再算上分页组件额外查一次总数，217 条对上了。</p>
+<p>这就是 N+1：<strong>先查 1 次主表，然后为每条记录再查 N 次</strong>。单条 SQL 都只要 0.5~2ms，看着不慢，但 200 次往返乘起来就是 700ms——而且这 200 次里，绝大部分时间花在<strong>网络往返和连接上下文切换</strong>上，不是数据库算得慢。</p>
+<p>所以你会看到那个反常现象：数据库 CPU 40%，接口却 800ms。CPU 没忙，都在路上耗掉了。</p>
+<h3 id="三种改法按推荐程度排">三种改法，按推荐程度排</h3>
+<p><strong>改法一：投影一次查完（最推荐）</strong></p>
+<p>把「补字段」的活儿交给 SQL，一次查完：</p>
+<pre><code class="language-csharp">var list = await _db.Orders
+    .Where(o =&gt; o.Status == OrderStatus.InProduction)
+    .OrderByDescending(o =&gt; o.CreatedAt)
+    .Skip((page - 1) * 50).Take(50)
+    .Select(o =&gt; new OrderListItemDto
+    {
+        Id = o.Id,
+        OrderNo = o.OrderNo,
+        CustomerName = o.Customer!.Name,
+        ItemCount = o.Items.Count,
+        LastReportTime = o.WorkReports.Max(r =&gt; (DateTime?)r.ReportedAt),
+        HasIssue = o.Issues.Any(x =&gt; !x.Resolved)
+    })
+    .ToListAsync();
+</code></pre>
+<p>生成的 SQL 会带几个相关子查询或者 LEFT JOIN，<strong>1 条搞定</strong>。这是我最常用的写法：既解决 N+1，又顺手只取需要的列（第三点会讲为什么这很重要）。</p>
+<p><strong>改法二：Include 预加载，但小心数据量</strong></p>
+<pre><code class="language-csharp">var orders = await _db.Orders
+    .Include(o =&gt; o.Customer)
+    .Include(o =&gt; o.Items)
+    .AsSplitQuery()          // 多个集合 Include 时必须加，后面会讲
+    .Where(o =&gt; o.Status == OrderStatus.InProduction)
+    .OrderByDescending(o =&gt; o.CreatedAt)
+    .Skip((page - 1) * 50).Take(50)
+    .ToListAsync();
+</code></pre>
+<p><code>Include</code> 能把查询压到 1~3 条，但它有个代价：<strong>会把整行实体的所有列都查出来</strong>。订单表 60 个字段，你页面只用 8 个，剩下 52 个白查、白传、白占内存。</p>
+<p>小数据量随手用没问题，列表页这种场景我更倾向投影。</p>
+<p><strong>改法三：批量查字典，再在内存里拼</strong></p>
+<p>有些统计口径用 LINQ 表达不出来（比如要走存储过程、要跨库），这时候用「先批量查、再内存匹配」：</p>
+<pre><code class="language-csharp">var orderIds = orders.Select(o =&gt; o.Id).ToList();
+
+// 一次查完全部明细条数
+var itemCounts = await _db.OrderItems
+    .Where(i =&gt; orderIds.Contains(i.OrderId))
+    .GroupBy(i =&gt; i.OrderId)
+    .Select(g =&gt; new { OrderId = g.Key, Count = g.Count() })
+    .ToDictionaryAsync(x =&gt; x.OrderId, x =&gt; x.Count);
+
+// 一次查完全部报工时间
+var lastReports = await _db.WorkReports
+    .Where(r =&gt; orderIds.Contains(r.OrderId))
+    .GroupBy(r =&gt; r.OrderId)
+    .Select(g =&gt; new { OrderId = g.Key, Last = g.Max(x =&gt; x.ReportedAt) })
+    .ToDictionaryAsync(x =&gt; x.OrderId, x =&gt; x.Last);
+</code></pre>
+<p>注意 <code>orderIds.Contains(...)</code> 在数据量很大时会生成巨大的 IN 列表。EF Core 8 之后改用 <code>OPENJSON</code> 传参，性能好很多，但也带来过一个 breaking change：在部分老版本 SQL Server 上会冒出「关键字 WITH 附近有语法错误」。这个坑我在手册第二章里单独写过，遇到了别慌，是已知问题。</p>
+<p><strong>这一刀下去：217 条 SQL → 2 条，800ms → 260ms。</strong></p>
+<p><img src="https://img2024.cnblogs.com/blog/1466017/202610/1466017-20261029142958581-333719592.png" alt="EF Core 查询 N+1：1 次主查 + 每条记录 N 次循环查" loading="lazy"></p>
+<h2 id="三优化点-2只读查询一定加-asnotracking">三、优化点 2：只读查询，一定加 AsNoTracking</h2>
+<p>解决了 N+1，260ms 还是偏慢。下一步看跟踪开销。</p>
+<p>EF Core 默认对查出来的每个实体做<strong>变更跟踪</strong>：它会保存一份原始值快照，等你调 <code>SaveChanges()</code> 时逐字段比对，决定发什么 UPDATE。</p>
+<p>问题在于——<strong>列表页根本不改数据，凭什么要为它保存快照？</strong></p>
+<pre><code class="language-csharp">// 只读查询，加这一个方法
+var list = await _db.Orders
+    .AsNoTracking()
+    .Where(o =&gt; o.Status == OrderStatus.InProduction)
+    .Select(o =&gt; new OrderListItemDto { /* ... */ })
+    .ToListAsync();
+</code></pre>
+<p><code>AsNoTracking()</code> 的效果在数据量小的时候不明显，但一旦是大列表、报表、导出，差别很大：内存占用能差将近一半，因为不用为每行实体存一份快照；<code>SaveChanges()</code> 时的 <code>DetectChanges()</code> 扫描也省了。</p>
+<p>几个实践细节：</p>
+<ul>
+<li><strong>只要不改，就加 <code>AsNoTracking()</code></strong>。这是默认习惯，不用犹豫。</li>
+<li>要改的实体别加，否则 <code>SaveChanges()</code> 不会更新它——这个坑很隐蔽，代码不报错，数据就是没改。</li>
+<li>查出来要改一部分字段，用 <code>AsNoTrackingWithIdentityResolution()</code> 或者干脆先 <code>AsNoTracking()</code> 查 DTO、改完再 <code>Update()</code>。</li>
+<li>匿名类型和 DTO 投影本身就不会被跟踪，所以投影 + <code>AsNoTracking()</code> 其实有点重复，但加上不亏，语义更清楚。</li>
+</ul>
+<h3 id="顺带说个-blazor-server-的坑">顺带说个 Blazor Server 的坑</h3>
+<p>如果你的项目是 Blazor Server，<code>DbContext</code> 的注册方式要特别注意。默认 <code>AddDbContext</code> 注册成 Scoped，在 Blazor Server 里 Scoped 的生命周期是<strong>整个用户连接</strong>——也就是说一个用户开着页面八小时，这个 <code>DbContext</code> 就活八小时。</p>
+<p>后果有两个：一是跟踪的实体越堆越多，内存只涨不跌；二是多个组件并发用同一个上下文，直接抛 <code>A second operation was started on this context instance before a previous operation completed</code>。</p>
+<p>正确做法是用工厂，每次操作创建一个短的：</p>
+<pre><code class="language-csharp">builder.Services.AddDbContextFactory&lt;AppDbContext&gt;(opt =&gt;
+    opt.UseSqlServer(conn));
+
+// 使用处
+public class OrderService(IDbContextFactory&lt;AppDbContext&gt; factory)
+{
+    public async Task&lt;List&lt;OrderListItemDto&gt;&gt; GetListAsync(int page)
+    {
+        await using var db = await factory.CreateDbContextAsync();
+        return await db.Orders.AsNoTracking() /* ... */.ToListAsync();
+    }
+}
+</code></pre>
+<p><strong>这一刀：260ms → 190ms，内存分配少了大约四成。</strong></p>
+<h2 id="四优化点-3select-投影别把整行实体捞回来">四、优化点 3：Select 投影，别把整行实体捞回来</h2>
+<p>前面提过一句，这里单独讲，因为它是最容易被忽略、收益又最直接的一条。</p>
+<p>订单主表我有 60 多个字段：客户信息、金额、税率、工艺参数、各种时间戳、备注、扩展字段……列表页只显示 8 个。</p>
+<p>不投影的话，EF Core 生成的是 <code>SELECT [o].[Id], [o].[OrderNo], ...</code>（60 个列全查），然后 50 行数据通过 TDS 传回来。</p>
+<p>改法很简单，<code>Select</code> 成 DTO：</p>
+<pre><code class="language-csharp">.Select(o =&gt; new OrderListItemDto
+{
+    Id = o.Id,
+    OrderNo = o.OrderNo,
+    CustomerName = o.Customer!.Name,
+    Qty = o.Qty,
+    Status = o.Status,
+    CreatedAt = o.CreatedAt
+})
+</code></pre>
+<p>三个收益叠在一起：</p>
+<ol>
+<li><strong>数据库少读列</strong>——宽表上 60 列和 8 列，IO 差好几倍；</li>
+<li><strong>网络少传数据</strong>——这一页的返回体从 3.2MB 降到 400KB 左右；</li>
+<li><strong>应用少分配内存</strong>——不用构造 50 个完整实体，也不用为它们存跟踪快照。</li>
+</ol>
+<p>有个细节要注意：<strong>投影之后导航属性就不能再「顺手」用了</strong>。因为查出来的已经是 DTO，没有导航属性这回事。有人投影完发现 <code>item.Customer.Phone</code> 拿不到，以为是 bug，其实是预期行为——需要什么字段，就在 <code>Select</code> 里一次性写全。</p>
+<p>这也是我推荐投影的原因：它会<strong>逼你把「这个页面到底需要什么数据」想清楚</strong>。想清楚之后，SQL 自然就瘦了。</p>
+<p><strong>这一刀：190ms → 130ms。</strong></p>
+<h2 id="五优化点-4深分页别用-skip总数别每次都-count">五、优化点 4：深分页别用 Skip，总数别每次都 Count</h2>
+<h3 id="skip-的代价随页码线性增长">Skip 的代价随页码线性增长</h3>
+<pre><code class="language-csharp">.Skip((page - 1) * 50).Take(50)
+</code></pre>
+<p>翻到第 200 页时，SQL 是 <code>OFFSET 9950 ROWS FETCH NEXT 50 ROWS ONLY</code>。数据库必须<strong>先扫过前 9950 行再丢掉</strong>，页码越深越慢。我实测第 200 页要 2.3 秒。</p>
+<p>改法是「键集分页」（Keyset Pagination）——不用偏移量，用上一页最后一条的值做起点：</p>
+<pre><code class="language-csharp">// 上一页最后一条是 id=10240，按 Id 倒序
+var list = await _db.Orders
+    .AsNoTracking()
+    .Where(o =&gt; o.Id &lt; lastId &amp;&amp; o.Status == OrderStatus.InProduction)
+    .OrderByDescending(o =&gt; o.Id)
+    .Take(50)
+    .Select(o =&gt; new OrderListItemDto { /* ... */ })
+    .ToListAsync();
+</code></pre>
+<p>配合 <code>Id</code> 上的索引，<strong>不管翻到第几页，都是索引 seek，耗时基本恒定</strong>。第 200 页从 2.3 秒降到 90ms。</p>
+<p>代价是不能直接跳到第 N 页，只能「上一页/下一页」。对 ERP 的列表页来说这完全可以接受——业务上没人真的会点到第 200 页，他们要的是「按条件筛选」。</p>
+<h3 id="别每次都查总数">别每次都查总数</h3>
+<p>分页组件通常要显示「共 X 条」，于是每次请求都来一发：</p>
+<pre><code class="language-csharp">var total = await query.CountAsync();   // 全表或大范围 COUNT
+</code></pre>
+<p>数据量上百万时，这个 COUNT 可能比列表查询本身还慢。</p>
+<p>三个处理办法：</p>
+<ul>
+<li><strong>缓存总数</strong>：条件不变时缓存 30~60 秒，翻页时直接用缓存值；</li>
+<li><strong>只判断「有没有下一页」</strong>：多取一条（<code>Take(51)</code>），返回 50 条，多出来那条存在就说明有下一页。前端只需要「上一页/下一页」，压根不需要总数；</li>
+<li><strong>近似值</strong>：管理后台显示「约 1.2 万条」，用系统视图的行数估算，不需要精确。</li>
+</ul>
+<p><strong>这一刀：首页 130ms → 95ms，深页 2.3s → 90ms。</strong></p>
+<h2 id="六优化点-5批量写入别在循环里-savechanges">六、优化点 5：批量写入，别在循环里 SaveChanges</h2>
+<p>上面讲的都是读。写这边有个更普遍、杀伤力更大的写法：</p>
+<pre><code class="language-csharp">// 千万别这么写
+foreach (var row in rows)          // rows 有 1 万条
+{
+    _db.WorkReports.Add(row);
+    await _db.SaveChangesAsync();  // 一万次事务、一万次往返
+}
+</code></pre>
+<p>每一次 <code>SaveChanges()</code> 都是一个独立事务、一次网络往返、一次全量 <code>DetectChanges()</code> 扫描。1 万条这样写，月度成本重算跑了 <strong>42 秒</strong>，而且中途失败会留下一半脏数据。</p>
+<h3 id="改法一addrange--一次-savechanges">改法一：AddRange + 一次 SaveChanges</h3>
+<pre><code class="language-csharp">await _db.WorkReports.AddRangeAsync(rows);
+await _db.SaveChangesAsync();
+</code></pre>
+<p>一次事务、一次往返。但它仍然是逐条 INSERT，而且 <code>AddRange</code> 到 1 万条时 <code>DetectChanges()</code> 本身就开始慢了。</p>
+<h3 id="改法二分批提交">改法二：分批提交</h3>
+<pre><code class="language-csharp">const int batchSize = 1000;
+foreach (var batch in rows.Chunk(batchSize))
+{
+    await _db.WorkReports.AddRangeAsync(batch);
+    await _db.SaveChangesAsync();
+    _db.ChangeTracker.Clear();     // 关键：清掉跟踪，防止越跑越慢
+}
+</code></pre>
+<p><code>ChangeTracker.Clear()</code> 这行很多人不知道，但它是分批导入能不能跑住的关键——不清的话，跟踪的实体一直累积，第 10 批比第 1 批慢好几倍。</p>
+<h3 id="改法三executeupdate--executedelete根本不进跟踪">改法三：ExecuteUpdate / ExecuteDelete，根本不进跟踪</h3>
+<p>EF Core 7 之后有了批量更新和删除，直接翻译成一条 SQL：</p>
+<pre><code class="language-csharp">// 把某批订单状态批量改成已关闭，一条 UPDATE
+await _db.Orders
+    .Where(o =&gt; o.Status == OrderStatus.Finished &amp;&amp; o.CloseFlag == false)
+    .ExecuteUpdateAsync(s =&gt; s
+        .SetProperty(o =&gt; o.CloseFlag, true)
+        .SetProperty(o =&gt; o.ClosedAt, DateTime.Now));
+
+// 批量删除
+await _db.TempImportRows
+    .Where(r =&gt; r.BatchId == batchId)
+    .ExecuteDeleteAsync();
+</code></pre>
+<p>以前这种需求得先 <code>ToList()</code> 全部查出来、改属性、再 <code>SaveChanges()</code>——查一遍、改一遍、写一遍，数据量大时是灾难。现在一条 SQL 完事。</p>
+<p><strong>但有两个必须知道的限制</strong>：</p>
+<ol>
+<li><strong>绕过变更跟踪</strong>，所以你内存里已经加载的实体会变成过期数据，需要手动刷新或重新查；</li>
+<li><strong>不触发 <code>SaveChanges</code> 的拦截器和领域事件</strong>。如果你的审计日志、软删除是靠 <code>SaveChanges</code> 拦截器做的，用 <code>ExecuteUpdate</code> 会直接绕过去，审计字段不会写。</li>
+</ol>
+<p>第二条我在项目里踩过：批量关单之后发现审计表里一条记录都没有，查了半天才想起来是拦截器没跑。</p>
+<p><strong>这一刀：月度成本重算 1 万行，42 秒 → 6.8 秒。</strong></p>
+<h2 id="七优化点-6多个集合-include记得-assplitquery">七、优化点 6：多个集合 Include，记得 AsSplitQuery</h2>
+<p>这个坑比较隐蔽，特征是「数据量不大，但查询突然变慢，还特别吃内存」。</p>
+<pre><code class="language-csharp">var bom = await _db.Boms
+    .Include(b =&gt; b.Items)          // 一个 BOM 20 个物料
+    .Include(b =&gt; b.Operations)     // 30 道工序
+    .Include(b =&gt; b.Materials)      // 15 种材料
+    .FirstOrDefaultAsync(b =&gt; b.Id == id);
+</code></pre>
+<p>EF Core 默认用「单查询」模式，把三个集合塞进一个 SQL，用 JOIN 拼。结果会产生<strong>笛卡尔积</strong>：</p>
+<p><code>20 × 30 × 15 = 9000 行</code>。而 BOM 主表那几十个字段，在这 9000 行里被重复传了 9000 遍。</p>
+<p>改法就是加一行：</p>
+<pre><code class="language-csharp">var bom = await _db.Boms
+    .Include(b =&gt; b.Items)
+    .Include(b =&gt; b.Operations)
+    .Include(b =&gt; b.Materials)
+    .AsSplitQuery()                 // 拆成 4 条查询
+    .FirstOrDefaultAsync(b =&gt; b.Id == id);
+</code></pre>
+<p>拆成 4 条独立查询，主表只传 1 行，每个集合各传自己的行。<strong>BOM 树查询 1.6 秒 → 340ms。</strong></p>
+<p>也可以全局开：</p>
+<pre><code class="language-csharp">optionsBuilder.UseSqlServer(conn, o =&gt; o.UseQuerySplittingBehavior(
+    QuerySplittingBehavior.SplitQuery));
+</code></pre>
+<p>但<strong>别一刀切开全局</strong>。拆分会多几次往返，单集合、小数据量的场景反而更慢。我的习惯是：<strong>两个及以上集合 <code>Include</code> 就加 <code>AsSplitQuery()</code>，单个集合不加。</strong></p>
+<h2 id="八最后那-35ms别指望-orm-解决索引问题">八、最后那 35ms：别指望 ORM 解决索引问题</h2>
+<p>做到 95ms 的时候，我已经没什么 EF 层面能改的了。剩下的一刀在数据库：</p>
+<p>那个查询的条件是 <code>Status + CreatedAt</code> 组合排序，而表上只有一个 <code>CreatedAt</code> 单列索引。加一个组合索引：</p>
+<pre><code class="language-sql">CREATE INDEX IX_Orders_Status_CreatedAt
+ON Orders (Status, CreatedAt DESC)
+INCLUDE (OrderNo, CustomerId, Qty);
+</code></pre>
+<p><code>INCLUDE</code> 把列表页要用的列带上，让这个查询变成<strong>覆盖索引</strong>，不用回表。</p>
+<p><strong>95ms → 60ms。</strong></p>
+<p>这里要说清楚一件事：<strong>ORM 优化的上限是「不浪费」，不是「变快」。</strong> EF Core 能做的是别发 217 条 SQL、别查 60 个用不上的列、别为只读数据存快照。真正的查询速度，最后还是落在索引和执行计划上。</p>
+<p>所以顺序不能反：<strong>先修 ORM 的浪费，再看索引。</strong> 反过来先加索引，你会用索引去喂一个本来就不该存在的 217 条查询。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1466017/202610/1466017-20261029143035387-1614473991.png" alt=".NET 接口 800ms→60ms 优化阶梯" loading="lazy"></p>
+<h2 id="九完整账单一览">九、完整账单一览</h2>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>动作</th>
+<th>SQL 条数</th>
+<th>耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>起点</td>
+<td>—</td>
+<td>217</td>
+<td>800ms</td>
+</tr>
+<tr>
+<td>优化点 1</td>
+<td>投影 / 批量查字典，干掉 N+1</td>
+<td>217 → 2</td>
+<td>260ms</td>
+</tr>
+<tr>
+<td>优化点 2</td>
+<td>只读查询加 AsNoTracking</td>
+<td>2</td>
+<td>190ms</td>
+</tr>
+<tr>
+<td>优化点 3</td>
+<td>Select 投影，只取 8 列</td>
+<td>2</td>
+<td>130ms</td>
+</tr>
+<tr>
+<td>优化点 4</td>
+<td>键集分页 + 缓存总数</td>
+<td>2</td>
+<td>95ms</td>
+</tr>
+<tr>
+<td>优化点 5</td>
+<td>组合索引 + INCLUDE 覆盖</td>
+<td>2</td>
+<td><strong>60ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>另外两个场景单独算：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>改法</th>
+<th>前后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>月度成本重算（1 万行写入）</td>
+<td>分批 + <code>ChangeTracker.Clear()</code> / <code>ExecuteUpdate</code></td>
+<td>42s → 6.8s</td>
+</tr>
+<tr>
+<td>BOM 树查询（3 个集合 Include）</td>
+<td><code>AsSplitQuery()</code></td>
+<td>1.6s → 340ms</td>
+</tr>
+</tbody>
+</table>
+<h2 id="十怎么防止半年后又被改回去">十、怎么防止半年后又被改回去</h2>
+<p>优化做完就完事，是最容易反弹的。我在项目里留了三道闸：</p>
+<p><strong>① 日志里固定打 SQL 条数。</strong> 每条请求结束记一条「SQL 条数 + 总耗时」，超过阈值（比如 20 条）就告警。N+1 是慢慢长出来的，今天有人加一个循环内查询，明天再加一个，没人会注意到。</p>
+<p><strong>② 慢查询日志带上调用堆栈。</strong> 只记「某条 SQL 慢 800ms」没用，你要知道是哪个接口、哪段代码发出来的。</p>
+<p><strong>③ Code Review 六条清单：</strong></p>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 循环体里有没有 <code>await</code> 数据库操作？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 只读查询有没有 <code>AsNoTracking()</code>？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 列表页是不是查了整行实体、而不是 DTO 投影？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 有没有 <code>Skip</code> 大于一万的深分页？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 循环里有没有 <code>SaveChanges()</code>？</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 两个以上集合 <code>Include</code> 有没有 <code>AsSplitQuery()</code>？</label></li>
+</ul>
+<p>这六条不解决「写得快不快」，只解决「别写出 217 条 SQL」。</p>
+<h2 id="最后">最后</h2>
+<p>回头看这个接口，最讽刺的是：<strong>没有一处是「服务器性能不够」</strong>。数据库 CPU 40%，应用 CPU 20%，加机器、加内存、加缓存，一样都解决不了。</p>
+<p>它慢，是因为代码在拿数据的方式上，每一层都在浪费：查 200 次能一次查完的、存了根本不会改的快照、搬了 52 个用不上的字段、扫了 9950 行只为了跳过它们。</p>
+<p>顺便提醒一句：<strong>别用缓存盖住慢查询。</strong> 缓存能让这个接口看起来变快，但那 217 条 SQL 还在，换个筛选条件、缓存一过期，问题原样回来，而且更难查——因为你已经不知道慢在哪了。</p>
+<p>如果你手上也有这种「CPU 不忙但接口慢」的接口，就按上面的顺序过一遍：先数 SQL 条数，再拆跟踪开销，再看投影，然后分页，最后才是索引。</p>
+<p>这几步的排查过程，加上另外三篇 EF Core 事故复盘（<code>Contains</code> 报错、延迟加载序列化崩、RowVersion 并发覆盖），我整理进了《.NET 生产环境避坑手册》第二章。</p>
+<p>需要的话，在公众号后台回复：<strong>避坑</strong>，自取。</p>
+<p>拿到之后建议先翻第二章，那三篇都是一句话就能对照出来的坑，比看文档快。</p>
+<blockquote>
+<p>本文同步发布于独立站 coderlog.net（搜索标题可阅全文）；公众号「CSharp精选营」后台回复「避坑」可领《.NET 生产环境避坑手册》。</p>
+</blockquote>
+<p>EF Core / .NET 生产实战系列，我会持续更——只写生产环境里真踩过的坑，不整虚的。</p>
+<p>阅读原文:<a href="https://www.coderlog.net/post/dotnet-api-800ms-to-60ms-production-optimization" target="_blank" rel="noopener nofollow">码录集</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-30 08:03">2026-10-30 08:02</span>&nbsp;
+<a href="https://www.cnblogs.com/shenchuanchao">码农刚子</a>&nbsp;
+阅读(<span id="post_view_count">124</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23481724);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshenchuanchao%2Fp%2F23481724%2Fdotnet-api-800ms-to-60ms-production-optimization&amp;targetId=23481724&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
