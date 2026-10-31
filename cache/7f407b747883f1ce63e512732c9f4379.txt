@@ -1,0 +1,924 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/smartloli/p/23507748" title="发布于 2026-10-31 18:01">
+    
+
+    <span role="heading" aria-level="2">让 Agent 可靠运行：幂等、持久化与失败恢复</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="1-概述">1. 概述</h2>
+<h3 id="11-一个看似简单却很容易出错的任务">1.1 一个看似简单、却很容易出错的任务</h3>
+<p>假设我们正在开发一个运维 Agent。用户提出要求：“如果订单服务最近五分钟的错误率超过阈值，就创建一张排障工单，并告诉我工单编号。”</p>
+<p>Agent 查到了监控数据，也判断出应该创建工单。它调用工单系统，等待结果。十秒后，请求超时了。</p>
+<p>接下来怎么办？很多演示程序会捕获异常，然后再调用一次创建接口。如果第二次成功，程序就向用户报告任务完成。整个过程看上去很合理：第一次失败了，第二次补上。</p>
+<p>但真实情况可能是：第一次请求已经到达工单系统，工单也已经创建，只是响应在返回途中丢失。第二次调用又创建了一张新工单。Agent 报告了一次成功，后台却出现了两个处理同一问题的任务。</p>
+<p>如果把“创建工单”替换成“发送客户通知”“申请云资源”“触发部署”，重复操作可能带来更大的成本。问题也不一定来自网络：进程可能在远端成功后、本地保存结果前退出；工作节点可能在调用过程中被替换；用户可能关闭页面，然后要求继续上次任务。</p>
+<p>这些故障有一个共同点：<strong>执行过程被打断以后，本地程序掌握的信息可能落后于外部世界已经发生的事实。</strong></p>
+<p>失败恢复的目标，就是在信息不完整的情况下，找到有依据的继续方式：已经完成的操作尽量复用结果；尚未执行的操作可以继续；结果不确定的操作先查证；不能安全重试的操作停在明确的边界上。</p>
+<h3 id="12-为什么-agent-特别需要失败恢复">1.2 为什么 Agent 特别需要失败恢复</h3>
+<p>这里的 Agent，可以理解为一个围绕大模型建立的“观察—决策—行动”循环：模型根据目标和已有信息提出下一步，程序调用工具获得结果，再把结果交给模型继续判断。工具可以是查资料的接口，也可以是能够修改外部系统的业务能力。</p>
+<p>普通程序也会遇到分布式故障，Agent 并没有发明这些问题。但 Agent 的工作方式会让问题更容易暴露。</p>
+<p>首先，Agent 的控制路径经常由模型动态决定。一个固定工作流可能只调用三次接口，Agent 却可能根据观察结果查询资料、修改计划、调用多个工具，再决定是否完成任务。路径越长，中途遇到故障的机会越多。</p>
+<p>其次，Agent 经常跨越多个系统。文件、数据库、浏览器、消息平台和业务 API 各自有不同的状态、权限与事务边界。一段 Python 函数里的顺序执行，并不能让这些系统共同参与一个原子事务。</p>
+<p>再次，模型可能把“没有看到结果”理解为“没有执行成功”，然后通过新的计划再次发起语义相同的动作。即使底层 HTTP 客户端没有重试，模型层也可能制造重复操作。</p>
+<p>最后，长任务需要跨越进程生命周期。一次研究任务可能执行十几分钟，一次代码修改可能经历多轮测试，一次审批流程可能等待数小时。把全部进度放在内存变量和聊天记录里，很难支持稳定恢复。</p>
+<p>因此，Agent 的可靠性既取决于模型能否提出合适行动，也取决于运行系统能否管理行动的身份、状态、结果与执行条件。提示词可以提醒模型谨慎，但实际的去重、预算与状态迁移必须由程序承担。</p>
+<h3 id="13-先建立三个核心概念">1.3 先建立三个核心概念</h3>
+<p>本文围绕三个核心能力展开。</p>
+<p><strong>工具幂等性</strong>解决“同一个逻辑操作被提交多次，会不会产生多份业务效果”。它帮助系统承受重复请求，但不意味着网络请求只发送一次。</p>
+<p><strong>状态持久化</strong>解决“进程消失以后，系统还能否知道之前准备做什么、已经确认什么、还有什么需要查证”。它保存的是恢复所需的业务事实，而不只是用于排查问题的文本日志。</p>
+<p><strong>重试边界</strong>解决“什么情况下可以继续尝试、可以尝试多久、最多尝试多少次，以及什么时候必须停止”。它决定自动化是否有条件地收敛。</p>
+<p>三个能力必须配合使用。只有重试，没有幂等，可能重复产生副作用；只有幂等，没有持久化，重启后可能丢失原来的幂等键；只有持久化，没有重试边界，系统可能在同一个故障上无限消耗资源。</p>
+<p>阅读时可以记住一个判断顺序：<strong>先识别操作，再记录意图；先确认事实，再决定是否重试。</strong></p>
+<h2 id="2-内容失败恢复的核心原理">2. 内容：失败恢复的核心原理</h2>
+<p>简要介绍：恢复并不是把程序从头再运行一次，而是根据已持久化的操作记录和可核验的外部事实，选择下一步合法行动。本节先区分失败类型，再解释幂等、持久化、重放和预算之间的关系。</p>
+<h3 id="21-失败至少有四种处理方式并不相同">2.1 失败至少有四种，处理方式并不相同</h3>
+<p>初学者很容易把所有异常都归为“工具调用失败”，然后写一个统一的重试装饰器。这样的代码很简洁，却丢掉了决定恢复策略的关键信息。</p>
+<table>
+<thead>
+<tr>
+<th>失败类别</th>
+<th>典型例子</th>
+<th>应当优先采取的行动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>输入或业务拒绝</td>
+<td>参数缺失、对象不存在、业务规则不允许</td>
+<td>修正输入或结束当前操作</td>
+</tr>
+<tr>
+<td>明确的暂时不可用</td>
+<td>接入层确认请求未被接收、服务明确要求稍后再试</td>
+<td>满足重试条件后退避重试</td>
+</tr>
+<tr>
+<td>结果不确定</td>
+<td>读响应超时、连接中断、执行中进程崩溃</td>
+<td>查询结果、核对业务状态或用相同身份安全重放</td>
+</tr>
+<tr>
+<td>结果内容不合格</td>
+<td>模型给出错误参数、生成内容未通过验证</td>
+<td>反馈错误并进行有边界的修正</td>
+</tr>
+</tbody>
+</table>
+<p>分类应依据具体接口契约和观察证据，而不是只看异常名称。例如，<code>TimeoutError</code> 只能说明本地等待超时，并不能证明远端没有执行。某个 <code>500</code> 响应也可能出现在业务提交之后，不能直接解释成“什么都没发生”。</p>
+<p>权限拒绝通常也不适合立即原样重试。只有系统明确具备刷新凭据、重新检查权限等修复路径，才可能在修复后重新尝试。反复提交相同请求，并不会自动获得缺失的权限。</p>
+<p>为了让上层能够做出正确判断，工具适配器最好返回结构化错误：错误类别、是否可能产生副作用、是否存在外部请求编号、是否建议等待，以及是否可以查询操作状态。单独返回一句“执行失败，请重试”，信息量远远不够。</p>
+<h3 id="22-最重要的中间状态结果不确定">2.2 最重要的中间状态：结果不确定</h3>
+<p>很多系统只设计 <code>SUCCESS</code> 和 <code>FAILED</code> 两种结果。但对远程写操作来说，第三种状态往往最重要：<code>UNKNOWN</code>，也就是当前无法确认操作是否生效。</p>
+<p>可以用寄快递来理解。你把包裹交到柜台，随后手机没有收到通知。这时你知道的事实是“没有收到通知”，而不是“柜台没有收件”。如果因此再寄一份相同包裹，就可能产生重复交付。</p>
+<p>在程序里，下面三件事必须分开：请求有没有发出去，远端有没有提交业务结果，本地有没有保存确认。它们发生在不同位置，中间任何一条连接或任何一个进程都可能中断。</p>
+<div class="mermaid">sequenceDiagram
+    participant A as Agent
+    participant L as 本地状态库
+    participant T as 工具服务
+    A-&gt;&gt;L: 保存操作意图和幂等键
+    A-&gt;&gt;T: 创建工单
+    T-&gt;&gt;T: 提交工单和幂等结果
+    T--xA: 响应丢失或 Agent 崩溃
+    Note over A,L: 本地没有成功确认
+    Note over T: 外部工单已经存在
+    A-&gt;&gt;L: 恢复并读取原操作
+    A-&gt;&gt;T: 按操作身份查询结果
+    T--&gt;&gt;A: 返回原工单编号
+    A-&gt;&gt;L: 保存成功结果
+</div><p><code>UNKNOWN</code> 不表示任务永远无法完成。它表示系统需要走一条“确认事实”的路径，而不是直接进入“再做一次”的路径。恢复时可以查询外部操作状态、按业务关联编号查找结果，或者在接口明确支持的条件下，用原幂等键重放请求。</p>
+<p>还要注意：<strong>查不到也未必证明没有执行。</strong> 如果查询接口采用最终一致性，刚提交的结果可能尚未出现在查询副本里；原请求也可能仍在后台运行。这时应遵守接口提供的等待与查询语义，不能仅凭一次空结果就生成新操作。</p>
+<h3 id="23-幂等性允许请求重复约束业务效果">2.3 幂等性：允许请求重复，约束业务效果</h3>
+<p>幂等性的直观含义是：对同一个逻辑操作重复执行，不会在第一次效果之外继续增加同类业务影响。</p>
+<p>例如，把某个设置项改为 <code>enabled = true</code>，重复设置通常仍然得到开启状态；把计数器执行 <code>count += 1</code>，每次都会继续增加，因此通常不是幂等的。创建一张新工单默认也不是幂等的，因为每次创建都可能生成新的业务对象。</p>
+<p>但这个判断要基于完整业务语义。一个“设置状态”接口如果每次调用都会另发一封通知，那么主记录虽然没有变化，通知副作用仍然可能重复。判断幂等性时，需要明确到底保护哪些可观察的业务效果。</p>
+<p>HTTP 方法可以提供语义线索，却不能替代接口实现。RFC 9110 对幂等方法给出了定义，也指出客户端不应在没有额外依据时自动重试非幂等请求。业务系统可以为 <code>POST</code> 增加幂等契约，反过来，也不能因为请求使用了某个方法就忽略服务端实际行为。</p>
+<p>工程上可以把目标写成下面的约束：</p>
+<pre><code class="language-text">同一操作身份 + 同一语义参数
+    -&gt; 多次提交可以发生
+    -&gt; 受保护的业务效果不重复增加
+
+同一操作身份 + 不同语义参数
+    -&gt; 拒绝冲突，要求调用方解释新的业务意图
+</code></pre>
+<p>幂等也不要求所有响应在字节层面完全一致。重复查询时返回的时间戳可能不同，资源状态可能已经继续推进。真正需要明确的是：重复调用如何关联到原操作，以及调用方可以依赖哪些稳定字段。</p>
+<h3 id="24-稳定幂等键给逻辑操作一个不会丢失的身份">2.4 稳定幂等键：给逻辑操作一个不会丢失的身份</h3>
+<p>幂等键可以理解为业务操作的取件码。调用方告诉服务端：“这次提交对应的是这个操作。如果之前已经处理过，请关联到原来的处理结果。”</p>
+<p>关键是区分四种身份。</p>
+<table>
+<thead>
+<tr>
+<th>身份</th>
+<th>含义</th>
+<th>重试时是否改变</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>run_id</code></td>
+<td>一次完整任务运行</td>
+<td>同一次恢复不应改变</td>
+</tr>
+<tr>
+<td><code>operation_id</code></td>
+<td>一个已确认的逻辑业务操作</td>
+<td>不应改变</td>
+</tr>
+<tr>
+<td><code>attempt_id</code></td>
+<td>一次具体调用尝试</td>
+<td>可以改变</td>
+</tr>
+<tr>
+<td><code>trace_id</code></td>
+<td>一段调用链的追踪标识</td>
+<td>按追踪系统约定管理</td>
+</tr>
+</tbody>
+</table>
+<p>一个任务可以包含多个操作，一个操作也可以对应多次调用尝试。把 <code>attempt_id</code> 当幂等键，等于每次重试都向服务端声明“这是全新的业务操作”，去重自然无法生效。</p>
+<p>常用做法是在创建操作意图时生成一个 UUID，并和操作参数一起提交到本地状态库；之后所有重试、恢复和对账都读取这条记录。也可以根据明确的业务编号生成稳定键，但必须考虑租户隔离、操作类型和业务版本。</p>
+<p>不要简单把“全部参数的哈希值”当成永远通用的操作身份。用户可能确实希望创建两张内容完全相同的工单，这时参数一样，但业务意图不同。反过来，同一个操作经过模型重新表述，文本稍有变化，也不应该自动变成一次新操作。</p>
+<p>因此，更清楚的设计是把身份和指纹分开：<code>operation_id</code> 回答“是不是同一件事”；<code>request_hash</code> 回答“同一件事的参数有没有被悄悄改动”。指纹应覆盖影响业务语义的规范化字段，数值、时区、默认值和字段顺序都应有一致处理规则。AWS 对幂等 API 的设计讨论也专门区分了相同参数与相同意图，并讨论了同键异参的处理。</p>
+<h3 id="25-幂等记录与业务提交为什么要原子完成">2.5 幂等记录与业务提交为什么要原子完成</h3>
+<p>有了幂等键，还不代表实现已经可靠。最常见的错误是先查询去重表，发现没有记录，再创建业务对象，最后补写去重记录。</p>
+<p>这个流程存在两个缺口。第一，两个并发请求可能同时查到“没有记录”，然后各自创建一份业务对象。第二，业务对象已经创建，进程却在写去重记录前崩溃，下一次请求依然会被当成新操作。</p>
+<p>当业务对象和幂等记录位于同一个可事务化数据库时，可以利用唯一约束与事务，把“记录操作身份”“创建业务对象”“保存可复用结果”组合成一个本地原子提交。并发冲突需要由数据库约束处理，不能只依赖应用先查后写。</p>
+<pre><code class="language-text">开始服务端事务
+    检查或占用幂等键，校验参数指纹
+    创建业务对象
+    保存该幂等键对应的业务结果
+提交服务端事务
+</code></pre>
+<p>如果整个事务回滚，业务对象与幂等结果都不应该单独留下；如果事务提交，两者应该能够互相对应。SQLite 的原子提交文档解释了事务如何实现“全部生效或全部不生效”的可见语义，具体可靠性仍受文件系统与持久化配置等条件约束。</p>
+<p>这里的“一个事务”有严格范围：它属于工具服务内部。如果 Agent 使用自己的数据库，工单系统使用另一套数据库，普通本地事务并不能同时覆盖两边。把远程 API 调用放进 Python 的 <code>with transaction</code> 代码块，也不会凭空得到跨系统原子性。</p>
+<h3 id="26-幂等契约还有有效期作用域和失败语义">2.6 幂等契约还有有效期、作用域和失败语义</h3>
+<p>真实接口的幂等能力通常带有边界。需要弄清楚键在什么范围内唯一，记录保留多久，并发重复请求如何处理，以及失败响应是否也会被缓存。</p>
+<p>例如，Stripe API v1 的官方文档说明：首次请求进入执行后的状态码与响应体会被保存，其中包括 <code>500</code>；幂等记录至少保留二十四小时后可以被清除；同键异参会被拒绝。该文档目前还区分了 API v2 的处理行为，因此不能把这些细节推广为所有接口的通用规则。</p>
+<p>这个例子说明一个工程原则：幂等键是接口契约的一部分，而不是调用方随便加一个请求头就能获得的保障。</p>
+<p>如果服务端只保留一天的去重记录，任务却可能在一周后恢复，恢复系统就必须考虑超出窗口的情况。可以查询长期保留的业务对象、使用业务唯一约束，或者把无法确定的操作转入待对账状态。换一个新键直接重试，只会绕过原来的去重保护。</p>
+<p>还要区分接口去重和业务去重。两条不同幂等键的请求，仍可能指向同一个订单、同一次部署或同一份报告。对于不能重复创建的业务实体，业务唯一约束通常比仅靠请求缓存更持久，但唯一字段必须符合真实业务规则。</p>
+<h3 id="27-持久化恢复需要事实而不只是聊天记录">2.7 持久化：恢复需要事实，而不只是聊天记录</h3>
+<p>所谓持久化，就是把进程重启后仍然需要的信息，保存到能够在重启后读取的存储中。对 Agent 而言，至少需要保存任务目标、已确认的操作意图、操作身份、执行状态、工具结果和剩余预算。</p>
+<p>把最近几十轮聊天历史存下来，通常还不够。聊天内容可能说“我准备创建工单”，却没有记录具体参数；也可能说“正在创建”，却没有区分请求是否已经发出；还可能包含模型推测的结果，而不是服务端确认的结果。</p>
+<p>恢复系统需要结构化记录。例如：这次任务的第三个操作是创建工单，参数指纹是什么，已经占用了几次提交尝试，最近一次调用什么时候开始，服务端返回的业务编号是什么，是否仍有未确认的外部请求。</p>
+<p>日志和状态库也承担不同职责。日志帮助人理解过程；状态库帮助程序决定下一步。日志可以采样、异步发送或延迟到达，关键操作状态则必须在相应边界上可靠提交。</p>
+<p>最小的写操作顺序通常是：先持久化操作意图，再记录即将开始的一次提交，然后调用工具，最后保存得到的确认结果。这个顺序不能消灭所有崩溃窗口，但能让恢复程序知道应该查证哪一个操作，而不是从零猜测。</p>
+<h3 id="28-检查点事件记录与重放分别做什么">2.8 检查点、事件记录与重放分别做什么</h3>
+<p>检查点可以理解为某个时刻的状态快照，例如“查询已完成，创建工单尚待确认”。事件记录则保存状态变化的经过，例如“操作已登记”“第一次调用开始”“读取响应超时”“对账找到结果”。</p>
+<p>两者可以配合：检查点缩短恢复路径，事件记录提供审计线索。小系统可以只使用关系表和必要的变更记录；复杂系统可能引入事件历史、快照和专门的持久执行引擎。</p>
+<p>“重放”不是把所有外部操作重新做一遍，而是根据已经保存的历史重建控制过程。已经确认完成的步骤应复用保存的结果；尚未确认的步骤再进入对应的恢复策略。</p>
+<p>这对模型调用也很重要。恢复时重新询问模型，可能得到不同的工具顺序和不同的参数。对于已经形成业务承诺的操作，应使用之前保存的结构化意图，而不是让模型在重启后重新发明一次操作身份。</p>
+<p>Temporal 把工作流控制逻辑与 Activity 区分开：工作流依赖历史重放重建执行状态，Activity 承担外部操作。官方文档建议 Activity 按可重试、幂等的方式实现。持久工作流可以帮助管理恢复，但外部副作用仍需要相应设计。</p>
+<p>持久执行也不等于保存一个 Python 进程的全部内存、文件句柄和网络连接。常见实现恢复的是逻辑进度：重新构造任务状态，再利用历史结果继续推进。理解这个区别，才能合理设计任务的输入输出和副作用边界。</p>
+<h3 id="29-重试边界什么时候值得再试一次">2.9 重试边界：什么时候值得再试一次</h3>
+<p>一个可重试操作至少要回答三个问题：失败是否可能通过等待消失，重复提交是否安全，继续尝试是否仍在预算内。</p>
+<p>第一个问题关系到错误性质。临时限流可能通过等待恢复，参数格式错误通常不会。第二个问题关系到副作用。读操作通常更容易重试，写操作则需要幂等契约、明确未执行证据或其他去重机制。第三个问题关系到资源。即使操作安全，也不能无限等待和无限调用。</p>
+<p>可以把准入条件写成一个工程判断：</p>
+<pre><code class="language-text">允许再次提交 = 错误具有恢复可能
+            且 重复提交满足操作契约
+            且 提交次数仍有余额
+            且 当前时间没有超过截止时间
+            且 当前业务条件仍然允许执行
+</code></pre>
+<p>注意这里约束的是“再次提交”，而不是禁止所有后续动作。写入预算耗尽以后，系统可能仍需要查询已经发出的请求，才能知道业务最终发生了什么。查询也需要独立的次数、频率和时间预算，不能因为它不再创建对象就无限执行。</p>
+<p>重试次数与最大尝试次数也应明确区分。如果最大尝试次数是三，通常意味着首次提交加两次重试。配置命名如果含糊，团队就容易在系统不同层面理解成不同数量。</p>
+<h3 id="210-退避抖动与服务端等待建议">2.10 退避、抖动与服务端等待建议</h3>
+<p>遇到临时故障后立即密集重试，可能让本来已经拥堵的服务更加拥堵。指数退避通过逐渐增加等待时间，让系统有恢复机会；抖动则把不同客户端的重试时刻分散开。</p>
+<p>一个常见的 full jitter 计算方式是：</p>
+<pre><code class="language-text">第 n 次失败后的等待上限 = min(cap, base × 2^(n - 1))
+实际等待时间 = 在 0 到等待上限之间随机选择
+</code></pre>
+<p>例如，基础等待为一秒，上限为三十秒，失败后的等待范围依次可能是零到一秒、零到两秒、零到四秒。真正选中的时间不是固定值，所以大量客户端不容易整齐地在同一时刻再次冲击服务。</p>
+<p>AWS 的工程文章强调了重试对下游负载的放大，以及退避和抖动的作用，也提醒调用失败不代表副作用没有发生。这些机制需要结合幂等设计使用。</p>
+<p>服务端如果返回 <code>Retry-After</code>，客户端还要遵守相应等待约定。这个字段可以是秒数，也可以是 HTTP 日期。解析后仍需检查总截止时间：如果服务端要求一分钟后再试，而任务只剩十秒，就应该停止自动提交或转入延后调度。</p>
+<p>对长等待任务，应保存 <code>next_attempt_at</code>，让调度器在时间到达后重新唤醒，而不是长期占用一个线程休眠。这个时间也应该持久化，否则服务重启可能把所有等待中的任务同时唤醒。</p>
+<h3 id="211-单次超时与任务截止时间是两回事">2.11 单次超时与任务截止时间是两回事</h3>
+<p>单次调用超时回答“这一次最多等多久”，任务截止时间回答“整个操作最晚什么时候还允许继续”。两个限制不能互相替代。</p>
+<p>假设每次调用最多等十秒，最多提交三次，中间还需要退避和查询，那么完整流程的耗时可能超过三十秒。如果用户只愿意等待十五秒，系统必须在启动每次调用前重新计算剩余时间，并把剩余额度传给底层客户端。</p>
+<p>进程重启以后，次数和时间预算也不能重新计算为满额。否则一个不断重启的任务可能永远到不了上限。应该把首次建立的截止时间、已消耗的尝试数和下一次允许执行的时间一起保存。</p>
+<p>进程内测量短时间间隔，通常适合使用单调时钟，例如 Python 的 <code>time.monotonic()</code>；跨重启恢复则需要可持久化的时间基准，例如 UTC 截止时间或由调度系统管理的持久定时器。不能把某个进程里的单调时钟读数当成跨机器通用的时间戳。跨机器使用墙上时钟时，还需要考虑时钟偏差和校时，严格的时间语义最好交给能够统一管理定时事件的系统。</p>
+<p>截止时间控制的也只是客户端何时不再启动操作、何时停止等待。客户端超时并不自动终止已经在服务端运行的工作。即使存在取消接口，也要检查取消是否已确认，以及取消请求发出前是否已经发生业务提交。</p>
+<h3 id="212-重试修正重新规划与补偿需要分开">2.12 重试、修正、重新规划与补偿需要分开</h3>
+<p>Agent 场景里经常出现四种表面相似、实际含义不同的动作。</p>
+<p><strong>重试</strong>保持同一个逻辑操作和同一份语义参数，例如用原幂等键再次提交创建请求。它处理的是执行通道中的暂时问题。</p>
+<p><strong>修正</strong>修改不合法的输入，例如把不存在的字段名改成工具支持的字段。输入变化后，需要重新校验操作身份与参数绑定，不能悄悄覆盖已经提交过的意图。</p>
+<p><strong>重新规划</strong>改变后续解决问题的路径，例如查询接口不可用时选择读取另一份可信快照。重新规划应建立在当前事实之上，不应把结果未知的写操作当成“从未执行”处理。</p>
+<p><strong>补偿</strong>为已经发生的业务动作执行新的逆向业务操作，例如关闭误创建的工单、释放已申请的资源。它是一个有自己身份、权限、条件与失败可能的新操作。</p>
+<p>因此，一个“自动恢复”按钮背后可以有多种机制，但状态机和日志应明确记录究竟做了哪一种。否则系统可能把参数变更伪装成重试，把撤销失败隐藏在恢复成功的描述里。</p>
+<h2 id="3-架构构建可恢复的-agent-执行系统">3. 架构：构建可恢复的 Agent 执行系统</h2>
+<h3 id="31-模型负责提出行动运行系统负责执行承诺">3.1 模型负责提出行动，运行系统负责执行承诺</h3>
+<p>理解架构时，可以把系统分成“决定做什么”和“保证如何做”两部分。模型读取目标与观察结果，提出一个候选行动；运行系统校验行动、分配身份、持久化意图，并控制工具执行。</p>
+<p>这里的分工不是说模型不重要。模型仍然决定任务理解、工具选择和复杂问题的处理质量。但请求有没有发出、哪一条记录对应哪次业务操作、还能不能重试，这些事实不适合交给自然语言临时推断。</p>
+<div class="mermaid">flowchart TB
+    U[用户目标与约束] --&gt; P[模型规划与行动提议]
+    P --&gt; V[参数校验与业务策略]
+    V --&gt; C[任务协调器]
+    C &lt;--&gt; S[(任务状态与操作台账)]
+    C --&gt; E[工具执行器]
+    E --&gt; T[外部工具服务]
+    T --&gt; B[(外部业务数据与幂等结果)]
+    E --&gt; C
+    C --&gt; R[结果对账与验证器]
+    R --&gt; T
+    R --&gt; C
+    C --&gt; N[结果交付或等待处理]
+    C -.结构化事件.-&gt; O[日志 指标 链路追踪]
+    E -.调用事件.-&gt; O
+    C --&gt; P
+</div><p>任务协调器管理控制状态，工具执行器处理具体协议，对账器查询外部事实，状态库存储恢复依据。它们可以先写在一个进程里，职责清楚以后再决定是否拆分服务。</p>
+<p>一个重要的设计点是：工具协议返回的调用编号不一定就是业务幂等键。模型服务可能为每次工具提议生成新的调用标识，运行系统仍需维护自己的稳定操作身份，并与这些调用标识建立关联。</p>
+<h3 id="32-把运行状态与操作状态分开">3.2 把运行状态与操作状态分开</h3>
+<p>一次任务运行可能包含读取监控、创建工单和整理报告等多个操作。把整个任务只标记成一个 <code>RUNNING</code>，很难判断中断以后应该恢复哪个环节。</p>
+<p>运行层可以使用 <code>RUNNING</code>、<code>WAITING</code>、<code>COMPLETED</code>、<code>FAILED</code>、<code>CANCEL_REQUESTED</code> 等状态。操作层则需要更细致地表达某一个工具动作的执行事实。</p>
+<p>下面是一种操作状态机。命名可以调整，但含义应保持明确。</p>
+<div class="mermaid">stateDiagram-v2
+    [*] --&gt; PREPARED: 意图已持久化
+    PREPARED --&gt; IN_FLIGHT: 占用尝试额度并提交
+    IN_FLIGHT --&gt; SUCCEEDED: 收到并保存确认
+    IN_FLIGHT --&gt; RETRY_WAIT: 明确可重试且结果已知
+    IN_FLIGHT --&gt; FAILED: 明确拒绝或已知失败耗尽预算
+    IN_FLIGHT --&gt; UNKNOWN: 超时或恢复时发现未确认提交
+    RETRY_WAIT --&gt; IN_FLIGHT: 等待结束且预算允许
+    UNKNOWN --&gt; SUCCEEDED: 对账确认已完成
+    UNKNOWN --&gt; RETRY_WAIT: 满足同键安全重放条件
+    UNKNOWN --&gt; NEEDS_RECONCILIATION: 无法确认或不能安全重放
+    NEEDS_RECONCILIATION --&gt; SUCCEEDED: 后续确认成功
+    NEEDS_RECONCILIATION --&gt; FAILED: 后续证据确认未完成且终止
+    SUCCEEDED --&gt; [*]
+    FAILED --&gt; [*]
+</div><p>其中，<code>IN_FLIGHT</code> 表示提交意图已经记录，但尚未保存确定结果。进程恢复时看见这个状态，不能推断远端一定在执行，也不能推断远端没有执行，只能把它放进不确定结果的处理路径。</p>
+<p><code>FAILED</code> 应尽量保留给已经明确的终止事实，例如参数被拒绝，或者所有确定未生效的尝试都已耗尽。对于可能已经生效的写操作，即使自动提交预算耗尽，也更适合标记为待对账，而不是直接宣布“操作失败，未产生影响”。</p>
+<h3 id="33-一份操作台账应该保存什么">3.3 一份操作台账应该保存什么</h3>
+<p>操作台账是恢复系统的核心数据结构。可以先把它理解为“程序可以查询的工作记录表”。</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>run_id</code></td>
+<td>关联完整任务</td>
+</tr>
+<tr>
+<td><code>operation_id</code></td>
+<td>标识稳定的逻辑操作</td>
+</tr>
+<tr>
+<td><code>tool_name</code>、<code>tool_version</code></td>
+<td>确定具体工具及参数契约</td>
+</tr>
+<tr>
+<td><code>arguments</code>、<code>request_hash</code></td>
+<td>保存已确认的输入并检测冲突</td>
+</tr>
+<tr>
+<td><code>idempotency_key</code></td>
+<td>与外部服务的幂等契约对应</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>记录当前恢复位置</td>
+</tr>
+<tr>
+<td><code>attempts</code>、<code>max_attempts</code></td>
+<td>约束实际提交次数</td>
+</tr>
+<tr>
+<td><code>deadline_at</code>、<code>next_attempt_at</code></td>
+<td>约束总体时间与重试调度</td>
+</tr>
+<tr>
+<td><code>external_request_id</code>、<code>external_resource_id</code></td>
+<td>关联外部状态与业务对象</td>
+</tr>
+<tr>
+<td><code>result</code>、<code>last_error</code></td>
+<td>保存确认结果和最近失败信息</td>
+</tr>
+<tr>
+<td><code>version</code>、<code>lease_owner</code></td>
+<td>支持并发控制与任务认领</td>
+</tr>
+<tr>
+<td><code>created_at</code>、<code>updated_at</code></td>
+<td>支持审计与超时扫描</td>
+</tr>
+</tbody>
+</table>
+<p>教学示例可以只实现其中一部分，生产系统则根据操作风险和规模补齐。关键不是字段越多越好，而是每个恢复判断都能找到明确的数据依据。</p>
+<p>还需要保存参数契约的版本。假设一个旧任务暂停了两天，恢复时工具的新版本改变了字段含义，直接用新规则解释旧参数就可能执行错误动作。可以保留兼容适配器，也可以在迁移前暂停受影响的操作。</p>
+<p>大结果不一定直接塞进同一行数据库。报告、文件和长工具输出可以保存到对象存储，并在台账里记录引用、内容摘要、完整性校验值和访问范围。恢复时需要确认引用的内容仍然存在且没有被替换。</p>
+<h3 id="34-五个崩溃窗口决定五种恢复动作">3.4 五个崩溃窗口，决定五种恢复动作</h3>
+<p>把调用过程沿时间轴展开，可以更清楚地理解持久化的价值。</p>
+<table>
+<thead>
+<tr>
+<th>中断位置</th>
+<th>本地留下的证据</th>
+<th>外部是否可能生效</th>
+<th>恢复动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>意图提交之前</td>
+<td>没有已确认操作记录</td>
+<td>按设计尚未调用工具</td>
+<td>从前一检查点继续规划</td>
+</tr>
+<tr>
+<td>意图已提交，尚未开始提交尝试</td>
+<td><code>PREPARED</code></td>
+<td>尚未发起该次调用</td>
+<td>在预算内执行原意图</td>
+</tr>
+<tr>
+<td>已记录提交开始，尚未确认远端结果</td>
+<td><code>IN_FLIGHT</code></td>
+<td>可能没有，也可能已经生效</td>
+<td>按结果不确定处理</td>
+</tr>
+<tr>
+<td>远端已提交，本地结果尚未保存</td>
+<td><code>IN_FLIGHT</code> 或 <code>UNKNOWN</code></td>
+<td>已经生效</td>
+<td>查询或同键安全重放，找回结果</td>
+</tr>
+<tr>
+<td>本地已保存成功，后续报告尚未完成</td>
+<td><code>SUCCEEDED</code> 和结果</td>
+<td>已经生效</td>
+<td>复用结果，继续后续任务</td>
+</tr>
+</tbody>
+</table>
+<p>第三行尤其容易被误读。系统可能刚刚记录 <code>IN_FLIGHT</code> 就崩溃，实际上还没发出请求；也可能已经发出请求并成功。单凭这条本地记录无法区分两者，因此宁可进入对账路径，也不能把状态直接重置为未执行。</p>
+<p>尝试次数通常在发送前持久化。这样可能把一次“来不及真正发出”的尝试也计入预算，但能防止反复崩溃不断获得免费额度。这是一种偏向保守的资源约束，需要在文档中写清楚。</p>
+<h3 id="35-多执行器接管锁租约与-fencing-的边界">3.5 多执行器接管：锁、租约与 fencing 的边界</h3>
+<p>单进程示例只需要避免自己重复执行。生产系统还要考虑两个 Worker 同时认为自己可以接手同一操作。</p>
+<p>常见做法是使用数据库条件更新认领任务，并附带租约和版本号。只有满足当前状态与版本的更新才能成功；执行者需要定期续租，完成时也必须确认自己仍拥有提交状态变更的资格。</p>
+<p>但租约到期不代表旧执行者已经停止。旧 Worker 可能只是暂时卡顿，等新 Worker 接管后又继续发出请求。仅在本地状态库中检查一次租约，无法阻止之后才到达外部服务的旧请求。</p>
+<p>这时可以使用 fencing token：每次认领获得一个递增序号，受保护资源拒绝比已见序号更旧的写入。例如新执行者携带序号四十二，旧执行者仍携带四十一，资源端识别后拒绝旧写。</p>
+<p>这里有一个前提：被写入的资源必须实际校验 token。只把序号写进日志，或者只在 Agent 数据库里检查，不能自动保护一个完全不识别它的第三方 API。第三方接口不支持 fencing 时，仍需要稳定幂等键、业务唯一约束、并发限制与结果对账等机制配合。</p>
+<p>幂等和 fencing 保护的对象也不同。幂等防止同一逻辑操作重复产生业务效果；fencing 防止失去执行资格的旧执行者继续写入。复杂系统可能同时需要两者。</p>
+<h3 id="36-transactional-outbox-解决哪一段可靠交接">3.6 Transactional Outbox 解决哪一段可靠交接</h3>
+<p>假设 Agent 把操作记录保存到数据库后，还需要往消息队列发送“请执行这个操作”。如果保存成功后进程崩溃，消息可能没有发送；如果先发送消息，再提交数据库，消费者又可能读到一条尚不存在或最终回滚的操作。</p>
+<p>Transactional Outbox 的做法是在同一个数据库事务里，同时保存业务状态和待发送事件。独立的转发器再读取 Outbox，把事件送到消息队列。</p>
+<div class="mermaid">flowchart LR
+    A[任务协调器] --&gt; B[本地数据库事务]
+    B --&gt; C[(操作意图)]
+    B --&gt; D[(Outbox 事件)]
+    D --&gt; E[转发器]
+    E --&gt; F[消息队列]
+    F --&gt; G[工具执行器]
+    G --&gt; H[幂等工具或消费者去重]
+</div><p>这个模式保证的是本地状态与待投递事件的原子关联。转发器可能在消息已经发送、发送状态尚未更新时崩溃，因此消息依然可能重复，消费者仍需去重。Outbox 模式的原作者说明也明确指出了这个重复投递窗口。</p>
+<p>对初学者而言，可以先记住边界：Outbox 帮你减少“本地提交了，却忘了通知执行”的问题；它不会自动让远程创建接口成为幂等接口，也不会让数据库和任意外部服务共享一个事务。</p>
+<h3 id="37-多步业务失败补偿不是数据库回滚">3.7 多步业务失败：补偿不是数据库回滚</h3>
+<p>当任务包含多次已经提交的业务操作时，恢复还可能涉及补偿。例如 Agent 先申请测试环境，再创建临时账号，最后运行验证。验证明确失败以后，系统可能需要关闭账号、释放环境。</p>
+<p>这些清理动作可以组织成 Saga：每一步有自己的提交和必要的补偿步骤，后续失败时按业务规则推进补偿。补偿顺序经常与原操作相反，但具体顺序仍取决于依赖关系。</p>
+<p>补偿和数据库事务回滚不同。已经发送的通知不能让接收人“没有看见”，已经运行过的部署也可能影响下游系统。补偿只能在当前业务规则下执行另一个动作，不能保证把世界恢复到历史上完全相同的状态。</p>
+<p>补偿本身也会失败，因此需要自己的操作身份、幂等契约、预算和状态记录。把所有清理代码写进一个 <code>finally</code>，并不意味着清理一定完成；进程可能在进入 <code>finally</code> 前就被终止，清理接口也可能不可用。</p>
+<p>对于结果仍然未知的原操作，更不能立即进行相反操作。例如还不知道资源有没有创建成功，就直接发起删除，可能与正在完成的创建产生竞态。应先确认事实，再根据业务状态决定补偿。</p>
+<h3 id="38-模型重新规划时怎样避免绕过去重">3.8 模型重新规划时，怎样避免绕过去重</h3>
+<p>底层执行器设计得再严谨，如果模型在每次失败后都创建一个全新的逻辑操作，重复副作用仍然可能发生。</p>
+<p>例如第一次提出“创建订单故障工单”，超时后又提出“登记订单异常排查任务”。两段自然语言不同，工具名可能相同，参数也略有差异，但业务上可能仍然是在处理同一条告警。</p>
+<p>运行系统可以把已经确认的业务意图绑定到稳定的事件或任务槽位，例如“告警事件 A 的工单创建操作”。模型在这个槽位上重复提出创建时，应先查看原操作状态；只有业务规则允许新增工单，才建立新操作。</p>
+<p>这不是用字符串相似度决定是否重复。更可靠的依据来自业务标识、对象关系和状态规则。文本相似只能作为辅助信号，因为相同文字可能对应不同任务，不同文字也可能对应同一任务。</p>
+<p>模型需要得到的反馈也应该具体：“原工单创建操作结果未知，操作编号为某值，当前需要查询状态”，比“创建失败，请换一种方法”更有助于保持正确边界。</p>
+<p>对于已经确认成功的操作，运行系统可以把工单编号作为事实提供给模型，让它继续组织报告，而不再暴露一个含糊的“也许成功”。这样既减少重复调用，也降低模型为了补全信息而猜测的机会。</p>
+<h3 id="39-观察恢复质量成功率之外还看什么">3.9 观察恢复质量：成功率之外还看什么</h3>
+<p>如果只统计最终成功率，一个系统可能通过大量重试获得很高的数字，同时让下游承受严重负载，甚至重复创建业务对象。因此，恢复能力需要单独的指标。</p>
+<p>可以记录操作首次成功率、每个操作的平均提交次数、幂等结果复用次数、结果未知操作数量、待对账停留时间、恢复耗时、预算耗尽比例，以及经业务核验发现的重复副作用。</p>
+<p>这些指标的定义必须有分母。例如“恢复成功率”可以定义为故障注入后，在规定时间内恢复到 <code>SUCCEEDED</code> 的任务数，除以注入故障的任务总数。同时应分别报告已确认失败与仍待确认的比例；若把成功与明确失败都算入已收敛状态，则应称为“终态确认率”。直接把仍在等待的任务排除，会让数字显得过于乐观。</p>
+<p>追踪信息则需要串起任务、操作、尝试和外部对象。工程师应该能够从一个用户反馈找到对应的 <code>run_id</code>，再看到某个 <code>operation_id</code> 的所有尝试，以及最终确认的业务编号。</p>
+<p>日志里不必保存模型的私有内部推理。对于恢复，真正有价值的是结构化行动、输入摘要、状态迁移、工具证据和决策依据。敏感参数可以按字段脱敏，完整业务证据则保存在有相应访问控制的存储中。</p>
+<h3 id="310-不要被恰好一次四个字误导">3.10 不要被“恰好一次”四个字误导</h3>
+<p>讨论可靠性时，经常会遇到 at-most-once、at-least-once 和 exactly-once。理解这些术语时，首先要问：讨论的是消息投递、代码执行，还是某种业务效果？</p>
+<p>至多一次强调不重复，代价可能是某些操作完全没有完成。至少一次允许重复尝试，以提高最终被处理的机会，但接收方需要处理重复。所谓恰好一次，通常只能在明确的系统范围与假设条件下成立。</p>
+<p>对跨多个任意外部 API 的 Agent，单靠“调用完保存检查点”，无法宣称全链路恰好一次。请求可能已经在远端提交，而本地还没有确认；工作流引擎即使能恢复控制状态，也无法替一个不支持去重的通知服务撤销重复发送。</p>
+<p>更实用的目标是分别写出不变量：同一业务事件最多创建一张工单；成功状态必须有可核验的工单编号；恢复不能重置原预算；未知结果不能被伪装成确定失败。然后通过事务、幂等、状态机和故障测试验证这些不变量。</p>
+<p>这样得到的承诺虽然比“全链路恰好一次”更具体，却更容易落地，也更容易在出现问题时定位责任范围。</p>
+<h2 id="4-实践实现验证与落地">4. 实践：实现、验证与落地</h2>
+<h3 id="41-实验目标与运行环境">4.1 实验目标与运行环境</h3>
+<p>下面实现一个最小的工单创建执行器。它不调用真实业务服务，不需要模型 API Key，也不需要安装第三方依赖。环境要求为 Python 3.10 或更高版本，以及可写的本地目录。</p>
+<p>示例故意不接入真实大模型，因为我们要验证的是模型行动被接受之后，执行系统如何处理副作用和恢复。把模型输出的工具参数交给相同的执行入口，就可以接入真实 Agent；网络模型请求反而会给这个实验引入额外变量。</p>
+<p>实验使用两份独立 SQLite 文件：<code>agent.sqlite3</code> 保存 Agent 的操作记录，<code>service.sqlite3</code> 模拟工单服务的业务记录与幂等结果。两边各自提交事务，不能通过一个本地事务一起提交。</p>
+<p>模拟服务和执行器运行在同一个 Python 程序中，便于阅读和注入故障，但它们的持久化边界彼此独立。这个实验演示的是远端提交与本地确认之间的恢复窗口，不是模拟真实网络的所有细节。</p>
+<p>我们要验证五个性质：同一操作重复运行不会多建工单；远端提交后响应丢失可以找回结果；远端提交后进程退出可以跨进程恢复；同键异参会被拒绝；预算耗尽或缺乏安全恢复条件时会明确停止自动提交。</p>
+<h3 id="42-完整代码一个可以重启的工具执行器">4.2 完整代码：一个可以重启的工具执行器</h3>
+<p>将下面的代码保存为 <code>agent_recovery.py</code>。如果使用本文配套目录，文件位于 <code>examples/agent_recovery.py</code>。代码分为四部分：状态存储、模拟工单服务、恢复执行器和命令行入口。</p>
+<p>为便于理解，一个 <code>run_id</code> 在示例中只对应一个创建工单操作，因此直接用于构造稳定键。真实任务包含多个操作时，应当独立增加 <code>operation_id</code>，并按租户、操作类型与工具版本设计身份范围。</p>
+<pre><code class="language-python">"""Agent 失败恢复教学示例：Python 3.10+，仅依赖标准库，限单执行器。"""
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import sqlite3
+import time
+from pathlib import Path
+
+
+class PermanentError(Exception):
+    """请求被明确拒绝，继续原样重试没有意义。"""
+
+
+class NotAccepted(Exception):
+    """服务端明确保证尚未接受请求，可按预算重试。"""
+
+
+class UnknownOutcome(Exception):
+    """请求可能已经生效，必须先查询结果。"""
+
+
+class QueryUnavailable(Exception):
+    """当前无法查明远端操作结果。"""
+
+
+def canonical(data):
+    # 本示例只有字符串字段；生产环境还需明确数字、Unicode 等规范。
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def digest(data):
+    return hashlib.sha256(canonical(data).encode("utf-8")).hexdigest()
+
+
+def connect(path):
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    return db
+
+
+class LocalStore:
+    def __init__(self, path):
+        self.db = connect(path)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS operations (
+                run_id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE NOT NULL,
+                request_json TEXT NOT NULL, request_hash TEXT NOT NULL,
+                state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL, deadline_at REAL NOT NULL,
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                result_json TEXT, error TEXT
+            )
+        """)
+        self.db.commit()
+
+    def prepare(self, run_id, payload, max_attempts, deadline_seconds):
+        if max_attempts &lt; 1 or deadline_seconds &lt;= 0:
+            raise ValueError("max_attempts 和 deadline_seconds 必须大于零")
+        encoded, fingerprint = canonical(payload), digest(payload)
+        # 业务操作身份一旦落盘，恢复时必须复用，不能每次重试生成新键。
+        key = "create-ticket:" + run_id
+        with self.db:
+            self.db.execute("""
+                INSERT OR IGNORE INTO operations
+                (run_id, idempotency_key, request_json, request_hash,
+                 state, max_attempts, deadline_at)
+                VALUES (?, ?, ?, ?, 'READY', ?, ?)
+            """, (run_id, key, encoded, fingerprint,
+                  max_attempts, time.time() + deadline_seconds))
+        row = self.get(run_id)
+        if row["request_hash"] != fingerprint:
+            raise PermanentError("同一 run_id 不允许改用不同请求参数")
+        # 重启时以已持久化的预算和截止时间为准，不采用新的 CLI 参数。
+        return row
+
+    def get(self, run_id):
+        return dict(self.db.execute(
+            "SELECT * FROM operations WHERE run_id = ?", (run_id,)
+        ).fetchone())
+
+    def save(self, run_id, state, *, attempts=None, next_retry_at=0,
+             result=None, error=None):
+        old = self.get(run_id)
+        with self.db:
+            self.db.execute("""
+                UPDATE operations SET state=?, attempts=?, next_retry_at=?,
+                    result_json=?, error=? WHERE run_id=?
+            """, (state, old["attempts"] if attempts is None else attempts,
+                  next_retry_at, canonical(result) if result is not None else None,
+                  error, run_id))
+        row = self.get(run_id)
+        print(canonical({"event": "state", "state": state,
+                         "attempts": row["attempts"], "error": error}), flush=True)
+        return row
+
+
+class TicketService:
+    """用另一份数据库模拟远端服务，不与 LocalStore 共用事务。"""
+
+    def __init__(self, path, scenario):
+        self.db, self.scenario = connect(path), scenario
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL, title TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS receipts (
+                idempotency_key TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL, result_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS injected_faults (
+                idempotency_key TEXT PRIMARY KEY
+            );
+        """)
+
+    def lookup(self, key, request_hash):
+        if self.scenario == "ambiguous-unqueryable":
+            raise QueryUnavailable("远端结果查询暂时不可用")
+        row = self.db.execute(
+            "SELECT * FROM receipts WHERE idempotency_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_hash"] != request_hash:
+            raise PermanentError("远端发现幂等键与请求摘要冲突")
+        return json.loads(row["result_json"])
+
+    def create_ticket(self, key, payload):
+        fingerprint = digest(payload)
+        if self.scenario == "reject":
+            raise PermanentError("模拟业务校验拒绝")
+        if self.scenario == "unavailable":
+            raise NotAccepted("模拟服务拒绝接收：没有执行任何业务写入")
+        if self.scenario == "transient-once":
+            with self.db:
+                cursor = self.db.execute(
+                    "INSERT OR IGNORE INTO injected_faults VALUES (?)", (key,)
+                )
+            if cursor.rowcount:
+                raise NotAccepted("模拟第一次请求未被接受")
+        # 业务写入和回执必须在服务端同一事务里提交。
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT * FROM receipts WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            if row is not None:
+                if row["request_hash"] != fingerprint:
+                    raise PermanentError("同一幂等键不允许提交不同参数")
+                self.db.commit()
+                return json.loads(row["result_json"])
+            if not payload.get("title") or not payload.get("tenant_id"):
+                raise PermanentError("tenant_id 和 title 不可为空")
+            cursor = self.db.execute(
+                "INSERT INTO tickets (tenant_id, title) VALUES (?, ?)",
+                (payload["tenant_id"], payload["title"])
+            )
+            result = {"ticket_id": cursor.lastrowid, "status": "created"}
+            self.db.execute("INSERT INTO receipts VALUES (?, ?, ?)",
+                            (key, fingerprint, canonical(result)))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        if self.scenario == "crash-after-commit":
+            # 不执行 finally 或本地检查点保存，模拟进程突然消失。
+            print("模拟崩溃：远端已提交，本地尚未保存结果", flush=True)
+            os._exit(70)
+        if self.scenario in {"timeout-after-commit", "ambiguous-unqueryable"}:
+            raise UnknownOutcome("远端已提交，但响应丢失")
+        return result
+
+    def count(self):
+        return self.db.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+
+
+class RecoveryRunner:
+    def __init__(self, store, service, base_delay=0.1):
+        if base_delay &lt; 0:
+            raise ValueError("base_delay 不可小于零")
+        self.store, self.service, self.base_delay = store, service, base_delay
+
+    def run(self, run_id):
+        while True:
+            op = self.store.get(run_id)
+            state = op["state"]
+            if state in {"SUCCEEDED", "FAILED", "NEEDS_RECONCILIATION"}:
+                return op
+            if state in {"IN_FLIGHT", "UNKNOWN"}:
+                # 即使预算已用完，也应先确认已发出操作的真实结果。
+                try:
+                    result = self.service.lookup(
+                        op["idempotency_key"], op["request_hash"]
+                    )
+                except (QueryUnavailable, PermanentError) as exc:
+                    return self.store.save(
+                        run_id, "NEEDS_RECONCILIATION", error=str(exc)
+                    )
+                if result is not None:
+                    return self.store.save(run_id, "SUCCEEDED", result=result)
+                # 本模拟没有仍在运行的旧请求，查询强一致且幂等记录不失效。
+                # 真实远端查无记录时若旧请求仍在途，不能据此断言业务未发生。
+                op = self.store.save(run_id, "READY")
+            if op["attempts"] &gt;= op["max_attempts"]:
+                return self.store.save(run_id, "FAILED", error="执行次数预算耗尽")
+            now = time.time()
+            if now &gt;= op["deadline_at"]:
+                return self.store.save(run_id, "FAILED", error="操作截止时间已到")
+            if op["next_retry_at"] &gt; now:
+                # 仅限这个单进程教学示例；生产环境交给持久化调度器唤醒。
+                time.sleep(min(op["next_retry_at"] - now, op["deadline_at"] - now))
+                continue
+            # 先提交 IN_FLIGHT 和次数，再发送；崩溃也不会把预算归零。
+            op = self.store.save(run_id, "IN_FLIGHT", attempts=op["attempts"] + 1)
+            try:
+                result = self.service.create_ticket(
+                    op["idempotency_key"], json.loads(op["request_json"])
+                )
+            except UnknownOutcome as exc:
+                self.store.save(run_id, "UNKNOWN", error=str(exc))
+            except PermanentError as exc:
+                return self.store.save(run_id, "FAILED", error=str(exc))
+            except NotAccepted as exc:
+                # Full Jitter：等待区间指数扩大，在区间内随机选择时间。
+                cap = min(2.0, self.base_delay * 2 ** min(op["attempts"] - 1, 20))
+                next_time = time.time() + random.uniform(0, cap)
+                self.store.save(run_id, "RETRY_WAIT", next_retry_at=next_time,
+                                error=str(exc))
+            else:
+                return self.store.save(run_id, "SUCCEEDED", result=result)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dir", type=Path, required=True)
+    parser.add_argument("--run-id", default="demo")
+    parser.add_argument("--title", default="检查订单服务告警")
+    parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--deadline-seconds", type=float, default=60)
+    parser.add_argument("--base-delay", type=float, default=0.1)
+    parser.add_argument("--scenario", default="normal", choices=[
+        "normal", "transient-once", "timeout-after-commit", "crash-after-commit",
+        "unavailable", "ambiguous-unqueryable", "reject"
+    ])
+    args = parser.parse_args()
+    args.dir.mkdir(parents=True, exist_ok=True)
+    store = LocalStore(args.dir / "agent.sqlite3")
+    service = TicketService(args.dir / "service.sqlite3", args.scenario)
+    try:
+        store.prepare(args.run_id, {"tenant_id": "demo-tenant", "title": args.title},
+                      args.max_attempts, args.deadline_seconds)
+        op = RecoveryRunner(store, service, args.base_delay).run(args.run_id)
+    except (PermanentError, ValueError) as exc:
+        print(canonical({"error": str(exc)}), flush=True)
+        return 2
+    print(canonical({
+        "event": "summary", "state": op["state"], "attempts": op["attempts"],
+        "ticket_count": service.count(),
+        "result": json.loads(op["result_json"]) if op["result_json"] else None,
+    }), flush=True)
+    return {"SUCCEEDED": 0, "FAILED": 2, "NEEDS_RECONCILIATION": 3}[op["state"]]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+</code></pre>
+<h3 id="43-逐段理解代码为什么这样写">4.3 逐段理解代码为什么这样写</h3>
+<p>先看 <code>LocalStore.prepare()</code>。它第一次接收任务时，把参数、参数指纹、稳定幂等键、最大尝试次数和截止时间保存到数据库。再次运行同一任务时，<code>INSERT OR IGNORE</code> 不会重新创建记录，也不会把预算恢复为初始值。</p>
+<p>随后程序核对请求指纹。如果用户用同一个 <code>run_id</code> 提交了不同标题，就会得到明确的参数冲突。系统不会把旧结果当成新请求的结果，也不会悄悄覆盖之前已经准备或已经执行过的意图。</p>
+<p>再看 <code>TicketService.create_ticket()</code>。服务端使用 <code>BEGIN IMMEDIATE</code> 开始写事务，检查幂等回执。已有同键同参回执时直接复用；没有时才创建工单，并在同一事务里保存回执。这个模拟实现利用 SQLite 的写事务串行化与主键约束保护服务端提交。</p>
+<p>接着看故障注入的位置。<code>timeout-after-commit</code> 在服务端事务提交以后抛出异常，因此本地没有拿到返回值，但工单和回执已经存在。<code>crash-after-commit</code> 则直接调用 <code>os._exit(70)</code>，让整个进程退出，不给本地代码保存成功状态的机会。</p>
+<p>最后看 <code>RecoveryRunner.run()</code>。它每轮先读取持久化状态。如果已经成功，就直接返回保存的结果；如果处于 <code>IN_FLIGHT</code> 或 <code>UNKNOWN</code>，就先查询回执；只有没有已完成结果，并且满足示例的安全条件，才检查预算并准备新的调用。</p>
+<p>执行器在调用工具前，先保存 <code>IN_FLIGHT</code> 并增加 <code>attempts</code>。这保证重启后能看见一次未确认的提交。它不能精确证明底层请求已经发出，因此 <code>attempts</code> 的语义是“已预留的提交机会”，可能保守消耗一次额度。</p>
+<p>示例中的 <code>READY</code> 对应前文状态机里的 <code>PREPARED</code>：操作意图已经存在，尚待提交。名称不同不影响含义。<code>RETRY_WAIT</code> 则保存下次允许重试的时间，避免循环无间隔地提交。</p>
+<h3 id="44-第一个实验正常执行后重复运行">4.4 第一个实验：正常执行后重复运行</h3>
+<p>如果文件保存在当前目录，使用下面的命令；使用配套仓库时，把文件名替换为 <code>examples/agent_recovery.py</code> 即可。</p>
+<pre><code class="language-bash">python3 agent_recovery.py --dir /tmp/agent-normal --scenario normal
+python3 agent_recovery.py --dir /tmp/agent-normal --scenario normal
+</code></pre>
+<p>第一次运行会创建一张工单，并保存成功状态。第二次运行读取同一份本地状态，直接复用成功结果。最终摘要形如：</p>
+<pre><code class="language-json">{"attempts":1,"event":"summary","result":{"status":"created","ticket_id":1},"state":"SUCCEEDED","ticket_count":1}
+</code></pre>
+<p>这里需要同时观察 <code>attempts</code> 和 <code>ticket_count</code>：第二次运行并没有重新提交创建操作，服务端工单总数也没有增加。</p>
+<p>示例目录就是持久化身份的一部分。恢复必须使用原目录和原 <code>run_id</code>。如果换一个全新目录，Agent 状态库与模拟服务库都会重新创建，这对应的是新的实验环境。</p>
+<p>为了重复验证某个场景，可以换一个新的实验目录，而不是删除正在恢复的数据库。同样，改变 <code>run_id</code> 表示创建新的逻辑操作，不能拿来冒充原操作的恢复。</p>
+<h3 id="45-第二个实验请求已提交但响应丢失">4.5 第二个实验：请求已提交，但响应丢失</h3>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-timeout \
+  --scenario timeout-after-commit \
+  --max-attempts 1
+</code></pre>
+<p>在一个全新目录里运行时，可以观察到以下状态迁移：</p>
+<pre><code class="language-text">IN_FLIGHT，attempts = 1
+UNKNOWN，原因是远端已提交但响应丢失
+SUCCEEDED，来自服务端幂等回执
+</code></pre>
+<p>最终仍然只有一张工单，提交机会只使用了一次。虽然 <code>max_attempts</code> 被设置为一，程序依然可以完成恢复，因为它没有进行第二次创建，只是在确认第一次创建的结果。</p>
+<p>这个实验解释了一个容易误用的边界：预算限制新的业务提交，不应该让系统拒绝认识已经发生的成功事实。否则一次成功的操作，可能仅仅因为回执迟到就被错误报告为失败。</p>
+<p>在真实环境里，结果查询本身也可能失败。生产系统应给查询设置单独预算与退避，必要时由异步对账任务继续处理。示例每轮恢复只进行一次即时查询；查询不可用时就升级为待对账，不会在查询接口上无限循环。</p>
+<h3 id="46-第三个实验让进程真的退出再由新进程恢复">4.6 第三个实验：让进程真的退出，再由新进程恢复</h3>
+<p>先执行：</p>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-crash \
+  --scenario crash-after-commit
+</code></pre>
+<p>这条命令预期返回退出码 <code>70</code>。这不是需要修复的环境错误，而是我们主动注入的中断点：工单已经保存，Agent 还没有保存成功确认。</p>
+<p>接着单独执行下面的命令：</p>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-crash \
+  --scenario normal
+</code></pre>
+<p>新进程读取到 <code>IN_FLIGHT</code>，查询同一个幂等键，取回已有工单编号，再保存 <code>SUCCEEDED</code>。最终 <code>attempts</code> 仍为一，<code>ticket_count</code> 仍为一。</p>
+<p>这里改变 <code>scenario</code> 只是关闭故障注入，不是修改业务参数或操作身份。恢复依赖的仍然是同一目录、同一 <code>run_id</code>、同一请求指纹和同一份服务端回执。</p>
+<p>用异常捕获模拟“恢复”与真实进程退出存在差别。前者可能继续保留内存变量，甚至让测试误以为状态已经持久化。这里通过退出进程再重新启动，至少验证了恢复所需的核心信息确实保存在磁盘上。</p>
+<p>不过，进程退出实验并不等于断电可靠性实验。文件系统故障、磁盘损坏、存储回滚和数据库备份恢复，还需要对应环境下的额外验证。</p>
+<h3 id="47-第四个实验暂时故障预算耗尽与明确拒绝">4.7 第四个实验：暂时故障、预算耗尽与明确拒绝</h3>
+<p>模拟第一次请求明确未被接受：</p>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-transient \
+  --scenario transient-once
+</code></pre>
+<p>执行器会进入 <code>RETRY_WAIT</code>，经过带抖动的退避后再次提交。最终预期使用两次提交机会，创建一张工单。</p>
+<p>模拟服务始终明确拒绝接收请求：</p>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-budget \
+  --scenario unavailable \
+  --max-attempts 2
+</code></pre>
+<p>程序会在两次已知未生效的尝试后结束，状态为 <code>FAILED</code>，退出码为 <code>2</code>，工单数为零。这里的“明确未生效”来自模拟接口的 <code>NotAccepted</code> 契约，不能把任意真实服务的超时或 <code>503</code> 都映射成这个异常。</p>
+<p>然后尝试把最大次数改成九十九：</p>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-budget \
+  --scenario normal \
+  --max-attempts 99
+</code></pre>
+<p>结果仍然保持原来的终止状态和已用次数。示例不会让一次重启或新的命令行参数修改原操作的预算。生产系统如果确实需要人工延长预算，应有显式、可审计的管理动作。</p>
+<p>模拟业务规则拒绝：</p>
+<pre><code class="language-bash">python3 agent_recovery.py --dir /tmp/agent-reject --scenario reject
+</code></pre>
+<p>这时程序直接结束，不会退避后重复相同请求。原因是等待不会改变当前参数被拒绝的事实。如果模型能够修正参数，应回到输入校验和业务意图确认层，而不是绕过原来的参数指纹检查。</p>
+<h3 id="48-第五个实验结果不确定而且查询不可用">4.8 第五个实验：结果不确定，而且查询不可用</h3>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-unknown \
+  --scenario ambiguous-unqueryable
+</code></pre>
+<p>这个场景先创建工单，再丢失响应，同时让结果查询不可用。执行器会把操作标记为 <code>NEEDS_RECONCILIATION</code>，返回退出码 <code>3</code>。</p>
+<pre><code class="language-text">IN_FLIGHT -&gt; UNKNOWN -&gt; NEEDS_RECONCILIATION
+</code></pre>
+<p>摘要中的工单数会显示为一，因为实验程序直接读取模拟服务库，方便我们观察外部事实。真实 Agent 未必拥有这样的旁路观察能力；正因为无法确认，它才必须保留不确定状态。</p>
+<p>示例采用保守策略：查询不可用后不再自动提交。即使某些服务允许在幂等窗口内直接同键重放，也需要适配器明确声明这个契约，才能选择更积极的恢复策略。不能仅凭“重试应该没问题”作决定。</p>
+<p>在这个教学实现里，<code>NEEDS_RECONCILIATION</code> 是自动执行器的停止状态，不提供人工解锁命令。真实系统可以建立对账队列，由专门任务或运维界面补充证据，再通过受控状态迁移恢复处理。</p>
+<p>这也是面向用户报告结果时的重要区别：“已停止自动提交，原请求结果待确认”比“失败了，请重新执行”更准确。后者容易引导用户再次创建同一项业务操作。</p>
+<h3 id="49-验证同键异参与不同业务意图">4.9 验证同键异参与不同业务意图</h3>
+<p>先创建正常工单：</p>
+<pre><code class="language-bash">python3 agent_recovery.py --dir /tmp/agent-conflict --scenario normal
+</code></pre>
+<p>再用同一个身份提交另一个标题：</p>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-conflict \
+  --scenario normal \
+  --title "另一条不同的工单"
+</code></pre>
+<p>程序会返回参数冲突，拒绝把新的内容绑定到旧操作。如果用户确实需要创建另一张工单，应显式使用新的 <code>run_id</code>：</p>
+<pre><code class="language-bash">python3 agent_recovery.py \
+  --dir /tmp/agent-conflict \
+  --scenario normal \
+  --run-id second-ticket \
+  --title "另一条不同的工单"
+</code></pre>
+<p>这会创建第二个合法业务对象。幂等的目的并不是阻止所有内容相似的操作，而是区分“同一操作的再次提交”和“另一个经过确认的新操作”。</p>
+<h3 id="410-自动化测试应验证哪些性质">4.10 自动化测试应验证哪些性质</h3>
+<p>对恢复系统，最有价值的测试不是“某个函数有没有被调用”，而是故障发生后，业务不变量是否仍然成立。</p>
+<p>本文配套测试使用临时目录和独立子进程，覆盖十三个场景。包括成功结果跨进程复用、暂时故障重试、响应丢失对账、真实进程退出、重启不重置预算、本地与服务端参数冲突、查询不可用时保留未知结果、发送前崩溃，以及截止时间到达后的结果确认。</p>
+<p>在配套目录中运行：</p>
+<pre><code class="language-bash">python3 -m unittest discover -s examples -p 'test_agent_recovery.py' -v
+</code></pre>
+<p>测试判断的是实际状态与外部对象数量。例如崩溃恢复测试不仅检查新进程退出码为零，还检查尝试数没有重置、服务端依然只有一张工单，并确认崩溃时本地确实停留在 <code>IN_FLIGHT</code>。</p>
+<p>手动复制本文完整代码，也能通过前述命令逐个复现实验。配套自动化测试只是把这些断言固定下来，方便后续修改执行器时发现语义退化。</p>
+<p>生产环境还可以增加更强的故障注入：重复投递同一消息、同时启动两个执行器、延迟服务端响应、让查询结果短暂不可见、模拟幂等记录过期，以及在补偿过程中再次中断。测试强度应与实际架构的并发和故障范围相匹配。</p>
+<h3 id="411-示例的能力边界哪些地方需要生产化">4.11 示例的能力边界：哪些地方需要生产化</h3>
+<p>第一，示例只支持单执行器。<code>LocalStore.save()</code> 没有实现版本条件更新、租约或任务认领协议，不能因为 SQLite 支持事务，就认为多个 Worker 可以安全运行同一任务。</p>
+<p>第二，模拟服务没有后台继续执行的请求，也没有最终一致的查询副本。一次函数返回或进程退出后，不存在另一个远端线程稍后继续完成原请求。因此恢复时查询不到回执，可以结合这个模拟契约和保留的幂等键继续执行，或者在预算耗尽时判为已知未完成。</p>
+<p>真实服务如果查询为空时原请求仍可能在途，就不能照搬这个判定。它可能需要返回 <code>PENDING</code>、<code>NOT_FOUND_FINAL</code> 等更精确的查询结果；或者允许在幂等有效期内安全重放；如果仍然无法确认，应该保持待对账状态。</p>
+<p>第三，示例通过异常模拟网络故障，没有真实的连接超时、读超时和远端取消机制。代码中的截止时间用于限制何时可以开始新的调用，不能中断一个阻塞的真实网络库。接入 HTTP 客户端后，必须把剩余时间传递给其连接与请求超时配置。</p>
+<p>第四，示例的回执不自动过期，参数只有字符串字段，租户也是固定值。生产环境要明确幂等保留期、租户隔离、请求规范化、鉴权以及数据清理策略，不能直接把这个实验当成多租户服务端。</p>
+<p>第五，示例为了方便观察，用 <code>time.sleep()</code> 等待很短的退避。长任务应使用持久化调度器，查询预算、模型调用预算和工具写入预算也应独立管理，再共同受任务总预算限制。</p>
+<p>第六，数据库异常等非预期错误没有被统一吞掉。这是有意保留的失败方式：未知错误让进程暴露故障，并保留已经提交的状态；不要用一个宽泛的 <code>except Exception: retry()</code> 把所有程序缺陷都变成无限重试。</p>
+<p>这些边界对应明确的工程工作量。先用小实验把恢复协议验证清楚，再根据实际需求增加组件，比一开始就搭建庞大系统更容易判断每个模块的价值。</p>
+<h3 id="412-如何接入真正的模型与工具调用">4.12 如何接入真正的模型与工具调用</h3>
+<p>接入模型以后，整体路径可以保持不变：模型生成候选工具调用，适配器解析工具名与参数，业务层校验授权和对象关系，协调器创建或定位稳定操作，执行器完成恢复协议，最后把结构化结果交回模型。</p>
+<p>模型提议可以是这样的对象：</p>
+<pre><code class="language-json">{
+  "tool": "create_ticket",
+  "arguments": {
+    "tenant_id": "demo-tenant",
+    "title": "检查订单服务告警"
+  },
+  "business_reference": "alert-2026-001"
+}
+</code></pre>
+<p>其中，<code>business_reference</code> 可以帮助协调器定位业务事件，但它是否真实存在、属于当前用户、允许关联创建，都需要程序核验。租户身份也应从可信会话或服务身份取得，不能直接信任模型输出。</p>
+<p>协调器在业务事件与操作之间维护关系，例如同一告警默认只允许存在一个“创建主工单”的槽位。模型重新提出该操作时，系统读取台账，返回已有结果、当前等待状态或明确冲突，而不是每次生成一个新键。</p>
+<p>对于模型 API 的请求超时，也需要单独考虑费用、响应关联与重复生成。模型调用通常不会直接创建业务工单，但它会消耗预算，也可能产生不同决策。是否重用已保存的模型输出、是否重新请求，应由所在步骤的恢复策略决定。</p>
+<p>不论模型最终回复得多么确定，系统都应该根据工具证据判定任务完成。可以把结果分为三个层次：协议调用成功，业务操作成功，用户目标完成。成功拿到 HTTP 响应不代表工单创建成功，工单创建成功也不一定代表整个排障任务已经完成。</p>
+<h3 id="413-选择框架时看恢复语义而不是只看接口便利性">4.13 选择框架时，看恢复语义而不是只看接口便利性</h3>
+<p>如果使用 LangGraph，应关注检查点的存储介质、状态提交边界和节点恢复行为。官方文档区分了完整检查点与节点待提交写入；内存型存储适合调试，却不能在进程重启后保留状态。</p>
+<p>另一个需要注意的细节是中断恢复。LangGraph 的 <code>interrupt</code> 恢复会重新运行相应节点，不能把它理解为任意 Python 语句位置上的直接续跑。放在中断前的有副作用代码，需要按相应重执行语义设计。</p>
+<p>如果使用 Temporal，应把需要确定性重放的工作流逻辑与外部交互拆开。模型请求、数据库访问和业务 API 调用通常由 Activity 承担；工作流重放利用历史结果恢复控制过程。代码升级时，还需要遵守框架的兼容与版本管理要求。</p>
+<p>两类框架的抽象、部署方式与使用场景并不完全相同，不能简单视为互相替换。但都需要检查同一个问题：当外部副作用已经发生、完成结果尚未记录时，应用准备怎样确认或去重？</p>
+<p>选型时可以实际做一次小型故障验证：在工具提交后强制退出，重新启动，再看是否重复创建对象。这个实验往往比正常路径上的演示更能说明系统的真实恢复能力。</p>
+<h3 id="414-三类典型用途对应三种恢复重点">4.14 三类典型用途，对应三种恢复重点</h3>
+<p><strong>资料收集与报告生成</strong>主要关注进度保存和结果复用。例如已经下载并校验的资料可以按内容版本复用，已经完成的章节分析可以保存成中间产物。恢复时要区分历史快照与需要重新查询的最新数据，避免把过期资料当作当前事实。</p>
+<p>这类任务的副作用通常较轻，但计算费用、下载配额和生成时间仍然值得管理。一个明确的阶段检查点，可以避免任务执行到最后一步失败后重新处理全部资料。</p>
+<p><strong>工单、CRM 和数据导入</strong>主要关注业务去重与写入一致性。例如一个客户事件只应创建一条跟进记录，一批导入任务应能识别哪些记录已经成功。稳定的业务关联编号、服务端唯一约束和逐条操作台账，比一句“失败后自动重试”更重要。</p>
+<p>这类场景还需要处理部分成功。一千条数据导入，九百九十九条成功、一条失败，不应该简单把整批标记为未执行。可以按条目记录状态，再聚合批次结果，恢复时只处理未完成部分。</p>
+<p><strong>跨系统流程与资源管理</strong>主要关注依赖关系、长时间等待与补偿。例如创建环境、运行检查、登记结果、释放资源。每一步都可能完成，但完整目标仍然失败，因此需要把“已经发生的事实”和“接下来应做的清理”同时展示出来。</p>
+<p>在这类流程中，人工确认也可以作为持久化状态的一部分。系统保存待确认内容、审批身份与有效期，等待外部事件后继续。人工参与并不意味着恢复协议失效，只是多了一种必须记录和验证的输入。</p>
+<h3 id="415-常见反模式代码很短问题却被隐藏了">4.15 常见反模式：代码很短，问题却被隐藏了</h3>
+<p>第一种反模式是给所有工具加统一重试装饰器。它容易把读操作、非幂等写操作、输入错误和结果未知混在一起。更好的做法是由工具契约声明恢复能力，执行器据此选择策略。</p>
+<p>第二种反模式是把模型的每次重新提议都当成新操作。这样底层幂等永远只保护单次提议，无法约束业务上的重复意图。需要由应用维护业务事件与逻辑操作之间的稳定关系。</p>
+<p>第三种反模式是只在内存里累计重试次数。服务一重启，次数归零，自动化就可能无限进行。次数、截止时间和下一次调度时间应成为持久化状态。</p>
+<p>第四种反模式是每一层都开启独立重试。假设 Agent 层允许三次尝试，工具包装层三次，底层 SDK 也三次，那么在某些故障路径中，一项操作可能触发最多二十七次底层提交。这个数字是调用层级组合的结果，不是某个 SDK 的默认行为。</p>
+<p>解决方法是明确重试责任层，读取实际 SDK 的配置，统一计算底层尝试预算。必须保留多层恢复时，也应让各层共享截止时间，并记录底层真实调用量。</p>
+<p>第五种反模式是把 <code>NEEDS_RECONCILIATION</code> 显示成普通失败，再鼓励用户重新开始。它抹掉了“原操作可能已经生效”的事实。对用户应明确展示待确认事项，以及已经完成的部分。</p>
+<p>第六种反模式是用“自动补偿完成”掩盖清理过程中的错误。补偿应有自己的结果和证据，必要时进入独立待处理状态。业务上承认部分成功，往往比输出一个过度简化的总状态更可靠。</p>
+<h3 id="416-前景agent-的恢复能力会怎样演进">4.16 前景：Agent 的恢复能力会怎样演进</h3>
+<p>以下是基于前述工程问题作出的趋势判断，不代表某个标准已经落地，也不保证所有系统都会采用同一种架构。</p>
+<p>第一个方向是模型决策与持久工作流进一步结合。模型擅长理解目标、处理非结构化信息和提出方案，持久执行系统擅长管理状态、等待、重试与版本。把两者结合，可以让灵活决策运行在明确的执行边界内。</p>
+<p>第二个方向是工具契约更加丰富。未来的工具描述除了名称、参数和返回值，还可以显式表达幂等作用域、记录保留期、结果查询方式、取消语义、补偿能力与并发约束。这样执行器能够根据可机器读取的契约选择策略，而不是依赖开发者记住某份文档。</p>
+<p>第三个方向是故障恢复成为 Agent 评测的一部分。除了看正常情况下能否完成任务，还应比较响应丢失、进程重启、重复消息和结果延迟下的行为：是否重复写入，是否保留未知状态，是否正确遵守预算，是否能提供可核验的结果。</p>
+<p>第四个方向是调试工具围绕业务操作组织。开发者不只查看聊天记录，还能看到一个操作从提议、确认、提交到对账的完整生命周期，并在隔离环境里重放状态变化。模型版本、提示词版本和工具版本也能与具体结果关联起来。</p>
+<p>第五个方向是长期任务拥有更明确的资源所有权。跨小时或跨天运行的 Agent，需要知道谁可以接管、哪些权限仍然有效、哪些预算已经消耗，以及何时必须重新确认业务条件。持久化不仅保存进度，也保存这些条件的版本与有效范围。</p>
+<p>这些方向共同指向一个变化：Agent 的工程价值会越来越依赖可解释的执行行为。模型可以不断变强，但只要它还需要影响外部系统，副作用、并发与故障窗口就仍然需要被认真处理。</p>
+<h2 id="5-总结">5. 总结</h2>
+<p>Agent 失败恢复的核心，是让执行系统在中断以后仍然记得原来的业务意图，并能够区分已经确认的事实与尚待确认的结果。</p>
+<p>幂等性让同一逻辑操作可以承受重复提交；持久化保存身份、参数、状态和预算；对账弥补外部提交与本地确认之间的间隙；重试边界限制自动化继续尝试的条件；补偿处理已经提交但需要调整的业务结果。</p>
+<p>它们各自解决不同的问题，不能互相替代。检查点不会自动保护外部 API，租约不会自动终止旧执行者，超时不会自动撤销远端工作，模型重新规划也不能抹掉已经发生的副作用。</p>
+<p>落地时，可以先选择一个具体写操作，建立稳定身份和操作台账，再验证三个最关键的故障点：请求已发出但没有响应，远端已经提交但进程退出，以及重启后预算是否仍然有效。通过这些实验，再决定是否需要消息队列、Outbox、并发接管或持久工作流引擎。</p>
+<p>本文的工单示例刻意保持简单，却保留了最重要的提交间隙。它说明，可靠恢复并不依赖模型“记得更牢”，而依赖系统把业务事实记录得清楚，把重复提交限制得明确，把无法确认的结果诚实地保留下来。</p>
+<h2 id="6-结束语">6. 结束语</h2>
+<p>这篇博客就和大家分享到这里，如果大家在研究学习的过程当中有什么问题，可以加群进行讨论或发送邮件给我，我会尽我所能为您解答，与君共勉！</p>
+<p>另外，博主出新书了《<a href="https://item.jd.com/14421833.html" target="_blank" rel="noopener nofollow"><strong><span style="color: rgba(255, 0, 0, 1)">Hadoop与Spark大数据全景解析</span></strong></a>》、同时已出版的《<a href="https://item.jd.com/14699434.html" target="_blank" rel="noopener nofollow"><span style="color: rgba(22, 119, 255, 1)">深入理解Hive</span></a>》、《<a href="https://item.jd.com/12455361.html" target="_blank" rel="noopener nofollow"><span style="color: rgba(22, 119, 255, 1)">Kafka并不难学</span></a>》和《<a href="https://item.jd.com/12371763.html" target="_blank" rel="noopener nofollow"><span style="color: rgba(22, 119, 255, 1)">Hadoop大数据挖掘从入门到进阶实战</span></a>》也可以和新书配套使用，喜欢的朋友或同学， 可以在公告栏那里点击购买链接购买博主的书进行学习，在此感谢大家的支持。关注下面公众号，根据提示，可免费获取书籍的教学视频。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <div>
+<b class="b1"></b><b class="b2 d1"></b><b class="b3 d1"></b><b class="b4 d1"></b>
+<div class="b d1 k">  
+联系方式：
+<br>
+邮箱：smartloli.org@gmail.com
+<br>
+<strong style="color: green">QQ群（Hive与AI实战【新群】）：935396818</strong>
+<br>
+QQ群（Hadoop - 交流社区1）：424769183
+<br>
+QQ群（Kafka并不难学）：825943084
+<br>
+温馨提示：请大家加群的时候写上加群理由（姓名＋公司/学校），方便管理员审核，谢谢！
+<br>
+<h3>热爱生活，享受编程，与君共勉！</h3>  
+</div>
+<b class="b4b d1"></b><b class="b3b d1"></b><b class="b2b d1"></b><b class="b1b"></b>
+</div>
+<br>
+<div>
+<b class="b1"></b><b class="b2 d1"></b><b class="b3 d1"></b><b class="b4 d1"></b>
+<div class="b d1 k">
+<h3>公众号：</h3>
+<h3><img style="width: 8%; margin-left: 10px" src="https://www.cnblogs.com/images/cnblogs_com/smartloli/1324636/t_qr.png"></h3>
+</div>
+<b class="b4b d1"></b><b class="b3b d1"></b><b class="b2b d1"></b><b class="b1b"></b>
+</div>
+<br>
+<div>
+<b class="b1"></b><b class="b2 d1"></b><b class="b3 d1"></b><b class="b4 d1"></b>
+<div class="b d1 k">
+<h3>作者：哥不是小萝莉 ［<a style="color: green" href="http://www.kafka-eagle.org/" target="_blank">关于我</a>］［<a style="color: green" href="http://www.cnblogs.com/smartloli/p/4241701.html" target="_blank">犒赏</a>］</h3>
+<h3>出处：<a style="color: green" href="http://www.cnblogs.com/smartloli/" target="_blank">http://www.cnblogs.com/smartloli/</a></h3>
+<h3>转载请注明出处，谢谢合作！</h3>
+</div>
+<b class="b4b d1"></b><b class="b3b d1"></b><b class="b2b d1"></b><b class="b1b"></b>
+</div>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-31 18:02">2026-10-31 18:01</span>&nbsp;
+<a href="https://www.cnblogs.com/smartloli">哥不是小萝莉</a>&nbsp;
+阅读(<span id="post_view_count">43</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23507748);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsmartloli%2Fp%2F23507748&amp;targetId=23507748&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

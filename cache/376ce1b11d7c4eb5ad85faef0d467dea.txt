@@ -1,0 +1,427 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zw-awa/p/23506792" title="发布于 2026-10-31 15:50">
+    
+
+    <span role="heading" aria-level="2">串口为什么会丢字节：从轮询到中断和环形缓冲区</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3791643/202610/3791643-20261031154708997-999959236.png" alt="串口为什么会丢字节：从轮询到中断和环形缓冲区" class="desc_img">
+        线上不断送来字节，主循环什么时候转回来却说不准。那些消失的字符去了哪里，一块会绕圈的仓库又该在什么情况下丢掉数据？
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="经典三问">经典三问</h2>
+<p>Q: 串口接收为什么会丢字节？<br>
+A: 因为硬件只有一个字节的接收位置，而主循环不一定在下一个字节收完之前路过那里。</p>
+<p>Q: 中断在接收里做什么？<br>
+A: 它把“搬字节”这件事从主循环手里接过去，字节一到就取走，放进软件缓冲区。</p>
+<p>Q: 环形缓冲区是什么？<br>
+A: 一段固定长度的数组，加一前一后两个下标；写到末尾就绕回开头，用来装下连续到来的字节。</p>
+<hr>
+<p>上一篇用的是最直白，最直接，最不绕弯子的接收方式：主循环转到串口那几行，才去问 USART1 有没有新字节。一句一句慢慢发，什么毛病都看不出来。</p>
+<p>在 VOFA+ 的发送框里一次粘三行，一起发出去：</p>
+<pre><code class="language-text">How are you?
+LED ON
+LED OFF
+</code></pre>
+<p>收到的可能是：</p>
+<pre><code class="language-text">I'm fine, thank you, and you?
+Unknown command
+LED OFF
+</code></pre>
+<p><code>How are you?</code> 回了，说明线是通的、波特率是对的；<code>LED ON</code> 却成了一句认不出来的东西，灯没亮。发出去的字符一个都没少，程序却像少读了几笔。这一回就把这几笔逐个找出来。</p>
+<h2 id="第一版868µs-里能塞几个字节">第一版：86.8µs 里能塞几个字节</h2>
+<p><code>115200</code> 这个数字上一篇数过：一位大约 8.7µs。加上起始位和停止位，一个字节在线上占 10 位，也就是大约 <strong>86.8µs</strong>。</p>
+<p>USART1 收字节的地方只有<strong>一格</strong>。线上把 8 位数据收齐，硬件把它交给 <code>DR</code> 这个寄存器，同时把 <code>RXNE</code> 置 1，意思是“我这里有一个字节，谁来拿走”；软件读一次 <code>DR</code>，<code>RXNE</code> 才会清掉，那一格才算空出来。</p>
+<p>于是从 <code>RXNE</code> 置 1 那一刻算起，程序把 <code>DR</code> 读走的时间只有<strong>一个字节的长度</strong>。下一个字节收完时，如果 <code>RXNE</code> 还是 1，硬件就置起 <code>ORE</code>（溢出错误），<strong>新到的那一个字节直接丢掉</strong>，<code>DR</code> 里那个旧的还留着。</p>
+<p>主循环每 1ms 才路过一次串口那几行。1ms 除以 86.8µs 大约是 11.5：这 1ms 里线上已经走完十一个字节，而程序只来得及取走一个。</p>
+<p>轮询的接收函数和上一篇一模一样，一个字都没改：</p>
+<pre><code class="language-c">uint8_t Uart_ReceiveByte(uint8_t *data)
+{
+    if (USART_GetFlagStatus(USART1, USART_FLAG_RXNE) == RESET)
+    {
+        return 0U;
+    }
+
+    *data = (uint8_t)USART_ReceiveData(USART1);
+    return 1U;
+}
+</code></pre>
+<p><code>USART_GetFlagStatus()</code> 读的是状态标志，<code>USART_FLAG_RXNE</code> 为 <code>SET</code> 就表示那一格里有新字节；<code>USART_ReceiveData()</code> 读的正是 <code>DR</code>，读一次顺手把 <code>RXNE</code> 清掉。有字节就返回 1，没有就返回 0，主循环据此决定要不要继续取。</p>
+<p>拼行的逻辑上一篇是直接写在主循环里的。它还要改两次，先给它一个名字：</p>
+<pre><code class="language-c">#define COMMAND_BUFFER_SIZE  32U
+
+static char    command[COMMAND_BUFFER_SIZE];   /* 32 个字符，最后一位留给 '\0' */
+static uint8_t command_length = 0U;
+
+static void Uart_ServiceLine(uint8_t data)
+{
+    if ((data == '\r') || (data == '\n'))
+    {
+        if (command_length &gt; 0U)
+        {
+            command[command_length] = '\0';
+            HandleCommand(command);
+            command_length = 0U;
+        }
+    }
+    else if (command_length &lt; (COMMAND_BUFFER_SIZE - 1U))
+    {
+        command[command_length] = (char)data;
+        command_length++;
+    }
+    else
+    {
+        command_length = 0U;
+    }
+}
+</code></pre>
+<p>它只认一件事：<code>\r</code> 或 <code>\n</code> 代表一行结束，凑够一行就交给解析函数。<code>HandleCommand()</code> 还是上一篇那三个命令——<code>How are you?</code> 回一句话，<code>LED ON</code> 和 <code>LED OFF</code> 写第 0 颗灯（PC13），认不出来就回 <code>Unknown command</code>；函数本身不用重写。</p>
+<p>主循环里要加一个 300ms 的空等，专门用来把问题逼出来。先把它写成一个函数：</p>
+<pre><code class="language-c">static void Demo_SlowMainLoop(uint32_t ms)
+{
+    uint32_t start = tick_ms;
+
+    while ((tick_ms - start) &lt; ms)
+    {
+    }
+}
+</code></pre>
+<p><code>tick_ms</code> 是那条 1ms 时间轴（<code>TIM1_UP_IRQHandler()</code> 里每 1ms 给它加一）。用它的差值来空等，时间不用猜。</p>
+<p>它不是一个延时函数，因为它<strong>挡不住中断</strong>：这 300ms 里灯照常闪、<code>tick_ms</code> 照常往前走——它们走的是中断；被停住的是整个主循环——<code>Mode_Loop()</code> 停了，串口那几行也停了；按键扫描和灯的节拍走的是中断，不受影响。</p>
+<p>也正因为这样，“灯还在闪”不能证明串口没问题——灯走的是中断，串口走的是主循环，两边不是一条路。</p>
+<p>主循环还是老三样：跑模式、收字节、空等。接收那一段走 <code>Uart_ReceiveByte()</code>：</p>
+<pre><code class="language-c">static uint8_t received_byte;
+
+while (1)
+{
+    Mode_Loop();
+
+    while (Uart_ReceiveByte(&amp;received_byte))
+    {
+        Uart_ServiceLine(received_byte);
+    }
+
+    Demo_SlowMainLoop(300U);
+}
+</code></pre>
+<p><code>Key_Tick()</code> 挂在 1ms 中断里，<code>Mode_Loop()</code> 是主循环里的事；两个都来自前面那套按键与模式框架，这里不重复讲。</p>
+<p>烧进去，连续发那三行。屏幕上会出现 <code>Unknown command</code>，灯不亮。多发几次，每次错的字符还不一样。丢的字节没有规律，因为它取决于主循环转一圈用了多久。</p>
+<h2 id="第二版让中断把字节搬走">第二版：让中断把字节搬走</h2>
+<p>主循环来不及取，是因为它要等自己转回来。那就换个人来取：字节一到就打断 CPU，先把它搬走。</p>
+<h3 id="打开这条路要写三处">打开这条路要写三处</h3>
+<p>初始化单子要加一段，中断入口要新写一个函数。下面是完整的 <code>Uart_Init()</code>：</p>
+<pre><code class="language-c">void Uart_Init(void)
+{
+    GPIO_InitTypeDef gpio;
+    USART_InitTypeDef uart;
+    NVIC_InitTypeDef nvic;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA |
+                           RCC_APB2Periph_USART1, ENABLE);
+
+    gpio.GPIO_Pin = GPIO_Pin_9;
+    gpio.GPIO_Mode = GPIO_Mode_AF_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &amp;gpio);
+
+    gpio.GPIO_Pin = GPIO_Pin_10;
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOA, &amp;gpio);
+
+    uart.USART_BaudRate = 115200;
+    uart.USART_WordLength = USART_WordLength_8b;
+    uart.USART_StopBits = USART_StopBits_1;
+    uart.USART_Parity = USART_Parity_No;
+    uart.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    uart.USART_Mode = USART_Mode_Tx | USART_Mode_Rx;
+
+    USART_Init(USART1, &amp;uart);
+
+    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+
+    nvic.NVIC_IRQChannel = USART1_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = 1;
+    nvic.NVIC_IRQChannelSubPriority = 2;
+    nvic.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&amp;nvic);
+
+    USART_Cmd(USART1, ENABLE);
+}
+</code></pre>
+<p>前半段和上一篇一样：开时钟、把 PA9 交给 USART、PA10 做输入、填好 115200 8N1。新增的只有七行：一行 <code>nvic</code> 单子、一行开中断、四行填单子、一行交出去。</p>
+<p><code>USART_ITConfig(USART1, USART_IT_RXNE, ENABLE)</code> 的意思是：<strong>允许 USART1 在“收到新字节”这件事上提出请求</strong>。它只是允许外设开口，CPU 这时候还听不到。</p>
+<p>请求会送到 NVIC，也就是芯片里统一管理中断的地方。<code>NVIC_IRQChannelCmd = ENABLE</code> 才是把 USART1 这个通道放开，CPU 才肯放下手里的事跳过去。少了这一句，<code>USART_ITConfig()</code> 开得再对，请求也只会一直挂在那里没人接。</p>
+<p>优先级这两句，现在只需要知道一件事：抢占优先级填 1，和 1ms 定时器同一档，所以串口和节拍之间不会互相打断。谁先谁后的细节涉及优先级分组，开定时器那篇设置过 <code>NVIC_PriorityGroup_2</code>，这里够用了。</p>
+<p>中断拿到字节，先放进两个变量里，主循环再来取：</p>
+<pre><code class="language-c">static volatile uint8_t rx_byte = 0U;
+static volatile uint8_t rx_byte_ready = 0U;
+</code></pre>
+<p><code>volatile</code> 是在告诉编译器：这两个变量会在中断里被改，主循环每次都要真的去内存读一次，不要把值一直放在寄存器里当它不会变。</p>
+<p>处理函数本身是另外写的一个函数，名字不能自己起：</p>
+<pre><code class="language-c">void USART1_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART1, USART_IT_RXNE) != RESET)
+    {
+        rx_byte = (uint8_t)USART_ReceiveData(USART1);
+        rx_byte_ready = 1U;
+    }
+}
+</code></pre>
+<p><code>USART1_IRQHandler</code> 这个名字要和启动文件里的中断向量表对上。那张表把 USART1 的中断号和这个名字绑在一起，而且用的是 <code>WEAK</code> 声明——我们写了同名函数，就由我们的版本顶上去。名字写错一个字母，编译器不会报错，因为启动文件替每个中断都留了一个默认实现，那个默认实现里只有一条原地打转的指令 <code>B .</code>。平时它躺着不动，可一旦串口中断真的来了，CPU 会跳进去再也不出来，程序看起来就是彻底卡死。</p>
+<p>函数体里 <code>USART_GetITStatus()</code> 确认这次中断确实是“收到新字节”引起的，<code>USART_ReceiveData()</code> 读一次 <code>DR</code>。<strong>读 <code>DR</code> 这个动作本身就清掉了 <code>RXNE</code></strong>，不需要另外清标志——这和定时器不一样，定时器那个更新标志要专门清。如果这里忘了读 <code>DR</code>，<code>RXNE</code> 一直是 1，中断会立刻重新进来，主循环再也跑不动。</p>
+<h3 id="一格中转站证明了什么">一格中转站证明了什么</h3>
+<p>主循环那段接收换成读这两个变量：</p>
+<pre><code class="language-c">if (rx_byte_ready != 0U)
+{
+    uint8_t data = rx_byte;
+    rx_byte_ready = 0U;
+    Uart_ServiceLine(data);
+}
+</code></pre>
+<p>顺序是有讲究的：<strong>先把 <code>rx_byte</code> 读进局部变量，再清 <code>rx_byte_ready</code></strong>。反过来先清标志，中断可能恰好插在中间，把新字节写进 <code>rx_byte</code> 并把标志重新置 1，这一轮就会把新来的字节当成旧的用掉，还会再处理一遍。</p>
+<p>想确认中断真的进来了，把 <code>Uart_ServiceLine(data)</code> 那一行临时换成回显：</p>
+<pre><code class="language-c">Uart_SendByte(data);
+</code></pre>
+<p>慢慢发 <code>ABC</code>，能看到 <code>ABC</code> 回来，说明搬字节这件事已经由中断接手了。</p>
+<h3 id="一格还是不够">一格还是不够</h3>
+<p>把 300ms 的空等放回去，一次发那三行。结果还是坏的，而且比上一版更没痕迹：屏幕上还是一句 <code>Unknown command</code>。</p>
+<p>因为 <code>DR</code> 每次都被中断及时读走了，硬件的溢出标志根本没有机会置起，硬件不认为自己丢过东西。丢的地方换到了我们自己的两个变量上——主循环 300ms 后才来取，这中间到达的每一个字节都把前一个盖掉，最后只剩下一个字符。</p>
+<p>一格中转站只是把“硬件里的一格”变成“软件里的一格”，余量还是一个字节的时间。<strong>中断解决的是“谁来取”，不是“取到的东西放哪”。</strong></p>
+<h2 id="第三版一块会绕圈的仓库">第三版：一块会绕圈的仓库</h2>
+<p>需要一排格子，而不是一格。先画 8 个：</p>
+<pre><code class="language-text">格子： 0  1  2  3  4  5  6  7
+       ↑                 ↑
+     tail              head
+</code></pre>
+<p><code>head</code> 指向下一个要写入的格子，<code>tail</code> 指向下一个要读出的格子。</p>
+<ul>
+<li>中断拿到新字节：写进 <code>head</code> 那一格，然后 <code>head</code> 往右走一格；</li>
+<li>主循环处理字节：从 <code>tail</code> 那一格取出，然后 <code>tail</code> 往右走一格；</li>
+<li>走到最后一格：回到 0。这就是“环形”。</li>
+</ul>
+<p><code>head == tail</code> 就表示没有待处理的字节。为了能区分“空”和“满”，故意留一个格子不用：8 格最多装 7 个字节；我们的 64 字节缓冲区，实际能装 63 个。</p>
+<p>这个“留一格”和行缓冲区的“留一格”原因不一样。行缓冲区那 32 个字符里，最后一位是留给字符串结束符 <code>\0</code> 的；环形缓冲区留的那一格，是用来分辨空和满的。</p>
+<p>四个变量一起定义好：</p>
+<pre><code class="language-c">#define UART_RX_BUFFER_SIZE  64U
+
+static volatile uint8_t  rx_buffer[UART_RX_BUFFER_SIZE];
+static volatile uint8_t  rx_head = 0U;
+static volatile uint8_t  rx_tail = 0U;
+static volatile uint32_t rx_overflow_count = 0U;
+</code></pre>
+<p>中断往里放：</p>
+<pre><code class="language-c">static void Uart_RingPush(uint8_t data)
+{
+    uint8_t next_head = (uint8_t)((rx_head + 1U) &amp; (UART_RX_BUFFER_SIZE - 1U));
+
+    if (next_head == rx_tail)
+    {
+        rx_overflow_count++;
+        return;
+    }
+
+    rx_buffer[rx_head] = data;
+    rx_head = next_head;
+}
+</code></pre>
+<p><code>next_head</code> 是“如果写进去，<code>head</code> 会到哪”。如果那个位置正是 <code>tail</code>，说明再写就把没读走的数据追上了，也就是满了；满了就丢掉这个新到的字节，把计数加一，直接返回。</p>
+<p>丢掉新到的、不覆盖旧的，是因为旧的那些可能已经拼了一半。把一半的命令悄悄改掉，解析那层看不出任何异常；丢晚到的字节，后果会明明白白地表现为一句认不出来的命令。</p>
+<p>主循环从另一头取：</p>
+<pre><code class="language-c">uint8_t Uart_ReadByte(uint8_t *data)
+{
+    if (rx_head == rx_tail)
+    {
+        return 0U;
+    }
+
+    *data = rx_buffer[rx_tail];
+    rx_tail = (uint8_t)((rx_tail + 1U) &amp; (UART_RX_BUFFER_SIZE - 1U));
+    return 1U;
+}
+</code></pre>
+<p>取字节的函数不再碰 <code>RXNE</code>，它只关心仓库里还有没有货。再配一个查数量的：</p>
+<pre><code class="language-c">uint8_t Uart_RingCount(void)
+{
+    return (uint8_t)((rx_head - rx_tail) &amp; (UART_RX_BUFFER_SIZE - 1U));
+}
+</code></pre>
+<p><code>&amp; (UART_RX_BUFFER_SIZE - 1U)</code> 就是在做“走到 64 就回 0”。它只在缓冲区长度是 2 的幂时成立——64、32、128 都可以；如果哪天把长度改成 100，这里必须写成 <code>% 100U</code>。</p>
+<p>中断函数跟着缩短一行：</p>
+<pre><code class="language-c">void USART1_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART1, USART_IT_RXNE) != RESET)
+    {
+        Uart_RingPush((uint8_t)USART_ReceiveData(USART1));
+    }
+}
+</code></pre>
+<p>第二版那两个中转变量（<code>rx_byte</code>、<code>rx_byte_ready</code>）到此删掉，字节出了 <code>DR</code> 就直接进仓库。</p>
+<p>到这里有一个容易被漏掉的问题：主循环读的时候，中断会不会正好也在动这些变量？</p>
+<p>不会出问题，因为分工是死的：<strong><code>rx_head</code> 只有中断会改，<code>rx_tail</code> 只有主循环会改</strong>，两边不会写同一个变量；<code>rx_buffer</code> 是中断往 <code>head</code> 那一头写、主循环从 <code>tail</code> 那一头读，位置也是分开的。所以这里不需要关中断，也不用担心“读了一半被改掉”。</p>
+<p>主循环只改一个函数名：</p>
+<pre><code class="language-c">while (Uart_ReadByte(&amp;received_byte))
+{
+    Uart_ServiceLine(received_byte);
+}
+</code></pre>
+<p>轮询那个 <code>Uart_ReceiveByte()</code> 不再被主循环调用了。先留着它，实验里要换回去对比两种接收方式的时候还用得上。</p>
+<p>再把 300ms 的空等放回去，一次发那三行：三行命令都完整收到，<code>LED ON</code> 和 <code>LED OFF</code> 都把灯写对了。这 300ms 里到达的字节全都躺在仓库里等着，只要一次发的不超过 63 个字节。</p>
+<h2 id="第四版满了丢谁怎么知道">第四版：满了丢谁，怎么知道</h2>
+<p>仓库满了还是会丢，这一版让这件事变得看得见。</p>
+<p>计数变量已经在上面定义过，<code>Uart_RingPush()</code> 里那一句 <code>rx_overflow_count++</code> 就是它的全部写入点。它在中断里被加，在主循环里被读出来显示，所以定义时带 <code>volatile</code>。</p>
+<p>屏幕上看两个数字：</p>
+<pre><code class="language-c">static uint32_t panel_last_ms = 0;
+
+static void OLED_ShowRxPanel(void)
+{
+    OLED_Clear();
+    OLED_ShowString(0, 0, "BUFFER", OLED_6X8);
+    OLED_ShowNum(48, 0, Uart_RingCount(), 2, OLED_6X8);
+    OLED_ShowString(0, 16, "OVERFLOW", OLED_6X8);
+    OLED_ShowNum(60, 16, rx_overflow_count, 5, OLED_6X8);
+    OLED_Update();
+}
+</code></pre>
+<p>第一行是仓库里现在堆着多少字节，第二行是从开机到现在一共丢了多少个。<code>OLED_ShowNum()</code> 把数字按位数写进显存，<code>OLED_Update()</code> 才把整屏推上屏幕。</p>
+<p>主循环里加一段节拍，放在那个空等的前面：</p>
+<pre><code class="language-c">if ((tick_ms - panel_last_ms) &gt;= 200U)
+{
+    panel_last_ms = tick_ms;
+    OLED_ShowRxPanel();
+}
+</code></pre>
+<p>还是那套“记起点、到点动一小步”的写法：每隔 200ms 刷一次，不睡、不等。刷新不放进中断，原因在“中断里不该做的事”那一节。</p>
+<p>把这两个数字看清楚，接收的状况就有两种明显的形状：</p>
+<ul>
+<li>慢速手动发命令时，<code>BUFFER</code> 多数时候是 0，偶尔跳一下又回 0。这是正常的：主循环取走得比来的快；</li>
+<li>一次粘一大段过去，<code>BUFFER</code> 冲到接近 63，<code>OVERFLOW</code> 开始涨。这是缓冲区不够用，或者主循环被什么挡住了。</li>
+</ul>
+<p><code>OVERFLOW</code> 不清零，所以改完代码想知道刚才有没有真的丢过，看它就行。空等 300ms 那一段开着的时候，只要这 300ms 里发过去的字节超过 63 个，它就会开始涨——这一段本来就是故意拖出来的。</p>
+<h2 id="拼行这层还欠一处">拼行这层还欠一处</h2>
+<p>接收那一半理顺了，<code>Uart_ServiceLine()</code> 里还有一处旧问题。</p>
+<p>上一版里，字符数涨到行缓冲区的上限时，做法是把 <code>command_length</code> 清成 0。这样一条 40 个字符的超长命令会变成：前 31 个字符被塞进缓冲区，第 32 个字符触发清零，后面 8 个字符从开头重新存，等换行到来时，程序拿这 8 个字符去当一条命令执行。</p>
+<p>结果就是，<strong>超长命令的尾巴会被当成下一条命令</strong>。这条尾巴通常是随机的几个字符，落进 <code>HandleCommand()</code> 就是一句 <code>Unknown command</code>，看起来像“偶尔抽风”。</p>
+<p>改法是加一个状态：这行已经在被丢掉了，就一直丢到换行为止。</p>
+<pre><code class="language-c">static uint8_t line_discarding = 0U;
+
+static void Uart_ServiceLine(uint8_t data)
+{
+    if ((data == '\r') || (data == '\n'))
+    {
+        if (line_discarding != 0U)
+        {
+            Uart_SendString("line too long\r\n");
+            line_discarding = 0U;
+            command_length = 0U;
+        }
+        else if (command_length &gt; 0U)
+        {
+            command[command_length] = '\0';
+            HandleCommand(command);
+            command_length = 0U;
+        }
+    }
+    else if (line_discarding != 0U)
+    {
+        return;
+    }
+    else if (command_length &lt; (COMMAND_BUFFER_SIZE - 1U))
+    {
+        command[command_length] = (char)data;
+        command_length++;
+    }
+    else
+    {
+        line_discarding = 1U;
+        command_length = 0U;
+    }
+}
+</code></pre>
+<p>换了行、发现这行是被丢掉的，就回一句 <code>line too long</code>，然后回到干净状态等下一行。<code>Uart_SendString()</code> 是上一篇那个逐字节往外发的字符串发送函数，这里借它回一句提示。这样超长命令既不会被执行半截，也不会污染下一条命令。</p>
+<h2 id="中断里不该做的事">中断里不该做的事</h2>
+<p>仓库一建好，很容易想把所有事都搬进中断里做，尤其是回显。把中断函数临时改成这样试一下：</p>
+<pre><code class="language-c">void USART1_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART1, USART_IT_RXNE) != RESET)
+    {
+        uint8_t data = (uint8_t)USART_ReceiveData(USART1);
+
+        Uart_RingPush(data);
+
+        printf("%c", (char)data);
+    }
+}
+</code></pre>
+<p>一个字符看起来什么事都没有。但 <code>printf</code> 最终会走到换过 <code>fputc</code> 的那条路上，而 <code>fputc</code> 里调用的 <code>Uart_SendByte()</code> 有一个等 <code>TXE</code> 的循环：</p>
+<pre><code class="language-c">#include &lt;stdio.h&gt;
+
+int fputc(int ch, FILE *f)
+{
+    (void)f;
+    Uart_SendByte((uint8_t)ch);
+    return ch;
+}
+</code></pre>
+<p>等 <code>TXE</code> 的时间由发送速度决定：115200 下往外送一个字节也要 86.8µs，回显一行十来个字节就是 1ms 上下。这一段留在中断里，中断每次都要多待这么久；这期间接收那一格没人读，下一个字节收完就顶上 <code>ORE</code>，字节丢掉。</p>
+<p>这次丢的字节<strong>连缓冲区都进不去</strong>，所以 <code>OVERFLOW</code> 不会涨，屏幕上看不出来。能看出来的地方在别处：1ms 节拍被挤，灯的时间判断变迟钝，按键的消抖和长按跟着一起漂。</p>
+<p>刷 OLED 更重。<code>OLED_Update()</code> 会把整屏显存通过 I2C 一位一位送出去，把它放进中断，等于每收到一个字节就让另一条总线在中断里跑一大圈。</p>
+<p>中断里最短的写法就是第三版那一行：读一个字节，放进仓库，返回。<strong>搬运留在中断，解释和显示留给主循环</strong>，这样接收的时间余量才是 86.8µs，而不是“等一行字刚好发完”。</p>
+<h2 id="五个现场实验">五个现场实验</h2>
+<h3 id="先做回环不接-stm32">先做回环，不接 STM32</h3>
+<p>CH340 的 <code>TXD</code> 和 <code>RXD</code> 短接，VOFA+ 选这个 COM 口，发送那三行。窗口能收到自己发出的内容，说明电脑、驱动、COM 口和上位机参数这一端没问题。接收丢字节从来不是这一端引起的，但先排除掉，出问题时就只需要怀疑另一边。</p>
+<h3 id="把主循环拖慢对比两种接收">把主循环拖慢，对比两种接收</h3>
+<p><code>Demo_SlowMainLoop(300U)</code> 就是为这件事准备的。</p>
+<p>先回到轮询：把 <code>Uart_Init()</code> 里 <code>USART_ITConfig()</code> 那一句和整段 NVIC 配置先注释掉，主循环的 <code>while (Uart_ReadByte(&amp;received_byte))</code> 换回 <code>while (Uart_ReceiveByte(&amp;received_byte))</code>。发那三行，屏幕上会出现 <code>Unknown command</code>。</p>
+<p>再把注释去掉、函数名换回来，重新烧录，发同样的三行。三行都正常，<code>BUFFER</code> 在屏幕上一跳然后回 0。</p>
+<p>两次之间只改接收方式，别的都不动。</p>
+<h3 id="一次发多行看峰值">一次发多行，看峰值</h3>
+<p>把发送间隔调到尽可能短，连发十来行 <code>LED ON</code> / <code>LED OFF</code>。<code>BUFFER</code> 的读数会冲上去再落下来。发送端很慢的时候它可能一直是 0，这不能说明字节没经过缓冲区，只能说明主循环取走得比来的快。</p>
+<h3 id="故意写一条超长命令">故意写一条超长命令</h3>
+<p>先发 40 个普通字符，最后补一个换行。程序不会拿前 31 个字符去执行，而是回 <code>line too long</code>，紧接着的 <code>How are you?</code> 仍然正常回复。</p>
+<p>如果你看到超长命令的尾巴被当成了一条命令（屏幕上多出一句 <code>Unknown command</code>），说明丢弃状态没有写对。</p>
+<h3 id="在中断里回显然后删掉">在中断里回显，然后删掉</h3>
+<p>照上面那段把中断函数改成带回显的版本，连着发一大段文本，再删掉那一行重烧一次。</p>
+<p>短字符回显可能完全正常，这正是这个实验有价值的地方：错误不是每次都炸出来，而是在负载上来时变成偶发卡顿和丢数据。</p>
+<h2 id="最后橘猫说">最后橘猫说</h2>
+<p>现在这条接收路是这样的：</p>
+<pre><code class="language-text">PA10 收到电平
+ -&gt; USART1 硬件里那一格
+ -&gt; USART1_IRQHandler 只搬一个字节
+ -&gt; 64 字节环形缓冲区
+ -&gt; 主循环 Uart_ReadByte 取字节
+ -&gt; Uart_ServiceLine 拼成一行
+ -&gt; HandleCommand 解释命令
+ -&gt; LED / OLED / 串口回复
+</code></pre>
+<p>解决了的事很具体：接收不再依赖主循环转得多勤。主循环被 OLED、电机、传感器占住的时候，字节照样能被搬进仓库；仓库满了会丢，但会留下数字。</p>
+<p>没解决的事同样具体：</p>
+<ul>
+<li>发送方向还是轮询。<code>Uart_SendByte()</code> 里那个等 <code>TXE</code> 的循环还在，一次回一大段内容，主循环就要陪着等；</li>
+<li>仓库只解决“收下来放哪”。装不下就是装不下：一次发过来超过 63 个字节，多出来的那部分会被丢掉，<code>OVERFLOW</code> 会涨；</li>
+<li>电平接错、波特率不一致、帧格式不对，这些错误发生在硬件那一格之前，环形缓冲区一个字节也救不回来；</li>
+<li>主循环如果一直很慢，仓库迟早还会被填满；换成更大的数组只是把这个时间往后推。</li>
+</ul>
+<p>屏幕上那两个数字就是判断依据：如果 <code>BUFFER</code> 经常贴着上限、<code>OVERFLOW</code> 一直在涨，缺的是空间；如果中断自己回得太慢（回显那一段就是例子），缺的是把中断里的动作再削短。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-10-31 15:50">2026-10-31 15:50</span>&nbsp;
+<a href="https://www.cnblogs.com/zw-awa">Zw-awa</a>&nbsp;
+阅读(<span id="post_view_count">36</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23506792);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzw-awa%2Fp%2F23506792&amp;targetId=23506792&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
