@@ -1,0 +1,1068 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/sunyuliang/p/23518941" title="发布于 2026-11-02 09:58">
+    
+
+    <span role="heading" aria-level="2">从 axios 写法到服务端治理：AxiosNet 与 HttpClient / Refit / RestSharp / Flurl 的横向对比</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>本文的数据来自仓库内的可复现基准。功能对比是对各库公开 API 的定性判断，性能对比给了完整口径和"这套数据不覆盖什么"。看完再决定要不要往下读源码。</p>
+</blockquote>
+<hr>
+<h2 id="一先把问题说清楚">一、先把问题说清楚</h2>
+<p>在 .NET 里发一个 HTTP 请求只需要三行：</p>
+<pre><code class="language-csharp">using var http = new HttpClient();
+var json = await http.GetStringAsync("https://api.example.com/users/1");
+</code></pre>
+<p>但只要这段代码进了生产环境，清单就会变成这样：</p>
+<ul>
+<li>超时到底是一次尝试的，还是整条请求的？</li>
+<li>失败了重试几次？退避多久？非幂等的 POST 能不能重试？</li>
+<li>下游整体挂了，还要不要继续打？熔断了谁来恢复？</li>
+<li>同一时刻最多发多少条？排队排多久算超时？</li>
+<li>这个接口能不能缓存 30 秒？并发同一 URL 能不能只发一次？</li>
+<li>出问题怎么定位：卡在连接池、卡在重试等待、还是卡在服务端？</li>
+</ul>
+<p>BCL 只负责传输层。剩下的部分，行业里的标准答案是把 <code>HttpClient</code> + Polly + 某个缓存库 + 几个自写 <code>DelegatingHandler</code> 拼起来。这套方案没问题，它的问题是<strong>配置分散</strong>：重试在 Polly 的策略里，超时在 <code>HttpClient.Timeout</code> 和 Polly 的 <code>TimeoutPolicy</code> 里，缓存键在缓存库的配置里，观测点散在每一条 Handler 上。线上出了事，第一件事是搞清楚"这次失败到底被哪一层改写过"。</p>
+<p>AxiosNet 的出发点很朴素：<strong>把这些东西收进一个配置对象，并且让写法对齐前端同学熟悉的 axios。</strong></p>
+<pre><code class="language-csharp">using AxiosNet;
+using AxiosNet.Retry;
+using AxiosNet.Circuit;
+
+var http = Axios.Create(c =&gt;
+{
+    c.BaseAddress = "https://api.example.com/";
+    c.Timeout = TimeSpan.FromSeconds(10);          // 单次尝试
+    c.TotalTimeout = TimeSpan.FromSeconds(30);     // 整条请求（含重试与排队）
+    c.Retry.Policy = RetryPolicy.Exponential(3, TimeSpan.FromMilliseconds(200));
+    c.Circuit.Policy = new CircuitBreaker { FailureThreshold = 5 };
+});
+
+var user = (await http.GetAsync&lt;User&gt;("users/1")).Data;
+</code></pre>
+<p>同一个配置对象里，超时、重试、熔断、缓存、并发闸门、观测全部就位。这是它和"再包一层 HttpClient"最本质的区别：<strong>不是语法糖，是把治理管线的所有权收回来了。</strong></p>
+<p>配置的归属对比更直观：</p>
+<table>
+<thead>
+<tr>
+<th>治理能力</th>
+<th>传统拼装落在哪</th>
+<th>AxiosNet 落在哪</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单次尝试超时</td>
+<td><code>HttpClient.Timeout</code>（重试后含义会变）</td>
+<td><code>Config.Timeout</code></td>
+</tr>
+<tr>
+<td>整条请求预算</td>
+<td>Polly 的 <code>TimeoutPolicy</code>（还要自己算剩余）</td>
+<td><code>Config.TotalTimeout</code></td>
+</tr>
+<tr>
+<td>重试</td>
+<td>Polly <code>RetryPolicy</code> + Handler 注册</td>
+<td><code>Config.Retry.Policy</code></td>
+</tr>
+<tr>
+<td>熔断</td>
+<td>Polly <code>CircuitBreaker</code> + Handler 注册</td>
+<td><code>Config.Circuit.Policy</code></td>
+</tr>
+<tr>
+<td>响应缓存</td>
+<td>另一个缓存库的配置</td>
+<td><code>Config.Cache</code></td>
+</tr>
+<tr>
+<td>并发上限</td>
+<td>自写 <code>SemaphoreSlim</code> 或 <code>RateLimiter</code></td>
+<td><code>Config.Limits.MaxConcurrentRequests</code></td>
+</tr>
+<tr>
+<td>观测</td>
+<td>每条 Handler 各加一次埋点</td>
+<td><code>Telemetry</code> 统一，尝试级事件</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="二它是什么">二、它是什么</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>包</td>
+<td><code>AxiosNet</code>（核心 + 声明式客户端同包）、<code>AxiosNet.DependencyInjection</code>（可选）、<code>AxiosNet.Cli</code>（可选，设计期 dotnet tool）</td>
+</tr>
+<tr>
+<td>目标框架</td>
+<td><code>net6.0</code> / <code>net8.0</code> 双目标，.NET 6 ~ 11 都能引用</td>
+</tr>
+<tr>
+<td>运行时依赖</td>
+<td>核心包零第三方，只用 BCL</td>
+</tr>
+<tr>
+<td>风格</td>
+<td>全异步，<code>Task</code> + <code>CancellationToken</code></td>
+</tr>
+<tr>
+<td>观测</td>
+<td><code>ActivitySource</code> + <code>Meter</code> + <code>DiagnosticListener</code>，默认开启，无人订阅时零产出</td>
+</tr>
+<tr>
+<td>AOT</td>
+<td>两个目标都 <code>IsTrimmable</code>，<code>net8.0</code> 另开 <code>IsAotCompatible</code>，包内自带源生成器</td>
+</tr>
+</tbody>
+</table>
+<p>安装：</p>
+<pre><code class="language-bash">dotnet add package AxiosNet
+dotnet add package AxiosNet.DependencyInjection   # 可选
+dotnet tool install -g AxiosNet.Cli               # 可选：OpenAPI 生成客户端
+</code></pre>
+<p>关于"零依赖"要说准确：核心包确实只用 BCL；DI 扩展依赖 <code>Microsoft.Extensions.DependencyInjection.Abstractions</code> 一个抽象包；CLI 是设计期工具，用 YamlDotNet 解析 OpenAPI 文档，<strong>不进运行时</strong>。</p>
+<hr>
+<h2 id="三三种写法同一个内核">三、三种写法，同一个内核</h2>
+<h3 id="31-原始请求返回类型由泛型决定">3.1 原始请求：返回类型由泛型决定</h3>
+<pre><code class="language-csharp">// 原文：不解析
+var text = await Axios.GetAsync&lt;string&gt;("https://api.example.com/ping");
+
+// dynamic：不定义 DTO，按字段取值
+var dyn = await Axios.GetAsync&lt;dynamic&gt;("https://api.example.com/users/1");
+Console.WriteLine($"{dyn.Data.name}, {dyn.Data.address.city}");
+
+// 强类型
+var response = await Axios.GetAsync&lt;User&gt;("https://api.example.com/users/1");
+</code></pre>
+<p>四种形态（<code>string</code> / <code>AxiosDynamic</code> / <code>T</code> / 非泛型 <code>JsonElement</code>）都在同一个方法族里，不用换 API。</p>
+<h3 id="32-声明式模型或接口调用只剩一句">3.2 声明式：模型或接口，调用只剩一句</h3>
+<p>端点多起来之后，URL 和参数散落在调用处是最难维护的。AxiosNet 给两种声明方式，由同一个 <code>ApiClient</code> 承载：</p>
+<pre><code class="language-csharp">[Get("users/{id}")]
+public sealed class GetUserRequest : IApiRequest&lt;User&gt;
+{
+    [Path] public int Id { get; set; }
+    [Query("verbose")] public string? Verbose { get; set; }
+}
+
+var client = new ApiClient("https://api.example.com/");
+var user = (await client.RequestAsync(new GetUserRequest { Id = 5 })).Data;
+</code></pre>
+<p>也可以直接写接口，由包内源生成器在编译期烘焙真实代理（JIT 与 Native AOT 同一路径）：</p>
+<pre><code class="language-csharp">public interface IUserApi
+{
+    [Get("users/{id}")]
+    Task&lt;User&gt; GetAsync(int id, CancellationToken ct = default);
+}
+</code></pre>
+<p>有 OpenAPI 文档时，连接口都不用写：</p>
+<pre><code class="language-bash">dotnet tool install -g AxiosNet.Cli
+axiosnet-gen ./openapi.json -o ./Generated -n MyApp.Api --style interface
+</code></pre>
+<p>这一点是它和 Refit 最直接的同台竞争：Refit 需要 Refitter 之类的第三方工具才能从 OpenAPI 生成，AxiosNet 把生成器做进了同一个仓库、同一个包族。</p>
+<h3 id="33-流式请求体边算边发响应体边收边解析">3.3 流式：请求体边算边发，响应体边收边解析</h3>
+<pre><code class="language-csharp">// http 是 AxiosClient 实例：请求体给异步序列，库不缓冲
+await http.PostAsync&lt;UploadResult&gt;("ingest", ReadChunks(file), c =&gt;
+{
+    c.ContentType = "text/csv";
+});
+
+// 声明式客户端把 SSE / NDJSON / JSON 数组解析成 IAsyncEnumerable&lt;T&gt;
+var stream = await api.RequestStreamAsync(
+    new ChatStreamRequest { Prompt = "hi" },
+    AxiosStreamFormat.ServerSentEvents);
+
+await foreach (var chunk in stream.Data!)
+{
+    Console.Write(chunk.Text);
+}
+</code></pre>
+<p>Server-Sent Events、NDJSON、JSON 数组三种分帧格式内置，不用自己写 <code>StreamReader</code> 循环；每收完一帧就交付，不等整个响应下完（LLM 增量输出、行情推送、分页列表都能直接用）。</p>
+<hr>
+<h2 id="四能力盘点">四、能力盘点</h2>
+<p>不逐条列 API，按"服务端真正会用到"分三组。</p>
+<p><strong>请求与响应</strong></p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>入口</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>查询参数对象化</td>
+<td><code>c.Params = new { page = 2, tags = new[] { "dev", "ops" } }</code></td>
+</tr>
+<tr>
+<td>表单 / 文件上传</td>
+<td><code>PostFormAsync</code> / <code>FormFile</code></td>
+</tr>
+<tr>
+<td>流式请求体</td>
+<td><code>data = IAsyncEnumerable&lt;byte[]&gt;</code> 或内存块</td>
+</tr>
+<tr>
+<td>流式响应分帧</td>
+<td><code>RequestStreamAsync&lt;T&gt;</code>（SSE / NDJSON / JSON 数组）</td>
+</tr>
+<tr>
+<td>进度、限速、体积上限</td>
+<td><code>Callbacks.OnDownloadProgress</code> / <code>Limits.MaxRate</code> / 大小上限</td>
+</tr>
+<tr>
+<td>请求体压缩</td>
+<td><code>c.RequestCompression = AxiosCompression.Gzip</code></td>
+</tr>
+<tr>
+<td>令牌缓存与刷新</td>
+<td><code>AccessTokenManager</code>（提前刷新、并发刷新单飞、401 重放）</td>
+</tr>
+<tr>
+<td>只拼 URL 不发请求</td>
+<td><code>client.GetUri(...)</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>流量治理</strong></p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>入口</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>重试（退避 / 抖动 / <code>Retry-After</code> / 幂等门禁）</td>
+<td><code>c.Retry.Policy = RetryPolicy.Exponential(...)</code></td>
+</tr>
+<tr>
+<td>全局重试预算</td>
+<td><code>RetryBudgetPolicy</code>（令牌桶，只拦重试不拦首发）</td>
+</tr>
+<tr>
+<td>熔断</td>
+<td><code>CircuitBreaker</code>（滚动窗口失败率 + 连续失败两条规则，半开慢启动）</td>
+</tr>
+<tr>
+<td>并发对冲</td>
+<td><code>c.Hedging.MaxHedges = 1</code></td>
+</tr>
+<tr>
+<td>备用端点 + 端点健康记忆</td>
+<td><code>c.Failover.Endpoints = ...</code></td>
+</tr>
+<tr>
+<td>幂等键</td>
+<td><code>c.Idempotency.Enabled = true</code></td>
+</tr>
+<tr>
+<td>在途并发闸门</td>
+<td><code>c.Limits.MaxConcurrentRequests</code> + 排队上限</td>
+</tr>
+<tr>
+<td>响应缓存 + 单飞 + 条件复用</td>
+<td><code>client.Defaults.Cache = new AxiosCache(...)</code></td>
+</tr>
+<tr>
+<td>短路响应（mock / 回放）</td>
+<td><code>c.ShortCircuit = new AxiosShortCircuit { ... }</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>连接与观测</strong></p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>入口</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>按 origin 自建连接池</td>
+<td>默认；<code>HttpConnectionPool.GetOrCreate("key")</code> 可命名共享</td>
+</tr>
+<tr>
+<td>多出口（代理 / 凭据 / 证书 / Cookie 分档）</td>
+<td><code>ConnectionPoolOptions.AddTransport("egress-a", ...)</code></td>
+</tr>
+<tr>
+<td>HTTP/2 默认、HTTP/3 可选</td>
+<td><code>c.Connection.HttpVersion</code></td>
+</tr>
+<tr>
+<td>尝试级中间件链</td>
+<td><code>AxiosAttemptPipeline.Default.Append(...)</code></td>
+</tr>
+<tr>
+<td>三路遥测</td>
+<td><code>AddSource("AxiosNet")</code> / <code>AddMeter("AxiosNet")</code></td>
+</tr>
+<tr>
+<td>统一错误模型</td>
+<td><code>AxiosException</code> + 稳定 <code>Code</code>，如 <code>ERR_CIRCUIT_OPEN</code>、<code>ERR_QUEUE_TIMEOUT</code></td>
+</tr>
+</tbody>
+</table>
+<p>这些能力不是"接口都摆在那里"，而是每条都有明确的语义边界。举两个例子：</p>
+<p><strong>超时分两个层级。</strong> <code>Timeout</code> 是一次尝试的预算（3 次重试 × 10 秒，最坏 40 秒）；<code>TotalTimeout</code> 是整条请求的预算，排队等待、退避等待、重试全部计入。当 <code>TotalTimeout</code> 在请求<strong>发出前</strong>就耗尽时，库内三处逻辑必须同时认这件事——熔断不计失败、重试不重试、换端点也不换——因为它一个字节都没发出去，记成下游故障或者再换一个镜像重试，都是在放大问题。这类"边界一致"比多写一个 API 难得多。</p>
+<p><strong>熔断有两条打开规则。</strong> 只按连续失败熔断，低流量的"半死不活"下游永远熔不断——每夹一次成功就清零，而它恰恰最该被熔断；只按窗口失败率熔断，小流量又填不满样本。所以两条并存：样本够看比率，不够看连续失败。</p>
+<hr>
+<h2 id="五和主流组件比">五、和主流组件比</h2>
+<h3 id="51-对比对象与方法">5.1 对比对象与方法</h3>
+<p>选了四个对手，加上自己：</p>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th>版本</th>
+<th>形态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HttpClient</code></td>
+<td>BCL（.NET 8）</td>
+<td>基线，功能最少但吞吐天花板</td>
+</tr>
+<tr>
+<td>Refit</td>
+<td>16.4.0</td>
+<td>声明式接口 + 源生成（只测 <code>ForGenerated</code>，不含反射回退）</td>
+</tr>
+<tr>
+<td>RestSharp</td>
+<td>113.0.0</td>
+<td>请求对象模型，老项目存量大</td>
+</tr>
+<tr>
+<td>Flurl</td>
+<td>Flurl.Http 4.0.2</td>
+<td>字符串即请求的链式写法</td>
+</tr>
+<tr>
+<td><strong>AxiosNet</strong></td>
+<td>仓库源码（net8.0）</td>
+<td>默认 <code>AxiosClient</code>，不做任何调优</td>
+</tr>
+</tbody>
+</table>
+<p><code>HttpClient</code> / Refit / RestSharp / Flurl 四家都注入了<strong>与 AxiosNet 默认连接池逐项对齐</strong>的 <code>SocketsHttpHandler</code>（Cookies / Proxy / 连接数 / 超时 / 解压一致），否则测到的是默认值差异，不是实现差异。</p>
+<p>没有纳入 WebApiClientCore、RestEase 等：不是它们不重要，而是没有同口径实测数据，写进来就只能凭印象，那不如不写。</p>
+<h3 id="52-功能对比">5.2 功能对比</h3>
+<p>功能对比是定性判断，依据是各库公开 API。表里"需 Polly"指需要额外引入第三方弹性库并把它装进 <code>DelegatingHandler</code> 链——这本身是可行方案，但它是<strong>另一个包 + 另一套配置模型</strong>，和"同一次配置调用里就能写"不是一回事。</p>
+<p><strong>请求能力</strong></p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>HttpClient</th>
+<th>Refit</th>
+<th>RestSharp</th>
+<th>Flurl</th>
+<th>AxiosNet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>强类型反序列化</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>原文 / <code>dynamic</code> / <code>JsonElement</code></td>
+<td>需自己处理</td>
+<td>需自己处理</td>
+<td>需自己处理</td>
+<td>需自己处理</td>
+<td>四种形态内置</td>
+</tr>
+<tr>
+<td>声明式端点</td>
+<td>—</td>
+<td>接口 + 特性</td>
+<td>—</td>
+<td>—</td>
+<td>模型式 + 接口式</td>
+</tr>
+<tr>
+<td>OpenAPI 生成客户端</td>
+<td>—</td>
+<td>需第三方</td>
+<td>—</td>
+<td>—</td>
+<td>内置 <code>axiosnet-gen</code></td>
+</tr>
+<tr>
+<td>流式响应分帧（SSE / NDJSON / JSON 数组）</td>
+<td>需自己读流</td>
+<td>返回 <code>Stream</code></td>
+<td>返回流</td>
+<td>返回流</td>
+<td>内置三种格式</td>
+</tr>
+<tr>
+<td>流式请求体（边算边发）</td>
+<td>需自定义 <code>HttpContent</code></td>
+<td>有限</td>
+<td>有限</td>
+<td>有限</td>
+<td>异步序列 / 内存块</td>
+</tr>
+<tr>
+<td>上传下载进度</td>
+<td>需自定义</td>
+<td>—</td>
+<td>部分支持</td>
+<td>—</td>
+<td>回调内置</td>
+</tr>
+<tr>
+<td>字节限速 / 体积上限</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>请求体压缩</td>
+<td>手写</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>令牌缓存 / 提前刷新 / 401 重放</td>
+<td>—</td>
+<td>部分</td>
+<td>部分</td>
+<td>—</td>
+<td><code>AccessTokenManager</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>弹性与治理（差距最大的一块）</strong></p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>HttpClient</th>
+<th>Refit</th>
+<th>RestSharp</th>
+<th>Flurl</th>
+<th>AxiosNet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>重试（退避 / 抖动 / <code>Retry-After</code>）</td>
+<td>需 Polly</td>
+<td>需 Polly</td>
+<td>—</td>
+<td>需 Polly</td>
+<td>内置策略</td>
+</tr>
+<tr>
+<td>全局重试预算</td>
+<td>需自写</td>
+<td>需自写</td>
+<td>—</td>
+<td>—</td>
+<td><code>RetryBudgetPolicy</code></td>
+</tr>
+<tr>
+<td>熔断</td>
+<td>需 Polly</td>
+<td>需 Polly</td>
+<td>—</td>
+<td>需 Polly</td>
+<td>内置状态机</td>
+</tr>
+<tr>
+<td>并发对冲（Hedging）</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>备用端点 / 端点健康记忆</td>
+<td>自写</td>
+<td>自写</td>
+<td>自写</td>
+<td>自写</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>幂等键</td>
+<td>自写</td>
+<td>自写</td>
+<td>自写</td>
+<td>自写</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>在途并发闸门 + 排队上限</td>
+<td>自写</td>
+<td>自写</td>
+<td>自写</td>
+<td>自写</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>响应缓存 + 单飞 + 条件复用</td>
+<td>需缓存库</td>
+<td>需缓存库</td>
+<td>需缓存库</td>
+<td>需缓存库</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>单次预算 vs 整条请求预算</td>
+<td>只有 <code>Timeout</code></td>
+<td>继承</td>
+<td>有超时</td>
+<td>有超时</td>
+<td><code>Timeout</code> + <code>TotalTimeout</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>工程化</strong></p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>HttpClient</th>
+<th>Refit</th>
+<th>RestSharp</th>
+<th>Flurl</th>
+<th>AxiosNet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DI 注册</td>
+<td><code>IHttpClientFactory</code></td>
+<td><code>Refit.HttpClientFactory</code></td>
+<td>手写</td>
+<td>手写</td>
+<td><code>AddAxiosClient</code> / <code>AddApiClient</code></td>
+</tr>
+<tr>
+<td>遥测</td>
+<td>内置事件</td>
+<td>继承</td>
+<td>继承</td>
+<td>继承</td>
+<td>三路 + 尝试级事件</td>
+</tr>
+<tr>
+<td>Native AOT / 裁剪</td>
+<td>原生支持</td>
+<td>源生成支持</td>
+<td>反射较重</td>
+<td>反射较重</td>
+<td><code>IsAotCompatible</code> + 生成器烘焙</td>
+</tr>
+<tr>
+<td>第三方运行时依赖</td>
+<td>0（BCL）</td>
+<td>1 个包</td>
+<td>1 个包</td>
+<td>2 个包</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>结论很清楚：<strong>功能维度上，AxiosNet 的定位不是"更好的 HttpClient"，而是"把 HttpClient 周边那套拼装收进一个包"。</strong> 如果你只需要发 GET，前四家都够用，甚至更省。</p>
+<h3 id="53-性能对比">5.3 性能对比</h3>
+<h4 id="口径">口径</h4>
+<p>这一节的所有数字都来自仓库内 <code>test/AxiosNet.Comparison</code>，不是引用。口径必须写清楚，否则数字没有意义：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>采集时间</td>
+<td>2026-11-01 10:13:55 +08:00（本轮窗口 CPU 份额 44%~49%，在项目自定的 42% 判定门槛之上）</td>
+</tr>
+<tr>
+<td>环境</td>
+<td>Windows 10.0.19045；18 核；.NET 8.0.31；Server GC=False；Release</td>
+</tr>
+<tr>
+<td>负载</td>
+<td>每实现 8 并发常驻 × 1 秒窗口 × 5 轮，轮间整体轮转实现顺序，预热 3 秒 + 冷却 2 秒</td>
+</tr>
+<tr>
+<td>请求</td>
+<td>HTTP/1.1 明文回环 GET，正文 51 B JSON，反序列化为同一个 <code>User</code></td>
+</tr>
+<tr>
+<td>延迟</td>
+<td><code>Stopwatch</code> 包住「发请求 + 读正文 + 反序列化」，含服务端处理与回环 RTT</td>
+</tr>
+<tr>
+<td>分配</td>
+<td>进程级 <code>GC.GetTotalAllocatedBytes</code> ÷ 完成请求数，<code>净分配</code> 已减掉 RawSocket 基线</td>
+</tr>
+<tr>
+<td>汇总</td>
+<td>每列取 5 轮的<strong>中位数</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>为什么不用"写文章这一刻"的数字：本文定稿时（2026-11-02 上午）本机正在跑 Visual Studio、Defender 扫描与兼容性遥测，两次复跑的 CPU 份额只有 11%~45%，轮间抖动超过 40%（同一实现相邻两轮能差一倍），按项目自己的口径（CPU 份额低于 42% 时只打印数字、不做结论）属于无效采样，因此没有采用。上面这组是达标窗口里的一次完整对照，复现命令在文末。</p>
+</blockquote>
+<p>表里最后一行 <code>RawSocket</code> 不是客户端：它是本仓库基准里裸 TCP 发预编码请求的实现，作用是<strong>服务端上限参照</strong>。加上它是为了知道"这个窗口里有多少成本其实是服务端和回环造成的"。</p>
+<h4 id="结果">结果</h4>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th style="text-align: right">RPS</th>
+<th style="text-align: right">p50 (µs)</th>
+<th style="text-align: right">p99 (µs)</th>
+<th style="text-align: right">分配/请求</th>
+<th style="text-align: right">净分配/请求</th>
+<th style="text-align: right">CPU</th>
+<th style="text-align: right">vs HttpClient</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HttpClient</td>
+<td style="text-align: right">84,389</td>
+<td style="text-align: right">84</td>
+<td style="text-align: right">218</td>
+<td style="text-align: right">3.7 KB</td>
+<td style="text-align: right">3.6 KB</td>
+<td style="text-align: right">49%</td>
+<td style="text-align: right">—</td>
+</tr>
+<tr>
+<td>Refit</td>
+<td style="text-align: right">78,353</td>
+<td style="text-align: right">88</td>
+<td style="text-align: right">232</td>
+<td style="text-align: right">4.6 KB</td>
+<td style="text-align: right">4.5 KB</td>
+<td style="text-align: right">48%</td>
+<td style="text-align: right">92.8%</td>
+</tr>
+<tr>
+<td><strong>AxiosNet</strong></td>
+<td style="text-align: right"><strong>77,183</strong></td>
+<td style="text-align: right"><strong>87</strong></td>
+<td style="text-align: right"><strong>251</strong></td>
+<td style="text-align: right"><strong>5.2 KB</strong></td>
+<td style="text-align: right"><strong>5.0 KB</strong></td>
+<td style="text-align: right"><strong>49%</strong></td>
+<td style="text-align: right"><strong>91.5%</strong></td>
+</tr>
+<tr>
+<td>Flurl</td>
+<td style="text-align: right">75,553</td>
+<td style="text-align: right">90</td>
+<td style="text-align: right">262</td>
+<td style="text-align: right">6.0 KB</td>
+<td style="text-align: right">5.9 KB</td>
+<td style="text-align: right">49%</td>
+<td style="text-align: right">89.5%</td>
+</tr>
+<tr>
+<td>RestSharp</td>
+<td style="text-align: right">49,014</td>
+<td style="text-align: right">116</td>
+<td style="text-align: right">1,551</td>
+<td style="text-align: right">31.5 KB</td>
+<td style="text-align: right">31.4 KB</td>
+<td style="text-align: right">44%</td>
+<td style="text-align: right">58.1%</td>
+</tr>
+<tr>
+<td>RawSocket（服务端上限）</td>
+<td style="text-align: right">106,945</td>
+<td style="text-align: right">66</td>
+<td style="text-align: right">149</td>
+<td style="text-align: right">131 B</td>
+<td style="text-align: right">0 B</td>
+<td style="text-align: right">45%</td>
+<td style="text-align: right">126.7%</td>
+</tr>
+</tbody>
+</table>
+<p>每轮原始 RPS 也放出来，避免只信一个漂亮数字：</p>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th style="text-align: right">第 1 轮</th>
+<th style="text-align: right">第 2 轮</th>
+<th style="text-align: right">第 3 轮</th>
+<th style="text-align: right">第 4 轮</th>
+<th style="text-align: right">第 5 轮</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HttpClient</td>
+<td style="text-align: right">94,717</td>
+<td style="text-align: right">82,191</td>
+<td style="text-align: right">84,408</td>
+<td style="text-align: right">80,174</td>
+<td style="text-align: right">84,389</td>
+</tr>
+<tr>
+<td>Refit</td>
+<td style="text-align: right">84,992</td>
+<td style="text-align: right">77,327</td>
+<td style="text-align: right">79,008</td>
+<td style="text-align: right">78,353</td>
+<td style="text-align: right">77,919</td>
+</tr>
+<tr>
+<td>AxiosNet</td>
+<td style="text-align: right">79,078</td>
+<td style="text-align: right">77,183</td>
+<td style="text-align: right">76,708</td>
+<td style="text-align: right">76,026</td>
+<td style="text-align: right">78,199</td>
+</tr>
+<tr>
+<td>Flurl</td>
+<td style="text-align: right">78,292</td>
+<td style="text-align: right">75,553</td>
+<td style="text-align: right">75,685</td>
+<td style="text-align: right">74,609</td>
+<td style="text-align: right">74,110</td>
+</tr>
+<tr>
+<td>RestSharp</td>
+<td style="text-align: right">51,606</td>
+<td style="text-align: right">48,710</td>
+<td style="text-align: right">48,609</td>
+<td style="text-align: right">49,014</td>
+<td style="text-align: right">49,421</td>
+</tr>
+<tr>
+<td>RawSocket</td>
+<td style="text-align: right">107,612</td>
+<td style="text-align: right">104,077</td>
+<td style="text-align: right">106,945</td>
+<td style="text-align: right">106,334</td>
+<td style="text-align: right">111,036</td>
+</tr>
+</tbody>
+</table>
+<p>除 HttpClient 的第 1 轮偏高（首轮余温，+12%）外，其余轮次相对中位的波动都在 ±9% 以内；AxiosNet 最稳，+2.5% / -1.5%。对比复跑时"同一实现相邻两轮差一倍"的场面，就知道为什么要挑窗口。</p>
+<h4 id="怎么读这组数字">怎么读这组数字</h4>
+<p><strong>第一，8.5% 的吞吐差，换的是一整个治理栈。</strong></p>
+<p>AxiosNet 与裸 <code>HttpClient</code> 不是同一档，但差距是 8.5%，不是数量级。同一窗口里两者的 CPU 份额都是 49%，p50 只差 3 µs——说明差的不是传输层，而是每次请求上多走的配置合并、拦截器/转换链、统一错误模型与遥测判定。</p>
+<p>把这 8.5% 换个说法：它替代的是 Polly + 缓存库 + 自写 Handler 链。那套拼装如果在同样的 8 并发下测，成本不会比 8.5% 更低——只是从来没人把它算进"HTTP 客户端"的账上。</p>
+<p><strong>第二，Refit 和 AxiosNet 同档（92.8% vs 91.5%）。</strong></p>
+<p>两者都是"源生成/轻封装 + 少量每请求分配"的代表。Refit 分配更低（4.5 KB vs 5.0 KB），因为它不承担治理管线；AxiosNet 多出来的约 0.5 KB 就是这些管线的固定成本。这个差值是可以解释的、也是有上限的，不是"每加一个特性就多一份分配"。</p>
+<p><strong>第三，RestSharp 的尾延迟和它的分配是同一件事。</strong></p>
+<p>p99 1,551 µs，是其它实现的 6~7 倍；净分配 31.4 KB/请求，是 HttpClient 的 8.7 倍。每请求新建 <code>RestRequest</code> + 自身的序列化路径带来更高的 Gen0 压力，窗口内的 GC 暂停直接体现在尾延迟上。这不是服务端或适配器带进来的——用不经过 socket 的伪 Handler 单独复测，<code>ExecuteAsync&lt;User&gt;</code> 单次约 29.4 KB，同量级。</p>
+<p><strong>第四，RawSocket 说明瓶颈已经开始向服务端转移。</strong></p>
+<p>HttpClient 已经跑到服务端上限的 79%，各客户端的 RPS 都被一定程度上限。所以这组数字适合比较<strong>相对关系</strong>，不适合拿来宣称"某库能跑 8 万 RPS"。</p>
+<p><strong>第五，最新提交把比值推到了 97.0%。</strong></p>
+<p>上面主表是一次完整横向对照。之后仓库里做了一轮响应正文的读取优化（多段正文与池化段，不再无条件装配成连续数组），同机配对复测（HttpClient vs AxiosNet，9 轮中位）：</p>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th style="text-align: right">RPS</th>
+<th style="text-align: right">p50 (µs)</th>
+<th style="text-align: right">p99 (µs)</th>
+<th style="text-align: right">净分配/请求</th>
+<th style="text-align: right">CPU</th>
+<th style="text-align: right">vs HttpClient</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HttpClient</td>
+<td style="text-align: right">51,598</td>
+<td style="text-align: right">141</td>
+<td style="text-align: right">324</td>
+<td style="text-align: right">3.6 KB</td>
+<td style="text-align: right">48%</td>
+<td style="text-align: right">—</td>
+</tr>
+<tr>
+<td>AxiosNet</td>
+<td style="text-align: right">50,071</td>
+<td style="text-align: right">140</td>
+<td style="text-align: right">320</td>
+<td style="text-align: right"><strong>4.7 KB</strong></td>
+<td style="text-align: right">52%</td>
+<td style="text-align: right"><strong>97.0%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>绝对 RPS 比主表低（机器状态不同，同一台机器两次运行差一倍很正常），但<strong>比值是同窗口配对量，可以比</strong>：91.5% → 97.0%，每请求净分配 5.0 KB → 4.7 KB。p50 已经追平（140 vs 141 µs），剩下的差距在尾部和每请求固定开销上。</p>
+<h4 id="这套数据不覆盖什么">这套数据不覆盖什么</h4>
+<ul>
+<li>只测 HTTP/1.1 明文回环 GET + 51 B JSON。TLS、HTTP/2、HTTP/3、上传、大正文、流式响应都不在范围内。</li>
+<li>服务端与客户端同进程，分配指标必须减基线，CPU 指标含服务端。</li>
+<li>每个实现按各自文档的惯用写法，不做"为跑分而调优"（RestSharp 每请求新建 <code>RestRequest</code> 就是它的正常用法）。</li>
+<li>Refit 只测源生成模式，反射回退是另一档性能。</li>
+<li>大正文与流式的分项成本在另一个 BenchmarkDotNet 工程里，两套数字不可互换。</li>
+</ul>
+<h3 id="54-易用性同一件事写五遍">5.4 易用性：同一件事写五遍</h3>
+<p>场景：<code>GET /users?page=2&amp;tags=dev&amp;tags=ops</code>，带 Bearer 令牌，10 秒超时，返回 <code>List&lt;User&gt;</code>。</p>
+<pre><code class="language-csharp">// HttpClient：请求消息、鉴权头、超时 CTS、读正文、反序列化，五步都自己写
+var url = "https://api.example.com/users?page=2&amp;tags=dev&amp;tags=ops";
+using var req = new HttpRequestMessage(HttpMethod.Get, url);
+req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+using var res = await http.SendAsync(req, cts.Token);
+res.EnsureSuccessStatusCode();
+var users = await res.Content.ReadFromJsonAsync&lt;List&lt;User&gt;&gt;(cts.Token);
+
+// Refit：接口声明一次，调用一行；查询数组、鉴权头、超时靠特性/HttpClient 配置表达
+public interface IUserApi
+{
+    [Get("/users")]
+    Task&lt;List&lt;User&gt;&gt; SearchAsync(
+        [Query] int page,
+        [Query] string[] tags,
+        [Header("Authorization")] string authorization,
+        CancellationToken ct = default);
+}
+
+// RestSharp：请求对象上逐个加参数与头
+var req = new RestRequest("users")
+    .AddQueryParameter("page", 2)
+    .AddQueryParameter("tags", "dev")
+    .AddQueryParameter("tags", "ops")
+    .AddHeader("Authorization", $"Bearer {token}");
+
+// Flurl：URL + 查询 + 鉴权 + 超时 + 反序列化，全部链在一行
+var users = await "https://api.example.com/users"
+    .SetQueryParam("page", 2)
+    .SetQueryParam("tags", new[] { "dev", "ops" })
+    .WithOAuthBearerToken(token)
+    .WithTimeout(TimeSpan.FromSeconds(10))
+    .GetJsonAsync&lt;List&lt;User&gt;&gt;(cancellationToken: ct);
+
+// AxiosNet：配置对象集中表达
+var response = await http.GetAsync&lt;List&lt;User&gt;&gt;("users", c =&gt;
+{
+    c.Params = new { page = 2, tags = new[] { "dev", "ops" } };
+    c.Headers.Set("Authorization", $"Bearer {token}");
+}, ct);
+</code></pre>
+<p>单次调用最省代码的是 Flurl，这个没有争议。AxiosNet 的优势不在"少写几个字符"，而在<strong>多请求之间的一致性</strong>：超时、重试、缓存、鉴权都在实例默认值里，调用点只写差异部分。</p>
+<p>同一件事加上"失败重试 3 次 + 熔断 + 缓存"：</p>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th>需要做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HttpClient</td>
+<td>引入 Polly（或 <code>Microsoft.Extensions.Http.Resilience</code>），组 <code>DelegatingHandler</code> 链，再单独接缓存库</td>
+</tr>
+<tr>
+<td>Refit</td>
+<td>同上，Polly 挂在传给 <code>RestService.For</code> 的 <code>HttpClient</code> 上</td>
+</tr>
+<tr>
+<td>RestSharp</td>
+<td>自己在循环里重试，熔断与缓存全自写</td>
+</tr>
+<tr>
+<td>Flurl</td>
+<td>同上；事件钩子能做记录，但不等于弹性策略</td>
+</tr>
+<tr>
+<td>AxiosNet</td>
+<td>同一个配置对象里写 <code>c.Retry.Policy</code>、<code>c.Circuit.Policy</code>、<code>client.Defaults.Cache</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="六几个值得单独说的实现细节">六、几个值得单独说的实现细节</h2>
+<p>功能表谁都能列，难的是这些能力凑在一起之后不互相打架。挑四个点。</p>
+<h3 id="61-一次尝试--一条中间件链顺序是契约">6.1 一次尝试 = 一条中间件链，顺序是契约</h3>
+<p>「一次尝试」被抽象成可组合的中间件链，默认顺序：</p>
+<pre><code>重试 → 备用端点 → 熔断 → 对冲 → 并发闸门 → 审计 → 发送
+</code></pre>
+<p>这个顺序不是随手排的，每一条都对应一个语义：</p>
+<ul>
+<li>重试在最外层 → 每次尝试都会重新过一遍备用端点、熔断、对冲与闸门；</li>
+<li>备用端点在熔断之外 → 每个端点各自过熔断，一个镜像挂了不影响另一个；</li>
+<li>熔断在对冲之外 → 一整组对冲分支只记一笔失败，不会因为发了 3 条就把失败数乘以 3；</li>
+<li>熔断在闸门之前 → 被熔断拒绝的请求不占并发槽位。</li>
+</ul>
+<p>中间件恒在链上，是否干活由它自己看 <code>ctx.Config</code> 决定——没配重试策略时重试中间件就是纯直通。所以链可以在构造期编译一次，每次尝试零分配。</p>
+<p>并发槽位有个容易漏的坑：中间件如果自己给了响应、或者自己抛了异常，就不会调用 <code>next</code>，槽位没人归还。所以闸门自己兜底归还；唯一的例外是流式响应——槽位随正文交给 <code>StreamOwner</code>，由流的 <code>Dispose</code> 释放，正文下载期间这条请求一直占着额度。这个"所有权转移"用一个 <code>SlotTransferred</code> 标志告诉闸门"别还"。</p>
+<h3 id="62-熔断的两条打开规则">6.2 熔断的两条打开规则</h3>
+<p>前面提过：连续失败管低流量，窗口失败率管高流量。还有两个细节：</p>
+<ul>
+<li><strong>"没发出"不算下游故障。</strong> 排队到 <code>TotalTimeout</code> 耗尽而抛的异常，下游一个字节都没收到，记成失败就等于"越拥堵越容易熔断健康的下游"，把局部排队放大成链路不可用。</li>
+<li><strong>卡死的探测不会永久占名额。</strong> 半开态的探测 30 秒没回报就整轮作废、重新打开，迟到的结果按代次丢弃——否则一次挂住的探测会让该维度永远停在半开。</li>
+</ul>
+<h3 id="63-响应正文能不解码就不解码能不复制就不复制">6.3 响应正文：能不解码就不解码，能不复制就不复制</h3>
+<p>这一条是最近一轮优化的重点，也是 97.0% 那个数字的来源。</p>
+<p>正文读取有三种形态：单块数组、池化数组、多段（chunked 或超过 8 MB 时按段累积）。默认实现要先把多段装配成一整块连续数组，才能交给 <code>Deserialize(ReadOnlyMemory&lt;byte&gt;)</code>。但"装配"本身就是一次整份正文的复制——32 MB 的响应就是多复制 32 MB。</p>
+<p>所以加了 <code>ISequenceContentSerializer</code>：实现这个接口，就能直接拿 <code>ReadOnlySequence&lt;byte&gt;</code> 解析，省掉那一份复制。内置的 JSON 实现走的就是这条路——<code>Utf8JsonReader</code> 本身能在多段 buffer 上工作，先把段装配成整块再解析，纯属浪费。</p>
+<p>同一轮还改了缓存的正文所有权。缓存条目要不要克隆正文，取决于能不能<strong>证明</strong>调用方拿不到这块数组：</p>
+<pre><code class="language-csharp">private static bool CanShareBody(AxiosResponse response, byte[] body)
+    =&gt; !ReferenceEquals(response.Data, body)
+       &amp;&amp; response.Config?.TransformResponseSnapshot is not { Length: &gt; 0 };
+</code></pre>
+<p><code>byte[]</code> / <code>ArrayBuffer</code> 形态的 <code>Data</code> 就是原始字节本身，调用方一次改写就会污染后续命中，必须克隆；配了 <code>transformResponse</code> 时，它可能把数组包进任意对象，无法证明没被拿走，按最坏情况克隆。只有"JSON / 文本形态且没有 transform"时，才和响应共用同一块内存。</p>
+<p>这类优化的共同点是：<strong>判据不是"看起来能不能省"，而是"能不能证明安全"。</strong> 证明不了就复制，这是可以接受的成本；证明了就省，这是白赚的。</p>
+<h3 id="64-aot-不是打个标记是把反射路径整段切掉">6.4 AOT 不是"打个标记"，是把反射路径整段切掉</h3>
+<p>库声明了 <code>IsAotCompatible</code> 不等于 AOT 下能用。AxiosNet 的做法是：</p>
+<ul>
+<li>包内自带源生成器（<code>analyzers/dotnet/cs</code>，引用即生效），编译期为每个带路由特性的模型烘焙元数据，为接口声明生成真实代理类，在模块初始化器里注册；</li>
+<li>运行时不再反射模型 / 接口，成员取值是直接 getter 委托；</li>
+<li><strong>JIT 专用的反射实现整段写在 <code>RuntimeFeature.IsDynamicCodeSupported</code> 为 true 的分支里</strong>，ILC 把它折成常量 <code>false</code> 后，整段不可达，连同类型一起被裁掉；</li>
+<li>AOT 下未命中注册表会抛 <code>AxiosAotMetadataException</code> 并带修复指引，不会静默丢字段。</li>
+</ul>
+<p>结果：示例在 win-x64 上发布 8.3 MiB、linux-x64 10.2 MiB，CI 把 <code>IL2026</code> / <code>IL3050</code> / 以及 DAM 那组警告直接当错误——"发布成功"等于"分析器 0 警告"。</p>
+<hr>
+<h2 id="七什么情况下别用它">七、什么情况下别用它</h2>
+<p>这部分必须写，否则前面的对比没有可信度。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>更合适的选择</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只发几个 GET，没有治理需求</td>
+<td><code>HttpClient</code> + <code>System.Net.Http.Json</code>，少一层抽象</td>
+</tr>
+<tr>
+<td>追求极致吞吐，每 1% 都要</td>
+<td><code>HttpClient</code>（84k vs 77k，差 8.5%）</td>
+</tr>
+<tr>
+<td>团队已经深度使用 Polly，策略是跨协议共用的</td>
+<td>继续用 Polly；AxiosNet 的治理只针对 HTTP 请求</td>
+</tr>
+<tr>
+<td>需要 .NET Framework / .NET Core 3.1</td>
+<td>不支持，目标只有 net6.0 / net8.0</td>
+</tr>
+<tr>
+<td>只想要链式语法、不关心治理</td>
+<td>Flurl 更轻，代码更短</td>
+</tr>
+<tr>
+<td>端点多、要类型安全、不需要内置治理</td>
+<td>Refit 更成熟，生态资料更多</td>
+</tr>
+</tbody>
+</table>
+<p>还有一个客观短板：<strong>生态。</strong> HttpClient / Refit / RestSharp 有十年的问答、博客、StackOverflow 积累；AxiosNet 目前的主要资料就是仓库 README 本身。这不是靠功能表能弥补的，只能靠时间。</p>
+<hr>
+<h2 id="八工程现状">八、工程现状</h2>
+<p>判断一个库能不能进生产，看这几项比看功能表有用：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>现状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用例数</td>
+<td>2167（net8.0）/ 2160（net6.0），两个 TFM 各跑一遍，共 4253 次执行</td>
+</tr>
+<tr>
+<td>行 / 分支覆盖率</td>
+<td>91.7% / 87.3%（net8.0，Debug 口径，排除性能与分配类用例）</td>
+</tr>
+<tr>
+<td>测试方式</td>
+<td>自研 <code>TcpListener</code> HTTP/1.1 Keep-Alive 服务器跑真实 TCP 往返，不是 mock Handler</td>
+</tr>
+<tr>
+<td>运行时矩阵</td>
+<td>编译目标 net6.0/net8.0 两份资产；运行时在 .NET 6 与 .NET 10 上各跑一遍</td>
+</tr>
+<tr>
+<td>AOT</td>
+<td>win-x64 / linux-x64 矩阵，裁剪与 AOT 分析器 0 警告，包消费 smoke 脚本</td>
+</tr>
+<tr>
+<td>示例</td>
+<td>三套：核心 + 声明式（50+ 项交互菜单）、DI 六场景、Native AOT</td>
+</tr>
+</tbody>
+</table>
+<p>覆盖率 91.7% 这个数字要说清口径：是 Debug 下的行覆盖率，Release 下序列点更少、分母会明显变小，两种口径不能混用。排除的用例有四类（性能比值与分配护栏在插桩下都会失真），普通 <code>dotnet test</code> 仍然全跑。</p>
+<p>写测试时踩过的坑也有价值：时序敏感的用例（断言上限耗时）与按分配字节数断言的用例必须各自独占运行，否则并行跑测试时互相干扰，会出现"本地绿、CI 红"的随机失败。</p>
+<hr>
+<h2 id="九小结">九、小结</h2>
+<p>AxiosNet 不是一个"更快的 HttpClient"。它在吞吐上比裸 <code>HttpClient</code> 慢 8.5%，每请求多约 1.4 KB 分配，这是它背着整个治理栈的代价，也是它存在的理由。</p>
+<p>它真正想解决的问题是：<strong>服务端调用外部 HTTP 时，那套"重试 + 熔断 + 限流 + 缓存 + 观测"的拼装，能不能只写一遍、只在一个地方配、出错时只查一个地方。</strong></p>
+<p>如果这个问题的答案是"能，而且我愿意为此付 8.5% 的吞吐"，那它值得一试；如果答案是"我只要发个 GET"，那用 <code>HttpClient</code> 就好——这也是它自己在文档里给出的选型建议。</p>
+<pre><code class="language-bash">dotnet add package AxiosNet
+</code></pre>
+<p>仓库（Gitee 主仓）：<a href="https://gitee.com/itsm/axios-net" target="_blank" rel="noopener nofollow">https://gitee.com/itsm/axios-net</a><br>
+GitHub 只读镜像：<a href="https://github.com/sunyuliang/AxiosNet" target="_blank" rel="noopener nofollow">https://github.com/sunyuliang/AxiosNet</a></p>
+<p>复现本文的性能数据：</p>
+<pre><code class="language-bash">cd test/AxiosNet.Comparison
+dotnet run -c Release -- --rounds 5 --duration 1 --tag my-run
+
+# 当回归门禁用：吞吐不低于 HttpClient 的 85%，净分配不超过其 2 倍
+dotnet run -c Release -- --min-ratio 0.85 --max-alloc-ratio 2
+</code></pre>
+<p>完整的对比报告（含功能矩阵与选型建议）在 <code>docs/http-client-comparison.md</code>。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.15694444444444444" data-date-updated="2026-11-02 13:44">2026-11-02 09:58</span>&nbsp;
+<a href="https://www.cnblogs.com/sunyuliang">sunyuliang</a>&nbsp;
+阅读(<span id="post_view_count">92</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23518941);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fsunyuliang%2Fp%2F23518941&amp;targetId=23518941&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
