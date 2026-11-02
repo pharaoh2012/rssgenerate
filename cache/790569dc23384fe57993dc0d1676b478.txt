@@ -1,0 +1,376 @@
+
+        <h2 class="post-title">
+            <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xyyt/p/23512721" title="发布于 2026-11-01 16:36">
+    
+
+    <span role="heading" aria-level="2">鸿蒙也能热更新了：uni-app WGT 热更新的真机结论、六道校验闸与五个深坑</span>
+    
+
+</a>
+
+        </h2>
+        <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>关于本文的占位符</strong>：文中所有项目标识类信息均已脱敏，落地时请逐项替换为你自己的取值。</p>
+<ul>
+<li><code>&lt;你的鸿蒙 AppId&gt;</code>：鸿蒙原生应用的 DCloud AppId（<strong>不带</strong> <code>__UNI__</code> 前缀，形如 <code>UNIXXXXXX</code>）</li>
+<li><code>&lt;你的包名&gt;</code>：鸿蒙 <code>bundleName</code>（形如 <code>com.example.app</code>）</li>
+<li><code>&lt;热更新配置键&gt;</code>：你在自建后台新建的配置项 key（本文只用它代指你自己的那个键名，不出现真实取值）</li>
+<li><code>&lt;你的配置查询接口&gt;</code>：按 key 拉取配置值的接口</li>
+<li><code>&lt;prod-api.example.com&gt;</code> / <code>&lt;qa-api.example.com&gt;</code>：生产与测试环境域名</li>
+</ul>
+<p>结论均在真机实测得到，具体取值与命令细节以你项目内部档案为准（见文末）。</p>
+</blockquote>
+<hr>
+<h4 id="先给结论">先给结论</h4>
+<ol>
+<li><strong>普通 uni-app（不是 uni-app x 蒸汽模式）在 HarmonyOS Next 上可以走 WGT 资源热更新</strong>，<code>plus.runtime.install</code> / <code>getProperty</code> / <code>quit</code> 实测均可用，连续两次热更成功。</li>
+<li><strong>最大风险不是"热更失败"，而是"整包升级被旧 WGT 永久遮蔽"</strong>。运行时只用"目录是否存在"判断有没有热更包，<strong>不做任何版本比较</strong>。这条我会在下面单独展开，它足以让你的新版本在用户手机上永远不生效。</li>
+<li>热更新的<strong>生效方式</strong>只有一个：安装成功后调 <code>plus.runtime.quit()</code> 让用户重开。官方链路在鸿蒙不支持自动重启，别指望 <code>restart()</code>。</li>
+<li>第一个"具备热更能力的整包基线"必须先发出去，用户装上之后，远程热更通道才算打开。线上老包根本不读你的热更配置。</li>
+</ol>
+<hr>
+<h4 id="一先划清能力边界">一、先划清能力边界</h4>
+<p>很多人第一步就搞错了范围，把原生改动塞进热更包里。</p>
+<table>
+<thead>
+<tr>
+<th>能走 WGT 热更</th>
+<th>必须整包升级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>页面/组件 JS、CSS、renderjs、wxs</td>
+<td>ArkTS（<code>entry/src/main/ets/**</code>）、UTS 插件</td>
+</tr>
+<tr>
+<td>分包、静态图片等资源</td>
+<td>HAR / 原生 SDK（推送、支付、IM、音视频…）</td>
+</tr>
+<tr>
+<td>业务逻辑、接口调用、条件编译分支</td>
+<td><code>module.json5</code> 权限、<code>AppScope</code> 壳配置</td>
+</tr>
+<tr>
+<td>调用<strong>壳内已存在</strong>的原生能力</td>
+<td>uni-app 运行时本身升级</td>
+</tr>
+</tbody>
+</table>
+<p>一句话判据：<strong>凡是新增或变更了原生能力，就必须先出整包，热更才有地方调它。</strong></p>
+<p>顺带说一个容易忽略的点：区分<strong>壳版本</strong>和<strong>资源版本</strong>。壳版本来自原生 <code>AppScope/app.json5</code>，是华为应用市场比较用的；资源版本来自前端 <code>manifest.json</code>，是 WGT 比较用的。两者数值不同、更新节奏不同，混用必然误判。客户端读资源版本要用：</p>
+<pre><code class="language-ts">const info = uni.getAppBaseInfo();
+const resourceVersion = info?.appWgtVersion || info?.appVersion || '';
+</code></pre>
+<p>读到空串就<strong>中止本次资源更新</strong>，不要拿壳版本冒充资源版本往下比。</p>
+<hr>
+<h4 id="二整体链路">二、整体链路</h4>
+<pre><code>冷启动 / 用户主动点「检查更新」
+        │
+        ├── 开发态直接 return（重要！见第五节坑 5）
+        ▼
+  上次热更是否已生效？（pending 标记核验）
+        ▼
+  ① 整包优先：原生应用市场检查
+     弹窗已出现 / 仍在检查中  →  本次不做热更
+        ▼
+  ② 读当前资源版本（空则中止）
+        ▼
+  ③ 拉远程配置 → 六道校验（任一不过 = 静默视为无更新）
+        ▼
+  ④ uni.downloadFile(wgtUrl)  真实进度上报给 UI
+        ▼
+  ⑤ plus.runtime.install(tempFilePath, { force: false })
+        ▼
+  ⑥ 写入「待生效」标记 → UI 切到「更新已安装 / 立即重启」
+        ▼
+  ⑦ 用户点确认 → plus.runtime.quit()
+     或点「稍后」→ 下次冷启动自然生效
+        ▼
+  ⑧ 下次启动比对 pending.version === appWgtVersion → 一致才清标记
+</code></pre>
+<p>改动面可以很小：一个更新检查 Hook + 一个更新弹窗组件，全部包在条件编译里，其他平台路径一行不动。</p>
+<pre><code class="language-ts">// #ifdef APP-HARMONY
+// 鸿蒙专属：市场整包优先，其次资源热更
+// #endif
+// #ifndef APP-HARMONY
+// 原有 Android/iOS 逻辑，读另一个配置键
+// #endif
+</code></pre>
+<p>⚠️ 条件编译宏是 <code>APP-HARMONY</code>，它和 <code>APP-PLUS</code>（Android/iOS）是<strong>并列关系，不是包含关系</strong>。写了 <code>#ifdef APP-PLUS</code> 鸿蒙不会命中。</p>
+<hr>
+<h4 id="三配置协议与六道校验闸">三、配置协议与六道校验闸</h4>
+<p>后台就存一个 JSON 字符串：</p>
+<pre><code class="language-json">{
+  "appid": "&lt;你的鸿蒙 AppId&gt;",
+  "enabled": true,
+  "resourceVersion": "2.0.20",
+  "wgtUrl": "https://你的CDN/app-2.0.20.wgt",
+  "updateLog": "本次更新说明（可选）"
+}
+</code></pre>
+<p>客户端逐条校验，<strong>任一不过就返回 null、静默当作"无更新"</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>校验</th>
+<th>踩坑提示</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>配置值非空、能 <code>JSON.parse</code> 成对象</td>
+<td>后台把值存成带 BOM 或多余转义会静默失败，务必打日志</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>enabled === true</code></td>
+<td>必须是布尔真。字符串 <code>"true"</code> 不算</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>resourceVersion</code> 是非空字符串</td>
+<td>建议带 <code>updateLog</code> 方便运营核对</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>wgtUrl</code> 匹配 <code>^https://</code></td>
+<td>http 直接跳过，鸿蒙不接受明文下载地址</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>appid</code> 与 <code>getAppBaseInfo().appId</code> 一致</td>
+<td>防跨应用误装。Android 的 WGT 绝不能被鸿蒙装上</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>compareVersion(resourceVersion, 当前) &gt; 0</code></td>
+<td><strong>严格大于</strong>。这条是"配置了却没弹更新"的头号原因</td>
+</tr>
+</tbody>
+</table>
+<p>版本比较不要用"主版本 + 第三段"这类偷懒规则，做完整分段数字比较：</p>
+<pre><code class="language-ts">function compareVersion(a: string, b: string): number {
+  const pa = String(a).split('.').map((n) =&gt; parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map((n) =&gt; parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i &lt; len; i++) {
+    const va = pa[i] || 0;
+    const vb = pb[i] || 0;
+    if (va !== vb) return va - vb;
+  }
+  return 0;
+}
+</code></pre>
+<p>还有一条纪律：<strong>资源版本线单调递增，永不复用</strong>。基线是 <code>2.0.19</code>，热更配置就得写 <code>≥2.0.20</code>；下发过的版本号不能回收再用。</p>
+<hr>
+<h4 id="四ui-只要处理好两个状态">四、UI 只要处理好两个状态</h4>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>标题</th>
+<th>主按钮</th>
+<th>次按钮</th>
+<th>进度</th>
+<th>点主按钮</th>
+<th>点次按钮</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>下载/安装中</td>
+<td>发现新版本</td>
+<td><code>正在下载更新...</code> → <code>正在安装更新...</code></td>
+<td>取消</td>
+<td><strong>真实</strong>进度</td>
+<td>无动作</td>
+<td>关弹窗</td>
+</tr>
+<tr>
+<td>安装完成</td>
+<td><code>更新已安装</code></td>
+<td><code>立即重启</code></td>
+<td><code>稍后</code></td>
+<td>保留完成态</td>
+<td><code>plus.runtime.quit()</code></td>
+<td><strong>只关弹窗</strong>（下次冷启动生效）</td>
+</tr>
+</tbody>
+</table>
+<p>两个细节：</p>
+<ul>
+<li>进度必须是真实的。有些端上原来是用定时器"模拟进度"爬格子，鸿蒙有 <code>onProgressUpdate</code>，就别再演了：</li>
+</ul>
+<pre><code class="language-ts">const task = uni.downloadFile({ url, success: ..., fail: ... });
+task.onProgressUpdate((res) =&gt; { progress.progress = res.progress; });
+</code></pre>
+<ul>
+<li><code>install</code> 用 <code>{ force: false }</code>。旧链路里 <code>force: true</code> + 三秒后自动 <code>restart</code> 的组合在鸿蒙会直接打断用户，且官方链路根本不支持自动重启。</li>
+</ul>
+<p>还有一个容易漏的<strong>并发去重</strong>：冷启动自动检查和用户立刻进"关于页"手动检查可能同时跑，用一个模块级标志位挡住，否则会出现两个下载任务叠加。</p>
+<hr>
+<h4 id="五五个深坑">五、五个深坑</h4>
+<h5 id="坑-1整包升级被旧-wgt-永久遮蔽最凶的一个">坑 1：整包升级被旧 WGT 永久遮蔽（最凶的一个）</h5>
+<p><strong>现象</strong>：热更装了 <code>2.0.20</code>，随后你上架了一个内置资源 <code>2.0.21</code>、<code>versionCode</code> 也从 1 升到 2 的新整包。用户覆盖安装后打开——<strong>跑的还是 2.0.20</strong>。登录态、本地存储都完好，看起来一切正常，只有代码是旧的。</p>
+<p><strong>根因</strong>：直接逆向我们用的运行时（<code>@dcloudio/uni-app-runtime</code>，<code>uni-mp-sdk/sdk.js</code>）：</p>
+<pre><code class="language-js">function isWgtRelease(appId) { return fs.accessSync(getWWWPath(appId)); }
+function isExistsApp(appId)  { return isWgtRelease(appId); }
+// getResourceStr: 只有 !isWgtRelease(appId) 时才把路径回退到 resfile/raw 内置资源
+</code></pre>
+<p>它<strong>只判断热更释放目录存不存在，完全没有版本比较</strong>。只要目录在，就永远优先加载那份资源，新整包内置的资源被架空。</p>
+<p><strong>对策（方案层收敛，别指望运行时自愈）</strong>：</p>
+<ol>
+<li>每次整包上架，<strong>同渠道同步下发一份与新包同源构建、版本高于线上任何 WGT 的热更包</strong>，让覆盖层内容和新包对齐；</li>
+<li>卸载重装 / 清除数据是<strong>唯一的自然恢复路径</strong>，不能指望用户主动做；</li>
+<li>把"WGT 版本线与整包版本线绑定递增"写进发布纪律。</li>
+</ol>
+<p>排查这类"我明明发了新版却没生效"，第一步就是查覆盖层目录：</p>
+<pre><code class="language-powershell">hdc shell "ls -d /data/app/el2/100/base/&lt;你的包名&gt;/files/apps/&lt;你的鸿蒙 AppId&gt;/www"
+# No such file or directory = 没有覆盖层，跑的是包内基线
+</code></pre>
+<h5 id="坑-2入口形态切换导致启动闪退">坑 2：入口形态切换导致启动闪退</h5>
+<p>离线打包的鸿蒙工程里，入口 Ability 有两种形态：带 HMR 的调试形态和正式形态，靠<strong>继承不同的父类</strong>区分（<code>UniEntryAbilityDev</code> vs <code>UniEntryAbility</code>）。</p>
+<p>从调试切正式时，如果照搬调试子类里的手动打开调用，启动会抛未捕获 JS Error：</p>
+<pre><code>UniMP: &lt;你的鸿蒙 AppId&gt; already opened     exit 254
+</code></pre>
+<p>因为正式父类的 <code>onWindowStageCreate</code> 内部<strong>已经做了 <code>init</code> + <code>openUniApp</code></strong>，你再手动 <code>openUniApp</code> 就是重复打开。两个父类构造签名一致，所以切换动作必须是：改继承目标 <strong>且</strong> 删掉子类的 <code>hmr.init()</code> / <code>openUniApp()</code> 两行 + 清理无用 import。</p>
+<p>顺带回答一个常被问到的问题：<strong>这个入口形态能不能用前端 <code>.env</code> 控制？不能。</strong> <code>.env</code> 的 <code>VITE_*</code> 由 Vite 烧进前端 bundle，入口 Ability 属于另一个仓库、由 hvigor 编译成 ArkTS，两者产物完全不相交；而 <code>extends</code> 是编译期静态决定的，运行期开关换不了父类。</p>
+<p>我的做法是：<strong>仓库里永久提交正式形态</strong>，需要 HMR 调试时用脚本临时打 Dev 补丁、调完还原，补丁不进版本控制。这样"误打包带 HMR 的正式包"在物理上不可能发生。</p>
+<h5 id="坑-3qa-域名被烧进正式包编译期折叠">坑 3：QA 域名被烧进正式包（编译期折叠）</h5>
+<p>产物核验时发现正式包里带着测试环境域名。两个原因：</p>
+<ol>
+<li><code>.env</code> 里的"生产 API"变量本身被写成了测试域名（而且 <code>.env</code> 是全平台共用的，于是所有端的正式包都连了测试环境）；</li>
+<li>更隐蔽的一个：<code>VITE_SYS_ENV</code> 这类分流键写在 <code>.env</code>（无 mode 后缀）里，对所有构建生效。代码里 <code>import.meta.env.VITE_SYS_ENV === 'DEV'</code> 会被<strong>编译期直接折叠成 true</strong>，于是那些按它分流的业务域名——即使你走的是发行构建——也全指到了测试环境。</li>
+</ol>
+<p>正确分层：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>进 git</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.env</code></td>
+<td>是</td>
+<td>默认值（开发友好，指向测试环境）</td>
+</tr>
+<tr>
+<td><code>.env.production</code></td>
+<td>是</td>
+<td><strong>只</strong>覆盖分流键，让发行构建走正式</td>
+</tr>
+<tr>
+<td><code>.env.production.local</code></td>
+<td>否（<code>.gitignore</code> 用 <code>*.local</code> 忽略）</td>
+<td>本机临时把发行构建也拉回测试环境，便于联调</td>
+</tr>
+</tbody>
+</table>
+<p>Vite 优先级：<code>.env.production.local</code> &gt; <code>.env.production</code> &gt; <code>.env.local</code> &gt; <code>.env</code>。</p>
+<p>并且要<strong>用产物指纹验证配置真的生效</strong>，而不是"我改了配置所以应该生效"。挑几个只属于某个环境的域名字符串，在产物里计数：</p>
+<table>
+<thead>
+<tr>
+<th>指纹</th>
+<th>正式包</th>
+<th>测试包</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;prod-api.example.com&gt;</code></td>
+<td>&gt;0</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>&lt;qa-api.example.com&gt;</code></td>
+<td>0</td>
+<td>&gt;0</td>
+</tr>
+</tbody>
+</table>
+<p>⚠️ 别凭构建日志里打印的 <code>XXX_BASE_URL&gt;&gt; ...</code> 判断产物环境，那一行在发行构建里也会打印。</p>
+<h5 id="坑-4取证手段本身会骗你">坑 4：取证手段本身会骗你</h5>
+<p>这个坑不修 bug，但会让你做出<strong>完全相反</strong>的错误决策。三次实测翻车：</p>
+<ol>
+<li><strong><code>Select-String</code> 在超长单行文件上假失效</strong>。对一个 4MB、逻辑上只有极少行的 <code>app-service.js</code>，<code>Select-String -SimpleMatch -AllMatches</code> 对<strong>确定存在</strong>的字符串返回 0 命中，看起来像"代码没打进包"。正确做法是整文件读进来手动数：</li>
+</ol>
+<pre><code class="language-powershell">$t = [IO.File]::ReadAllText($绝对路径)
+$c = 0; $i = 0
+while (($i = $t.IndexOf('关键字', $i)) -ge 0) { $c++; $i += '关键字'.Length }
+$c
+</code></pre>
+<p>另外 <code>-SimpleMatch</code> 和 <code>[regex]::Escape()</code> <strong>不能同时用</strong>，否则 <code>\.</code> 变成字面反斜杠，永远匹配不上。</p>
+<ol start="2">
+<li>
+<p><strong>编译缓存目录长期并存</strong>。ArkTS 编译产物在 <code>...\default@CompileArkTS\esmodule\debug\...</code> 与 <code>...\release\...</code> 两个目录里同时存在，另一个目录残留着几个月前的历史代码。必须选<strong>与本次 buildMode 一致</strong>的那个子目录，否则会读到旧版本代码并得出相反结论。</p>
+</li>
+<li>
+<p><strong>PowerShell 的 <code>cd</code> 不改变 .NET 进程的当前目录</strong>。<code>[IO.File]::ReadAllText('相对路径')</code> 会抛异常，而脚本若没中止，下一行输出的就是<strong>上一轮残留变量</strong>——看起来"验证通过了"，其实读的是旧数据。这类读取一律用绝对路径。</p>
+</li>
+</ol>
+<p>一条通用纪律：<strong>证明改动进了最终安装包，而不是进了某个中间目录。</strong> 中间产物目录可能残留数月前的陈旧文件，其时间戳和内容都不能作判断依据。要三重比对：</p>
+<pre><code>导出产物 app-service.js
+  └─ 原生工程 www/app-service.js               （同步是否到位）
+      └─ HAP 中间产物 resfile/.../app-service.js（是否真打进包）
+</code></pre>
+<p>三者做 SHA256 比对即可。</p>
+<h5 id="坑-5hmr-与生产热更是两条链路必须隔离">坑 5：HMR 与生产热更是两条链路，必须隔离</h5>
+<p>开发期"运行到设备"触发的差量编译（HMR）和生产 WGT 资源安装走的是完全不同的机制。<strong>HMR 成功不代表热更新可行</strong>，反之，HMR 通道开着的时候测热更，结论无效。</p>
+<p>另外：热更检查在开发态是不执行的——我的代码里第一行就 <code>if (isDevEnv()) return;</code>。所以验证热更必须用<strong>发行构建</strong>，这一点经常让测试同学误判为"热更没生效"。</p>
+<hr>
+<h4 id="六发布纪律清单可直接抄进-checklist">六、发布纪律清单（可直接抄进 checklist）</h4>
+<ol>
+<li>先发一个<strong>具备热更能力的整包基线</strong>，用户装上后远程通道才打开。</li>
+<li><strong>整包上架必须同发同源 WGT</strong>（原因见坑 1），且版本高于线上任何 WGT。</li>
+<li>资源版本单调递增，永不复用；壳版本与资源版本各自独立维护。</li>
+<li><code>wgtUrl</code> 必须 https，且只从你自己可控的 CDN 下发。</li>
+<li><code>enabled: false</code> 只能<strong>阻止新增安装，已安装设备不会自动回滚</strong>。真要回滚，就下发一份"内容回退但版本号更高"的包。</li>
+<li>热更内容仍受应用市场政策约束，有技术支持 ≠ 免审核。</li>
+<li>每次出包跑一遍产物指纹核验 + 三重 SHA256 一致性，不合格不装机。</li>
+</ol>
+<hr>
+<h4 id="七还没做的事诚实清单">七、还没做的事（诚实清单）</h4>
+<ul>
+<li><strong>WGT 完整性校验缺失</strong>：目前是 <code>downloadFile</code> 拿到临时文件直接 <code>install</code>，没有 SHA256 比对，只信 https 通道。补的话要在配置里加 <code>sha256</code> 字段 + 引入鸿蒙的文件摘要能力。</li>
+<li><strong>白屏自恢复没有实现</strong>：热更包如果本身有问题导致白屏，设备端没有回退入口（因为运行时不会用版本比较去淘汰旧覆盖层）。需要额外设计原生启动健康检查 + 恢复入口。</li>
+<li><strong>灰度 / 分渠道 / 审计要自己做</strong>：这套自建方案只有一个 <code>enabled</code> 一刀切开关。要精细化灰度，要么给配置加白名单字段并同步改客户端校验，要么迁到官方 uni-upgrade-center（前提是你在维护 uniCloud 服务空间）。</li>
+</ul>
+<hr>
+<h4 id="八如果你只记住三件事">八、如果你只记住三件事</h4>
+<ol>
+<li><strong>覆盖安装新整包后，先查有没有旧 WGT 覆盖层</strong>——它不会自己消失，运行时不做版本比较。</li>
+<li><strong>正式包的环境要性靠产物指纹证明</strong>，不靠"我改过配置了"。<code>.env</code> 无 mode 后缀会污染所有构建，<code>import.meta.env.X === '常量'</code> 会被编译期折叠。</li>
+<li><strong><code>install</code> 用 <code>force: false</code>，生效靠 <code>quit()</code> + 下次启动核验标记</strong>，并且一定要核验 <code>appWgtVersion</code> 真的变了才算升级完成，别在安装成功回调里就直接记"已升级"。</li>
+</ol>
+<hr>
+<blockquote>
+<p>本文是脱敏对外版，结论与取值以项目内部档案为准：《鸿蒙端 WGT 热更新：方案、实现与运维总结》与《鸿蒙端发版流程（整包基线 + WGT 热更新）操作手册》。</p>
+</blockquote>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    个人原创博客，转载请注明来源地址：https://www.cnblogs.com/xyyt
+</div>
+<div class="clear"></div>
+
+        <p class="postfoot">
+            posted on 
+<span id="post-date" data-last-update-days="0.001388888888888889" data-date-updated="2026-11-01 16:38">2026-11-01 16:36</span>&nbsp;
+<a href="https://www.cnblogs.com/xyyt">码间留白</a>&nbsp;
+阅读(<span id="post_view_count">50</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23512721);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxyyt%2Fp%2F23512721&amp;targetId=23512721&amp;targetType=0" target="_blank">举报</a>
+
+        </p>
+    
