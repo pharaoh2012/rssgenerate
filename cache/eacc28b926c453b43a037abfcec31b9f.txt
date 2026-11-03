@@ -1,0 +1,610 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zw-awa/p/23538260" title="发布于 2026-11-03 18:07">
+    
+
+    <span role="heading" aria-level="2">从 CPU 搬运到自动搬运：DMA、空闲中断和两块缓冲</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3791643/202611/3791643-20261103180548548-855872722.png" alt="从 CPU 搬运到自动搬运：DMA、空闲中断和两块缓冲" class="desc_img">
+        收发的每一个字节都要 CPU 亲自经手，主循环里还剩下多少时间干别的？把这件杂活交出去之后，接收靠什么切块，不定长这件事又归谁管？
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>前面几篇里，CPU 一直在做同一件杂活：搬字节。</p>
+<p>接收方向，每来一个字节就进一次中断，中断里把字节从 <code>DR</code> 搬到环形缓冲区；115200 下这个动作每秒发生 11520 次。发送方向，<code>Uart_SendByte()</code> 每送一个字节都要守在 <code>TXE</code> 上等一次寄存器空出来——一帧应答 10 个字节要 0.87ms，一段 256 字节的日志要 22ms，这 22ms 里主循环什么都干不了。</p>
+<p>这两件事都不需要判断、不需要计算，只是把数据从一个地方挪到另一个地方。让 CPU 去做这种活，等于请一个会量子场论重整化计算的人专门负责搬箱子。</p>
+<p>上一回那篇讲乒乓缓冲和“以空间换时间”的文章里有一句话：乒乓缓冲真正划算的场合，是“搬运本身贵到值得省”，而且搬运最好不由 CPU 干。这一回就把那个搬运工请来。</p>
+<h2 id="dma-是什么不是什么">DMA 是什么，不是什么</h2>
+<p>DMA 是芯片里一块专门搬数据的硬件。你告诉它三件事：从哪搬、搬到哪、搬多少个；然后按下开始，它一个字节一个字节地搬完，中间不需要 CPU 插手，搬完按你的要求报一声。</p>
+<p>它<strong>不做</strong>的事同样重要：</p>
+<ul>
+<li>它不解析数据。它不知道 <code>AA 55</code> 是帧头，也不知道第几个字节是校验；它眼里只有“多少个字节”。</li>
+<li>它不做判断。缓冲区满了、数据坏没坏，它一概不管。</li>
+<li>它的通道是画死的。F1 这一代芯片上，每个外设能用的通道是固定的：USART1 的发送绑在 DMA1 通道 4，接收绑在通道 5（参考手册里那张“各个通道的 DMA1 请求一览”的表）。这两个通道被串口占了，别的外设如果也要用同一个通道，就得排队或者换方案。</li>
+</ul>
+<p>搬运这件事可以这样分成三种做法：</p>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th>谁在搬</th>
+<th>中断次数（115200 下）</th>
+<th>适合什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>轮询</td>
+<td>CPU，每次调用时搬一个</td>
+<td>0</td>
+<td>一次只发几个字节，且不着急</td>
+</tr>
+<tr>
+<td>每字节中断</td>
+<td>CPU，在中断里搬一个</td>
+<td>每秒上万次</td>
+<td>数据量小、想第一时间知道</td>
+</tr>
+<tr>
+<td>DMA</td>
+<td>DMA 硬件，一次搬一整块</td>
+<td>每块一次</td>
+<td>连续数据流、大块发送</td>
+</tr>
+</tbody>
+</table>
+<h2 id="接收方向dma-加空闲中断">接收方向：DMA 加空闲中断</h2>
+<p>换成 DMA 接收以后，<code>DR</code> 里的字节由 DMA 硬件直接写进内存，CPU 不再需要为每个字节中断一次。但这样一来，程序怎么知道“数据到了”？</p>
+<p>DMA 只会告诉你“我搬够了你说的那么多字节”。串口的数据是不定长的：发一条 10 字节的帧，DMA 配的是 128 字节，它搬完 10 个就停在那里等，永远等不到第 128 个。程序如果只看“搬够 128 个没有”，就会一直以为什么都没来。</p>
+<p><strong>线上空闲就是答案。</strong> USART 有一件事专门报告它：接收线上连续一个完整帧的时间没有新的起始位，它就置起 <code>IDLE</code> 标志。对手敲键盘、对程序自动发的每一帧来说，这句话几乎总是成立的——数据发完了，线自然就静下来了。</p>
+<p>所以接收方向的分工是：</p>
+<pre><code class="language-text">线上来字节 -&gt; DMA 硬件直接写进内存（CPU 完全不参与）
+线上一空闲 -&gt; USART 置起 IDLE -&gt; 进一次中断
+中断里    -&gt; 记下“这一块到哪结束”，让 DMA 换到另一块继续接
+</code></pre>
+<p>一次中断处理一整块，这就是“从 CPU 搬运到自动搬运”最直观的地方：中断次数从每秒上万次掉到每次发完一帧一次。</p>
+<h3 id="两块缓冲怎么摆">两块缓冲怎么摆</h3>
+<p>之前那套接收写法（中断里一个字节一个字节往 64 格仓库里搬，主循环再一个一个取走的那套）在这一版退休了：字节改由 DMA 直接写进内存。<code>rx_buffer</code>、<code>rx_head</code>、<code>rx_tail</code>、<code>Uart_RingPush()</code>、<code>Uart_ReadByte()</code> 和面板上那两个数字（待处理字节数、溢出次数）统统换成下面的东西。</p>
+<p>缓冲准备两块，一块正在被 DMA 写，另一块等着被主循环取走：</p>
+<pre><code class="language-c">#define UART_RX_BLOCK_SIZE   128U
+
+static volatile uint8_t  rx_block[2][UART_RX_BLOCK_SIZE];
+static volatile uint8_t  rx_write_index = 0U;    /* DMA 正在写的那一块 */
+static volatile uint8_t  rx_ready = 0U;          /* 有一块已经交出来了 */
+static volatile uint8_t  rx_ready_index = 0U;
+static volatile uint16_t rx_block_length = 0U;
+
+static volatile uint32_t rx_int_count = 0U;      /* 接收方向一共进了几次中断 */
+static volatile uint32_t rx_block_count = 0U;
+static volatile uint32_t rx_block_full_count = 0U;
+static volatile uint32_t rx_block_drop_count = 0U;
+</code></pre>
+<p><code>volatile</code> 在这里不只是防编译器优化：这些变量由中断改、由主循环读，硬件写内存那部分更是连编译器都看不见。</p>
+<p>启动一块的接收，就是给 DMA 填一张单子：</p>
+<pre><code class="language-c">static void Uart_DmaRxStart(uint8_t index)
+{
+    DMA_InitTypeDef dma;
+
+    DMA_Cmd(DMA1_Channel5, DISABLE);
+    DMA_ClearFlag(DMA1_FLAG_GL5);
+
+    dma.DMA_PeripheralBaseAddr = (uint32_t)&amp;USART1-&gt;DR;
+    dma.DMA_MemoryBaseAddr     = (uint32_t)rx_block[index];
+    dma.DMA_DIR                = DMA_DIR_PeripheralSRC;
+    dma.DMA_BufferSize         = UART_RX_BLOCK_SIZE;
+    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;
+    dma.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
+    dma.DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte;
+    dma.DMA_Mode               = DMA_Mode_Normal;
+    dma.DMA_Priority           = DMA_Priority_High;
+    dma.DMA_M2M                = DMA_M2M_Disable;
+    DMA_Init(DMA1_Channel5, &amp;dma);
+
+    DMA_ITConfig(DMA1_Channel5, DMA_IT_TC, ENABLE);
+
+    rx_write_index = index;
+
+    DMA_Cmd(DMA1_Channel5, ENABLE);
+}
+</code></pre>
+<p>这张单子每一句都要读懂，因为它是后面所有 DMA 配置的共同形状：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>值</th>
+<th>在说什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DMA_PeripheralBaseAddr</code></td>
+<td><code>&amp;USART1-&gt;DR</code></td>
+<td>搬的一端是串口的数据寄存器</td>
+</tr>
+<tr>
+<td><code>DMA_MemoryBaseAddr</code></td>
+<td><code>rx_block[index]</code></td>
+<td>另一端是内存里这块数组</td>
+</tr>
+<tr>
+<td><code>DMA_DIR</code></td>
+<td><code>PeripheralSRC</code></td>
+<td>从外设往内存搬（发送方向要反过来）</td>
+</tr>
+<tr>
+<td><code>DMA_BufferSize</code></td>
+<td><code>128</code></td>
+<td>这一轮搬多少个</td>
+</tr>
+<tr>
+<td><code>DMA_PeripheralInc</code></td>
+<td><code>Disable</code></td>
+<td>外设那头永远是同一个寄存器，地址不动</td>
+</tr>
+<tr>
+<td><code>DMA_MemoryInc</code></td>
+<td><code>Enable</code></td>
+<td>内存那头每搬一个就往前进一格</td>
+</tr>
+<tr>
+<td><code>DMA_Mode</code></td>
+<td><code>Normal</code></td>
+<td>搬够 128 个就停，不自己绕圈</td>
+</tr>
+</tbody>
+</table>
+<p><code>DMA_ClearFlag(DMA1_FLAG_GL5)</code> 是重新武装前先擦掉上一次留下的标志。这件事在“每搬一块就重启一次”的用法里必须做，否则刚打开通道就会看到上一次的完成标志还挂着。</p>
+<h3 id="一块结束的两个理由">一块结束的两个理由</h3>
+<p>一块什么时候算结束？有两个理由，都要处理。</p>
+<p><strong>理由一：线上空闲。</strong> 这就是 <code>IDLE</code> 中断，也是常态。收到它的时候，DMA 手上这块里已经躺着一整帧（或者好几帧）了。</p>
+<p><strong>理由二：搬满了 128 个。</strong> 如果发送方一口气发 200 个字节不停顿，DMA 在写到第 128 个时就满了，<code>IDLE</code> 还没来。这时候必须靠 DMA 自己的“搬完了”中断（传输完成，<code>TC</code>），把这块先交出去，再换下一块，否则后面的字节全丢。</p>
+<p>两个理由做的是同一件事，所以写成一个函数：</p>
+<pre><code class="language-c">static void Uart_DmaRxSwitchBlock(void)
+{
+    uint16_t received;
+    uint8_t filled = rx_write_index;
+
+    DMA_Cmd(DMA1_Channel5, DISABLE);
+
+    received = (uint16_t)(UART_RX_BLOCK_SIZE - DMA_GetCurrDataCounter(DMA1_Channel5));
+
+    if (received &gt; 0U)
+    {
+        if (rx_ready != 0U)
+        {
+            rx_block_drop_count++;      /* 上一块还没被取走，只能顶掉它 */
+        }
+
+        rx_ready_index = filled;
+        rx_block_length = received;
+        rx_ready = 1U;
+        rx_block_count++;
+    }
+
+    Uart_DmaRxStart((uint8_t)(1U - filled));
+}
+</code></pre>
+<p><code>DMA_GetCurrDataCounter()</code> 返回“还剩多少个没搬”。128 减去它，就是这一块实际收到了多少个——<strong>DMA 不会主动告诉你收了多少，这个减法就是它唯一的“已收长度”</strong>。</p>
+<p><code>1U - filled</code> 就是讲乒乓缓冲那一回里两块交替的换块动作：0 变 1，1 变 0。只改一个下标，一个字节的数据都不用搬。</p>
+<p>上一块还没被取走时，这里<strong>丢掉的是旧块、保留最新的一块</strong>。和讲丢字节那一回里“丢新到的字节、保住已经收了一半的命令”正好相反，理由是角色不同：那是字节级的流，半个命令比一个陌生字节值钱；这里是块级的交接，旧块压着不放只会让延迟越积越多。流里出现缺口这件事解析器能自己收拾——上一回那套帧头重同步和校验就是干这个的。</p>
+<h3 id="两个中断入口">两个中断入口</h3>
+<p>空闲中断走的是 USART1 的老入口：</p>
+<pre><code class="language-c">void USART1_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART1, USART_IT_IDLE) != RESET)
+    {
+        USART_ReceiveData(USART1);      /* 读 SR 再读 DR，IDLE 才清得掉 */
+        rx_int_count++;
+        Uart_DmaRxSwitchBlock();
+    }
+}
+</code></pre>
+<p>清 <code>IDLE</code> 的顺序是手册规定的：先读状态寄存器，再读数据寄存器。上面两句就是这个顺序——<code>USART_GetITStatus()</code> 读的是 <code>SR</code>，<code>USART_ReceiveData()</code> 读的是 <code>DR</code>。这一步不会把 DMA 已经搬走的字节再吃掉一次：空闲中断意味着线上已经静了一个帧的时间，那个字节早就被 DMA 搬进内存了。</p>
+<p>缓冲搬满走的是 DMA 通道 5 的入口：</p>
+<pre><code class="language-c">void DMA1_Channel5_IRQHandler(void)
+{
+    if (DMA_GetITStatus(DMA1_IT_TC5) != RESET)
+    {
+        DMA_ClearITPendingBit(DMA1_IT_TC5);
+        rx_int_count++;
+        rx_block_full_count++;
+        Uart_DmaRxSwitchBlock();
+    }
+}
+</code></pre>
+<h3 id="初始化里最容易漏的一句">初始化里最容易漏的一句</h3>
+<p>完整的 <code>Uart_Init()</code> 里，和讲丢字节那一回那份初始化相比，有增有减：</p>
+<pre><code class="language-c">void Uart_Init(void)
+{
+    GPIO_InitTypeDef gpio;
+    USART_InitTypeDef uart;
+    NVIC_InitTypeDef nvic;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA |
+                           RCC_APB2Periph_USART1, ENABLE);
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+
+    gpio.GPIO_Pin = GPIO_Pin_9;
+    gpio.GPIO_Mode = GPIO_Mode_AF_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &amp;gpio);
+
+    gpio.GPIO_Pin = GPIO_Pin_10;
+    gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOA, &amp;gpio);
+
+    uart.USART_BaudRate = 115200;
+    uart.USART_WordLength = USART_WordLength_8b;
+    uart.USART_StopBits = USART_StopBits_1;
+    uart.USART_Parity = USART_Parity_No;
+    uart.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    uart.USART_Mode = USART_Mode_Tx | USART_Mode_Rx;
+    USART_Init(USART1, &amp;uart);
+
+    Uart_DmaRxStart(0U);
+
+    USART_DMACmd(USART1, USART_DMAReq_Rx | USART_DMAReq_Tx, ENABLE);
+
+    USART_ITConfig(USART1, USART_IT_IDLE, ENABLE);
+    USART_ITConfig(USART1, USART_IT_RXNE, DISABLE);
+
+    nvic.NVIC_IRQChannel = USART1_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = 1;
+    nvic.NVIC_IRQChannelSubPriority = 2;
+    nvic.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&amp;nvic);
+
+    nvic.NVIC_IRQChannel = DMA1_Channel4_IRQn;
+    nvic.NVIC_IRQChannelSubPriority = 1;
+    NVIC_Init(&amp;nvic);
+
+    nvic.NVIC_IRQChannel = DMA1_Channel5_IRQn;
+    nvic.NVIC_IRQChannelSubPriority = 0;
+    NVIC_Init(&amp;nvic);
+
+    USART_Cmd(USART1, ENABLE);
+}
+</code></pre>
+<p>（后两句只改了通道号和子优先级，抢占优先级和使能位沿用上面填过的那张单子——同一个结构体接着用，没动过的字段保持原值。）</p>
+<p>新增的三件事：打开 DMA1 的时钟（它在 AHB 总线上，所以用 <code>RCC_AHBPeriphClockCmd()</code>）、<code>USART_DMACmd()</code> 允许串口把收发请求交给 DMA、以及三个 NVIC 通道（串口用来报空闲，通道 4 用来报发送完成，通道 5 用来报接收搬满）。</p>
+<p><strong>真正容易漏的是那一句 <code>DISABLE</code>。</strong> 讲丢字节那一回里打开的是 <code>USART_IT_RXNE</code>——每收到一个字节中断一次。现在字节由 DMA 搬了，如果那一句还开着，中断会照旧每字节来一次，CPU 的负担一点没少，DMA 白配。换成 DMA 的第一件事，就是把那条按字节的中断关掉。</p>
+<p><code>USART_DMACmd()</code> 也容易被忽略：DMA 通道配得再对，串口这边不开“允许把请求交给 DMA”，请求就根本不会发出去。</p>
+<h3 id="主循环怎么取">主循环怎么取</h3>
+<p>主循环只多了一段：看到 <code>rx_ready</code>，把整块取过来，一个字节一个字节喂给上一回那个逐字节的解析器：</p>
+<pre><code class="language-c">static uint8_t  ready_index;
+static uint16_t ready_length;
+static uint16_t i;
+
+while (1)
+{
+    Mode_Loop();
+
+    if (rx_ready != 0U)
+    {
+        ready_index = rx_ready_index;
+        ready_length = rx_block_length;
+        rx_ready = 0U;
+
+        for (i = 0U; i &lt; ready_length; i++)
+        {
+            Protocol_Service(rx_block[ready_index][i]);
+        }
+    }
+}
+</code></pre>
+<p><code>Key_Tick()</code> 还在 1ms 中断里，<code>Mode_Loop()</code> 还在主循环里，一行取字节的 <code>Uart_ReadByte()</code> 不再出现了。</p>
+<p><strong>解析器一个字都没改。</strong> <code>Protocol_Service()</code> 收的还是“一个字节”，它不知道这个字节是中断搬来的还是 DMA 搬来的。这里真正要分清的是：DMA 换掉的是搬运方式，分工仍然不变。</p>
+<p><code>rx_block[ready_index][i]</code> 是一个 <code>volatile</code> 数组，这里读它没有问题：主循环读的这块，DMA 正在写的是另一块。</p>
+<h3 id="两块够不够">两块够不够</h3>
+<p>两块缓冲买到的余量是“一块”。处理一块的时间必须短于填满另一块的时间：128 个字节在 115200 下要 11ms 才填满，而把 128 个字节喂进解析器是微秒级的事，余量很足。</p>
+<p>真要在解析里做慢活（比如收到命令就去刷一整屏 OLED），余量就不够了。那时候要么加第三块，要么在取走的那一刻先把这块复制出去。<strong>缓冲买的是时间，不是免死金牌</strong>——上一回那句“额度用完，两边立刻重新耦合”，说的就是这件事。</p>
+<h2 id="发送方向拼好一整帧交给-dma">发送方向：拼好一整帧，交给 DMA</h2>
+<p>发送这边要补的是前面留下的两处：把 <code>printf</code> 接到串口那一回，和讲丢字节那一回——两处都留着 <code>Uart_SendByte()</code> 里那个等 <code>TXE</code> 的循环。</p>
+<p>思路和接收反过来——不再一个字节一个字节地送，而是<strong>先在内存里把一整帧拼好，然后把“这块的地址和长度”交给 DMA</strong>。这也正是讲乒乓缓冲那一回说的“真正划算”的场合：数据单位是整块，搬运由硬件完成。</p>
+<p>两块发送缓冲加一本书：</p>
+<pre><code class="language-c">#define TX_BLOCK_MAX   256U
+
+static uint8_t  tx_buffer[2][TX_BLOCK_MAX];
+static volatile uint16_t tx_length[2] = {0U, 0U};
+static volatile uint8_t  tx_ready[2] = {0U, 0U};
+static volatile uint8_t  tx_active = 0U;          /* DMA 正在搬的那一块 */
+static volatile uint8_t  tx_in_use = 0U;          /* 有没有正在发的 */
+static volatile uint32_t tx_int_count = 0U;
+static uint32_t tx_drop_count = 0U;
+</code></pre>
+<p>启动发送，单子和接收那张几乎一样，只有两处反过来：方向是“从内存到外设”，外设地址那头的 <code>DR</code> 仍然不动：</p>
+<pre><code class="language-c">static void Uart_DmaSendStart(uint8_t index)
+{
+    DMA_InitTypeDef dma;
+
+    DMA_Cmd(DMA1_Channel4, DISABLE);
+    DMA_ClearFlag(DMA1_FLAG_GL4);
+
+    dma.DMA_PeripheralBaseAddr = (uint32_t)&amp;USART1-&gt;DR;
+    dma.DMA_MemoryBaseAddr     = (uint32_t)tx_buffer[index];
+    dma.DMA_DIR                = DMA_DIR_PeripheralDST;
+    dma.DMA_BufferSize         = tx_length[index];
+    dma.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+    dma.DMA_MemoryInc          = DMA_MemoryInc_Enable;
+    dma.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
+    dma.DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte;
+    dma.DMA_Mode               = DMA_Mode_Normal;
+    dma.DMA_Priority           = DMA_Priority_Medium;
+    dma.DMA_M2M                = DMA_M2M_Disable;
+    DMA_Init(DMA1_Channel4, &amp;dma);
+
+    DMA_ITConfig(DMA1_Channel4, DMA_IT_TC, ENABLE);
+
+    tx_ready[index] = 0U;
+    tx_active = index;
+    tx_in_use = 1U;
+
+    DMA_Cmd(DMA1_Channel4, ENABLE);
+}
+</code></pre>
+<p>要发一块数据时的规则很短：</p>
+<ul>
+<li>没有在发的，直接装进当前这一块，开搬；</li>
+<li>正在发的，装进另一块，排着等；</li>
+<li>两块都占着（一块在发、一块在等），<strong>丢掉这一条并计数</strong>。</li>
+</ul>
+<pre><code class="language-c">static uint8_t Uart_DmaSendFrame(const uint8_t *data, uint16_t length)
+{
+    uint8_t index;
+    uint16_t i;
+
+    if (length &gt; TX_BLOCK_MAX)
+    {
+        return 1U;
+    }
+
+    if (tx_in_use == 0U)
+    {
+        index = tx_active;
+    }
+    else
+    {
+        index = (uint8_t)(1U - tx_active);
+
+        if (tx_ready[index] != 0U)
+        {
+            tx_drop_count++;
+            return 2U;
+        }
+    }
+
+    for (i = 0U; i &lt; length; i++)
+    {
+        tx_buffer[index][i] = data[i];
+    }
+    tx_length[index] = length;
+
+    /* 判断和登记要一起做完：中间被传输完成中断插进来，这一块就没人启动了 */
+    DMA_ITConfig(DMA1_Channel4, DMA_IT_TC, DISABLE);
+
+    if (tx_in_use == 0U)
+    {
+        Uart_DmaSendStart(index);
+    }
+    else
+    {
+        tx_ready[index] = 1U;
+    }
+
+    DMA_ITConfig(DMA1_Channel4, DMA_IT_TC, ENABLE);
+
+    return 0U;
+}
+</code></pre>
+<p>这里必须交代一件事：<strong>交给 DMA 的内存，在整段发送期间必须一直有效。</strong> 上面这份 copy 就是为它准备的——如果直接把函数里一个局部数组的地址交给 DMA，函数一返回，那块栈内存就可能被别的东西覆盖，DMA 搬出去的会是一串垃圾。所以发送的数据一律先复制进这两块常驻缓冲。还有一处要护住：结尾那次 <code>tx_in_use</code> 判断和 <code>tx_ready[index] = 1U</code> 的登记不能分开做——发送完成中断要是正好落在这两步中间，它看到 <code>tx_ready</code> 还是 0、以为没人排队就返回，主循环随后才把 <code>tx_ready</code> 置 1，这一块从此没有谁来启动，等于被静默丢掉。所以这一小段用 <code>DMA_ITConfig(DMA1_Channel4, DMA_IT_TC, DISABLE)</code> 与 <code>ENABLE</code> 前后夹住，再配合上面那几个 <code>volatile</code>，“检查—登记”才是一次完整的交接。</p>
+<p>发送完成的中断里做交接：</p>
+<pre><code class="language-c">void DMA1_Channel4_IRQHandler(void)
+{
+    if (DMA_GetITStatus(DMA1_IT_TC4) != RESET)
+    {
+        DMA_ClearITPendingBit(DMA1_IT_TC4);
+        tx_int_count++;
+        tx_in_use = 0U;
+
+        if (tx_ready[1U - tx_active] != 0U)
+        {
+            Uart_DmaSendStart((uint8_t)(1U - tx_active));
+        }
+    }
+}
+</code></pre>
+<p>一块发完，如果另一块上排着活就接着开搬，没有排队的就是“发送空闲”。这里不需要额外的标志，<code>tx_in_use</code> 本身就是那个标志。</p>
+<h3 id="应答改走-dma">应答改走 DMA</h3>
+<p>上一回那个应答函数原来是一个字节一个字节往外送，现在改成“先拼进一个数组，再把数组交给 DMA”：</p>
+<pre><code class="language-c">static void Protocol_SendReply(uint8_t command, uint8_t result)
+{
+    uint8_t frame[16];
+    uint8_t sum = 0U;
+    uint8_t index = 0U;
+
+    frame[index++] = PROTOCOL_HEADER_1;
+    frame[index++] = PROTOCOL_HEADER_2;
+
+    sum = (uint8_t)(sum + PROTOCOL_DEVICE_ID);
+    frame[index++] = PROTOCOL_DEVICE_ID;
+
+    sum = (uint8_t)(sum + PROTOCOL_TYPE_REPLY);
+    frame[index++] = PROTOCOL_TYPE_REPLY;
+
+    sum = (uint8_t)(sum + command);
+    frame[index++] = command;
+
+    sum = (uint8_t)(sum + 1U);
+    frame[index++] = 1U;
+
+    sum = (uint8_t)(sum + PROTOCOL_VERSION);
+    frame[index++] = PROTOCOL_VERSION;
+
+    sum = (uint8_t)(sum + result);
+    frame[index++] = result;
+
+    frame[index++] = sum;
+    frame[index++] = PROTOCOL_TAIL;
+
+    Uart_DmaSendFrame(frame, index);
+}
+</code></pre>
+<p>帧的内容一个字节都没变，变的只是“谁把它送出去”。拼帧这件事还是 CPU 干，因为它需要算校验；搬运交给 DMA，因为它不需要动脑。</p>
+<p><code>Uart_SendByte()</code> 那个等 <code>TXE</code> 的循环并没有被删掉，它只是退到了配角的位置：偶尔需要立即送出几个字节、又确定不会久等的时候，用它更省事。主链路上大块的发送，从此不再占用主循环。</p>
+<h2 id="不定长这件事长度归谁管">不定长这件事，长度归谁管</h2>
+<p>收发两头现在都能处理不定长的数据，但这件事要单独钉一遍，因为“长度”在三个地方各有一套说法。</p>
+<p><strong>接收的长度是算出来的。</strong> <code>DMA_BufferSize</code> 里填的 128 是“这次最多接多少”，不是“这次要接多少”。真正收到几个字节靠减法得到：</p>
+<pre><code class="language-c">received = (uint16_t)(UART_RX_BLOCK_SIZE - DMA_GetCurrDataCounter(DMA1_Channel5));
+</code></pre>
+<p>DMA 从来不知道“对方发了多少个字节”，它只知道“我离终点还有多远”。所以 4 个字节的帧、37 个字节的帧、200 个字节的突发，在它眼里没有区别：前两个是“没搬完就闲下来了”，后一个是“搬满了”。</p>
+<p><strong>发送的长度是一笔一设的。</strong> <code>Uart_DmaSendFrame()</code> 的第二个参数就是长度，<code>Uart_DmaSendStart()</code> 每次都把它写进 <code>dma.DMA_BufferSize</code>。发 10 个字节的应答和发 256 个字节的日志走同一条路，用不着写两套代码。</p>
+<p>三根硬边线要记住：</p>
+<table>
+<thead>
+<tr>
+<th>边线</th>
+<th>数值</th>
+<th>越线之后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单笔发送上限</td>
+<td><code>TX_BLOCK_MAX</code>，256 字节</td>
+<td><code>Uart_DmaSendFrame()</code> 直接返回 1，这一笔不发</td>
+</tr>
+<tr>
+<td>发送排队深度</td>
+<td>2 块</td>
+<td>前一块在发、另一块排着，第三条被丢掉并计 <code>tx_drop_count</code></td>
+</tr>
+<tr>
+<td>单块接收容量</td>
+<td>128 字节</td>
+<td>突发被切成多块交付，<code>FULL</code> 往上涨，这不是错误</td>
+</tr>
+</tbody>
+</table>
+<p>第一条还有一层意思：<strong>DMA 只会搬一段连续的内存。</strong> 想把几段内容拼着发出去，得先自己把它们复制进一块连续缓冲——这也是 <code>Uart_DmaSendFrame()</code> 里那份 copy 的另一半作用。数据更大、来源更散的时候，切分和排队都归业务层管，DMA 只负责“把这一块搬完”。</p>
+<p>最后一件最容易误会的事：<strong>帧有多长，不归 DMA 管。</strong> 块的边界由“搬满 128 了没有”和“线上闲下来了没有”决定，帧的边界由 <code>AA 55</code> 和长度字段决定，两把尺子量的是两回事。所以解析永远是上一回那个逐字节的状态机，块只是它的输入单位。</p>
+<p>还有一种情况要提前想到：<strong>发送方如果连续不断地发，线上从不空闲，<code>IDLE</code> 就永远不来。</strong> 这时候切块全靠“搬满 128”，块的边界和数据的边界彻底没有关系。对付这种永远不停的数据流有另一种常见做法：让 DMA 用循环模式自己绕圈写，程序按读到哪儿去取，不必每次重新武装通道。它省掉了重启的开销，代价是生产方随时可能追上消费方，位置一旦算错就是静默丢数据。这里选的是普通模式加每次重启——慢一点，但每一块的长度和起点都是明确的。</p>
+<h2 id="四个现场实验">四个现场实验</h2>
+<h3 id="1-数中断次数">1. 数中断次数</h3>
+<p>上一回那块面板上的两个数字先收起来，换成搬运的几项新数字：</p>
+<pre><code class="language-c">static uint32_t uart_panel_last_ms = 0U;
+
+static void Uart_ShowPanel(void)
+{
+    if ((tick_ms - uart_panel_last_ms) &lt; 200U)
+    {
+        return;
+    }
+    uart_panel_last_ms = tick_ms;
+
+    OLED_Clear();
+
+    OLED_ShowString(0, 0, "INT", OLED_6X8);
+    OLED_ShowNum(36, 0, rx_int_count + tx_int_count, 6, OLED_6X8);
+
+    OLED_ShowString(0, 8, "BLOCK", OLED_6X8);
+    OLED_ShowNum(48, 8, rx_block_count, 5, OLED_6X8);
+
+    OLED_ShowString(0, 16, "FULL", OLED_6X8);
+    OLED_ShowNum(48, 16, rx_block_full_count, 5, OLED_6X8);
+
+    OLED_ShowString(0, 24, "RXDROP", OLED_6X8);
+    OLED_ShowNum(54, 24, rx_block_drop_count, 5, OLED_6X8);
+
+    OLED_ShowString(0, 32, "TXDROP", OLED_6X8);
+    OLED_ShowNum(54, 32, tx_drop_count, 5, OLED_6X8);
+
+    OLED_Update();
+}
+</code></pre>
+<p>手动发几条命令，<code>INT</code> 是每次发完一帧加一。然后把这个数字和讲丢字节那一回那套写法比一比：那时候每来一个字节就中断一次，115200 下每秒 11520 次；现在一整帧只打扰 CPU 一两次。</p>
+<p>想亲眼看见那条按字节的中断有多密，把它打开试一次：在 <code>Uart_Init()</code> 里加一句</p>
+<pre><code class="language-c">USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+</code></pre>
+<p>再在 <code>USART1_IRQHandler()</code> 里补一段：</p>
+<pre><code class="language-c">    if (USART_GetITStatus(USART1, USART_IT_RXNE) != RESET)
+    {
+        rx_int_count++;
+        USART_ReceiveData(USART1);      /* 按老规矩把中断里那个字节读走 */
+    }
+</code></pre>
+<p><code>INT</code> 会立刻跳到每秒上万。但更该看的是另一件事：<strong>数据开始丢了。</strong> 读 <code>DR</code> 是清 <code>RXNE</code> 的动作，而 DMA 正是靠 <code>RXNE</code> 产生搬运请求；中断抢先读了这一下，DMA 那个字节就搬不到了。两个搬运工抢同一口井，谁都打不满。看完记得把这两段删掉。</p>
+<p>这也是那一句 <code>DISABLE</code> 为什么重要的最好证据：DMA 在搬，中断也在收，两个都开着只会互相拆台。</p>
+<h3 id="2-量一次发送要占用主循环多久">2. 量一次发送要占用主循环多久</h3>
+<p>准备一段 256 字节的假日志：</p>
+<pre><code class="language-c">static uint8_t log_buffer[256];
+
+static void Demo_FillLog(void)
+{
+    uint16_t i;
+
+    for (i = 0U; i &lt; 256U; i++)
+    {
+        log_buffer[i] = (uint8_t)('A' + (i % 26U));
+    }
+}
+</code></pre>
+<p>发送前后各取一次那条 1ms 时间轴（每毫秒给 <code>tick_ms</code> 加一的那条），差值存进一个 <code>uint32_t</code> 变量 <code>send_used_ms</code>，它就是这次发送占住主循环的时间：</p>
+<pre><code class="language-c">uint32_t start = tick_ms;
+
+Uart_DmaSendFrame(log_buffer, 256U);
+
+send_used_ms = tick_ms - start;
+</code></pre>
+<p><code>send_used_ms</code> 会是 0 或者 1——DMA 一开，函数立刻就返回了。</p>
+<p>把这句临时换成逐个字节发：</p>
+<pre><code class="language-c">uint16_t k;
+
+for (k = 0U; k &lt; 256U; k++)
+{
+    Uart_SendByte(log_buffer[k]);
+}
+</code></pre>
+<p>同一个变量会变成 22 左右。256 个字节，每个字节 86.8µs 等 <code>TXE</code>，加起来就是 22ms——这 22ms 里按键没人扫、屏幕不刷新、控制周期全部推迟。这就是“谁在搬”带来的差别。</p>
+<h3 id="3-主循环被挡住-300ms">3. 主循环被挡住 300ms</h3>
+<p>把讲丢字节那一回留下的 <code>Demo_SlowMainLoop(300U)</code> 放回主循环末尾。接收侧是 DMA 在干活，这 300ms 里到达的字节照样进内存，主循环转回来就整块取走。</p>
+<p>这时候要留意 <code>RXDROP</code>：如果一次灌进来的数据超过 128 字节（一块装不下），就会看到 <code>FULL</code> 涨——那是 DMA 搬满一块、换了另一块继续接的正常现象；如果主循环迟迟不回来看，第二块也满了，<code>RXDROP</code> 才会开始涨。</p>
+<h3 id="4-一次发-200-字节看两块怎么切">4. 一次发 200 字节，看两块怎么切</h3>
+<p>在发送框里一次粘 200 个字符发出去。200 个字节超过了 128 一块的容量，所以会切两次：先搬满 128 触发通道 5 的中断（<code>FULL</code> 加一），剩下 72 个字节等到线上一空闲，由 <code>IDLE</code> 收尾（<code>BLOCK</code> 再加一）。</p>
+<p>这个实验还说明另一件事：<strong>块的边界不是帧的边界。</strong> 一块里可能有一帧半，也可能有三帧，还可能只是半帧——DMA 按“多少个字节”切，协议按“帧头和长度”切，两把尺子量的不是同一个东西。所以解析还得是上一回那个逐字节的状态机，不能拿“来了一块”就当成“来了一帧”。</p>
+<h2 id="dma-的代价">DMA 的代价</h2>
+<p>请来的搬运工不会白干活，它要的东西很具体：</p>
+<ul>
+<li><strong>内存。</strong> 接收两块 128 字节，发送两块 256 字节，一共 768 字节。F103C8T6 的 20 KB SRAM 拿得出这点余量，但余量要自己核一遍：这点内存换掉的是一整条主链路上的等待，划算。</li>
+<li><strong>通道。</strong> 通道 4 和 5 从此归串口。后面想给别的外设配 DMA，得先查那张通道表，别撞车。</li>
+<li><strong>调试难度。</strong> 数据是硬件写进内存的，断点停在主循环里看不到“谁写的”。出问题时先怀疑两处：搬运的长度对不对（<code>DMA_BufferSize</code>）、内存地址有没有在发送期间失效。</li>
+<li><strong>它不解决解析。</strong> 中断次数降下来了，但把字节喂进状态机、算校验、决定命令，还是 CPU 的活。DMA 省掉的是搬运的时间，不是思考的时间。</li>
+<li><strong>缓冲区还是有限的。</strong> 一块装不下、主循环不回来取，数据照样丢；区别是现在有 <code>FULL</code>、<code>RXDROP</code>、<code>TXDROP</code> 这些数字告诉你丢在哪一环。</li>
+</ul>
+<h2 id="最后橘猫说">最后橘猫说</h2>
+<p>前面几篇里 CPU 一直在干搬箱子的活：接收方向每来一个字节中断一次，发送方向每个字节守着 <code>TXE</code> 等一次。DMA 把这件事接了过去——你只需要告诉它从哪搬、搬到哪、搬多少，它就自己搬完再报一声；它不解析、不判断、也不认识帧头，通道和外设的对应关系还是芯片画死的（F1 上 USART1 发送在通道 4、接收在通道 5）。接收方向靠“线上空闲”这唯一一个信号来切块：<code>IDLE</code> 中断处理常态，搬满 128 字节的 <code>TC</code> 中断兜住长突发，两块缓冲一写一取，换块只改一个下标。发送方向反过来——先在内存里把一整帧拼好，再把地址和长度交给 DMA，两块轮流用，前一块还在发就装后一块，两块都占着就丢掉并计数，而交给 DMA 的内存必须在整段发送期间一直有效，所以要 copy 进常驻缓冲。至于“不定长”这件事，长度从头到尾不归 DMA 管：接收的长度是 <code>DMA_GetCurrDataCounter()</code> 减出来的，发送的长度是每笔一设的参数，单笔 256、排队两块、一块 128 是它的三根硬边线；它只搬一段连续内存，帧有多长由协议说了算。初始化里最要紧的一句不是新增的，而是那句 <code>USART_IT_RXNE</code> 的 <code>DISABLE</code>：按字节的中断不关掉，DMA 配得再对也白配；<code>USART_DMACmd()</code> 忘了开，DMA 一张单子也收不到。最后，解析器一个字都没改——DMA 换掉的是搬运方式，不是分工。</p>
+<h2 id="最后蜘蛛说">最后蜘蛛说</h2>
+<p>嘿嘿，STM32有我，Linux也有我，性能瓶颈了？——用上我DMA了吗</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-03 18:08">2026-11-03 18:07</span>&nbsp;
+<a href="https://www.cnblogs.com/zw-awa">Zw-awa</a>&nbsp;
+阅读(<span id="post_view_count">42</span>)&nbsp;
+评论(<span id="post_comment_count">3</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23538260);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzw-awa%2Fp%2F23538260&amp;targetId=23538260&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
