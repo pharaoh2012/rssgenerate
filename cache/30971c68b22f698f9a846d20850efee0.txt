@@ -1,0 +1,456 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23522225" title="发布于 2026-11-02 19:16">
+    
+
+    <span role="heading" aria-level="2">百亿数据写入 MySQL：空间降维 × IO 降维 × 工程兜底</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="100-亿条数据如何快速写入-mysqlnet-10--sqlsugar-实战空间降维io-降维与工程兜底">100 亿条数据如何快速写入 MySQL？.NET 10 + SqlSugar 实战：空间降维、IO 降维与工程兜底</h1>
+<blockquote>
+<p><strong>性能参考</strong>：逐条 <code>INSERT</code> 约 <strong>115~231 天</strong>（磁盘与网络更差可达数百天量级，更好约 2 个月）；整套方案（多分片、多实例并行）落地，<strong>SSD 环境下总吞吐可达 3.5 小时量级</strong>——这是多实例并行写入的<strong>总吞吐目标</strong>，约需 3~20 台 SSD 实例（取决于单机吞吐与分片均匀度），<strong>以压测为准</strong>。这不是 ORM 调参技巧，而是先判断“该不该进 MySQL”，再改变问题形态。单机单分片的实际吞吐多在数万到数十万行/秒量级。</p>
+<p><strong>版本声明</strong>：本文全部 C# 代码已在 <strong>SqlSugarCore 5.1.4.221 + MySqlConnector 2.6.2（.NET 10.0.300）</strong> 下编译验证通过（API 存在性与语法正确性）；运行时行为（尤其 <code>Fastest().BulkCopy</code> 底层、<code>Storageable</code>/<code>BulkMerge</code> 的 SQL 生成）仍需在你实际部署的 MySQL 上做一次真实数据压测确认。</p>
+</blockquote>
+<h1 id="〇核心思想与方法论">〇、核心思想与方法论</h1>
+<blockquote>
+<p><strong>核心思想</strong>：先看清成本结构，再决定是摊薄成本，还是换掉承担成本的那个系统。</p>
+<p><strong>方法论</strong>：空间降维 → IO 降维 → 工程兜底。</p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261102142827828-1749635796.png" alt="" loading="lazy"></p>
+<p>三者关系：<strong>空间降维解决天花板，IO 降维把每一块分片压榨到极限，工程兜底守住数据正确性的底线。</strong></p>
+<h1 id="一先算账该不该进-mysql进来有多大">一、先算账：该不该进 MySQL、进来有多大</h1>
+<h2 id="11-先选战场100-亿条该不该进-mysql">1.1 先选战场：100 亿条该不该进 MySQL</h2>
+<p>这是最容易被跳过、收益却最大的一步。100 亿行如果是时序上报、日志、审计流水，天然具备“写多读少、按时间范围扫、极少更新”的特征——这不是 OLTP 的活。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261102142833511-972334120.png" alt="" loading="lazy"></p>
+<p><strong>让合适的工具做合适的事</strong>，是架构层面的答案；后面的调参只是“必须用 MySQL”这个既定约束下的极限挤压。</p>
+<p>本文的讨论前提是：这批数据<strong>必须落 MySQL、需要事务与幂等、后续要按分片键检索</strong>。如果答案是“不必”，先换存储，再谈写入。</p>
+<h2 id="12-容量账">1.2 容量账</h2>
+<p>假设一行设备上报记录约 500 字节，100 亿行 ≈ <strong>4.5TiB / 5TB</strong> 原始数据；加主键、二级索引、页填充率和导入期 binlog，落盘轻松奔 <strong>6~8TB</strong>。导入期还会产生等量 binlog 和数 TB 临时文件。结论：这不是“一台机器一张表”能扛的量，一开始就不是。</p>
+<h2 id="13-b-树账为什么单表-2000-万是条经验线">1.3 B+ 树账：为什么“单表 2000 万”是条经验线</h2>
+<p>按 InnoDB 默认 16KB 页、1KB 行、8B 主键估算：</p>
+<ul>
+<li>叶子页约存 <strong>16 行/页</strong>；</li>
+<li>非叶子节点约存 <strong>1170 个主键指针</strong>；</li>
+<li><strong>三层 B+ 树</strong>：1170 × 1170 × 16 ≈ <strong>2190 万行</strong>；</li>
+<li><strong>四层 B+ 树</strong>：1170³ × 16 ≈ <strong>256 亿行</strong>。</li>
+</ul>
+<p>“单表不要超过 2000 万”这条江湖经验，科学来源就在这里：<strong>三层 B+ 树刚好把索引前两层塞进内存，第四层开始每次查询多一次磁盘 IO</strong>。100 亿已经踩进第四层甚至第五层。行宽越小，单页行数越多，阈值会随之上移；但数量级结论不变：<strong>100 亿必须分片，单表压到 500 万~1000 万行</strong>。</p>
+<h2 id="14-时间账不优化就是-115231-天">1.4 时间账：不优化，就是 115~231 天</h2>
+<p>单条 <code>INSERT</code> 自动提交，每个事务一次 fsync，约 0.5ms，折合 <strong>500~1000 行/秒</strong>（0.5ms 对应约 2000 次/秒的理论 fsync 上限，再叠加网络 RTT、SQL 解析、二级索引维护后落到 500~1000，属保守量级）：按 500 行/秒，100 亿 ÷ 500 = 2×10⁷ 秒 ≈ <strong>231 天</strong>；按 1000 行/秒 ≈ <strong>116 天</strong>。这是 <strong>SSD 适中场景</strong>的量级——磁盘与网络更差（如机械盘）可达数百天，顶级 SSD + 快 fsync 可压到约 2 个月。</p>
+<p>反过来看目标：<strong>3.5 小时 = 12600 秒</strong>，100 亿 ÷ 12600 ≈ <strong>79.4 万行/秒</strong>。注意：这是<strong>多分片、多实例并行写入的总吞吐目标</strong>，不是单机单分片的成绩——它约需 <strong>3~20 台 SSD 实例</strong>并行（取决于单机吞吐与分片均匀度），<strong>规模不到就达不到 3.5 小时</strong>。后面所有优化，都是在这个基数上砍数量级。</p>
+<blockquote>
+<p><strong>耗时敏感性</strong>：同一 100 亿行，吞吐差 1000 倍，耗时从 2.8 小时到 3 年。下表把“吞吐 → 100 亿耗时”列成对照，方便你对着自己的硬件预估。</p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261102142840246-2060841424.png" alt="" loading="lazy"></p>
+<blockquote>
+<p>这些是<strong>量级参考，不是精确预测</strong>：磁盘类型、fsync 频率、网络 RTT、行宽、实例数任一改变，结果都会跨数量级。上线前请用真实数据样本压测。</p>
+</blockquote>
+<h1 id="二空间降维先把单表瘦下来">二、空间降维：先把单表“瘦”下来</h1>
+<blockquote>
+<p>目标：把 100 亿行拆到 <strong>1500~2000 张分表</strong>，让单表回到 <strong>500 万~1000 万行</strong>的黄金区间。分片数按团队运维能力上限反推，不是越多越好。</p>
+</blockquote>
+<h2 id="21-分片键怎么选">2.1 分片键怎么选</h2>
+<p>三个硬标准，缺一不可：<strong>高基数</strong>（能均匀散开，别选性别、状态这种只有几个值的字段）；<strong>查询高频</strong>（业务 90% 的查询都要带它）；<strong>不可变</strong>（分片键一旦写入就不该改，改了就得跨分片迁移）。</p>
+<p>路由策略上：<strong>固定取模</strong>（如 <code>device_id % 1500</code>）实现简单、分布均匀，一次性导入首选；<strong>一致性哈希</strong>适合后续在线弹性扩容，历史导入场景不必优先。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261102142845209-884853250.png" alt="" loading="lazy"></p>
+<h2 id="22-分片数量规划">2.2 分片数量规划</h2>
+<p>100 亿 ÷ 1500 片 ≈ <strong>每片 667 万行</strong>，落在 500 万~1000 万黄金区间的中位；若按 1000 片，每片 1000 万行已踩在区间上沿，行宽稍大或索引稍多就可能回到四层 B+ 树。建议把分片数上修到 <strong>1500~2000</strong>，例如 <strong>20 库 × 100 表（2000 片）</strong> 或 <strong>24 库 × 80 表（1920 片）</strong>——对应每片 <strong>500 万 / 521 万行</strong>，都在黄金区间内且留有余量。</p>
+<blockquote>
+<p>分片数不是越多越好：100 个数据库实例的监控、备份、DDL 变更、连接池运维成本会显著上升。生产落地更常见的是<strong>几十个实例、每个实例几十张表</strong>，按团队能力反推分片数。只要单表保持在 500 万~1000 万，不必刻意逼近 1000 片下限。</p>
+</blockquote>
+<h2 id="23-用-sqlsugar-的-splittable-落地">2.3 用 SqlSugar 的 SplitTable 落地</h2>
+<pre><code class="language-csharp">using SqlSugar;
+
+// 设备上报分表实体：按月分表，按设备维度做库级分片。
+// 按月分表：自动生成 device_report_202611 等物理表
+[SplitTable(SplitType.Month)]
+// 表名模板：{year}{month} 为 4 位年 + 2 位月
+[SugarTable("device_report_{year}{month}")]
+public class DeviceReport
+{
+    // 雪花 ID，非自增；由应用侧生成（见 3.3）
+    [SugarColumn(IsPrimaryKey = true)]
+    public long Id { get; set; }
+
+    // 分片键：哈希取模决定去哪个库
+    public long DeviceId { get; set; }
+
+    // 分表路由字段；时间分表时必须是 DateTime
+    [SplitField]
+    public DateTime ReportTime { get; set; }
+
+    // 上报载荷（示例字段，可按需替换）
+    public int Payload { get; set; }
+}
+</code></pre>
+<p>初始化时一次性建好所有分表结构：<code>db.CodeFirst.SplitTables().InitTables&lt;DeviceReport&gt;();</code></p>
+<p>写入时自动路由：<code>await db.Insertable(list).SplitTable().ExecuteCommandAsync();</code></p>
+<p>几个关键细节：<code>SplitField</code> 必须是 <code>DateTime</code> 类型（时间分表时）；<strong>分片键（<code>DeviceId</code>）和分表字段（<code>ReportTime</code>）是两套维度，别混</strong>；<strong>自动建表适合初始化，不适合高频写入</strong>——大批量导入时表结构应提前由 DDL 建好，分片任务拿到物理表名后固定表名写入更稳；<code>SplitTable</code> 的自动识别主要覆盖 Insert / Update / Delete，<strong>Select 查询需要手动指定表名或用 <code>AsTable</code> 映射</strong>。</p>
+<h2 id="24-列瘦身与冷热分离">2.4 列瘦身与冷热分离</h2>
+<p>只保留在线查询需要的列，大文本/Blob 拆到旁路表或对象存储；数值能定长就不用变长，能 <code>TINYINT</code> 不用 <code>INT</code>，<strong>绝对别用 <code>CHAR(36)</code> 的 UUID 主键</strong>；上线即定归档策略：近 3 个月热数据留 MySQL，历史数据导出 ClickHouse，MySQL 侧按分区 <code>DROP PARTITION</code> 秒级回收空间。</p>
+<h1 id="三io-降维把-n-次-io-压成-1-次">三、IO 降维：把 N 次 IO 压成 1 次</h1>
+<blockquote>
+<p>目标：单次网络往返装下尽量多的行，单次刷盘覆盖尽量多的事务，磁盘写尽量顺序化。</p>
+</blockquote>
+<h2 id="31-先识别假批量">3.1 先识别“假批量”</h2>
+<p>Java 的 <code>rewriteBatchedStatements=true</code> 在 .NET 没有同名对应；.NET 的批量路径分两种：<strong><code>MySqlBulkCopy</code>（多值 INSERT 批量）</strong> 与 <strong><code>MySqlBulkLoader</code>（LOAD DATA LOCAL INFILE 流式）</strong>。<code>Insertable(List)</code> 的多值 INSERT 仍经过 SQL 解析层，属于“半批量”；真正把 IO 降一个数量级的是 BulkCopy / LOAD DATA 路径。</p>
+<pre><code class="language-csharp">// 白银写法：一次提交一批，合并网络往返 + 合并事务。
+// 注意：此事务仅包裹多值 INSERT；BulkCopy 路径不要在外层再开大事务（见 3.5 红线）。
+db.Ado.BeginTran();
+try
+{
+    // 每 2000 行拼一条多值 INSERT
+    await db.Insertable(list)
+            .PageSize(2000)
+            .ExecuteCommandAsync();
+    db.Ado.CommitTran();
+}
+catch
+{
+    // 任何异常都回滚，避免事务悬空占用连接
+    db.Ado.RollbackTran();
+    throw;
+}
+</code></pre>
+<h2 id="32-大杀器fastestbulkcopy">3.2 大杀器：Fastest().BulkCopy()</h2>
+<p>SqlSugar 的 <code>Fastest&lt;T&gt;().BulkCopy()</code> 在 MySQL 上的底层实现<strong>取决于当前 SqlSugar / 驱动版本</strong>：常见走 MySqlConnector 的 <code>MySqlBulkCopy</code>（多值 INSERT 批量），部分版本/配置下才走 <code>MySqlBulkLoader</code>（LOAD DATA LOCAL INFILE 流式）。两条路径都能把 N 次逐行 IO 合并成少数几次大操作；<strong>具体走哪条路径、是否依赖 <code>local_infile</code>，请以当前版本实测为准</strong>。官方文档确认 <code>PageSize</code> 可与 <code>BulkCopy</code> 一起使用用于分批。</p>
+<p>若你当前版本确实走 <strong>LOAD DATA LOCAL INFILE</strong> 路径，则需要以下两个前提（否则 <code>BulkCopy</code> 可能报错）：</p>
+<p><strong>① 连接串必须加 <code>AllowLoadLocalInfile=true</code>：</strong></p>
+<pre><code class="language-csharp">var db = new SqlSugarClient(new ConnectionConfig
+{
+    DbType = DbType.MySql,
+    ConnectionString = "Server=10.0.0.10;Port=3306;Database=iot;Uid=importer;Pwd=***;" +
+                       // 走 LOAD DATA LOCAL 时必需
+                       "AllowLoadLocalInfile=true;" +
+                       // 建连超时
+                       "Connection Timeout=600;" +
+                       // 长任务别被默认超时打断（0=不超时）
+                       "Default Command Timeout=0;",
+    // 每次执行完自动归还连接
+    IsAutoCloseConnection = true,
+    // 主键/自增等特性按 Attribute 识别
+    InitKeyType = InitKeyType.Attribute
+});
+</code></pre>
+<p><strong>② 服务端必须开 <code>local_infile</code>：</strong></p>
+<pre><code class="language-sql">SHOW VARIABLES LIKE 'local_infile';
+SET GLOBAL local_infile = 1;
+</code></pre>
+<blockquote>
+<p>⚠️ <strong>安全提醒</strong>：<code>LOCAL INFILE</code> 允许客户端读取服务器本地文件，生产环境应使用<strong>专用导入账号</strong>，导入完成后关闭 <code>local_infile</code>，而不是常开。<code>local_infile</code> 是全局变量，<strong>Docker 容器重启后可能被重置成 OFF</strong>，稳妥做法是在导入程序启动时主动执行一次 <code>SET GLOBAL local_infile = 1</code>，并做失败告警。</p>
+</blockquote>
+<p>写入主体：</p>
+<pre><code class="language-csharp">// 每 10 万行一次批量（分批语义以当前版本实测为准）
+await db.Fastest&lt;DeviceReport&gt;()
+        .PageSize(100_000)
+        .BulkCopyAsync(batch);
+</code></pre>
+<p><code>PageSize</code> 的语义：官方文档中 <code>PageSize(100000)</code> 与 <code>BulkCopy</code> 搭配使用，用于控制每批行数。<strong>对 BulkCopy 的分批语义以当前 SqlSugar 版本实测为准</strong>；若当前版本对 BulkCopy 不分批，BulkCopy 本身即流式写入，无需额外 PageSize。5 万~10 万是常见安全区间，太小合并效果不明显，太大则客户端内存、单事务、<code>max_allowed_packet</code> 都可能出问题。</p>
+<h2 id="33-顺序写把随机-io-掰成顺序-io">3.3 顺序写：把随机 IO 掰成顺序 IO</h2>
+<p>InnoDB 是<strong>索引组织表</strong>，数据按主键顺序存放。主键无序（比如 UUID），每插一行都可能引发<strong>页分裂 + 随机磁盘写</strong>；主键有序，写入就变成<strong>顺序追加</strong>。</p>
+<p><strong>普通 Insert 路径可以用 SqlSugar 的雪花 ID 返回：</strong></p>
+<pre><code class="language-csharp">// 每个不能共享 SnowFlakeSingle 静态变量的实例必须使用不同的 WorkId（从配置/环境变量读取）
+SnowFlakeSingle.WorkId = int.Parse(
+    Environment.GetEnvironmentVariable("SNOWFLAKE_WORKER_ID") ?? "1");
+
+// 普通 Insertable 路径可直接返回雪花主键（同步返回 long，无需 await）
+long id = db.Insertable(entity).SplitTable().ExecuteReturnSnowflakeId();
+</code></pre>
+<p><strong>但 BulkCopy 路径必须由应用侧预生成 ID。</strong> 官方明确说明：<strong>“大数据写入方式如果用到雪花ID需要手动赋值：<code>SnowFlakeSingle.Instance.NextId()</code>”</strong>。<code>ExecuteReturnSnowflakeId</code> / <code>ExecuteReturnSnowflakeIdList</code> 是 <code>Insertable</code> 的方法，不会自动填充 BulkCopy 的实体列表。</p>
+<pre><code class="language-csharp">// BulkCopy 批次：构造时逐条预生成雪花 ID，再按主键排序 → 顺序写
+SnowFlakeSingle.WorkId = int.Parse(
+    Environment.GetEnvironmentVariable("SNOWFLAKE_WORKER_ID") ?? "1");
+
+// 逐行填充雪花 ID，再按主键排序 → 顺序追加
+var ordered = batch
+    .Select(x =&gt; { x.Id = SnowFlakeSingle.Instance.NextId(); return x; })
+    .OrderBy(x =&gt; x.Id)
+    .ToList();
+
+await db.Fastest&lt;DeviceReport&gt;().PageSize(100_000).BulkCopyAsync(ordered);
+</code></pre>
+<p><code>WorkId</code> 必须从配置/环境变量读取，<strong>每个实例唯一，1 只是示例</strong>。多机并行 + 分库分表下，数据库自增 ID 会因自增锁串行化成为瓶颈，还会跨库撞号。</p>
+<h2 id="34-先灌数据后建索引">3.4 先灌数据，后建索引</h2>
+<p>每插一行，表上所有二级索引都要更新一次 B+ 树。正确姿势：</p>
+<pre><code class="language-sql">-- 导入前：删掉二级索引，让写变成纯顺序追加
+ALTER TABLE device_report_202611 DROP INDEX idx_device_time;
+
+-- 导入完成后：在线重建，不锁表、不阻塞读写
+ALTER TABLE device_report_202611
+  ADD INDEX idx_device_time (device_id, report_time),
+  ALGORITHM=INPLACE, LOCK=NONE;
+</code></pre>
+<p>一次性批量建索引比逐行维护快得多，因为重建时可以<strong>排序 + 批量加载</strong>。</p>
+<blockquote>
+<p><strong>唯一索引与外键约束</strong>：唯一索引（含主键）不能简单“后建”；如果业务依赖唯一键做幂等，要么导入后单独去重，要么接受导入期 <code>unique_checks=0</code> 带来的延迟校验成本。恢复 <code>unique_checks=1</code> 时可能触发唯一索引重建，是阻塞操作。如果表有外键，<strong>恢复 <code>foreign_key_checks=1</code> 前必须先做孤儿行清理</strong>，否则恢复语句会失败或留下脏数据。</p>
+</blockquote>
+<h2 id="35-导入期参数超频拿可靠性换吞吐">3.5 导入期参数“超频”：拿可靠性换吞吐</h2>
+<p>这是一次性、可重放、可对账的离线导入窗口，OLTP 的那套“保险”价值下降，可以临时调参。<strong>但必须分清 SESSION 和 GLOBAL，并在 <code>try/finally</code> 里成对恢复。</strong></p>
+<pre><code class="language-sql">-- 会话级：只影响当前导入连接
+SET SESSION unique_checks = 0;
+SET SESSION foreign_key_checks = 0;
+SET SESSION autocommit = 0;
+
+-- 全局级：需要 DBA 授权，仅限离线导入窗口
+SET GLOBAL innodb_flush_log_at_trx_commit = 2;
+SET GLOBAL sync_binlog = 0;
+SET GLOBAL max_allowed_packet = 67108864;
+</code></pre>
+<p>导入结束后<strong>必须逐条恢复</strong>：</p>
+<pre><code class="language-sql">SET SESSION unique_checks = 1;
+SET SESSION foreign_key_checks = 1;
+COMMIT;
+SET SESSION autocommit = 1;
+
+SET GLOBAL innodb_flush_log_at_trx_commit = 1;
+SET GLOBAL sync_binlog = 1;
+-- 说明：max_allowed_packet=67108864 恰为 MySQL 8 默认值（64MB），导入后不恢复也安全；
+-- 若你原环境将其调小过，请补回 SET GLOBAL max_allowed_packet = &lt;原值&gt;。
+</code></pre>
+<p>几条红线：<code>innodb_flush_log_at_trx_commit=2</code> 崩溃可能丢最近 1 秒事务；<code>unique_checks=0</code> / <code>foreign_key_checks=0</code> 关掉后<strong>一定要恢复</strong>，否则后续业务插入可能静默破坏唯一性；<strong>不要在 <code>BulkCopy</code> 外层再套一个超长事务</strong>，undo 膨胀反而拖慢，事务边界交给分批提交；这些参数<strong>严禁线上常态业务常驻</strong>。</p>
+<p>一个逐条执行的会话参数恢复封装（避免多语句依赖驱动配置，并带事务回滚兜底）：</p>
+<pre><code class="language-csharp">public static async Task WithImportSessionAsync(SqlSugarClient db, Func&lt;Task&gt; action)
+{
+    // 逐条执行 SET：避免把多条语句拼成一条命令（降低对驱动“多语句”配置的依赖）
+    await db.Ado.ExecuteCommandAsync("SET SESSION unique_checks=0");
+    await db.Ado.ExecuteCommandAsync("SET SESSION foreign_key_checks=0");
+    try
+    {
+        await action();
+    }
+    finally
+    {
+        // 成对恢复：先回滚 action 内部可能未提交的事务，避免事务悬空占用连接
+        try { await db.Ado.ExecuteCommandAsync("ROLLBACK"); } catch { /* 无活动事务时忽略 */ }
+        await db.Ado.ExecuteCommandAsync("SET SESSION unique_checks=1");
+        await db.Ado.ExecuteCommandAsync("SET SESSION foreign_key_checks=1");
+        await db.Ado.ExecuteCommandAsync("SET SESSION autocommit=1");
+    }
+}
+</code></pre>
+<blockquote>
+<p>GLOBAL 参数不建议在业务代码里自动改，应由 DBA 在导入窗口统一执行并恢复。</p>
+</blockquote>
+<h2 id="36-并发必须落在分片维度">3.6 并发：必须落在“分片维度”</h2>
+<p><strong>千万不要在同一张表里乱序并发写</strong>，那只会放大锁竞争、页分裂、undo 压力。正确姿势：<strong>一个分片一个写入流</strong>，分片之间天然无锁冲突；单机并发度控制在 <strong>16~32</strong>（这是常见经验区间，最终以“吞吐-并发”压测曲线的拐点为准，过高会因线程竞争雪崩）；每个并行分支用 <code>CopyNew()</code> 或独立 <code>SqlSugarClient</code>，共享连接会把并行退化成串行；生产者和消费者之间用有界 <code>Channel</code> 做背压。</p>
+<blockquote>
+<p><strong><code>CopyNew()</code> 的语义</strong>：它解决的是<strong>线程安全/连接隔离</strong>，不是分库路由。多库分片时，物理库切换应由 <code>SqlSugarScope</code> 的 <code>GetConnectionScope(configId)</code> 或路由中间件完成，<code>CopyNew</code> 本身不负责切换 <code>db_0/db_1</code>。</p>
+</blockquote>
+<pre><code class="language-csharp">public async Task ImportShardAsync(SqlSugarClient rootDb, ShardTask shard, CancellationToken ct)
+{
+    // 线程安全/连接隔离（不是分库路由）
+    var db = rootDb.CopyNew();
+    try
+    {
+        // 读水位：断点续传起点
+        var watermark = await LoadWatermarkAsync(db, shard.ShardKey);
+        // 上次导到的最大主键
+        long lastId = watermark?.LastId ?? 0;
+        // 标记分片“处理中”，防重复领取
+        await MarkRunningAsync(db, shard.ShardKey);
+
+        // 流式读取数据源，每次取 10 万行一个批次
+        await foreach (var batch in ReadSourceBatchAsync(shard, lastId, batchSize: 100_000, ct))
+        {
+            // 本批：逐条预生成雪花 ID → 按主键排序 → 有序批次
+            var ordered = batch
+                .Select(x =&gt; { x.Id = SnowFlakeSingle.Instance.NextId(); return x; })
+                .OrderBy(x =&gt; x.Id)
+                .ToList();
+
+            // AS(表名) 部分版本支持，以实测为准；无效则提前把数据路由到目标物理表再 BulkCopy
+            await db.Fastest&lt;DeviceReport&gt;()
+                    // 固定物理表，避免运行时路由反射开销
+                    .AS(shard.TableName)
+                    .PageSize(100_000)
+                    .BulkCopyAsync(ordered);
+
+            // 每批成功后推进水位：last_id 取本批最大主键，rows_written 累加
+            await UpdateWatermarkAsync(db, shard.ShardKey, ordered[^1].Id, ordered.Count);
+        }
+        // 分片全部导完，标记“成功”
+        await MarkDoneAsync(db, shard.ShardKey);
+    }
+    catch
+    {
+        // 任一批失败，标记“失败”供重启续传
+        await MarkFailedAsync(db, shard.ShardKey);
+        throw;
+    }
+    finally { db.Dispose(); }
+}
+</code></pre>
+<p>并行入口：</p>
+<pre><code class="language-csharp">// 单机 16~32 路，以压测拐点为准
+await Parallel.ForEachAsync(
+    shards,
+    new ParallelOptions { MaxDegreeOfParallelism = 16 },
+    async (shard, ct) =&gt; await ImportShardAsync(rootDb, shard, ct));
+</code></pre>
+<blockquote>
+<p>主键统一用<strong>雪花算法 / 号段模式</strong>在应用侧生成——多机并行 + 分库分表下，数据库自增 ID 会因自增锁串行化成为瓶颈，还会<strong>跨库撞号</strong>。</p>
+</blockquote>
+<h2 id="37-段位对照表net--sqlsugar-版">3.7 段位对照表（.NET + SqlSugar 版）</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261102143006925-243950922.png" alt="" loading="lazy"></p>
+<blockquote>
+<p><strong>数字前提必须说清楚</strong>：钻石/王者的“80 万~200 万行/秒”是<strong>数百个分片分布在数十台数据库实例上并行写入的总吞吐</strong>，不是单机单分片的 LOAD DATA 吞吐。公开可复现的单机 LOAD DATA 参考多在<strong>数万到数十万行/秒</strong>量级（例如 SSD + 32GB 内存下约 30 万行/秒，普通 SSD 单路约 2.5 万~4 万行/秒）。硬件天花板先确认：NVMe SSD（IOPS 50 万、延迟 &lt;50μs）相比 7200RPM HDD（IOPS 200、延迟 5~10ms），批量写入差距可达两个数量级。上线前请用真实数据样本压测。</p>
+</blockquote>
+<h1 id="四工程兜底让一次跑-35-小时的任务敢于失败">四、工程兜底：让一次跑 3.5 小时的任务敢于失败</h1>
+<p>前两层决定“能跑多快”，这一层决定“能不能放心跑完”。</p>
+<h1 id="41-幂等重跑不炸库">4.1 幂等：重跑不炸库</h1>
+<p><strong>关键事实</strong>：<code>BulkCopy</code> 是“只插不管”，<strong>SqlSugar 原生 <code>BulkCopy</code> 不支持 UPSERT 语义</strong>，遇到主键冲突会直接报错，重跑可能整批失败。幂等必须由外层设计保证。</p>
+<p><strong>① 换用 <code>BulkMerge()</code>（Upsert）。</strong> 官方原理：Oracle/SqlServer 使用 Merge Into + BulkCopy，<strong>其他库底层是分页 + BulkCopy + 查询验证</strong>。需要注意：<code>BulkMerge</code> 在事务中可能与 <code>BulkCopy</code> 自带的事务冲突，部分库不支持外部事务。</p>
+<pre><code class="language-csharp">// 以当前版本实测确认；存在则更新、不存在则插入
+await db.Fastest&lt;DeviceReport&gt;()
+        .PageSize(100_000)
+        .BulkMergeAsync(page);
+</code></pre>
+<p><strong>② 多值 Insert 走 <code>ON DUPLICATE KEY UPDATE</code></strong>（适合非 BulkCopy 路径）：</p>
+<pre><code class="language-csharp">// 多值 INSERT 的 UPSERT：SqlSugar 5.x 由 Storageable 提供，底层生成 INSERT ... ON DUPLICATE KEY UPDATE ...。
+// WhereColumns 指定“业务唯一键”作为冲突判定列；若唯一索引是 (device_id, report_time)，
+// 就换成 .WhereColumns(it =&gt; new { it.DeviceId, it.ReportTime })。
+// 冲突判定列，需与表上唯一索引一致，否则冲突检测不生效
+await db.Storageable(list)
+        .WhereColumns(it =&gt; it.Id)
+        .ExecuteCommandAsync();
+</code></pre>
+<blockquote>
+<p>⚠️ <strong>并发死锁风险</strong>：<code>ON DUPLICATE KEY UPDATE</code> 在并发冲突时会对唯一索引加 S 锁，多会话命中同一唯一键可能互相等待形成死锁，RR 隔离级别下尤其明显。建议在 <strong>RC 隔离级别下单语句短事务</strong>执行，或改用“上游保证唯一 + 水位 + 对账”的 BulkCopy 路线。</p>
+</blockquote>
+<p><strong>③ 上游保证唯一 + 水位表 + 对账兜底</strong>（BulkCopy 场景最省事）。无论哪种方案，<strong>前提都是目标表上有以业务唯一键建立的唯一索引</strong>，否则冲突检测根本不生效。</p>
+<h2 id="42-断点续传水位表">4.2 断点续传：水位表</h2>
+<pre><code class="language-sql">CREATE TABLE import_watermark (
+  shard_key    VARCHAR(64) NOT NULL PRIMARY KEY,
+  last_id      BIGINT      NOT NULL DEFAULT 0,
+  rows_written BIGINT      NOT NULL DEFAULT 0,
+  -- status 枚举：0待处理 1处理中 2成功 3失败
+  status       TINYINT     NOT NULL DEFAULT 0,
+  updated_at   DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                           ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+</code></pre>
+<blockquote>
+<p>实体类按列映射即可，此处不重复展开。流程：开始处理分片标记 <code>status=1</code> → 每批 <code>BulkCopy</code> 成功后更新 <code>last_id</code> 和 <code>rows_written</code> → 程序中断重启只捞 <code>status=1/3</code> 的分片，从水位继续。</p>
+</blockquote>
+<p><strong>恢复粒度</strong>：水位按<strong>每 10 万行</strong>更新一次，崩溃最多重跑当前批次（10 万行量级），不会从零重跑 100 亿。这是百亿级任务的生命线。</p>
+<h2 id="43-三层对账">4.3 三层对账</h2>
+<p>“跑完了”不等于“跑对了”。<strong>总量对账</strong>（源端 count vs 目标端 count）；<strong>抽样对账</strong>（按分片均匀抽 1‰，按主键回查逐字段比对 MD5）；<strong>指纹对账</strong>（两端按分片算 <code>COUNT(*) + SUM(CRC32(关键字段))</code>）。</p>
+<pre><code class="language-sql">-- 指纹对账：两端按分片聚合。
+-- 注意：SUM(CRC32(...)) 在百亿量级会超出 BIGINT（约 2×10¹⁹ &gt; 9.2×10¹⁸），
+-- 必须 CAST 为 DECIMAL(40,0) 提升精度，否则 MySQL 会报错或失真。
+SELECT shard_key,
+       COUNT(*) AS cnt,
+       CAST(SUM(CRC32(CONCAT_WS('|', id, device_id, payload))) AS DECIMAL(40,0)) AS fp
+FROM device_report_202611
+GROUP BY shard_key;
+</code></pre>
+<p><strong>只有对账通过，才允许切换业务流量。</strong></p>
+<h2 id="44-影子表--原子切换">4.4 影子表 + 原子切换</h2>
+<p>如果这 100 亿是<strong>替换旧表</strong>而不是追加，不要在旧表上直接写：数据全部导入影子表 → 对账、在线重建二级索引全部完成 → 业务低峰用一条 <code>RENAME</code> 原子切换：</p>
+<pre><code class="language-sql">RENAME TABLE device_report TO device_report_old,
+             device_report_shadow TO device_report;
+</code></pre>
+<p><code>RENAME</code> 是元数据操作，毫秒级完成，业务几乎无感；回滚只需反向 <code>RENAME</code>。</p>
+<h2 id="45-背压限流与主从保护">4.5 背压限流与主从保护</h2>
+<p>生产者和消费者速度不匹配时，用<strong>有界 <code>Channel</code></strong> 做背压：</p>
+<pre><code class="language-csharp">// 有界缓冲：生产者/消费者速度不匹配时，用固定容量 Channel 做背压。
+// 缓冲满了就让生产者等待（写入侧消费），形成背压
+var channel = Channel.CreateBounded&lt;Batch&gt;(new BoundedChannelOptions(64)
+{
+    FullMode = BoundedChannelFullMode.Wait
+});
+</code></pre>
+<p>大批量写入会瞬间打爆主从延迟：导入期限流，给从库留追赶时间；方案评审时明确<strong>导入窗口内读流量是否允许走从库</strong>；导完如果延迟太大，直接从新主库做一次全量重建，比等它追几 TB binlog 更快。</p>
+<h2 id="46-可观测性">4.6 可观测性</h2>
+<p>必看指标：进程内存峰值、各分片吞吐（rows/s）、水位延迟、失败重试次数、目标库 <code>Innodb_rows_inserted</code>、<code>Innodb_log_wait</code>、磁盘 <code>iostat</code>。<strong>没有这些指标，你就不知道 3.5 小时是快是慢、卡在哪一环。</strong></p>
+<h1 id="五完整流水线与踩坑清单">五、完整流水线与踩坑清单</h1>
+<h2 id="51-完整流水线">5.1 完整流水线</h2>
+<pre><code class="language-text">数据源(HDFS/Kafka/CSV/设备上报)
+   ↓ 流式读取 + 有界 Channel 背压
+[空间降维] 按分片键分组归集，一个分片一个写入任务
+   ↓
+[IO 降维] 分片内预生成雪花 ID → 按主键排序 → 有序批次
+   ↓
+[IO 降维] Fastest().BulkCopy()
+           + 导入前删二级索引
+           + 临时关闭 unique_checks / 降低刷盘频率
+   ↓
+[工程兜底] 每批更新水位；失败标记分片，等待重试
+   ↓
+全部分片完成 → 在线重建二级索引
+   ↓
+[工程兜底] 三层对账（count / 抽样 / 指纹）
+   ↓
+[工程兜底] 影子表 RENAME 原子切换 → 开放业务流量
+</code></pre>
+<p>六步口诀：<strong>一算、二拆、三批量、四调参、五并发、六收尾。</strong></p>
+<h2 id="52-踩坑清单net--sqlsugar-特有">5.2 踩坑清单（.NET + SqlSugar 特有）</h2>
+<ol>
+<li>连接串缺少 <code>AllowLoadLocalInfile=true</code>，走 LOAD DATA 的 <code>BulkCopy</code> 直接报错；</li>
+<li>服务端 <code>local_infile=OFF</code>，或 Docker 重启后被重置；</li>
+<li>数据没有预先按分片分组，乱序路由导致批量失效；</li>
+<li>分片内主键无序写入，页分裂严重；</li>
+<li>导入临时参数忘记恢复，线上库静默产生脏数据；</li>
+<li>单分片开大量并发 <code>BulkCopy</code>，锁竞争、undo 日志暴涨；</li>
+<li>只看写入日志成功，不做对账，存在静默丢数；</li>
+<li><code>SplitField</code> 不是 <code>DateTime</code>，或分片字段为空，路由失败；</li>
+<li>批大小设置过大，单事务超时、binlog 爆炸、回滚灾难；</li>
+<li>用数据库自增 ID 做分片主键，跨库撞号、自增锁串行化；</li>
+<li><strong><code>BulkCopy</code> 没有原生 UPSERT，直接重跑会因主键冲突整批失败</strong>；</li>
+<li><strong><code>BulkCopy</code> 路径依赖 <code>ExecuteReturnSnowflakeId</code> 自动赋 ID</strong>——需要手动 <code>SnowFlakeSingle.Instance.NextId()</code> 预填充；</li>
+<li><strong><code>OnDuplicateKeyUpdate()</code> 在 SqlSugar 5.x 已不存在</strong>——多值 UPSERT 改用 <code>Storageable().WhereColumns(...)</code>；</li>
+<li><code>SplitTable</code> 只对 Insert/Update/Delete 自动路由，Select 查询忘了手动指定表名；</li>
+<li><strong><code>AS(表名)</code> 对 <code>Fastest&lt;实体&gt;().BulkCopy</code> 的全版本兼容性未确认</strong>，应实测或提前路由到目标物理表；</li>
+<li>指纹对账 <code>SUM(CRC32)</code> 忘了 <code>CAST AS DECIMAL(40,0)</code>，百亿表可能溢出报错。</li>
+</ol>
+<h1 id="六架构师视角与面试口述">六、架构师视角与面试口述</h1>
+<h2 id="61-三个提醒">6.1 三个提醒</h2>
+<p><strong>1. 不是所有数据都该进 MySQL。</strong> 日志/时序 → ClickHouse / Doris；海量 KV → HBase；全文检索 → Elasticsearch；HTAP → TiDB。MySQL 只伺候<strong>在线交易的热数据</strong>。100 亿条数据放 MySQL，本身就该先问一句：<strong>这些数据真的适合 MySQL 吗？</strong></p>
+<p><strong>2. 导入期的参数调优是“拿可靠性换吞吐”。</strong> 关掉 <code>unique_checks</code>、刷盘改成每秒、<code>sync_binlog=0</code>——这些操作的潜台词都是“我不在乎这一段时间的持久性”。<strong>只允许用在可重跑的离线导入</strong>，导完立即恢复双 1 配置。</p>
+<p><strong>3. 真正的能力不是背结论。</strong> 先<strong>反问边界</strong>；能用 <strong>B+ 树算账</strong>解释“为什么单表 2000 万”；<strong>分层讲方案</strong>，每层都有取舍逻辑；有<strong>真实数字</strong>，敢说“3.5 小时”也敢解释“这是多分片总吞吐”。</p>
+<h2 id="62-30-秒面试口述模板">6.2 30 秒面试口述模板</h2>
+<blockquote>
+<p>“100 亿条数据，先算账：容量 4.5TB+，落盘 6~8TB，单表 B+ 树要四层，<strong>单机单表装不下</strong>。处理思路九个字——<strong>空间降维、IO 降维、工程兜底</strong>。<br>
+① <strong>空间降维</strong>：用 SqlSugar 的 <code>SplitTable</code> 按分片键拆成 1500+ 张分表，单表压到千万级以内；冷热分离。<br>
+② <strong>IO 降维</strong>：主力是 <code>Fastest().BulkCopy()</code>；BulkCopy 场景主键用 <code>SnowFlakeSingle.Instance.NextId()</code> 预生成，分片内先排序；导入前删二级索引、导完在线重建；参数临时降刷盘、关唯一性校验，导完立刻恢复。<br>
+③ <strong>并发</strong>：按分片维度并行，每分片独立连接，单机 16~32 路。<br>
+④ <strong>工程兜底</strong>：水位表断点续传、幂等、三层对账、影子表原子切流量、主从保护。<br>
+最后一句：<strong>100 亿这种量级，更该先质疑它是不是该放 MySQL——冷数据去 ClickHouse，热数据才留在这里。</strong>”</p>
+</blockquote>
+<h1 id="七结语">七、结语</h1>
+<p>231 天到 3.5 小时，中间并没有任何“黑科技”。所有提速都来自同一件事：</p>
+<blockquote>
+<p><strong>想办法把 N 次操作合并成 1 次；合并不了的，就降维拆到能合并的粒度。</strong></p>
+</blockquote>
+<ul>
+<li><strong>空间降维</strong>拆的是“数据规模”，解决“装得下”；</li>
+<li><strong>IO 降维</strong>合的是“操作次数”，解决“写得快”；</li>
+<li><strong>工程兜底</strong>保的是“合并之后不出事”，解决“跑得稳”。</li>
+</ul>
+<p>这三层叠起来，才是那个从 231 天到 3.5 小时的完整答案。</p>
+<p><strong>最后再提醒一句</strong>：所有导入期调参都是阶段性取舍，不能把导入模式当成常态业务模式；当业务不需要 MySQL 的事务与检索能力时，优先选择专门的分析型数据库。</p>
+<blockquote>
+<p><strong>免责说明</strong>：文中耗时为量级参考，3.5 小时对应多分片、多实例并行的总吞吐，单机单分片以压测为准。本文 C# 代码基于 <strong>SqlSugarCore 5.1.4.221 + MySqlConnector 2.6.2（.NET 10.0.300）编译验证</strong>；<code>BulkCopy</code> 底层是否走 LOAD DATA、<code>Storageable</code>/<code>BulkMerge</code>/<code>AS(表名)</code> 的 SQL 生成，请按你的实际版本与 MySQL 环境实测确认。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-02 19:17">2026-11-02 19:16</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">138</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23522225);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23522225&amp;targetId=23522225&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
