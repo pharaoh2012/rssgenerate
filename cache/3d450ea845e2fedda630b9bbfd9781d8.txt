@@ -1,0 +1,452 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ykbb/p/23532279/c-2voqmz" title="发布于 2026-11-03 10:36">
+    
+
+    <span role="heading" aria-level="2">C# .NET Core 并发控制：悲观原子、悲观锁、乐观锁</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="c-net-core-并发控制悲观原子悲观锁乐观锁">C# .NET Core 并发控制：悲观原子、悲观锁、乐观锁</h1>
+<blockquote>
+<p>前言：在活动报名、名额限额这类业务中，高并发下的超卖、数据不一致是绕不开的问题。很多开发者对悲观原子、悲观锁、乐观锁三者的定位和边界理解模糊，尤其是悲观原子什么时候加事务、什么时候不加，是上线高频踩坑点。本文基于 .NET Core + EF Core，统一使用<strong>活动报名、名额上限</strong>作为业务案例，依次讲解悲观原子、悲观锁、乐观锁的原理、代码示例、优缺点以及适用场景，方便直接落地。</p>
+</blockquote>
+<p>前置说明：数据库采用 MySQL InnoDB，默认 RR（可重复读）隔离级别；所有示例围绕两张实体：活动表（名额控制）、报名表（报名记录）。</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 活动表，管控报名名额上限
+/// &lt;/summary&gt;
+public class Activity
+{
+    public long Id { get; set; }
+    public string ActivityName { get; set; }
+    /// &lt;summary&gt;
+    /// 总名额
+    /// &lt;/summary&gt;
+    public int TotalQuota { get; set; }
+    /// &lt;summary&gt;
+    /// 剩余可报名名额
+    /// &lt;/summary&gt;
+    public int RemainQuota { get; set; }
+}
+
+/// &lt;summary&gt;
+/// 报名记录表，报名成功后写入
+/// &lt;/summary&gt;
+public class ActivitySignUp
+{
+    public long Id { get; set; }
+    public long ActivityId { get; set; }
+    public long UserId { get; set; }
+    public DateTime CreateTime { get; set; }
+}
+</code></pre>
+<p>并发冲突基础概念：</p>
+<ol>
+<li><strong>脏读</strong>：读到别的事务未提交的数据</li>
+<li><strong>不可重复读</strong>：同一个事务内，同一条数据两次查询结果不一样（被其他事务修改）</li>
+<li><strong>幻读</strong>：同一个事务，相同查询条件，两次返回行数不一样（别的事务新增/删除）</li>
+</ol>
+<p>并发控制，本质就是解决多个线程/多个服务实例同时读写同一份数据时的数据不一致。</p>
+<blockquote>
+<p>概念先行区分：<br>
+悲观原子 = 带业务判断条件的原子UPDATE；原子性是语句级，不等于事务，区分无事务、事务包裹两种写法<br>
+悲观锁 = 数据库行排他锁 ​<code>SELECT ... FOR UPDATE</code>​<br>
+乐观锁 = 版本号/并发令牌校验</p>
+</blockquote>
+<h1 id="一悲观原子重点区分无事务--有事务">一、悲观原子（重点区分：无事务 / 有事务）</h1>
+<blockquote>
+<p>核心定义：悲观原子不是悲观锁，没有 ​<code>FOR UPDATE</code>​；它把【名额判断 + 名额扣减】合并在一条带WHERE条件的UPDATE语句中，依靠<strong>单条DML语句的数据库原子性</strong>实现防超卖。 重点：原子性 = 语句级别原子，​<strong>不等于事务</strong>；是否包裹事务，是这个方案最大的分水岭，直接决定能不能配套写入报名记录。</p>
+</blockquote>
+<p>基础SQL模板：</p>
+<pre><code class="language-sql">UPDATE Activity 
+SET RemainQuota = RemainQuota - 1 
+WHERE Id = @ActivityId AND RemainQuota &gt; 0;
+</code></pre>
+<p>受影响行数=1：扣名额成功；行数=0：名额已满。 单条DML执行时InnoDB会加瞬时行锁，语句执行完毕，锁是否立刻释放，由是否处于手动事务决定。</p>
+<h2 id="11-无事务版本的悲观原子">1.1 无事务版本的悲观原子</h2>
+<p>适用边界：仅适合可以容忍极小概率数据不一致、不想开启事务、追求极致吞吐的场景。生产常规报名业务，依然优先事务包裹版本。 风险点：补偿语句执行前程序宕机、数据库断连，补偿逻辑不会执行，名额扣减无法撤销，出现数据不一致；补偿逻辑本身也会并发竞争问题。</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 无事务悲观原子 + 业务补偿回退（不推荐优先使用，仅作为备选方案）
+/// &lt;/summary&gt;
+public async Task&lt;bool&gt; SignUpAtomicCompensate(long activityId, long userId)
+{
+    // 第一步：原子扣名额，自动提交
+    var affectRows = await _dbContext.Database.ExecuteSqlInterpolatedAsync($@"
+        UPDATE Activity 
+        SET RemainQuota = RemainQuota - 1
+        WHERE Id = {activityId} AND RemainQuota &gt; 0
+    ");
+    if (affectRows &lt;= 0)
+    {
+        return false;
+    }
+
+    try
+    {
+        // 尝试写入报名记录
+        var signUpRecord = new ActivitySignUp
+        {
+            ActivityId = activityId,
+            UserId = userId,
+            CreateTime = DateTime.Now
+        };
+        await _dbContext.ActivitySignUps.AddAsync(signUpRecord);
+        await _dbContext.SaveChangesAsync();
+        return true;
+    }
+    catch
+    {
+        // 写入失败，补偿：把名额加回去（业务回退）
+        await _dbContext.Database.ExecuteSqlInterpolatedAsync($@"
+            UPDATE Activity 
+            SET RemainQuota = RemainQuota + 1
+            WHERE Id = {activityId}
+        ");
+        throw;
+    }
+}
+</code></pre>
+<p>✅ 原理：MySQL autocommit默认开启，这条UPDATE本身就是一个自动提交的独立短事务，SQL执行完成，自动提交、锁立刻释放。 ✅ 优点：锁持有时间极短、并发吞吐量最高、无死锁风险。<br>
+❌ 致命短板（报名业务几乎不能单独使用）： 如果扣名额成功之后程序宕机、网络中断，后续的报名记录无法写入。出现：名额扣掉了，但是没有用户报名记录，数据不一致。</p>
+<h2 id="12-事务包裹版本的悲观原子">1.2 事务包裹版本的悲观原子</h2>
+<p>业务诉求：​<strong>扣名额 和 新增报名记录，必须同时成功、同时回滚，不允许出现半成功状态</strong>。 此时需要手动开启事务，把原子UPDATE、插入报名记录放到同一个事务中。</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 事务包裹悲观原子：扣名额 + 写入报名记录，原子绑定
+/// &lt;/summary&gt;
+public async Task&lt;bool&gt; SignUpAtomicWithTrans(long activityId, long userId)
+{
+    using var tran = await _dbContext.Database.BeginTransactionAsync();
+    try
+    {
+        // 原子UPDATE，条件内完成名额判断+扣减
+        var affectRows = await _dbContext.Database.ExecuteSqlInterpolatedAsync($@"
+            UPDATE Activity 
+            SET RemainQuota = RemainQuota - 1
+            WHERE Id = {activityId} AND RemainQuota &gt; 0
+        ");
+
+        if (affectRows &lt;= 0)
+        {
+            await tran.RollbackAsync();
+            return false;
+        }
+
+        // 同事务写入报名记录
+        var signUpRecord = new ActivitySignUp
+        {
+            ActivityId = activityId,
+            UserId = userId,
+            CreateTime = DateTime.Now
+        };
+        await _dbContext.ActivitySignUps.AddAsync(signUpRecord);
+        await _dbContext.SaveChangesAsync();
+
+        await tran.CommitAsync();
+        return true;
+    }
+    catch (Exception ex)
+    {
+        await tran.RollbackAsync();
+        throw;
+    }
+}
+</code></pre>
+<blockquote>
+<p>关键变化：UPDATE执行拿到行锁之后，​<strong>锁不会在SQL执行完释放，会一直持有到整个事务Commit或者Rollback</strong>。</p>
+</blockquote>
+<p>✅ 优点：名额扣减、报名记录写入满足ACID，不会出现数据不一致；相比FOR UPDATE悲观锁，不需要单独SELECT查询，写法简洁，是名额争抢场景性价比最高的方案。<br>
+❌ 风险：锁持有周期拉长为整个事务周期，事务内不能放慢速逻辑，否则会引发排队超时；存在极低概率死锁。</p>
+<h2 id="13-悲观原子高频坑汇总">1.3 悲观原子高频坑汇总</h2>
+<ol>
+<li>判断名额的条件​<strong>必须写在SQL的WHERE里面</strong>，不能先C#查询判断再UPDATE，会丢失原子性，出现超卖；</li>
+<li>不要在原子UPDATE之前，用普通查询读取活动数据做判断（快照读拿到旧数据）；如果需要额外复杂校验，改用FOR UPDATE悲观锁；</li>
+<li>适合单表条件判断；多表复杂联动、大量校验逻辑不适合；</li>
+<li>无事务版本只适合单纯扣配额，正规报名业务优先事务包裹版本。</li>
+</ol>
+<h2 id="14-无事务-vs-事务包裹悲观原子对比">1.4 无事务 vs 事务包裹悲观原子对比</h2>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>锁释放时机</th>
+<th>原子范围</th>
+<th>适合报名场景</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无事务悲观原子</td>
+<td>UPDATE执行完成立刻释放（自动提交）</td>
+<td>仅这条UPDATE语句</td>
+<td>只扣名额，不需要写报名记录、流水</td>
+<td>扣名额成功后宕机，附属业务记录丢失</td>
+</tr>
+<tr>
+<td>事务包裹悲观原子</td>
+<td>事务Commit/Rollback后释放</td>
+<td>UPDATE + 同事务内全部DML</td>
+<td>标准报名：扣名额 + 新增报名记录</td>
+<td>事务过长拉长锁持有时间，并发排队</td>
+</tr>
+</tbody>
+</table>
+<h1 id="二悲观锁pessimistic-lock">二、悲观锁（Pessimistic Lock）</h1>
+<h2 id="21-原理">2.1 原理</h2>
+<p>思想：默认争抢名额的冲突一定会发生，​<strong>先加排他行锁，锁成功之后再执行业务校验与修改，事务提交或者回滚之后才释放锁</strong>。 其他请求来争抢同一条活动行锁时会阻塞等待，或者锁等待超时直接报错。</p>
+<blockquote>
+<p>注意：EF Core 没有原生封装 ​<code>FOR UPDATE</code>，需要手写原生SQL；锁必须包裹在事务内部。</p>
+</blockquote>
+<h2 id="22-代码示例活动报名场景">2.2 代码示例（活动报名场景）</h2>
+<p>适合场景：除名额外，还需要读取活动数据做多重业务校验（校验活动时间、活动状态、用户黑名单等）</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 悲观锁报名：FOR UPDATE 行排他锁，先锁行、再校验、再扣名额+写入报名记录
+/// &lt;/summary&gt;
+public async Task&lt;bool&gt; SignUpPessimistic(long activityId, long userId)
+{
+    using var tran = await _dbContext.Database.BeginTransactionAsync();
+    try
+    {
+        // FOR UPDATE 加行排他锁，事务未提交前，其他事务无法修改该行
+        var activity = await _dbContext.Activities
+            .FromSqlRaw("SELECT * FROM Activity WHERE Id = {0} FOR UPDATE", activityId)
+            .FirstOrDefaultAsync();
+
+        // 多重业务校验：名额、活动状态、时间等都可以在这里写
+        if (activity == null || activity.RemainQuota &lt;= 0)
+        {
+            await tran.RollbackAsync();
+            return false;
+        }
+
+        // 扣减名额
+        activity.RemainQuota -= 1;
+        _dbContext.Activities.Update(activity);
+
+        // 新增报名记录
+        var signUp = new ActivitySignUp
+        {
+            ActivityId = activityId,
+            UserId = userId,
+            CreateTime = DateTime.Now
+        };
+        await _dbContext.ActivitySignUps.AddAsync(signUp);
+
+        await _dbContext.SaveChangesAsync();
+        await tran.CommitAsync();
+        return true;
+    }
+    catch (Exception ex)
+    {
+        await tran.RollbackAsync();
+        // 捕获锁超时、死锁异常
+        throw;
+    }
+}
+</code></pre>
+<h2 id="23-优缺点与坑点">2.3 优缺点与坑点</h2>
+<p>✅ 优点：</p>
+<ul>
+<li>强一致性，拿到锁之后，该行数据不会被其他事务篡改；</li>
+<li>适合校验逻辑复杂，需要先读取实体、在C#代码中做多种业务判断的报名场景。</li>
+</ul>
+<p>❌ 缺点：</p>
+<ul>
+<li>锁会阻塞其他请求，事务越长，锁持有时间越久，高并发下容易排队、锁超时、产生死锁；</li>
+<li>长事务是悲观锁大忌，事务内部禁止写HTTP调用、复杂计算、慢速逻辑；</li>
+<li>仅适用于单库场景；分库分表、跨服务分布式场景，数据库行锁无效。</li>
+</ul>
+<p>⚠️ 核心坑：​<code>FOR UPDATE</code> 如果没有命中索引，会升级为表锁，整张活动表被锁住，并发直接雪崩；锁只有在事务提交/回滚后释放。</p>
+<h2 id="24-适用场景">2.4 适用场景</h2>
+<p>报名业务校验规则复杂、冲突概率高、一致性要求极高；需要读出活动实体做多种业务判断。</p>
+<h1 id="三乐观锁optimistic-lock">三、乐观锁（Optimistic Lock）</h1>
+<h2 id="31-原理">3.1 原理</h2>
+<p><strong>思想：</strong> 冲突是小概率事件，不加锁，正常读取数据；更新的时候校验版本号，如果版本和读取时不一致，说明中间名额已经被别人抢走，更新失败，交给上层重试或者返回用户“操作冲突，请重试”。<br>
+<strong>主流实现：</strong> 版本号 Version（long/int，每次更新自动+1，推荐）；时间戳DateTime存在精度问题，高并发不推荐。<br>
+<strong>更新逻辑：</strong> 读取活动、业务判断 → 更新时附带版本条件；受影响行数为0代表并发冲突。</p>
+<p>EF Core 使用 ​<code>[ConcurrencyToken]</code> 标记版本字段，自动生成并发校验SQL。 改造后的活动实体：</p>
+<pre><code class="language-c#">public class Activity
+{
+    public long Id { get; set; }
+    public string ActivityName { get; set; }
+    public int TotalQuota { get; set; }
+    public int RemainQuota { get; set; }
+
+    [ConcurrencyToken]
+    public long Version { get; set; }
+}
+</code></pre>
+<h2 id="32-基础代码示例">3.2 基础代码示例</h2>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 乐观锁报名，冲突直接返回失败
+/// &lt;/summary&gt;
+public async Task&lt;bool&gt; SignUpOptimistic(long activityId, long userId)
+{
+    var activity = await _dbContext.Activities.FindAsync(activityId);
+    if (activity == null || activity.RemainQuota &lt;= 0)
+        return false;
+
+    activity.RemainQuota -= 1;
+    var signUp = new ActivitySignUp
+    {
+        ActivityId = activityId,
+        UserId = userId,
+        CreateTime = DateTime.Now
+    };
+    await _dbContext.ActivitySignUps.AddAsync(signUp);
+
+    try
+    {
+        await _dbContext.SaveChangesAsync();
+        return true;
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        // EF Core检测到版本不匹配，抛出并发异常，代表名额已经被抢占
+        return false;
+    }
+}
+</code></pre>
+<p>EF Core底层生成SQL类似：</p>
+<pre><code class="language-sql">UPDATE Activity
+SET RemainQuota = @p0, Version = @p1
+WHERE Id = @p2 AND Version = @p3;
+</code></pre>
+<h2 id="33-带重试的封装">3.3 带重试的封装</h2>
+<p>冲突后短时间重试，提高报名成功率，必须限制最大重试次数，防止死循环：</p>
+<pre><code class="language-c#">/// &lt;summary&gt;
+/// 乐观锁报名，带有限重试
+/// &lt;/summary&gt;
+public async Task&lt;bool&gt; SignUpOptimisticWithRetry(long activityId, long userId, int maxRetry = 3)
+{
+    for (int i = 0; i &lt; maxRetry; i++)
+    {
+        // AsNoTracking 避免本地缓存干扰版本
+        var activity = await _dbContext.Activities.AsNoTracking().FirstOrDefaultAsync(x =&gt; x.Id == activityId);
+        if (activity == null || activity.RemainQuota &lt;= 0)
+            return false;
+
+        activity.RemainQuota -= 1;
+        _dbContext.Activities.Update(activity);
+        var signUp = new ActivitySignUp
+        {
+            ActivityId = activityId,
+            UserId = userId,
+            CreateTime = DateTime.Now
+        };
+        await _dbContext.ActivitySignUps.AddAsync(signUp);
+
+        try
+        {
+            await _dbContext.SaveChangesAsync();
+            return true;
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            _dbContext.ChangeTracker.Clear();
+            await Task.Delay(20); // 简单退避
+        }
+    }
+    return false;
+}
+</code></pre>
+<h2 id="34-优缺点与坑点">3.4 优缺点与坑点</h2>
+<p>✅ 优点：</p>
+<ul>
+<li>没有长锁，读操作不会被阻塞，数据库性能好；</li>
+<li>不存在死锁问题；</li>
+<li>适合读多写少、报名争抢不激烈的活动。</li>
+</ul>
+<p>❌ 缺点：</p>
+<ul>
+<li>冲突发生时会失败，需要自己实现重试策略；</li>
+<li>大量并发争抢名额时，重试会持续打数据库，压力上涨；</li>
+<li>无法杜绝“查询时有名额，长时间等待后再提交”的窗口问题。</li>
+</ul>
+<p>⚠️ 核心坑： 版本号必须由数据库更新自增，不能在C#代码手动赋值；不能无限制重试。</p>
+<h2 id="35-适用场景">3.5 适用场景</h2>
+<p>读多写少、并发争抢名额概率低，能够接受提示用户重试的活动报名场景。</p>
+<h1 id="四三大方案横向总对比">四、三大方案横向总对比</h1>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>核心手段</th>
+<th>一致性</th>
+<th>是否长锁</th>
+<th>阻塞</th>
+<th>死锁风险</th>
+<th>适合活动报名场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>悲观原子（事务包裹）</td>
+<td>带条件原子UPDATE，放在事务内</td>
+<td>强一致</td>
+<td>✅ 锁持有至事务结束</td>
+<td>争抢同名额会排队</td>
+<td>低</td>
+<td>只校验名额是否充足，单表判断，报名业务首选</td>
+</tr>
+<tr>
+<td>悲观锁</td>
+<td>SELECT ... FOR UPDATE 事务行锁</td>
+<td>强一致</td>
+<td>✅ 事务周期持有锁</td>
+<td>会阻塞等待</td>
+<td>有</td>
+<td>除名额外还有大量业务校验，需要读取活动实体做判断</td>
+</tr>
+<tr>
+<td>乐观锁</td>
+<td>Version版本号，提交校验</td>
+<td>强一致</td>
+<td>❌ 无长锁</td>
+<td>不阻塞读，冲突直接失败</td>
+<td>无</td>
+<td>读多写少，名额争抢概率低，可接受重试提示</td>
+</tr>
+</tbody>
+</table>
+<h1 id="五选型决策">五、选型决策</h1>
+<ol>
+<li>只校验剩余名额，业务简单，扣名额同时要写入报名记录 → <strong>事务包裹悲观原子（优先推荐）</strong></li>
+<li>除名额外，还要校验活动时间、上下架状态、用户黑名单等，需要读取实体做复杂逻辑 → <strong>悲观锁 FOR UPDATE</strong></li>
+<li>活动流量大、但是报名争抢名额很少，读远大于写，允许用户提示重试 → <strong>乐观锁</strong></li>
+<li>多服务分布式争抢同一个名额，数据库锁全部失效 → 需要Redis分布式锁（本文不展开）</li>
+</ol>
+<h1 id="六总结">六、总结</h1>
+<ol>
+<li><strong>悲观原子</strong>​：依靠带条件UPDATE实现语句级原子；​<strong>有无事务是它的核心分支</strong>。无事务仅单语句安全，无法配套写报名记录；事务包裹版本兼顾防超卖与多步写入的一致性，是大部分简单名额报名场景的最优解。</li>
+<li><strong>悲观锁</strong>：先上锁再执行业务，强一致；代价是锁阻塞、长事务风险，适合校验复杂的报名流程。</li>
+<li><strong>乐观锁</strong>：不加锁，依靠版本号检测冲突，冲突后重试；适合争抢不激烈的活动。</li>
+</ol>
+<p>日常 .NET Core 报名系统开发里，绝大多数名额扣减需求，事务包裹的悲观原子就足够稳定落地；只有校验逻辑变复杂时，再切换为悲观锁。</p>
+<blockquote>
+<p>误区提醒：不要把悲观原子等同于乐观锁。乐观锁的设计思想是“冲突很少，冲突重试”；悲观原子的目标是直接在数据库层面拦截超卖，业务上是悲观的思路。</p>
+</blockquote>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>本文来自博客园，作者：<a href="https://www.cnblogs.com/ykbb/" target="_blank">一块白板</a>，转载请注明原文链接：<a href="https://www.cnblogs.com/ykbb/p/23532279/c-2voqmz" target="_blank">https://www.cnblogs.com/ykbb/p/23532279/c-2voqmz</a></p>
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-03 10:37">2026-11-03 10:36</span>&nbsp;
+<a href="https://www.cnblogs.com/ykbb">一块白板</a>&nbsp;
+阅读(<span id="post_view_count">31</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23532279);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fykbb%2Fp%2F23532279%2Fc-2voqmz&amp;targetId=23532279&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

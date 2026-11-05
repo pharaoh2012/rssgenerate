@@ -1,0 +1,714 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/mudtools/p/23555872" title="发布于 2026-11-05 09:35">
+    
+
+    <span role="heading" aria-level="2">把AI编码从自由生成到受约束声明：微信生态 .NET SDK 中用源生成器压制 AI 编码幻觉的工程实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>Mud.Wechat 是一套覆盖企业微信、公众号、小程序、微信支付、开放平台、微信小店·视频号、<br>
+腾讯广告七条产品线的 .NET SDK：18 个可打包工程、2000+ 端点。仅企业微信线就有 470 个接口<br>
+（158 个父接口 + 312 个可注入接口）、122 个回调事件键。在这个体量上，靠人工逐条比对官方文档<br>
+不可行，正确性必须由机器检查；配套的 20 个测试工程与 650+ 测试文件，主要职能就是把官方契约<br>
+固定成可执行断言。</p>
+</blockquote>
+<p>这套代码的写法可以概括为：把"写实现"换成"写声明"。端点、DTO、回调载荷、AI 工具都以特性和<br>
+签名声明，实现类、序列化上下文、契约登记表、工具 Schema 由源生成器发射，偏差再由编译错误、<br>
+AOT 诊断与契约守卫挡住。本文回答三个问题：哪些环节可以这样交给生成器、哪些不能；这些机制在<br>
+什么条件下失效；维护成本落在哪里。文中机制对应仓库内的具体文件，数字取自当前基线，失效案例<br>
+来自实际踩过的坑。</p>
+<hr>
+<h2 id="一把幻觉定义成可观测事件">一、把"幻觉"定义成可观测事件</h2>
+<h3 id="11-定义">1.1 定义</h3>
+<p>如果把"AI 编码幻觉"当成模型属性，讨论会落在无法测量的地方（模型多大、温度多少、提示词怎么写）。本文换一个定义：</p>
+<blockquote>
+<p><strong>幻觉 = 模型产出的代码与项目认定的事实源不一致，且现有流程未能在合入前发现。</strong></p>
+</blockquote>
+<p>这个定义把问题从"模型是否可靠"转到"流程能否检出"，后者可以工程化。它同时给出两个可操作的自变量：</p>
+<ul>
+<li><strong>可写面大小</strong>：模型需要自由发挥的代码量；</li>
+<li><strong>错误信号强度</strong>：写错之后多久、以什么形式被发现。</li>
+</ul>
+<h3 id="12-三类可观测形态">1.2 三类可观测形态</h3>
+<p>在 Mud.Wechat 的日常增量中，AI 写错的形态集中在三类，且三类的检出难度差别很大。</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>具体形态</th>
+<th>无机制时的检出时机</th>
+<th>检出难度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>事实错误</td>
+<td>路由拼错、HTTP 方法写反、官方字段名按直觉拼、令牌放进 Header（企微强制走 Query）</td>
+<td>联调或线上</td>
+<td>中：会在请求失败时暴露</td>
+</tr>
+<tr>
+<td>契约错误</td>
+<td>DTO 未登记序列化上下文；回调处理器的事件键不在载荷契约里；配置项无人读取</td>
+<td>运行期</td>
+<td>高：多数不抛异常、不返回错误码</td>
+</tr>
+<tr>
+<td>结构错误</td>
+<td>目录 / 命名空间 / 注册入口三处不一致；新工程未进解决方案清单</td>
+<td>评审或发布</td>
+<td>中：靠人看或靠打包失败</td>
+</tr>
+</tbody>
+</table>
+<p>第二类是重点。以回调为例：处理器声明的事件键写错后，事件到达时匹配不到处理器，SDK 返回 200，官方不再重推，业务侧表现为"这个事件从来没来过"。没有错误日志、没有异常栈，只有一条缺失的业务数据。这类错误的排查成本远高于编译错误。</p>
+<h3 id="13-三个结构性根因">1.3 三个结构性根因</h3>
+<p>把上述错误归因到"模型不够聪明"，不能推出任何工程动作。归因到结构，才能推出动作。</p>
+<ol>
+<li><strong>事实源不在上下文里。</strong> 微信生态七个文档站点、数千个端点页面，且存在同一接口商户页与服务商页字段表不一致、已下架页面仍留在目录树的情况。模型只能按训练记忆补全，记忆与当前文档版本的偏差不可观测。</li>
+<li><strong>错误没有编译期代价。</strong> 手写 <code>HttpClient</code> 拼错 URL、DTO 少标一个序列化特性、配置项写了没人读，编译器一律不报错。</li>
+<li><strong>同一件事有多种写法。</strong> 一个 POST 端点可以用 <code>PostAsync</code>、<code>SendAsync</code>、自定义封装实现；样本越多，模型输出的方差越大。</li>
+</ol>
+<p>写成函数形式：</p>
+<pre><code>错误率 ≈ f(可写面大小, 错误信号强度)
+提示词 → 只能微弱影响"模型自检"这一项
+工程结构 → 直接决定前两项的量级
+</code></pre>
+<p>这不是类比。可写面大小可以直接数：手写一个端点要写 URL、令牌注入、序列化、错误码解析、DI 注册，声明式只需要一个方法签名和几个特性。信号强度也可以直接数：错误是在编译期、CI、联调还是线上被发现的。</p>
+<hr>
+<h2 id="二方法总览三层结构与可写面">二、方法总览：三层结构与可写面</h2>
+<h3 id="21-三层">2.1 三层</h3>
+<div class="mermaid">flowchart LR
+    A["声明层&lt;br/&gt;特性 · 方法签名 · DTO 属性 · XML 注释"] --&gt; B["生成层&lt;br/&gt;实现类 · JsonContext · RegisterAll · Schema"]
+    B --&gt; C["门禁层&lt;br/&gt;编译错误 · AOT IL 诊断 · 契约守卫 · 配置审计"]
+    C --&gt;|通过| D["合入"]
+    C --&gt;|失败| A
+</div><p>三层各自的责任边界很清楚：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>谁写</th>
+<th>自由度</th>
+<th>错误的表现形式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>声明层</td>
+<td>AI（或人）</td>
+<td>有限：特性、签名、字段、注释</td>
+<td>编译器报错、分析器诊断、守卫断言失败</td>
+</tr>
+<tr>
+<td>生成层</td>
+<td>生成器</td>
+<td>零：同一输入必得同一输出</td>
+<td>生成器自身缺陷（需守卫兜底）</td>
+</tr>
+<tr>
+<td>门禁层</td>
+<td>CI</td>
+<td>零：通过或不通过</td>
+<td>唯一出口，不可绕过</td>
+</tr>
+</tbody>
+</table>
+<p>关键在第三列。声明层的错误<strong>有确定的反馈通道</strong>；生成层没有自由度，因此不产生"风格差异"这类错误；门禁层没有自由度，因此不存在"这次先放过"。</p>
+<h3 id="22-可写面缩小到什么程度">2.2 可写面缩小到什么程度</h3>
+<p>以企业微信线的异步导入域为例。手写实现需要覆盖 4 个端点的方法体、URL、令牌位置、请求体序列化、响应解析、DI 注册；声明式只需要下面这些：</p>
+<pre><code class="language-csharp">// Interfaces/Contacts/IWechatWorkBatchService.cs（公共父接口，不注册 DI）
+[HttpClientApi(TokenManage = nameof(IWechatAppManager), IsAbstract = true)]
+[Token(TokenType = WechatTokenTypes.AccessToken,
+      InjectionMode = TokenInjectionMode.Query, Name = "access_token")]
+public interface IWechatWorkBatchService
+{
+    [Post("/cgi-bin/batch/syncuser")]
+    Task&lt;BatchJobResponse&gt; SyncUsersAsync(
+        [Body] BatchImportUsersRequest request,
+        CancellationToken cancellationToken = default);
+
+    // 其余 3 个端点同形态
+}
+</code></pre>
+<pre><code class="language-csharp">// Interfaces/Contacts/IWechatWorkBatchService_Internal.cs（应用类型子接口）
+[HttpClientApi(RegistryGroupName = "Contact",
+    TokenManage = nameof(IWechatAppManager), InheritedFrom = nameof(WechatWorkBatchService))]
+[Token(TokenType = WechatTokenTypes.AccessToken,
+      TokenManagerKey = WechatTokenManagerKeys.InternalAccessToken,
+      InjectionMode = TokenInjectionMode.Query, Name = "access_token")]
+public interface IWechatWorkInternalBatchService : IWechatWorkBatchService
+{
+}
+</code></pre>
+<p>实现类 <code>WechatWorkBatchService</code> 由生成器发射到 <code>Mud.Wechat.Work.Interfaces.Internal</code>，不入库；注册方法 <code>AddContactWebApiHttpClient()</code> 同为生成物，没有签入源文件。企业微信线 470 个接口对应同一套规则，手写 <code>HttpClient</code> 代码为 0 行。</p>
+<p>四类任务的可写面对比如下（行数以异步导入域的实际文件为准）：</p>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>手写方案的必写内容</th>
+<th>声明方案的必写内容</th>
+<th>事实依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>新增一个端点</td>
+<td>URL、方法体、令牌注入、序列化、错误码、注册</td>
+<td>方法签名 + <code>[Post]</code> + <code>[Body]</code></td>
+<td>父接口 107 行（含 XML 文档注释），方法体 0 行</td>
+</tr>
+<tr>
+<td>新增一个 DTO</td>
+<td>类 + 序列化上下文登记</td>
+<td>类 + <code>[HttpJsonSerializable]</code></td>
+<td>特性可由脚本批量补</td>
+</tr>
+<tr>
+<td>新增一个回调事件</td>
+<td>载荷类 + 解析 + 登记 + 处理器</td>
+<td>载荷类 + 2 个特性 + 处理器</td>
+<td>登记表由生成器发射</td>
+</tr>
+<tr>
+<td>新增一个 AI 工具</td>
+<td>Schema + 解包器 + 注册</td>
+<td>接口 + <code>[AgentTool]</code> + <code>[ToolParameter]</code></td>
+<td>Schema 与解包器由生成器发射</td>
+</tr>
+</tbody>
+</table>
+<h3 id="23-为什么-review-不是主要手段">2.3 为什么 review 不是主要手段</h3>
+<p>"AI 生成 + 人工 review"在工程上成立，但成本结构随规模变化：</p>
+<ul>
+<li>人工 review 的成本与代码行数近似线性，漏检率随行数上升（注意力是有限资源）；</li>
+<li>实现层的行数是声明层的 5~20 倍，因此 review 实现层的总成本高一个量级；</li>
+<li>声明层的错误有机器信号（编译器、分析器、守卫），人工只需要判断"声明是否表达了官方契约"这一类语义问题。</li>
+</ul>
+<p>结论不是"review 没用"，而是<strong>把 review 放在声明层，把实现层交给生成器</strong>。前者是判断，后者是机械复现。</p>
+<hr>
+<h2 id="三四条生成链">三、四条生成链</h2>
+<p>四条链的共同结构是"声明进、代码出"，但各自消灭的错误类型不同。</p>
+<div class="mermaid">flowchart TB
+    subgraph IN["声明（AI 可写面）"]
+        I1["[HttpClientApi]&lt;br/&gt;[Get] / [Post] / [Token] / [Query] / [Body]"]
+        I2["[HttpJsonSerializable]"]
+        I3["[PayloadContract]&lt;br/&gt;[WechatCallbackContract]"]
+        I4["[AgentTool]&lt;br/&gt;[ToolParameter]"]
+    end
+
+    subgraph GEN["生成层（零自由度）"]
+        G1["实现类&lt;br/&gt;Add{域}WebApiHttpClient()"]
+        G2["{域}JsonContext.g.cs"]
+        G3["RegisterAll&lt;br/&gt;PayloadFieldMap"]
+        G4["MCP Schema&lt;br/&gt;参数解包器 · golden 快照"]
+    end
+
+    subgraph GATE["门禁层"]
+        C1["编译 + AOT strict"]
+        C2["契约守卫"]
+        C3["golden diff"]
+    end
+
+    I1 --&gt; G1 --&gt; C1
+    I2 --&gt; G2 --&gt; C1
+    I3 --&gt; G3 --&gt; C2
+    I4 --&gt; G4 --&gt; C3
+</div><table>
+<thead>
+<tr>
+<th>链</th>
+<th>输入</th>
+<th>输出</th>
+<th>落点</th>
+<th>消灭的错误</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>声明式接口</td>
+<td><code>[HttpClientApi]</code> + 路由 / 令牌特性</td>
+<td>实现类 + DI 注册方法</td>
+<td><code>Internal/</code>（生成，不入库）</td>
+<td>手写 URL / 令牌位置漂移 / 注册遗漏</td>
+</tr>
+<tr>
+<td>JSON 上下文</td>
+<td><code>[HttpJsonSerializable]</code></td>
+<td><code>{域}JsonContext.g.cs</code></td>
+<td><code>DataModels/Generated/</code>（入库，勿手改）</td>
+<td>反射序列化、上下文漏登记</td>
+</tr>
+<tr>
+<td>回调契约</td>
+<td><code>[PayloadContract]</code> + <code>[WechatCallbackContract]</code></td>
+<td><code>RegisterAll</code> + 字段映射</td>
+<td>生成器发射</td>
+<td>事件键与载荷不一致、静默丢事件</td>
+</tr>
+<tr>
+<td>工具 Schema</td>
+<td><code>[AgentTool]</code> + <code>[ToolParameter]</code></td>
+<td>Schema + 解包器 + 注册器</td>
+<td>生成物 + golden</td>
+<td>Schema 与执行器实现漂移</td>
+</tr>
+</tbody>
+</table>
+<h3 id="31-声明式接口--实现类">3.1 声明式接口 → 实现类</h3>
+<p><strong>输入</strong>：接口上的 <code>[HttpClientApi]</code>（<code>RegistryGroupName</code> 决定模块注册组、<code>InheritedFrom</code> 指向父实现类、<code>TokenManage</code> 指向令牌管理器）与方法上的 <code>[Get]</code>/<code>[Post]</code>/<code>[Query]</code>/<code>[Body]</code>。</p>
+<p><strong>输出</strong>：实现类 + <code>Add{域}WebApiHttpClient()</code>。两者都不入库，因此在代码评审中不存在"生成代码要不要看"的问题——它不在 diff 里。</p>
+<p><strong>消除的错误</strong>：URL 拼接错误、HTTP 方法写反、令牌注入位置漂移（企微强制 Query，不是 Header）、注册方法漏写。</p>
+<p><strong>代价</strong>：</p>
+<ul>
+<li><code>netstandard2.0</code> 下部分便利 API 不可用，需要换等价写法（<code>ValueTask.FromResult</code> → <code>new ValueTask&lt;T&gt;(x)</code>、<code>string.Contains(x, cmp)</code> → <code>IndexOf &gt;= 0</code> 等）；</li>
+<li>生成实现不可手改，个性化逻辑只能放在调用方或服务层；</li>
+<li>接口命名空间按 <code>IsAbstract</code> 二分（父接口 → <code>Mud.Wechat.Work.Interfaces</code>，可注入接口 → <code>Mud.Wechat.Work</code>），新增接口必须同批调整守卫 N1~N3 的 158 / 312 计数。</li>
+</ul>
+<h3 id="32-dto--jsoncontext">3.2 DTO → JsonContext</h3>
+<p><strong>输入</strong>：</p>
+<pre><code class="language-csharp">[HttpJsonSerializable(SerializerClassName = "Batch")]
+public class BatchJobResponse : WechatWorkResponse
+{
+    [JsonPropertyName("jobid")]          // 官方原文拼写，不改成 jobId
+    public string? JobId { get; set; }
+}
+</code></pre>
+<p><strong>输出</strong>：<code>DataModels/Generated/BatchJsonContext.g.cs</code>。<code>SerializerClassName</code> 取命名空间域段，每个域一个上下文，上下文 <code>internal</code>，由 <code>InternalsVisibleTo</code> 供主包与测试直读。</p>
+<p><strong>消除的错误</strong>：新增 DTO 后忘记登记（运行期序列化抛出"类型未配置"）、以及反射序列化在 AOT 下的不可用。后者的判定不靠纪律，靠门禁：<code>AotStrictMode</code> 把 <code>IL2026</code>/<code>IL3050</code> 等诊断升为错误，反射版 <code>JsonSerializer.Serialize&lt;T&gt;(T, JsonSerializerOptions)</code> 直接构建失败。</p>
+<p><strong>代价</strong>：</p>
+<ul>
+<li>新增 DTO 必须跑 <code>AddHttpJsonSerializable.ps1</code> + <code>GenerateJsonContext.ps1</code>；</li>
+<li>生成物入库，但一旦手改，下次重新生成即被覆盖，且编译器不会提醒；</li>
+<li>开放泛型不登记（<code>SYSLIB1030</code>），<code>WechatChatbotResponse&lt;T&gt;</code> 是已知例外，其闭合构造由调用方按具体类型使用；</li>
+<li>配置 DTO 禁止 <code>required</code>：配置绑定是源生成的，生成器以 <code>new T()</code> 构造，写 <code>required</code> 直接报 <code>CS9035</code>，校验必须放进 <code>Validate()</code>。</li>
+</ul>
+<h3 id="33-回调载荷--契约登记">3.3 回调载荷 → 契约登记</h3>
+<p><strong>输入</strong>：载荷类上的两个特性。</p>
+<pre><code class="language-csharp">[PayloadContract]
+[WechatCallbackContract(
+    WechatCallbackEventTypes.CreateUser,          // 事件键，可多参覆盖同载荷的多个键
+    OpenSurfaces = new[] { /* 模式集合 × 通道 */ },
+    RequiredFamily = WechatEventFamily.Contacts)]
+public sealed class ContactUserChangedPayload
+{
+    public static PayloadFieldMap PayloadFieldMap { get; } = ...;   // 上游生成器产出
+}
+</code></pre>
+<p><strong>输出</strong>：<code>OfficialPayloadContracts.RegisterAll</code> 的方法体，每事件键一条 <code>registry.Register(...)</code>，把事件键、字段映射、开放面、必带事件值、族前置条件一次写全。生成器同时做声明完整性校验，缺 <code>OpenSurfaces</code>/<code>Channel</code>/<code>EventTypes</code> 或同键多声明互相矛盾时，报 <code>MUDCB001</code>（Error）。</p>
+<p><strong>消除的错误</strong>：这是四条链里最能说明问题的一条。回调处理器写错键的故障形态是"静默丢事件"——HTTP 200、无异常、无日志、官方不重推。分析器以载荷契约为唯一权威，把这件事变成编译错误：</p>
+<pre><code class="language-csharp">public sealed class MyHandler : WechatCallbackPayloadHandler&lt;ContactUserChangedPayload&gt;
+{
+    // 该载荷的契约键集里没有 "create_party" ⇒ MUDCB002（Error）
+    public override string SupportedEventType =&gt; "create_party";
+}
+</code></pre>
+<p>诊断分工如下，两者不可互相替代：</p>
+<table>
+<thead>
+<tr>
+<th>诊断</th>
+<th>产生方</th>
+<th>级别</th>
+<th>触发条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MUDCB001</td>
+<td>生成器</td>
+<td>Error</td>
+<td>契约声明不完整，或同键多声明矛盾</td>
+</tr>
+<tr>
+<td>MUDCB002</td>
+<td>分析器</td>
+<td>Error</td>
+<td>处理器键 ∉ 载荷契约键集</td>
+</tr>
+<tr>
+<td>MUDCB003</td>
+<td>分析器</td>
+<td>Info</td>
+<td>键不是编译期常量，无法静态校验</td>
+</tr>
+<tr>
+<td>MUDCB004</td>
+<td>分析器</td>
+<td>Warning</td>
+<td>键写成字符串字面量而非 <code>WechatCallbackEventTypes</code> 常量</td>
+</tr>
+<tr>
+<td>MUDCB005</td>
+<td>分析器</td>
+<td>Warning</td>
+<td>处理器疑似未注册（启发式，非安全闸）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>代价</strong>：</p>
+<ul>
+<li>载荷按官方<strong>报文结构族</strong>建模，不是逐事件一个 DTO；三模式（自建 / 第三方 / 代开发）报文结构相同、仅值的有无不同，因此载荷是可空超集，禁止在载荷层出现 <code>WechatAppType</code> 分支；</li>
+<li>官方"重复同名兄弟元素"的列表形态需要投影器做全树同名兄弟合并，包装形态的项名还要登记豁免表；这些规则一旦违反，运行期表现为字段丢失而不是异常；</li>
+<li>规则本身是给 AI 的约束：不得新增"逐事件 DTO + 手写 <code>ParseXxx</code>"，不得手写多级嵌套解析，不得手改 <code>RegisterAll</code> 方法体。</li>
+</ul>
+<h3 id="34-工具--schema--golden">3.4 工具 → Schema + golden</h3>
+<p><strong>输入</strong>：</p>
+<pre><code class="language-csharp">[AgentTool(
+    name: "approval.get",
+    Description = "按审批单号获取企业微信审批申请详情……返回 sp_no、sp_name、sp_status……不含表单控件取值与审批意见正文。",
+    Source = "IWechatWorkApprovalService.GetApprovalDetailAsync",
+    RequiredScopes = ["approval.read"])]
+public interface IWechatWorkApprovalGetTool
+{
+    Task&lt;string&gt; GetApprovalDetailAsync(
+        [ToolParameter("sp_no", "审批单号（由用户从审批应用/通知中提供）。", Required = true)]
+        string sp_no,
+        CancellationToken cancellationToken = default);
+}
+</code></pre>
+<p><strong>输出</strong>：Schema、参数解包器、域注册器，以及 <code>Generated/WechatToolSchemas.golden.txt</code> 快照。</p>
+<p><strong>消除的错误</strong>：Schema 与执行器实现漂移。模型看到的是 Schema，执行的是解包器，两者由同一份声明发射，结构上不会分叉；描述文字的改动则被 golden 快照拦住——快照按 <code>&lt;工具名&gt;\t&lt;SchemaJson&gt;</code>、工具名 Ordinal 升序、LF 行尾落盘，任何一项变化都会让构建失败。</p>
+<p>这一条链有个容易被忽略的设计判断：<strong>快照是契约，不是构建副产物</strong>。把描述文字也纳入 diff，意味着"改一句给模型看的说明"和"改一个端点"一样需要显式确认。</p>
+<p><strong>代价</strong>：改描述必须重固化快照并逐行 <code>git diff</code> 复核；快照更新脚本要绕开"漂移即构建失败"与"失败构建不落地生成物"之间的死锁（先以跳过比对的开关构建一次，再从生成物重建快照）。</p>
+<hr>
+<h2 id="四门禁层让错误有代价">四、门禁层：让错误有代价</h2>
+<h3 id="41-verify-build-三步">4.1 verify-build 三步</h3>
+<div class="mermaid">flowchart TD
+    A["提交前"] --&gt; B["步骤 1&lt;br/&gt;Release 全量构建"]
+    B --&gt;|编译错误不为 0| X["失败"]
+    B --&gt; C["步骤 2&lt;br/&gt;逐源工程 net8.0 AOT strict"]
+    C --&gt;|编译错误或 IL 诊断不为 0| X
+    C --&gt; D["步骤 3&lt;br/&gt;逐测试工程 net8.0"]
+    D --&gt;|守卫断言失败| X
+    D --&gt; E["通过"]
+</div><table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>做什么</th>
+<th>断言什么</th>
+<th>已知的假绿风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>dotnet build -c Release</code> 全量</td>
+<td>编译错误数 = 0</td>
+<td>无</td>
+</tr>
+<tr>
+<td>2</td>
+<td>逐源工程 <code>AotStrictMode=true</code>、<code>-f net8.0</code>、<code>--no-incremental</code></td>
+<td><strong>编译错误数 = 0 且 IL 诊断数 = 0</strong></td>
+<td>只断言其一</td>
+</tr>
+<tr>
+<td>3</td>
+<td>逐测试工程 <code>-f net8.0</code></td>
+<td>全部用例通过</td>
+<td>测试工程排除在 AOT 之外</td>
+</tr>
+</tbody>
+</table>
+<p>步骤 2 的三个设置缺一不可，每一条都对应一次假绿：</p>
+<pre><code class="language-powershell"># ① 双断言：构建失败时 IL 诊断计数仍为 0，只断言 IL 就是假绿
+$aotErrors = ([regex]::Matches($aotLog, ': error ')).Count
+$ilErrors  = ([regex]::Matches($aotLog, ': (error|warning) IL\d{4}')).Count
+Assert-Zero -Step '步骤2' -Name "$($project.BaseName) 编译错误" -Value $aotErrors
+Assert-Zero -Step '步骤2' -Name "$($project.BaseName) IL 诊断"    -Value $ilErrors
+
+# ② 递归枚举：漏掉嵌套 csproj，AOT 步骤静默空跑（可用有界 -Depth，但不得退化为名单）
+# ③ --no-incremental：CoreCompile 只比对时间戳，紧跟步骤 1 的构建会被整体跳过
+</code></pre>
+<p>一个细节：门禁只统计编译错误与 IL 诊断，不因 CS 警告失败。理由是低 TFM 下存在大量既存 <code>CS86xx</code> 警告，若把警告也纳入，团队会把精力花在消警告而不是修契约上。</p>
+<h3 id="42-契约守卫">4.2 契约守卫</h3>
+<p>守卫是契约的机器可读描述，不是测试的补充。以异步导入域为例：</p>
+<pre><code class="language-csharp">private static readonly (Type Interface, string Method, Type HttpAttribute, string Route)[] Routes =
+{
+    (typeof(IWechatWorkBatchService), nameof(IWechatWorkBatchService.SyncUsersAsync),      typeof(PostAttribute), "/cgi-bin/batch/syncuser"),
+    (typeof(IWechatWorkBatchService), nameof(IWechatWorkBatchService.ReplaceUsersAsync),   typeof(PostAttribute), "/cgi-bin/batch/replaceuser"),
+    (typeof(IWechatWorkBatchService), nameof(IWechatWorkBatchService.ReplaceDepartmentsAsync), typeof(PostAttribute), "/cgi-bin/batch/replaceparty"),
+    (typeof(IWechatWorkBatchService), nameof(IWechatWorkBatchService.GetBatchJobResultAsync),  typeof(GetAttribute),  "/cgi-bin/batch/getresult"),
+};
+
+[Fact]
+public void BatchEndpoints_ShouldMatchOfficialRoutes()
+{
+    Routes.Should().HaveCount(4, "官方对自建/第三方应用开放一致的 4 个异步导入端点");
+    foreach (var (iface, method, httpAttribute, route) in Routes)
+    {
+        // DeclaredOnly：端点必须落在父接口自身声明，而不是从子接口继承
+        var target = iface.GetMethod(method, BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+        var attr = target!.GetCustomAttribute(httpAttribute) as HttpMethodAttribute;
+        attr!.RequestUri.Should().Be(route);
+    }
+}
+</code></pre>
+<p>守卫锁定的是<strong>官方契约</strong>，不是实现细节：端点数、HTTP 方法、路由、令牌绑定、DTO 上下文登记、字段名（含官方原文拼写）。因此规则是"改契约面必须同批改守卫"，而不是"改完再补测试"——守卫是描述本身，测试只是它的一种载体。</p>
+<h3 id="43-结构不变式与配置审计">4.3 结构不变式与配置审计</h3>
+<p>契约守卫管"内容对不对"，还有一组不变量管"位置对不对"：</p>
+<table>
+<thead>
+<tr>
+<th>不变量</th>
+<th>内容</th>
+<th>违反后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AB-G6</td>
+<td>可打包集恰等于终态 18 包清单（集合相等）</td>
+<td>少一项 = 工程漏登记；多一项 = 又拆出无人单独安装的包</td>
+</tr>
+<tr>
+<td>AB-G10</td>
+<td>目录 ⇔ 命名空间双向校验</td>
+<td>新 DTO 落回工程根，命名空间与目录错位</td>
+</tr>
+<tr>
+<td>N1~N3</td>
+<td>接口命名空间 ⇔ <code>IsAbstract</code> 二分，锁定 158 / 312</td>
+<td>父接口混入可注入面，IDE 自动完成列表被污染</td>
+</tr>
+<tr>
+<td>依赖白名单</td>
+<td>跨线依赖边白名单仅 2 条</td>
+<td>包边界失效，按需引用退化</td>
+</tr>
+</tbody>
+</table>
+<p>配置面另有一道审计：每个公开可写配置属性必须有真实消费点，<code>Validate()</code> / <code>ToString()</code> 不算消费点。没有消费点的属性只有两种处置——补消费点，或删属性。加白名单绕开不在这两种之内。</p>
+<h3 id="44-门禁为什么比提示词有效">4.4 门禁为什么比提示词有效</h3>
+<p>三个可比较的维度：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>提示词</th>
+<th>门禁</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>效果可测量性</td>
+<td>不可测（同一提示词在不同上下文结果不同）</td>
+<td>可测（每次构建通过 / 失败）</td>
+</tr>
+<tr>
+<td>反馈粒度</td>
+<td>需要模型自检，粒度取决于模型</td>
+<td>精确到文件、行、诊断号</td>
+</tr>
+<tr>
+<td>可回归性</td>
+<td>提示词改了就没了</td>
+<td>规则在代码里，可 diff、可 review、可回滚</td>
+</tr>
+</tbody>
+</table>
+<p>还有一点是提示词做不到的：<strong>编译错误文本本身就是下一轮的输入</strong>。AI 拿到 <code>MUDCB002 ... 键 "create_party" 不在载荷契约键集</code>，修正成本接近零；拿到"事件没来"这个运行期现象，修正成本高一个量级。</p>
+<hr>
+<h2 id="五失效场景">五、失效场景</h2>
+<p>这一节不是免责声明，而是这套方法的使用条件。以下六条都在本仓实际发生过。</p>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>表现</th>
+<th>检测手段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>生成器只认硬编码 metadata name</td>
+<td>特性或宿主类型改名后，规则静默空跑：0 发射、0 诊断、无报错</td>
+<td>守卫里的反射断言（CB24 是唯一能发现该漂移的形态）</td>
+</tr>
+<tr>
+<td>生成物入库但不许手改</td>
+<td>手改后下次重新生成即被覆盖，编译器不提示</td>
+<td>文件头 <code>&lt;auto-generated&gt;</code> + 文档明确边界</td>
+</tr>
+<tr>
+<td>扫 <code>obj/</code> 断言生成物</td>
+<td>常态构建不落地 <code>*.g.cs</code>，<code>obj/</code> 里是历史残骸 → 本地假红、干净 CI 假绿</td>
+<td>不用扫描代替编译；需要看生成物时用 <code>EmitCompilerGeneratedFiles=true --no-incremental</code></td>
+</tr>
+<tr>
+<td>同版本重打包</td>
+<td>NuGet 按 <code>id + version</code> 计价，内容变了版本没变 ⇒ 下游沿用旧程序集</td>
+<td>删全局缓存包目录 → <code>restore --no-cache</code> → <code>clean</code> → <code>build</code></td>
+</tr>
+<tr>
+<td>分析器规则被当成安全闸</td>
+<td>MUDCB005 是启发式，跨程序集注册编排不在覆盖范围</td>
+<td>文档标注"启发式"；关键路径另设运行期断言</td>
+</tr>
+<tr>
+<td>守卫自身漂移</td>
+<td>改守卫让测试变绿是最短路径</td>
+<td>计数类断言设基线锚点（<code>ContractBaseline</code>）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="51-这些坑的共同结构">5.1 这些坑的共同结构</h3>
+<p>六个坑可以归成两类：</p>
+<ol>
+<li><strong>静默失效</strong>：机制看起来在工作，实际没有触发（metadata name 漂移、<code>obj</code> 残骸、分析器启发式）；</li>
+<li><strong>缓存与残留</strong>：构建系统按时间戳或版本号走捷径，导致新旧产物并置（incremental、NuGet 缓存）。</li>
+</ol>
+<p>两类都不是"逻辑写错"，而是"约束没有被观测"。由此得到一条设计准则：<strong>任何自动机制都必须有一个显式断言证明它这次真的执行了</strong>。门禁步骤 2 的双断言（编译错误 + IL 诊断）就是这条准则的直接应用——如果只断言 IL = 0，构建失败时同样为 0，机制等于没跑。</p>
+<h3 id="52-源生成不提供自动正确">5.2 源生成不提供"自动正确"</h3>
+<p>生成器只能覆盖可机械判定的部分：路由字符串与特性是否一致、事件键是否在键集内、Schema 是否与声明一致。它不能判定：</p>
+<ul>
+<li>选错了抽象（把有状态编排塞进声明式接口）；</li>
+<li>模块拆分错误（一个域包含了两类生命周期差异很大的端点）；</li>
+<li>官方文档本身自相矛盾时该采信哪一页。</li>
+</ul>
+<p>这些仍然需要人判断。所以准确的表述是：<strong>源生成把"可机械判定"的错误从运行期移到编译期，把"不可机械判定"的错误留给评审</strong>。它不减少后者的工作量，只是让前者的工作量趋近于零。</p>
+<hr>
+<h2 id="六可迁移的做法">六、可迁移的做法</h2>
+<h3 id="61-适用判据">6.1 适用判据</h3>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>适合</th>
+<th>不适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>契约面规模</td>
+<td>数百到数千端点，外部给定</td>
+<td>十几个内部 API，每周改形状</td>
+</tr>
+<tr>
+<td>契约稳定性</td>
+<td>官方文档为准，变更可追溯</td>
+<td>需求驱动，接口随产品迭代变形</td>
+</tr>
+<tr>
+<td>团队形态</td>
+<td>多人 + AI 混合编写，需要强制统一</td>
+<td>单人短期项目</td>
+</tr>
+<tr>
+<td>发布约束</td>
+<td>有 AOT / 裁剪 / 严格构建诉求</td>
+<td>无 CI，靠本地手工构建</td>
+</tr>
+<tr>
+<td>维护预算</td>
+<td>有人维护生成器与守卫</td>
+<td>生成器只有一个人懂且他随时会离开</td>
+</tr>
+</tbody>
+</table>
+<p>判断顺序建议：先看"错误是否可机械判定"，再看"规模是否足够大"，最后看"有没有门禁"。三者缺一，收益都会显著下降——没有门禁的源生成，只是把错误生产得更快。</p>
+<h3 id="62-七条可抄的做法">6.2 七条可抄的做法</h3>
+<ol>
+<li><strong>每个事实只有一个来源。</strong> 端点只声明在接口上，注册表由生成器发射；一旦出现第二处手写副本，两份就会分叉。</li>
+<li><strong>只生成"机械可推"的部分。</strong> 判断类逻辑（重试策略、作用域切换、业务编排）留在手写代码里，生成器不猜。</li>
+<li><strong>生成物入库并标 <code>&lt;auto-generated&gt;</code>。</strong> 入库是为了让 diff 可见，标记是为了让"勿手改"有据可依。</li>
+<li><strong>能升级为编译错误的，不要降级为 Warning。</strong> 降级必须注明"启发式"，并说明覆盖范围之外的情形。</li>
+<li><strong>守卫与契约同批提交。</strong> 守卫是描述，不是收尾项；"先改代码后补测试"的窗口里，契约是无人看管状态。</li>
+<li><strong>门禁的统计口径写清楚。</strong> 统计什么、在哪一步、计数为 0 时是否可能是假绿，三者都要写在脚本注释里。</li>
+<li><strong>每条规则都写成可执行断言。</strong> 写在 README 里的规则，在 AI 参与的流程中等同于不存在——它不在上下文里，也不产生任何失败信号。</li>
+</ol>
+<h3 id="63-什么时候不该用">6.3 什么时候不该用</h3>
+<p>三种情况会亏本：</p>
+<ul>
+<li><strong>生成器维护成本高于手写成本</strong>：契约面小且变化快时，每次变更都要改生成器 + 改守卫 + 重生成，总成本高于直接写实现。</li>
+<li><strong>没有稳定的门禁</strong>：生成器把错误集中到声明层，但如果声明层的错误没人跑测试，错误只是换了个位置。</li>
+<li><strong>规则本身不可机械判定</strong>：例如"这个端点该不该暴露给第三方应用"，这类判断写在 XML 注释里给人看，不要试图让生成器校验。</li>
+</ul>
+<hr>
+<h2 id="七数据与边界">七、数据与边界</h2>
+<h3 id="71-规模">7.1 规模</h3>
+<table>
+<thead>
+<tr>
+<th>产品线</th>
+<th>包</th>
+<th>规模</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>企业微信</td>
+<td><code>Mud.Wechat.Work</code>（+ Callback）</td>
+<td>42 个业务域、470 个接口（158 父 + 312 可注入）、122 个回调事件键</td>
+</tr>
+<tr>
+<td>公众号</td>
+<td><code>Mud.Wechat.OfficialAccount</code>（+ Callback）</td>
+<td>266 条路由</td>
+</tr>
+<tr>
+<td>小程序</td>
+<td><code>Mud.Wechat.MiniProgram</code></td>
+<td>588 端点 / 39 域</td>
+</tr>
+<tr>
+<td>微信支付</td>
+<td><code>Mud.Wechat.Pay</code>（+ Callback）</td>
+<td>APIv3 625 端点 / 91 接口；APIv2 71 端点</td>
+</tr>
+<tr>
+<td>开放平台</td>
+<td><code>Mud.Wechat.OpenPlatform</code></td>
+<td>208 端点</td>
+</tr>
+<tr>
+<td>小店 · 视频号</td>
+<td><code>Mud.Wechat.Channels</code>（+ Callback）</td>
+<td>29 域 394 端点</td>
+</tr>
+<tr>
+<td>腾讯广告</td>
+<td><code>Mud.Wechat.Ads</code></td>
+<td>13 域 48 端点</td>
+</tr>
+<tr>
+<td>AI 工具面</td>
+<td><code>Mud.Wechat.Work.AI.Tools</code></td>
+<td>62 个策展工具 / 14 个域</td>
+</tr>
+</tbody>
+</table>
+<p>配套：18 个可打包工程、20 个测试工程、650+ 测试文件、四条生成链、两个构建期工具（生成器与分析器，均为 <code>netstandard2.0</code> 单 TFM、不打包）。</p>
+<h3 id="72-边界">7.2 边界</h3>
+<p>这套方法能压低的是"事实错误"与"契约错误"的发生率，压不低"设计错误"——选错抽象、拆错模块、判断错官方文档的采信顺序，编译器不会给出任何信号。</p>
+<p>它还有一个前提：<strong>事实源本身必须可判定</strong>。Mud.Wechat 的每条端点都有官方文档 URL 与业务限制写进接口 XML 注释，守卫才有东西可断言；如果事实源是一份口头约定，生成器只能固化这份约定，不能校验它对不对。</p>
+<p>最后是一句成本陈述，不是结论口号：这套方法把错误从"运行期随机出现"移动到"提交前固定出现"，代价是生成器与分析器本身的维护成本，以及每次契约变更必须同批更新的守卫。是否值得，取决于契约面的规模与稳定性，与是否使用 AI 无关——AI 只是把"人手写实现"的方差放大到不可忽略，从而让这笔成本更早显形。</p>
+<p><em>源码：<a href="https://github.com/mudtools/MudWechat" target="_blank" rel="noopener nofollow">GitHub</a> ｜ <a href="https://gitee.com/mudtools/MudWechat" target="_blank" rel="noopener nofollow">Gitee</a>（MIT 协议）</em></p>
+<p>欢迎添加我的微信公众号<br>
+<img alt="qrcode_for_gh_acad905b0171_258" loading="lazy" data-src="https://img2024.cnblogs.com/blog/1908909/202610/1908909-20261028185127052-506767631.jpg" class="lazyload"></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-05 09:36">2026-11-05 09:35</span>&nbsp;
+<a href="https://www.cnblogs.com/mudtools">玩泥巴的|mudtools.cn</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23555872);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fmudtools%2Fp%2F23555872&amp;targetId=23555872&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
