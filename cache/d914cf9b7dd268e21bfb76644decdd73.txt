@@ -1,0 +1,614 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23554102" title="发布于 2026-11-06 07:33">
+    
+
+    <span role="heading" aria-level="2">Redis 数据类型全解 - Bitfield：99% 开发者没用过的位域操作，把内存再砍 80%（七）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        BITFIELD 将连续比特视为小整数，取代多个 key 以节省内存（每合并一 key 省约 77B）。核心要点：溢出默认 WRAP 静默，需显式设 SAT/FAIL；原子但非事务，失败不回滚；布局即契约。BITFIELD_RO 可读取只读副本，BITOP 8.2+ 支持 DIFF/ANDOR 等原子集合运算。C# 使用 ExecuteAsync 调用，无高层封装。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>一句话</strong>：<code>SETBIT</code> 把 1 个比特当开关，<code>BITFIELD</code> 把连续 M 个比特当小整数——同一张 String，用几位干掉几个 key。<br>
+<strong>版本</strong>：<code>BITFIELD</code> 3.2.0+ · <code>BITFIELD_RO</code> 6.2+ · <code>BITOP</code> 基础 2.6+ · <code>BITOP</code> 新操作符 <code>DIFF</code>/<code>DIFF1</code>/<code>ANDOR</code>/<code>ONE</code> 8.2+（无 <code>ANDNOT</code>）。</p>
+</blockquote>
+<p><strong>三条最该先记住的结论</strong>：<br>
+① 溢出默认 <code>WRAP</code> 且完全静默，<code>u8</code> 255+1 变 0、<code>i8</code> 127+1 变 -128，必须显式 <code>SAT</code>/<code>FAIL</code>；<br>
+② <code>BITFIELD</code> 原子但非事务，<code>FAIL</code> 也不是"什么都没发生"（key 会被预扩展且不同步）；<br>
+③ 收益来自消除 per-key 元数据（每合并一个 key 省约 77 B），代价是"布局即契约"。</p>
+<blockquote>
+<p><strong>适合谁读</strong>：写过 <code>SETBIT</code> 却没敢用 <code>BITFIELD</code> 的人；被"一个 key 一个计数器"撑爆内存、又被位域溢出坑过一次的人。<strong>前置</strong>：熟悉 String 命令、知道 SDS 与 <code>redisObject</code>，能在 <code>redis-cli</code> 和 .NET 之间来回验证。全篇 C# 代码基于 StackExchange.Redis 2.8.16，已用 <code>dotnet build</code>（net10.0）编译通过。</p>
+</blockquote>
+<h1 id="一位域定位与命令全集">一、位域定位与命令全集</h1>
+<h2 id="11-一个-string两种视角">1.1 一个 String，两种视角</h2>
+<p>第 6 篇讲过：Redis 里没有 Bitmap 类型，它只是 String 的位视图。位域是同一件事的下半场：</p>
+<ul>
+<li><code>SETBIT</code> 把<strong>第 N 个比特</strong>当一个开关；</li>
+<li><code>BITFIELD</code> 把<strong>从第 N 位起连续 M 个比特</strong>当<strong>一个小整数</strong>。</li>
+</ul>
+<p>两者共用同一张 String、同一套 SDS，只是视角不同。同一个 key 先 <code>BITFIELD SET u8 0 200</code> 写一个字节，再 <code>GETBIT</code> 看第 0 位，读的是同一段内存。</p>
+<p>为什么需要下半场：<code>SETBIT</code> 只能存 0/1。真实业务常常要在一个对象上塞几十个小整数——8 个互动计数、32 个权限开关、一局游戏 6 个角色的血量。一个 bit 不够，一个 key 一个计数器又太浪费，因为<strong>key 自身的元数据远超数值本身</strong>。同样存 8 个计数器，8 个独立 key 约 1050 字节，一段位域约 145 字节。</p>
+<p>三个现象说明了它的风险面：</p>
+<ul>
+<li><strong>数据错乱</strong>：<code>u4</code> 计数器到 15 后继续 <code>INCRBY</code>，不报错直接归零——默认 <code>WRAP</code>。</li>
+<li><strong>统计失真</strong>：一次 uid→offset 映射迁移后，新旧两张日活图直接 <code>BITOP AND</code>，交集全错——错在映射口径，不在 <code>BITOP</code>。</li>
+<li><strong>内存堆积</strong>：<code>BITOP</code> 产出的临时结果 key 忘设 <code>EXPIRE</code>，日积月累堆上万个。</li>
+</ul>
+<p>三条主线由此而来：<strong>溢出策略、映射口径一致性、结果 key 的生命周期。</strong></p>
+<h2 id="12-命令家族bitfield-与-bitop">1.2 命令家族：BITFIELD 与 BITOP</h2>
+<p><code>BITFIELD</code> 自 <strong>3.2.0</strong> 起可用，每个子命令 O(1)。一次调用可串联多个子命令，<strong>返回一个数组</strong>，元素与子命令顺序一一对应：</p>
+<pre><code class="language-redis">BITFIELD key [GET encoding offset]
+              [SET encoding offset value]
+              [INCRBY encoding offset increment]
+              [OVERFLOW WRAP|SAT|FAIL]
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031441760-421773598.png" alt="" loading="lazy"></p>
+<pre><code class="language-redis"># 一条命令同时读写多个字段
+# 偏移 100 处的 i5 加 1，返回新值
+# 偏移 0 处的 u4 读出 0
+BITFIELD mykey INCRBY i5 100 1 GET u4 0
+</code></pre>
+<p>两个必须现在知道的边界：<strong>原子但非事务</strong>（子命令按序执行、不会被并发打断，但 <code>FAIL</code> 只跳过当前一条，前面成功的<strong>不回滚</strong>）；<strong>先扩展后执行</strong>（即使全部写子命令被 <code>FAIL</code> 拒绝，字符串的预创建/预扩展也已发生，且不写 AOF、不传播副本，见 2.6）。</p>
+<h2 id="13-类型编码与位宽选择">1.3 类型编码与位宽选择</h2>
+<p>类型 = 符号 + 位宽，<code>i</code> 有符号、<code>u</code> 无符号。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031453280-1995033650.png" alt="" loading="lazy"></p>
+<p><strong>为什么 <code>u64</code> 不存在而 <code>i64</code> 存在</strong>：RESP 的整数是有符号 64 位。<code>u63</code> 的最大值 <code>2^63-1</code> 落在正数范围内，能正常返回；<code>u64</code> 的 <code>2^64-1</code> 超出这个容器。<code>i64</code> 正好塞得进去，所以支持。</p>
+<pre><code class="language-redis"># u64 直接报错
+BITFIELD k GET u64 0
+</code></pre>
+<p>常用位宽按业务上界选，<strong>上界拿不准才大一号</strong>，别为"整齐"超配：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031506191-1116751669.png" alt="" loading="lazy"></p>
+<p>记忆：无符号看"能到 2ⁿ-1"，有符号看"正负各一半"——<code>u4</code> 到 15、<code>i4</code> 到 7。</p>
+<p>两个常见反例：用 <code>u4</code> 存"连续签到天数"，第 16 天静默归零；用 <code>i4</code> 存"评分"以为范围是 0~15，实际只到 7。<strong>位宽超配也有代价</strong>——8 个字段都多给 8 位，key 就从 32 字节涨到 64 字节，正好跨过一个 jemalloc 桶，"省内存"变成"多占一倍"。宽度选择的标准不是好看，而是"业务上界 + 一号余量"。</p>
+<h2 id="14-两种偏移与溢出语法">1.4 两种偏移与溢出语法</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031512034-1487113886.png" alt="" loading="lazy"></p>
+<pre><code class="language-redis"># 写入 i8 数组的第 0、1 个元素，等价于 SET i8 0 100 i8 8 200
+BITFIELD mystring SET i8 #0 100 i8 #1 200
+</code></pre>
+<p><strong>辟谣</strong>：网上说"纯数字是字节偏移、<code>#n</code> 才是位偏移"——错的，两者都是比特，<code>#n</code> 只是乘以位宽。把 <code>SET u8 8 1</code> 当成"从第 8 个字节写"，结果差 8 倍且不报错。</p>
+<p><strong><code>#</code> 的陷阱</strong>：乘数是<strong>当前子命令的编码宽度</strong>。同一个 <code>#1</code>，<code>i8</code> 下是 bit 8，<code>i16</code> 下是 bit 16。混用位宽时手写绝对偏移更安全。位域可以跨字节边界，但生产上建议按字节对齐，避免客户端 SDK 解析出错。</p>
+<blockquote>
+<p>上例第二笔 <code>200</code> 超出 <code>i8</code> 上界 127，默认 <code>WRAP</code> 会<strong>静默回绕成 -56 写入</strong>（200−256），返回的 0 只是旧值。<code>SET</code> 的越界同样受 <code>OVERFLOW</code> 控制。</p>
+</blockquote>
+<p><code>OVERFLOW</code> 只影响<strong>它之后、直到下一条 <code>OVERFLOW</code></strong> 的 <code>SET</code>/<code>INCRBY</code>，对 <code>GET</code> 无效。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031523716-377473.png" alt="" loading="lazy"></p>
+<p><strong>必须记住</strong>：服务器层面三种策略都不抛异常，默认 <code>WRAP</code> 静默回绕。要封顶或显式拒绝，必须手写 <code>SAT</code>/<code>FAIL</code>。</p>
+<h2 id="15-只读变体与-bitop-82-新操作符">1.5 只读变体与 BITOP 8.2 新操作符</h2>
+<p><code>BITFIELD_RO</code>（6.2+）与 <code>BITFIELD</code> 同源，但<strong>只接受 <code>GET</code></strong>，任何 <code>SET</code>/<code>INCRBY</code>/<code>OVERFLOW</code> 都报错。存在的理由是：<code>BITFIELD</code> 整条命令带 write 标志，<strong>哪怕只含 <code>GET</code>，发到只读副本也会被 <code>READONLY</code> 拒绝</strong>。集群下 <code>BITFIELD_RO</code> 可路由到副本，<code>BITFIELD</code> 只能落主节点——统计类查询统一走 <code>_RO</code>。</p>
+<p><code>BITOP op destkey key [key ...]</code> 把多个位图按位运算写入 <code>destkey</code>，<strong>返回结果位图的字节长度</strong>。四个基础运算：<code>AND</code>（交集）、<code>OR</code>（并集）、<code>XOR</code>（对称差，<strong>不是"新增"</strong>）、<code>NOT</code>（补集，只接受一个输入）。</p>
+<p>三条边界：</p>
+<ul>
+<li><strong>长度取最长、短图尾部补 0，但不会算错</strong>。位图缺失的高位本来就是 0，补 0 补的正是真实内容，<code>AND</code>/<code>OR</code>/<code>XOR</code>/<code>DIFF</code> 在长度不一致时结果仍语义精确。长度差异真正影响三件事：结果 key 长度不可预测；<code>NOT</code> 输出截断在输入长度内、<code>NOT</code>+<code>AND</code> 两跳会丢高位；<strong><code>STRLEN</code> 差异过大是映射口径漂移的信号</strong>。</li>
+<li><strong>结果 key 不继承源 key 的 TTL</strong>，用完记得 <code>EXPIRE</code>/<code>UNLINK</code>。</li>
+</ul>
+<p>8.2 的四个新操作符把过去要写 Lua 的位集合运算变成一条命令：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031529570-737426620.png" alt="" loading="lazy"></p>
+<pre><code class="language-redis"># DIFF：今天活跃但昨天不活跃（新增用户）
+BITOP DIFF new_active active:20261103 active:20261102
+
+# 旧写法三条命令、要临时 key、非原子；新写法一条命令原子完成
+# BITOP NOT tmp b
+# BITOP AND result a tmp
+# UNLINK tmp
+BITOP DIFF result a b
+</code></pre>
+<blockquote>
+<p>⚠️ <code>DIFF</code> 与 <code>DIFF1</code> 方向相反，不是别名。这四个操作符需要 <strong>8.2+</strong>，低版本用 <code>NOT</code>+<code>AND</code> 模拟或用 Lua。</p>
+</blockquote>
+<h2 id="16-net-解析只有-executeasync">1.6 .NET 解析：只有 ExecuteAsync</h2>
+<p><strong>StackExchange.Redis 至今没有 <code>BITFIELD</code> 高层封装</strong>（社区 PR 未合并）。网上出现的 <code>StringBitfieldAsync</code> / <code>BitfieldOperation</code> 之类签名均不可信，<strong>所有版本都走 <code>ExecuteAsync</code></strong>。</p>
+<pre><code class="language-csharp">// BITFIELD：紧跟命令名的第一个参数是 key，集群下必须显式转 RedisKey
+// SE.Redis 靠"参数是否为 RedisKey 类型"识别 key 并分片路由，传 string 会走默认路由
+// 显式转换运算符的返回类型标了可空，服务器这里一定返回数组，用 ! 消掉可空警告
+var result = ((RedisResult[])await db.ExecuteAsync("BITFIELD", (RedisKey)"user:100:stats",
+    "OVERFLOW", "SAT",
+    "INCRBY", "u32", "#0", 1,
+    "GET",    "u32", "#2"))!;
+// result.Length == 2：OVERFLOW 不产生返回元素
+
+// BITOP：紧跟命令名的是操作符，不是 key；dest 与所有源 key 都要转 RedisKey
+await db.ExecuteAsync("BITOP", "DIFF", (RedisKey)"new_active",
+    (RedisKey)"active:20261103", (RedisKey)"active:20261102");
+await db.KeyExpireAsync((RedisKey)"new_active", TimeSpan.FromHours(1));
+</code></pre>
+<p>三个最容易踩的点：</p>
+<ol>
+<li><strong>返回值解析</strong>。<code>RedisResult</code> 有到 <code>RedisResult[]</code> 的显式转换运算符，整条结果先 <code>(RedisResult[])</code>；<strong>公开 API 既没有 <code>AsArray()</code>（内部 <code>AsRedisResultArray()</code> 为 internal），也没有 <code>AsInt64()</code>（同为 internal，实测 CS0122）</strong>，单元素统一 <code>(long)result[i]</code>，别调 <code>.AsInt64()</code>。解析前先判 <code>IsNull</code>：读场景可缺省为 0，<strong>写场景必须区分 <code>nil</code>（被 <code>FAIL</code> 拒绝）与 0（真值）</strong>。</li>
+<li><strong>参数数组一次传完</strong>。<code>ExecuteAsync("BITFIELD_RO", key, argsArray)</code> 会把 <code>object[]</code> 当单个参数装箱，命令帧拼错、服务端收不到并超时。</li>
+<li><strong><code>u64</code> 与类型名</strong>：类型字符串必须 <code>i1~i64</code> / <code>u1~u63</code>，<code>uint8</code>、<code>U8</code> 都会 <code>Invalid bitfield type</code>。副本读只能 <code>BITFIELD_RO</code>；<code>BITOP</code> 多 key 必须同 Slot；RESP2/RESP3 响应结构可能不同，上线前两种协议各跑一遍。</li>
+</ol>
+<h2 id="17-一页速查">1.7 一页速查</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031547080-78012359.png" alt="" loading="lazy"></p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031552888-1862021702.png" alt="" loading="lazy"></p>
+<blockquote>
+<p><code>BITCOUNT</code>/<code>BITPOS</code> 的 <code>start</code>/<code>end</code> 默认按<strong>字节</strong>，而 <code>SETBIT</code>/<code>BITFIELD</code> 的 offset 按<strong>比特</strong>——两套单位极易记混（7.0+ 可用 <code>BIT</code> 参数统一）。</p>
+</blockquote>
+<hr>
+<h1 id="二位序扩展与溢出">二、位序、扩展与溢出</h1>
+<h2 id="21-位域住在-string-里">2.1 位域住在 String 里</h2>
+<p><code>BITFIELD</code> 操作的就是一段 SDS 字节串，和 <code>SETBIT</code> 完全一样。所以 <code>TYPE key</code> 返回 <code>string</code>；<strong>被位命令写过的 key 编码是 <code>raw</code></strong>（写路径会 unshare，强制脱离 <code>int</code>/<code>embstr</code>），但<strong>由 <code>SET</code> 创建、只被 <code>GET</code> 读过的 key 仍可能是 <code>embstr</code></strong>，别拿编码判断"这是不是位域"；可以对它用 <code>STRLEN</code>/<code>EXPIRE</code>/<code>MEMORY USAGE</code>/<code>UNLINK</code>；<strong>禁用 <code>APPEND</code>/<code>SETRANGE</code></strong>，它们会改长度和内容、破坏布局。</p>
+<h2 id="22-按需扩展但绝不缩容">2.2 按需扩展，但绝不缩容</h2>
+<p><code>SET</code>/<code>INCRBY</code> 写到超过当前长度，会自动扩展并按字节补 0：</p>
+<pre><code class="language-redis"># 写到第 4 个字节（第 32 位）
+BITFIELD k SET u8 #4 1
+# 扩展到 5 字节：第 0~3 字节补零，第 4 字节被写
+STRLEN k
+</code></pre>
+<p><strong>长度由你写入的最远位置决定</strong>，与真正用到的字段数无关。所以布局要按最远字段算容量——随手写 <code>#1000000</code> 会立刻分配约 1 MB（与第 6 篇的大 offset 陷阱同源）。</p>
+<p><strong>反向不成立：清零不会缩容</strong>。把字段 <code>SET</code> 回 0、整段清成 0，长度也不缩短，<code>max_offset</code> 不回退。这直接影响"定时任务把今日字段清零"的设想：key 一旦被大 offset 撑过就永久占着那块内存。要真正释放只能 <code>DEL</code>/<code>UNLINK</code> 重建；更省心的是 <strong>key 按日切换 + TTL</strong>。</p>
+<h2 id="23-msb-first-与符号扩展">2.3 MSB-first 与符号扩展</h2>
+<p><strong>位序高位在前（大端 / MSB-first）</strong>。一个字节里，offset 最小的 bit 对应<strong>最高位</strong>。<code>SETBIT k 0 1</code> 写入的是 <code>\x80</code>（<code>1000 0000</code>），不是 <code>\x01</code>。</p>
+<pre><code class="language-redis"># 高位在前：第 0 位 = 字节最高位
+SETBIT bo 0 1
+GET bo
+</code></pre>
+<p><strong>对你意味着什么</strong>：在应用层自己拆原始字节时，必须用 <code>1 &lt;&lt; (7 - (offset &amp; 7))</code>。照搬 <code>1 &lt;&lt; offset</code>（小端直觉），整个字节位序反转，offset 0 与 7 对调——这就是"命令行验证正确、应用层解析全错"的根因。</p>
+<p><strong>符号扩展</strong>：同一段比特，按 <code>i</code> 读和按 <code>u</code> 读是两回事。<code>i4</code>/<code>u4</code> 共用 4 位：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031612377-1594603120.png" alt="" loading="lazy"></p>
+<p>有符号读法把最高位当符号位（补码）。所以字段类型必须"一次定型"，不要在同一槽位混读。</p>
+<h2 id="24-未初始化恒-0">2.4 未初始化恒 0</h2>
+<p><code>GET</code> 读超出长度的位、或从未写入的区域，一律返回 0，不报错。由此带来一个语义陷阱：用 <code>u2</code> 存状态（0=未激活、1=激活、2=冻结、3=注销），<strong>"真的未激活"和"从未设置"返回的都是 0，分不清</strong>。</p>
+<p>两个解法：① 额外用一个 <code>u1</code> 标记"该槽位是否写过"；② 值从 1 起编号，让 <code>0</code> 专表"未设置"。</p>
+<h2 id="25-溢出三策略与业务选型">2.5 溢出三策略与业务选型</h2>
+<p>同一个起点、三种结局（每条独立 key，从 255 起加 1）：</p>
+<pre><code class="language-redis"># 三条各用独立 key，避免前一条改了值、后一条起点就不再是 255
+DEL s1 s2 s3
+# WRAP：255 加 1 回绕到 0，返回 0
+BITFIELD s1 OVERFLOW WRAP INCRBY u8 0 1
+# SAT：255 加 1 封顶在 255，返回 255
+BITFIELD s2 OVERFLOW SAT INCRBY u8 0 1
+# FAIL：不执行，返回 nil，值保持 255
+BITFIELD s3 OVERFLOW FAIL INCRBY u8 0 1
+</code></pre>
+<p><code>i8</code> 的三种结局同理，只是方向更隐蔽：<strong>127 加 1 在 <code>WRAP</code> 下变成 -128（符号翻转）</strong>。</p>
+<pre><code class="language-redis"># 三条各用独立 key，从 127 起加 1
+DEL i1 i2 i3
+# WRAP：127 加 1 符号翻转成 -128
+BITFIELD i1 OVERFLOW WRAP INCRBY i8 0 1
+# SAT：封顶在 127
+BITFIELD i2 OVERFLOW SAT INCRBY i8 0 1
+# FAIL：返回 nil，值保持 127
+BITFIELD i3 OVERFLOW FAIL INCRBY i8 0 1
+</code></pre>
+<p><strong><code>SET</code> 同样会越界</strong>，而且更隐蔽——调用方以为写什么就是什么，返回的旧值又让命令看起来成功了。<code>u8</code> 写 300：默认 <code>WRAP</code> 静默存 44（300 mod 256）；<code>SAT</code> 存 255；<code>FAIL</code> 返回 <code>nil</code> 拒绝。</p>
+<p>业务选型三句话：</p>
+<ul>
+<li><strong>只增不减的计数器</strong>（签到、积分、累计消费）→ <code>SAT</code> 或 <code>FAIL</code>，<strong>绝不用 <code>WRAP</code></strong>。<code>SAT</code> 封顶要能被感知（返回值 == 上限即信号，客户端埋点告警），否则报表静默停涨；对封顶敏感的指标改用 <code>FAIL</code>。</li>
+<li><strong>允许负增量的短期计数</strong>（余额、可撤销计数）→ 优先 <code>SAT</code>，但位宽要覆盖负界；<strong>扣减不可截断</strong>（少扣一分都不行）就用 <code>FAIL</code> + 应用层拒绝重试。</li>
+<li><strong>"回绕即业务语义"</strong>（哈希、环形缓冲区序号）→ <code>WRAP</code> 才是对的。</li>
+</ul>
+<h2 id="26-fail-的边缘全部失败key-却已被预扩展">2.6 FAIL 的边缘：全部失败，key 却已被预扩展</h2>
+<p>这是本篇最重要、最容易漏的一条。</p>
+<p><code>BITFIELD</code> 的执行顺序是<strong>先按最远触点创建/扩展字符串，再逐条执行子命令</strong>。即使所有写子命令都因 <code>FAIL</code> 返回 <code>nil</code>，<strong>预创建/预扩展已经发生</strong>；但因为没有任何 bit 写入成功，<code>changes</code> 计数保持 0，于是它<strong>不标记 key modified、不发 keyspace 通知、不写 AOF、不传播副本</strong>。</p>
+<pre><code class="language-redis"># key 原本不存在
+BITFIELD created OVERFLOW FAIL SET u1 0 2
+# 写被拒绝，返回 nil
+EXISTS created
+# 但 key 已经被创建了
+STRLEN created
+# 长度 1 字节（预分配）
+
+# key 已存在但很短
+SET grown ""
+BITFIELD grown OVERFLOW FAIL SET u1 63 2
+# 字符串被预扩展到了 8 字节
+STRLEN grown
+</code></pre>
+<p><strong>后果</strong>：主库的 key 长度/存在性已改变，但这个改变不写 AOF、不同步副本；主从从此可能不一致，AOF 重载后预扩展又消失（Redis issue #15599）。</p>
+<p><strong>规避</strong>：不要依赖"<code>FAIL</code> = 什么都没发生"，对存在性/长度敏感的场景额外校验 <code>EXISTS</code>/<code>STRLEN</code>；需要"全有或全无"用 <code>MULTI/EXEC</code> 或 Lua；该行为在 7.x、8.0 上同样存在，修复状态以对应版本的 release notes 为准。</p>
+<h2 id="27-原子非事务读改写不在保护范围">2.7 原子非事务，读改写不在保护范围</h2>
+<p>单条 <code>BITFIELD</code> 内部不会被并发打断，但<strong>没有事务语义</strong>：某个子命令 <code>FAIL</code> 只跳过它，前面成功的<strong>不回滚</strong>。</p>
+<p>更关键的是<strong>跨命令的读-改-写</strong>：把 8 个值读回应用层、改一个、再 <code>SET</code> 写回，两个并发请求会互相覆盖（lost update），且无报错。<code>BITFIELD</code> 的"原子"只覆盖单条命令内部。</p>
+<p><strong>"全有或全无"的最小 Lua 样例</strong>（两个计数必须同时成功，任一被拒则整体恢复旧值）：</p>
+<pre><code class="language-lua">-- KEYS[1] = 位域 key；ARGV[1]/ARGV[2] = 两个字段的增量
+-- BITFIELD 的 FAIL 返回 nil，在 Lua 里收到的是 false
+local old = redis.call('BITFIELD', KEYS[1], 'GET', 'u32', '0', 'GET', 'u32', '32')
+local out = redis.call('BITFIELD', KEYS[1], 'OVERFLOW', 'FAIL',
+  'INCRBY', 'u32', '0', ARGV[1],
+  'INCRBY', 'u32', '32', ARGV[2])
+
+if out[1] == false or out[2] == false then
+  -- 任一被拒绝：两个字段都写回旧值，实现"整体回滚"
+  redis.call('BITFIELD', KEYS[1],
+    'SET', 'u32', '0',  old[1],
+    'SET', 'u32', '32', old[2])
+  return {0, old[1], old[2]}
+end
+return {1, out[1], out[2]}
+</code></pre>
+<blockquote>
+<p>注意这只是"失败后恢复旧值"的补偿式回滚，不是 CAS——两个并发脚本之间仍可能互相踩。要严格消除并发窗口，把"读旧值—写新值—恢复"全放进一个脚本；或用 <code>WATCH</code> + <code>MULTI/EXEC</code> 乐观锁重试。</p>
+</blockquote>
+<h2 id="28-亲手验证">2.8 亲手验证</h2>
+<pre><code class="language-redis"># 1. 按最远触点扩展
+DEL bf
+# 第 0 字节
+BITFIELD bf SET u8 #0 200
+# =&gt; 1
+STRLEN bf
+# 跳到第 4 字节，中间补零
+BITFIELD bf SET u8 #4 1
+# =&gt; 5
+STRLEN bf
+
+# 2. 溢出默认静默回绕
+DEL ov
+BITFIELD ov SET u8 0 255
+# =&gt; 0，不是报错
+BITFIELD ov INCRBY u8 0 1
+
+# 3. FAIL 返回 nil
+DEL fl
+BITFIELD fl SET u8 0 250
+# =&gt; nil，值保持 250
+BITFIELD fl OVERFLOW FAIL INCRBY u8 0 10
+
+# 4. u64 不支持
+BITFIELD u64test GET u64 0
+
+# 5. 未初始化区返回 0
+DEL ge
+# =&gt; 0，key 不存在也返回 0
+BITFIELD ge GET u32 0
+
+# 6. 写过位命令的对象编码是 raw
+OBJECT ENCODING bf
+</code></pre>
+<p>建议第一次读到这照着敲一遍，尤其第 2 步——亲眼看到"255 加 1 等于 0"，比读十遍都记得牢。</p>
+<h2 id="29-位操作全家族总览">2.9 位操作全家族总览</h2>
+<p>把本篇与前一篇的位能力放在一张图里，避免"该用哪个"反复纠结：</p>
+<pre><code class="language-text">                    ┌─ SETBIT / GETBIT        单 bit 布尔开关（第 6 篇）
+        ┌─ Bitmap ──┼─ BITCOUNT / BITPOS      整图 / 区间计数
+        │           └─ BITOP AND/OR/XOR/NOT  多图集合运算（2.6+）
+位操作 ─┤              BITOP DIFF/DIFF1/ANDOR/ONE（8.2+）
+        │
+        └─ Bitfield ─┬─ BITFIELD    多字段读写 + 原子自增（3.2+）
+                     ├─ OVERFLOW    WRAP / SAT / FAIL
+                     └─ BITFIELD_RO 只读，可下发副本（6.2+）
+</code></pre>
+<p>三条边界决定选型：<strong>一个 bit 表达一个布尔</strong>用 Bitmap；<strong>多张图之间做集合关系</strong>用 <code>BITOP</code>；<strong>一个对象上挂多个小整数</strong>用 Bitfield。三者在同一系统里可以并存，而且常常并存——日活图用 Bitmap、漏斗用 <code>BITOP</code>、每篇帖子的互动数用 Bitfield。</p>
+<hr>
+<h1 id="三生产五大场景">三、生产五大场景</h1>
+<h2 id="31-八计数器一个-string-存-8-个-u32">3.1 八计数器：一个 String 存 8 个 u32</h2>
+<p>内容社区每篇帖子维护 8 类互动数——浏览、点赞、收藏、评论、转发、举报、分享、打赏。一计数一 key，一篇帖子就是 8 个 key。</p>
+<pre><code class="language-redis"># 方案 A：8 个独立 key
+INCR post:100:view
+INCR post:100:like
+# ... 共 8 个 key
+
+# 方案 B：1 个 key + 8 个 u32 位域（共 32 字节）
+# 一条命令批量自增前 3 个并回读第 0 个
+BITFIELD post:100:stats \
+  INCRBY u32 #0 1 \
+  INCRBY u32 #1 1 \
+  INCRBY u32 #2 1 \
+  GET u32 #0
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031659017-1623605600.png" alt="" loading="lazy"></p>
+<p>从 ~1.05 GB 到 ~145 MB，<strong>省约 86%</strong>——这就是"内存再砍 80%"的账单。</p>
+<pre><code class="language-csharp">public sealed class PostStatsService
+{
+    private readonly IDatabase _db;
+    public PostStatsService(IDatabase db) =&gt; _db = db;
+
+    private const int SlotView = 0, SlotLike = 1, SlotFav = 2, SlotComment = 3,
+                      SlotShare = 4, SlotReport = 5, SlotRepost = 6, SlotTip = 7;
+
+    /// &lt;summary&gt;增减计数。BITFIELD 即使只有一条 INCRBY，返回的也是数组，
+    /// 必须 (RedisResult[]) 转换后取 [0]；把整条结果强转 long 会抛异常。
+    /// 这里用 SAT 封顶（SAT 永不返回 nil）；若改 FAIL，先判 result[0].IsNull。&lt;/summary&gt;
+    public async Task&lt;long&gt; IncrAsync(string postId, int slot, long delta = 1)
+    {
+        var result = ((RedisResult[])await _db.ExecuteAsync("BITFIELD",
+            (RedisKey)$"post:{postId}:stats",
+            "OVERFLOW", "SAT",
+            "INCRBY", "u32", $"#{slot}", delta))!;
+        // 单元素统一 (long) 取整
+        return (long)result[0];
+    }
+
+    public async Task&lt;long[]&gt; GetAllAsync(string postId)
+    {
+        // 一次往返读回全部 8 个计数器；统计查询走 BITFIELD_RO（见 1.5）
+        var res = ((RedisResult[])await _db.ExecuteAsync("BITFIELD_RO",
+            (RedisKey)$"post:{postId}:stats",
+            "GET", "u32", "#0", "GET", "u32", "#1", "GET", "u32", "#2", "GET", "u32", "#3",
+            "GET", "u32", "#4", "GET", "u32", "#5", "GET", "u32", "#6", "GET", "u32", "#7"))!;
+        // 未初始化位返回 nil，读场景缺省为 0
+        return res.Select(r =&gt; r.IsNull ? 0L : (long)r).ToArray();
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：8 个计数共享一个 key 的 TTL，不能单独过期；<code>u32</code> 上限约 42.9 亿，单篇千万级爆款够用，"累计曝光"这类指标要 <code>u63</code> 或拆字段。按日滚动的字段必须 <strong>key 按日切换 + TTL</strong>（如 <code>post:100:stats:20261105</code>）——如果用常驻 key 每天把 8 个字段 <code>SET 0</code>，不但多写一轮，还会因 2.2 的"清零不缩容"永久占着历史最大长度。热点帖子是单 key 热点，超热内容先在应用侧本地聚合再批量落盘，或拆 key 分散到多个分片。</p>
+<h2 id="32-权限位与多状态段掩码与位段同一个服务">3.2 权限位与多状态段：掩码与位段同一个服务</h2>
+<p><strong>权限</strong>：32 个功能权限用 <code>u32</code> 的每一位表示，一个用户全部权限只占 <strong>4 字节</strong>。</p>
+<pre><code class="language-redis"># 整块设置：0b1001 = 查看 + 导出
+BITFIELD user:100:perm SET u32 0 9
+
+# 单点翻转（相当于 SETBIT），offset 是 MSB-first 的比特下标
+# 打开 0b1000 那一位
+SETBIT user:100:perm 28 1
+# 打开 0b0001 那一位
+SETBIT user:100:perm 31 1
+
+# 读回权限掩码
+BITFIELD user:100:perm GET u32 0
+</code></pre>
+<blockquote>
+<p>⚠️ <strong>两套编号别混</strong>：<code>u32</code> 整数值按 <code>1 &lt;&lt; n</code> 编号（低位 n 小），<code>SETBIT</code> 的 offset 是 MSB-first——<strong>value 的 bit n 对应 offset <code>31 − n</code></strong>。整块写 9（<code>0b1001</code>）等于置位 offset <strong>28</strong>（bit3）与 <strong>31</strong>（bit0），不是 offset 3。用 <code>SETBIT key 3 1</code> 去"打开查看权限"，实际改的是 <code>1 &lt;&lt; 28</code>。</p>
+</blockquote>
+<p><strong>多状态段</strong>：一局游戏 6 个角色，各有血量 <code>u16</code>、等级 <code>u8</code>、状态 <code>u2</code>，每角色预留 128 bit。这里<strong>刻意不用 <code>#</code> 相对偏移</strong>——<code>#N</code> 的乘数是当前子命令位宽，混用 <code>u16</code>/<code>u8</code>/<code>u2</code> 时会落进错误区间并互相覆盖，改用绝对 bit 偏移：</p>
+<pre><code class="language-redis"># 角色 i 基址 base = i*128，全部手写绝对 bit 偏移
+BITFIELD game:room:88:chars \
+  SET u16 0   65535  SET u8 32  12  SET u2 48  1 \
+  SET u16 128 32000  SET u8 160 5   SET u2 176 0
+</code></pre>
+<pre><code class="language-csharp">// 权限位（掩码）与游戏角色（位段）共用一个"掩码 + 位段"服务
+public class MaskStateService
+{
+    private readonly IDatabase _db;
+    public MaskStateService(IDatabase db) =&gt; _db = db;
+
+    // 权限编号按 value 的 bit n；SETBIT 的 offset = 31 - n（MSB-first）
+    private static int OffsetOf(int permissionBit) =&gt; 31 - permissionBit;
+
+    // 授予权限：SETBIT 幂等，重复授予无副作用
+    public async Task GrantAsync(long userId, int permissionBit)
+        =&gt; await _db.StringSetBitAsync((RedisKey)$"user:{userId}:perm", OffsetOf(permissionBit), true);
+
+    // 判断权限：GETBIT 对未初始化位返回 0（即未授予）
+    public async Task&lt;bool&gt; HasAsync(long userId, int permissionBit)
+        =&gt; await _db.StringGetBitAsync((RedisKey)$"user:{userId}:perm", OffsetOf(permissionBit));
+
+    // 读整块掩码：u32 最大约 42.9 亿，仍在 long 正数范围内，(long) 不溢出
+    public async Task&lt;uint&gt; GetMaskAsync(long userId)
+    {
+        var res = ((RedisResult[])await _db.ExecuteAsync("BITFIELD_RO",
+            (RedisKey)$"user:{userId}:perm", "GET", "u32", "0"))!;
+        // unchecked 防止 /checked+ 下 (uint)long 抛 OverflowException
+        return unchecked((uint)(res[0].IsNull ? 0L : (long)res[0]));
+    }
+
+    // 多状态段：每角色 128 bit，血量 @0、等级 @32、状态 @48
+    private const int BitsPerRole = 128;
+    private static int HpOffset(int r)     =&gt; r * BitsPerRole;
+    private static int LevelOffset(int r)  =&gt; r * BitsPerRole + 32;
+    private static int StatusOffset(int r) =&gt; r * BitsPerRole + 48;
+
+    // 一条 BITFIELD 三个 SET 原子生效；入口先做位宽范围校验（越界 SET 会静默回绕）
+    public async Task SetRoleAsync(string roomId, int roleIdx, int hp, int level, int status)
+    {
+        if (roleIdx &lt; 0 || roleIdx &gt;= 6) throw new ArgumentOutOfRangeException(nameof(roleIdx));
+        if (hp &lt; 0 || hp &gt; 65535 || level &lt; 0 || level &gt; 255 || status &lt; 0 || status &gt; 3)
+            throw new ArgumentOutOfRangeException();
+
+        await _db.ExecuteAsync("BITFIELD", (RedisKey)$"game:room:{roomId}:chars",
+            "SET", "u16", HpOffset(roleIdx),     hp,
+            "SET", "u8",  LevelOffset(roleIdx),  level,
+            "SET", "u2",  StatusOffset(roleIdx), status);
+    }
+
+    // 只读血量：读路径统一 BITFIELD_RO，可下发副本
+    public async Task&lt;long&gt; GetHpAsync(string roomId, int roleIdx)
+    {
+        var res = ((RedisResult[])await _db.ExecuteAsync("BITFIELD_RO",
+            (RedisKey)$"game:room:{roomId}:chars", "GET", "u16", HpOffset(roleIdx)))!;
+        return res[0].IsNull ? 0L : (long)res[0];
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：布局是硬编码约定，发布后不能随意改（改了旧数据全错）；跨字节边界读取时部分 SDK 解析易出错，建议按字节对齐；权限超过 63 个改用第二个 <code>u63</code>，更实际是换回 <code>SETBIT</code> 位图（offset 上限 <code>2^32−1</code>）。</p>
+<p><strong>为什么权限不用 <code>SETBIT</code> 位图？</strong> 两者都只占几字节，差别在"读法"：位图按用户 ID 建图、一个用户一个 bit，适合"这批用户里谁有某权限"的批量筛选；位域按用户建 key、权限落在同一个 <code>u32</code> 里，适合"这个用户有哪些权限"的单点查询。权限数固定、按用户查，位域更顺手；要按权限维度批量圈人，仍该用位图 + <code>BITOP</code>。</p>
+<h2 id="33-滑动窗口60-个-u16-秒桶">3.3 滑动窗口：60 个 u16 秒桶</h2>
+<p>统计"最近 60 秒请求数"，用 60 个 <code>u16</code> 桶（每秒一个）。</p>
+<p><strong>先说常见错误设计</strong>：把 60 个桶放一个常驻 key、读时全加起来——桶永不复位，算出来的是"有史以来累计"。要正确，<strong>key 必须带时间切面</strong>：按分钟切 key，桶对应这一分钟内的秒位。</p>
+<pre><code class="language-redis"># key 每分钟一个：60 个 u16 秒桶（共 120 字节），TTL 2 分钟防堆积
+# 槽位 = 当前秒（假设第 37 秒）；SAT 封顶防单秒溢出
+BITFIELD rate:user:100:202611051430 OVERFLOW SAT INCRBY u16 #37 1
+</code></pre>
+<pre><code class="language-csharp">public class SlidingWindowCounter
+{
+    private readonly IDatabase _db;
+    public SlidingWindowCounter(IDatabase db) =&gt; _db = db;
+
+    // key 每分钟一个：60 个 u16 秒桶；TTL 2 分钟，过期即清，无需复位逻辑
+    private static string Key(long userId, DateTimeOffset t) =&gt;
+        $"rate:user:{userId}:{t:yyyyMMddHHmm}";
+
+    // 写入 + 首次设 TTL 放进同一个脚本：两条独立命令之间失败会留下永不过期的分钟 key，
+    // 逐分钟累积就是内存泄漏；同时避免每次 INCR 都重复发 EXPIRE
+    private const string IncrScript = @"
+redis.call('BITFIELD', KEYS[1], 'OVERFLOW', 'SAT', 'INCRBY', 'u16', ARGV[1], 1)
+if redis.call('TTL', KEYS[1]) &lt; 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 1";
+
+    // 限流桶只需一致时间轴，不涉及"业务日"语义，直接用 UtcNow
+    public async Task IncrAsync(long userId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        await _db.ScriptEvaluateAsync(IncrScript,
+            new RedisKey[] { Key(userId, now) },
+            new RedisValue[] { $"#{now.Second}", 120 });
+    }
+
+    // 最近 60 秒 = 当前分钟的 [0..nowSec] 段 + 上一分钟的 (nowSec..59] 段
+    public async Task&lt;long&gt; TotalAsync(long userId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var cur  = await SumRangeAsync(userId, now,                 0, now.Second);
+        var prev = await SumRangeAsync(userId, now.AddMinutes(-1),  now.Second + 1, 59);
+        return cur + prev;
+    }
+
+    private async Task&lt;long&gt; SumRangeAsync(long userId, DateTimeOffset minute, int from, int to)
+    {
+        // now.Second == 59 时上一分钟段为空
+        if (from &gt; to) return 0;
+        // key 必须是参数数组第一个元素、整包一次传给 ExecuteAsync；
+        // 写成 ExecuteAsync("BITFIELD_RO", key, args.ToArray()) 会把 object[] 当单个参数装箱，
+        // 命令帧拼错、服务端收不到并超时（SE.Redis 有公开的故障记录）
+        var args = new List&lt;object&gt; { (RedisKey)Key(userId, minute) };
+        for (int i = from; i &lt;= to; i++) args.AddRange(new object[] { "GET", "u16", $"#{i}" });
+        var res = ((RedisResult[])await _db.ExecuteAsync("BITFIELD_RO", args.ToArray()))!;
+        return res.Sum(r =&gt; r.IsNull ? 0L : (long)r);
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：跨两个 key 的求和有两次往返，精确限流要用 Lua 在服务端一次完成；桶宽 <code>u16</code> 上限 65535，单秒 QPS 极高换 <code>u32</code>；<code>TTL &lt; 0</code> 分支只在 key 首次创建时触发。</p>
+<h2 id="34-漏斗与分组归属位图--bitop-新操作符">3.4 漏斗与分组归属：位图 + BITOP 新操作符</h2>
+<p>运营要看"访问商品页 → 加购 → 下单"的漏斗，或"这批用户谁同时属于 A 活动、又没参与 B"。这类"多张位图之间的集合关系"，正是 <code>BITOP</code> 新操作符的主场。</p>
+<pre><code class="language-redis"># 三张位图：每个 bit 对应一个 userId
+SETBIT funnel:view  100100 1
+SETBIT funnel:cart  100100 1
+SETBIT funnel:order 100100 1
+
+# 加购但未下单（在 cart 不在 order）
+BITOP DIFF result:cart_no_order funnel:cart funnel:order
+
+# 访问且（加购或下单）——ANDOR 一条搞定
+BITOP ANDOR result:engaged funnel:view funnel:cart funnel:order
+
+# 恰好只参与一个活动（分组互斥分析）
+BITOP ONE result:only_one campaign:a campaign:b campaign:c
+
+# 统计某一步人数
+BITCOUNT result:cart_no_order
+</code></pre>
+<p>C# 端只需一条 <code>ExecuteAsync</code>（见 1.6 的 BITOP 示例），<code>dest</code> 与所有源 key 都显式转 <code>RedisKey</code>。</p>
+<p><strong>边界</strong>：需要 userId <strong>稠密有界</strong>（大 offset 陷阱同第 6 篇）；跨 Slot 的 key 用 Hash Tag 绑定；结果 key 务必 <code>EXPIRE</code>。</p>
+<p><strong>与 3.1~3.3 的分工</strong>：前三节用<strong>位域</strong>存"每个对象自己的多个小数字"，本节用<strong>位图</strong>存"每个用户的一个布尔状态"再做集合运算——两者常在同一系统并存。</p>
+<h2 id="35-场景速查">3.5 场景速查</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031746638-502125102.png" alt="" loading="lazy"></p>
+<blockquote>
+<p>共同前提只有两条：<strong>字段固定、个数已知</strong>；<strong>值域是小整数</strong>。一旦"字段会增删""要按字段名查"，就该换 Hash。</p>
+</blockquote>
+<hr>
+<h1 id="四内存账与选型决策">四、内存账与选型决策</h1>
+<h2 id="41-内存构成省的是-key-元数据不是位宽">4.1 内存构成：省的是 key 元数据，不是位宽</h2>
+<p>先算位域数据本身：</p>
+<pre><code class="language-text">总位数 = Σ(各字段位宽)
+字节数 = ceil(总位数 / 8)
+实际分配 = 向上取整到 jemalloc size class（32/48/64/80/96/112/128/256 …）
+</code></pre>
+<p><strong>字段宽度之和决定理论字节数，真正占多少看 jemalloc 桶</strong>。只需要 130 位（约 17 字节），jemalloc 会给 32 字节的桶——所以"省内存"必须连桶对齐一起算。</p>
+<p>关键认知：<strong>位域省的不是"位域数据比 key 小"，而是被合并掉的 key 的固定开销</strong>。一个 key 的固定开销约 <strong>77 字节</strong>（redisObject 16 + SDS 头约 9 + dictEntry 24 + 哈希桶 8 + key 名 20）。把 N 个独立计数 key 合并成 1 个位域 key，省下 <code>(N−1) × 77 B</code>，<strong>与位域数据本身多大无关</strong>。</p>
+<pre><code class="language-text">每 key 固定开销 ≈ 77 B
+合并 N 个计数器 → 省 (N−1) × 77 B
+8 个 u32 计数器：省 7 × 77 ≈ 539 B，而位域数据本身只有 32 B
+</code></pre>
+<p>所以"100 万个 <code>u4</code> 位域 = 500 KB，比 100 万个独立 key 的 77 MB 省 150 倍"是<strong>错的对比</strong>：左边只算位域数据、右边算完整 key，而且 100 万字段塞进一个 key 会得到 500 KB 的 value，是 64 KB 大 key 线的 8 倍，RDB fork、主从同步、集群迁移都会被拖累。真实布局是"每用户/每帖子一个位域 key"，每个 key 同样付 77 B——收益只来自"合并了多少字段"。</p>
+<p>单个 key 的内存构成（8×<code>u32</code> 为例）：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031806620-2025330465.png" alt="" loading="lazy"></p>
+<h2 id="42-三方案量化对比">4.2 三方案量化对比</h2>
+<p>同样存 8 个计数器，key 名均假设约 20 字节，<strong>统一 1000 进制</strong>：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031812510-1033778026.png" alt="" loading="lazy"></p>
+<blockquote>
+<p>两个口径提醒：① 单对象内存的区间（Hash 约 250~350、Bitfield 约 110~180）来自 key 名长度与 jemalloc 桶波动，表中 ~1050/~300/~145 是基准估算。② <strong>Hash 一列按 hashtable 编码估</strong>。字段少且短时 Hash 会走 <strong>listpack</strong>（<code>hash-max-listpack-entries</code> 默认 128，8 个短字段在限内），实际可低至约 150 B——那时 Hash 与 Bitfield 差距只剩约 1.2 倍，"为省内存选位域"的论据明显减弱。<strong>选型前先跑一次 <code>OBJECT ENCODING</code>，按真实编码算账。</strong></p>
+</blockquote>
+<p>规模账：日活 500 万的内容产品，不压缩（每用户每类一行）是 4000 万个 key × 约 131 B ≈ <strong>5.25 GB</strong>；位域压缩（每用户一个 key 含 8 个 u32）是 500 万 × 约 145 B ≈ <strong>725 MB</strong>，<strong>省约 86%</strong>。省下的还有主从带宽、RDB 体积、集群迁移时间。</p>
+<blockquote>
+<p>⚠️ 跨表引用数字先确认分母：6.2 的 1050 B 是"每对象 8 个 key 的合计"，拿它乘 4000 万会高估 8 倍；77 B 是"每 key"，131 B 也是"每 key"，三者不能互换。</p>
+</blockquote>
+<h2 id="43-64-kb-大-key-线与字段数上界">4.3 64 KB 大 key 线与字段数上界</h2>
+<p><strong>大 key 线</strong>：单个位域 value 超过 <strong>约 64 KB（约 51 万 bit）</strong> 就该拆分或改用 Hash——大 String 会放大 RDB fork、主从同步、<code>UNLINK</code> 与集群迁移压力。8×u32 只有 32 字节，离这条线很远；撞线的是"把一整张日活图塞进一个位域 key"这类误用。</p>
+<p><strong>每 key 放多少字段</strong>：</p>
+<pre><code class="language-text">设 F = 字段数，W = 平均位宽(bit)，D = ceil(F × W / 8)
+约束 1（大 key）：D ≤ 64 KB ⇒ F ≤ 64×1024×8 / W（W=32 时约 16384）
+约束 2（单命令耗时）：一次 BITFIELD 的子命令串行执行，建议 ≤ 几十条
+约束 3（单 key 热点）：该 key 的写 QPS 不能压垮所在分片
+生产取值：约束 1 很宽松，真正卡人的是 2 和 3 —— 建议 F ≤ 64
+</code></pre>
+<h2 id="44-什么时候位域不划算">4.4 什么时候位域不划算</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031824135-895979997.png" alt="" loading="lazy"></p>
+<blockquote>
+<p>判断口诀："<strong>少、独立过期、要浮点、要排序、要动态字段</strong>"命中一条就别用位域。最佳射程是"<strong>几十个固定布局的小整数、共享生命周期、内存敏感</strong>"。</p>
+</blockquote>
+<h2 id="45-全套位指令选型决策树">4.5 全套位指令选型决策树</h2>
+<p>选型不只发生在 String/Hash/Bitfield 之间，也发生在<strong>位操作的三个视角</strong>之间：</p>
+<pre><code class="language-text">业务需求判断
+├─ 只需要单 bit 布尔标记，统计 0/1 数量
+│   └─ Bitmap：SETBIT / GETBIT / BITCOUNT
+├─ 需要多 key 位图之间做 AND/OR/XOR/DIFF 集合运算
+│   ├─ 仅离线定时任务执行 → BITOP
+│   │   ※ 源 key 映射口径一致；destkey 务必 EXPIRE
+│   └─ 业务接口禁止调用 BITOP
+└─ 需要在同一个 String 内存储大量窄位宽整型，支持原子自增
+    ├─ 指标上限可评估、schema 长期稳定 → BITFIELD
+    │   ※ INCRBY 显式 OVERFLOW；同宽字段才用 `#` 相对偏移，混宽手写绝对偏移
+    ├─ 指标上限不可预估、schema 频繁变更 → 放弃 Bitfield，改用独立 String INCR
+    └─ 只读不写 → BITFIELD_RO（6.2+），下发副本
+</code></pre>
+<p><strong>关键取舍</strong>：Bitfield 是"牺牲可维护性换极致内存压缩"。schema 一变，改一个字段位宽，后面所有偏移全部错位。<strong>字段固定、个数已知、值域是小整数</strong>三条同时满足才值得用；否则 Hash 或独立 String 更稳。</p>
+<p>落到实操，按这个顺序问三句：<strong>① 这些值要不要各自过期？</strong> 要 → 独立 String，位域做不到。<strong>② 字段会不会增删、要不要按名字查？</strong> 会 → Hash，位域布局是冻结的。<strong>③ 值域是不是 1~63 位的小整数、写入频率可控？</strong> 是 → 位域；否则回退。三句都过，再算内存账确认收益足够覆盖维护成本。</p>
+<hr>
+<h1 id="五坑点速查与上线清单">五、坑点速查与上线清单</h1>
+<h2 id="51-28-条速查表">5.1 28 条速查表</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031835828-1416802395.png" alt="" loading="lazy"></p>
+<h2 id="52-三条必须展开的坑">5.2 三条必须展开的坑</h2>
+<p><strong>坑 7｜溢出静默回绕（最危险）</strong>。<code>u8</code> 涨到 255 后变 0、<code>i8</code> 涨到 127 后变 -128，日志无报错。根因是默认 <code>WRAP</code>，回绕是正常返回值；服务器不抛异常。规避：显式 <code>OVERFLOW SAT</code> 或 <code>FAIL</code>，绝不用默认。<strong>注意 <code>SAT</code> 封顶后报表会静默停涨</strong>——返回值等于上限也应埋点告警，否则体验和 <code>WRAP</code> 归零一样差。</p>
+<p><strong>坑 11｜<code>FAIL</code> 全部失败但 key 已预扩展</strong>。全部写子命令返回 <code>nil</code>，<code>EXISTS</code> 却是 1、<code>STRLEN</code> 不为 0，主从可能不一致，AOF 重载后 key 又消失。根因：预扩展发生在子命令执行之前，且因 <code>changes == 0</code> 不落 AOF、不传播（issue #15599，详见 2.6）。规避：不依赖"<code>FAIL</code> = 什么都没发生"，对存在性/长度敏感时额外校验。</p>
+<p><strong>坑 17｜无符号字段的负增量下溢</strong>。库存/余额用 <code>u32</code>，扣到 0 后再 <code>INCRBY u32 0 -1</code>，值变成 <strong>4,294,967,295</strong>，比归零更离谱且不报错。根因：<code>INCRBY</code> 的 increment 可为负，无符号下溢在默认 <code>WRAP</code> 下回绕到最大值。规避：可能有负增量的字段用有符号位宽（<code>i32</code>/<code>i64</code>）+ <code>SAT</code>，或用 <code>FAIL</code> + 应用层处理拒绝，<strong>绝不让无符号字段在默认 <code>WRAP</code> 下接负增量</strong>。</p>
+<h2 id="53-两个故障复盘">5.3 两个故障复盘</h2>
+<p><strong>故障 1［性能］：<code>BITOP AND</code> 合并 30 天日活，主线程卡顿数百毫秒。</strong> 30 张约 <strong>33 MB</strong> 的日活图（对应约 2.6 亿 ID 上界）≈ <strong>1 GB 输入</strong>，按位运算约 1~2 GB/s 折算，单条命令要跑 <strong>0.5~1 秒</strong>，期间整个实例阻塞。换成 1000 万 ID 上界（1.25 MB/张）则只有 37.5 MB 输入、约 <strong>20~40 ms</strong>——别把前者耗时套到自己规模。排查路径：P99 周期性尖刺恰好落在留存任务窗口 → <code>SLOWLOG GET</code> 抓到该 <code>BITOP AND</code> 约 0.8 s → 按输入总字节折算确认是单线程阻塞。</p>
+<p>一个反直觉的点：<code>BITOP</code> 的复杂度是 <strong>O(N)</strong>，N 是<strong>最长输入位图的字节数</strong>，不是 key 的个数。30 张图不是"30 次小操作"，而是"一次 33 MB 的逐字节扫描"——耗时随单图规模线性涨，和 key 数几乎无关。这也解释了为什么"把 30 天拆成 3 批各 10 天"没有帮助：每批仍是 33 MB 输入，只是分成三次阻塞。</p>
+<p>修复：错峰执行；副本执行需先设 <code>replica-read-only no</code>（全局配置，改完该副本可被任何客户端写脏，full resync 即被冲掉，只适合一次性聚合）；更稳的是按 ID 分片拆小位图、各算一次再应用层相加，或用独立统计实例；结果 key 设短 TTL。</p>
+<p><strong>故障 2［一致性］：两张日活图映射口径不同，<code>BITOP AND</code> 全错。</strong> 一次 uid→offset 映射迁移后序号基准变了，新旧两张图（一张 12.5 MB、一张 1.25 MB）直接 <code>BITOP AND</code>，交集统计全错。排查初期怀疑"<code>BITOP</code> 对长度不一致的处理有 bug"——方向就错了：补 0 与缺失位的真实内容一致，<strong><code>BITOP</code> 无辜</strong>，错的是映射。修复：映射口径变更必须升 key 版本并迁移；定期 <code>STRLEN</code> 抽查，把"同上界的图长度差异过大"当口径漂移的告警信号。</p>
+<blockquote>
+<p>其余四个故障（<code>u4</code> 归零、<code>FAIL</code> 预扩展、结果 key 堆积、应用层位反）的根因与修复分别对应坑 7 / 坑 11 / 坑 25 / 坑 19。</p>
+</blockquote>
+<h2 id="54-上线前-10-项自检">5.4 上线前 10 项自检</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031841623-1774630836.png" alt="" loading="lazy"></p>
+<p><strong>监控必须客户端埋点</strong>——服务端对这些没有指标，等 Redis 提供是等不到的：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261105031848432-378328179.png" alt="" loading="lazy"></p>
+<hr>
+<h1 id="六faq-与小结">六、FAQ 与小结</h1>
+<h2 id="61-faq">6.1 FAQ</h2>
+<p><strong>Q1｜<code>BITFIELD</code> 和 <code>SETBIT</code> 什么关系？</strong> 同一张 String 的两种视角：<code>SETBIT</code> 管单个比特，<code>BITFIELD</code> 管连续多位。底层都是 SDS 字节串。</p>
+<p><strong>Q2｜为什么 <code>u64</code> 不支持、<code>i64</code> 却支持？</strong> RESP 整数是有符号 64 位；<code>u63</code> 最大值能塞进正数范围，<code>u64</code> 的 <code>2^64-1</code> 超出无法表达。</p>
+<p><strong>Q3｜写溢出会报错吗？</strong> 服务器层面都不抛异常：<code>WRAP</code>/<code>SAT</code> 静默返回回绕/边界值，<code>FAIL</code> 返回 <code>nil</code>。区别在客户端能否感知——只有 <code>FAIL</code> 给了显式拒绝信号，但需主动判 <code>nil</code>。<strong><code>SET</code> 的 value 越界同样走这套策略</strong>。</p>
+<p><strong>Q4｜<code>#</code> 和纯数字偏移有什么区别？</strong> 纯数字是"第 n 个比特"，<code>#n</code> 是"第 n 个类型宽度的槽位"（<code>offset = n × 位宽</code>）。<code>#</code> 用于同宽数组；混宽时手写绝对偏移更安全。</p>
+<p><strong>Q5｜<code>GET</code> 读不存在区域会怎样？</strong> 返回 0，不报错。所以无法区分"真 0"与"未写"。</p>
+<p><strong>Q6｜<code>OVERFLOW</code> 影响哪些子命令？</strong> 只影响它之后、直到下一条 <code>OVERFLOW</code> 之间的 <code>SET</code>/<code>INCRBY</code>，对 <code>GET</code> 无效。</p>
+<p><strong>Q7｜一个 String 能省多少内存？</strong> 省约 86%；小规模 Hash 走 listpack 时差距缩小到约 1.2 倍，选型前实测编码。</p>
+<p><strong>Q8｜<code>DIFF</code> 和 <code>DIFF1</code> 有什么区别？</strong> 方向相反：<code>DIFF</code> 是 X−Y（在第一个 key 不在其他），<code>DIFF1</code> 是 Y−X。</p>
+<p><strong>Q9｜应用层自己解析位图为什么左右颠倒？</strong> Redis 位序是 MSB-first，字节最高位对应 offset 最小的 bit；正确写法 <code>1 &lt;&lt; (7 - (offset &amp; 7))</code>。</p>
+<p><strong>Q10｜两张位图 <code>BITOP AND</code> 交集偏小，可能是什么原因？</strong> 几乎不会是 <code>BITOP</code> 本身——长度不一致时补 0 与缺失位真实内容一致，结果精确。真正要查的是两张图是否用了不同的 uid→offset 映射，<code>STRLEN</code> 差异过大是口径漂移信号。</p>
+<p><strong>Q11｜同一条命令里 <code>GET</code> 和 <code>INCRBY</code> 谁先生效？</strong> 按书写顺序串行执行。想读到自增后的值，<code>GET</code> 必须写在 <code>INCRBY</code> 之后；写在前面的 <code>GET</code> 读到的是旧值。</p>
+<p><strong>Q12｜位域能存负数吗？</strong> <code>i</code> 类型可以（补码表示）；<code>u</code> 类型不接受负值写入——<code>SET u8 0 -1</code> 会走溢出策略，默认 <code>WRAP</code> 静默回绕成 255，<code>FAIL</code> 则返回 <code>nil</code>。</p>
+<h2 id="62-小结">6.2 小结</h2>
+<p>Bitfield 是 Redis 位能力里<strong>"最反直觉、也最容易静默出错"</strong>的一块：把 String 当成可按任意位宽、任意偏移读写的位域数组，收益是内存砍 80%，代价是溢出静默、布局强 Schema 绑定、位序与符号要自己守。</p>
+<p>三条最该记住：</p>
+<ol>
+<li><strong>溢出默认静默</strong>。不写 <code>OVERFLOW</code>，<code>u8</code> 255+1 变 0、<code>i8</code> 127+1 变 -128，<code>SET</code> 越界同样回绕，无符号负增量还会下溢成天文数字。计数器一律 <code>SAT</code>；封顶致误判或扣减不可截断时用 <code>FAIL</code>；<code>OVERFLOW</code> 只向后生效。</li>
+<li><strong>原子但非事务，<code>FAIL</code> 也不是"什么都没发生"</strong>。单条命令只保证不被并发打断，不回滚；跨命令读-改-写要搬进 Lua 或 <code>WATCH</code>；全部写被 <code>FAIL</code> 拒绝时 key 仍可能已预扩展且不写 AOF、不同步副本。</li>
+<li><strong>用可维护性换内存压缩</strong>。收益来自消除 per-key 元数据（每合并一个 key 省约 77 B），代价是布局强 Schema 绑定、位序 MSB-first、符号一次定型。<strong>字段固定、个数已知、值域小整数</strong>三条同时满足才值得用。</li>
+</ol>
+<blockquote>
+<p>用一个 key 装几十个小整数，省的是 key 元数据，付的是"布局即契约"。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-06 07:34">2026-11-06 07:33</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">78</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23554102);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23554102&amp;targetId=23554102&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

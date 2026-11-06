@@ -1,0 +1,1061 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shanyou/p/23564852" title="发布于 2026-11-05 21:03">
+    
+
+    <span role="heading" aria-level="2">OpenBao 实战笔记：从上手到生产部署（已更新至 v2.7.2）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        这篇文章是我把 OpenBao 从上手到生产跑通一遍的记录，覆盖安装、各类 Secret Engine、认证授权、Seal/Unseal、HA 集群和 Kubernetes 集成。内容已按 OpenBao v2.7.2（2026 年 10 月 26 日发布）核对过，2.6 和 2.7 之间的破坏性变更都写进来了。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>数据库密码、API Key、TLS 证书这些敏感信息，散落在环境变量、配置文件和 CI/CD Pipeline 里，几乎是所有攻击者的第一目标。密钥管理这件事，迟早要做，早做比晚做好。</p>
+<p>OpenBao 是 HashiCorp Vault 的开源分叉，挂在 Linux Foundation 的 LF Edge 下面，MPL-2.0 许可证。起因是 2023 年 8 月 HashiCorp 把 Vault 从 MPL-2.0 改成了 BSL，限制竞争性使用，社区一怒之下 fork 了一份。现在它的 API 和 Vault 高度兼容，CLI 命令是 <code>bao</code>，用法几乎照搬 Vault。</p>
+<p>这篇文章是我把 OpenBao 从上手到生产跑通一遍的记录，覆盖安装、各类 Secret Engine、认证授权、Seal/Unseal、HA 集群和 Kubernetes 集成。内容已按 <strong>OpenBao v2.7.2</strong>（2026 年 10 月 26 日发布）核对过，2.6 和 2.7 之间的破坏性变更都写进来了。</p>
+<h2 id="升级前先看看-26--272-改了什么">升级前先看看 2.6 → 2.7.2 改了什么</h2>
+<p>如果你已经在跑 2.5.x 或 2.6.x，升级之前这几条必须先过一遍，不然会踩坑。</p>
+<p>破坏性变更：</p>
+<ul>
+<li><strong>云厂商 Auto Unseal 不再内置</strong>。<code>awskms</code>、<code>gcpckms</code>、<code>azurekeyvault</code>、<code>alicloudkms</code>、<code>ocikms</code>、<code>pkcs11</code> 全部移出了主二进制，要去 <a href="https://github.com/openbao/openbao-plugins" target="_blank" rel="noopener nofollow">openbao-plugins</a> 装对应的 KMS 插件，再用 <code>plugin "kms"</code> 声明式注册。独立的 HSM 发行版也停发了。</li>
+<li><strong>LDAP / Kerberos / RADIUS 认证引擎、LDAP 密钥引擎移出主二进制</strong>，同样需要外部插件。</li>
+<li><strong><code>file</code> 存储后端被移除</strong>，新的替代是非 HA 的 PebbleDB 后端，Linux 软件包的默认配置已经切过去了。还在用 <code>storage "file"</code> 的配置在 2.7 上起不来。</li>
+<li><strong>容器镜像默认以非 root 的 <code>openbao</code> 用户运行</strong>（2.6 起），依赖 root 的自定义启动脚本需要适配。</li>
+<li>PKI 不再接受以 <code>.</code> 结尾的域名（<code>example.com.</code> 这种会被拒）。</li>
+</ul>
+<p>值得用的新东西：</p>
+<ul>
+<li><strong>External Keys</strong>：PKI 和 Transit 可以直接调用 KMS/HSM 里的密钥做运算，密钥材料不进 OpenBao。</li>
+<li><strong>ML-DSA 后量子签名</strong>：PKI 签发和 Transit 签名都支持 NIST FIPS 204 的 ML-DSA（44/65/87 三个参数集）。监听器还能配置纯 PQC 的 TLS 密钥交换。</li>
+<li><strong>强一致性控制</strong>：写请求响应带 <code>X-Vault-Index</code> 头，读请求可以声明自己见到过的最新写入，节点数据落后时可以选择直接 429、转发给活跃节点或者本地等待追平。治"写完马上从 Standby 读到旧值"这个老毛病。</li>
+<li><strong>Control Groups</strong>：ACL 策略里可以写审批控制，敏感路径的操作要第二个人批了才执行。</li>
+<li><strong>PebbleDB 存储后端</strong>：替代 <code>file</code>，性能好不少。</li>
+<li><strong>声明式自初始化增强</strong>（2.6）：支持 CEL 表达式和模板，Dev 模式也能用。</li>
+<li><strong><code>tls_auto_reload</code></strong>：证书文件变了自动重载，不用再发 SIGHUP。</li>
+</ul>
+<p>为什么要立刻升到 2.7.2：2.7.1 和 2.7.2 一共修了 11 个安全漏洞，包括 AppRole 的 Secret ID 过期后仍能认证、Kubernetes Auth 在 Service Account 被吊销后还能续租、Transit 导入备份时的路径遍历、SSH 证书模板默认允许通配符等。低于 2.7.2 的部署都应该尽快升。</p>
+<h2 id="核心概念">核心概念</h2>
+<p>术语不多，先把这几个记住就行：</p>
+<table>
+<thead>
+<tr>
+<th>术语</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Secret Engine</td>
+<td>存储、生成或加密数据的插件化组件，按路径挂载（<code>secret/</code>、<code>database/</code>、<code>pki/</code>）</td>
+</tr>
+<tr>
+<td>Auth Method</td>
+<td>认证方式，验证身份后发 Token</td>
+</tr>
+<tr>
+<td>Token</td>
+<td>认证成功后拿到的凭证，带策略信息</td>
+</tr>
+<tr>
+<td>Policy</td>
+<td>ACL 策略，定义 Token 对路径的权限</td>
+</tr>
+<tr>
+<td>Lease</td>
+<td>密钥有效期，到期自动撤销，可续租</td>
+</tr>
+<tr>
+<td>Seal / Unseal</td>
+<td>加密保护机制，启动时处于 Sealed，要 Unseal Key 才能解密数据</td>
+</tr>
+<tr>
+<td>Barrier</td>
+<td>加密屏障，写进存储的数据都经过它加密</td>
+</tr>
+<tr>
+<td>Integrated Storage</td>
+<td>内置 Raft 共识存储，不依赖外部组件</td>
+</tr>
+<tr>
+<td>PebbleDB</td>
+<td>2.7 新增的非 HA 持久化后端</td>
+</tr>
+<tr>
+<td>External Key</td>
+<td>2.7 新增，存于外部 KMS/HSM、由 OpenBao 调用的密钥</td>
+</tr>
+</tbody>
+</table>
+<h2 id="架构">架构</h2>
+<p>OpenBao 的安全核心是多层加密。理解这条链基本就理解了一半：</p>
+<pre><code>Unseal Key（操作员持有 / 外部 KMS 插件托管）
+    └── 加密 → Root Key
+            └── 加密 → Encryption Keyring
+                    └── 加密 → 存储里的所有数据
+</code></pre>
+<p>几个要点：</p>
+<ol>
+<li>Unseal Key 不存在任何地方。Shamir 模式下它分散在多个人手里，Auto Unseal 模式下由外部 KMS 插件托管。</li>
+<li>就算攻击者拖走了整个存储后端的数据，没有 Unseal Key 也解不开。</li>
+<li>数据加密密钥可以在线轮换，旧密钥留在 Keyring 里解密历史数据，不用停机。</li>
+</ol>
+<p>请求进来时的处理路径是：Listener 终止 TLS（2.7 可选纯 PQC 密钥交换）→ 一致性检查（<code>X-Vault-Index</code>）→ 审计 → Token 验证 → ACL 评估（可能触发 Control Group 审批）→ Secret Engine 处理 → Barrier 加密落盘。文末有一张完整的架构图。</p>
+<h2 id="安装">安装</h2>
+<p>macOS 最省事：</p>
+<pre><code class="language-bash">brew install openbao
+bao version
+# OpenBao v2.7.2 ...
+</code></pre>
+<p>Linux：</p>
+<pre><code class="language-bash"># Arch
+pacman -Sy openbao
+
+# Fedora / RHEL
+dnf install -y epel-release
+dnf install -y openbao
+
+# Debian / Ubuntu：从 https://openbao.org/downloads/ 下载
+wget https://github.com/openbao/openbao/releases/download/v2.7.2/bao_2.7.2_linux_amd64.deb
+sudo dpkg -i bao_2.7.2_linux_amd64.deb
+</code></pre>
+<p>顺带一提，2.6 起 Release 制品的命名统一了（架构统一 <code>amd64</code>，校验和合并成一个 <code>checksums.txt</code>），写自动下载脚本的话注意一下。</p>
+<p>Docker：</p>
+<pre><code class="language-bash">docker pull ghcr.io/openbao/openbao:latest
+
+docker run --rm -p 8200:8200 \
+  --memory-swappiness=0 \
+  --name openbao-dev \
+  ghcr.io/openbao/openbao:latest server -dev
+</code></pre>
+<p>装完记得加固：禁用 Swap（密钥数据不能进交换空间），systemd 服务文件默认有 <code>MemorySwapMax=0</code>，Docker 要加 <code>--memory-swappiness=0</code>。macOS 的 Swap 默认加密，不用管。另外 2.6 起容器默认非 root 运行，镜像里也没有 <code>VOLUME</code> 指令了，数据目录要自己显式挂载。</p>
+<h2 id="dev-模式上手">Dev 模式上手</h2>
+<p>Dev 模式内存存储、自动 Unseal、预生成 Root Token，学习用很合适，但<strong>绝对不要拿去跑生产</strong>。</p>
+<pre><code class="language-bash">bao server -dev
+# ==&gt; OpenBao server configuration:
+#                  Storage: inmem
+#                  Version: OpenBao v2.7.2
+# ...
+# Root Token: hvs.xxxxxxxxxxxxxxxxxxxxxxxx
+</code></pre>
+<p>另开一个终端：</p>
+<pre><code class="language-bash">export BAO_ADDR='http://127.0.0.1:8200'
+export BAO_TOKEN='hvs.xxxxxxxxxxxxxxxxxxxxxxxx'
+bao status
+bao status -field=version   # 2.7 起 status 支持 -field
+</code></pre>
+<p>2.6 起 Dev 模式也支持声明式自初始化了，启动时可以自动执行一串预定义的 API 请求，搭演示环境很方便。</p>
+<h2 id="kv-引擎第一个-secret">KV 引擎：第一个 Secret</h2>
+<p>Dev 模式默认挂了 KV v2 在 <code>secret/</code> 路径，最常用的命令跑一遍：</p>
+<pre><code class="language-bash"># 写入
+bao kv put secret/myapp/config \
+  db_host="postgres.prod.internal" \
+  db_port="5432" \
+  db_user="app_user" \
+  db_password="S3cur3P@ssw0rd!"
+
+# 读取
+bao kv get secret/myapp/config
+
+# 只取一个字段
+bao kv get -field=db_password secret/myapp/config
+
+# JSON 输出给脚本用
+bao kv get -format=json secret/myapp/config | jq '.data.data'
+
+# 更新（会产生新版本）
+bao kv put secret/myapp/config db_password="N3wS3cur3P@ss!"
+
+# 读历史版本
+bao kv get -version=1 secret/myapp/config
+
+# 列出路径
+bao kv list secret/myapp/
+
+# 软删除 / 恢复 / 永久销毁
+bao kv delete secret/myapp/config
+bao kv undelete -versions=2 secret/myapp/config
+bao kv destroy -versions=1 secret/myapp/config
+</code></pre>
+<p>KV v1 和 v2 的区别：v2 有版本控制、软删除、元数据和 CAS（check-and-set，防止并发写互相覆盖），API 路径多一层 <code>secret/data/</code>。生产上直接用 v2，v1 只适合不在乎版本的小场景。</p>
+<p>不走 CLI 的话，所有操作都有 HTTP API：</p>
+<pre><code class="language-bash">curl -s \
+  --header "X-Vault-Token: $BAO_TOKEN" \
+  --request POST \
+  --data '{"data": {"api_key": "sk-abc123def456"}}' \
+  $BAO_ADDR/v1/secret/data/myapp/api-keys | jq
+</code></pre>
+<p>这里说一下 2.7 的强一致性头：写请求响应会带 <code>X-Vault-Index</code>，后续读请求带上这个值再加 <code>X-Vault-Inconsistent</code> 声明策略——<code>fail</code>（数据没追平就返回 429 + Retry-After）、<code>forward-active-node</code>（转发给活跃节点）、<code>await-state</code>（本地等待追平），还能组合。HA 集群里"刚写完读不到"的问题可以靠它缓解。</p>
+<h2 id="secret-engines">Secret Engines</h2>
+<p>先看全景：</p>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>类型</th>
+<th>用途</th>
+<th>2.7 状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>KV</td>
+<td>存储</td>
+<td>键值对</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>Database</td>
+<td>动态</td>
+<td>数据库临时账号</td>
+<td>内置，MySQL 2.6 起支持多主机故障转移</td>
+</tr>
+<tr>
+<td>PKI</td>
+<td>动态</td>
+<td>X.509 证书签发</td>
+<td>内置，2.7 支持 ML-DSA 和外部密钥</td>
+</tr>
+<tr>
+<td>Transit</td>
+<td>加密</td>
+<td>加密即服务</td>
+<td>内置，2.7 支持 ML-DSA 和外部密钥</td>
+</tr>
+<tr>
+<td>SSH</td>
+<td>动态</td>
+<td>SSH 证书签发</td>
+<td>内置，2.7.2 起模板默认禁止通配符</td>
+</tr>
+<tr>
+<td>TOTP</td>
+<td>动态</td>
+<td>TOTP 码</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>Transform</td>
+<td>加密</td>
+<td>FPE / 脱敏</td>
+<td>内置</td>
+</tr>
+<tr>
+<td>LDAP</td>
+<td>动态</td>
+<td>LDAP 凭证</td>
+<td>已移出主二进制，需外部插件</td>
+</tr>
+</tbody>
+</table>
+<h3 id="database动态数据库凭证">Database：动态数据库凭证</h3>
+<p>动态密钥是这类系统最有价值的能力——按需生成有时效的数据库账号，到期自动删，不用再把一个万能密码贴得到处都是。</p>
+<pre><code class="language-bash">bao secrets enable database
+
+# 配置 PostgreSQL 连接
+bao write database/config/my-postgresql-db \
+  plugin_name="postgresql-database-plugin" \
+  allowed_roles="readonly,readwrite" \
+  connection_url="postgresql://{{username}}:{{password}}@postgres.internal:5432/myapp?sslmode=require" \
+  username="vault_admin" \
+  password="vault_admin_password"
+
+# 只读角色
+bao write database/roles/readonly \
+  db_name="my-postgresql-db" \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; \
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+  revocation_statements="DROP ROLE IF EXISTS \"{{name}}\";" \
+  default_ttl="1h" \
+  max_ttl="24h"
+
+# 动态获取凭证
+bao read database/creds/readonly
+# lease_id           database/creds/readonly/abcd1234...
+# lease_duration     1h
+# username           v-token-readonly-xxxxxxxxx
+# password           A1a-xxxxxxxxxxxxxxxxx
+
+# 续租 / 撤销
+bao lease renew database/creds/readonly/abcd1234...
+bao lease revoke database/creds/readonly/abcd1234...
+</code></pre>
+<p>几个经验：<code>default_ttl</code> 控制在 1 小时以内；应用要在 Lease 到期前主动续租，或者干脆交给 Agent；配置完连接后马上跑 <code>bao write -force database/rotate-root/my-postgresql-db</code> 把管理员密码轮换掉，防止有人拿原始密码直接登数据库。</p>
+<h3 id="pki内部-ca">PKI：内部 CA</h3>
+<p>OpenBao 可以当内部 CA 用，签发和管理 TLS 证书。典型做法是 Root CA + Intermediate CA 两层：</p>
+<pre><code class="language-bash"># Root CA
+bao secrets enable pki
+bao secrets tune -max-lease-ttl=87600h pki
+bao write -field=certificate pki/root/generate/internal \
+  common_name="My Organization Root CA" \
+  issuer_name="root-2026" \
+  ttl=87600h &gt; root_ca.crt
+
+# Intermediate CA：开第二个挂载点，生成 CSR，拿 Root 签，再导回去
+bao secrets enable -path=pki_int pki
+bao secrets tune -max-lease-ttl=43800h pki_int
+bao write -field=csr pki_int/intermediate/generate/internal \
+  common_name="My Organization Intermediate CA" \
+  issuer_name="intermediate-2026" &gt; pki_intermediate.csr
+bao write -field=certificate pki/root/sign-intermediate \
+  csr=@pki_intermediate.csr format=pem_bundle ttl=43800h &gt; intermediate_ca.crt
+bao write pki_int/intermediate/set-signed certificate=@intermediate_ca.crt
+
+# 定义可签发的证书规范
+bao write pki_int/roles/internal-service \
+  allowed_domains="internal.mycompany.com,svc.cluster.local" \
+  allow_subdomains=true max_ttl="720h" key_type="ec" key_bits=256
+
+# 签发
+bao write pki_int/issue/internal-service \
+  common_name="api.internal.mycompany.com" ttl="72h"
+# 返回里的 private_key 只有这一次能拿到，丢了只能重签
+</code></pre>
+<p>2.7 的两个新能力：一是 PKI 全流程支持 ML-DSA 后量子签名（FIPS 204，注意 Go 的 OCSP 还不支持 ML-DSA，这类 Issuer 用不了 OCSP）；二是可以用外部密钥签发，私钥留在 HSM 里，OpenBao 只拿签名结果。</p>
+<h3 id="transit加密即服务">Transit：加密即服务</h3>
+<p>应用不用自己管加密密钥，调 API 加解密就行，数据本身不落在 OpenBao：</p>
+<pre><code class="language-bash">bao secrets enable transit
+bao write -f transit/keys/my-app-key
+
+# 加密（输入要 base64）
+bao write transit/encrypt/my-app-key plaintext=$(echo -n "my-secret-data" | base64)
+# ciphertext     vault:v1:xxxxxxxxxxxxxxxxxxxxxx
+
+# 解密
+bao write transit/decrypt/my-app-key ciphertext="vault:v1:xxxxxxxxxxxxxxxxxxxxxx"
+
+# 轮换密钥、用新版本重加密旧密文
+bao write -f transit/keys/my-app-key/rotate
+bao write transit/rewrap/my-app-key ciphertext="vault:v1:..."
+</code></pre>
+<p>2.7 给 Transit 加了 ML-DSA 签名密钥，44/65/87 三个参数集都支持生成、导入导出：</p>
+<pre><code class="language-bash">bao write -f transit/keys/pqc-signing-key type=mldsa-65
+bao write transit/sign/pqc-signing-key input=$(echo -n "message" | base64)
+</code></pre>
+<p>提醒一句：Transit 导入密钥备份的路由遍历漏洞（能覆盖任意密钥）是 2.7.2 才修的，用到这个功能的务必升上来。</p>
+<h3 id="external-keys27-新增">External Keys（2.7 新增）</h3>
+<p>PKI 和 Transit 现在可以直接用外部 KMS/HSM 里的密钥做运算，密钥材料全程不进 OpenBao。通过 <code>/sys/external-keys</code> API 配映射：</p>
+<pre><code class="language-bash"># 需要先装对应的 KMS 插件（比如 kms-pkcs11）
+bao write sys/external-keys/pki/hsm-root-ca \
+  plugin_name="kms-pkcs11" \
+  # ... 插件自己的密钥引用参数
+</code></pre>
+<p>Transit 后端密钥是内置支持的，PKCS#11 走 <code>kms-pkcs11</code> 插件，接口本身和 Provider 无关，想接自家 KMS 可以自己写插件。</p>
+<h2 id="认证与授权">认证与授权</h2>
+<p>常用的认证方式：Token（一切的终点）、UserPass（测试用，2.6 起支持预哈希 bcrypt 密码）、AppRole（应用首选）、Kubernetes（Pod 用 ServiceAccount 认证）、JWT/OIDC、TLS 证书（2.7 支持解析 Envoy 的 XFCC 头）。LDAP、Kerberos、RADIUS 2.7 起都挪去外部插件了。</p>
+<h3 id="approle">AppRole</h3>
+<p>应用接入首选 AppRole，双因素：Role ID（可以大方放在配置里）加 Secret ID（要走安全通道下发，而且建议限一次使用）：</p>
+<pre><code class="language-bash">bao auth enable approle
+
+bao write auth/approle/role/my-app \
+  token_policies="my-app-policy" \
+  token_ttl=1h token_max_ttl=4h \
+  secret_id_ttl=10m \
+  secret_id_num_uses=1
+
+# 拿 Role ID
+bao read auth/approle/role/my-app/role-id
+
+# 生成 Secret ID
+bao write -f auth/approle/role/my-app/secret-id
+
+# 应用侧登录
+bao write auth/approle/login \
+  role_id="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
+  secret_id="yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+</code></pre>
+<p>2.7.1 修过一个 AppRole 的洞：Secret ID 过期后、tidy 还没清理之前居然还能拿来登录。2.7.2 又修了 Role ID 路径没做规范化的问题。所以再次强调，版本要跟上。</p>
+<h3 id="kubernetes-auth">Kubernetes Auth</h3>
+<pre><code class="language-bash">bao auth enable kubernetes
+
+bao write auth/kubernetes/config \
+  kubernetes_host="https://kubernetes.default.svc:443"
+
+bao write auth/kubernetes/role/my-app \
+  bound_service_account_names=my-app-sa \
+  bound_service_account_namespaces=production \
+  policies=my-app-policy ttl=1h
+</code></pre>
+<p>2.7.1 之前这里有个问题：Token 续租时不会重新校验 ServiceAccount JWT，SA 被吊销了还能续。现在续租会强制校验。</p>
+<h3 id="token">Token</h3>
+<p>两种：Service Token 可续租可撤销，有持久化存储；Batch Token 轻量不可续租，适合高吞吐短任务。Root Token 权限等于 root 用户，初始化完立刻 <code>bao token revoke</code> 掉，真要用的时候用 <code>bao operator generate-root</code> 临时生成（要多个 Unseal Key 持有者共同授权）。</p>
+<h2 id="acl-策略">ACL 策略</h2>
+<p>OpenBao 是白名单模型，没写进策略的路径一律拒绝：</p>
+<pre><code class="language-hcl"># my-app-policy.hcl
+path "secret/data/myapp/*" {
+  capabilities = ["read", "list"]
+}
+
+path "secret/data/myapp/config" {
+  capabilities = ["create", "read", "update"]
+}
+
+path "database/creds/readonly" {
+  capabilities = ["read"]
+}
+
+path "sys/leases/renew"  { capabilities = ["update"] }
+path "sys/leases/revoke" { capabilities = ["update"] }
+path "auth/token/lookup-self" { capabilities = ["read"] }
+path "auth/token/renew-self"  { capabilities = ["update"] }
+
+# deny 优先级最高，可以覆盖其他策略
+path "secret/metadata/*" {
+  capabilities = ["deny"]
+}
+</code></pre>
+<p>权限一共七种：<code>create</code>、<code>read</code>、<code>update</code>、<code>delete</code>、<code>list</code>、<code>sudo</code>（访问 root 级路径）、<code>deny</code>。</p>
+<p>2.7 新增的 Control Groups 值得单独说：策略里可以挂审批控制，类似银行金库的双人规则。读生产根凭证、改 Root CA、导出 Transit 密钥这类操作很适合套上：</p>
+<pre><code class="language-hcl">path "secret/data/prod/root-credentials" {
+  capabilities = ["read"]
+
+  control_group {
+    factor "approver" {
+      identity {
+        group_names = ["security-approvers"]
+        approvals   = 1
+      }
+    }
+  }
+}
+</code></pre>
+<p>策略管理命令：</p>
+<pre><code class="language-bash">bao policy write my-app-policy my-app-policy.hcl
+bao policy list
+bao policy read my-app-policy
+bao token create -policy="my-app-policy" -ttl=2h
+bao token lookup -field=policies   # 2.7 起支持 -field
+</code></pre>
+<p>模板化策略也支持，<code>{{identity.entity.name}}</code> 这类变量可以做基于身份的动态权限，每个用户只能碰自己的命名空间。</p>
+<h2 id="seal--unseal">Seal / Unseal</h2>
+<h3 id="shamir-分片">Shamir 分片</h3>
+<p>默认模式，用 Shamir's Secret Sharing 把 Unseal Key 切成多份，凑够阈值才能重建：</p>
+<pre><code class="language-bash">bao operator init -key-shares=5 -key-threshold=3
+
+# Unseal 要凑 3 片
+bao operator unseal   # Progress: 1/3
+bao operator unseal   # Progress: 2/3
+bao operator unseal   # Sealed: false
+</code></pre>
+<p>分片怎么发：生产建议 5 片阈值 3，分给不同的人物理隔离存放；小团队 3/2 也行；开发环境 1/1 就好。</p>
+<h3 id="auto-unseal27-改成了插件化重点">Auto Unseal：2.7 改成了插件化（重点）</h3>
+<p>这是 2.7 最大的架构变化。云厂商 KMS 和 PKCS#11 的 Seal 全部从主二进制里拿出去了，只有 Transit Seal 还内置。2.7 的配置要分两步——先注册插件，再像原来一样写 <code>seal</code>：</p>
+<pre><code class="language-hcl"># /etc/openbao/config.hcl
+
+# 插件二进制先放到 plugin_directory
+# 官方预构建：https://github.com/openbao/openbao-plugins
+plugin "kms" "awskms" {
+  # 2.7 起手动安装的插件不再强制要求 sha256sum
+}
+
+seal "awskms" {
+  region     = "ap-southeast-1"
+  kms_key_id = "arn:aws:kms:ap-southeast-1:123456789:key/abcd-1234-..."
+}
+</code></pre>
+<p>拆出去之后有几个实际好处：插件崩了会自动重启，不用整个实例跟着重启（PKCS#11 库抽风时尤其有用）；SIGHUP 可以热加载 KMS 插件配置、运行中升级插件；想实现自己的 Seal 也有 SDK 了。另外 2.7 还给 Auto Seal 健康检查加了配置项，可以禁用或自定义间隔和超时。</p>
+<p>升级时要注意：如果老版本在用云厂商 Seal，升到 2.7 之前必须先把插件装好注册好，否则升完 Unseal 不了。风险提醒还是那两条——KMS 密钥不可用就起不来，密钥被永久删除数据就永远没了，记得用 SCP 之类的机制把 KMS 密钥锁死。</p>
+<p>Seal 类型之间迁移（比如 Shamir 换 Auto Unseal）可以做，但要停机。</p>
+<h2 id="生产部署">生产部署</h2>
+<h3 id="配置文件">配置文件</h3>
+<p>一份生产级配置，Raft 存储加插件化的 AWS KMS Auto Unseal：</p>
+<pre><code class="language-hcl"># /etc/openbao/config.hcl（OpenBao v2.7.2）
+cluster_name = "prod-openbao-cluster"
+
+api_addr     = "https://openbao.mycompany.com:8200"
+cluster_addr = "https://10.0.1.10:8201"
+
+ui         = true
+log_level  = "info"
+log_format = "json"
+
+listener "tcp" {
+  address         = "0.0.0.0:8200"
+  cluster_address = "0.0.0.0:8201"
+
+  tls_cert_file = "/etc/openbao/tls/server.crt"
+  tls_key_file  = "/etc/openbao/tls/server.key"
+
+  # 证书文件变了自动重载，不用 SIGHUP
+  tls_auto_reload = true
+
+  tls_min_version    = "tls12"
+  tls_cipher_suites  = "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+
+  # 想上后量子 TLS 的话：
+  # tls_key_exchange_preferences = "X25519MLKEM768,SecP256r1MLKEM768"
+
+  # 强一致性（可选）：
+  # consistency_missing_header_forward = true
+  # consistency_fallback_behavior      = "forward-active-node"
+  # consistency_max_index_wait         = "10s"
+
+  max_request_duration = "90s"
+  max_request_size     = 33554432
+}
+
+storage "raft" {
+  path    = "/opt/openbao/data"
+  node_id = "node-1"
+
+  performance_multiplier = 1
+
+  autopilot {
+    cleanup_dead_servers               = true
+    dead_server_last_contact_threshold = "24h"
+    min_quorum                         = 3
+  }
+
+  retry_join {
+    leader_api_addr     = "https://10.0.1.11:8200"
+    leader_ca_cert_file = "/etc/openbao/tls/ca.crt"
+  }
+  retry_join {
+    leader_api_addr     = "https://10.0.1.12:8200"
+    leader_ca_cert_file = "/etc/openbao/tls/ca.crt"
+  }
+}
+
+plugin "kms" "awskms" {
+}
+
+seal "awskms" {
+  region     = "ap-southeast-1"
+  kms_key_id = "arn:aws:kms:ap-southeast-1:123456789:key/abcd-1234-..."
+}
+
+telemetry {
+  prometheus_retention_time = "24h"
+  disable_hostname          = true
+}
+
+default_lease_ttl = "768h"
+max_lease_ttl     = "768h"
+</code></pre>
+<p>单机或边缘场景不需要 HA 的话，用 PebbleDB（<code>storage "pebbledb"</code>），<code>file</code> 后端已经没有了。如果团队已经有在维护的 PostgreSQL 集群，也可以直接用 PostgreSQL 当存储后端，见下文"PostgreSQL 存储后端"一节。</p>
+<h3 id="postgresql-存储后端">PostgreSQL 存储后端</h3>
+<p>除了 Raft，OpenBao 官方支持的另一个生产级 HA 后端是 PostgreSQL（v2.1 重新引入，最低要求 PostgreSQL 9.5）。适合已经有成熟 PG 运维体系、不想再养一套 Raft 的团队：</p>
+<pre><code class="language-hcl">storage "postgresql" {
+  connection_url = "postgres://openbao:secret@postgres.internal:5432/openbao?sslmode=verify-full"
+  ha_enabled     = true                  # 开启 HA（基于 openbao_ha_locks 表抢锁选主）
+  max_parallel   = 128                   # 最大并发请求数
+  # skip_create_table = true             # 连接账号没有建表权限时要手动建表并打开这个
+}
+</code></pre>
+<p>连接串也可以走 <code>BAO_PG_CONNECTION_URL</code> 环境变量或标准 <code>PGHOST</code> 系列变量，密码不用写进配置文件。表结构 OpenBao 会自己建（<code>openbao_kv_store</code> 和 <code>openbao_ha_locks</code> 两张表），如果数据库账号没有 CREATE 权限，就按官方文档的 DDL 手动建好再设 <code>skip_create_table=true</code>。</p>
+<p>和 Raft 怎么选：</p>
+<ul>
+<li><strong>Raft</strong>：数据在本地，少一跳网络，读性能好；但写入要多数派投票，对节点间延迟敏感，且要懂 Raft 的节点管理和故障切换。</li>
+<li><strong>PostgreSQL</strong>：OpenBao 节点本身无状态，扩缩容和 failover 只需要一个连接串，不用做 raft join/remove-peer 这些操作；写性能往往更好（单活跃节点写、物理复制到从库）；HA 和备份恢复直接复用 PG 生态（比如 CloudNativePG + 物理复制）。代价是多一个外部依赖，以及读默认走缓存。</li>
+</ul>
+<p>2.7 的一个重要补强：PostgreSQL 后端从 v2.7.0 起支持<strong>读水平扩展</strong>（和 Raft 在 2.5 就有的能力对齐），Standby 节点可以本地处理只读请求。需要 <code>ha_enabled = true</code> 且 Standby 能通过 <code>cluster_addr</code> 连到活跃节点；长时间失去 Leader 时 Standby 会以只读模式起来。注意只支持 PG 物理复制，逻辑复制不行。要关闭就在配置里加 <code>disable_standby_reads=true</code>。</p>
+<p>备份方式也不一样：Raft 用 <code>bao operator raft snapshot</code>，PostgreSQL 后端没有对应的快照 API，直接用 PG 自己的备份体系（pg_dump、WAL 归档、云数据库快照等）。</p>
+<h3 id="systemd">systemd</h3>
+<pre><code class="language-ini"># /etc/systemd/system/openbao.service
+[Unit]
+Description=OpenBao - A tool for managing secrets
+Requires=network-online.target
+After=network-online.target
+ConditionFileNotEmpty=/etc/openbao/config.hcl
+
+[Service]
+Type=notify
+User=openbao
+Group=openbao
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+SecureBits=keep-caps
+AmbientCapabilities=CAP_IPC_LOCK
+NoNewPrivileges=yes
+ExecStart=/usr/bin/bao server -config=/etc/openbao/config.hcl
+ExecReload=/bin/kill --signal HUP $MAINPID
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<h3 id="初始化和首次启动">初始化和首次启动</h3>
+<pre><code class="language-bash">sudo mkdir -p /opt/openbao/data
+sudo chown openbao:openbao /opt/openbao/data
+
+sudo mkdir -p /etc/openbao/tls
+sudo cp server.crt server.key ca.crt /etc/openbao/tls/
+sudo chown openbao:openbao /etc/openbao/tls/*
+sudo chmod 600 /etc/openbao/tls/server.key
+
+sudo systemctl enable --now openbao
+
+export BAO_ADDR='https://openbao.mycompany.com:8200'
+export BAO_CACERT='/etc/openbao/tls/ca.crt'
+
+bao operator init -key-shares=5 -key-threshold=3
+# Unseal Key 和 Root Token 立刻收好
+
+bao operator unseal
+bao operator unseal
+bao operator unseal
+
+bao login $ROOT_TOKEN
+bao audit enable file file_path=/var/log/openbao/audit.log
+bao token revoke $ROOT_TOKEN
+</code></pre>
+<p>不想手动 init 的话，2.6 起声明式自初始化支持 CEL 表达式、模板引用前序响应值、<code>when</code> 条件执行，IaC 全自动部署可以走这条路。</p>
+<h2 id="ha-集群">HA 集群</h2>
+<p>生产推荐 Integrated Storage（Raft），不用额外养一个 Consul。三节点为例，Node 1：</p>
+<pre><code class="language-hcl">storage "raft" {
+  path    = "/opt/openbao/data"
+  node_id = "node-1"
+
+  retry_join {
+    leader_api_addr     = "https://10.0.1.11:8200"
+    leader_ca_cert_file = "/etc/openbao/tls/ca.crt"
+  }
+  retry_join {
+    leader_api_addr     = "https://10.0.1.12:8200"
+    leader_ca_cert_file = "/etc/openbao/tls/ca.crt"
+  }
+}
+</code></pre>
+<p>Node 2、3 改一下 <code>node_id</code> 和 retry_join 列表就行。每个节点启动后独立 Unseal，然后在 Leader 上确认成员：</p>
+<pre><code class="language-bash">bao operator raft list-peers
+# node-1     10.0.1.10:8201     leader      true
+# node-2     10.0.1.11:8201     follower    true
+# node-3     10.0.1.12:8201     follower    true
+</code></pre>
+<p>日常运维：</p>
+<pre><code class="language-bash">bao status                                     # 看 HA 模式
+bao operator step-down                         # 手动移交领导权
+bao operator raft snapshot save backup-$(date +%Y%m%d).snap
+bao operator raft snapshot restore backup-20261105.snap
+bao operator raft remove-peer node-3
+</code></pre>
+<p>2.7 在 Raft 上修了不少东西：<code>auto_join</code> 带端口地址失败的问题、批量应用的二次事务性能回归、写入量不足 snapshot_threshold 时日志无限增长的问题，都修了。另外配合 <code>X-Vault-Index</code>，SSCT 现在能用存储层索引做精确的读一致性控制。</p>
+<p>经验：节点数用 3 或 5（奇数），同 Region 部署节点间延迟压在 10ms 内；读请求所有节点都能处理，写会自动转给 Leader；每天定时跑 snapshot 备份。</p>
+<h2 id="审计日志">审计日志</h2>
+<p>三种审计设备：file、syslog、socket。最常用的：</p>
+<pre><code class="language-bash">bao audit enable file file_path=/var/log/openbao/audit.log
+bao audit list -detailed
+</code></pre>
+<p>所有请求和响应都会记录，敏感字段用 HMAC-SHA256 哈希，反推不出来，但知道原始值的话可以用 <code>bao audit hash</code> 算哈希做比对。</p>
+<p>两个要点：必须至少有一个审计设备可用，全部失败时 OpenBao 会拒绝处理一切请求（宁可不服务也不能留审计盲区）；审计日志要实时转发到集中式日志系统。2.7.1 修过一个边角问题——未认证的 Root Token Generation / Rekey 端点（默认关闭）在审计失败时居然还会返回响应，现在审计失败就直接拒了。</p>
+<h2 id="kubernetes-集成">Kubernetes 集成</h2>
+<h3 id="helm-部署">Helm 部署</h3>
+<pre><code class="language-bash">helm repo add openbao https://openbao.github.io/openbao-helm
+helm repo update
+</code></pre>
+<p>values.yaml：</p>
+<pre><code class="language-yaml">global:
+  enabled: true
+  tlsDisable: false
+
+server:
+  image:
+    repository: ghcr.io/openbao/openbao
+    tag: "2.7.2"
+
+  ha:
+    enabled: true
+    replicas: 3
+    raft:
+      enabled: true
+      config: |
+        ui = true
+
+        listener "tcp" {
+          address = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_cert_file = "/vault/tls/tls.crt"
+          tls_key_file = "/vault/tls/tls.key"
+          tls_auto_reload = true
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+          retry_join {
+            leader_api_addr = "https://openbao-0.openbao-internal:8200"
+            leader_ca_cert_file = "/vault/tls/ca.crt"
+          }
+          retry_join {
+            leader_api_addr = "https://openbao-1.openbao-internal:8200"
+            leader_ca_cert_file = "/vault/tls/ca.crt"
+          }
+          retry_join {
+            leader_api_addr = "https://openbao-2.openbao-internal:8200"
+            leader_ca_cert_file = "/vault/tls/ca.crt"
+          }
+        }
+
+        service_registration "kubernetes" {}
+
+  dataStorage:
+    enabled: true
+    size: 10Gi
+    storageClass: "gp3"
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 256Mi
+    limits:
+      cpu: 2000m
+      memory: 1Gi
+
+  auditStorage:
+    enabled: true
+    size: 5Gi
+
+injector:
+  enabled: true
+  replicas: 2
+
+ui:
+  enabled: true
+  serviceType: ClusterIP
+</code></pre>
+<pre><code class="language-bash">helm install openbao openbao/openbao -n openbao --create-namespace -f openbao-values.yaml
+</code></pre>
+<h3 id="agent-injector">Agent Injector</h3>
+<p>Pod 上加注解，Webhook 自动注入 Sidecar 拉密钥写文件：</p>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "my-app"
+        vault.hashicorp.com/agent-inject-secret-db-creds: "database/creds/readonly"
+        vault.hashicorp.com/agent-inject-template-db-creds: |
+          {{- with secret "database/creds/readonly" -}}
+          DB_USER={{ .Data.username }}
+          DB_PASSWORD={{ .Data.password }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-app-config: "secret/data/myapp/config"
+        vault.hashicorp.com/agent-inject-template-app-config: |
+          {{- with secret "secret/data/myapp/config" -}}
+          API_KEY={{ .Data.data.api_key }}
+          {{- end }}
+    spec:
+      serviceAccountName: my-app-sa
+      containers:
+        - name: my-app
+          image: my-app:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              source /vault/secrets/db-creds
+              source /vault/secrets/app-config
+              exec ./my-app-binary
+</code></pre>
+<p>密钥会落在 Pod 的 <code>/vault/secrets/</code> 目录。</p>
+<h3 id="csi-provider">CSI Provider</h3>
+<p>另一种思路，密钥直接当卷挂载，走标准的 secrets-store CSI：</p>
+<pre><code class="language-yaml">volumes:
+  - name: secrets
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: "openbao-secrets"
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: openbao-secrets
+spec:
+  provider: vault   # 兼容 Vault CSI Provider
+  parameters:
+    roleName: "my-app"
+    vaultAddress: "https://openbao.openbao.svc:8200"
+    objects: |
+      - objectName: "db-password"
+        secretPath: "secret/data/myapp/config"
+        secretKey: "db_password"
+</code></pre>
+<h2 id="agent--proxy">Agent / Proxy</h2>
+<p>Agent 是客户端守护进程，干四件事：Auto Auth 自动拿 Token、本地缓存、模板渲染、API 代理。</p>
+<pre><code class="language-hcl"># /etc/openbao/agent.hcl
+auto_auth {
+  method "approle" {
+    config = {
+      role_id_file_path   = "/etc/openbao/role-id"
+      secret_id_file_path = "/etc/openbao/secret-id"
+      remove_secret_id_file_after_reading = true
+    }
+  }
+
+  sink "file" {
+    config = {
+      path = "/tmp/openbao-token"
+      mode = 0640
+      # 2.6 起可以指定属主：
+      # uid = 1000
+      # gid = 1000
+    }
+  }
+}
+
+cache {
+  use_auto_auth_token = true
+}
+
+listener "tcp" {
+  address     = "127.0.0.1:8100"
+  tls_disable = true
+}
+
+vault {
+  address     = "https://openbao.mycompany.com:8200"
+  tls_ca_cert = "/etc/openbao/tls/ca.crt"
+}
+
+template {
+  source      = "/etc/openbao/templates/db-config.tpl"
+  destination = "/app/config/database.env"
+  perms       = 0640
+  command     = "systemctl reload my-app"
+}
+</code></pre>
+<p>模板文件长这样：</p>
+<pre><code>{{ with secret "database/creds/readonly" }}
+DB_USER={{ .Data.username }}
+DB_PASSWORD={{ .Data.password }}
+{{ end }}
+</code></pre>
+<p>Proxy 是精简版 Agent，只做 API 代理，适合当 Sidecar。2.6/2.7 的小变化：SIGHUP 会重载客户端 TLS 配置；开了 <code>require_request_header</code> 之后 <code>/quit</code> 和 <code>/cache-clear</code> 要求带 <code>X-Vault-Request</code> 头。</p>
+<h2 id="运维">运维</h2>
+<h3 id="监控指标">监控指标</h3>
+<p>盯这几个就够：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>说明</th>
+<th>告警参考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vault.core.handle_request</code></td>
+<td>请求延迟</td>
+<td>P99 &gt; 500ms</td>
+</tr>
+<tr>
+<td><code>vault.barrier.get</code> / <code>put</code></td>
+<td>Barrier 读写延迟</td>
+<td>P99 &gt; 100ms / 200ms</td>
+</tr>
+<tr>
+<td><code>vault.raft.leader.lastContact</code></td>
+<td>Follower 到 Leader 最后联系</td>
+<td>&gt; 500ms</td>
+</tr>
+<tr>
+<td><code>vault.raft.commitTime</code></td>
+<td>Raft 提交时间</td>
+<td>P99 &gt; 50ms</td>
+</tr>
+<tr>
+<td><code>vault.expire.num_leases</code></td>
+<td>活跃 Lease 数</td>
+<td>按容量规划</td>
+</tr>
+<tr>
+<td><code>vault.core.unsealed</code></td>
+<td>是否已 Unseal</td>
+<td>等于 0 立刻告警</td>
+</tr>
+</tbody>
+</table>
+<p>2.7 起 <code>vault.core.unsealed=0</code> 走独立指标循环上报，Sealed 状态下的指标更靠谱了。</p>
+<p>Prometheus 抓取配置：</p>
+<pre><code class="language-yaml">scrape_configs:
+  - job_name: "openbao"
+    metrics_path: "/v1/sys/metrics"
+    params:
+      format: ["prometheus"]
+    scheme: "https"
+    tls_config:
+      ca_file: "/etc/prometheus/openbao-ca.crt"
+    authorization:
+      credentials_file: "/etc/prometheus/openbao-token"
+    static_configs:
+      - targets: ["openbao-0.internal:8200", "openbao-1.internal:8200", "openbao-2.internal:8200"]
+</code></pre>
+<h3 id="备份">备份</h3>
+<p>每天快照加异地归档：</p>
+<pre><code class="language-bash">#!/bin/bash
+# /opt/openbao/scripts/backup.sh
+BACKUP_DIR="/opt/openbao/backups"
+DATE=$(date +%Y%m%d-%H%M%S)
+
+bao operator raft snapshot save "${BACKUP_DIR}/openbao-${DATE}.snap"
+
+aws s3 cp "${BACKUP_DIR}/openbao-${DATE}.snap" \
+  "s3://my-backups/openbao/openbao-${DATE}.snap" \
+  --sse aws:kms
+
+find "${BACKUP_DIR}" -name "*.snap" -mtime +30 -delete
+</code></pre>
+<pre><code class="language-bash">echo "0 3 * * * /opt/openbao/scripts/backup.sh &gt;&gt; /var/log/openbao/backup.log 2&gt;&amp;1" | crontab -
+</code></pre>
+<h3 id="密钥轮换">密钥轮换</h3>
+<pre><code class="language-bash">bao operator rotate          # 在线轮换，不影响服务
+bao read sys/key-status      # 看当前 term
+</code></pre>
+<p>2.7 修了轮换配置里 <code>disabled</code> 字段更新不持久化的问题。</p>
+<h2 id="应用集成">应用集成</h2>
+<p>四种接法，按环境选：直接调 API（控制力最强，但要自己管 Token 生命周期）、Agent（虚机/裸机首选）、K8s Injector（注解驱动零侵入）、CSI Provider（标准卷接口）。</p>
+<p>Go：</p>
+<pre><code class="language-go">package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    vault "github.com/openbao/openbao/api/v2"
+)
+
+func main() {
+    config := vault.DefaultConfig()
+    config.Address = "https://openbao.mycompany.com:8200"
+
+    client, err := vault.NewClient(config)
+    if err != nil {
+        log.Fatalf("init client: %v", err)
+    }
+
+    resp, err := client.Logical().Write("auth/approle/login", map[string]interface{}{
+        "role_id":   "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        "secret_id": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy",
+    })
+    if err != nil {
+        log.Fatalf("login: %v", err)
+    }
+    client.SetToken(resp.Auth.ClientToken)
+
+    secret, err := client.KVv2("secret").Get(context.Background(), "myapp/config")
+    if err != nil {
+        log.Fatalf("read secret: %v", err)
+    }
+    fmt.Printf("DB Host: %s\n", secret.Data["db_host"].(string))
+
+    // 后台续租；2.7 修了 LifetimeWatcher 续租失败不遵守退避间隔的问题
+    go func() {
+        for {
+            time.Sleep(30 * time.Minute)
+            if _, err := client.Auth().Token().RenewSelf(3600); err != nil {
+                log.Printf("renew failed: %v", err)
+            }
+        }
+    }()
+
+    select {}
+}
+</code></pre>
+<p>Python（用 hvac，兼容 OpenBao API）：</p>
+<pre><code class="language-python">import hvac
+import os
+import threading
+import time
+
+
+class SecretsManager:
+    def __init__(self):
+        self.client = hvac.Client(
+            url=os.environ.get('BAO_ADDR', 'https://openbao.mycompany.com:8200'),
+            verify='/etc/openbao/tls/ca.crt'
+        )
+        self._login()
+        self._start_renewal()
+
+    def _login(self):
+        result = self.client.auth.approle.login(
+            role_id=os.environ['BAO_ROLE_ID'],
+            secret_id=os.environ['BAO_SECRET_ID']
+        )
+        self.client.token = result['auth']['client_token']
+        self.lease_duration = result['auth']['lease_duration']
+
+    def get_secret(self, path, key=None):
+        response = self.client.secrets.kv.v2.read_secret_version(
+            path=path, mount_point='secret'
+        )
+        data = response['data']['data']
+        return data[key] if key else data
+
+    def get_db_credentials(self, role='readonly'):
+        response = self.client.read(f'database/creds/{role}')
+        return {
+            'username': response['data']['username'],
+            'password': response['data']['password'],
+            'lease_id': response['lease_id'],
+        }
+
+    def _start_renewal(self):
+        def renew():
+            while True:
+                time.sleep(self.lease_duration * 0.7)
+                try:
+                    self.client.auth.token.renew_self()
+                except Exception as e:
+                    print(f"renew failed: {e}")
+                    self._login()
+        threading.Thread(target=renew, daemon=True).start()
+</code></pre>
+<h2 id="上生产前对照一遍">上生产前对照一遍</h2>
+<p>基础安全：TLS 启用（可以顺手开 <code>tls_auto_reload</code>）；版本不低于 2.7.2；Swap 禁用；Root Token 撤销；Unseal Key 分人分地存放；Auto Unseal 用的是注册好的 KMS 插件且 KMS 密钥有防删除保护。</p>
+<p>存储与 HA：Raft 三节点起步、奇数；或者复用现有 PostgreSQL 集群（<code>ha_enabled=true</code>，2.7 起支持读水平扩展）；单机用 PebbleDB；Raft 每天 snapshot，PG 后端用数据库自己的备份体系，恢复流程真的演练过。</p>
+<p>审计监控：至少一个审计设备；日志进集中式系统；Prometheus 指标和告警都配了。</p>
+<p>访问控制：策略最小权限；高危路径套 Control Group；应用走 AppRole 或 K8s Auth；Secret ID 限制使用次数和 TTL；Token TTL 别超过 24h；有"写后立刻读"场景的考虑 <code>X-Vault-Index</code>。</p>
+<p>密钥管理：KV 用 v2；数据库凭证用动态生成；定期 <code>bao operator rotate</code>；动态凭证 TTL 压到 1 小时内；有合规压力的可以开始评估 ML-DSA 和 PQC TLS。</p>
+<h2 id="架构图">架构图</h2>
+<p>下面是 OpenBao v2.7.2 的整体架构<br>
+<img src="https://img2024.cnblogs.com/blog/510/202611/510-20261105210226129-309616059.png" alt="OpenBao-2.7.2-架构图" loading="lazy"></p>
+<hr>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a href="https://github.com/openbao/openbao" target="_blank" rel="noopener nofollow">OpenBao GitHub</a></li>
+<li><a href="https://openbao.org/docs/release-notes/2-7-0/" target="_blank" rel="noopener nofollow">2.7.x 发布说明</a></li>
+<li><a href="https://openbao.org/community/release-notes/2-6-0/" target="_blank" rel="noopener nofollow">2.6.x 发布说明</a></li>
+<li><a href="https://github.com/openbao/openbao-plugins" target="_blank" rel="noopener nofollow">openbao-plugins：官方外部插件</a></li>
+<li><a href="https://openbao.org/docs/" target="_blank" rel="noopener nofollow">OpenBao 官方文档</a></li>
+</ul>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>欢迎大家扫描下面二维码成为我的客户，扶你上云</p>
+<img src="https://images.cnblogs.com/cnblogs_com/shanyou/57459/o_220125090408_%E9%82%80%E8%AF%B7%E4%BA%8C%E7%BB%B4%E7%A0%81-258px.jpeg" width="170">
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-05 21:04">2026-11-05 21:03</span>&nbsp;
+<a href="https://www.cnblogs.com/shanyou">张善友</a>&nbsp;
+阅读(<span id="post_view_count">133</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23564852);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshanyou%2Fp%2F23564852&amp;targetId=23564852&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
