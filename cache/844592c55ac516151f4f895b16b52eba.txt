@@ -1,0 +1,536 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23578745" title="发布于 2026-11-07 13:08">
+    
+
+    <span role="heading" aria-level="2">API 安全三支柱：认证、防篡改、防重放的工程实践</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        HTTPS 与 Bearer Token 仅保障传输安全与身份认证，无法防止报文篡改与请求重放。需通过请求签名构建字节级契约：以 HMAC 保证完整性，时间戳+Nonce 确保新鲜性，三者协同形成“身份-内容-时效”三角信任。签名应基于不可变的请求契约（如单值头、特定体字段），避免歧义。密钥环须热更新、无锁读取，支持灰度与回滚；验签中间件置于认证前，确保未授权请求不触发冗余链路。最终实现可验证、可灰度、可回滚的安全体系。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>本文只回答一个问题：HTTPS 和 Bearer Token 都就位了，为什么还要对请求本身签名，以及怎么把它做对、能跑、能灰度、能回滚。</p>
+<p><strong>读法</strong>：七章是一条问题链。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230248721-1339046768.png" alt=""></p>
+<h1 id="https-token">一、为什么 HTTPS 加 Token 还不够</h1>
+<h2 id="token">1.1 两类 Token 拦不住的动作</h2>
+<pre><code class="language-http">POST /api/orders
+Authorization: Bearer &lt;合法 Token&gt;
+Content-Type: application/json
+
+{"sku":"A","amount":1}
+</code></pre>
+<p>攻击者把 <code>amount</code> 改成 <code>99999</code>，Token 依然合法，服务端照常收款，这是<strong>报文篡改</strong>。第二种连字节都不用改：把「转账 100 元」的完整请求原样重发 10 次，扣款 1000 元，这是<strong>请求重放</strong>。HTTPS 防链路窃听，Token 防身份冒用，两者都不约束「这一次请求」。</p>
+<h2 id="section">1.2 三支柱：一张表定分工</h2>
+<p>Token 是身份断言（可复用、有效期长），HMAC 是报文承诺（一次性、绑定具体字节），时间戳加 Nonce 是新鲜性断言（依赖服务端状态）。三者之间没有推导关系：有 Token 不能证明报文没被改，能验签不能证明不是重放。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230300225-1191154984.png" alt=""></p>
+<p>三行分别对应第二、三、四章，第五到七章处理的是三根支柱怎么接起来。这张表也可以当验收清单用：哪一行的兜底落不了地，那根支柱就是空的。只有 Token 没有签名，完整性这一行是空的；有签名但 TTL 配错，新鲜度这一行是空的。缺一根，系统只是看起来安全。</p>
+<h2 id="section-1">1.3 信任边界：谁可能改写字节</h2>
+<pre><code class="language-text">[客户端] --TLS--&gt; [WAF/CDN] --TLS 终止--&gt; [API 网关] --内网 mTLS--&gt; [业务服务] --&gt; [日志 / APM / MQ]
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230311866-901053576.png" alt=""></p>
+<p>签名协议不是加密，它在客户端与验签方之间建立一条跨多个不可信中间件的字节契约；任何中途重写请求的组件都是契约破坏者。</p>
+<h1 id="section-2">二、身份怎么被证明</h1>
+<h2 id="appid">2.1 客户端不该自己声明 AppId</h2>
+<p>如果客户端传 <code>X-App-Id</code> 并签进待签串，攻击者拿到一套合法 KeyId 与 Secret 后，改自己的 AppId 照样能签出有效请求。签名保护的是报文完整，不保护身份归属。所以客户端只报 KeyId，AppId 必须由服务端密钥环查表得到，再与 Token 里的身份声明比对。这一条把混淆代理类攻击的入口关掉了：签名只能回答报文是不是这个 KeyId 的持有者发的，这个人是谁得落回 Token 与服务端记录。</p>
+<h2 id="useauthentication">2.2 认证配置：不能只写 <code>UseAuthentication()</code></h2>
+<pre><code class="language-csharp">// 必须显式指定默认 scheme，否则管道里没有 scheme 被选中，[Authorize] 一律 401
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(o =&gt;
+    {
+        // 关闭 claim 重映射：否则 app_id 被改名，后面 FindFirst("app_id") 取不到值
+        o.MapInboundClaims = false;
+        o.TokenValidationParameters = new TokenValidationParameters
+        {
+            // 四类校验全开：关掉任何一项，等于自己拆掉 Token 这层防线
+            ValidateIssuer = true, ValidIssuer = "api-security-demo",
+            ValidateAudience = true, ValidAudience = "api-security-demo",
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = DemoJwt.Key,
+            // 30 秒容差只吸收签发端与服务端的时钟抖动，不参与请求签名的时间窗口
+            ClockSkew = TimeSpan.FromSeconds(30)
+        };
+    });
+builder.Services.AddAuthorization();
+</code></pre>
+<p>三个容易漏的点：<code>MapInboundClaims = false</code>（否则 <code>app_id</code> 被映射成 <code>http://schemas.../claims/appid</code>）；四项 <code>Validate</code> 必须显式打开（只验签名不验 issuer/audience/lifetime，等于接受任意来源的有效签名 Token）；生产环境把 <code>DemoJwt</code> 换成真实 IdP 的 <code>Authority</code> 与密钥轮换配置。</p>
+<h2 id="section-3">2.3 管道顺序：验签插在认证与授权之间</h2>
+<p>正确的顺序是 <code>UseRouting</code> → <code>UseAuthentication</code> → 验签中间件 → <code>UseAuthorization</code> → 端点。理由有两条：验签要读 <code>Endpoint</code> 元数据，必须排在路由之后；而授权策略经常要查数据库，未验签的请求不该先耗掉这一次授权链路。放在授权之后是最常见的错位。那时请求已经走完鉴权，拒绝只是迟到的拒绝。</p>
+<h2 id="section-4">2.4 密钥环：无锁读、热更新、失败保留旧表</h2>
+<pre><code class="language-csharp">// 读多写少的不可变快照：整表原子替换，读路径无锁
+// 单条配置非法只跳过该项并保留上一次可用快照，热更新不能把服务打挂
+public sealed class HotReloadKeyRing : IApiKeyRing, IDisposable
+{
+    // FrozenDictionary 发布后不可变，因此可以无锁并发读
+    private FrozenDictionary&lt;string, ApiKeyRecord&gt; _snapshot;
+    // 订阅句柄：Dispose 时退订，避免配置中心一直持有已释放实例
+    private readonly IDisposable? _subscription;
+    private readonly IOptionsMonitor&lt;ApiSignatureOptions&gt; _signatureOptions;
+    private readonly ILogger&lt;HotReloadKeyRing&gt; _logger;
+
+    public HotReloadKeyRing(
+        IOptionsMonitor&lt;KeyRingOptions&gt; options,
+        IOptionsMonitor&lt;ApiSignatureOptions&gt; signatureOptions,
+        ILogger&lt;HotReloadKeyRing&gt; logger)
+    {
+        _signatureOptions = signatureOptions;
+        _logger = logger;
+        // 首次构建没有旧快照可继承，非法项直接跳过并记日志
+        _snapshot = Build(options.CurrentValue, null);
+        // 配置中心推送时重建整表，建成才整体替换
+        _subscription = options.OnChange(o =&gt;
+        {
+            try
+            {
+                // 先读旧快照：构建失败时还能原样保留它，而不是让服务裸奔
+                var previous = Volatile.Read(ref _snapshot);
+                var next = Build(o, previous);
+                // 原子替换：读路径要么见旧表、要么见新表，看不到半成品
+                Interlocked.Exchange(ref _snapshot, next);
+                _logger.LogInformation("keyring.reloaded count={Count}", next.Count);
+            }
+            catch (Exception ex)
+            {
+                // 构建失败或推送全非法配置时保留旧快照，异常不能掀翻订阅链
+                _logger.LogError(ex, "keyring.reload_failed keeping previous snapshot");
+            }
+        });
+    }
+
+    // 读路径：取快照后直接查表，无锁、无额外分配
+    public bool TryGet(string keyId, out ApiKeyRecord? key) =&gt;
+        Volatile.Read(ref _snapshot).TryGetValue(keyId, out key);
+
+    public void Dispose() =&gt; _subscription?.Dispose();
+}
+</code></pre>
+<p>这里有两处取舍值得讲。热更新失败时宁可继续用旧密钥环，也不能把它清空：清空等于全站 401，比密钥多活几分钟危险得多。读路径则完全不加锁，<code>FrozenDictionary</code> 一旦发布就不再修改，<code>Volatile.Read</code> 加 <code>Interlocked.Exchange</code> 保证读者要么看到完整旧表、要么看到完整新表，看不到构建到一半的状态。</p>
+<h2 id="section-5">2.5 密钥生命周期</h2>
+<p>Secret 至少 32 字节，由 KMS 生成而不是人手输入；轮换时新旧并存，用 <code>NotBefore</code> 让新密钥提前上线、<code>ExpiresAt</code> 让旧密钥延后下线，中间留出大于客户端发版周期的重叠窗口；吊销必须秒级生效，这也是密钥环要热更新的原因；发生泄露就按吊销、换钥、排查调用方、复盘日志的顺序走，前两步在十分钟内完成。</p>
+<p>身份确定下来之后，下一个问题就换成了：这条报文有没有被改过一个字节。</p>
+<h1 id="section-6">三、内容怎么被复现</h1>
+<h2 id="section-7">3.1 请求契约：哪些字节进待签串</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230329313-535347277.png" alt=""></p>
+<p>两条硬规则：参与签名的头<strong>一律拒绝多值</strong>；<code>Content-Type</code> 缺失时两端都归一为<strong>空串</strong>，不许一端补默认值——一端补了，另一端就永远对不上。</p>
+<p>还有一个协议层细节：HTTP/2 没有 <code>Host</code> 头，客户端写的是伪头 <code>:authority</code>，Kestrel 会把它映射到 <code>Request.Host</code>，取值与 HTTP/1.1 的 <code>Host</code> 同形。签名侧要签 <code>uri.Authority</code> 的规范化结果，而不是按名字去读某个头——按头名取值的实现一升到 HTTP/2 就断。</p>
+<h2 id="section-8">3.2 待签串：版本 + 十二行</h2>
+<pre><code class="language-csharp">// v1.2：再追加 Bearer Token 的 SHA-256 摘要，闭合「漏签即漏洞」的自查
+public sealed class V12Protocol : ISignatureProtocol
+{
+    // 版本写进首行：换版即换协议，旧签名自然失效，不存在静默兼容
+    public string Version =&gt; "v1.2";
+
+    public string BuildStringToSign(RequestMaterial m)
+    {
+        // 先拆分并归一 Path / Query，后续只接受归一后的结果
+        var (path, query) = Canonicalizer.SplitTarget(m.RawTarget);
+        // 十二行固定顺序：只在尾部追加字段，行数与顺序本身就是协议
+        return string.Join('\n',
+            // 第 1 行：版本，决定服务端用哪套规范化器
+            Version,
+            // 第 2 行：方法大写，避免 get 与 GET 签出两个串
+            m.Method.ToUpperInvariant(),
+            // 第 3~4 行：归一后的路径与查询串
+            Canonicalizer.CanonicalPath(path),
+            Canonicalizer.CanonicalQuery(query),
+            // 第 5 行：Body 原始字节的 SHA-256，小写 hex
+            Canonicalizer.ToLowerHex(m.BodyHash),
+            // 第 6 行：Content-Type 取 `;` 前、Trim、小写
+            Canonicalizer.NormalizeContentType(m.ContentType),
+            // 第 7~9 行：KeyId / 时间戳 / Nonce，定位密钥与新鲜度
+            m.KeyId,
+            m.Timestamp,
+            m.Nonce,
+            // 第 10~11 行：Host 与幂等键，堵住跨虚拟主机重放与换键重试
+            Canonicalizer.NormalizeHost(m.Host),
+            Canonicalizer.NormalizeToken(m.IdempotencyKey),
+            // 第 12 行：Token 摘要，Token 被替换即验签失败
+            Canonicalizer.TokenDigest(m.Authorization));
+    }
+}
+</code></pre>
+<p>字段顺序本身不带来安全性，但必须固定且版本化：定位字段（method / path / query）在前，是变长且最常被篡改的部分；定长字段（bodyHash / keyId / ts / nonce）在后，全部经白名单或 hex 编码。任何字段增减都升版本，不原地改 <code>v1</code>。</p>
+<h2 id="n">3.3 规范化：<code>\n</code> 分隔不防歧义，白名单编码才防</h2>
+<p>很多人以为「字段之间用 <code>\n</code> 连起来」就不会歧义了。真正要防的不是字段之间的分隔，而是字段内部恰好含有分隔符：Path 里一个未编码的换行、Content-Type 里一个 CR，就能让 9 行变 10 行，把后面的字段挤错位。所以每个字段必须先过白名单或编码：自由文本拒绝全部 C0 控制字符与 DEL；Path 与 Query 逐段 <code>decode → RFC 3986 encode</code>，<code>%7E</code> 与 <code>~</code> 收敛为 <code>~</code>，<code>%2F</code> 保持 <code>%2F</code> 不与真正的分隔符碰撞。</p>
+<p>这里要顶住一个诱惑：先清洗用户输入再签名。清洗意味着服务端要先猜客户端的清洗规则，猜错就是大面积 401；而且清洗后的字节已经不是发出去的字节，签名不再承诺收到的就是发出的。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230340955-218827506.png" alt=""></p>
+<h2 id="section-9">3.4 验签：恒定时间比较与真实的分配开销</h2>
+<pre><code class="language-csharp">// 热点路径：UTF-8 编码、32 字节摘要、比较全在栈上完成
+public bool Verify(ReadOnlySpan&lt;byte&gt; secret, ReadOnlySpan&lt;char&gt; stringToSign, ReadOnlySpan&lt;char&gt; signatureHex)
+{
+    // 先校验格式：非 64 位小写 hex 直接拒绝，畸形输入不进解码
+    if (!Canonicalizer.IsLowerHex(signatureHex, 64)) return false;
+
+    // hex 解码成 32 字节，栈上完成，不产生临时数组
+    Span&lt;byte&gt; provided = stackalloc byte[32];
+    for (var i = 0; i &lt; provided.Length; i++)
+        provided[i] = (byte)((Nibble(signatureHex[2 * i]) &lt;&lt; 4) | Nibble(signatureHex[2 * i + 1]));
+
+    return VerifyCore(secret, stringToSign, provided);
+}
+
+private static bool VerifyCore(
+    ReadOnlySpan&lt;byte&gt; secret, ReadOnlySpan&lt;char&gt; stringToSign, ReadOnlySpan&lt;byte&gt; provided)
+{
+    // UTF-8 字节数决定走栈还是走池：4 KiB 以内全在栈上
+    var byteCount = Encoding.UTF8.GetByteCount(stringToSign);
+    if (byteCount &lt;= 4096)
+    {
+        // 固定 4096 字节栈缓冲，用完即弃，不归还、不触发 GC
+        Span&lt;byte&gt; utf8 = stackalloc byte[4096];
+        return ComputeAndCompare(secret, stringToSign, provided, utf8);
+    }
+    // 超长待签串（正常不会出现）回退池化缓冲，finally 里必然归还
+    var rented = ArrayPool&lt;byte&gt;.Shared.Rent(byteCount);
+    // 只切出实际长度，避免池里的旧数据参与计算
+    try { return ComputeAndCompare(secret, stringToSign, provided, rented.AsSpan(0, byteCount)); }
+    finally { ArrayPool&lt;byte&gt;.Shared.Return(rented); }
+}
+</code></pre>
+<p>比较对象是解码后的 32 字节，不是 hex 字符串。比较字符串会走短路比较，长度相同时仍可能泄露前缀信息，必须用 <code>CryptographicOperations.FixedTimeEquals</code>。</p>
+<p>这段热点路径我量过分配：4 KiB 以内的待签串走下来，<code>GC.GetAllocatedBytesForCurrentThread()</code> 前后差 0 B。但这是热点路径的账，不是整条链路的账，<code>string.Join</code> 与 <code>ToLowerHex</code> 照样要分配字符串。</p>
+<p>另一个查证结果是我原本预期错的：按印象，越新的框架越该补齐这个方法，实际是 <code>Convert.TryFromHexString</code> 在 <code>net8.0</code> 与 <code>net10.0</code> 上都不存在，编译直接报 <code>CS0117</code>。<code>Convert.FromHexString</code> 存在，但会分配、也可能抛 <code>FormatException</code>。所以在字符白名单已经保证字符集的前提下，手写 nibble 解码直写栈上更省也更可控；反过来 <code>Convert.ToHexStringLower</code> 是真实 API（.NET 9+）。</p>
+<h2 id="section-10">3.5 版本治理</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230352568-1153673629.png" alt=""></p>
+<p>版本头由客户端声明，是否生效由服务端白名单加注册表决定。收益是改协议变成一次可灰度、可回滚的配置变更。</p>
+<p>报文能复现了，可它可能是一小时前的请求，也可能已经被用过十次。接下来才是时间。</p>
+<h1 id="section-11">四、时效怎么被判定</h1>
+<h2 id="ttl-2w">4.1 <code>TTL = 2W + δ</code>，并且被启动校验钉死</h2>
+<p>设时间窗口为 <code>W = 300s</code>，允许的时钟容差 <code>δ = 60s</code>。请求在窗口末端到达时，服务端记录 Nonce 的时刻比客户端签名时刻最多滞后 <code>W + δ</code>；要让这个 Nonce 在还可能被重放的整个区间内都有效，TTL 至少得覆盖 <code>W + δ</code> 再加上一个 <code>W</code> 的回溯期，即 <code>2W + δ = 660s</code>。TTL 设成 <code>W</code> 是流传最广的错误：它让一个签名后 300 秒到达、服务端再过 300 秒才被重放的请求正好穿过缝隙。</p>
+<p>这条不变量不能靠文档约束，必须启动即失败。做法是在选项校验签名里写 <code>.Validate(o =&gt; o.NonceTtlSeconds &gt;= 2 * o.ClockSkewSeconds + 60, "NonceTtlSeconds must cover 2W + delta")</code>，配错就让进程起不来，而不是等到线上出现重放才发现。</p>
+<p>同理在启动期一并钉死的还有：密钥 ≥32 字节、版本白名单非空、<code>KeyIdModes</code> 只接受 <code>Enforce</code>。这些配置错一个，故障都不是慢一点，而是验签永远失败，或者全站 401。</p>
+<h2 id="set-nx-ex">4.2 原子消费：<code>SET NX EX</code></h2>
+<pre><code class="language-csharp">// 三态而非 bool：存储故障必须与"重放"区分，否则故障被当攻击、攻击被当故障
+public enum NonceOutcome { Consumed, Replayed, Unavailable }
+
+public interface INonceStore
+{
+    // 原子消费：首次返回 Consumed，已存在返回 Replayed，存储故障返回 Unavailable
+    ValueTask&lt;NonceOutcome&gt; TryConsumeAsync(
+        string keyId, string nonce, TimeSpan ttl, CancellationToken ct);
+}
+
+public sealed class RedisNonceStore(
+    IConnectionMultiplexer redis,
+    ILogger&lt;RedisNonceStore&gt; logger) : INonceStore
+{
+    public async ValueTask&lt;NonceOutcome&gt; TryConsumeAsync(
+        string keyId, string nonce, TimeSpan ttl, CancellationToken ct)
+    {
+        // 每次取 db 句柄（库内已缓存，成本极低），重连后仍指向当前连接
+        var db = redis.GetDatabase();
+        // key 结构 sig:{keyId}:{nonce}：单 key 操作，集群下天然同槽
+        var key = $"sig:{keyId}:{nonce}";
+        try
+        {
+            // SET NX EX：整条链路唯一一次带副作用的写，原子判断"首次出现"
+            var ok = await db.StringSetAsync(
+                    // 带 sig: 前缀，与业务 key 空间隔离
+                    key: key,
+                    // 值只用 "1"：存在性即语义，不存业务数据
+                    value: "1",
+                    // TTL 由 NonceTtlSeconds 推导，必须 &gt;= 2W + δ
+                    expiry: ttl,
+                    // 只在 key 不存在时写入，成功返回 true
+                    when: When.NotExists,
+                    // 强制走主节点：读数从会因复制延迟放过本该重放的请求
+                    flags: CommandFlags.DemandMaster)
+                .WaitAsync(ct);
+            // true = 首次消费；false = key 已存在 = 重放
+            return ok ? NonceOutcome.Consumed : NonceOutcome.Replayed;
+        }
+        // RedisTimeoutException 继承 TimeoutException，并不继承 RedisException，
+        // WaitAsync 也可能抛 TimeoutException；三者一起兜，超时才不会直接变 500
+        catch (Exception ex) when (ex is RedisException or RedisTimeoutException or TimeoutException)
+        {
+            logger.LogError(ex, "nonce.store_unavailable keyId={KeyId}", keyId);
+            return NonceOutcome.Unavailable;
+        }
+        // OperationCanceledException 不在此捕获：请求取消交给框架处理
+    }
+}
+</code></pre>
+<p>先 <code>EXISTS</code> 再 <code>SET</code> 是最常见的伪原子实现：两步之间插进一个并发请求，两次都读到不存在，两条都放行。<code>SET NX EX</code> 用一条命令完成判断与写入。这是整条链路里唯一一次带副作用的写，所以它必须排在验签之后，否则匿名流量就能灌爆 Redis。</p>
+<h2 id="nonce">4.3 Nonce 不是幂等键</h2>
+<p>Nonce 保证同一份报文不被用第二次，幂等键保证同一个业务意图被执行第二次时返回首次结果。两者不能合并：网络超时后客户端必须换新 Nonce、保留幂等键重试，否则要么被当作重放拒绝，要么丢掉幂等保护。存储故障则单列一态：<code>Unavailable</code> 由 <code>FailClosedOnNonceStoreError</code> 决定是 503 还是放行——这个决定必须是配置里的显式选择，不能由异常类型隐式决定。</p>
+<p>时钟本身也是威胁面。NTP 回拨会让 <code>now</code> 跳回过去：<code>IsActive(now)</code> 可能把已到 <code>NotBefore</code> 的密钥判成未生效、把已过 <code>ExpiresAt</code> 的判成仍然有效，时间窗也会瞬间把一批正常请求判成越界。做法是用单调时钟（<code>Stopwatch</code> / <code>TimeProvider</code>）度量经过时间，墙上时钟只用于和客户端对齐窗口；回拨超过 <code>δ</code> 时记日志并交给告警，而不是让它静默发生。</p>
+<p>新鲜性落定，三根支柱就齐了。剩下的问题变成：怎么把它们排进同一条管道。</p>
+<h1 id="section-12">五、三者怎么串成一条流水线</h1>
+<h2 id="section-13">5.1 校验顺序与成本</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230404229-980979882.png" alt=""></p>
+<p>顺序的价值在于<strong>失败成本递增</strong>：请求越早被拒越便宜，而唯一有副作用的操作放在最后。</p>
+<h2 id="section-14">5.2 中间件主干</h2>
+<pre><code class="language-csharp">public async Task InvokeAsync(HttpContext ctx)
+{
+    // 取消令牌跟随请求生命周期：客户端断开后不再写 Redis
+    var ct = ctx.RequestAborted;
+    // 每请求读一次快照，热更新对下一个请求立即生效
+    var opt = options.CurrentValue;
+    // 当前 UTC 秒；时间源可注入，测试才能精确驱动窗口边界
+    var now = clock.GetUtcNow().ToUnixTimeSeconds();
+    // 回写服务端时间：客户端据此校正时钟，而不是靠猜
+    ctx.Response.Headers["X-Server-Time"] = now.ToString(CultureInfo.InvariantCulture);
+
+    // 早退只依赖可信信号：全局开关、端点元数据、路径前缀，绝不看客户端声明的 KeyId
+    if (!opt.Enabled
+        || ctx.GetEndpoint()?.Metadata.GetMetadata&lt;SkipApiSignatureAttribute&gt;() is not null
+        || opt.ExcludedPaths.Any(p =&gt; ctx.Request.Path.StartsWithSegments(
+            p, StringComparison.OrdinalIgnoreCase)))
+    {
+        await next(ctx);
+        return;
+    }
+
+    // initialMode 只来自路径，KeyId 覆盖要等 KeyRing 查表确认
+    var result = await ValidateAsync(
+        ctx, opt, now, opt.ResolvePath(ctx.Request.Path.Value ?? ""), ct);
+    if (!result.Ok)
+    {
+        // 只记内部原因与档位，对外错误体不含 reason（reason 是探测 oracle）
+        logger.LogWarning(
+            "api_signature.rejected reason={Reason} mode={Mode} trace={Trace} path={Path}",
+            result.Reason, result.Mode, ctx.TraceIdentifier, ctx.Request.Path);
+
+        // Terminal（Body 流已损坏）与存储不可用即使处于 Observe 也必须终止
+        if (result.Mode == EnforcementMode.Enforce || result.Terminal)
+        {
+            ctx.Response.StatusCode = result.Status;
+            // 带签的请求一律不可缓存，避免中间层把它当普通响应缓存
+            ctx.Response.Headers.CacheControl = "no-store";
+            await ctx.Response.WriteAsJsonAsync(
+                new { error = "invalid_request_signature", trace_id = ctx.TraceIdentifier },
+                cancellationToken: ct);
+            return;
+        }
+    }
+    else if (result.Verified is not null &amp;&amp; result.Mode != EnforcementMode.Disabled)
+    {
+        // 只有真正通过才写上下文；Observe 失败不会被下游误当成已认证
+        ctx.Items[ApiSignatureContext.ItemKey] = result.Verified;
+    }
+
+    await next(ctx);
+}
+</code></pre>
+<p>这里有一处比错误码更要紧：<strong>早退分支不看 KeyId</strong>。<code>opt.ExcludedPaths</code> 来自服务端配置，路径来自路由器，都是可信的；一旦用客户端声明的 KeyId 做早退判断，伪造一个 KeyId 就能绕过验签。同样要紧的是 Observe 档不写 <code>ctx.Items</code>：影子模式下失败请求被放行，但下游不能把它当成「已认证」，否则灰度期反而制造新的越权面。</p>
+<p>Body 那一层还有三道界：<code>EnableBuffering(bufferThreshold: 64 * 1024, bufferLimit: …)</code> 之内走内存，超出落临时文件，再到 <code>MaxBodyBytes</code> 就该拒绝。这里还有一处我预期错的：超出上限时 <code>FileBufferingReadStream</code> 抛的是 <code>IOException</code>，不是 <code>InvalidOperationException</code>。照后者去 catch，超限请求会绕过 413 直接变成 500；<code>HashBodyAsync</code> 把 <code>IOException</code> 归一成 <code>BodyTooLargeException</code>，413 才能正常透出。</p>
+<h2 id="keyid">5.3 分级执行：路径定档，KeyId 只收紧</h2>
+<pre><code class="language-csharp">// 只按可信的路径信号分级；KeyId 覆盖要等 KeyRing 查表确认后再生效
+var mode = initialMode;
+
+// 1) 结构校验
+if (!TryReadHeaders(ctx.Request, out var h))
+    return ValidationResult.Fail("bad_header", mode);
+
+// 幂等键可缺省，但一旦出现必须单值且合法，否则下游拿到拼接后的脏值
+var idempotencyHeader = ctx.Request.Headers["X-Idempotency-Key"];
+if (idempotencyHeader.Count &gt; 1 || !Canonicalizer.IsToken(idempotencyHeader.ToString()))
+    return ValidationResult.Fail("bad_idempotency_key", mode);
+var idempotencyKey = idempotencyHeader.ToString();
+
+// Authorization 只做长度上限：内容由 v1.2 的 Token 摘要绑定，不在这里解析
+var authorization = ctx.Request.Headers["Authorization"].ToString();
+if (authorization.Length &gt; 8192) return ValidationResult.Fail("bad_header", mode);
+
+// 2) 版本白名单 + 注册表路由：声明不等于生效
+if (!opt.SupportedVersions.Contains(h.Version, StringComparer.Ordinal)
+    || !protocols.TryGet(h.Version, out var protocol) || protocol is null)
+    return ValidationResult.Fail("unsupported_signature_version", mode);
+
+// 3) 时间窗口：用绝对值比较，偏快偏慢同一类拒绝，不泄露服务端时间
+if (Math.Abs(now - h.Timestamp) &gt; opt.ClockSkewSeconds)
+    return ValidationResult.Fail("timestamp_out_of_window", mode);
+
+// 4) 密钥环：AppId / Secret / 权限边界全部查表得到
+// 查不到、已吊销、未到 NotBefore 都归为 unknown_key_id，对外不区分
+if (!keyRing.TryGet(h.KeyId, out var key) || key is null || !key.IsActive(now))
+    return ValidationResult.Fail("unknown_key_id", mode);
+
+// 身份确认后才分级：KeyId 只能收紧到 Enforce，S 档路径恒为 Enforce
+mode = opt.Resolve(h.KeyId, ctx.Request.Path.Value ?? "");
+
+// 主体绑定：Token 的身份声明与 KeyId 的 AppId 不一致即拒绝（防混淆代理）
+if (opt.RequirePrincipalBinding &amp;&amp; !IsBound(ctx, key))
+    return ValidationResult.Fail("principal_key_mismatch", mode);
+
+// 5) 原始 Body 增量哈希：读前复位、双上界、异常归一都在 HashBodyAsync 内完成
+byte[] bodyHash;
+try { bodyHash = await HashBodyAsync(ctx.Request, opt.MaxBodyBytes, ct); }
+catch (BodyTooLargeException)
+{
+    return ValidationResult.Fail("body_too_large", mode, 413, terminal: true);
+}
+
+// 6) 按版本重建 StringToSign
+// RawTarget 取框架解析出的原始请求行目标，取不到才回退 Path + QueryString
+string sts;
+try
+{
+    var feature = ctx.Features.Get&lt;IHttpRequestFeature&gt;();
+    var rawTarget = feature?.RawTarget
+        ?? string.Concat(ctx.Request.Path.Value ?? "", ctx.Request.QueryString.Value ?? "");
+    // 请求材料是不可变快照，BuildStringToSign 只读不改，可整体缓存进日志
+    var material = new RequestMaterial(
+        ctx.Request.Method, rawTarget, ctx.Request.ContentType, bodyHash,
+        h.KeyId, h.TimestampText, h.Nonce,
+        Host: ctx.Request.Host.Value,
+        IdempotencyKey: idempotencyKey,
+        Authorization: authorization);
+    sts = protocol.BuildStringToSign(material);
+}
+// 归一化阶段的协议错误自带 reason，不能被笼统记成 signature_mismatch
+catch (ProtocolFormatException ex) { return ValidationResult.Fail(ex.Reason, mode); }
+
+// 7) 验签：恒定时间比较，比较对象是解码后的 32 字节而不是 hex 串
+if (!signer.Verify(key.Secret, sts, h.Signature))
+    return ValidationResult.Fail("signature_mismatch", mode);
+
+// 验签通过才构造上下文，后续所有分支都以它为准
+var verified = new ApiSignatureContext(
+    key.AppId, h.KeyId, h.Nonce, h.Timestamp, h.Version);
+
+// 8) Observe：不做带副作用的 Nonce 写入
+if (mode == EnforcementMode.Observe) return ValidationResult.Pass(verified, mode);
+
+// 9) 唯一一次带副作用的写：SET NX EX，放在验签之后
+var outcome = await nonceStore.TryConsumeAsync(
+    h.KeyId, h.Nonce, TimeSpan.FromSeconds(opt.NonceTtlSeconds), ct);
+
+// 三态映射：Consumed 通过；Replayed 拒绝；Unavailable 由 fail-closed 决定
+return outcome switch
+{
+    NonceOutcome.Consumed =&gt; ValidationResult.Pass(verified, mode),
+    NonceOutcome.Replayed =&gt; ValidationResult.Fail("nonce_replayed", mode),
+    _ =&gt; opt.FailClosedOnNonceStoreError
+        ? ValidationResult.Fail("nonce_store_unavailable", mode, 503, terminal: true)
+        : FailOpen(verified, mode)
+};
+</code></pre>
+<p><code>EnforcementMode</code> 不是全局开关的别名，而是两级裁决：进请求时按路径定档（<code>ExcludedPaths</code> / <code>PathModes</code> 段级最长前缀 / <code>DefaultMode</code>，路径来自路由器，可信）；查表命中后按 KeyId 调档（真实存在的 KeyId 才允许把档位<strong>收紧到 <code>Enforce</code></strong>，<code>KeyIdModes</code> 写 <code>Observe</code> 或 <code>Disabled</code> 启动即失败）。外加一条硬规则：<code>StrictPaths</code>（支付、转账、退款、下单）恒为 <code>Enforce</code>，不受任何 KeyId 配置影响。</p>
+<p>因此灰度的唯一方向是「全局 <code>Observe</code> 加白名单 <code>Enforce</code>」。不存在某个 KeyId 把严格路径放松，也不存在配了 <code>Disabled</code> 却悄悄变成 <code>Enforce</code> 的静默改写。影子模式自身也有风险：<code>Observe</code> 下验签失败被放行，任何能声明该 KeyId 的人都享受不拦截，所以灰度期应限定在已知接入方、内网来源和有限时间窗，并配合失败率告警。</p>
+<h2 id="section-15">5.4 注册与限流</h2>
+<p>三个协议实现注册为同一接口的多实现，由注册表按版本号选取；限流前置，按已知 KeyId 分区、未知一律按 IP 分区。<code>X-Key-Id</code> 先过格式白名单并查表确认存在才用于分键，随机 KeyId 因此撑不爆分区表。拒绝状态码固定 429，不是默认的 503。</p>
+<p>流水线的顺序由成本与可信度决定；唯一带副作用的写，只能发生在验签之后。</p>
+<h1 id="section-16">六、客户端对齐与灰度上线</h1>
+<h2 id="handler">6.1 签名 Handler</h2>
+<pre><code class="language-csharp">public sealed class ApiSignatureHandler(
+    IApiSigner signer,
+    ISignatureProtocol protocol,
+    byte[] secret,
+    string keyId,
+    TimeProvider? clock = null) : DelegatingHandler
+{
+    // 时间源可注入：测试用 FakeTimeProvider 精确驱动边界
+    private readonly TimeProvider _clock = clock ?? TimeProvider.System;
+
+    protected override async Task&lt;HttpResponseMessage&gt; SendAsync(
+        HttpRequestMessage req, CancellationToken ct)
+    {
+        // 没有绝对 URI 就无法确定 request-target 与 Host，直接失败而不是签个错的
+        var uri = req.RequestUri
+            ?? throw new InvalidOperationException("RequestUri 为空：请设置绝对 URI 或 HttpClient.BaseAddress。");
+        // 相对 URI 同理：拼不出 Host 与路径，签出来的串一定对不上
+        if (!uri.IsAbsoluteUri)
+            throw new InvalidOperationException(
+                "Handler 收到相对 URI。HttpClient 通常会在调用 Handler 前与 BaseAddress 合并；" +
+                "若在自定义管道中出现此情况，请显式传入绝对 URI，否则无法确定要签的 request-target 与 Host。");
+
+        // Body 哈希：Content 为空用空字节哈希，与协议一致；只在即将发送的字节上算
+        var bodyHash = req.Content is null
+            ? SHA256.HashData(ReadOnlySpan&lt;byte&gt;.Empty)
+            : SHA256.HashData(await req.Content.ReadAsByteArrayAsync(ct));
+
+        // 时间戳与 Nonce 每次发送都重新生成：重试必须换 Nonce，幂等键保持不变
+        var ts = _clock.GetUtcNow().ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
+        // 128 bit 随机数的 32 位小写 hex，与服务端格式校验一致
+        var nonce = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+
+        // Uri 会把 %7E 归一为 ~，服务端 CanonicalPath 用同一套规则，两端得到同一串
+        var rawTarget = uri.GetComponents(UriComponents.PathAndQuery, UriFormat.UriEscaped);
+        // Authority 含非默认端口，与服务端 Request.Host.Value 对齐；NormalizeHost 只剥默认端口
+        var host = uri.Authority;
+
+        // Authorization 没有就传 null，摘要函数对 null 与空串的处理两端必须一致
+        var authValues = req.Headers.TryGetValues("Authorization", out var av) ? av.ToArray() : [];
+        var authorization = authValues.Length == 0 ? null : string.Join(",", authValues);
+
+        // 幂等键多值在客户端就失败，不要等服务端返回 401 才发现
+        var idemValues = req.Headers.TryGetValues("X-Idempotency-Key", out var iv) ? iv.ToArray() : [];
+        if (idemValues.Length &gt; 1)
+            throw new InvalidOperationException("X-Idempotency-Key 必须为单值，服务端会拒绝多值头。");
+
+        // 与服务端同一份不可变材料结构，各版本协议各自拼串
+        var material = new RequestMaterial(
+            req.Method.Method, rawTarget,
+            req.Content?.Headers.ContentType?.ToString(), bodyHash,
+            keyId, ts, nonce,
+            Host: host,
+            IdempotencyKey: idemValues.FirstOrDefault(),
+            Authorization: authorization);
+
+        // 拼串 → HMAC → 小写 hex，三步都不做额外归一，全部交给 Canonicalizer
+        var sts = protocol.BuildStringToSign(material);
+        var sig = Canonicalizer.ToLowerHex(signer.Compute(secret, sts));
+
+        // TryAddWithoutValidation：值是受控的 hex / 数字，框架无需再校验
+        req.Headers.TryAddWithoutValidation("X-Signature-Version", protocol.Version);
+        req.Headers.TryAddWithoutValidation("X-Key-Id", keyId);
+        req.Headers.TryAddWithoutValidation("X-Timestamp", ts);
+        req.Headers.TryAddWithoutValidation("X-Nonce", nonce);
+        req.Headers.TryAddWithoutValidation("X-Signature", sig);
+        return await base.SendAsync(req, ct);
+    }
+}
+</code></pre>
+<p>还有一个真实的坑：<code>HttpClient</code> 用 <code>HttpMessageInvoker</code> 直接发送时，请求行可能变成 absolute-form（<code>POST http://host/api/... HTTP/1.1</code>），服务端 <code>RawTarget</code> 于是带上完整 URI，而客户端拼的是 <code>:path</code>，两边对不上。Handler 里对绝对 URI 的强制检查，加上服务端 <code>SplitTarget</code> 对 absolute-form 的归一，正好把这条路堵上。</p>
+<h2 id="section-17">6.2 同字段取值对照</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230427493-1390185653.png" alt=""></p>
+<p>对照表之外，还有几件容易出错的事。每次网络尝试都要换新 Nonce，同一业务意图则保持同一幂等键。Token 刷新后必须重签，因为 <code>v1.2</code> 把 Token 摘要签进了串，旧签名必然失效。客户端时钟用 <code>X-Server-Time</code> 校准，容器与移动端尤其需要 NTP。</p>
+<h2 id="section-18">6.3 观测：统一 401 与三个例外</h2>
+<p>对外默认一律 <code>401 {"error":"invalid_request_signature","trace_id":"..."}</code> 且 <code>Cache-Control: no-store</code>。只有三个例外，且返回同一错误体：<code>413</code>（<code>body_too_large</code>，客户端要知道是报文过大而非凭证错误）、<code>429</code>（限流命中，早于验签）、<code>503</code>（<code>nonce_store_unavailable</code> 且 fail-closed，表达「服务暂不可用」而不是伪装成攻击）。</p>
+<p>对内分类记日志、不返回给调用方：<code>bad_header</code>、<code>bad_idempotency_key</code>、<code>unsupported_signature_version</code>、<code>timestamp_out_of_window</code>、<code>unknown_key_id</code>、<code>principal_key_mismatch</code>、<code>bad_target_encoding</code>、<code>empty_query_segment</code>、<code>bad_content_type</code>、<code>bad_host</code>、<code>bad_token</code>、<code>signature_mismatch</code>、<code>nonce_replayed</code>、<code>body_too_large</code>、<code>nonce_store_unavailable</code>。每条带 <code>traceId</code>、<code>mode</code>、<code>keyId</code>、<code>path</code>、<code>signature_version</code>。Secret、完整签名、Bearer Token、完整 Body 一律不落日志。</p>
+<p>指标至少要立起来：<code>api_signature_rejected_total</code>（按 <code>reason</code> 分）、<code>api_signature_verify_seconds</code>（P99）、<code>nonce_replayed_total</code>、<code>nonce_store_unavailable_total</code>。前两条回答有没有误伤，后两条分别回答有没有被攻击、存储是否在抖动。影子期与全量期的曲线必须可比，否则一条恒为 0 的线什么都证明不了。</p>
+<h2 id="section-19">6.4 灰度四阶段与门禁</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230433317-1533284015.png" alt=""></p>
+<p>上线门禁只有一份：三版本向量全部通过（含边界用例）；<code>TTL ≥ 2W + δ</code> 由启动校验保证；多值头、空 Body、两种大 Body（有 <code>Content-Length</code> 与 chunked）各有回归用例；重放、Body 篡改、时间窗越界、主体不一致各有一条端到端用例；<code>429</code>/<code>503</code> 的告警已接；回滚开关可在 5 分钟内生效。</p>
+<p>到这里，请求这一侧的闭环就讲完了。剩下的是它管不到的地方。</p>
+<h1 id="section-20">七、边界与演进</h1>
+<h2 id="section-21">7.1 适用与不适用</h2>
+<p>适用：能安全持有对称 Secret 的服务端到服务端调用、开放平台的 App 接入、需要防重放的高价值写接口。</p>
+<p>三种情况不该用。公开客户端（移动 App、浏览器）持有共享 Secret，它必然被逆向。需要不可否认性的场景，对称 HMAC 双方都能造出同一签名，得换非对称。已有 mTLS 覆盖身份、只关心链路完整性的内网调用，签名只剩请求级完整性这一层价值。</p>
+<h2 id="section-22">7.2 选型判据</h2>
+<p>判断顺序：调用方能否可信持有对称 Secret（否 → DPoP / BFF / 非对称）；是否需要不可否认性（是 → 非对称）；是否已有 mTLS 覆盖身份层（是 → 签名只保留完整性）。</p>
+<h2 id="section-23">7.3 演进路线</h2>
+<p>响应签名（用同一套规范化规则签 <code>status + bodyHash + timestamp + 独立响应 nonce</code>，请求 nonce 只用于关联，不能作为响应新鲜性依据）；签名下沉网关（解决「网关验签 → 内网下传可信身份」的信任链）；<code>v1.2</code> 接管后日落旧版本；签名失败率、Nonce 冲突、时钟偏移接入 SIEM 关联。</p>
+<p>版本依赖：文中新 API 里只有 C# 14 <code>field</code>（.NET 10）与 <code>Convert.ToHexStringLower</code>（.NET 9+）属于新版本能力，<code>FrozenDictionary</code> / <code>TimeProvider</code> / <code>SearchValues</code> / <code>HMACSHA256.HashData</code> / <code>ValidateOnStart</code> / <code>System.Threading.RateLimiting</code> 都是 .NET 6~8 的成熟 BCL。把 TargetFramework 从 8 改成 10，不会自动修好本文提到的任何一条问题。</p>
+<p>这套方案的边界是谁能安全持有 Secret，而不是用了什么算法。</p>
+<h1 id="section-24">结语</h1>
+<p><strong>Token 是门禁卡，HMAC 是封条，Nonce 是一次性的防伪码</strong>。三者签的是同一件事的三个侧面：这个人、这份字节、这个时刻。</p>
+<p>这套方案里几乎没有密码学难题，全是协议与工程问题：同一个主题能写出多种互不兼容的待签串，正说明规范化必须被当成协议来治理。真正决定成败的是这几件事：规范化是协议；字节级一致性；状态写在正确的位置；身份、版本、档位由服务端裁决；能跑、能观测、能灰度、能回滚。</p>
+<p>这套方案真正难的地方只有两处：规范化，和时钟。</p>
+<h1 id="a">附录 A｜常见实现分歧速查</h1>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261106230439134-210937707.png" alt=""></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-07 13:09">2026-11-07 13:08</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">106</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23578745);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23578745&amp;targetId=23578745&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
