@@ -1,0 +1,207 @@
+
+        <h2 class="post-title">
+            <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/jzp1207/p/23583046" title="发布于 2026-11-07 11:07">
+    
+
+    <span role="heading" aria-level="2">缓存穿透、击穿、雪崩：三个概念傻傻分不清楚？</span>
+    
+
+</a>
+
+        </h2>
+        <div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<p>这三个概念面试必考，但很多人记混了。</p>
+<p>一句话区分：</p>
+<ul>
+<li><strong>穿透：</strong> 查的数据根本不存在</li>
+<li><strong>击穿：</strong> 热点数据的缓存突然过期</li>
+<li><strong>雪崩：</strong> 大量缓存同时过期</li>
+</ul>
+<hr>
+<h2>缓存穿透</h2>
+<p><strong>场景：</strong> 查询一个数据库里根本不存在的数据。</p>
+<pre><code>请求 id=-1 → 查缓存（没有）→ 查数据库（也没有）→ 返回null
+下次再请求 id=-1 → 查缓存（还是没有）→ 查数据库（还是没有）
+</code></pre>
+<p>每次请求都打到数据库，缓存完全失效。恶意攻击者可以用这种方式打垮数据库。</p>
+<p><strong>解法一：缓存空值</strong></p>
+<p>查数据库发现没有，就在缓存里存一个空值，设置较短的过期时间（比如5分钟）。</p>
+<pre><code class="language-java">Object data = cache.get(key);
+if (data == null) {
+    data = db.query(key);
+    if (data == null) {
+        cache.set(key, "NULL", 5, TimeUnit.MINUTES);  // 缓存空值
+    } else {
+        cache.set(key, data, 30, TimeUnit.MINUTES);
+    }
+}
+return "NULL".equals(data) ? null : data;
+</code></pre>
+<p>缺点：如果攻击者用不同的不存在的key，缓存里会存大量空值，占用内存。</p>
+<p><strong>解法二：布隆过滤器（推荐）</strong></p>
+<p>布隆过滤器是一个位数组+多个哈希函数，可以判断一个元素"一定不存在"或"可能存在"。</p>
+<pre><code class="language-java">// 启动时，把所有合法的id加入布隆过滤器
+bloomFilter.add(id);
+
+// 请求进来时，先过布隆过滤器
+if (!bloomFilter.mightContain(requestId)) {
+    return null;  // 布隆过滤器说不存在，直接返回，不查缓存和数据库
+}
+// 布隆过滤器说可能存在，再查缓存和数据库
+</code></pre>
+<p>布隆过滤器有一定的误判率（说存在但实际不存在），但不会漏判（说不存在就一定不存在）。</p>
+<p><strong>布隆过滤器误判率与位数组大小的关系：</strong> 误判率由位数组长度 <code>m</code> 和哈希函数个数 <code>k</code> 决定，元素越多、位数组越小则误判率越高。Guava实现中可在创建时指定期望误判率：</p>
+<pre><code class="language-java">// Guava BloomFilter：期望插入100万元素，误判率1%
+BloomFilter&lt;Long&gt; bloomFilter = BloomFilter.create(
+    Funnels.longFunnel(),
+    1_000_000,   // 预期元素数量
+    0.01         // 期望误判率（1%）
+);
+// Guava会自动计算最优的位数组大小和哈希函数个数
+
+// Redis实现（RedisBloom模块）
+// BF.RESERVE key error_rate capacity
+// BF.RESERVE user:bloom 0.01 1000000
+// BF.ADD user:bloom 12345
+// BF.EXISTS user:bloom 12345
+</code></pre>
+<p><strong>数据更新时布隆过滤器的维护：</strong> 布隆过滤器不支持删除操作。新增数据时向过滤器添加即可；删除数据时无法从过滤器中移除（若需要支持删除，可使用 Counting Bloom Filter）。可以定期重建过滤器解决过时数据问题。</p>
+<p><strong>缓存空值方案的注意事项：</strong></p>
+<pre><code class="language-java">// ⚠️ 边界场景：数据库后续真正新增了该数据，空值缓存会导致短暂不一致
+// 解决：新增数据时主动删除空值缓存
+public void createUser(User user) {
+    userMapper.insert(user);
+    // 主动删除可能存在的空值缓存，防止缓存与数据库不一致
+    cache.delete("user:" + user.getId());
+}
+</code></pre>
+<hr>
+<h2>缓存击穿</h2>
+<p><strong>场景：</strong> 一个热点数据（比如明星微博、秒杀商品）的缓存突然过期，大量请求同时涌入，全部打到数据库。</p>
+<pre><code>缓存过期的那一刻：
+1000个并发请求 → 查缓存（全部miss）→ 全部打到数据库 → 数据库可能崩
+</code></pre>
+<p><strong>解法一：互斥锁</strong></p>
+<p>缓存miss时，只让一个线程去查数据库，其他线程等待。</p>
+<pre><code class="language-java">public Object getData(String key) {
+    Object data = cache.get(key);
+    if (data != null) return data;
+
+    // 缓存miss，尝试获取互斥锁
+    String lockKey = "lock:" + key;
+    if (tryLock(lockKey)) {
+        try {
+            // 双重检查，防止其他线程已经重建了缓存
+            data = cache.get(key);
+            if (data != null) return data;
+
+            // 查数据库，重建缓存
+            data = db.query(key);
+            cache.set(key, data, 30, TimeUnit.MINUTES);
+            return data;
+        } finally {
+            unlock(lockKey);
+        }
+    } else {
+        // 没拿到锁，等一会儿重试
+        Thread.sleep(50);
+        return getData(key);
+    }
+}
+</code></pre>
+<p>缺点：等待期间请求被阻塞，响应变慢。</p>
+<p><strong>解法二：逻辑过期（热点数据永不过期）</strong></p>
+<p>不设置TTL，而是在数据里存一个"逻辑过期时间"。发现逻辑过期时，异步更新缓存，同时返回旧数据。</p>
+<pre><code class="language-java">public Object getData(String key) {
+    CacheData cacheData = cache.get(key);
+
+    // 缓存存在且未逻辑过期
+    if (cacheData != null &amp;&amp; !isExpired(cacheData)) {
+        return cacheData.getData();
+    }
+
+    // 逻辑过期，异步重建
+    if (tryLock("lock:" + key)) {
+        // 异步线程去更新缓存
+        executor.submit(() -&gt; {
+            Object newData = db.query(key);
+            cache.set(key, new CacheData(newData, System.currentTimeMillis() + 30 * 60 * 1000));
+            unlock("lock:" + key);
+        });
+    }
+
+    // 返回旧数据（允许短暂不一致）
+    return cacheData != null ? cacheData.getData() : null;
+}
+</code></pre>
+<p>适合读多写少、允许短暂不一致的热点数据。</p>
+<hr>
+<h2>缓存雪崩</h2>
+<p><strong>场景：</strong> 大量缓存在同一时间段过期，或者Redis服务宕机，导致所有请求全部打到数据库。</p>
+<p><strong>解法：</strong></p>
+<p><strong>1. 过期时间加随机值</strong></p>
+<pre><code class="language-java">// ❌ 所有缓存同时过期
+cache.set(key, data, 30, TimeUnit.MINUTES);
+
+// ✅ 过期时间加随机扰动，避免同时过期
+int randomOffset = new Random().nextInt(300);  // 0-300秒随机
+cache.set(key, data, 30 * 60 + randomOffset, TimeUnit.SECONDS);
+</code></pre>
+<p><strong>2. Redis高可用</strong></p>
+<p>部署Redis集群（主从+哨兵，或者Cluster），避免单点故障导致全量缓存失效。</p>
+<p><strong>3. 服务降级</strong></p>
+<p>Redis挂了，不要让请求直接打到数据库，而是返回降级数据（比如空数据、本地缓存、兜底数据）。</p>
+<pre><code class="language-java">try {
+    data = cache.get(key);
+    if (data == null) {
+        data = db.query(key);
+    }
+} catch (RedisException e) {
+    // Redis挂了，返回降级数据
+    data = getDefaultData(key);
+    log.error("Redis异常，走降级", e);
+}
+</code></pre>
+<p><strong>4. 限流</strong></p>
+<p>即使缓存雪崩发生了，通过限流保护数据库不被打垮。</p>
+<hr>
+<h2>三种问题对比</h2>
+<table>
+<thead>
+<tr><th>问题</th><th>触发条件</th><th>核心解法</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>穿透</td>
+<td>查不存在的数据</td>
+<td>布隆过滤器</td>
+</tr>
+<tr>
+<td>击穿</td>
+<td>热点数据缓存过期</td>
+<td>互斥锁 / 逻辑过期</td>
+</tr>
+<tr>
+<td>雪崩</td>
+<td>大量缓存同时过期 / Redis宕机</td>
+<td>过期时间加随机值 / 高可用 / 限流</td>
+</tr>
+</tbody>
+</table>
+<p>面试时把这三个概念的区别和对应解法说清楚，不要混淆，基本就过了。</p>
+
+</div>
+<div class="clear"></div>
+
+        <p class="postfoot">
+            posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-07 11:07">2026-11-07 11:07</span>&nbsp;
+<a href="https://www.cnblogs.com/jzp1207">37.2°</a>&nbsp;
+阅读(<span id="post_view_count">38</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23583046);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjzp1207%2Fp%2F23583046&amp;targetId=23583046&amp;targetType=0" target="_blank">举报</a>
+
+        </p>
+    
