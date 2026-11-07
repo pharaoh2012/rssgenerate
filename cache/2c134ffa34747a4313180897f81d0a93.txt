@@ -1,0 +1,144 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/USTHzhanglu/p/23577592" title="发布于 2026-11-06 18:46">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2"># 一次 CRC 字段“神秘消失”的排查 -&gt; 指针强转的UB代价</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="现象">现象</h2>
+<p>嵌入式C设备，内部 flash 上有一个键值日志：每条记录 = 8 字节头（key/len/crc）+ 数据，CRC16 覆盖 key+len+data。<br>
+某次升级编译器后(其实是同事用的编译器版本不同), 发现固件写入记录后回读校验失败；<br>
+把 flash dump 出来发现：key、len、数据都对，<strong>CRC 字段始终是 0xFFFF（擦除值）</strong>。</p>
+<h2 id="背景">背景</h2>
+<p>在嵌入式C中,使用指针强转赋值是很常见的做法(写起来太方便通畅了,作者言)</p>
+<p>于是在写字段时自然而然使用指针强转</p>
+<p>写函数原本是这样：</p>
+<pre><code class="language-c">uint8_t buf[8 + MAX_LEN];
+entry_hdr_t *eh = (entry_hdr_t *)buf;   // ← 问题在这里
+memset(buf, 0xFF, sizeof buf);
+eh-&gt;key = key;
+eh-&gt;len = len;
+memcpy(buf + 8, data, len);
+
+memcpy(tmp, eh, 6);
+memcpy(tmp + 6, data, len);
+eh-&gt;crc = crc16(tmp, 6 + len);          // ← 被整行删掉
+
+flash_write(offs, buf, esize);
+</code></pre>
+<h2 id="根因">根因</h2>
+<p>C 的有效类型规则（6.5p7）：对象的存储值只能通过<strong>兼容类型</strong>或<strong>字符类型</strong>访问。字符类型访问任何对象是允许的，<strong>反过来不成立</strong>——用 <code>entry_hdr_t*</code> 写一个声明为 <code>uint8_t[]</code> 的对象是未定义行为。</p>
+<p>程序一旦有 UB，编译器就可以假设：结构体写和字节读是<strong>两个不相干的对象</strong>。于是 <code>eh-&gt;crc</code> 的存储对后面 <code>flash_write(offs, buf, ...)</code> 的读取“不可见”，被死存储消除（DSE）删除；存储没了，CRC 计算也成了死代码。</p>
+<p>为什么 key/len 没被删？因为 <code>memcpy(tmp, eh, 6)</code> 是一次按字符类型的读，编译器必须保留它们；而 crc 没有任何“存活的字符读者”，只剩那个不可见的 <code>flash_write</code>。</p>
+<h2 id="反汇编佐证">反汇编佐证</h2>
+<p><strong>旧写法（GCC 14.2，全量 LTO）</strong>——从 memset 到 flash_write 之间，没有 CRC 计算，也没有写入 crc 字段：</p>
+<pre><code>80065aa: movs  r2, #130
+80065ae: add.w r0, sp, #142
+80065b2: bl    memset            ; memset(buf+6, 0xFF, 130)
+80065be: str.w r8, [sp, #136]    ; key
+80065c2: strh.w r4, [sp, #140]   ; len
+80065c6: bl    memcpy            ; data
+80065ca: ldmia.w r7, {r0, r1}    ; 构造 tmp
+80065d0: str   r0, [sp, #0]
+80065d6: add.w r0, sp, #6
+80065dc: bl    memcpy
+80065e0: add.w r2, r4, #11
+80065e4: bic.w r2, r2, #3
+80065ec: bl    flash_write        ; ← 直接写，没有 crc
+</code></pre>
+<p><strong>行表佐证</strong>（addr2line）：<code>memcpy(tmp, ...)</code> 与 <code>flash_write</code> 都有地址，唯独 <code>eh-&gt;crc = crc16(...)</code> 这一行没有生成任何地址：</p>
+<pre><code>0x8006e16 -&gt; 156   memcpy(tmp, eh, 6);
+0x8006e22 -&gt; 157   memcpy(tmp + 6, data, len);
+0x8006e34 -&gt; 160   return flash_write(...);
+（158 行：eh-&gt;crc = crc16(...)  →  无指令）
+</code></pre>
+<p><strong>修复后（同一编译器、同一全量构建）</strong>——CRC 计算和写回都恢复：</p>
+<pre><code>80065e0: bl    crc16             ; CRC 计算
+80065e4: strh.w r0, [sp, #6]     ; crc 写回
+80065e8: ldrd  r0, r1, [sp]
+80065ee: stmia.w r5, {r0, r1}    ; 头 → 输出缓冲
+80065fc: bl    memcpy            ; data
+800660a: bl    memset            ; padding 0xFF
+8006614: bl    flash_write
+</code></pre>
+<h2 id="修复">修复</h2>
+<p>去掉“结构体指针写字节数组”：头在局部结构体里构造，再通过 <code>memcpy</code> 拷贝进输出缓冲（字符访问，标准允许的方向）：<br>
+(手写memcpy好繁琐啊,还好现在都是用AI写了,作者言)</p>
+<pre><code class="language-c">static int entry_write(uint32_t offs, uint32_t key, const void *data, uint32_t len) {
+  entry_hdr_t hdr;
+  uint8_t buf[8 + MAX_LEN];
+  uint8_t tmp[6 + MAX_LEN];
+
+  memset(buf, 0xFF, sizeof buf);
+  hdr.key = key;
+  hdr.len = (uint16_t)len;
+
+  memcpy(tmp, &amp;hdr, 6);
+  memcpy(tmp + 6, data, len);
+  hdr.crc = crc16(tmp, 6 + len);
+
+  memcpy(buf, &amp;hdr, sizeof hdr);   /* struct → 字节：允许方向 */
+  memcpy(buf + sizeof hdr, data, len);
+
+  return (flash_write(offs, buf, esize) == OK) ? 0 : -1;
+}
+</code></pre>
+<h2 id="验证全量构建-ab">验证（全量构建 A/B）</h2>
+<table>
+<thead>
+<tr>
+<th>编译器与构建</th>
+<th>旧写法</th>
+<th>新写法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GCC 10.3 全量 LTO</td>
+<td>✅ 保留</td>
+<td>✅ 保留</td>
+</tr>
+<tr>
+<td>GCC 14.2 全量 LTO</td>
+<td>❌ 被删（复现）</td>
+<td>✅ 保留</td>
+</tr>
+<tr>
+<td>GCC 15.3 全量 LTO</td>
+<td>❌ 被删</td>
+<td>✅ 保留</td>
+</tr>
+</tbody>
+</table>
+<h2 id="经验">经验</h2>
+<ol>
+<li>“嵌入式中指针强转很常见”不代表安全：指向<strong>没有声明类型的原始内存</strong>（寄存器、DMA 缓冲、flash 映射区）的强转没问题；指向<strong>已声明类型的对象</strong>再换类型访问是 UB。</li>
+<li>“能跑”不能作为验证：这类 UB 只有在特定编译器/优化/LTO 组合下才被利用，<strong>要用全量构建看反汇编</strong>。</li>
+<li>修法很便宜：<code>memcpy</code> 的常量长度会被内联成普通 load/store，代码量和性能与强转基本一致（实测差 2~3 条指令，而 flash 编程是几十微秒级，可忽略）。</li>
+<li>嵌入式C中还是GCC10.3爽,怪不得网上都推荐用这个</li>
+<li>多人开发时必须限制编译器同版本,不然就慢慢给不同编译器擦屁股吧</li>
+</ol>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-06 18:46">2026-11-06 18:46</span>&nbsp;
+<a href="https://www.cnblogs.com/USTHzhanglu">USTHzhanglu</a>&nbsp;
+阅读(<span id="post_view_count">51</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23577592);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FUSTHzhanglu%2Fp%2F23577592&amp;targetId=23577592&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
