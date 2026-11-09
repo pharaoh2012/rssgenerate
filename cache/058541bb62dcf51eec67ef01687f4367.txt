@@ -1,0 +1,406 @@
+
+		<h2>
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/liuziyi1/p/23598491" title="发布于 2026-11-09 09:43">
+    
+
+    <span role="heading" aria-level="2">SQL Server Always On 可用性组在Linux上的部署指南（步骤/命令/脚本）</span>
+    
+
+</a>
+
+		</h2>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p>适用平台：RHEL 7/8/9、Ubuntu 18.04/20.04/22.04。SQL Server 2025 起不再支持 SLES。<br>
+集群管理器：Linux 上使用 <strong>Pacemaker + Corosync</strong>（不使用 WSFC）；集群类型为 <code>CLUSTER_TYPE = EXTERNAL</code>。<br>
+高可用（可自动故障转移）在 Linux 上要求 <strong>3 个节点</strong>（2 个同步提交副本 + 1 个配置仅副本，或 3 个完整副本）。</p>
+</blockquote>
+<hr>
+<h2 id="一与-windows-方案的关键差异">一、与 Windows 方案的关键差异</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">对比项</th>
+<th style="text-align: left">Windows（WSFC）</th>
+<th style="text-align: left">Linux（Pacemaker）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">集群管理器</td>
+<td style="text-align: left">WSFC</td>
+<td style="text-align: left">Pacemaker + Corosync</td>
+</tr>
+<tr>
+<td style="text-align: left">是否需要 AD 域</td>
+<td style="text-align: left">需要（或工作组集群）</td>
+<td style="text-align: left">通常不需要</td>
+</tr>
+<tr>
+<td style="text-align: left">启用 AG 方式</td>
+<td style="text-align: left">配置管理器 / PowerShell</td>
+<td style="text-align: left"><code>mssql-conf</code></td>
+</tr>
+<tr>
+<td style="text-align: left">端点认证</td>
+<td style="text-align: left">Windows 认证</td>
+<td style="text-align: left"><strong>证书认证</strong>（不支持 Windows 集成认证）</td>
+</tr>
+<tr>
+<td style="text-align: left">故障转移模式</td>
+<td style="text-align: left"><code>AUTOMATIC</code> / <code>MANUAL</code></td>
+<td style="text-align: left"><code>FAILOVER_MODE = EXTERNAL</code>（由 Pacemaker 编排）</td>
+</tr>
+<tr>
+<td style="text-align: left">侦听器</td>
+<td style="text-align: left">内置 VNN</td>
+<td style="text-align: left">无等价物，需<strong>手工在 DNS 注册</strong> IP</td>
+</tr>
+<tr>
+<td style="text-align: left">集群类 DMV</td>
+<td style="text-align: left">正常返回</td>
+<td style="text-align: left">返回空行（DMV 为 WSFC 设计）</td>
+</tr>
+<tr>
+<td style="text-align: left">部署顺序</td>
+<td style="text-align: left">先建 WSFC 再装 SQL</td>
+<td style="text-align: left">可先装 SQL 再建 Pacemaker，或反之</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="二环境准备">二、环境准备</h2>
+<h3 id="步骤-1主机名与-etchosts所有节点">步骤 1：主机名与 /etc/hosts（所有节点）</h3>
+<pre><code class="language-bash"># 每台节点分别设置主机名，并保证三节点互相解析
+sudo hostnamectl set-hostname node1
+# 所有节点统一写入 /etc/hosts
+sudo tee -a /etc/hosts &lt;&lt;'EOF'
+10.0.0.11  node1
+10.0.0.12  node2
+10.0.0.13  node3
+EOF
+
+# 校验
+ping -c 2 node2
+ping -c 2 node3
+</code></pre>
+<blockquote>
+<p>节点名必须与 SQL Server <code>@@SERVERNAME</code> 一致，否则集群认证会失败；无法一致时用 <code>pcs cluster auth</code> 的 <code>addr</code> 选项指定匹配地址。</p>
+</blockquote>
+<h3 id="步骤-2安装-sql-server-与高可用组件所有节点">步骤 2：安装 SQL Server 与高可用组件（所有节点）</h3>
+<pre><code class="language-bash"># 安装 SQL Server（按官方源配置后）
+sudo dnf install -y mssql-server
+sudo /opt/mssql/bin/mssql-conf setup
+
+# 安装高可用组件（RHEL 系）
+sudo dnf install -y pacemaker pcs psmisc policycoreutils-python-utils
+
+# 安装 SQL Server HA 资源代理与 Agent 包
+sudo dnf install -y mssql-server-ha mssql-server-agent
+
+# Ubuntu 系对应使用 apt install pacemaker pcs psmisc 及 mssql-server-ha
+</code></pre>
+<h3 id="步骤-3开放防火墙端口所有节点">步骤 3：开放防火墙端口（所有节点）</h3>
+<pre><code class="language-bash"># 1433 数据库端口；5022 镜像端点端口
+sudo firewall-cmd --zone=public --add-port=1433/tcp --permanent
+sudo firewall-cmd --zone=public --add-port=5022/tcp --permanent
+sudo firewall-cmd --reload
+
+# 验证
+sudo firewall-cmd --zone=public --list-ports
+</code></pre>
+<hr>
+<h2 id="三启用-always-on-并配置证书端点">三、启用 Always On 并配置证书端点</h2>
+<h3 id="步骤-4启用可用性组功能所有节点">步骤 4：启用可用性组功能（所有节点）</h3>
+<pre><code class="language-bash">sudo /opt/mssql/bin/mssql-conf set hadr.hadrenabled 1
+sudo systemctl restart mssql-server
+# 确认
+sudo /opt/mssql/bin/mssql-conf get hadr.hadrenabled
+</code></pre>
+<h3 id="步骤-5创建主密钥证书并导出每个节点各做一次">步骤 5：创建主密钥、证书并导出（每个节点各做一次）</h3>
+<blockquote>
+<p>Linux 端点为证书认证，需在每个节点创建<strong>本机主密钥 + 本机证书</strong>，导出 <code>.cer</code> 后与其他节点交换。<br>
+以下脚本以 <code>node1</code> 为例，node2/node3 执行时替换证书名与文件名。</p>
+</blockquote>
+<pre><code class="language-sql">USE master;
+GO
+-- 1) 创建数据库主密钥
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'Str0ngP@ssw0rd!Node1';
+GO
+-- 2) 创建本机服务器证书
+CREATE CERTIFICATE node1_cert
+    WITH SUBJECT = 'node1 AG Certificate', EXPIRY_DATE = '20301231';
+GO
+-- 3) 导出证书（不含私钥），供其他节点导入
+BACKUP CERTIFICATE node1_cert
+    TO FILE = '/var/opt/mssql/data/node1_cert.cer';
+GO
+</code></pre>
+<p>将三个节点的 <code>.cer</code> 文件互相复制到各节点的 <code>/var/opt/mssql/data/</code> 目录：</p>
+<pre><code class="language-bash"># 在 node1 上把其他节点证书拷入（示例用 scp，实际按环境方式传输）
+scp node2:/var/opt/mssql/data/node2_cert.cer /var/opt/mssql/data/
+scp node3:/var/opt/mssql/data/node3_cert.cer /var/opt/mssql/data/
+sudo chown mssql:mssql /var/opt/mssql/data/*_cert.cer
+</code></pre>
+<h3 id="步骤-6创建数据库镜像端点并交换证书信任每个节点">步骤 6：创建数据库镜像端点并交换证书信任（每个节点）</h3>
+<pre><code class="language-sql">USE master;
+GO
+-- 1) 导入其他节点的证书
+CREATE CERTIFICATE node2_cert FROM FILE = '/var/opt/mssql/data/node2_cert.cer';
+CREATE CERTIFICATE node3_cert FROM FILE = '/var/opt/mssql/data/node3_cert.cer';
+GO
+-- 2) 由对端证书创建登录并授予端点连接权限
+CREATE LOGIN node2_login FROM CERTIFICATE node2_cert;
+CREATE LOGIN node3_login FROM CERTIFICATE node3_cert;
+GRANT CONNECT ON ENDPOINT::Hadr_endpoint TO node2_login;
+GRANT CONNECT ON ENDPOINT::Hadr_endpoint TO node3_login;
+GO
+-- 3) 创建端点，认证方式为证书，包含全部三个节点证书
+CREATE ENDPOINT [Hadr_endpoint]
+    STATE = STARTED
+    AS TCP (LISTENER_PORT = 5022, LISTENER_IP = ALL)
+    FOR DATABASE_MIRRORING (
+        ROLE = ALL,
+        AUTHENTICATION = CERTIFICATE node1_cert, node2_cert, node3_cert,
+        ENCRYPTION = REQUIRED ALGORITHM AES
+    );
+GO
+-- 4) 确认端点端口
+SELECT name, type_desc, port FROM sys.tcp_endpoints WHERE type_desc = 'DATABASE_MIRRORING';
+</code></pre>
+<blockquote>
+<p>每个节点只需一个镜像端点，所有 AG/镜像会话共用；端点已存在且在用时<strong>重用</strong>，不要删除重建。</p>
+</blockquote>
+<h3 id="步骤-7准备数据库主副本节点">步骤 7：准备数据库（主副本节点）</h3>
+<pre><code class="language-sql">ALTER DATABASE [SalesDB] SET RECOVERY FULL;
+GO
+BACKUP DATABASE [SalesDB] TO DISK = N'/var/opt/mssql/backup/SalesDB_full.bak' WITH INIT, COMPRESSION;
+BACKUP LOG [SalesDB] TO DISK = N'/var/opt/mssql/backup/SalesDB_log.trn' WITH INIT, COMPRESSION;
+GO
+</code></pre>
+<h3 id="步骤-8创建可用性组主副本节点执行cluster_type--external">步骤 8：创建可用性组（主副本节点执行，<code>CLUSTER_TYPE = EXTERNAL</code>）</h3>
+<pre><code class="language-sql">CREATE AVAILABILITY GROUP [ag1]
+WITH (
+    CLUSTER_TYPE = EXTERNAL,
+    AUTOMATED_BACKUP_PREFERENCE = SECONDARY,
+    DB_FAILOVER = ON
+)
+FOR DATABASE [SalesDB]
+REPLICA ON
+    N'node1' WITH (
+        ENDPOINT_URL = N'TCP://node1:5022',
+        AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+        FAILOVER_MODE = EXTERNAL,
+        SEEDING_MODE = AUTOMATIC,
+        SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+    ),
+    N'node2' WITH (
+        ENDPOINT_URL = N'TCP://node2:5022',
+        AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+        FAILOVER_MODE = EXTERNAL,
+        SEEDING_MODE = AUTOMATIC,
+        SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+    ),
+    N'node3' WITH (
+        ENDPOINT_URL = N'TCP://node3:5022',
+        AVAILABILITY_MODE = CONFIGURATION_ONLY,   -- 配置仅副本，参与仲裁不存数据
+        FAILOVER_MODE = EXTERNAL,
+        SEEDING_MODE = AUTOMATIC
+    );
+GO
+</code></pre>
+<p><strong>辅助节点加入并授权（node2、node3 各执行）</strong></p>
+<pre><code class="language-sql">ALTER AVAILABILITY GROUP [ag1] JOIN;
+GO
+ALTER AVAILABILITY GROUP [ag1] GRANT CREATE ANY DATABASE;
+GO
+</code></pre>
+<blockquote>
+<p>说明：<code>CLUSTER_TYPE</code> 在创建后<strong>不可通过 ALTER 修改</strong>；若误建为 External/NONE 需删除重建。<code>AVAILABILITY_MODE</code> 可用 <code>SYNCHRONOUS_COMMIT</code> / <code>ASYNCHRONOUS_COMMIT</code>，自动故障转移目标必须是同步提交。</p>
+</blockquote>
+<h3 id="步骤-9为-pacemaker-创建-sql-登录并授权主副本节点">步骤 9：为 Pacemaker 创建 SQL 登录并授权（主副本节点）</h3>
+<pre><code class="language-sql">CREATE LOGIN [PMLogin] WITH PASSWORD = N'P@ceMaker#2026';
+GO
+GRANT VIEW SERVER STATE TO [PMLogin];
+GO
+GRANT ALTER, CONTROL, VIEW DEFINITION ON AVAILABILITY GROUP::[ag1] TO [PMLogin];
+GO
+</code></pre>
+<blockquote>
+<p>最小权限方案：授予 <code>VIEW SERVER STATE</code> 及 AG 上的 <code>ALTER / CONTROL / VIEW DEFINITION</code> 即可，避免给 <code>sysadmin</code>。</p>
+</blockquote>
+<hr>
+<h2 id="四构建-pacemaker-集群">四、构建 Pacemaker 集群</h2>
+<h3 id="步骤-10初始化并创建集群在任一节点执行">步骤 10：初始化并创建集群（在任一节点执行）</h3>
+<pre><code class="language-bash"># 1) 设置 hacluster 用户密码（所有节点必须相同）
+sudo passwd hacluster
+
+# 2) 启动 pcsd 并设置开机自启（所有节点）
+sudo systemctl enable --now pcsd
+
+# 3) 节点认证（RHEL 7 写法）
+sudo pcs cluster auth node1 node2 node3 -u hacluster -p 'YourHaclusterPwd' --force
+
+# 4) 创建集群（RHEL 7 写法）
+sudo pcs cluster setup --name agcluster node1 node2 node3 --force
+
+# 5) 启动并开机自启（所有节点）
+sudo pcs cluster start --all
+sudo pcs cluster enable --all
+
+# 6) 查看状态
+sudo pcs status
+</code></pre>
+<p>RHEL 8+/9 及 Ubuntu 使用新版写法：</p>
+<pre><code class="language-bash">sudo pcs host auth node1 node2 node3 -u hacluster -p 'YourHaclusterPwd'
+sudo pcs cluster setup agcluster node1 node2 node3 --force
+sudo pcs cluster start --all
+sudo pcs cluster enable --all
+sudo pcs status
+</code></pre>
+<blockquote>
+<p>集群所有节点必须使用<strong>同一 Linux 发行版</strong>，不可混用 RHEL 与 SLES 节点。</p>
+</blockquote>
+<h3 id="步骤-11创建-ag-资源与虚拟-ip-资源在任一节点执行">步骤 11：创建 AG 资源与虚拟 IP 资源（在任一节点执行）</h3>
+<pre><code class="language-bash"># 1) 创建可用性组资源
+#    RHEL 7（HA agent v1，master 角色）
+sudo pcs resource create ag_cluster ocf:mssql:ag ag_name=ag1 meta failure-timeout=60s master notify=true
+
+#    RHEL 8+ / Ubuntu（HA agent v1，promotable 角色）
+sudo pcs resource create ag_cluster ocf:mssql:ag ag_name=ag1 meta failure-timeout=60s promotable notify=true
+
+#    HA agent v2（资源代理为 ocf:mssql:agv2，其余参数一致）
+# sudo pcs resource create ag_cluster ocf:mssql:agv2 ag_name=ag1 meta failure-timeout=30s promotable notify=true
+
+# 2) 创建虚拟 IP 资源（替换为可用静态 IP）
+sudo pcs resource create virtualip ocf:heartbeat:IPaddr2 ip=10.0.0.100
+
+# 3) 共置约束：VIP 与 AG 提升副本同节点
+sudo pcs constraint colocation add virtualip with ag_cluster-clone INFINITY
+
+# 4) 顺序约束：先提升 AG，再启动 VIP（避免 IP 先漂移指向旧辅助副本）
+sudo pcs constraint order promote ag_cluster-clone then start virtualip
+
+# 5) 查看资源与约束
+sudo pcs status
+sudo pcs constraint show
+</code></pre>
+<blockquote>
+<p>RHEL 8.x / Ubuntu 18.04 起资源名可能表现为 <code>ag_cluster-clone</code>（promotable clone）。<br>
+未添加显式顺序约束时，colocation 的隐式顺序会让虚拟 IP 在 AG 提升前先启动，导致 IP 临时指向故障转移前的辅助副本。</p>
+</blockquote>
+<hr>
+<h2 id="五验证与故障转移">五、验证与故障转移</h2>
+<h3 id="步骤-12验证sql-侧--集群侧">步骤 12：验证（SQL 侧 + 集群侧）</h3>
+<pre><code class="language-sql">-- 副本角色与同步健康
+SELECT ag.name AS ag_name, ar.replica_server_name, ars.role_desc,
+       ars.operational_state_desc, ars.synchronization_health_desc
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars ON ar.replica_id = ars.replica_id;
+
+-- 数据库同步状态与发送/重做队列
+SELECT DB_NAME(drs.database_id) AS db_name, ar.replica_server_name,
+       drs.synchronization_state_desc, drs.synchronization_health_desc,
+       drs.log_send_queue_size, drs.redo_queue_size
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id;
+</code></pre>
+<pre><code class="language-bash"># 集群状态：资源应显示 ag_cluster 为 Promoted，virtualip 在 Master 节点
+sudo pcs status
+sudo pcs resource status
+</code></pre>
+<blockquote>
+<p>Linux 上查询集群信息的 AG DMV 返回空行属正常（DMV 面向 WSFC 设计），集群状态以 <code>pcs status</code> 为准。</p>
+</blockquote>
+<h3 id="步骤-13故障转移测试">步骤 13：故障转移测试</h3>
+<pre><code class="language-bash"># 方式一：手工把 AG 资源迁移到另一节点（推荐验证）
+sudo pcs resource move ag_cluster-clone node2
+# 等待提升完成后清理临时约束
+sudo pcs resource clear ag_cluster-clone
+
+# 方式二：停掉当前主节点 SQL Server 模拟故障
+sudo systemctl stop mssql-server
+# 观察 Pacemaker 是否自动提升其他节点
+sudo pcs status
+</code></pre>
+<h3 id="步骤-14客户端连接侦听器--dns">步骤 14：客户端连接（侦听器 / DNS）</h3>
+<p>Linux 无内置侦听器 VNN，需<strong>手工在 DNS 为侦听器名称注册 IP</strong>（即虚拟 IP）：</p>
+<pre><code class="language-bash"># 示例：在 DNS 中为 ag1-listener 注册 10.0.0.100
+# 客户端连接字符串使用 TCP，多子网场景建议加 MultiSubnetFailover=True
+</code></pre>
+<hr>
+<h2 id="六常见误区与注意事项">六、常见误区与注意事项</h2>
+<ol>
+<li><strong>版本边界</strong>：完整 AG 仅 Enterprise 支持；Standard 仅支持基本可用性组（2 副本、单库、辅助副本不可读/不可备份）。</li>
+<li><strong>认证方式</strong>：Linux 端点必须用证书认证，不支持 Windows 集成认证；证书需在各节点互相导入。</li>
+<li><strong>节点数</strong>：Linux 高可用要求 3 节点（2 同步 + 1 配置仅副本或 3 完整副本）；两节点无法满足自动故障转移的仲裁要求。</li>
+<li><strong>集群类型不可改</strong>：<code>CLUSTER_TYPE</code> 创建后不能 ALTER 修改；<code>CLUSTER_TYPE = NONE</code> 的 AG 不需要也不能由 Pacemaker 管理。</li>
+<li><strong>发行版一致</strong>：Pacemaker 集群所有节点必须同一发行版，禁止混用 RHEL/SLES。</li>
+<li><strong>RHEL 9 + SELinux</strong>：SQL Server 2022 CU16 及更早以 SELinux confined 运行时可能导致 Pacemaker 集群异常，需以 unconfined 安装或升级到 CU17。</li>
+<li><strong>辅助副本路径</strong>：主副本新增数据文件时，若辅助副本对应目录不存在，辅助库会进入 <code>NOT SYNCHRONIZING</code>；多副本应统一目录结构。</li>
+<li><strong>自动种子压缩</strong>：可启用跟踪标志 9567 在自动种子设定过程中压缩数据流。</li>
+<li><strong>SLES 支持</strong>：SQL Server 2025 起不再支持 SUSE Linux Enterprise Server。</li>
+</ol>
+<hr>
+<h2 id="七快速命令速查">七、快速命令速查</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: left">目的</th>
+<th style="text-align: left">命令</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left">启用 AG</td>
+<td style="text-align: left"><code>sudo /opt/mssql/bin/mssql-conf set hadr.hadrenabled 1 &amp;&amp; sudo systemctl restart mssql-server</code></td>
+</tr>
+<tr>
+<td style="text-align: left">认证集群节点</td>
+<td style="text-align: left"><code>sudo pcs cluster auth node1 node2 node3 -u hacluster -p ***</code></td>
+</tr>
+<tr>
+<td style="text-align: left">创建集群</td>
+<td style="text-align: left"><code>sudo pcs cluster setup --name agcluster node1 node2 node3 --force</code></td>
+</tr>
+<tr>
+<td style="text-align: left">启动集群</td>
+<td style="text-align: left"><code>sudo pcs cluster start --all</code></td>
+</tr>
+<tr>
+<td style="text-align: left">创建 AG 资源</td>
+<td style="text-align: left"><code>sudo pcs resource create ag_cluster ocf:mssql:ag ag_name=ag1 meta failure-timeout=60s promotable notify=true</code></td>
+</tr>
+<tr>
+<td style="text-align: left">创建 VIP</td>
+<td style="text-align: left"><code>sudo pcs resource create virtualip ocf:heartbeat:IPaddr2 ip=10.0.0.100</code></td>
+</tr>
+<tr>
+<td style="text-align: left">查看状态</td>
+<td style="text-align: left"><code>sudo pcs status</code></td>
+</tr>
+<tr>
+<td style="text-align: left">手工迁移</td>
+<td style="text-align: left"><code>sudo pcs resource move ag_cluster-clone node2</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+
+
+</div>
+<div class="clear"></div>
+
+		<p class="postfoot">
+			posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-09 09:44">2026-11-09 09:43</span>&nbsp;
+<a href="https://www.cnblogs.com/liuziyi1">刘子毅</a>&nbsp;
+阅读(<span id="post_view_count">85</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23598491);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fliuziyi1%2Fp%2F23598491&amp;targetId=23598491&amp;targetType=0" target="_blank">举报</a>
+
+		</p>
+	

@@ -1,0 +1,460 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/uniqueDong/p/23604187" title="发布于 2026-11-09 16:40">
+    
+
+    <span role="heading" aria-level="2">Redis 分布式锁的 7 个坑：从 setnx 到 Redlock</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="image" loading="lazy" data-src="https://img2024.cnblogs.com/blog/735767/202611/735767-20261109164007608-2095948926.png" class="lazyload"></p>
+<p>2026 年的今天，我在 GitHub 上搜「Redis 分布式锁 setnx」，还能翻出一堆代码片段，其中九成跑在生产环境里依然是错的：要么忘了设过期时间，要么不带 UUID，要么把 Redlock 部署在同一台 Redis 上假装高可用。</p>
+<p>今天把 8 年做电商与支付后台踩过的、读论文补过的、在团队 code review 里抓过的 7 个坑一次说清楚——同时引用了 Martin Kleppmann 亲手画的两张原理图(原文以 CC BY 3.0 发布)，它们恰好画的就是本文最容易被讲糊的两个场景。</p>
+<p>Redis 锁很简单：一行 <code>SET</code> 命令就能拿，但生产里它非常复杂。Martin Kleppmann 在 2016 年的《How to do distributed locking》里把这件事拆成了「效率」和「正确性」两类目标——前者防重复，后者防出错。大部分工程师把两者混在一起谈，所以越聊越乱。要避坑，先搞清楚你要锁住的到底是哪一种。</p>
+<p><img alt="fig01 - Redis 分布式锁完整生命周期：同一把锁在 5 个阶段上的 7 种失效姿势" loading="lazy" data-src="https://magebyte.oss-cn-shenzhen.aliyuncs.com/myself/093-redis-distributed-lock-7-pitfalls-fig01.png" class="lazyload"></p>
+<h2 id="7-个坑之前的共识你要锁的是什么">7 个坑之前的共识：你要锁的是什么？</h2>
+<p>Redis 锁能解决两类问题，优先级完全不同：</p>
+<ul>
+<li><strong>效率类(efficiency)</strong>：避免重复做同一件事。比如每天 8 点给所有会员发「昨日账单」邮件，如果因为分布式部署多跑了一遍，后果只是用户收到两封一样的邮件，业务损失可以忽略。这种场景，<strong>单节点 Redis 锁就够了</strong>，Redisson 默认实现已经非常成熟。</li>
+<li><strong>正确性类(correctness)</strong>：锁住共享资源，要求任何时刻只有一个写入者。比如库存扣减、银行账户扣款，如果锁失效一次，数据直接损坏。这种场景，<strong>Redis 锁只能做辅助</strong>，真正能兜底的是资源端的乐观锁(<code>UPDATE ... WHERE version = $old</code>)。</li>
+</ul>
+<p>下面的 7 个坑，1–4 偏向效率场景(影响可用性)，5–7 偏向正确性场景(影响数据一致性)。</p>
+<blockquote>
+<p>一句话：你拿 Redis 锁「防重」，可以；你拿 Redis 锁「严格互斥」，需要谨慎，且必须配合资源端的版本控制。</p>
+</blockquote>
+<h2 id="坑-1setnx--expire-是两步中间崩溃--死锁">坑 1：<code>SETNX</code> + <code>EXPIRE</code> 是两步，中间崩溃 = 死锁</h2>
+<p>很多人第一次写分布式锁的代码长这样：</p>
+<pre><code class="language-java">// 这段代码是错的,生产不能用
+jedis.setnx("lock:order:42", "1");
+jedis.expire("lock:order:42", 30);
+</code></pre>
+<p>两行命令，中间夹着网络传输。如果 <code>setnx</code> 成功后，客户端进程崩溃、网络断开、JVM Full GC 卡住几十秒，<code>expire</code> 没机会执行，这个 key 就会<strong>永久留在 Redis 里</strong>，直到你手动 <code>DEL</code>。后续所有请求 <code>setnx</code> 都返回 0，业务直接卡死。</p>
+<p>Redis 官方早在 2013 年发布的 2.6.12 版本里就加了原子版的 <code>SET</code> 命令，一条命令搞定两件事：</p>
+<pre><code class="language-bash">SET lock:order:42 &lt;uuid&gt; NX PX 30000
+</code></pre>
+<ul>
+<li><code>NX</code>：只有 key 不存在时才设值，实现互斥</li>
+<li><code>PX 30000</code>：同时设置 30000 毫秒后过期，实现死锁防护</li>
+<li><code>&lt;uuid&gt;</code>：每个客户端唯一标识，详见坑 2</li>
+</ul>
+<p>这是单 Redis 节点锁的最小可行实现。把它包成 Lua 让 Redisson 用也行，自己写也行。<strong>任何还在用 <code>SETNX</code>/<code>SETNX + EXPIRE</code> 的项目，都应该立刻迁移到 <code>SET NX PX</code></strong>。</p>
+<p>顺带说一个最容易被忽略的细节：<code>&lt;uuid&gt;</code> 这个值不是随手填的。Redis 官方文档写得很明确——<strong>20 字节的 <code>/dev/urandom</code> 随机串</strong>。为什么强调长度？因为这个 value 是「所有权凭证」，太短、可预测，就可能被另一个客户端猜中并冒充持锁者去删锁。工程上 UUID v4(122 bit 随机)或者 <code>clientId + threadId</code> 已经够用，但<strong>绝对不要</strong>用 <code>"1"</code>、本机 IP、秒级时间戳这类可枚举的值。</p>
+<blockquote>
+<p>看到 <code>setnx</code> 这个命令当作 deprecated 处理：它的全部价值已被 <code>SET ... NX ... PX</code> 取代。</p>
+</blockquote>
+<h2 id="坑-2不带-uuid-的-del误删别人的锁">坑 2：不带 UUID 的 <code>DEL</code>，误删别人的锁</h2>
+<p>上一段代码里 <code>SET</code> 命令的值是 <code>&lt;uuid&gt;</code>，意思是每次加锁写一个唯一标识——比如 UUID v4 或者 <code>clientId + threadId</code> 拼出来的字符串。释放的时候，必须先校验，再删除：</p>
+<pre><code class="language-lua">-- 经典释放脚本,Redis 官方 distributed-locks 文档原版
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+</code></pre>
+<blockquote>
+<p><strong>2026 年更新</strong>：上面这段 Lua 是「经典解法」。Redis 8.4 已经把这个动作变成一条原生命令——<code>DELEX key IFEQ my_random_value</code>，原子比较并删除，语义与脚本完全等价，却省掉了 <code>EVAL</code> 的开销，也省掉了「脚本要自己维护、自己测」的负担。官方 distributed-locks 文档如今主推的就是它，Lua 退居「旧版本兼容」。</p>
+<p>但有个现实约束：Redis Software 与 Redis Cloud 的标准版目前<strong>尚未支持</strong> <code>DELEX</code>(Active-Active 同样不支持)。也就是说你手上托管的 Redis 大概率还停在 6.x / 7.x，Lua 版本仍然是必须掌握的。两个都记住，按实例版本二选一。</p>
+</blockquote>
+<p><strong>为什么不能先 <code>GET</code> 再 <code>DEL</code>？因为它俩不是原子的。</strong> 时间线是这样的：</p>
+<table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>客户端 A</th>
+<th>客户端 B</th>
+<th>Redis 中的 lock</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T1</td>
+<td><code>SET lock uuid-A NX PX 30000</code> 成功</td>
+<td>—</td>
+<td><code>uuid-A</code>，剩余 30s</td>
+</tr>
+<tr>
+<td>T2</td>
+<td>业务卡住</td>
+<td>—</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>T3</td>
+<td>—</td>
+<td><code>SET lock uuid-B NX PX 30000</code> 失败，因 key 存在</td>
+<td><code>uuid-A</code>，剩余 25s</td>
+</tr>
+<tr>
+<td>T4</td>
+<td>锁过期</td>
+<td>—</td>
+<td>已无</td>
+</tr>
+<tr>
+<td>T5</td>
+<td>—</td>
+<td><code>SET lock uuid-B NX PX 30000</code> 成功</td>
+<td><code>uuid-B</code></td>
+</tr>
+<tr>
+<td>T6</td>
+<td>A 业务恢复，执行 <code>DEL lock</code></td>
+<td>—</td>
+<td><code>uuid-B</code> 被 A 误删！</td>
+</tr>
+<tr>
+<td>T7</td>
+<td>—</td>
+<td>业务执行中，以为持锁</td>
+<td>实际上锁已被 A 删，B 在「裸奔」</td>
+</tr>
+</tbody>
+</table>
+<p>你看到 T6 这一刀了：A 的 <code>DEL</code> 是无差别的删，没问它是不是自己的锁。如果 A 的业务恰好在 T6 这一秒踩到 B 已经拿到锁的资源，直接数据损坏。</p>
+<p>解决办法就是上面那段 Lua：<code>GET</code> 一下确认是自己的(<code>uuid-A</code>)，才 <code>DEL</code>。否则什么都不做，让 B 自己处理过期和续期。</p>
+<blockquote>
+<p>Redisson 把这段 Lua、UUID 的生成、Hash 结构(可重入用)、看门狗定时器封装成了 <code>RLock</code> 接口，默认 <code>lock.lock()</code> 就已经是「UUID + Lua + 看门狗」三件套。不要自己造轮子，直接用 <code>RLock</code>。</p>
+</blockquote>
+<h2 id="坑-3锁过期但业务没跑完--gc-暂停--网络抽风">坑 3：锁过期但业务没跑完 — GC 暂停 / 网络抽风</h2>
+<p>假设你「细心」按坑 1+2 写了 <code>SET NX PX 30000</code>，每把锁 30 秒。然后你的业务代码是这样：</p>
+<pre><code class="language-java">RLock lock = redisson.getLock("order:42");
+lock.lock();  // 默认 30s 看门狗锁
+try {
+    orderService.deductStock(orderId);  // 业务跑 35s
+} finally {
+    lock.unlock();
+}
+</code></pre>
+<p>看起来没问题。但有一天，这个 35 秒的 deductStock 突然跑到了 <strong>35 秒外</strong>——因为里面有一个远程 RPC 慢了 8 秒，中间又有一次 4 秒的 Full GC。整体 42 秒才返回。这时候 Redis 上的锁已经 30 秒过期，被另一个实例的客户端拿走了。原始客户端恢复后，以为锁还在，继续 <code>deductStock</code>，但同一时刻另一个客户端也在做同一件事。</p>
+<p><strong>这是 Martin Kleppmann 在 2016 年那篇《How to do distributed locking》里反复强调的核心问题</strong>。他不点名地指出，这类问题在任何<strong>带过期时间的分布式锁</strong>里都存在——不管你用 Redis、ZooKeeper、etcd 还是 Consul。Antirez(Redis 作者)当年写了《Is Redlock safe?》回应，也承认这一点，只是强调「工程上能管得过来」。</p>
+<p>Martin 原文里还给了个更狠的版本：</p>
+<blockquote>
+<p>客户端 1 向 5 个 Redis 节点请求锁。就在 Redis 的响应<strong>飞回客户端 1 的路上</strong>，客户端 1 进入了 stop-the-world GC。等 GC 结束、客户端 1 恢复，它会从内核的网络缓冲区里读到那几个「加锁成功」的响应——<strong>它完全不知道，在自己暂停的这段时间里，所有节点上的锁都已经过期，并被客户端 2 重新拿走了</strong>。</p>
+</blockquote>
+<p>这个场景用图看最清楚：</p>
+<p><img alt="Martin Kleppmann 原始原理图：客户端 1 因 GC 暂停导致租约过期，客户端 2 接管锁并写入，客户端 1 恢复后同时写入，数据损坏" loading="lazy" data-src="https://magebyte.oss-cn-shenzhen.aliyuncs.com/myself/093-redis-distributed-lock-7-pitfalls-ref01-gc-pause.png" class="lazyload"></p>
+<p>从上往下读：Client 1 拿到租约(<code>ok</code>)，随即进入 stop-the-world GC 暂停(灰色条)；暂停期间租约过期，Client 2 拿到租约并写入 Storage；Client 1 从 GC 里醒来，<strong>以为自己还持锁</strong>，也去写同一份数据——右下角那个爆炸符号，就是数据损坏。图源：Martin Kleppmann《How to do distributed locking》(martin.kleppmann.com，以 CC BY 3.0 发布)。</p>
+<p>注意最后一步的细节：Client 1 不是「忘了检查锁」，而是<strong>它拿到的所有本地证据都显示锁还在</strong>——只是这些证据在它暂停的那一刻就已经过期了。所以「写入之前再查一次锁」根本补不上这个洞，因为检查动作本身也可能被下一次 GC 打断。</p>
+<p>对纯效率类场景，锁过期引发的最坏后果是「多做了一次重复工作」(配合业务幂等就没事)。对正确性场景，这就是数据损坏的源头，处理方式见坑 7。</p>
+<blockquote>
+<p>锁的 TTL 是「业务最坏耗时 × 1.5–2 倍」，但这只是让坑 3 概率变低，不能消除。</p>
+</blockquote>
+<h2 id="坑-4看门狗续期不是神药--主线程卡续期也卡">坑 4：看门狗续期不是神药 — 主线程卡，续期也卡</h2>
+<p>Redisson 的看门狗(WatchDog)是这个问题最常用的补丁。但大多数人只记得「默认 30 秒、每 10 秒续一次」，不清楚它到底怎么跑、什么时候不跑。把调用链拆成四步看，边界就清楚了。</p>
+<p><strong>第一步：先决定要不要启动看门狗。</strong> 只有「你没告诉 Redisson 这把锁要持有多久」时它才启动：</p>
+<pre><code class="language-java">protected Long tryAcquire(long leaseTime, TimeUnit unit, long threadId) {
+    Long ttl = null;
+    if (leaseTime != -1) {
+        // 你显式传了 leaseTime —— 看门狗不介入，到期就释放
+        ttl = tryLockInnerAsync(leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
+    } else {
+        // 没传 —— 拿 lockWatchdogTimeout 当初始 TTL，并注册续期任务
+        ttl = tryLockInnerAsync(commandExecutor.getConnectionManager().getCfg()
+                .getLockWatchdogTimeout(), TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
+        scheduleExpirationRenewal(threadId);
+    }
+    return ttl;
+}
+</code></pre>
+<p><strong>第二步：把「这把锁需要续期」登记进全局表。</strong> 注意它是按「锁名」注册的，用 <code>putIfAbsent</code> 保证同一把锁只挂一个续期任务：</p>
+<pre><code class="language-java">private void scheduleExpirationRenewal(long threadId) {
+    ExpirationEntry entry = new ExpirationEntry();
+    ExpirationEntry oldEntry = EXPIRATION_RENEWAL_MAP.putIfAbsent(getEntryName(), entry);
+    if (oldEntry != null) {
+        oldEntry.addThreadId(threadId);   // 可重入：同名锁复用同一个续期条目
+    } else {
+        entry.addThreadId(threadId);
+        renewExpiration();                // 首次注册，开始排程
+    }
+}
+</code></pre>
+<p><strong>第三步：排一个「每隔 1/3 TTL 执行一次」的定时任务。</strong> 定时器用的是 Netty 的 <code>HashedWheelTimer</code>(时间轮)：</p>
+<pre><code class="language-java">private void renewExpiration() {
+    ExpirationEntry ee = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+    if (ee == null) { return; }
+    Timeout task = getServiceManager().newTimeout(new TimerTask() {
+        @Override
+        public void run(Timeout timeout) {
+            ExpirationEntry ent = EXPIRATION_RENEWAL_MAP.get(getEntryName());
+            if (ent == null) { return; }
+            Long threadId = ent.getFirstThreadId();
+            if (threadId == null) { return; }
+            CompletionStage&lt;Boolean&gt; future = renewExpirationAsync(threadId);
+            future.whenComplete((res, e) -&gt; {
+                if (res) {
+                    renewExpiration();                  // 续期成功，递归排下一次
+                } else {
+                    cancelExpirationRenewal(null);      // 锁已不在，停止续期
+                }
+            });
+        }
+    }, internalLockLeaseTime / 3, TimeUnit.MILLISECONDS);   // 默认 30/3 = 10 秒
+    ee.setTimeout(task);
+}
+</code></pre>
+<p><strong>第四步：真正续期的那段 Lua。</strong> 这段脚本解释了为什么 Redisson 的锁值不是一个字符串，而是一个 Hash：</p>
+<pre><code class="language-java">protected RFuture&lt;Boolean&gt; renewExpirationAsync(long threadId) {
+    return commandExecutor.evalWriteAsync(getName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+        "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +   // 这把锁还是我的吗？
+        "    redis.call('pexpire', KEYS[1], ARGV[1]); " +              // 是的话，重置为 30 秒
+        "    return 1; " +
+        "end; " +
+        "return 0;",
+        Collections.singletonList(getName()), internalLockLeaseTime, getLockName(threadId));
+}
+</code></pre>
+<p><code>hexists</code> 查的是 <code>{uuid:threadId:count}</code> 这个 Hash 结构里的字段——<strong>续期之前先验证「这把锁是不是当前线程的」</strong>，别人的锁不会被误续；而 <code>count</code> 这个字段顺带把可重入也实现了。</p>
+<p>关键参数(<code>Config.java</code> 源码注释原话)：</p>
+<blockquote>
+<p><code>Default is 30000 milliseconds</code></p>
+</blockquote>
+<p>也就是 <code>lockWatchdogTimeout = 30 * 1000</code>：<strong>每 10 秒把 key 的 <code>PEXPIRE</code> 重置回 30 秒</strong>。只要 JVM 没死、续期任务能被时间轮轮到，锁就一直续下去。</p>
+<p>现在看真正的问题。这个定时器跑在 Netty 的 <code>HashedWheelTimer</code>(时间轮)上，而时间轮<strong>默认与业务共享同一个 EventLoop 线程</strong>。如果你 <code>lock.lock()</code> 之后调用了一个阻塞 25 秒的同步 RPC(老的 <code>HttpClient</code>、老的 <code>JDBC</code>、老的 <code>SOAP</code>，随便哪个)，EventLoop 就被占住了，看门狗的 TimerTask 排在那儿也执行不了。10 秒的续期点错过，30 秒后锁过期，别人拿走——坑 3 的剧本原样再演一遍。</p>
+<p>更隐蔽的变种是<strong>主线程 GC 暂停</strong>(G1/CMS/ZGC 都有 STW 阶段)，暂停超过 10 秒，后果完全相同。看门狗救不了业务线程，它只能证明「这个 JVM 还活着」——这两件事差得很远。</p>
+<p>还有一个容易被搞反的参数：<code>lockWatchdogTimeout</code>。它既是锁的初始 TTL，也是每次续期重置的目标值，同时决定了续期频率(它的 1/3)。把它调大有得有失——好处是续期偶尔晚一拍不容易致命，坏处是<strong>客户端真的崩溃之后，锁要等更久才会被别人拿到</strong>。默认 30 秒是这两者之间的折中，除非有明确的理由，别动它。</p>
+<p>正确做法：</p>
+<ol>
+<li><strong>业务里禁止阻塞调用</strong>——所有远程调用必须异步(<code>CompletableFuture</code> / <code>Reactor</code> / <code>Coroutine</code>)。</li>
+<li><strong>锁的 TTL 留够安全余量</strong>——业务 P99 耗时 × 2，这是硬指标。</li>
+<li><strong>核心业务加幂等</strong>——锁失效时的第二道防线是「资源端发现 version 冲突就拒绝」，不是「锁服务再撑一次」。</li>
+</ol>
+<blockquote>
+<p>看门狗是「客户端还没挂」的证明，不是「业务还在正常跑」的证明。这两个是完全不同的判断。</p>
+</blockquote>
+<h2 id="坑-5主从切换丢锁--异步复制的天然缺陷">坑 5：主从切换丢锁 — 异步复制的天然缺陷</h2>
+<p>坑 1–4 都在单 Redis 实例上讨论。但如果你的部署不是单实例，而是主从(Replication)、Sentinel 或 Cluster，异步复制会引入一个新问题：</p>
+<table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>事件</th>
+<th>master 上的 lock</th>
+<th>slave 上的 lock</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T1</td>
+<td>客户端 A 在 master <code>SET lock uuid-A NX PX</code> 成功</td>
+<td><code>uuid-A</code></td>
+<td>尚未同步</td>
+</tr>
+<tr>
+<td>T2</td>
+<td>master 宕机，slave 升级为新 master</td>
+<td>—</td>
+<td>无</td>
+</tr>
+<tr>
+<td>T3</td>
+<td>客户端 B 在新 master <code>SET lock uuid-B NX PX</code> 成功</td>
+<td>—</td>
+<td><code>uuid-B</code></td>
+</tr>
+<tr>
+<td>T4</td>
+<td>客户端 A 醒来，以为锁还在(它只跟 master 握手过)</td>
+<td>—</td>
+<td><code>uuid-B</code>，互斥已破坏</td>
+</tr>
+</tbody>
+</table>
+<p>这是 Redis 主从架构的固有缺陷——master 写成功了，slave 还没收到，master 挂了就丢了。Antirez 推出 Redlock 的根本动机就是解决它：<strong>用 5 个完全独立的 Redis 实例，过半写入成功才算拿到锁</strong>，这样丢一个 master、两个 master 都行，只要还有 ≥3 个节点承认就行。</p>
+<p>听起来很美好，问题是：绝大多数团队的「Redis 主从」部署都在<strong>同一个机房、同一个机架、同一个 ToR 交换机、同一个供电回路</strong>，TrueTime 不存在，NTP 同源……也就是说，这 5 个节点在事故域上并不独立。它们同时故障、同时不可用的概率远高于 Redlock 论文里假设的「独立节点」。</p>
+<blockquote>
+<p>「线上 Redis 是 Cluster 模式，Master × 3」 ≠ 「Redlock 的 5 独立节点」。前者是一份数据按 slot 切片的多主，后者是同一份 key 多副本的多写。这是两个完全不同的设计目标。</p>
+</blockquote>
+<p>既然丢锁的根因是「异步复制 + 写入成功不等待副本」，那能不能让 master 必须等到副本确认才算写成功？可以——用 <code>min-replicas-to-write</code>：</p>
+<pre><code class="language-conf"># 至少 1 个副本确认，且副本延迟不超过 10 秒，master 才接受写
+min-replicas-to-write 1
+min-replicas-max-lag 10
+</code></pre>
+<p>打开之后，master 在「没有健康副本」时会直接拒绝写入——锁根本加不上，而不是「加上了但可能丢」。代价是可用性：副本全挂(或全部延迟超阈值)时，这个实例会退化成拒绝写。<strong>这就是典型的 CAP 取舍，你要 C 就得让出 A</strong>。实践建议：对「跑分布式锁的那个实例」开这两个参数，对纯缓存实例保持关闭。</p>
+<h2 id="坑-6redlock-的-5-独立节点假设几乎没人真正满足">坑 6：Redlock 的 5 独立节点假设，几乎没人真正满足</h2>
+<p>退一步，假设你真的部署了 5 个机房、5 个独立 NTP 时钟、5 个独立电源的 Redis 实例，都同步写入同一把锁的 key。Redlock 算法跑起来是这样：</p>
+<pre><code>T1 = now()
+for node in [R1, R2, R3, R4, R5]:
+    if node.SET(lock, uuid, NX, PX, timeout=50ms):
+        success += 1
+T2 = now()
+if success &gt;= 3 and (T2 - T1) &lt; lock_ttl:
+    # 拿到锁
+else:
+    # 在所有节点上释放可能的部分锁
+</code></pre>
+<p>过半数节点 + 总耗时小于 TTL 才行。<strong>5 节点、50ms 超时、TTL=30s，</strong> 看起来很严格的判断条件。</p>
+<p>但是有两个隐藏假设，Martin 已经挑明过(同 F3)：</p>
+<ol>
+<li><strong>「N 个 Redis 节点本地时钟同步到毫秒级」</strong>——任何节点时钟向前跳变(管理员手调、NTP 校正)，导致那个节点认为锁已经过期，但其他节点还不知道，过半门槛被突破。</li>
+<li><strong>「客户端没有超过 TTL 的停顿」</strong>——Full GC、SIGSTOP、慢 IO、调度抢占，任一发生，客户端在恢复前还以为自己持锁，但服务端早已把锁给了别人。</li>
+</ol>
+<p>这是 Redlock 安全性的两个致命点。前者属于运维，后者属于物理——Martin 的原文大意是：除非你能给进程暂停一个严格上界，否则这个洞没法从算法层面消除。</p>
+<p>Antirez 在回应文章《Is Redlock safe?》里的辩护，比大多数人转述的要认真得多。他不是撂一句「工程上能管」就完事，而是逐条回应：</p>
+<ul>
+<li><strong>网络延迟</strong>：他认为 Redlock 的算法步骤本身就绕开了无界延迟——「取时间 T1 → 依次加锁 → <strong>再取一次时间 T2</strong> → 检查是否超时」，所以「不管中间加多少网络延迟，只要总耗时超过 TTL，锁就会被判定为无效」。延迟只可能发生在 T2 之后，那就退回到「客户端暂停」这个共同问题了。</li>
+<li><strong>时钟</strong>：他明确承认 Redis 应该改用单调时钟 API，并当场承诺「I'll implement this in the next weeks」(写于 2016 年 7 月)。同时他强调 Redlock 需要的只是<strong>半同步模型</strong>——各节点「以大致相同的速度计时」就够，比如「计时 5 秒，误差不超过 10%」，并不需要绝对时钟的误差上界。</li>
+<li><strong>进程暂停</strong>：他指出「获取锁过程中的暂停不影响算法正确性」，真正致命的是「拿到锁之后的暂停」——而这一点 ZooKeeper、etcd 的锁同样躲不掉。</li>
+</ul>
+<p>这三条在技术上站得住。但把时间拉到今天，有两件事必须单独拎出来说。</p>
+<p><strong>第一，那个「几周内实现」的单调时钟，十年过去了一直没兑现。</strong> 直到 2026 年的官方 distributed-locks 文档，末尾仍然挂着这句免责声明：<strong>「Redis 不使用单调时钟来做 TTL 过期判定」</strong>，紧接着承认「墙上时钟的跳变，可能导致同一把锁被多个进程同时持有」。也就是说，Antirez 当年自己也认同、并亲口承诺修掉的问题，至今仍是官方文档里白纸黑字的已知风险。</p>
+<p><strong>第二，Redlock 真正依赖的不是「时钟准不准」，而是「进程不会长时间停顿 + 节点时钟不会跳变」。</strong> 这两条在任何带 GC 的语言、虚拟机或容器环境里，都只是「大概率成立」，没有任何硬保证。</p>
+<p>所以工程上的结论不是「Antirez 错了」，而是：<strong>Antirez 的辩护在实践中成立的前提是「效率类锁」，Martin 的批评成立的前提是「正确性类锁」</strong>——两人各说各的场景，谁也没驳倒谁；但你的场景属于哪一个，得自己先想清楚。</p>
+<blockquote>
+<p>90% 团队把 Redlock 装在「5 个 Redis 实例」上，但只部署了「1 个机房 + 1 个 NTP 源 + 1 个机柜」。Redlock 的算法假设与部署现实之间的鸿沟，是它最大的坑。</p>
+</blockquote>
+<h2 id="坑-7时钟--gc-同时发生时redlock-也会丢--fencing-token-才是终极防线">坑 7：时钟 + GC 同时发生时，Redlock 也会丢 — fencing token 才是终极防线</h2>
+<p>把坑 5(主从)+ 坑 6(时钟)+ 坑 3(GC)叠在一起，就是 Martin Kleppmann 的核心场景：</p>
+<pre><code>T1: Client1 在 R1、R2、R3 写入锁成功(T1 时刻)
+T2: Client1 的工作线程 GC 暂停 6 秒
+T3: R2 上的时钟被 NTP 向前跳了 2 秒
+T4: 此时刻(T1+6)Client1 自己看起来锁还有 24 秒,但 R2 上的视角是 TTL 还剩 22 秒 → 也已过期
+T5: Client2 在 R3、R4、R5 上成功写入锁(success=3,过半)
+T6: Client1 GC 恢复,以为自己持锁
+T7: Client1 和 Client2 都在写同一个共享资源 → 数据损坏
+</code></pre>
+<p>这是 Martin 自己的「冠军场景」，他提出的解药叫 <strong>fencing token</strong>(单调递增的令牌)：</p>
+<pre><code>Client1: 成功 → 返回 token = 33
+  → GC 暂停 6 秒
+  → 醒来继续业务,带着 token=33 去写 DB
+Client2: 成功 → 返回 token = 34
+  → 顺利写 DB
+DB 端校验:UPDATE table SET val = ? WHERE id = ? AND lock_token &lt; 36
+  → Client1 的 token=33 &lt; 36,被拒
+  → Client2 的 token=34 &lt; 36,通过
+</code></pre>
+<p>这个机制用图看最直观——注意它和坑 3 那张图唯一的区别，就在 Storage 那一行：</p>
+<p><img alt="Martin Kleppmann 原始原理图：fencing token 生效，Storage 拒绝了 Client 1 迟到的旧 token 33" loading="lazy" data-src="https://magebyte.oss-cn-shenzhen.aliyuncs.com/myself/093-redis-distributed-lock-7-pitfalls-ref02-fencing-token.png" class="lazyload"></p>
+<p>两张图对照着看：Client 1 的停顿、锁的过期、Client 2 的接管，全都一模一样。唯一的差别是<strong>写入时带上了 token，而 Storage 记住了自己见过的最大 token</strong>——Client 2 写入的 token 34 被接受，Client 1 迟到写入的 token 33 被直接拒绝，右上角那个爆炸符号没有出现。图源：Martin Kleppmann《How to do distributed locking》(martin.kleppmann.com，CC BY 3.0)。</p>
+<p>这里有个关键认识：<strong>真正兜住底的不是锁，而是资源端那句「只接受更大的 token」</strong>。锁只负责决定谁先来，能不能最终落地，由资源端说了算。</p>
+<p>token 必须<strong>单调递增</strong>，由能保证不丢顺序的对象产生——典型选择是 etcd 的 <strong>Revision</strong>(每次写操作 +1，全集群唯一)、ZooKeeper 的 <strong>zxid</strong>，或者数据库本身的乐观锁列(<code>version int</code>)。</p>
+<p><strong>Redis 不天然支持 fencing token</strong>，因为它的 key 是单点(<code>SET uuid NX PX</code>)，没有连续递增的全局序号。如果你想在 Redis 上模拟 fencing token，要么自建一个 <code>INCR fencing_counter</code> 的 key(Redis 是单线程命令，<code>INCR</code> 天然原子递增)，但多个 Redis 实例之间这个 counter 不能保证严格递增。所以 Martin 的结论是：<strong>Redis 锁天生不适合严格互斥场景</strong>。</p>
+<blockquote>
+<p>真正做到「严格互斥」，锁服务和资源服务必须共享一个递增序列。这个递增序列 Redis 给不了，etcd 的 Revision、ZooKeeper 的 zxid、MySQL 的 version 列都可以，选你能用的那个。</p>
+</blockquote>
+<p>不过讲到这里，还得把 Antirez 当年对 fencing token 的反驳补上——这部分在很多转述里都被省掉了，但它恰恰决定了「这场争论到底谁对」：</p>
+<ul>
+<li><strong>「如果你的存储能按 token 大小决定接不接受写入，它本身就是一个线性化存储。」</strong> 推论是：既然存储已经能提供这种保证，它自己就能发递增 ID，你直接用它的自增序列就完了，Redlock 的意义被大幅稀释——「这等价于用数据库实现分布式锁」。</li>
+<li><strong>「多数情况下，互斥一旦被破坏，你就已经输了。」</strong> 他认为 Martin 的论证隐含一个前提：资源端还有别的手段兜住竞态。可现实里用分布式锁，恰恰是因为资源端<strong>没有</strong>别的控制手段。「假设你总能在资源端解掉竞态，这是一种很奇怪的推理方式。」</li>
+<li><strong>「Redlock 本身已经返回了一个 20 字节的随机 token。」</strong> 官方规范写明这个值取自 <code>/dev/urandom</code>。你完全可以拿它做 Check-And-Set：把资源状态置成这个 token，写回时校验 token 是否还一致。</li>
+<li><strong>「很多锁根本不在事务性资源上。」</strong> 比如用锁去操作一台物理设备、去调一个外部 API——这些动作没有 <code>version</code> 列让你回滚，fencing token 那套假设直接不成立。</li>
+</ul>
+<p>平心而论，这几条反驳都站得住，尤其第一条，它戳中了一个真实的尴尬：<strong>如果一个存储已经有能力按单调序号拒绝写入，那它本身就是个共识系统，你何必再在外面叠一层 Redlock</strong>。</p>
+<p>但换个角度看，Martin 的诉求其实更朴素：<strong>在你必须保证「任何时刻只有一个写入者」的场景里，锁的可靠性不该是唯一的防线</strong>。Antirez 说「资源端有自增 ID 就不需要 Redlock」——这句话恰恰印证了同一个结论：防线应该在资源端，而不是把宝全押在锁上。</p>
+<h2 id="三方案决策表redis-vs-zookeeper-vs-etcd">三方案决策表：Redis vs ZooKeeper vs etcd</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Redis(Redisson + 单节点)</th>
+<th>ZooKeeper / Curator</th>
+<th>etcd / <code>concurrency</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一致性模型</td>
+<td>AP(可用 + 分区容错)</td>
+<td>CP(强一致)</td>
+<td>CP(强一致 + Raft)</td>
+</tr>
+<tr>
+<td>互斥原语</td>
+<td><code>SET key uuid NX PX</code> + Lua</td>
+<td>临时顺序节点</td>
+<td>Lease + <code>PUT if Not Exists</code></td>
+</tr>
+<tr>
+<td>Fencing Token</td>
+<td>❌ 需自建 INCR，跨节点不安全</td>
+<td>✅ zxid 自带</td>
+<td>✅ Revision 自带</td>
+</tr>
+<tr>
+<td>主从切换丢锁</td>
+<td>⚠️ 有(异步复制)</td>
+<td>✅ 无(ZAB 同步)</td>
+<td>✅ 无(Raft)</td>
+</tr>
+<tr>
+<td>时钟依赖</td>
+<td>⚠️ TTL 强依赖本地时钟</td>
+<td>✅ 无</td>
+<td>✅ 无</td>
+</tr>
+<tr>
+<td>业务耗时超过 TTL</td>
+<td>看门狗(在主线程 → 失效)</td>
+<td>Session 心跳(独立线程 → 健壮)</td>
+<td>Lease KeepAlive(独立线程 → 健壮)</td>
+</tr>
+<tr>
+<td>QPS(典型)</td>
+<td>10 万+(单实例)</td>
+<td>万级</td>
+<td>万级</td>
+</tr>
+<tr>
+<td>部署门槛</td>
+<td>已有，几乎零成本</td>
+<td>需独立 ZK 集群</td>
+<td>已有或随 K8s</td>
+</tr>
+<tr>
+<td>何时用</td>
+<td>效率类、防重复、缓存防击穿</td>
+<td>强一致、跨数据中心、金融</td>
+<td>K8s / 云原生、跨数据中心</td>
+</tr>
+</tbody>
+</table>
+<p><strong>简化的版本</strong>：你要防重复 → Redis；你要跨数据中心选主 → etcd 或 ZK；你在金融严正确性场景 → 数据库乐观锁 + Redis 锁双层(锁是优化，真正互斥在 DB)。</p>
+<h2 id="我的判断什么时候用什么">我的判断：什么时候用什么</h2>
+<p>我写代码用了 8 年 Redis 锁，其中 4 年是「什么场景都用 Redisson 默认设置」。回头看我接手的实际业务，<strong>大约 80% 的 Redlock 部署应该退回到单节点 Redisson</strong>——不是怕它不安全，而是大多数场景根本不需要它。</p>
+<p>我目前的态度：</p>
+<ol>
+<li><strong>效率场景</strong>(<code>去重、定时任务、缓存防击穿、防短时重复请求</code>)：<strong>单 Redis 实例 + Redisson 默认 <code>RLock</code></strong>。TTL 设为业务 P99 耗时 × 2，看门狗自动续期。够用。</li>
+<li><strong>中等正确性场景</strong>(<code>分布式任务调度、资源竞争不严重、数据有重试兜底</code>)：<strong>Redisson MultiLock(主从多 Redis 抢同一把锁)</strong>，不是 Redlock。前者是「一个客户端给 3 个 Redis 写」，后者是「5 个独立节点过半」。两者在解决不同问题。</li>
+<li><strong>强正确性场景</strong>(<code>资金扣减、库存扣减、订单状态机</code>)：<strong><code>RLock</code> + 数据库 <code>version</code> 列乐观锁，双重兜底</strong>。锁是 50% 防重复，DB 是 100% 防错。锁失效不会脏数据。</li>
+<li><strong>跨数据中心 / 容器编排场景</strong>：<strong>etcd 的 <code>concurrency</code> 包</strong>。天然 Revision + Lease + Raft，不用自己造计数。</li>
+<li><strong>完全不要用</strong>：Redlock 的「5 独立节点」真的部署完成本高(5 个独立机柜 + 独立 NTP + 独立电源)，绝大多数团队的「5 个 Redis」不是这个意思，只是把现有的几个 Redis 拼一起。</li>
+</ol>
+<p>落到具体动作上，如果你手上正好有一批老代码要改，建议按这个顺序动：<strong>先把 <code>SETNX + EXPIRE</code> 全部换成 <code>SET key uuid NX PX</code>；再检查释放逻辑有没有校验 uuid(实例支持 <code>DELEX</code> 就用 <code>DELEX</code>，不支持就用 Lua)；最后才去评估「5 节点 Redlock 到底有没有必要」</strong>。前两步是纯收益，第三步十有八九的答案是「没必要」。</p>
+<p>「Redis 锁不安全」不只是一句口号，但同时「升级到 Redlock」也不是万能解。<strong>真正靠谱的分布式锁，从来都是「锁服务 + 资源端的版本控制」两层叠在一起</strong>——前者省成本，后者兜底数据。这事儿 2016 年 Martin 讲过，2026 年的今天，生产里大多数人还在重复同样的错。</p>
+<h2 id="常见问题">常见问题</h2>
+<p><strong>Q1：<code>SET NX PX</code> 和 <code>SETNX + EXPIRE</code> 真有差别吗？一条命令真的会崩溃在两命令之间？</strong></p>
+<p>会。Redis 单线程串行执行命令，但<strong>两命令之间隔着网络往返</strong>。如果第一条 <code>SETNX</code> 成功后，你的客户端进程被操作系统 OOM Killer 杀掉，或者 Java 进程被 <code>kill -9</code>，或网络断了 ~30 秒，<code>EXPIRE</code> 那行就<strong>永远不会到 Redis</strong>。Redis 上的 key 没有过期时间，会<strong>永远存在</strong>，除非你手动 <code>DEL</code>。<code>SET NX PX</code> 单命令，过期间隔跟写入同步生效，绕过这个脆弱的两步组合。这条没有例外。</p>
+<p><strong>Q2：业务真的有 35 秒，我应该把 TTL 调到 35 秒吗？</strong></p>
+<p>不要。35 秒是你<strong>某次最坏</strong>耗时，你要按 P99 × 1.5–2 倍设，避免单次偶然慢请求直接让锁消失。更稳的做法是把所有远程调用异步化，业务耗时压到毫秒级。</p>
+<p><strong>Q3：Redisson 看门狗到底什么时候不工作？</strong></p>
+<p>两个边界：<strong>显式传了 leaseTime</strong>(比如 <code>lock.lock(5, TimeUnit.SECONDS)</code>)——看门狗直接被关掉；<strong>业务主线程与 Netty 共享 EventLoop 时被同步 IO 阻塞</strong>时，续期任务压根不跑。这两条在官方文档的角落里有提，容易被忽略。</p>
+<p><strong>Q4：Redlock 我部署在「5 台 Redis」上，是不是就没坑 6 / 坑 7 了？</strong></p>
+<p>不是。坑 6 的本质是「<strong>5 个节点是否真的在事故域上独立</strong>」，同机房、同机柜、同供电、同 NTP 源，都不算独立。坑 7 的本质是「Redlock 算法本身依赖时钟同步，且假设客户端不会发生长时间 STW」，这两条工程上做不到 100% 保证。Martin 从 2016 年到今天从未收回这个判断，Redis 官方文档也至今保留着「不使用单调时钟」的免责声明——十年过去，两边的立场其实都没变。</p>
+<p><strong>Q5：etcd / ZK / Redis，生产怎么选？</strong></p>
+<p>如果你有 K8s，etcd 已经在，直接 <code>etcd clientv3 concurrency.NewMutex</code>，License 全免费；如果是传统金融/政企运维，ZK 更成熟；如果团队根本没有 ZK/etcd，<strong>别强上</strong>，就用 Redis 锁 + 数据库乐观锁，业务链路完全够。这不是降级，这是当前生产里 80% 工程师实际在用的方案，Martin 没反对这个。</p>
+<p><strong>更多 Java/Go 架构干货 + AI 提效实战，关注「码哥跳动」持续更新。</strong></p>
+<p>觉得有收获，转发给你的技术同事 —— 一篇好文章值得被更多人看到。<br>
+<img alt="beeaa00ee37c5db0e2fb2c5c5efe4f29" loading="lazy" data-src="https://img2024.cnblogs.com/blog/735767/202605/735767-20260526114014236-744639895.png" class="lazyload"></p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    加我微信进去专属技术群，欢迎读者提出意见，喜欢请关注博客和个人公众号：码哥字节
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-09 16:41">2026-11-09 16:40</span>&nbsp;
+<a href="https://www.cnblogs.com/uniqueDong">码哥字节</a>&nbsp;
+阅读(<span id="post_view_count">9</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23604187);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FuniqueDong%2Fp%2F23604187&amp;targetId=23604187&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
