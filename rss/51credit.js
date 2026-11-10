@@ -2,7 +2,6 @@
 //cron: 8/20 7-23 * * *
 //new Env('51信用卡优惠信息RSS');
 
-const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const fs = require('fs');
 const tools = require("./tools")
@@ -138,7 +137,7 @@ async function getPage(url) {
             fs.writeFileSync(COOKIE_FILE, ck);
             return getPage(url)
         } else {
-            const body = await r.buffer();
+            const body = Buffer.from(await r.arrayBuffer());
             return iconv.decode(body, 'gbk');
         }
     } catch (error) {

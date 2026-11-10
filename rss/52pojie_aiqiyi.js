@@ -2,7 +2,6 @@
 //new Env('52pojie吾爱破解-爱奇艺RSS');
 
 
-const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const fs = require('fs');
 const tools = require("./tools")
@@ -79,7 +78,7 @@ async function getPage(url) {
         "body": null,
         "method": "GET"
     });
-    let b = await r.buffer();
+    let b = Buffer.from(await r.arrayBuffer());
     let b1 = iconv.decode(b, 'gbk');
     //console.info(b1);
     console.info(b1.length);

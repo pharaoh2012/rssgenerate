@@ -2,7 +2,6 @@
 //cron: 11/20 7-23 * * *
 //new Env('0818团体RSS');
 
-const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const fs = require('fs');
 const tools = require("./tools")

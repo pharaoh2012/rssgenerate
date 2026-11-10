@@ -2,7 +2,6 @@
 //cron: 18/20 7-23 * * *
 //new Env('精华区 - 博客园RSS');
 
-const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const fs = require('fs');
 const tools = require("./tools")

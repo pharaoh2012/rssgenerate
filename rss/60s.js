@@ -2,7 +2,6 @@
 //new Env('60s 看世界');
 
 
-const fetch = require('node-fetch');
 const tools = require("./tools")
 
 // https://github.com/vikiboss/60s
