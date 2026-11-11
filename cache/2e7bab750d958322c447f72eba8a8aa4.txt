@@ -1,0 +1,584 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23614256" title="发布于 2026-11-11 07:08">
+    
+
+    <span role="heading" aria-level="2">Redis 数据类型全解 - Stream 深度：Pending 回收、重试死信与消息队列选型（十一）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文深入探讨 Redis Stream 确认后的核心机制：Pending 队列（PEL）的管理、死信处理与异常恢复。重点解析 PEL 的双层结构、状态流转、内存开销及四大硬边界（集群、副本、持久化、淘汰），强调“至少一次”需依赖业务幂等，投递次数≠失败次数，幽灵条目需主动清理。结合版本演进（7.0+ 优化），提出基于 idle 超时的自动接管策略与死信流设计，揭示 Stream 作为可靠 MQ 的工程复杂性——正常路径简单，异常路径需精细运维。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>本篇是《Redis Stream 深度：消费者组、Pending 队列与死信处理》的姊妹篇。上一篇把「怎么消费、怎么确认、怎么建组」讲完；这一篇只讲确认之后的事——pending 怎么回收、失败怎么重试到死信、以及 Stream 到底该不该当 MQ。命令表、rax 结构、位点与有界保留在上一篇，本篇不重复。</p>
+<h1 id="0-版本基线与四个术语">0. 版本基线与四个术语</h1>
+<h2 id="01-版本节点">0.1 版本节点</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130222869-1608189634.png" alt="" loading="lazy"></p>
+<p>读写属性与 ACL 分类不要凭命令名推测：<code>XACKDEL</code> / <code>XNACK</code> 这类会写 PEL 的命令都属于写命令，<code>XPENDING</code> / <code>XINFO</code> 属于读。ACL 分类之间是「或」关系，只给账号 <code>@write</code> 时执行不了属于 <code>@stream</code> 的 <code>XNACK</code>。</p>
+<p><strong>实测边界</strong>：7.x 的行为（<code>XAUTOCLAIM</code> 三段、<code>XPENDING</code> 四形态、<code>XCLAIM JUSTID</code>、<code>XGROUP DELCONSUMER</code>、<code>XTRIM</code> 与 PEL、<code>XINFO CONSUMERS</code> 字段、下文两段 Lua）都在 Redis 7.4.2 上实跑核对；8.2 / 8.4 / 8.6 / 8.8 / 8.10 只按官方文档与官方博客核对，未在 8.x 实例实测，上线前以目标版本的 <code>COMMAND DOCS</code> 与实际返回为准。</p>
+<p>这几条之所以单列，是因为它们改的都是「确认之后」的语义：7.0 之前幽灵条目只能人工捞；7.2 之前分不清「消费者挂了」和「消费者只是暂时没活干」；8.2 之前必须两步操作；8.4 之前巡检成本随 pending 条数线性上涨；8.10 之前多流读取的总量根本控不住。版本差一年，运维工作量差一倍。</p>
+<p><code>redis</code> 代码块里的 <code>#</code> 行是注释，但 <code>redis-cli</code> 用管道读 stdin 时不识别 <code>#</code>（会报 <code>ERR unknown command '#'</code>），整段执行前先滤掉注释行：<code>grep -v '^[[:space:]]*#' cmds.txt | redis-cli ...</code>。</p>
+<h2 id="02-四个术语">0.2 四个术语</h2>
+<ul>
+<li><code>entries-read</code>：组已投递的逻辑序号，随投递推进，也会被 <code>SETID</code> 改写。</li>
+<li><code>lag</code>：<code>entries-added - entries-read</code> 的估算差，<code>XINFO GROUPS</code> 里可能是 NULL。</li>
+<li><code>delivery-count</code>：这条消息被投递了几次，只在 PEL 里，不等于业务失败次数。</li>
+<li><code>idle</code>：从最后一次投递或认领到现在的毫秒数，它只是时间戳差值，不是超时器。</li>
+</ul>
+<h2 id="03-与前一篇的分工">0.3 与前一篇的分工</h2>
+<p>前一篇负责「一条消息怎么被读到、怎么被确认」；本篇负责「确认之前卡住时怎么办」。两篇的流名与消费者命名可以对照着看，代码可以拼接使用。</p>
+<h1 id="1-为什么-pending-是分水岭">1. 为什么 pending 是分水岭</h1>
+<p>「Stream 能当队列」与「Stream 能当可靠队列」之间只隔一件事：未确认的消息会不会自己消失。PEL 就是那道账，账不平，前面所有「至少一次」的承诺都是空话。</p>
+<p>三处最容易先入为主的判断：</p>
+<ul>
+<li><strong>读到了就算消费了</strong>。读只把消息搬进 PEL，业务没执行、没确认，消息仍然活着；进程重启后它还在，但没人把它捞回来。</li>
+<li><strong>pending 多了就是消费慢</strong>。可能是消费者崩了、卡在死循环、或者消息被 <code>XTRIM</code> 裁掉了正文成了幽灵条目——三种原因的处理方式完全不同。</li>
+<li><strong>投递次数多就是这条消息有问题</strong>。<code>delivery-count</code> 会因为巡检、认领、<code>FORCE</code> 而上涨，跟业务失败没有一一对应关系。</li>
+</ul>
+<p>这三处落到具体条目，第 6 章的反模式表按「现象 + 根因 + 规避」逐条列，这里只做定位。</p>
+<p>为什么会有「Stream 就是轻量 MQ」的印象？因为正常路径确实像：<code>XADD</code> 写、<code>XREADGROUP</code> 读、<code>XACK</code> 确认，四行命令就能跑通。分水岭只出现在异常路径——消费者崩了、消息卡住了、正文被裁了。正常路径的简单，掩盖了异常路径的全部工程量。</p>
+<h1 id="2-pel-是一本独立账状态机与六个业务影响">2. PEL 是一本独立账：状态机与六个业务影响</h1>
+<h2 id="21-两层-pel-与四个字段">2.1 两层 PEL 与四个字段</h2>
+<p>Redis 有组级 PEL（记录每个组里未确认的消息）和消费者级 PEL（记录这些消息归谁）。两层都指向同一批消息 ID，但删除任意一层都不代表另一层同步清掉，所以排查时要分清看哪一层。</p>
+<p><code>XPENDING</code> 明细每行四个字段：消息 ID、所属消费者、<code>idle</code> 毫秒、<code>delivery-count</code>。这四个字段决定了后续所有判断——超时看 idle、毒消息看计数、归属变化看消费者名。</p>
+<p>排查时先定层：<code>XPENDING &lt;key&gt; &lt;group&gt;</code> 给组级概要，<code>XPENDING &lt;key&gt; &lt;group&gt; - + 10 &lt;consumer&gt;</code> 给某个消费者的明细，<code>XINFO STREAM &lt;key&gt; FULL COUNT 10</code> 把两层一起摊开。三者数字对不上，通常说明有消费者被 <code>DELCONSUMER</code> 删过——那批消息已经不在任何一层里了。</p>
+<h2 id="22-状态流转">2.2 状态流转</h2>
+<pre><code class="language-text">XADD                → 进入流，未被任何组读
+XREADGROUP "&gt;"      → 投递给某消费者，进 PEL，delivery-count = 1
+处理成功 + XACK     → 出 PEL；正文仍在流里，等 XTRIM / XACKDEL 回收
+处理失败 / 崩溃     → 留在 PEL，idle 持续增长
+idle 超阈值         → XCLAIM / XAUTOCLAIM / 8.4 CLAIM 转移归属，计数 +1
+超重试上限          → 先写死信流，再 XACK 原消息
+正文被删但 PEL 在   → 幽灵 pending；XAUTOCLAIM 第三段（7.0+）自动清
+</code></pre>
+<h2 id="23-影响一至少一次幂等是前提">2.3 影响一：至少一次，幂等是前提</h2>
+<p><code>XREADGROUP</code> 的语义是至少一次：崩溃、认领、重复投递都会让同一条消息被执行两遍。所以业务副作用必须自带幂等键，最省事的是用业务主键（订单号 + 事件 ID）建唯一索引，而不是指望「Stream 保证只执行一次」。</p>
+<p>幂等键有两种选法，取舍不同：只写业务主键（订单号）最稳，但同一订单的不同事件会被当成重复；只写事件 ID 更细，但要求生产端能稳定生成、且在重放时不变。多数系统用「业务主键 + 事件类型」的组合，把唯一性交给数据库唯一索引，Redis 去重键只当快速短路。</p>
+<h2 id="24-影响二pel-是独立内存开销不会随时间自己缩小">2.4 影响二：PEL 是独立内存开销，不会随时间自己缩小</h2>
+<p>PEL 条目在 ACK 之前一直驻留内存；它不会因为时间流逝或反复投递而变少，<strong>只有 <code>XACK</code> 与 <code>XACK DEL</code> 系列才让它缩小</strong>。增长路径有三条：消费速率低于生产、异常分支漏写 ACK、死信不处理导致失败消息永久挂着。它还会拖慢巡检扫描，所以「PEL 总数」比「流长度」更该进告警。</p>
+<p>单条开销有两种口径，别混：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130235694-289091561.png" alt="" loading="lazy"></p>
+<p>后者来自官方博客的差值法实测：插入 20 万条后读入 PEL，内存从 6.80 MB 增到 41.53 MB，增量 34.73 MB，折合约 174 B/条；8.4 的时间索引再加 3.55 MB（3.55 / 41.53 约 8.5%），同一口径约 17.8 B/条。只按 30 至 50 B 做预算会低估 3 到 5 倍，一次消费者故障就能顶爆内存。</p>
+<p>8.4 的时间索引换来了什么：在此之前每次投递都要沿 PEL 链表找到记录再改时间，pending 多时是 O(n)；加了索引之后按时间定位，接近 O(1)。代价是每条 pending 多 17.8 B，以及写路径多一次维护——一笔典型的「用内存换 CPU」。它也让「按 idle 排序找毒消息」从全表扫描变成范围查询。</p>
+<h2 id="25-影响三一套可见性超时但阈值要你自己定">2.5 影响三：一套「可见性超时」，但阈值要你自己定</h2>
+<p><code>XPENDING</code> 看 idle、<code>XCLAIM</code> 按 <code>min-idle-time</code> 认领，组合起来等价于 SQS 的 visibility timeout。但 <strong>idle 不是超时器</strong>：Redis 到点不会自动判死、也不会自动重投，超时完全是业务定义的阈值。</p>
+<p>下限要大于正常处理耗时的 p99 加 ACK 往返，经验取正常耗时的 3 到 5 倍（处理 300 ms 取 5 至 10 s，处理 30 s 取 90 s 左右）。上限是能容忍的最长恢复延迟；若允许重试 N 次，第 k 次重投的等待量级约为 <code>k × min-idle-time</code>，据此反推。</p>
+<p>阈值设错有两种典型故障。设太短：消息还在处理就被抢走，同一事件被执行两次，日志里能看出重复但错误率指标不动。设太长：消费者真的崩了也要等很久才有人接管，表现为「积压不降、idle 一直涨」。两者都不体现为报错，只能从 idle 分布里看出来。</p>
+<h2 id="26-影响四投递计数不等于业务失败次数">2.6 影响四：投递计数不等于业务失败次数</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130241507-352079696.png" alt="" loading="lazy"></p>
+<p>结论很直接：<strong>重试判据用业务失败计数，投递计数只作硬上限</strong>。两条都测过——<code>XPENDING</code> 连读三次，计数仍是 1；<code>IDLE</code> 过滤把 idle 归零但不改计数，而且它只筛不排，返回仍按 ID 升序。</p>
+<h2 id="27-影响五幽灵-pending-有两条读取路径">2.7 影响五：幽灵 pending 有两条读取路径</h2>
+<p>正文被 <code>XDEL</code> 或 <code>XTRIM</code> 删掉、PEL 却还在，就成了幽灵：<code>XPENDING</code> 还能看到它，<code>XREADGROUP</code> 按具体 ID 读回来是空正文，投递计数照样涨。清它有两条路——<code>XAUTOCLAIM</code> 的第三段返回会把它从 PEL 删掉（7.0+），或者自己扫 <code>DeletedIds</code> 后补 <code>XACK</code>。<code>XTRIM</code> 只动正文不动 PEL，所以「裁剪」本身就是造幽灵的动作。</p>
+<p>识别方法最省事的是对照两条命令：<code>XPENDING</code> 里能查到某个 ID，<code>XRANGE &lt;key&gt; &lt;id&gt; &lt;id&gt;</code> 却返回空数组——这种组合基本可以断定正文先被删了。巡检看到它，不要重试业务，直接清 PEL 并告警。</p>
+<h2 id="28-影响六集群副本与持久化的四条硬边界">2.8 影响六：集群、副本与持久化的四条硬边界</h2>
+<ul>
+<li><strong>集群</strong>：Stream key 不会自动分片，大 key 只落在单分片；要么业务上分片（<code>orders:{shard}</code>），要么提前迁走。</li>
+<li><strong>副本</strong>：主从复制的是命令流，<code>XAUTOCLAIM</code> 的扫描在从库上不能替你分担——读扩展对 PEL 巡检无效。</li>
+<li><strong>持久化</strong>：AOF <code>everysec</code> 下最多丢 1 秒的写入，但那 1 秒里可能正包含 <code>XACK</code>，「确认丢了」比「消息丢了」更难查。</li>
+<li><strong>内存淘汰</strong>：<code>maxmemory-policy</code> 一旦触发淘汰，Stream 可能被整个 key 删掉，PEL 随之消失且不可恢复；有 pending 的流必须配 <code>noeviction</code> 或独立实例。</li>
+</ul>
+<p>这四条的共同点是<strong>都不会在正常路径上暴露</strong>：集群不均只表现为某个分片内存先满；副本延迟只表现为故障切换后少量重放；AOF 丢的那 1 秒只在崩溃那刻才出现；淘汰更是静默删 key。四条都需要提前配置，事后补不了。</p>
+<h2 id="29-不可逆操作">2.9 不可逆操作</h2>
+<p><code>XGROUP DELCONSUMER</code> 会连同该消费者名下未 ACK 的消息一起丢掉，删完 <code>XPENDING</code> 返回 <code>0 / nil / nil / nil</code>，消息再也认领不回来；<code>XGROUP SETID</code> / <code>XSETID</code> 改位点会造成大范围重放或永久丢消息。这两类操作要么双重校验，要么干脆不碰，重放请新建一个组来做。</p>
+<h2 id="210-八行骨架自己看一眼">2.10 八行骨架：自己看一眼</h2>
+<pre><code class="language-redis">DEL demo:pending
+XADD demo:pending 1000-0 orderId A1 status created
+XGROUP CREATE demo:pending g 0
+XREADGROUP GROUP g w1 COUNT 1 STREAMS demo:pending &gt;
+XPENDING demo:pending g - + 10
+XCLAIM demo:pending g w2 0 1000-0
+XPENDING demo:pending g - + 10
+XACK demo:pending g 1000-0
+</code></pre>
+<p>预期依次是：<code>1</code> → <code>1000-0</code> → <code>OK</code> → 一条投递 → <code>1000-0 / w1 / idle 1 / 1</code> → <code>1000-0</code> → <code>1000-0 / w2 / idle 1 / 2</code> → <code>1</code>。idle 是毫秒级计时，实测为 1（随机器与执行速度可能为 0 或 1），后文一律按实测值写。第 7 行计数从 1 变 2，就是「认领会让计数上涨」的直接证据；第 5、7 两行都是 <code>XPENDING</code>，计数不变，就是「查询不改计数」的直接证据。本块不写注释以便整段管道执行。</p>
+<h1 id="3-命令与客户端能做什么版本差在哪">3. 命令与客户端：能做什么、版本差在哪</h1>
+<h2 id="31-xpending-的四种看法">3.1 XPENDING 的四种看法</h2>
+<pre><code class="language-redis"># 概要：总数 / 最小最大 ID / 按消费者分布
+XPENDING mystream mygroup
+# 明细（全组）：- + 是 ID 范围，10 是条数上限
+XPENDING mystream mygroup - + 10
+# 明细（按消费者）：消费者名只能追加在最后
+XPENDING mystream mygroup - + 10 consumer-A
+# IDLE 过滤：只筛 idle 大于 60000 ms 的条目，不排序、不改计数
+XPENDING mystream mygroup IDLE 60000 - + 10
+</code></pre>
+<p>四种形态都不改投递计数，这是最容易误判的一点。要按 idle 找毒消息，用第四种；要确认某条消息归谁，用第三种。</p>
+<p>概要形态最容易被误用成「积压监控」：它给的是未确认总数，不含那些还没被任何消费者读到的消息。真实积压要把 <code>lag</code> 一起看，只盯 PEL 会把「生产太快」误判成「消费太慢」。</p>
+<h2 id="32-xclaim-与-xautoclaim">3.2 XCLAIM 与 XAUTOCLAIM</h2>
+<pre><code class="language-redis"># 精确认领：min-idle-time 毫秒；不加 JUSTID 计数 +1，加了不递增
+XCLAIM mystream mygroup consumer-B 60000 1526569498055-4
+# 自动认领：从游标 0-0 扫一批，返回 下一游标 / 认领列表 / 幽灵 ID 列表
+XAUTOCLAIM mystream mygroup consumer-B 60000 0-0 COUNT 10
+</code></pre>
+<p><code>XCLAIM</code> 是单条、要你知道 ID；<code>XAUTOCLAIM</code> 是批量、给你一个游标自己往下扫。生产巡检用后者，重试单条用前者。<code>COUNT</code> 的扫描上限是它×10，别指望 <code>COUNT 10</code> 就只扫 10 条。</p>
+<p><code>XCLAIM</code> 还有两个修复型参数：<code>FORCE</code> 允许认领不在 PEL 里的 ID，用于修 PEL 与正文不一致；<code>LASTID</code> 把组的 <code>last-delivered-id</code> 一并推进。它们都是修复手段，正常重试路径不要碰。</p>
+<h2 id="33-82确认与删除合成一步">3.3 8.2：确认与删除合成一步</h2>
+<pre><code class="language-redis"># 语法：三种引用选项三选一（缺省 KEEPREF），IDS 后必须先写条数
+XACKDEL key group [KEEPREF | DELREF | ACKED] IDS numids id [id ...]
+XDELEX  key       [KEEPREF | DELREF | ACKED] IDS numids id [id ...]
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130310645-643544851.png" alt="" loading="lazy"></p>
+<p>7.x 只能 <code>XACK</code> + <code>XDEL</code> 两步走，中间崩溃就留幽灵；8.2 起一条命令原子完成。<code>IDS numids</code> 里的 <code>numids</code> 必须写，这是最常漏的参数。</p>
+<p>返回值表达的是「删掉了多少」，不是「成功与否」：部分 ID 不存在时不报错，只是少删。多组场景先用 <code>XPENDING</code> 确认各组状态再选选项，否则容易出现「以为删了、正文其实还在」的错觉。</p>
+<h2 id="34-84-的-claim-与-810-的上限">3.4 8.4 的 CLAIM 与 8.10 的上限</h2>
+<pre><code class="language-redis"># 8.4：一次读顺带认领 idle 超阈的旧消息，省掉一轮单独巡检
+XREADGROUP GROUP g c COUNT 100 BLOCK 5000 CLAIM 30000 STREAMS s &gt;
+# 8.10：COUNT 是每流上限，MAXCOUNT 才是跨流累计上限
+XREADGROUP GROUP g c COUNT 50 MAXCOUNT 80 STREAMS s1 s2 s3 &gt; &gt; &gt;
+# 8.10：MAXSIZE 按字节封顶（跨流累计）
+XREADGROUP GROUP g c MAXCOUNT 5 MAXSIZE 100000 STREAMS s1 s2 s3 &gt; &gt; &gt;
+</code></pre>
+<p>官方基准把 <code>CLAIM</code> 的收益量化成 22.5 倍：20 万 pending、1 千条 idle、<code>COUNT=1000</code>、重复 1000 次，单次往返 54.671 ms 对 2.426 ms。这个倍数不是通用常数——它取决于一次扫描里<strong>真正可认领的条数 n 与扫描上限 k 的比值</strong>，n/k 越小，省下的往返越少。量和版本都对不上时，别拿它当承诺。</p>
+<p>有了 <code>CLAIM</code> 是不是就不需要 Janitor？单实例、单流的轻量场景可以省；只要涉及多实例或独立告警，Janitor 仍然要有——<code>CLAIM</code> 只解决「顺带认领」，不解决「谁负责监控与上报」。</p>
+<h2 id="35-88-的-xnack">3.5 8.8 的 XNACK</h2>
+<pre><code class="language-redis"># SILENT：认作可重试，投递计数 -1，归属不变
+XNACK orders:events order-group SILENT IDS 1 1750000000000-0
+# FAIL：标记失败，计数不变，优先于普通待投递消息
+XNACK orders:events order-group FAIL   IDS 2 1750000000001-0 1750000000002-0
+# FATAL：进「不可再投递」区，idle 置 LLONG_MAX
+XNACK orders:events order-group FATAL  IDS 1 1750000000003-0
+</code></pre>
+<p>它的价值是把「这条没处理成」这件事写回 PEL，而不是靠业务侧计数推断。ACL 上只有 <code>@stream</code>，只授了 <code>@write</code> 的账号执行不了。</p>
+<p>别把它当「重试开关」：<code>SILENT</code> 只是把计数减 1，不会让消息提前可投递；什么时候能被再投递，仍由 <code>min-idle-time</code> 决定。</p>
+<h2 id="36-net-签名与六个坑">3.6 .NET 签名与六个坑</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130328083-1322842651.png" alt="" loading="lazy"></p>
+<p>六个坑里四个是「参数名或类型对不上」，两个是「语义理解偏差」，都属于编译期或第一次上线就能撞到的类型。把这张表贴进项目 README 比读官方 XML 快。</p>
+<p>坑 4 最典型：正文里按 ID 精确定位时，<code>StreamPendingMessagesAsync(_stream, _group, 1, RedisValue.Null, minId: id, maxId: id)</code>——第 4 参省掉会直接编译失败（2.8.x 报 <code>CS7036</code>、3.x 报 <code>CS1501</code>）。</p>
+<h1 id="4-生产闭环主循环巡检死信容量与监控">4. 生产闭环：主循环、巡检、死信、容量与监控</h1>
+<h2 id="41-三层">4.1 三层</h2>
+<p>主循环管「读」和「处理」，Janitor 管「超时回收」，死信流管「放弃」。三者共用同一套幂等与失败计数，任何一层单独加上去都会漏。少 Janitor，卡住的消息永远等不到第二次机会；少死信，重试会变成无限循环；少统一幂等，前两者都在制造重复执行。</p>
+<h2 id="42-主循环">4.2 主循环</h2>
+<pre><code class="language-csharp">using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+public sealed class OrderEventConsumer
+{
+    private readonly IDatabase _db;
+    // 业务失败计数：唯一的重试判据，与投递计数是两套账
+    private readonly IFailureCounter _failures;
+    private readonly Func&lt;RedisValue, RedisValue, RedisValue, CancellationToken, Task&gt; _handle;
+    private readonly RedisKey _stream = "orders:events";
+    private readonly RedisValue _group = "order-group";
+    private readonly RedisKey _dead = "orders:dead";
+    private readonly string _consumer = $"w-{Environment.MachineName}-{Environment.ProcessId}";
+    private const int BatchSize = 10;
+    private const int MaxBusinessFailures = 5;
+    // 投递计数只兜底，不参与正常重试判定
+    private const int HardCeiling = 20;
+
+    public OrderEventConsumer(IConnectionMultiplexer redis, IFailureCounter failures,
+        Func&lt;RedisValue, RedisValue, RedisValue, CancellationToken, Task&gt; handle)
+    {
+        _db = redis.GetDatabase();
+        _failures = failures;
+        _handle = handle;
+    }
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        await EnsureGroupAsync();
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                // 不带 BLOCK：StackExchange.Redis 没有 blockMilliseconds 参数
+                var entries = await _db.StreamReadGroupAsync(
+                    _stream, _group, _consumer,
+                    StreamPosition.NewMessages, count: BatchSize);
+
+                if (entries.Length == 0)
+                {
+                    // 空结果退避
+                    await Task.Delay(200, ct);
+                    continue;
+                }
+
+                foreach (var entry in entries)
+                    await ProcessSafelyAsync(entry, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (RedisException ex)
+            {
+                // Redis 不可用：退避重试，别让进程崩
+                Console.WriteLine($"Redis 异常：{ex.Message}");
+                await Task.Delay(1000, ct);
+            }
+        }
+    }
+
+    private async Task EnsureGroupAsync()
+    {
+        try
+        {
+            // 建组位点 $：只消费建组之后的新消息
+            await _db.StreamCreateConsumerGroupAsync(
+                _stream, _group, StreamPosition.NewMessages, createStream: true);
+        }
+        catch (RedisServerException ex) when (ex.Message.Contains("BUSYGROUP"))
+        {
+            // 组已存在：正常，不重建、不重置位点
+        }
+    }
+
+    // 返回 true 表示已收口：成功 ACK，或已写死信并 ACK
+    public async Task&lt;bool&gt; ProcessSafelyAsync(StreamEntry entry, CancellationToken ct)
+    {
+        // 幽灵条目：正文被裁掉，只清 PEL 并记审计
+        if (entry.Values == null || entry.Values.Length == 0)
+        {
+            await _db.StreamAcknowledgeAsync(_stream, _group, entry.Id);
+            return true;
+        }
+
+        // 业务唯一事件 ID：重复投递时靠它做幂等
+        var eventId = entry["eventId"];
+        // 订单号与事件类型只用于业务处理，不参与幂等
+        var orderId = entry["orderId"];
+        var eventType = entry["type"];
+        // 兜底：没带 eventId 就用 Stream ID
+        if (eventId == RedisValue.Null) eventId = entry.Id;
+
+        try
+        {
+            await _handle(eventId, orderId, eventType, ct);
+            await _db.StreamAcknowledgeAsync(_stream, _group, entry.Id);
+            // 成功即清零，避免累计值误杀后续正常消息
+            await _failures.ResetAsync(eventId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // 查 PEL 只按 ID，不限消费者：认领后归属会变成 janitor，
+            // 若按主循环消费者名过滤会查不到，delivered 恒为 1，毒消息无限重试
+            var detail = await _db.StreamPendingMessagesAsync(
+                _stream, _group, 1, RedisValue.Null, minId: entry.Id, maxId: entry.Id);
+            long delivered = detail.Length == 0 ? 1 : detail[0].DeliveryCount;
+
+            // 业务失败次数：真正的重试判据
+            int businessFailures = await _failures.IncrementAsync(eventId);
+
+            // 两条阈值任一命中即转死信
+            if (businessFailures &gt;= MaxBusinessFailures || delivered &gt;= HardCeiling)
+                return await MoveToDeadAsync(entry, businessFailures, ex);
+
+            // 留在 PEL，等 Janitor 认领重试
+            return false;
+        }
+    }
+
+    private async Task&lt;bool&gt; MoveToDeadAsync(StreamEntry entry, int failures, Exception ex)
+    {
+        // 顺序：先写死信，成功后才 ACK 原消息；反了会丢一条
+        await _db.StreamAddAsync(_dead, new NameValueEntry[]
+        {
+            new("originalId", entry.Id.ToString()),
+            new("payload", string.Join(";", entry.Values.Select(v =&gt; $"{v.Name}={v.Value}"))),
+            new("error", ex.Message),
+            new("failures", failures.ToString()),
+            new("deadAt", DateTimeOffset.UtcNow.ToString("O"))
+        }, maxLength: 100000, useApproximateMaxLength: true);
+
+        await _db.StreamAcknowledgeAsync(_stream, _group, entry.Id);
+        return true;
+    }
+}
+
+public interface IFailureCounter
+{
+    Task&lt;int&gt; IncrementAsync(RedisValue eventId);
+    Task ResetAsync(RedisValue eventId);
+}
+
+// 最小可用实现：String 计数 + TTL，成功时删键清零
+// 强一致场景换成数据库幂等表，与业务结果同一事务提交
+public sealed class RedisFailureCounter : IFailureCounter
+{
+    private readonly IDatabase _db;
+    private static readonly TimeSpan Ttl = TimeSpan.FromDays(7);
+
+    public RedisFailureCounter(IConnectionMultiplexer redis) =&gt; _db = redis.GetDatabase();
+
+    public async Task&lt;int&gt; IncrementAsync(RedisValue eventId)
+    {
+        // 按事件 ID 计数，不用「订单号 + 事件类型」
+        RedisKey k = "fail:" + eventId.ToString();
+        long n = await _db.StringIncrementAsync(k);
+        // 每次失败续期，TTL 要覆盖最长重试窗口
+        await _db.KeyExpireAsync(k, Ttl);
+        return (int)Math.Min(n, int.MaxValue);
+    }
+
+    public async Task ResetAsync(RedisValue eventId)
+    {
+        // 成功即删键：下次失败从 1 重新计
+        await _db.KeyDeleteAsync("fail:" + eventId.ToString());
+    }
+}
+</code></pre>
+<p>三点值得单说。第一，建组用 <code>$</code> 而不是 <code>0</code>：用 <code>0</code> 会在重启时把历史消息全量重放一遍，正确做法是建成 <code>$</code> 后靠 Janitor 回收历史（<code>0</code> 只用于有意重放）。第二，查 PEL 必须不限消费者，否则 Janitor 认领过的消息查不到，计数永远为 1。第三，死信与 ACK 的顺序不能反。</p>
+<p>还有一处容易被忽略：<code>BatchSize</code> 不要设大。一次拿 10 条的吞吐不比拿 100 条低多少，但单批过大会让 idle 分布失真——排在队尾的那几条还没开始处理，计时已经在走，巡检会把它们当成「卡住的」提前抢走。</p>
+<h2 id="43-janitor">4.3 Janitor</h2>
+<pre><code class="language-csharp">using System;
+using System.Threading;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+public sealed class PendingJanitor
+{
+    private readonly IDatabase _db;
+    private readonly Func&lt;StreamEntry, CancellationToken, Task&lt;bool&gt;&gt; _handle;
+    // 告警上报：幽灵 ID 必须进监控系统，不能只打印
+    private readonly Func&lt;RedisValue, Task&gt; _alert;
+    // 单实例租约：Redis 锁、etcd 或部署平台都行
+    private readonly ILease _lease;
+    private readonly RedisKey _stream = "orders:events";
+    private readonly RedisValue _group = "order-group";
+    private readonly string _consumer = $"janitor-{Environment.MachineName}-{Environment.ProcessId}";
+    private const long MinIdleMs = 60_000;
+    private const int BatchSize = 50;
+
+    public PendingJanitor(IConnectionMultiplexer redis,
+        Func&lt;StreamEntry, CancellationToken, Task&lt;bool&gt;&gt; handle,
+        ILease lease, Func&lt;RedisValue, Task&gt; alert)
+    {
+        _db = redis.GetDatabase();
+        _handle = handle;
+        _lease = lease;
+        _alert = alert;
+    }
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                // 只有拿到租约的实例巡检，否则多实例互相抢同一批消息
+                if (await _lease.TryAcquireAsync("janitor:orders:events", ct))
+                    await SweepOnceAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (Exception ex)
+            {
+                // 巡检异常不能终止常驻任务
+                Console.WriteLine($"巡检异常：{ex}");
+            }
+
+            // 巡检周期：太密抢 CPU，太疏拉长恢复时间
+            await Task.Delay(30_000, ct);
+        }
+    }
+
+    private async Task SweepOnceAsync(CancellationToken ct)
+    {
+        // 游标从 0-0 起扫，回到 0-0 表示一轮结束
+        RedisValue cursor = "0-0";
+        do
+        {
+            var result = await _db.StreamAutoClaimAsync(
+                _stream, _group, _consumer,
+                minIdleTimeInMs: MinIdleMs, startAtId: cursor, count: BatchSize);
+
+            // 必须用返回值推进游标，写死 0-0 会一直扫同一批
+            cursor = result.NextStartId;
+
+            foreach (var entry in result.ClaimedEntries)
+                await _handle(entry, ct);
+
+            // 7.0+：正文已裁掉的幽灵 ID，XAUTOCLAIM 已从 PEL 清掉
+            foreach (var ghost in result.DeletedIds)
+            {
+                Console.WriteLine($"幽灵 ID：{ghost}");
+                await _alert($"stream.ghost:{ghost}");
+            }
+        } while (cursor != "0-0" &amp;&amp; !ct.IsCancellationRequested);
+    }
+}
+
+public interface ILease
+{
+    Task&lt;bool&gt; TryAcquireAsync(string name, CancellationToken ct);
+}
+</code></pre>
+<p><code>SweepOnceAsync</code> 里有两个必须守住的细节：游标用返回值推进；<code>DeletedIds</code> 非空说明有消息被裁剪吃掉过，这是「MAXLEN 设小了」的告警信号，必须上报而不是丢掉。Janitor 与主循环共用 <code>ProcessSafelyAsync</code>，所以死信判定不会出现两套。</p>
+<h2 id="44-死信闭环的五条规则">4.4 死信闭环的五条规则</h2>
+<ol>
+<li><strong>先写后删</strong>：死信成功写入才 ACK 原消息，顺序反了崩溃就丢一条。</li>
+<li><strong>写全上下文</strong>：原始 ID、完整字段、错误信息、失败次数、时间戳。只写 ID 等于把排查工作推给未来。</li>
+<li><strong>死信流也要上限</strong>：<code>MAXLEN ~ 100000</code>，否则死信本身会变成新的内存炸弹。</li>
+<li><strong>死信要有消费方</strong>：写了没人看只是把丢消息推迟了；死信流的消费必须能告警、能重放、能人工接管。</li>
+<li><strong>转存也要幂等</strong>：同一条消息可能被两个实例同时写进死信，用原始 ID 做去重键。</li>
+</ol>
+<p>字段设计比命令重要：至少要原始 ID、原始字段、错误、失败次数、写入时间。缺了原始字段，重放时只能靠猜；缺了失败次数，分不清是「第一次就炸」还是「重试 20 次才炸」。</p>
+<h2 id="45-安全删除消费者">4.5 安全删除消费者</h2>
+<p>删除前必须先确认没有 pending，否则未确认的消息随之消失且不可认领。检查和删除要原子：</p>
+<pre><code class="language-lua">-- KEYS[1] = stream key；ARGV[1] = group；ARGV[2] = consumer
+-- 返回：1 已安全删除 / -2 仍有 pending / -1 key 不存在
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return -1
+end
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2])
+if type(pending) == 'table' and #pending &gt; 0 then
+    return -2
+end
+redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
+return 1
+</code></pre>
+<p>7.4.2 上三种输入分别返回 <code>-2</code> / <code>1</code> / <code>-1</code>，与注释一致。</p>
+<h2 id="46-幂等与按业务主键保序">4.6 幂等与按业务主键保序</h2>
+<p>去重键（<code>SET ack:{eventId} 1 NX EX 86400</code>）只能做快速短路，TTL 一到、消息被认领，它挡不住重复；真正的幂等靠数据库唯一索引，而且去重键的置位与业务写入要在同一事务语义里，只在业务确认成功后才 ACK。</p>
+<p>保序上，Stream 本身只保证同一条流内按 ID 有序，跨消费者不保证处理顺序。要按订单保序，只能用「同一主键路由到同一消费者」加单消费者串行；跨进程（Janitor 认领、扩容）仍要靠业务版本号兜底，所以去重、版本校验、主键路由通常要一起上。</p>
+<p>版本号兜底的具体做法：消息体带业务版本（<code>seq</code> 或 <code>updatedAt</code>），落库时走 <code>WHERE seq &gt; 已存 seq</code> 的条件更新，重复与乱序到达的写入自然被拒，不需要额外加锁。</p>
+<h2 id="47-容量估算">4.7 容量估算</h2>
+<pre><code class="language-text">单条消息 = 固定开销(约 40 至 80 B：rax 分摊 + 16 B ID + listpack 元数据)
+         + sum(字段名 + 值 + 每项约 1 至 3 B 编码)
+整 key   = 单条 × 条数
+         + 各消费组 × (约 100 B + 消费者数 × 常数)
+         + 未确认条数 × 约 174 B(PEL 端到端)
+         + 8.4 时间索引(约 17.8 B/条 pending)
+         + 余量 1.2 至 1.5 倍(复制缓冲、碎片、dict 扩容)
+
+MAXLEN &gt;= 峰值写入速率 × 最大消费延迟 × 安全系数
+</code></pre>
+<p>三组演算只给量级参考，实际值必须按 4.8 的方法自测后替换。20 万条 200 B 消息、1 万条 pending：正文约 40 MB、PEL 约 1.7 MB、时间索引约 0.18 MB；把 pending 抬到 20 万，PEL 一项就变成约 35 MB，比正文还大——这就是 2.4 节强调双口径的原因。</p>
+<p>再给一组容易被漏算的：1 万条 100 B 消息、挂在 10 个消费组上、每组各 1 万 pending。正文约 1 MB，每组 PEL 约 1.7 MB，十组合计约 17 MB——PEL 是正文的 17 倍。多组共享一条流时，成本按组数线性叠加，这是预算里最容易缺的一项。</p>
+<h2 id="48-监控与自测">4.8 监控与自测</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130359239-1431681445.png" alt="" loading="lazy"></p>
+<p>自测用差值法，不要信 <code>MEMORY USAGE</code>——它不算 PEL：</p>
+<pre><code class="language-bash"># 基线：造数前取一次，不给基线就没有差值
+redis-cli INFO memory | grep used_memory:
+# 造数后：与基线相减 = 正文增量
+redis-cli INFO memory | grep used_memory:
+# 投递后：与上一次相减 = PEL 增量（读 10 万条不 ACK）
+redis-cli INFO memory | grep used_memory:
+# 单次调用平均耗时：只看 XAUTOCLAIM 这一轮
+redis-cli INFO commandstats | grep xautoclaim
+# 尾部延迟：平均值会掩盖长尾
+redis-cli SLOWLOG GET 10
+</code></pre>
+<p><code>lag</code> 为 NULL 时不要慌，也不要 <code>SETID</code>。NULL 的成因之一是组位点被改过，而它本身是暂时态：一旦该组把流里最后一条消息投递给成员，<code>entries-read</code> 会被重置为正确值，<code>lag</code> 自动恢复。NULL 期间按「PEL 总数 + 最大 idle + <code>XLEN</code> 增速」估算积压，告警降级为观察。采集频率不必高：PEL 总数 1 分钟一次、最大 idle 5 分钟一次、<code>lag</code> 跟 <code>XLEN</code> 一起采就够。巡检脚本自身也要限流，<code>XPENDING</code> 明细在大 PEL 上是重命令，按秒刷会把巡检变成新的负载源。</p>
+<p>还要记住两条：只看 <code>XLEN</code> 会漏（消息全投递出去后 <code>lag</code> 可以是 0、<code>XLEN</code> 稳定，但 PEL 在涨）；只看平均值会漏尾部（总量正常不代表没有几条 idle 极大的毒消息）。</p>
+<h1 id="5-场景与选型什么时候用什么时候走">5. 场景与选型：什么时候用、什么时候走</h1>
+<h2 id="51-延迟队列zset-触发--stream-消费">5.1 延迟队列：ZSet 触发 + Stream 消费</h2>
+<p>ZSet 存「到期时间」，到点后原子取出写进 Stream 再消费。取出的原子性用一段 Lua 保证：</p>
+<pre><code class="language-lua">-- KEYS[1] = delay:{order}（ZSet）；KEYS[2] = events:{order}（目标 Stream）
+-- ARGV[1] = now(ms)，ARGV[2] = batch
+-- Cluster 下两个 key 必须同 slot：用同一个 hash tag {order} 绑定
+local due = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, ARGV[2])
+for i, member in ipairs(due) do
+    redis.call('ZREM', KEYS[1], member)
+    redis.call('XADD', KEYS[2], 'MAXLEN', '~', 200000, '*', 'orderId', member)
+end
+return #due
+</code></pre>
+<p>7.4.2 上到期两条、未到期一条时返回 <code>2</code>，<code>ZCARD</code> 剩 1，Stream 里正好两条——取出与删除在同一脚本里，不会出现「取到但没删」的重复触发。</p>
+<h2 id="52-三个专题的结论">5.2 三个专题的结论</h2>
+<ul>
+<li><strong>事件溯源</strong>：一条业务事实一条消息，投影函数必须是纯函数，<code>XRANGE - +</code> 全量重放、<code>XRANGE - &lt;id&gt;</code> 定点重放都能复现同一状态。</li>
+<li><strong>消息体</strong>：超过数 KB 的对象放外部存储，Stream 里只放引用；大消息会把 rax 节点与复制缓冲一起推高。</li>
+<li><strong>物联网遥测</strong>：按设备哈希分片（<code>device:events:{sh}</code>），幂等键用 <code>dev:ts</code>，去重键只做短路，唯一索引兜底。</li>
+</ul>
+<p>三个专题的共性是：消息只是载体，真正的成本在「怎么重放、怎么去重」。先把重放路径想清楚，再决定消息里该存什么——存了外部引用就必须保证引用可长期取回，存了全量就要接受内存成本。</p>
+<h2 id="53-选型矩阵">5.3 选型矩阵</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130416715-129416940.png" alt="" loading="lazy"></p>
+<h2 id="54-三个反直觉的真相">5.4 三个反直觉的真相</h2>
+<ul>
+<li><strong>省下的是 MQ，付出的是工程量</strong>。Stream 不用新组件，但巡检、死信、幂等、容量、监控这五件事全要自己写，算下来是「一个 MQ 换成一套代码」。</li>
+<li><strong><code>COUNT</code> 是每流上限，不是总量</strong>。多流同时读时用 <code>COUNT</code> 控总量会超预期，8.10 的 <code>MAXCOUNT</code> 才是跨流累计。</li>
+<li><strong><code>XACKDEL</code> 不是万能的</strong>。多组共享同一条流时，<code>KEEPREF</code> 让正文删不掉，得用 <code>ACKED</code> 或等所有组确认；单组场景才敢用 <code>DELREF</code>。</li>
+</ul>
+<p>三条合起来是一句话：Stream 的甜点在「已有 Redis、量中等、愿意自建运维件」的交集里，离开这个交集就要交学费。</p>
+<h2 id="55-决策树">5.5 决策树</h2>
+<pre><code class="language-text">消息能不能丢？
+├─ 能，只要解耦或在线广播 ──► List / Pub/Sub
+└─ 不能
+   ├─ 需要「到未来某时刻才可见」？ ──► ZSet + Stream（5.1）
+   └─ 需要确认 / 重试 / 回溯？
+      ├─ 长期保留、任意 offset、TB 级堆积 ──► Kafka
+      ├─ JMS 语义、企业事务、原生 DLQ ──► ActiveMQ / Artemis
+      ├─ 精确一次且不愿做业务幂等 ──► Kafka 事务或数据库事件表
+      └─ 已有 Redis、量中等、能自建幂等与巡检 ──► Redis Stream
+</code></pre>
+<h2 id="56-什么时候迁走">5.6 什么时候迁走</h2>
+<p>三条信号：单 key 内存超过实例预算的一半；pending 巡检的单次耗时进入秒级；业务开始要求精确一次或跨天回放。迁出路径是双写 + 位点对齐：新系统先只读不删，等 Stream 侧积压归零再切写，最后用原始 ID 核对一致性。</p>
+<p>回滚方案要提前写：切流后保留 Stream 侧只读窗口至少一个巡检周期，确认新系统无遗漏再关写。没有只读窗口，回滚就等于再赌一次。</p>
+<h1 id="6-反模式与上线自检">6. 反模式与上线自检</h1>
+<h2 id="61-十二条反模式">6.1 十二条反模式</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130428342-897724222.png" alt="" loading="lazy"></p>
+<h2 id="62-十八项上线清单">6.2 十八项上线清单</h2>
+<ul class="contains-task-list">
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 1. 建组位点确认为 <code>$</code>，重放走新组</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 2. <code>MAXLEN</code> / <code>MINID</code> 有值，且与容量预算对得上</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 3. <code>maxmemory-policy</code> 为 <code>noeviction</code> 或独立实例</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 4. 主循环无阻塞读，用轮询 + 退避</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 5. 客户端版本与 API 对齐（<code>claimMinIdleTime</code> / <code>minIdleTimeInMs</code> 仅 3.x）</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 6. 查 PEL 不限消费者</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 7. 失败计数与投递计数分离</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 8. 死信先写后 ACK，且带原始 ID 与错误</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 9. 死信流有消费方与告警</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 10. <code>min-idle-time</code> 大于 p99 处理耗时</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 11. Janitor 单实例（租约或部署约束）</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 12. <code>DeletedIds</code> 非空必须告警</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 13. 消费者删除走原子检查脚本</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 14. 幂等键为业务主键，唯一索引兜底</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 15. 按主键保序时确认路由规则</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 16. 监控采集 PEL 总数、最大 idle、最大计数、<code>lag</code></label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 17. 容量按 174 B/条 PEL 做预算</label></li>
+<li class="task-list-item"><input class="task-list-item-checkbox" disabled="" type="checkbox"><label> 18. 8.x 命令在目标版本上复核过</label></li>
+</ul>
+<p>清单按「配置 → 代码 → 运维」的顺序过：前 4 项不过就不用往下看，它们是塌方式的；中间 8 项决定异常路径能不能走通；最后 6 项决定故障时你能不能看见。</p>
+<h1 id="附录-a-可判定验证脚本">附录 A. 可判定验证脚本</h1>
+<pre><code class="language-redis">DEL demo:pending
+XADD demo:pending 1000-0 orderId A1 status created
+XGROUP CREATE demo:pending g 0
+XREADGROUP GROUP g w1 COUNT 1 STREAMS demo:pending &gt;
+XPENDING demo:pending g - + 10
+XCLAIM demo:pending g w2 0 1000-0
+XPENDING demo:pending g - + 10
+XACK demo:pending g 1000-0
+XPENDING demo:pending g
+XLEN demo:pending
+XADD demo:pending 1001-0 orderId A2 status paid
+XREADGROUP GROUP g w1 COUNT 1 STREAMS demo:pending &gt;
+XDEL demo:pending 1001-0
+XPENDING demo:pending g
+XAUTOCLAIM demo:pending g w2 0 0-0 COUNT 10
+XPENDING demo:pending g
+XRANGE demo:pending - +
+XADD demo:pending 1002-0 orderId A3 status done
+XREADGROUP GROUP g w1 COUNT 1 STREAMS demo:pending &gt;
+XACK demo:pending g 1002-0
+XDEL demo:pending 1002-0
+XPENDING demo:pending g
+XRANGE demo:pending - +
+XINFO GROUPS demo:pending
+DEL demo:pending
+</code></pre>
+<p>预期（7.4.2 实测全中；脚本与表格按行号对应，所以正文不写注释）：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261110130440028-2121060368.png" alt="" loading="lazy"></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-11 07:08">2026-11-11 07:08</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">21</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23614256);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23614256&amp;targetId=23614256&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
