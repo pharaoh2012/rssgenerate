@@ -1,0 +1,252 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yellow3gold/p/23649681" title="发布于 2026-11-13 08:53">
+    
+
+    <span role="heading" aria-level="2">ES 7.17 三节点 Docker 集群接入 IK 自定义词典：一次从丢插件到热更新的完整排障</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        在 3 节点 Docker 化的 ES 7.17 集群上给 IK 分词器导入自定义词典，踩到了插件目录与配置目录分离、容器重建丢插件、数据目录被 chown 错、scp 权限、远程 sudo 无终端、集群 red 等一连串问题。本文按「方案 → 踩坑 → 验证 → 日常维护」整理全过程。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>AI 生成声明</strong>：本文内容由 AI 生成或经 AI 辅助完成，请注意甄别。</p>
+</blockquote>
+<h2 id="背景">背景</h2>
+<p>一套 3 节点的 Elasticsearch 7.17 集群跑在 Docker 里，节点分布在三台内网机器上，容器用 <code>--net=host</code> 起、数据目录挂载在宿主机。现在需要给 IK 分词器导入业务自定义词典，让"图计算引擎""向量数据库"这类专有名词不被切碎。</p>
+<p>最初的直觉方案很朴素：改 IK 的 <code>IKAnalyzer.cfg.xml</code>，把词典文件填进 <code>ext_dict</code>，重启就完事。但容器是 <code>docker stop &amp;&amp; docker rm</code> 重建式管理的，改在容器里的任何东西都会随容器删除而丢失——于是整个问题变成"如何把 IK 的插件与配置真正持久化到宿主机"。</p>
+<p>真正做下来才发现，坑远不止这一层。</p>
+<h2 id="一先搞清楚-7x-的-ik-目录结构">一、先搞清楚 7.x 的 IK 目录结构</h2>
+<p>这是整个过程中最关键的一条认知，也是后面所有问题的根源：</p>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>插件本体（jar 包、<code>plugin-descriptor.properties</code>）</td>
+<td><code>/usr/share/elasticsearch/plugins/analysis-ik/</code></td>
+</tr>
+<tr>
+<td>配置文件（<code>IKAnalyzer.cfg.xml</code>、<code>main.dic</code>、<code>stopword.dic</code>）</td>
+<td><code>/usr/share/elasticsearch/config/analysis-ik/</code></td>
+</tr>
+</tbody>
+</table>
+<p>在 IK 6.x 时代两者都在 <code>plugins/analysis-ik/config/</code> 下，7.x 之后配置目录搬到了 ES 的 <code>config/analysis-ik/</code>。网上大量教程还是 6.x 的路径，照抄会直接撞墙。</p>
+<p>所以持久化必须挂两个目录，缺一不可：</p>
+<pre><code class="language-bash">-v /data/elasticsearch/plugins/analysis-ik:/usr/share/elasticsearch/plugins/analysis-ik \
+-v /data/elasticsearch/config/analysis-ik:/usr/share/elasticsearch/config/analysis-ik \
+</code></pre>
+<p>只挂配置、不挂插件，容器一重建插件就丢，<code>_cat/plugins</code> 立刻变空——这个现象后面会反复出现。</p>
+<h2 id="二两种自定义词典方案">二、两种自定义词典方案</h2>
+<h3 id="方案-a本地词典-ext_dict">方案 A：本地词典 <code>ext_dict</code></h3>
+<p>把词典文件放进配置目录，在 <code>IKAnalyzer.cfg.xml</code> 的 <code>&lt;properties&gt;</code> 里声明：</p>
+<pre><code class="language-xml">&lt;entry key="ext_dict"&gt;custom.dic&lt;/entry&gt;
+</code></pre>
+<p>多个词典用分号分隔。词典格式要求很硬：<strong>每行一个词，UTF-8 无 BOM</strong>，可选 <code>词#词性</code> 标注词性。缺点是每次改词典都要重启节点，词典迭代频繁时体验很差。</p>
+<h3 id="方案-b远程词典-remote_ext_dict推荐">方案 B：远程词典 <code>remote_ext_dict</code>（推荐）</h3>
+<p>把词典放到一个 HTTP 静态服务上，配置指向 URL：</p>
+<pre><code class="language-xml">&lt;entry key="remote_ext_dict"&gt;http://192.168.1.13:8080/custom.dic&lt;/entry&gt;
+</code></pre>
+<p>IK 会按 <code>Last-Modified</code> 头判断文件有没有变，默认约 60 秒轮询一次，变了就重新加载。<strong>只有第一次改配置需要重启，之后改词典内容全程免重启。</strong></p>
+<p>远程词典服务用 <code>python3 -m http.server</code> 就够，再用 systemd 托管保证开机自启：</p>
+<pre><code class="language-ini">[Unit]
+Description=IK Dictionary HTTP Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=deploy
+Group=deploy
+ExecStart=/usr/bin/python3 -m http.server 8080 --directory /data/ik-dict
+Restart=always
+RestartSec=5
+WorkingDirectory=/data/ik-dict
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<pre><code class="language-bash">sudo systemctl daemon-reload
+sudo systemctl enable --now ik-dict-server
+curl -I http://192.168.1.13:8080/custom.dic
+</code></pre>
+<p>返回 200 且带 <code>Last-Modified</code> 才算正常——<code>python3</code> 的 <code>http.server</code> 自带这个头，换成某些简易服务端可能没有，那就热更新失效。</p>
+<p>服务装在哪台机器都行，只要三个节点都能访问到 8080 端口。建议同时配两个 URL（用分号分隔）指向不同机器上的同一份词典，避免单点：</p>
+<pre><code class="language-xml">&lt;entry key="remote_ext_dict"&gt;http://192.168.1.13:8080/custom.dic;http://192.168.1.11:8080/custom.dic&lt;/entry&gt;
+</code></pre>
+<h2 id="三踩坑实录">三、踩坑实录</h2>
+<p>下面这些报错按发生顺序排列，基本覆盖了"docker 化 ES + 插件持久化"会遇到的所有典型问题。</p>
+<h3 id="坑-1docker-cp--pluginsanalysis-ikconfig-报找不到文件">坑 1：<code>docker cp ... :/plugins/analysis-ik/config/.</code> 报找不到文件</h3>
+<pre><code>Error response from daemon: Could not find the file
+/usr/share/elasticsearch/plugins/analysis-ik/config/. in container es-node-1
+</code></pre>
+<p>第一反应是 <code>docker cp</code> 对结尾 <code>/.</code> 的兼容问题，但实际原因是 7.x 的 config 根本不在 <code>plugins/</code> 下。先确认目录结构，别靠猜：</p>
+<pre><code class="language-bash">docker exec es-node-1 ls -la /usr/share/elasticsearch/plugins/analysis-ik/
+docker exec es-node-1 ls -la /usr/share/elasticsearch/config/analysis-ik/
+</code></pre>
+<p>第一条只看到 jar 包、第二条才有 <code>IKAnalyzer.cfg.xml</code>，说明路径用错了，正确的复制源是 <code>/usr/share/elasticsearch/config/analysis-ik/.</code>。</p>
+<h3 id="坑-2重建容器后插件消失_catplugins-为空">坑 2：重建容器后插件消失，<code>_cat/plugins</code> 为空</h3>
+<pre><code>name component version
+</code></pre>
+<p>空表。原因就是只挂了 <code>config/analysis-ik</code>，没挂 <code>plugins/analysis-ik</code>，插件 jar 躺在容器可写层里，<code>docker rm</code> 之后灰飞烟灭。</p>
+<p>修复要先在运行中的容器里重装插件，再把整个插件目录复制出来持久化：</p>
+<pre><code class="language-bash">docker exec -it es-node-1 /bin/bash -c \
+  "./bin/elasticsearch-plugin install https://get.infini.cloud/elasticsearch/analysis-ik/7.17.0"
+
+sudo mkdir -p /data/elasticsearch/plugins
+sudo docker cp es-node-1:/usr/share/elasticsearch/plugins/analysis-ik /data/elasticsearch/plugins/
+sudo chown -R 1000:1000 /data/elasticsearch/plugins
+</code></pre>
+<blockquote>
+<p>官方源下载慢的话可以换成镜像站的 release zip（<code>elasticsearch-plugin install &lt;zip-url&gt;</code> 形式同样可用）。</p>
+</blockquote>
+<h3 id="坑-3dataelasticsearch-整目录-chown-把-es-搞崩了">坑 3：<code>/data/elasticsearch</code> 整目录 <code>chown</code> 把 ES 搞崩了</h3>
+<p>在目标机上为了能 <code>scp</code> 写入，顺手执行了：</p>
+<pre><code class="language-bash">sudo chown -R deploy:deploy /data/elasticsearch
+</code></pre>
+<p>结果节点进入 <code>Restarting</code> 循环：</p>
+<pre><code>ElasticsearchException[failed to bind service];
+nested: AccessDeniedException[.../data/nodes/0/indices/.../_state/.es_temp_file]
+</code></pre>
+<p>ES 容器内进程以 uid 1000 运行，<code>data</code> 目录属主被改成普通用户后写不进去，节点直接启动失败。<strong>数据目录千万不能跟着改属主</strong>：</p>
+<pre><code class="language-bash">sudo chown -R 1000:1000 /data/elasticsearch/data
+docker restart es-node-2
+</code></pre>
+<p>正确的目录权限分工是：</p>
+<ul>
+<li><code>data</code>、<code>plugins</code>：<code>1000:1000</code>，容器内进程要读写；</li>
+<li>需要给普通用户同步的目录：保持属主不变，只补读权限 <code>sudo chmod -R a+rX</code>。</li>
+</ul>
+<h3 id="坑-4scp-报-permission-denied">坑 4：<code>scp</code> 报 <code>Permission denied</code></h3>
+<pre><code>scp: local opendir "/data/elasticsearch/config/analysis-ik": Permission denied
+</code></pre>
+<p>目录属主是 <code>1000:1000</code>、权限 <code>700</code> 左右，普通用户 <code>deploy</code> 读不了本地源目录。不用改属主，加读权限即可：</p>
+<pre><code class="language-bash">sudo chmod -R a+rX /data/elasticsearch/config/analysis-ik
+sudo chmod -R a+rX /data/elasticsearch/plugins
+</code></pre>
+<p><code>a+rX</code> 里的 <code>X</code> 只对目录生效，不会给普通文件加执行位，是这里最合适的写法。</p>
+<h3 id="坑-5scp-报-stat-remote-no-such-file-or-directory">坑 5：<code>scp</code> 报 <code>stat remote: No such file or directory</code></h3>
+<p>不是本地问题，是目标机上 <code>/data/elasticsearch/</code> 还没建。先远程把目录建好并授权：</p>
+<pre><code class="language-bash">ssh -t deploy@192.168.1.12 "sudo mkdir -p /data/elasticsearch/config &amp;&amp; sudo chown -R deploy:deploy /data/elasticsearch"
+</code></pre>
+<h3 id="坑-6ssh-远程执行-sudo-报-a-terminal-is-required">坑 6：SSH 远程执行 <code>sudo</code> 报 <code>a terminal is required</code></h3>
+<pre><code>sudo: a terminal is required to read the password; either use the -S option ...
+</code></pre>
+<p>非交互式 SSH 没有分配终端，<code>sudo</code> 无法提示密码。加上 <code>-t</code> 强制分配伪终端即可：</p>
+<pre><code class="language-bash">ssh -t deploy@192.168.1.12 "sudo mkdir -p /data/elasticsearch/config &amp;&amp; sudo chown -R deploy:deploy /data/elasticsearch"
+</code></pre>
+<p>或者一劳永逸配置该用户的 sudo 免密（内网运维机可以接受）：</p>
+<pre><code class="language-bash">ssh -t deploy@192.168.1.12 "echo 'deploy ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/deploy &amp;&amp; sudo chmod 440 /etc/sudoers.d/deploy"
+</code></pre>
+<h3 id="坑-7三台节点插件不一致">坑 7：三台节点插件不一致</h3>
+<p><code>_cat/plugins</code> 只列出两台，第三台缺失。用 <code>docker inspect</code> 看挂载就能一眼定位：</p>
+<pre><code class="language-bash">docker inspect es-node-3 --format '{{range .Mounts}}{{.Source}} -&gt; {{.Destination}}{{println}}{{end}}'
+</code></pre>
+<p>结果少了 <code>plugins/analysis-ik</code> 那一行——重建时用的是旧命令。补上挂载重建即可。<strong>三台节点的插件与配置必须完全一致，否则同一段文本在不同节点分词结果不同</strong>，检索会出现莫名其妙的不一致。</p>
+<h3 id="坑-8集群-red大量分片未分配">坑 8：集群 red、大量分片未分配</h3>
+<p>滚动重启 + 权限事故之后，<code>unassigned_shards</code> 一度涨到 63，<code>status: red</code>。处理顺序是：</p>
+<pre><code class="language-bash"># 1. 先看能不能直接重试（节点重启导致的未分配，通常这步就够）
+curl -s -m 10 -u "elastic:${ES_PWD}" -X POST "http://localhost:9200/_cluster/reroute?retry_failed=true?pretty"
+
+# 2. 重试无效，查具体原因
+curl -s -m 10 -u "elastic:${ES_PWD}" "http://localhost:9200/_cluster/allocation/explain?pretty"
+
+# 3. 同时看磁盘水位
+curl -s -m 10 -u "elastic:${ES_PWD}" "http://localhost:9200/_cat/allocation?v"
+</code></pre>
+<p><code>reason</code> 字段的常见取值：<code>NODE_LEFT</code> / <code>CLUSTER_RECOVERED</code> 属暂时状态，重试后自动恢复；<code>ALLOCATION_FAILED</code> 要看详细报错；如果看到 <code>DISK_WATERMARK</code> 则是磁盘水位，只能先清盘或临时调高阈值（恢复后务必调回）：</p>
+<pre><code class="language-bash">curl -s -m 10 -u "elastic:${ES_PWD}" -X PUT "http://localhost:9200/_cluster/settings" \
+  -H 'Content-Type: application/json' -d'
+{
+  "persistent": {
+    "cluster.routing.allocation.disk.watermark.low": "92%",
+    "cluster.routing.allocation.disk.watermark.high": "95%",
+    "cluster.routing.allocation.disk.watermark.flood_stage": "98%"
+  }
+}'
+</code></pre>
+<p>另外，<code>curl</code> 卡住不代表集群挂了——16g 堆的节点重启加 60 多个分片恢复，1~3 分钟内连不上是正常的。排查时一律加 <code>-m 10</code> 超时，避免在终端里干等。</p>
+<h2 id="四怎么验证自定义词典真的生效了">四、怎么验证自定义词典真的生效了</h2>
+<p>按三层查，从配置到效果逐层排除：</p>
+<p><strong>第一层：配置是否指向词典</strong></p>
+<pre><code class="language-bash">cat /data/elasticsearch/config/analysis-ik/IKAnalyzer.cfg.xml
+</code></pre>
+<p>三台的 <code>remote_ext_dict</code> 内容应完全一致。</p>
+<p><strong>第二层：词典服务是否可用</strong></p>
+<pre><code class="language-bash">systemctl status ik-dict-server
+curl -I http://192.168.1.13:8080/custom.dic
+</code></pre>
+<p><strong>第三层：分词效果</strong></p>
+<pre><code class="language-bash">curl -s -m 10 -u "elastic:${ES_PWD}" "http://localhost:9200/_analyze?pretty" \
+  -H 'Content-Type: application/json' -d'
+{
+  "analyzer": "ik_max_word",
+  "text": "知识图谱推理"
+}'
+</code></pre>
+<p>判断标准：tokens 里出现完整的"知识图谱推理"即生效；被切成"知识/图谱/推理"则没加载。再拿一个词典里没有的词做对照，两个结果一对比就清楚。</p>
+<p>两个容易忽略的点：</p>
+<ul>
+<li>分析器必须是 <code>ik_max_word</code> 或 <code>ik_smart</code>，用 <code>standard</code> 测永远不会命中自定义词；</li>
+<li>刚改完词典要等约 60 秒轮询周期，立刻测还是旧结果。</li>
+</ul>
+<p>节点日志里也能看到加载记录，连不上词典服务时会打 <code>download error</code>：</p>
+<pre><code class="language-bash">docker logs es-node-1 2&gt;&amp;1 | grep -iE "dict|ik" | head -20
+</code></pre>
+<h2 id="五日常维护">五、日常维护</h2>
+<p><strong>加词</strong>：一条命令，一分钟全集群生效。</p>
+<pre><code class="language-bash">echo "新词条" | sudo tee -a /data/ik-dict/custom.dic
+</code></pre>
+<p>批量加词用 heredoc 更省事。带词性写 <code>词条#nz</code>。</p>
+<p><strong>删词</strong>：这是 IK 的已知行为——热更新<strong>只增不减</strong>，已加载进内存的词不会因为从词典里删掉而消失。想真正删掉，要么重启节点全量加载，要么把词典文件改名（让 IK 重新拉取），推荐后者：</p>
+<pre><code class="language-bash">sudo mv /data/ik-dict/custom.dic /data/ik-dict/custom.dic.old
+# 重新写入一份不含待删词的新 custom.dic
+</code></pre>
+<p><strong>改词性</strong>同理，只对新增生效。</p>
+<p><strong>备份</strong>：词典虽然是纯文本，但丢了就是线上分词立刻跑偏，建议定期留一份：</p>
+<pre><code class="language-bash">sudo cp /data/ik-dict/custom.dic /data/ik-dict/backup/custom.dic.$(date +%Y%m%d)
+</code></pre>
+<p><strong>词典体积</strong>：IK 启动时把词典全量读进每个节点的内存，几万词以上会明显拖慢启动并占用堆，别把整个行业词库一股脑塞进去。</p>
+<p><strong>本地 + 远程同时配置</strong>：<code>ext_dict</code> 保证节点启动时基础词一定可用（哪怕词典服务暂时挂了），<code>remote_ext_dict</code> 负责日常热更新 —— 两者并存是最稳的组合。</p>
+<h2 id="六最后的检查清单">六、最后的检查清单</h2>
+<p>给容器化 ES 配 IK 自定义词典，收尾时确认这几条：</p>
+<ol>
+<li>插件目录、配置目录<strong>两个都挂载</strong>，缺一会导致重建即失联；</li>
+<li>节点采用 <code>1000:1000</code> 属主，同步用 <code>chmod a+rX</code> 而不是改属主，<strong>数据目录尤其不能动</strong>；</li>
+<li>三台节点的插件版本、<code>IKAnalyzer.cfg.xml</code> 内容完全一致；</li>
+<li>词典文件 UTF-8 无 BOM，每行一词；</li>
+<li>远程词典服务有 <code>Last-Modified</code>，三节点网络可达 8080；</li>
+<li>用 <code>_analyze</code> + <code>ik_max_word</code> 验证，而不是只看文件在不在；</li>
+<li>重建节点<strong>逐台进行</strong>，每台起来并加回集群后再动下一台，避免分片恢复压力叠加。</li>
+</ol>
+<p>整套配好之后，日常维护确实只剩下"一条 <code>echo</code> + 等 60 秒"，但前期把目录、权限、挂载这三件事理顺，才是真正省时间的地方。</p>
+<blockquote>
+<p>注：文中 IP、主机名、账号、密码、集群名、索引与路径等均已做匿名化/占位符处理，示例账号密码一律用 <code>${ES_PWD}</code> 环境变量代替。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-13 08:53">2026-11-13 08:53</span>&nbsp;
+<a href="https://www.cnblogs.com/yellow3gold">新*</a>&nbsp;
+阅读(<span id="post_view_count">16</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23649681);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyellow3gold%2Fp%2F23649681&amp;targetId=23649681&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

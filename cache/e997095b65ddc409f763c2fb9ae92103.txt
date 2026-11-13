@@ -1,0 +1,209 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MrHuo/p/23649930/agent-from-scratch-05" title="发布于 2026-11-13 09:18">
+    
+
+    <span role="heading" aria-level="2">手搓 AI Agent 05：多工具协作——让 Agent 自己决定先搜再读、还能并行抓网页</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>系列大纲 · 手搓 AI Agent（Node.js / TypeScript）</strong></p>
+<p>本系列从零手搓一个<strong>通用工具型 Agent</strong>：能对话、能调用工具、能规划任务、能多 Agent 协作，并最终接入 MCP 生态。技术栈锁定 <strong>Node.js 22 + TypeScript</strong>，模型接入层用一套 <strong>OpenAI 兼容抽象</strong>通吃 OpenAI / DeepSeek / 通义 / OpenRouter——改 <code>.env</code> 即可换模型，内核零改动。每篇代码可跑、可测、可 <code>git checkout post-NN</code> 回溯到任意一篇起点，图文在多平台同步发布。</p>
+</blockquote>
+<p><strong>总目录（14 篇主线 + 1 篇收尾）</strong></p>
+<blockquote>
+<ol>
+<li>开篇：什么是 Agent，为什么不直接用框架</li>
+<li>工程地基：Node22 + TS + 统一 LLM 客户端</li>
+<li>心脏：Agent Loop 与 ReAct</li>
+<li>长出手脚：Tool 系统设计</li>
+<li>第一个真工具：搜索 / 计算 / 读文件</li>
+<li>多工具协作：串行编排与并行执行（<strong>本文</strong>）</li>
+<li>记忆的两种形态</li>
+<li>会规划：Plan-and-Execute</li>
+<li>多 Agent 协作</li>
+<li>接外部世界：MCP 实战</li>
+<li>让 Agent 可信：权限 / 沙箱 / 人工介入</li>
+<li>持久化与恢复：会话、状态、崩溃续跑</li>
+<li>上线与可观测</li>
+<li>收尾：本系列手搓的 vs 业界 ADK / Mastra</li>
+</ol>
+<p>当前篇：第 5 篇（对应总目录第 6 项·多工具协作）——在第 4 篇四个真工具（calculator / readFile / searchFiles / webFetch）的基础上，让 Agent 在一个任务里<strong>自主串联、并行多个工具</strong>。重点是两种协作形态：依赖型必须串行跨轮次编排，独立型可以在同一轮里并行执行；以及代码层如何让并行真正提速而不破坏 <code>tool_call_id</code> 的对应。</p>
+<p><strong>配套代码仓库</strong>：<a href="https://github.com/mrhuo/agent-from-scratch" target="_blank" rel="noopener nofollow">https://github.com/mrhuo/agent-from-scratch</a> （每篇对应一个 <code>post-NN</code> tag，<code>git checkout post-05</code> 即可回到本篇代码起点）</p>
+</blockquote>
+<h1 id="手搓-ai-agent-05多工具协作让-agent-自己决定先搜再读还能并行抓网页">手搓 AI Agent 05：多工具协作——让 Agent 自己决定先搜再读、还能并行抓网页</h1>
+<p>第 4 篇给 Agent 装上了四个真工具，它能"算、读、搜、抓"。但"有工具"和"会用工具协作"是两回事。给模型一个 <code>calculator</code>，它能算出 96；给模型四个工具，它也能在<strong>一次对话里连续调用</strong>它们。可一旦任务变复杂——"在资料里搜一下 agent、把命中的计划文件读出来、再告诉我它讲了什么"——就不再是"调一个工具"能解决的了：任务被拆成了<strong>一连串有先后、有依赖的动作</strong>，而且其中某些动作彼此独立，本可以<strong>同时做</strong>。</p>
+<p>这一篇要解决的，正是"协作"两个字：<strong>谁来决定工具调用的顺序？多个独立调用能不能一起跑？</strong> 你会发现，真正要改的代码极少（十几行），难的还是把"并行"这件事做对、不破坏已有的错误隔离与上下文结构。</p>
+<hr>
+<h2 id="00-引子为什么会调工具还不够">00 引子：为什么"会调工具"还不够</h2>
+<p>先区分两个层次：</p>
+<ul>
+<li><strong>单工具调用</strong>：模型决定"这一步调谁、传什么参数"。第 2、3、4 篇已经解决——循环负责转、注册表负责校验与执行、错误隔离负责不崩。</li>
+<li><strong>多工具协作</strong>：模型决定"先调谁、后调谁、哪几个可以一起调"。这一步的顺序和并发，不是写死在代码里的，而是<strong>由模型在每一轮自己判断</strong>，循环的"转圈"只是把它的判断落地。</li>
+</ul>
+<p>为什么这值得单独写一篇？因为一旦涉及多个工具，<strong>顺序和依赖</strong>就变成头等大事：</p>
+<ul>
+<li>"先 <code>searchFiles</code> 找到文件名，再 <code>readFile</code> 读它"——这两步有依赖，必须一前一后；让模型并行发，第二个还没拿到文件名就调 <code>readFile</code>，必然失败。</li>
+<li>"同时抓 <code>example.com</code> 和 <code>example.org</code> 两个网页"——这两步各跑各的，谁先谁后无所谓，一起发能省一半时间。</li>
+</ul>
+<p>把这两类混为一谈，要么慢（明明能并行却一个个等），要么错（明明有依赖却并行乱调）。下面先把形态钉死，再改代码。</p>
+<hr>
+<h2 id="01-概念多工具协作的两种形态">01 概念：多工具协作的两种形态</h2>
+<p>一个任务里的多个工具调用，按"有没有依赖"分成两类：</p>
+<h3 id="11-串行编排跨轮次因为有依赖">1.1 串行编排（跨轮次，因为有依赖）</h3>
+<p>当<strong>后一个工具需要前一个的返回</strong>时，它们只能在不同的模型轮次里发生。原因是：模型在发出工具调用时，还不知道前一个工具会返回什么——它必须先看到第一轮的观察（比如"命中了 <code>docs/plan.md</code>"），才能在第二轮决定"那我读 <code>docs/plan.md</code>"。</p>
+<p>这种编排<strong>不需要写任何代码</strong>：它就是 Agent Loop 的自然行为。模型第一轮调 <code>searchFiles</code> → 观察写回上下文 → 第二轮模型读到观察 → 调 <code>readFile</code> → 观察再写回 → 第三轮信息够了，给答案。循环每转一圈，上下文就多一份观察，模型的决策就往前推一步。代码要做的只是"别拦住它转圈"，而第 2 篇的循环本来就支持。</p>
+<h3 id="12-并行执行同轮次因为独立">1.2 并行执行（同轮次，因为独立）</h3>
+<p>当多个工具调用<strong>彼此独立</strong>时，模型可以在<strong>同一次回复里一次性发出多个 <code>tool_calls</code></strong>。OpenAI / DeepSeek 的接口本来就支持一个回复带多个 <code>tool_calls</code>——问题在旧代码的执行环节：它用 <code>for</code> 循环<strong>一个一个串行</strong>地跑，两个各耗 1 秒的抓取会被串成 2 秒。</p>
+<p>这一篇的核心改动，就是把这个串行执行换成<strong>并行执行</strong>。</p>
+<h3 id="13-谁来决定串行还是并行">1.3 谁来决定"串行还是并行"</h3>
+<p>关键认知：<strong>编排者是模型，引擎是循环</strong>。代码不预知任务，也不写"先搜后读"的流程；代码只保证两件事——</p>
+<ul>
+<li>依赖型调用，因为观察要等上一轮，天然被循环拆成两轮（串行由数据结构保证）；</li>
+<li>独立型调用，如果模型一次发了多个，代码就并行执行（并发由 <code>Promise.all</code> 保证）。</li>
+</ul>
+<p>你只需要<strong>告诉模型这件事的可能性</strong>（写在系统提示里），它自己会在合适的任务上选择并行。</p>
+<hr>
+<h2 id="02-代码把同一轮的多个工具调用并行起来">02 代码：把同一轮的多个工具调用并行起来</h2>
+<p>改动只落在 <code>src/agent/Agent.ts</code> 里，且只动"执行工具调用"那一小段。</p>
+<h3 id="21-旧逻辑串行-for-循环">2.1 旧逻辑：串行 for 循环</h3>
+<p>第 4 篇留下的是这样：</p>
+<pre><code class="language-ts">// 旧：一次回复里的多个 tool_calls，逐个串行执行
+for (const call of result.toolCalls) {
+  const observation = await this.runTool(call); // 等这一个跑完，才跑下一个
+  this.conversation.push({ role: "tool", content: observation, tool_call_id: call.id });
+}
+</code></pre>
+<p>两个各 1 秒的抓取会被串成 2 秒。更糟的是，模型明明在一条消息里说了"我同时抓这两个"，执行端却偷偷排了队。</p>
+<h3 id="22-新逻辑promiseall-并行">2.2 新逻辑：Promise.all 并行</h3>
+<pre><code class="language-ts">// src/agent/Agent.ts（节选）
+// 一次回复可能要求调用多个工具。彼此独立的调用（如并行抓取两个网页）
+// 用 Promise.all 同时跑，省时间；彼此依赖的调用模型会自动拆成两轮，
+// 依赖关系的编排由上面的 for 循环自然完成。registry.run 永不抛异常
+// （失败转成观察文本），所以 Promise.all 不会因单个工具失败而短路。
+const executed = await Promise.all(
+  result.toolCalls.map(async (call) =&gt; {
+    const actionText = `${call.function.name}(${JSON.stringify(call.function.arguments)})`;
+    const observation = await this.runTool(call);
+    return { id: call.id, actionText, observation };
+  }),
+);
+for (const { id, actionText, observation } of executed) {
+  steps.push({ kind: "action", text: actionText });
+  steps.push({ kind: "observation", text: observation });
+  this.conversation.push({
+    role: "tool",
+    content: observation,
+    tool_call_id: id,
+  });
+}
+</code></pre>
+<p>三点要讲清楚：</p>
+<ol>
+<li><strong>并发由 <code>Promise.all</code> 完成</strong>。多个 <code>runTool</code> 同时被 <code>await</code>，谁先返回谁先算完，墙钟时间约等于最慢那一个，而不是相加。</li>
+<li><strong><code>tool_call_id</code> 的对应没被破坏</strong>。每个观察都带着自己对应的 <code>id</code>，写回上下文时分别挂到正确的 <code>tool_call_id</code> 上。模型下一次看到的是"调用 a1 得到 x、调用 a2 得到 y"，不会串味——这是 OpenAI function calling 协议的硬性要求，并行时尤其容易写错，这里用"先收集、再按原顺序回写"绕开了竞态。</li>
+<li><strong>不会因单个失败而短路</strong>。<code>registry.run()</code> 内部 <code>try/catch</code> 把任何异常转成观察文本，所以 <code>Promise.all</code> 拿到的永远是已解析的值，不存在某个工具抛 reject 导致其余观察丢失的情况。错误隔离这一篇仍然成立。</li>
+</ol>
+<h3 id="23-系统提示给模型并行的许可">2.3 系统提示：给模型"并行"的许可</h3>
+<p>代码能并行，但模型未必会发多个 <code>tool_calls</code>。在第 4 篇的默认系统提示里补一段编排指引，把"什么时候并行、什么时候串行"明说：</p>
+<pre><code class="language-ts">// src/agent/Agent.ts（DEFAULT_SYSTEM_PROMPT 追加）
+"关于多工具协作：如果多个工具调用彼此独立（例如同时抓取两个网页、同时读两个文件），" +
+"请在同一次回复里一次性发出，我会并行执行它们；如果后一个工具需要前一个的返回结果" +
+"（例如先 searchFiles 找到文件名、再 readFile 读它），就分两轮，先拿到观察再决定下一步。";
+</code></pre>
+<p>这段提示不改变任何代码路径，只是降低模型"默认一个一个发"的倾向。实测里加上它之后，遇到"同时抓两个网页"这种明显独立的任务，模型会主动在同一条消息里发两个 <code>webFetch</code>。</p>
+<hr>
+<h2 id="03-数据流循环形态没变只是转得更快">03 数据流：循环形态没变，只是转得更快</h2>
+<p>工具还是那四个，注册表还是那个注册表，变化的只是"一次模型回复里的多个调用怎么落地"：</p>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261113091736730-1373765944.png" alt="多工具协作架构：串行编排 vs 并行执行" loading="lazy"></p>
+<ul>
+<li><strong>串行路径</strong>：模型第一轮发 <code>searchFiles</code> → <code>registry.run</code> 执行 → 观察写回 → 第二轮模型读观察发 <code>readFile</code> → 再写回 → 第三轮给答案。每一步的"下一步"都由模型基于上一轮的观察决定，循环只是反复调用 <code>chatWithTools</code>。</li>
+<li><strong>并行路径</strong>：模型一条消息发两个 <code>webFetch</code> → <code>Promise.all</code> 同时执行 → 两个观察按 <code>id</code> 分别写回 → 下一轮模型拿到两份结果一起总结。</li>
+</ul>
+<p>两条路径共用同一套 <code>registry.run()</code> 与错误隔离，新增的只是"并行"这一个加速器。</p>
+<hr>
+<h2 id="如何运行本章代码">如何运行本章代码</h2>
+<p>配套代码已全部推到 GitHub，每篇对应一个 <code>post-NN</code> tag。跟随本章，先切到 <code>post-05</code> 的代码状态，再逐步运行：</p>
+<pre><code class="language-bash"># 1. 克隆仓库
+git clone https://github.com/mrhuo/agent-from-scratch.git
+cd agent-from-scratch
+
+# 2. 切到本篇（第 5 篇）对应的代码快照
+git checkout post-05
+
+# 3. 安装依赖（需要 Node.js &gt;= 22，否则内置 fetch 不可用）
+npm install
+
+# 4. 配置密钥：复制模板，填入你的 API Key
+cp .env.example .env
+#   然后编辑 .env，填入：
+#     OPENAI_API_KEY=sk-xxxxxxxx（填入申请的 API Key）
+#     BASE_URL=https://api.deepseek.com   # DeepSeek 兼容地址，注意【不带 /v1】
+#     MODEL=deepseek-flash
+
+# 5. 启动 Agent 对话（输入一句，Agent 可能连续调用多个工具，输入 exit 退出）
+npm run dev
+
+# 6. 跑单元测试（mock，无需 key / 外网）
+npm test
+
+# 7. 类型检查
+npm run typecheck
+</code></pre>
+<p>说明：<code>.env</code> 已被 <code>.gitignore</code> 忽略，不会进入提交，密钥只留在本机。想直观看到协作效果，可以试这两句（前者触发串行编排，后者触发并行）："在资料目录里搜索 agent 这个词，找到提到的文件后读一下 docs/plan.md，告诉我它主要讲了什么"、"请在同一轮里并行抓取 <a href="https://example.com" target="_blank" rel="noopener nofollow">https://example.com</a> 和 <a href="https://example.org" target="_blank" rel="noopener nofollow">https://example.org</a> 两个网页，分别告诉我校验它们的页面标题文字"。若 <code>npm run dev</code> 报连接超时，先确认 <code>.env</code> 里 <code>BASE_URL</code> 没写成带 <code>/v1</code> 的地址（DeepSeek 不带 <code>/v1</code>）。</p>
+<hr>
+<h2 id="04-验证这一章代码做了什么实现了什么效果">04 验证：这一章代码做了什么、实现了什么效果</h2>
+<p>代码位置：<code>src/agent/Agent.ts</code>（<code>run()</code> 内工具执行由串行 <code>for</code> 改为 <code>Promise.all</code> 并行；<code>DEFAULT_SYSTEM_PROMPT</code> 追加编排指引）、<code>tests/collaboration.test.ts</code>（新增 3 个用例）。</p>
+<p><strong>做了什么</strong>：把"同一轮模型回复里的多个工具调用"从串行执行改为并行执行，并将"串行编排 / 并行执行"两种协作形态讲透。Agent 内核之外没有新增任何抽象——并行只是把 <code>runTool</code> 包进 <code>Promise.all</code>，顺序与 <code>tool_call_id</code> 对应靠"先收集再回写"保证。第 4 篇埋下的"模型是编排者、循环是引擎"的认知，在这里被显式兑现。</p>
+<p><strong>实现了什么效果</strong>，三组证据：</p>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261113091640772-1157158420.png" alt="验证结果" loading="lazy"></p>
+<ol>
+<li><strong>单元测试 36/36 通过</strong>（<code>npm test</code>，5 个文件共 36 用例：第 1 篇 <code>llm.test.ts</code> 6 例、第 2 篇 <code>agent.test.ts</code> 6 例、第 3 篇 <code>tools.test.ts</code> 13 例、第 4 篇 <code>tools-real.test.ts</code> 8 例、本篇新增 <code>collaboration.test.ts</code> 3 例）。新增用例专门覆盖协作：单轮多工具并行时每个观察按 <code>tool_call_id</code> 对应；两个各耗时 50ms 的假工具同轮调用，断言它们的时间区间<strong>重叠</strong>且总耗时远低于 100ms（证明确实并发而非排队）；依赖型工具跨轮次串行时，后一个工具拿到的参数确实来自前一个工具的观察。</li>
+<li><strong>类型检查 0 errors</strong>（<code>npm run typecheck</code>，<code>tsc --noEmit</code>，<code>strict</code> + <code>noUncheckedIndexedAccess</code> 全开）。<code>Promise.all</code> 收集的是 <code>{ id, actionText, observation }</code> 结构，回写时类型闭合。</li>
+<li><strong>真实对话端到端跑通</strong>（DeepSeek <code>deepseek-flash</code>，见下）：</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261113091624237-472845179.png" alt="真实对话验证" loading="lazy"></p>
+<p>真实运行显示两轮对话：第一轮用户要求"搜 agent、读 plan.md、总结"，模型自主走出 <code>searchFiles</code> → <code>readFile</code> → 回答的<strong>串行编排</strong>，第二步 <code>readFile</code> 的路径正是第一步观察给出的 <code>docs/plan.md</code>；第二轮用户要求"并行抓两个网页"，模型在<strong>同一条消息里发出两个 <code>webFetch</code></strong>，由 <code>Promise.all</code> 同时抓回，再一并总结标题。串行与并行两种形态在同一会话里都得到了验证。</p>
+<p><strong>三个工程坑记录</strong>（均已在代码中处理）：</p>
+<ul>
+<li><strong>并行必须用 <code>Promise.all</code> 收集后再按序回写</strong>。<code>runTool</code> 内部有 <code>await</code>，若边跑边 <code>push</code> 到步骤日志和上下文，多个调用的日志会交错、且 <code>tool_call_id</code> 容易挂错。先收集成数组、再统一 <code>for</code> 回写，既保证顺序可读，又保证 id 对应。</li>
+<li><strong>并行不会因单个失败短路，是因为 <code>registry.run</code> 永不抛异常</strong>。这一点是第 3 篇"错误隔离"的红利：工具执行异常被转成观察文本，<code>Promise.all</code> 拿到的都是正常值。如果哪天有人把 <code>run</code> 改成 <code>throw</code>，并行就会因为一个工具出错而丢掉其余所有观察。</li>
+<li><strong>步骤日志里并行调用看着像"挨个执行"</strong>。<code>[行动]</code>/<code>[观察]</code> 在终端里是按顺序打印的，这只是日志展示顺序，不代表墙钟上的执行顺序——两个 <code>webFetch</code> 其实是同时发的。理解这一点，才不会误以为"并行没生效"。</li>
+</ul>
+<hr>
+<h2 id="05-本篇埋的雷">05 本篇埋的雷</h2>
+<p>这一章让 Agent 能在一个任务里自主串联、并行多个工具，但三处问题仍然悬着，串起后续篇章：</p>
+<ul>
+<li><strong>模型未必每次都选对"串行还是并行"</strong> 。提示写明了规则，但模型仍可能在有依赖时也一次性发出（比如没等 <code>searchFiles</code> 返回就并行 <code>readFile</code>），结果第二个工具拿到空参数、触发 <code>validation</code> 观察，靠循环重试才纠正。更稳妥的"先规划再执行"是第 7 篇（Plan-and-Execute）的主题。</li>
+<li><strong><code>maxSteps</code> 在复杂任务里会更早触顶</strong> 。原来一个工具一回合，现在一个任务可能要"搜→读→算→总结"好几步，原先 8 步的预算在长任务里会不够，触发兜底回答。步数上限该不该按任务动态给，是第 7 篇规划拆子任务时要一起考虑的。</li>
+<li><strong>工具越多，模型越容易"选错、排乱"</strong> 。本篇四个工具模型还能驾驭，但注册表塞到二十个工具后，它可能在"该用 searchFiles 还是 webFetch"上纠结，或者并行发了一堆不相关的调用。这涉及工具描述怎么写得更区分度强、以及是不是该引入"先想清楚步骤"的规划层——同样指向第 7 篇。</li>
+</ul>
+<hr>
+<p>判断：多工具协作让 Agent 从"会调单个工具"进到"会在任务里自己排顺序、能并行提速"，但依赖误判、步数预算、工具膨胀这三类问题还没根治。看点：下一篇给 Agent 装上"记忆"——短期记住本轮上下文、长期记住跨会话的偏好与事实，否则每开一次对话它都像失忆。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    专注互联网产品开发，分享工具心得。
+做好每一件或大或小的事情。
+http://www.mrhuo.com
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-13 09:19">2026-11-13 09:18</span>&nbsp;
+<a href="https://www.cnblogs.com/MrHuo">开发者精选资讯</a>&nbsp;
+阅读(<span id="post_view_count">50</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23649930);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FMrHuo%2Fp%2F23649930%2Fagent-from-scratch-05&amp;targetId=23649930&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
