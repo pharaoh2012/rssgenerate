@@ -1,0 +1,330 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/jeff-tsai/p/23636206/day-17-client-connector" title="发布于 2026-11-12 08:48">
+    
+
+    <span role="heading" aria-level="2">Day 17：Connector 与调用端的职责收敛</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3864267/202611/3864267-20261112084835430-1011984979.png" alt="Day 17：Connector 与调用端的职责收敛" class="desc_img">
+        同进程调用与跨网络调用怎么变成同一个调用，两者真正的差别在哪里。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="Day 17：Connector 与调用端的职责收敛" loading="lazy" data-src="https://raw.githubusercontent.com/jeff377/blog-images/main/2026-day-17-sc.png" class="lazyload"></p>
+<p>昨天谈的是一次调用送进服务端之后怎么被处理。同一份契约在调用端这一侧也得有人负责：有的调用端连的是网络另一头的服务器，有的跑在后端逻辑的同一个进程里，两边要调用的却是同一支方法。</p>
+<p>中间那些跟业务无关的事如果留给每一个前端各自处理，有几个前端就会有几种写法，而且同一个错会在每一个前端各自发生一次。框架的答案是在调用端也放一层 Connector，所有前端都经过它。</p>
+<p>本篇说明：</p>
+<ol>
+<li>调用端要处理的有哪几件事，为什么收在同一个类型里</li>
+<li>近端与远程连接怎么变成同一个调用，真正的差别在哪里</li>
+<li>哪些状态属于一个登录的用户，哪些属于整个应用</li>
+</ol>
+<hr>
+<h2 id="一调用端的职责不只是送出去">一、调用端的职责，不只是送出去</h2>
+<p>一次保存从界面出发、到数据库为止，中间经过的层是固定的：</p>
+<pre><code class="language-text">调用端
+  界面
+    ↓
+  DataObject：框架提供的 ViewModel，包住 DataSet 供界面绑定（Day 2）
+    ↓
+  Connector（本篇）
+    ↓  一次 JSON-RPC 调用
+
+服务端
+  API 派发：method 切成 ProgId 与 action（Day 16）
+    ↓
+  BO：ProgId 从类型注册表换来的那一个（Day 15）
+    ↓
+  Repository：依 FormSchema 现组增修删查的语句（Day 5）
+    ↓
+  数据库
+</code></pre>
+<p>图上那一层 Connector，是调用端这一侧处理 JSON-RPC 调用的角色：一次调用怎么组成请求、怎么送出去、响应怎么还原，都由它负责，而前端不必知道另一端是网络另一头还是同一个进程。</p>
+<p>界面那一层想做的事只有一句「把这张表单存回去」。要让这句话真的成立，中间有一串与这张表单无关的事，而且每一件都必须做对。</p>
+<table>
+<thead>
+<tr>
+<th>这一件事</th>
+<th>收敛之后由谁做</th>
+<th>不收敛的话由谁做</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>寻址</td>
+<td>ProgId 与 action 接成 method</td>
+<td>每个调用点自己拼字符串</td>
+</tr>
+<tr>
+<td>身份</td>
+<td>令牌与 API 密钥放进该放的位置</td>
+<td>每次调用自己组请求头</td>
+</tr>
+<tr>
+<td>传输</td>
+<td>依模式挑一条路送出并收回</td>
+<td>每个前端各自接一次</td>
+</tr>
+<tr>
+<td>编码</td>
+<td>决定这一次要不要编码与加密</td>
+<td>每个前端各实现一次</td>
+</tr>
+<tr>
+<td>时区</td>
+<td>出去换成 UTC、回来换回用户的时区</td>
+<td>每个界面各换一次，还要记得换</td>
+</tr>
+<tr>
+<td>返回</td>
+<td>API payload 里的内容转成调用端声明的类型</td>
+<td>自己反序列化</td>
+</tr>
+<tr>
+<td>错误</td>
+<td>错误字段翻回一个异常</td>
+<td>每个调用点自己判错误码</td>
+</tr>
+</tbody>
+</table>
+<p>七件事全部收在 <a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Api.Client/Connectors/ApiConnector.cs" target="_blank" rel="noopener nofollow"><code>ApiConnector</code></a> 的 <code>ExecuteAsync</code> 这一条路上。拿掉追踪与异常包装之后，它的骨架是这样：</p>
+<pre><code class="language-csharp">protected async Task&lt;T&gt; ExecuteAsync&lt;T&gt;(string progId, string action, object value, PayloadFormat format)
+{
+    var timeZoneId = UserTimeZoneId;
+    T result;
+    using (PayloadZoneConverter.ToUtc(value, timeZoneId))
+    {
+        var (request, actualFormat) = PrepareRequest(progId, action, value, format);
+        var response = await this.Provider.ExecuteAsync(request);
+        result = FinalizeResponse&lt;T&gt;(response, actualFormat);
+    }
+    PayloadZoneConverter.ToUserZone(result, timeZoneId);
+    return result;
+}
+</code></pre>
+<p><code>PrepareRequest</code> 组出来的那份请求，<code>Method</code> 就是 <code>$"{progId}.{action}"</code>，也就是昨天谈过的两段式 method，而切它的那一段在服务端。两端的 JSON-RPC payload 是同一份代码组出来的，所以昨天那四处与规格的距离，框架自己的调用端一处都碰不到。<code>FinalizeResponse</code> 是把错误字段翻回异常的地方，每个前端因此不必各自认得错误码；那些码各自是什么意思，是明天的题目。</p>
+<p>这七件事不只是一份清单，它们的先后是固定的。时区要在编码之前换完，编码之后 <code>params</code> 那一格里已经是字节；回程的解码要在转成类型之前。</p>
+<p>其中一对是刻意排的：错误在解码之前就判读了，因为错误字段挂在 JSON-RPC payload 本身、不在被编码的那一格里，一次失败的调用不必先解一次密才知道自己失败了。服务端那条管道也有一处这样刻意排的顺序，调用端这一条短得多，道理是同一个。</p>
+<p>昨天那条受理分界在调用端也有另一面：受理之前的失败回的是 HTTP 状态码、受理之后走错误字段，而调用端送出请求的那一句会检查状态码，于是两种失败在这里是两个不同的 catch。</p>
+<h3 id="三个子类三种取得-progid-的方式">三个子类，三种取得 ProgId 的方式</h3>
+<p>基底类只管上面那条路，ProgId 从哪里来由子类决定。</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>ProgId 从哪来</th>
+<th>负责哪一类调用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ApiConnector</code></td>
+<td>调用时传入</td>
+<td>抽象基底，不直接使用</td>
+</tr>
+<tr>
+<td><code>SystemApiConnector</code></td>
+<td>固定 <code>System</code></td>
+<td>系统层级：登录、进出公司、取定义</td>
+</tr>
+<tr>
+<td><code>LogApiConnector</code></td>
+<td>固定 <code>AuditLog</code></td>
+<td>系统层级：轨迹查询</td>
+</tr>
+<tr>
+<td><code>FormApiConnector</code></td>
+<td>构造函数带进来</td>
+<td>表单层级：任何一张表单</td>
+</tr>
+</tbody>
+</table>
+<p>两个固定值都是 Day 15 那份类型注册表里的保留字。保留字在服务端是注册表的键，在调用端则是一个不需要参数的构造函数，同一个决定的两面。</p>
+<p>表单层级的六个 action，在 <code>FormApiConnector</code> 上各有一支对应的方法：<code>GetListAsync</code>、<code>GetLookupAsync</code>、<code>GetNewDataAsync</code>、<code>GetDataAsync</code>、<code>SaveAsync</code>、<code>DeleteAsync</code>。昨天说八张表单与上千张表单都是那六个 action，这里是它在调用端的形状：上千张表单共用同一个类型，差别只在构造时给的那个字符串。</p>
+<h2 id="二同一个调用近端与远程">二、同一个调用，近端与远程</h2>
+<p>一套 ERP 的调用端不会只有一种部署形状，桌面、浏览器与服务端自己的后台服务都算。把它们分成两类的是与后端逻辑之间隔着什么：</p>
+<ul>
+<li>远程：用户手上的前端发出调用，过一个网络到服务端，再由服务端走到 BO</li>
+<li>近端：后台服务要走同一份契约时，中间没有网络，同一个进程里就走到 BO</li>
+</ul>
+<p>框架的处理是把「怎么送出去」抽成一个接口，而这个接口只有一支方法：<code>Task&lt;JsonRpcResponse&gt; ExecuteAsync(JsonRpcRequest request)</code>。两个实现。远程那一支（<a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Api.Client/Providers/RemoteApiProvider.cs" target="_blank" rel="noopener nofollow"><code>RemoteApiProvider</code></a>）把请求转成 JSON、加上两个请求头、POST 出去、把回来的字符串还原：</p>
+<pre><code class="language-csharp">var headers = new NameValueCollection
+{
+    { ApiHeaders.ApiKey, ApiClientInfo.ApiKey },
+    { ApiHeaders.Authorization, $"Bearer {AccessToken}" }
+};
+string json = await HttpUtilities.PostAsync(Endpoint, request.ToJson(), headers);
+return JsonCodec.Deserialize&lt;JsonRpcResponse&gt;(json)!;
+</code></pre>
+<p>送出用的 HTTP 客户端不是每次新建，依「协议加主机加端口」共用一份；浏览器环境另走一条，因为那里的连接池由浏览器自己管。</p>
+<p>近端那一支（<a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Api.Client/Providers/LocalApiProvider.cs" target="_blank" rel="noopener nofollow"><code>LocalApiProvider</code></a>）从进程内解析出昨天那个派发器，把令牌设上去，直接调用：</p>
+<pre><code class="language-csharp">executor.AccessToken = AccessToken;
+executor.IsLocalCall = true;
+return await executor.ExecuteAsync(request);
+</code></pre>
+<p>Day 13 说 BO 的构造函数第四个参数是「是否为同进程调用」，那个标志的两端在这里才接得起来：近端这一支明确设成 <code>true</code>，走 HTTP 进来的那一条维持默认的 <code>false</code>，中间一路传到工厂建 BO 的那一行。服务端有几支只接受同进程调用的维护方法，判准就是它（语义属 Day 23）。</p>
+<p>近端调用默认连编码与加密都不做，格式定成 <code>Plain</code>，那一整段不运行。数据从头到尾没有离开过内存，那一段的成本在同一个进程里换不到任何东西。</p>
+<p>启用调试模式时，近端调用照样走完整条编码与加密，于是开发时想确认自己那些数据序列化得正不正确，在同一个进程里就验得完，不必为此架一台服务器。</p>
+<h3 id="走哪一条由构造函数决定">走哪一条由构造函数决定</h3>
+<p><code>ConnectType</code> 这个枚举记的是决定，实际生效的是用了哪一个构造函数：</p>
+<pre><code class="language-csharp">protected ApiConnector(Guid accessToken, ApiSessionContext session)                    // 没有地址，近端
+protected ApiConnector(string endpoint, Guid accessToken, ApiSessionContext session)   // 有地址，远程
+</code></pre>
+<p>地址从何而来、要不要走远程，在更前面就决定了。<code>ApiConnectValidator</code> 拿到设置的地址，是本机路径就当近端、是网址就先探一次连通性再打一次 <code>Ping</code>；<code>SupportedConnectTypes</code> 是应用自己的声明，一个只允许远程的应用拿到本机路径会在这里被挡下，而不是等到第一次调用失败。</p>
+<h3 id="少了序列化就少了一道免费的边界">少了序列化，就少了一道免费的边界</h3>
+<p>两条路的差别不只是「有没有走网络」。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>远程</th>
+<th>近端</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>另一端是谁</td>
+<td>一个 HTTP 端点</td>
+<td>同一个进程里的派发器</td>
+</tr>
+<tr>
+<td>序列化</td>
+<td>JSON 进、JSON 出</td>
+<td>完全没有</td>
+</tr>
+<tr>
+<td>编码与加密</td>
+<td>依这一次的要求</td>
+<td>默认整段跳过</td>
+</tr>
+<tr>
+<td>令牌怎么带</td>
+<td><code>Authorization</code> 头</td>
+<td>派发器上的一个属性</td>
+</tr>
+<tr>
+<td>送出的对象</td>
+<td>对方拿到的是副本</td>
+<td>对方拿到的是同一个对象</td>
+</tr>
+</tbody>
+</table>
+<p>最后一行才是真正要处理的那一件。走网络时，序列化顺手做出一份副本，调用端后续怎么用自己那一份都不影响对方。同进程调用没有这道手续，于是远程免费得到的东西，近端要手工补回来。</p>
+<p>框架补的方式是在时区转换那一段换掉、用完换回去（<a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Api.Core/JsonRpc/PayloadZoneConverter.cs" target="_blank" rel="noopener nofollow"><code>PayloadZoneConverter</code></a>）：</p>
+<pre><code class="language-csharp">case SaveRequest request when request.DataSet != null:
+{
+    var original = request.DataSet;
+    request.DataSet = DateTimeZoneConverter.UserToUtc(original, timeZoneId);
+    return new PayloadSwap(() =&gt; request.DataSet = original);
+}
+</code></pre>
+<p>换上去的是一份新的数据，原本那一份在调用结束时放回去。少了这一步，调用端手上的数据会被换成 UTC 那一份，然后拿去重画界面。回程同理，响应里的数据是拷贝一份出来改，不是就地改，因为同进程时那个对象是服务端的。</p>
+<p>两条路要让调用端看不出差别，代价就是这类「其中一条本来就有、另一条要自己造」的细节。少做一件，症状不是报错，是界面上的值不对。</p>
+<p>要对两条路都成立的事，只能放在它们唯一都会经过的地方，也就是 Connector。时区换算就是这样挂上去的，换算本身是第七章的题目。</p>
+<h2 id="三什么属于一个用户什么属于整个应用">三、什么属于一个用户，什么属于整个应用</h2>
+<p>Connector 用到的那些状态要放在哪里，答案取决于一个进程里有几个用户。</p>
+<p>桌面应用一个进程只有一个用户，登录拿到的传输密钥与时区放在静态属性上完全正确，也最省事。服务器渲染的网页前端不是：同一个进程同时服务多条连接、每一条各自登录，而静态属性只有一组。后登录的人会盖掉前一个人的密钥，被盖掉的那些人接下来每一次调用都用别人的密钥加密，直到重新登录为止。</p>
+<p>框架因此把「属于一个登录用户」的状态收成一个类型 <code>ApiSessionContext</code>，里面只有两个值：这条连接的传输密钥，和这个用户的时区。</p>
+<p>判准比机制本身更通用：</p>
+<table>
+<thead>
+<tr>
+<th>这个值的拥有者是</th>
+<th>例子</th>
+<th>该放哪里</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>这个应用本身</td>
+<td>API 密钥、服务地址</td>
+<td>整个进程一份</td>
+</tr>
+<tr>
+<td>一个登录的用户</td>
+<td>传输密钥、时区</td>
+<td>逐个 session 一份</td>
+</tr>
+<tr>
+<td>这一次调用</td>
+<td>访问令牌</td>
+<td>构造函数参数，绑在那个 Connector 上</td>
+</tr>
+</tbody>
+</table>
+<p>应用那一行是容易做错的方向。API 密钥识别的是「哪一个应用在调用」而不是「谁在调用」，每条连接的值都一样，把它也切成逐 session 一份不会比较安全，只是把拥有者认错了。</p>
+<p>令牌那一行是第三种拥有者：它既不是应用层的，也不是挂在 session 状态上的，而是每一个 Connector 构造时就带进去、之后不能换。要换身份就换一个 Connector。远程路径把它变成 <code>Bearer</code> 头、近端路径把它设在派发器上，调用端不需要知道是哪一种。</p>
+<h3 id="令牌在调用端住在哪里">令牌在调用端住在哪里</h3>
+<p>两个前端家族的答案不一样，源头就是上面那个「一个进程里有几个用户」。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>桌面家族</th>
+<th>服务器渲染家族</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>令牌住在哪</td>
+<td>一个静态字段</td>
+<td>一个逐连接的组件，往下层层传递</td>
+</tr>
+<tr>
+<td>session 状态</td>
+<td>整个进程共用一份</td>
+<td>逐连接各一份</td>
+</tr>
+<tr>
+<td>Connector 怎么来</td>
+<td>静态方法现建</td>
+<td>注入一个逐连接的工厂</td>
+</tr>
+<tr>
+<td>换令牌</td>
+<td>连带丢掉缓存的 Connector 与定义缓存</td>
+<td>重新渲染，下层自己重取</td>
+</tr>
+</tbody>
+</table>
+<p>换令牌那一行是前面那条规则的直接后果：令牌在构造的时候就绑定、之后换不了，所以换一次令牌等于把手上那个 Connector 整个换掉。</p>
+<h2 id="回到-northwind">回到 Northwind</h2>
+<p>案例有四个前端：桌面、浏览器、iOS、Android。四个都跑同一个 Avalonia UI 项目，各自只有一段启动代码，而那段代码里与本篇有关的只有三件事：声明只支持远程、指定地址与密钥要存到哪、把出厂密钥当第一次运行的种子。UI 项目的项目文件里没有 <code>Bee.Api.Client</code> 这一笔，它要用的 Connector 由框架的 UI 组件建好之后交给它。</p>
+<p>四个前端共用一个 UI 项目，这件事之所以成立，一部分就是因为调用端这一层把差异吃掉了。唯一走出不同路径的是浏览器那一头：那个运行环境产不出 RSA 密钥对，于是登录时的密钥交换整段跳过，后续要求加密的调用由 Connector 自动降一级。调用的代码一个字都不用改。</p>
+<p>案例示范不出来的有两件。四个前端全部声明只支持远程，所以同进程那条路径在这套应用里一次都没有被走到，它活在测试与示范程序里。案例也没有服务器渲染的前端，所以「一个进程好几个用户」那条线在这里连发生的条件都没有。</p>
+<h2 id="小结">小结</h2>
+<p>把调用端该做的事收成一层，换到的是「可能写错的地方」从前端的数量变成一个。</p>
+<ul>
+<li>寻址、身份、传输、编码、时区、返回类型、错误，七件事收在同一条路上，两端的 JSON-RPC payload 因此是同一份代码组出来的</li>
+<li>近端与远程由构造函数重载决定，差别不只是有没有走网络，还包含远程免费附赠而近端必须自己造出来的那道副本边界</li>
+<li>状态该不该逐 session 一份，看的是这个值的拥有者是一个用户还是这个应用</li>
+<li>两条路唯一都会经过的点是 Connector，所以要对两者都成立的事只能放在那里</li>
+</ul>
+<p>最该带走的是第三点，因为这条线画错的两个方向不对称。把应用层的值切成逐 session 一份，代价只是多几份一模一样的副本；把用户的值放成整个进程共用，代价是另一个人的数据。前者浪费，后者是事故，而两者在单人测试下的表现完全相同。</p>
+<p>明天谈调用失败的那一半：一个业务规则挡下来的保存，要用什么形式让调用端知道，而哪些消息可以原样送到用户面前。</p>
+<hr>
+<p>本文为 2026 iThome 铁人赛参赛文章，原文为繁体中文。</p>
+<p><a href="https://ithelp.ithome.com.tw/articles/10406905" target="_blank" rel="noopener nofollow">iThome 原文</a> ｜ <a href="https://hackmd.io/@jeff377/day-17-client-connector" target="_blank" rel="noopener nofollow">HackMD 版</a></p>
+<p>系列完整目录：<a href="https://www.cnblogs.com/jeff-tsai/p/23459221/ironman-2026" target="_blank">ERP 架构师笔记：定义驱动的框架设计</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-12 08:49">2026-11-12 08:48</span>&nbsp;
+<a href="https://www.cnblogs.com/jeff-tsai">Jeff-Tsai</a>&nbsp;
+阅读(<span id="post_view_count">52</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23636206);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjeff-tsai%2Fp%2F23636206%2Fday-17-client-connector&amp;targetId=23636206&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
