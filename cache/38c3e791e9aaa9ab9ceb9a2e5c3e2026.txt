@@ -1,0 +1,303 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/leikooo/p/23666738" title="发布于 2026-11-14 19:39">
+    
+
+    <span role="heading" aria-level="2">刚说好别动这个文件，Agent 怎么又改了？聊聊上下文压缩</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>用 Agent 跑长任务，迟早会碰到这一幕：屏幕上跳出一行 <code>Compacting conversation…</code>，等它转完，Agent 继续干活，但好像忘了点什么，刚才说好的「别动这个文件」，过一会它又去改了😅。</p>
+<p>这一步叫 <strong>compaction</strong>（上下文压缩）。看起来就是「把聊天记录总结一下」，但各家 harness 在这件事上花的心思差别挺大：有的在本地让模型写一份交接文档，有的直接交给服务端返回一段加密数据，有的做了五层级联，有的把原始记录一条不删地留着让你随时回去翻。</p>
+<p>这篇文章把最近几个比较有代表性的实现拆开看看：<strong>Codex、Claude Code、Hermes Agent、pi</strong>。不过在看它们之前，得先搞清楚一件事：为什么非压不可呢？</p>
+<p>大模型做的事情说起来很简单：给它一串 token，它预测下一个 token，然后把预测出来的拼回去，再预测下一个……一直循环到结束。</p>
+<p>关键在于：<strong>模型本身是无状态的</strong>。它不会「记得」上一轮聊了什么。你在聊天界面里感受到的「记忆」，其实是客户端每一轮都把<strong>完整的对话历史</strong>重新发给模型，系统提示词、你说过的每句话、它回过的每句话，全部再喂一遍。</p>
+<p>所以对话越长，每次请求就越大。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926050-1908693027.png" alt="模型无状态，每轮重发完整历史" loading="lazy"></p>
+<p>模型一次能「看」的 token 数量有上限，这就是<strong>上下文窗口</strong>（context window），现在常见的是 200K，大一些的能到 1M。</p>
+<p>可以把它想成一张办公桌：桌面就这么大，资料越堆越多，最后总有放不下的时候。而且就算还没堆满，资料一多也会出问题：</p>
+<ul>
+<li><strong>贵</strong>：Transformer 的注意力机制要让每个 token 和前面的 token 都打个照面，上下文越长，计算量和费用越高，响应也越慢。</li>
+<li><strong>容易看漏</strong>：研究和实践都发现，上下文很长时，模型对中间部分的信息不太敏感，这种现象常被叫做 context rot。桌上东西太多，真正重要的那张纸反而找不到了。</li>
+</ul>
+<p>Agent 场景更费桌子。普通聊天，几十轮下来也就几万 token。Agent 就不一样了：读一个文件几千 token，跑一次测试输出几千 token，搜一次代码又是一大段。这些 <strong>tool result</strong>才是真正的大头，一个稍微复杂的任务，几十次工具调用就能把 200K 塞满。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926043-1229245715.png" alt="Agent 上下文的构成示意" loading="lazy"></p>
+<p>还有一个隐形约束：<strong>prompt cache</strong>。既然每轮都要把历史重新发一遍，那前面没变的部分能不能别重复计算？可以，只要请求的<strong>前缀</strong>和上次一模一样，服务端就能复用之前算好的结果，又快又便宜。</p>
+<p>但缓存有个脾气：前缀里改了一个字，后面全部失效。而压缩恰恰就是在改历史——这意味着每次压缩，都要付出一次缓存重建的代价。后面你会看到，好几家的设计都在围着这个约束打转。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926083-525985929.png" alt="Prompt cache 与压缩" loading="lazy"></p>
+<p>说穿了，压缩就是<strong>一次有损的工作交接</strong>：上一个「自己」快装不下了，得写一份交接文档给下一个「自己」，然后把桌子清空。</p>
+<p>每家 harness 都要回答这几个问题：</p>
+<ol>
+<li><strong>什么时候压？</strong> 到多少比例触发，在哪个时间点检查</li>
+<li><strong>留什么、丢什么？</strong> 用户原话、最近几轮、工具输出分别怎么处理</li>
+<li><strong>交接文档谁来写、写成什么样？</strong></li>
+<li><strong>原件放哪？</strong> 压完之后还能不能找回原始记录</li>
+</ol>
+<p>带着这几个问题，我们一家一家看。</p>
+<h2 id="codex">Codex</h2>
+<p>Codex CLI 是开源的，压缩逻辑主要在 <code>codex-rs/core/src/compact.rs</code> 和 <code>compact_remote_v2.rs</code> 里。</p>
+<p>压缩分成两条路径：</p>
+<ul>
+<li><strong>本地压缩</strong>：在当前历史后面追加一条压缩指令，让模型生成一份摘要。</li>
+<li><strong>远程压缩</strong>：使用 OpenAI 自家模型时，交给 Responses API 在服务端完成，返回的是一个 <code>type=compaction</code> 的条目，里面只有一段 <code>encrypted_content</code>，<strong>加密的、客户端看不懂的数据</strong>。</li>
+</ul>
+<p>本地压缩用的 prompt 写得很直白，开头就是：</p>
+<pre><code class="language-text">You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary
+for another LLM that will resume the task.
+</code></pre>
+<p>要求摘要包含：当前进展和关键决策、重要上下文、约束和用户偏好、下一步计划，以及继续工作需要的关键数据。生成的摘要放回历史时，前面还会加一段「前情提要」：</p>
+<pre><code class="language-text">Another language model started to solve this problem and produced a summary
+of its thinking process. You also have access to the state of the tools that
+were used by that language model. Use this to build on the work that has
+already been done and avoid duplicating work.
+</code></pre>
+<p>注意它的措辞：不是「你之前做了什么」，而是「<strong>另一个模型</strong>做到了这里，你接着干」。Codex 把压缩明确定义成了一次交接。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926112-744636389.png" alt="Codex 压缩前后的历史" loading="lazy"></p>
+<p>压缩之后的历史大致由三部分组成：</p>
+<ol>
+<li><strong>用户的原话</strong>：从新到旧逐条保留，直到用完预算。本地路径的预算是 <code>COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000</code>，远程 v2 是 <code>RETAINED_MESSAGE_TOKEN_BUDGET = 64_000</code>。超出预算的消息会被截断，图片之类的媒体直接丢掉。</li>
+<li><strong>重新注入的初始上下文</strong>：AGENTS.md、环境信息等不是从旧历史里继承，而是重新生成一份插回去。</li>
+<li><strong>摘要</strong>：放在最后。</li>
+</ol>
+<p>助手的回复、工具调用和工具结果，统统折叠进摘要里，不单独保留。</p>
+<p>这个设计背后的判断很清楚：<strong>用户说过的话是需求本身，不能让模型转述</strong>；而模型自己干活的过程，总结一下就够了。</p>
+<p>自动压缩的阈值由 <code>model_auto_compact_token_limit</code> 控制，社区反馈从 v0.100.0 开始，这个值不能超过上下文窗口的 90%。源码里还区分了几个阶段：一轮开始前压（<code>PreTurn</code>）、一轮结束后压（<code>PostTurn</code>），以及用户手动执行 <code>/compact</code>。</p>
+<p>远程压缩返回的是加密数据，那里面到底装了什么？社区有两个挺有意思的研究：</p>
+<ul>
+<li>Kangwook Lee 用 prompt injection 的方式「骗」出了加密内容，发现服务端压缩内部用的仍然是一份 LLM 写的 handoff 摘要，prompt 和开源版本几乎一致。</li>
+<li>有人分析了 1087 次真实压缩记录，发现 blob 每次是<strong>重写而不是追加</strong>——上一次的 blob 作为输入，输出一份新的，大小基本稳定在一个范围内，并不会随着压缩次数越来越大。</li>
+</ul>
+<p>至于为什么要加密，官方没有详细解释，社区推测包括防篡改、方便服务端随时调整压缩算法等。这部分属于第三方实测和推断，看个思路就好。</p>
+<h2 id="claude-code">Claude Code</h2>
+<p>Claude Code 的压缩，官方文档讲得比较克制，能确认的有这些：</p>
+<ul>
+<li>快到上限时<strong>自动压缩</strong>，先清理旧的工具输出，空间还不够再对对话做摘要。</li>
+<li>摘要会保留你的请求和关键代码片段，但<strong>对话早期的细节指令可能丢失</strong>，所以官方建议把长期规则写进 CLAUDE.md，而不是指望对话历史。</li>
+<li>可以手动 <code>/compact focus on the API changes</code> 指定摘要重点，也可以在 CLAUDE.md 里加一个 "Compact Instructions" 小节。</li>
+<li>如果某个巨大的文件或工具输出让上下文压完马上又满，Claude Code 会在几次尝试后<strong>停止自动压缩并报错</strong>，而不是无限循环。</li>
+<li>子 agent 有独立的上下文窗口，它们的工具调用不会进入主对话，只有最终结果返回。</li>
+</ul>
+<p>更细的实现，官方没有展开。下面这部分来自<strong>社区对 Claude Code 实现的拆解分析，并非官方文档</strong>，具体数值可能随版本变化。</p>
+<p>按社区的分析，Claude Code 的压缩不是一次性的，而是从便宜到昂贵逐层尝试：</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926030-1580990473.png" alt="Claude Code 的分层压缩" loading="lazy"></p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>做什么</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>大结果落盘</td>
+<td>单个工具结果超过约 50K 字符，写到磁盘，上下文里只留约 2KB 预览和文件路径</td>
+<td>几乎为零</td>
+</tr>
+<tr>
+<td>Cached microcompact</td>
+<td>借助 API 的 <code>cache_edits</code>，在服务端缓存里直接删掉旧的工具结果，<strong>不破坏缓存前缀</strong></td>
+<td>很低</td>
+</tr>
+<tr>
+<td>时间触发 microcompact</td>
+<td>距离上次回复超过 60 分钟（缓存反正已经过期了），直接把旧工具结果替换成 <code>[Old tool result content cleared]</code></td>
+<td>低</td>
+</tr>
+<tr>
+<td>Session memory compact</td>
+<td>后台有个 agent 持续维护一份结构化笔记，压缩时直接用笔记当摘要</td>
+<td>压缩时无需额外调用 LLM</td>
+</tr>
+<tr>
+<td>Full compact</td>
+<td>fork 一个 agent 写完整摘要</td>
+<td>一次完整的 LLM 调用</td>
+</tr>
+</tbody>
+</table>
+<p>这里有两个设计挺巧的。</p>
+<p>第一个是 <strong>cached microcompact</strong>。前面说了，改历史会打断 prompt cache，那清理工具结果岂不是很亏？Claude Code 的做法是让服务端在缓存里把旧结果「抠掉」，本地消息不变，缓存前缀也还在。而时间触发的那一层更直接：一个小时没动静，缓存本来就过期了，这时候改历史不用心疼。</p>
+<p>第二个是 <strong>session memory</strong>。与其等到快满了再让模型一口气总结几十万 token，不如在平时就有个后台 agent 持续记笔记，包括当前状态、任务说明、涉及的文件、踩过的坑、关键结果等等。真到要压缩的时候，笔记已经现成了。</p>
+<p>走到最后一层 full compact 时，Claude Code 会 fork 一个 agent，继承原来的系统提示词和完整历史（这样大部分输入还能命中缓存），再追加一条压缩指令。模型先在 <code>&lt;analysis&gt;</code> 里打草稿，再输出 <code>&lt;summary&gt;</code>，包含 9 个部分：</p>
+<pre><code class="language-text">1. Primary Request and Intent
+2. Key Technical Concepts
+3. Files and Code Sections
+4. Errors and Fixes
+5. Problem Solving
+6. All User Messages
+7. Pending Tasks
+8. Current Work
+9. Optional Next Step
+</code></pre>
+<p>其中第 6 项是「所有用户消息」，和 Codex 保留用户原话的思路一致，只是这里是让模型在摘要里列出来。草稿部分会在提取后被丢掉，只留下 summary。</p>
+<p>摘要写完还没结束，Claude Code 还会做一轮「恢复」：</p>
+<ul>
+<li>重新读入最近访问的最多 5 个文件，每个最多 5K token，总共不超过 50K</li>
+<li>重新注入正在使用的 skills、plan 文件</li>
+<li>摘要里附上完整对话记录的文件路径，需要时可以回去查原文</li>
+</ul>
+<p>另外还有一个熔断：连续失败 3 次就停止自动压缩。据分析，这个机制是因为之前出现过大量会话反复压缩失败、白白浪费 API 调用的情况。</p>
+<h2 id="hermes-agent">Hermes Agent</h2>
+<p><a href="https://hermes-agent.nousresearch.com/" target="_blank" rel="noopener nofollow">Hermes Agent</a> 是 Nous Research 做的开源 Agent，它的开发者文档里专门有一篇讲压缩和缓存，写得非常细。</p>
+<p>触发上，Hermes 有两道防线：</p>
+<ul>
+<li><strong>Agent 内部的压缩器</strong>：默认在 prompt 达到上下文窗口的 <strong>50%</strong> 时触发；窗口小于 512K 的模型，比例会被抬到至少 75%。</li>
+<li><strong>网关层的兜底</strong>：每条消息进来之前检查，达到 85% 就压。</li>
+</ul>
+<p>还可以用 <code>threshold_tokens</code> 设置绝对值，或者用 <code>model_thresholds</code> 给不同模型单独配置。</p>
+<p>压缩结构很直观：掐头、留尾、压中间。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926025-731298346.png" alt="Hermes 的头尾保护与中间摘要" loading="lazy"></p>
+<ul>
+<li><strong>头部</strong>固定保留前 3 条，也就是系统提示词和第一轮对话。</li>
+<li><strong>尾部</strong>从后往前按 token 预算保留。默认的 <code>lean</code> 模式下，预算是窗口的 2.5%，夹在 10K 到 25K 之间，并且至少保留一条真实的用户消息。</li>
+<li><strong>切割点</strong>会自动调整，保证 tool_call 和对应的 tool_result 不会被拆开。</li>
+</ul>
+<p>中间这段的处理分两个阶段，先免费清理，再花钱总结。</p>
+<p><strong>第一阶段不调用 LLM</strong>：尾部以外、超过 200 字符的工具结果，直接替换成 <code>[Old tool output cleared to save context space]</code>。如果被清掉的是 skill 内容，还会留下标记，提醒模型需要时重新加载。</p>
+<p><strong>第二阶段</strong>才把中间部分交给一个辅助模型做摘要，模板是结构化的：</p>
+<pre><code class="language-text">Goal / Constraints &amp; Preferences / Progress (Done, In Progress, Blocked)
+Key Decisions / Relevant Files / Next Steps / Critical Context
+</code></pre>
+<p><code>lean</code> 模式下还会额外做几件事：逐字引用每条真实的用户消息；用正则从原文抽取 PR 编号、commit SHA、文件路径、错误信息这类「锚点」，<strong>不经过模型转述</strong>，避免模型把 <code>a3f9c2e</code> 记成 <code>a3f9c2f</code>。</p>
+<p>被压掉的原件不会删除。默认的 in-place 模式下，压缩后会话 ID 不变，被压掉的消息标记为已归档，但仍然可以通过 <code>session_search</code> 搜出来。</p>
+<p>后续再压缩时，Hermes 会把上一次的摘要传给模型，要求<strong>更新</strong>而不是重写：已完成的从 In Progress 挪到 Done，新进展补上，过时的信息删掉。</p>
+<p>另外，压缩器本身是一个可替换的 <code>ContextEngine</code> 接口，比如社区插件 hermes-vcc 就完全不调用 LLM，用正则提取的方式生成摘要。</p>
+<p>Hermes 在稳定性上下了不少功夫，从它的安全机制能看出踩过哪些坑：</p>
+<ul>
+<li>摘要失败后进入冷却，时间逐级递增：60 秒 → 300 秒 → 900 秒</li>
+<li>多次卡住后跳过 LLM，直接生成一份确定性的兜底摘要</li>
+<li>文档特别强调：<strong>辅助模型的上下文窗口必须不小于主模型</strong>，否则摘要请求会失败，中间那段对话就直接丢了。GitHub 上还有一个相关 issue：辅助模型窗口太小，导致每一轮都在触发压缩，陷入死循环。</li>
+</ul>
+<h2 id="pi">pi</h2>
+<p>pi 是 Mario Zechner 做的开源 coding agent，以简洁著称。它的压缩文档开头就写得很坦白：<strong>压缩是有损的</strong>，但完整历史一直保存在 JSONL 文件里。</p>
+<p>触发条件就一行公式：</p>
+<pre><code class="language-text">contextTokens &gt; contextWindow - reserveTokens
+</code></pre>
+<p><code>reserveTokens</code> 默认 16384。检查时机也很讲究：在工具结果写回历史之后、模型开始下一次回答之前。如果模型提供方报了上下文溢出，pi 会压缩一次再重试。</p>
+<p>切点的选法是从最新的消息往前数，累计到 <code>keepRecentTokens</code>（默认 20K）为止，这之后的消息原样保留，之前的交给模型摘要。</p>
+<p>切点只能落在用户消息、助手消息等位置，<strong>不能落在 tool result 上</strong>，因为它必须和对应的工具调用待在一起。</p>
+<p>还有一种边界情况：如果某一轮用户请求下，Agent 连续干了很久，单这一轮就超过了预算，那只能从这一轮的中间切开。pi 会分别生成两份摘要（之前完整轮次的历史摘要 + 这一轮前半段的摘要）再合并。</p>
+<p>另一个小细节：pi 不会把原始的消息数组直接丢给模型总结，而是先序列化成纯文本：</p>
+<pre><code class="language-text">[User]: 帮我把登录接口改成 JWT
+[Assistant]: 好的，我先看一下现有实现
+[Assistant tool calls]: read src/auth/login.ts
+[Tool result]: ...
+</code></pre>
+<p>为什么这么做？因为如果直接把对话历史给模型，它很容易把这当成一段要「接着聊」的对话，而不是一份要总结的材料。另外工具结果超过 2000 字符会被截断，thinking 内容会被省略。</p>
+<p>摘要格式也是结构化的：Goal、Constraints &amp; Preferences、Progress、Key Decisions、Next Steps、Critical Context。此外 pi 会从工具调用中提取<strong>读过哪些文件、改过哪些文件</strong>，以 <code>&lt;read-files&gt;</code>、<code>&lt;modified-files&gt;</code> 的形式附在摘要后面，而且会跨多次压缩累积。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926043-1795046486.png" alt="pi 的 CompactionEntry 与模型实际看到的上下文" loading="lazy"></p>
+<p>这是 pi 最有特点的地方：压缩不会改写历史，只是往会话的 JSONL 里<strong>追加一条 <code>CompactionEntry</code></strong>，记录摘要内容和「从哪条消息开始保留」。原始消息全部还在。</p>
+<p>再加上 pi 的会话本身是树状结构，用 <code>/tree</code> 可以回到任意一个历史节点开新分支。切换分支时，pi 还会提议把你离开的那条分支总结一下，带到新分支里。</p>
+<p>扩展性方面，<code>session_before_compact</code> 钩子可以拿到准备好的所有数据，然后取消压缩、或者直接返回一份你自己生成的摘要——整个压缩逻辑都可以替换掉。</p>
+<h2 id="放在一起看">放在一起看</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Codex</th>
+<th>Claude Code</th>
+<th>Hermes Agent</th>
+<th>pi</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>触发</td>
+<td>可配置 token 阈值（≤ 90% 窗口），回合前/后检查</td>
+<td>接近上限自动触发，可手动 <code>/compact</code></td>
+<td>默认 50% 窗口（小窗口抬到 75%），网关 85% 兜底</td>
+<td>窗口减去 16K 预留</td>
+</tr>
+<tr>
+<td>摘要由谁写</td>
+<td>本地模型；或服务端生成加密 blob</td>
+<td>分层：先清理，再用笔记，最后 fork agent 摘要</td>
+<td>辅助模型（可插拔引擎）</td>
+<td>当前模型（可由扩展替换）</td>
+</tr>
+<tr>
+<td>用户原话</td>
+<td>逐字保留，20K / 64K 预算</td>
+<td>在摘要中列出所有用户消息</td>
+<td>lean 模式逐字引用</td>
+<td>最近 20K 内原样保留，更早的进摘要</td>
+</tr>
+<tr>
+<td>工具输出</td>
+<td>折叠进摘要</td>
+<td>落盘 / cache_edits 清理 / 占位符</td>
+<td>先替换为占位符</td>
+<td>序列化时截断到 2000 字符</td>
+</tr>
+<tr>
+<td>摘要可读性</td>
+<td>本地可读；远程加密</td>
+<td>可读</td>
+<td>可读</td>
+<td>可读</td>
+</tr>
+<tr>
+<td>原始记录</td>
+<td>本地 rollout 文件</td>
+<td>本地 JSONL，摘要附路径</td>
+<td>软归档，可搜索</td>
+<td>JSONL 全保留，可回到任意节点</td>
+</tr>
+<tr>
+<td>和 prompt cache</td>
+<td>重新注入初始上下文</td>
+<td>尽量不破坏缓存前缀</td>
+<td>只在首次压缩时改系统提示词</td>
+<td>摘要请求不写缓存</td>
+</tr>
+</tbody>
+</table>
+<h2 id="我自己是怎么做的">我自己是怎么做的</h2>
+<p>最近用 Claude Code 比较多，我是直接在 <code>/config</code> 里把 auto-compact 关掉了</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261114193926067-835787838.png" alt="image-20261114185444770" loading="lazy"></p>
+<p>压缩全部手动来。主要有两种做法：</p>
+<ul>
+<li><strong>用 <a href="https://github.com/mattpocock/skills/blob/main/skills/productivity/handoff/SKILL.md" target="_blank" rel="noopener nofollow">handoff skill</a> 写交接文档</strong>：让模型把当前进展总结成一个文件，然后开一个新会话，把文件交给它接着干。</li>
+<li><strong>手动 <code>/compact</code> 并指定重点</strong>：比如 <code>/compact 重点保留接口改动和还没跑通的测试</code>，告诉它这次什么最不能丢，一般上下文到极限了就只能有这种方式了，不能用 handoff 这个 skills 进行压缩。</li>
+</ul>
+<p>这样做最大的好处是压缩是我主动的行为，我可以感知到。自动压缩往往在任务做到一半时触发，开头那种「刚说好别动的文件又被改了」的情况，很多就发生在这里。手动压缩可以挑一个子任务刚完成的时候，这时候需要交接的东西最少，也最清楚。</p>
+<p>而且 handoff 是模型在还能看到完整上下文时写的，质量不会比自动压缩差。它最后是一个文件，我可以看到内容。</p>
+<h2 id="最后总结">最后总结</h2>
+<p>四家放在一起看，其实都在回答开头那几个问题，只是给出了不同的答案。</p>
+<p><strong>相同的部分</strong>很明显：</p>
+<ul>
+<li>都认为<strong>用户说过的话</strong>比模型自己干活的过程更重要，要么原样保留，要么要求在摘要里完整列出。</li>
+<li>都在对付<strong>工具输出</strong>这个大头，而且大多选择在调用 LLM 摘要之前，先用不花钱的方式清掉一批。</li>
+<li>摘要格式都趋向结构化：目标、约束、进展、决策、下一步。</li>
+<li>都绕不开 <strong>prompt cache</strong>，压缩时机和方式或多或少都在考虑缓存的代价。</li>
+</ul>
+<p><strong>不同的部分</strong>，更多是取舍：</p>
+<ul>
+<li><strong>摘要放在哪里</strong>：Codex 的远程压缩把摘要交给服务端，客户端拿到的是不可读的加密数据；其他几家的摘要都是明文，用户可以看、可以改。</li>
+<li><strong>一步到位还是分层</strong>：Claude Code 和 Hermes 都是先便宜后昂贵地逐级尝试；Codex 和 pi 的主流程更直接。</li>
+<li><strong>原始记录怎么处理</strong>：pi 只追加不改写，Hermes 软归档可检索，Claude Code 在摘要里留下原文路径。</li>
+<li><strong>能不能换掉</strong>：Hermes 和 pi 把压缩逻辑做成了可替换的接口，用户可以接入自己的实现。</li>
+</ul>
+<p>不管哪种方案，压缩终究是有损的。已经有研究专门在测压缩过程中「约束条件」的丢失率。所以各家文档几乎都在暗示同一件事：真正需要一直生效的规则，别放在对话里，放进 AGENTS.md、CLAUDE.md 这类每次都会重新加载的地方。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-14 19:40">2026-11-14 19:39</span>&nbsp;
+<a href="https://www.cnblogs.com/leikooo">leikooo</a>&nbsp;
+阅读(<span id="post_view_count">38</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23666738);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fleikooo%2Fp%2F23666738&amp;targetId=23666738&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
