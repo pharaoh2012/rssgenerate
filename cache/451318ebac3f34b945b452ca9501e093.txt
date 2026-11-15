@@ -1,0 +1,153 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yeyunfei/p/23646036/threejs-3d-fire-drill-review-03" title="发布于 2026-11-15 22:31">
+    
+
+    <span role="heading" aria-level="2">如何使用three.js/WebGL实现3D消防演练系统 之 事件联动与时间线复盘</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        three.js、WebGL 3D 消防演练第三课：演练事件记录、不可变快照、二分查找、状态回放和暂停倍速。结合五张场景设计图说明关键代码。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<blockquote>
+<h2>序</h2>
+<p>看比赛的时候，回放总能看出不少东西。刚才还觉得这个人怎么不传球，换个角度一看，原来那边早有人堵着。坐在屏幕前指挥很容易，真到了场上，留给人想事情的时间没那么多。</p>
+<p>工作里也差不多。事情过去以后，大家都能说上几句。要是连先发生什么、后发生什么都记不清，讨论着讨论着，就容易变成谁的记性更好。</p>
+<p>前两篇已经做了报警定位和疏散改道。这篇把它们串起来，做演练回放。暂停以后能看，往前拖、往后拖，也应该得到同一份状态。</p>
+<h2>一、先看这几个位置</h2>
+<p><img alt="系统界面：空间总览：事件回放" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114083919646-1716491432.png" class="lazyload"></p>
+<p>配图为 AI 生成的三维场景设计。回放需要留下的是事件；只录一段视频，没法再点一个人查他当时的位置。这里用相对演练开始的毫秒数记录时间。</p>
+<pre><code class="language-js">const history = [
+  { id: 'e1', at: 1000, kind: 'alarm', device: 'SD-203', active: true },
+  { id: 'e2', at: 1800, kind: 'block', edges: ['eastHall'] },
+  { id: 'e3', at: 2400, kind: 'person', person: 'P-01', pos: [2, 6, 0] },
+  { id: 'e4', at: 4800, kind: 'person', person: 'P-01', pos: [-5, 6, 4] },
+  { id: 'e5', at: 6000, kind: 'alarm', device: 'SD-203', active: false }
+];
+
+function initialState() {
+  return { alarms: {}, closed: [], people: {} };
+}
+
+function reduceEvent(state, event) {
+  const next = structuredClone(state);
+  if (event.kind === 'alarm') next.alarms[event.device] = event.active;
+  if (event.kind === 'block') next.closed = [...event.edges];
+  if (event.kind === 'person') next.people[event.person] = [...event.pos];
+  return next;
+}
+</code></pre>
+<p>这里只放三种事件。实际接入时按事件 ID 去重，并校验字段，再按时间和服务器序号排序。播放过程中不要修改这份记录，否则一边播放一边补数据，同一个时间点可能出现两个结果。</p>
+<h2>二、拖到某个时间，状态从哪里来</h2>
+<p><img alt="系统界面：对象定位：事件回放" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114083924771-1563387125.png" class="lazyload"></p>
+<p>事件少就从头算，事件多就每隔一段存个快照。拖到某个时刻，找到它前面的快照，再补上中间几条事件。下面把“初始状态”和“第几条事件”一起保存，方便往回拖。</p>
+<pre><code class="language-js">function buildCheckpoints(events, stride = 50) {
+  let state = initialState();
+  const points = [{ at: -Infinity, index: 0, state }];
+  events.forEach((event, i) =&gt; {
+    state = reduceEvent(state, event);
+    if ((i + 1) % stride === 0) {
+      points.push({ at: event.at, index: i + 1, state });
+    }
+  });
+  return points;
+}
+
+const checkpoints = buildCheckpoints(history);
+
+function stateAt(time) {
+  let left = 0, right = checkpoints.length - 1;
+  while (left &lt; right) {
+    const mid = Math.ceil((left + right) / 2);
+    if (checkpoints[mid].at &lt;= time) left = mid;
+    else right = mid - 1;
+  }
+  const base = checkpoints[left];
+  let state = structuredClone(base.state);
+  for (let i = base.index; i &lt; history.length &amp;&amp; history[i].at &lt;= time; i++) {
+    state = reduceEvent(state, history[i]);
+  }
+  return state;
+}
+</code></pre>
+<p>关键在于每次都从对应快照重算，不能拿当前画面往上叠。否则从第五秒拖回第二秒，已经恢复的报警就再也亮不回来了。</p>
+<h2>三、把回放状态交给场景</h2>
+<p><img alt="系统界面：入口对象：门框及其分组关系" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114083929636-1308914331.png" class="lazyload"></p>
+<p>三维对象只读回放结果。下面三个 Map 分别保存报警标记、通道标记和人员模型，键使用业务 ID；具体对象在模型加载时登记。</p>
+<pre><code class="language-js">const alarmObjects = new Map();
+const passageObjects = new Map();
+const personObjects = new Map();
+
+function renderState(state) {
+  for (const [id, object] of alarmObjects) {
+    object.visible = state.alarms[id] === true;
+  }
+  for (const [id, object] of passageObjects) {
+    object.visible = state.closed.includes(id);
+  }
+  for (const [id, object] of personObjects) {
+    const position = state.people[id];
+    object.visible = Array.isArray(position);
+    if (position) object.position.fromArray(position);
+  }
+}
+
+renderState(stateAt(2500));
+</code></pre>
+<p>这段同时处理了“出现”和“消失”。特别是人员位置还没采到的时候，不要让模型默认站在原点；没有记录就先隐藏，界面上保留数据缺失提示。</p>
+<h2>四、播放和暂停共用同一个时钟</h2>
+<p><img alt="系统界面：回放涉及的门体" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114083934865-1820679408.png" class="lazyload"></p>
+<p>动画帧只推进时间，不直接往物体身上补位移。暂停、倍速、拖动最后都调用 <code>stateAt</code>，才不会有三套互相对不上的状态。</p>
+<pre><code class="language-js">let frame = 0, cursor = 0;
+const endTime = history.at(-1)?.at ?? 0;
+
+function pause() {
+  cancelAnimationFrame(frame);
+}
+
+function seek(time) {
+  pause();
+  cursor = Math.max(0, Math.min(time, endTime));
+  renderState(stateAt(cursor));
+}
+
+function play(rate = 1) {
+  if (!Number.isFinite(rate) || rate &lt;= 0) return;
+  pause();
+  const start = performance.now(), from = cursor;
+  function tick(now) {
+    cursor = Math.min(endTime, from + (now - start) * rate);
+    renderState(stateAt(cursor));
+    if (cursor &lt; endTime) frame = requestAnimationFrame(tick);
+  }
+  frame = requestAnimationFrame(tick);
+}
+</code></pre>
+<p><img alt="系统界面：前台区域：柜台、座椅与分区关系" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114083940236-956434387.png" class="lazyload"></p>
+<p>最后来回拖几次：报警前、报警后、改道后，再回到报警前。场景应该能完整恢复，旧标记不能留下来。人员经过了哪条路线，则继续沿用上一课的节点关系核对。</p>
+<p>消防这三篇先写到这里。把位置、路线和时间这三件事理顺，再加烟雾、音效和操作面板，会踏实很多。</p>
+<p><strong>上篇：</strong>第二课：人员疏散与动态改道</p>
+<p><img alt="" width="338" height="350" data-src="https://img2018.cnblogs.com/blog/800616/201903/800616-20190306111130020-1677299606.png" class="lazyload"></p>
+</blockquote>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-15 22:31">2026-11-15 22:31</span>&nbsp;
+<a href="https://www.cnblogs.com/yeyunfei">魂断蓝桥666</a>&nbsp;
+阅读(<span id="post_view_count">20</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23646036);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyeyunfei%2Fp%2F23646036%2Fthreejs-3d-fire-drill-review-03&amp;targetId=23646036&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
