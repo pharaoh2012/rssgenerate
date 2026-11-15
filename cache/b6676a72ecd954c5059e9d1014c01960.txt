@@ -1,0 +1,298 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/MrHuo/p/23671261/agent-from-scratch-06" title="发布于 2026-11-15 12:28">
+    
+
+    <span role="heading" aria-level="2">手搓 AI Agent 06：记忆的两种形态——短期压缩防溢出，长期存储跨会话</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>系列大纲 · 手搓 AI Agent（Node.js / TypeScript）</strong></p>
+<p>本系列从零手搓一个<strong>通用工具型 Agent</strong>：能对话、能调用工具、能规划任务、能多 Agent 协作，并最终接入 MCP 生态。技术栈锁定 <strong>Node.js 22 + TypeScript</strong>，模型接入层用一套 <strong>OpenAI 兼容抽象</strong>通吃 OpenAI / DeepSeek / 通义 / OpenRouter——改 <code>.env</code> 即可换模型，内核零改动。每篇代码可跑、可测、可 <code>git checkout post-NN</code> 回溯到任意一篇起点，图文在多平台同步发布。</p>
+</blockquote>
+<p><strong>总目录（14 篇主线 + 1 篇收尾）</strong></p>
+<blockquote>
+<ol>
+<li>开篇：什么是 Agent，为什么不直接用框架</li>
+<li>工程地基：Node22 + TS + 统一 LLM 客户端</li>
+<li>心脏：Agent Loop 与 ReAct</li>
+<li>长出手脚：Tool 系统设计</li>
+<li>第一个真工具：搜索 / 计算 / 读文件</li>
+<li>多工具协作：串行编排与并行执行</li>
+<li>记忆的两种形态（<strong>本文</strong>）</li>
+<li>会规划：Plan-and-Execute</li>
+<li>多 Agent 协作</li>
+<li>接外部世界：MCP 实战</li>
+<li>让 Agent 可信：权限 / 沙箱 / 人工介入</li>
+<li>持久化与恢复：会话、状态、崩溃续跑</li>
+<li>上线与可观测</li>
+<li>收尾：本系列手搓的 vs 业界 ADK / Mastra</li>
+</ol>
+</blockquote>
+<blockquote>
+<p>当前篇：第 6 篇（对应总目录第 7 项·记忆的两种形态）——在「思考 → 行动 → 观察」循环之上，补齐 Agent 的两种记忆：<strong>短期记忆</strong>（历史轮次超阈值时自动摘要，防止上下文溢出窗口）与<strong>长期记忆</strong>（remember / recall 两个工具把事实落盘到文件，并自动把相关事实注入每一轮提示，跨会话都记得住）。</p>
+<p><strong>配套代码仓库</strong>：<a href="https://github.com/mrhuo/agent-from-scratch" target="_blank" rel="noopener nofollow">https://github.com/mrhuo/agent-from-scratch</a> （每篇对应一个 <code>post-NN</code> tag，<code>git checkout post-06</code> 即可回到本篇代码起点）</p>
+</blockquote>
+<h1 id="手搓-ai-agent-06记忆的两种形态短期压缩防溢出长期存储跨会话">手搓 AI Agent 06：记忆的两种形态——短期压缩防溢出，长期存储跨会话</h1>
+<p>第 5 篇让 Agent 能在一次任务里自主串联、并行多个工具。但「会调用工具」离「像个能共事的助手」还差一件事：<strong>记忆</strong>。有两个现象会反复出现：一是长对话越聊越长，最终撞上模型的上下文窗口上限；二是关掉进程再打开，Agent 把之前说过的话全忘了。</p>
+<p>这一篇把记忆拆成两种形态分别解决：</p>
+<ul>
+<li><strong>短期记忆</strong>：一次对话内部的上下文管理。历史轮次超过阈值时，把旧轮次压成一段摘要，只把最近几轮原样发给模型——解决上下文溢出。</li>
+<li><strong>长期记忆</strong>：跨进程的持久化。把「用户叫什么、偏好什么、项目代号是什么」这类事实写进文件，下次启动还能读出来——解决失忆。</li>
+</ul>
+<p>代码层面，两者都通过组合注入 Agent，<strong>内核循环一行不用改</strong>：短期压缩是「组装上下文」这一步里的一个可选环节；长期记忆是注册表里的两个工具加一次检索注入。</p>
+<hr>
+<h2 id="00-引子为什么有上下文不等于有记忆">00 引子：为什么「有上下文」不等于「有记忆」</h2>
+<p>先区分两层：</p>
+<ul>
+<li><strong>对话历史（conversation）</strong>：这一轮之前的全部消息。第 2 篇起 Agent 就持有它，<code>run()</code> 只追加新一句，循环在它之上叠加。这是「短期」的载体。</li>
+<li><strong>持久化记忆（memory）</strong>：进程之外的状态。关掉再开还在，才是真正的「记住」。</li>
+</ul>
+<p>只靠对话历史会撞两堵墙：</p>
+<ol>
+<li><strong>窗口墙</strong>：模型一次能吃的 token 有限。一个几十轮的任务，把每一轮原样堆进上下文，迟早超限，要么报错，要么前端截断丢信息。</li>
+<li><strong>重启墙</strong>：<code>conversation</code> 是内存里的数组，进程一退出就没了。下个进程是「全新的脑子」。</li>
+</ol>
+<p>短期记忆对付第一堵墙，长期记忆对付第二堵墙。</p>
+<hr>
+<h2 id="01-概念两种记忆各自解决什么">01 概念：两种记忆各自解决什么</h2>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>生命周期</th>
+<th>解决的问题</th>
+<th>实现手段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>短期记忆</td>
+<td>单次会话内</td>
+<td>上下文过长溢出窗口</td>
+<td>旧轮次摘要 + 最近轮次保真</td>
+</tr>
+<tr>
+<td>长期记忆</td>
+<td>跨会话、跨进程</td>
+<td>Agent 重启后失忆</td>
+<td>文件持久化 + 检索注入</td>
+</tr>
+</tbody>
+</table>
+<p>一个常见的误区：把长期记忆当成「把对话历史写进数据库」。二者的关键差异在<strong>检索方式</strong>。对话历史是「按顺序全给」；长期记忆是「按需取用」——模型在推理中主动 <code>recall</code>，或系统在每轮把相关问题相关的事实<strong>被动</strong>喂进提示。后者才是「记住你」的体感来源：你不用每次重复背景，Agent 自己把旧知识摆到眼前。</p>
+<hr>
+<h2 id="02-短期记忆为什么要压缩而不是无限堆">02 短期记忆：为什么要压缩，而不是无限堆</h2>
+<p>最朴素的做法是「把 <code>conversation</code> 全发给模型」。它在短对话里没问题，但有两个代价：</p>
+<ul>
+<li><strong>成本随轮次线性增长</strong>：每多一轮，输入 token 翻倍式累积（因为历史每次都重发）。</li>
+<li><strong>逼近窗口上限</strong>：到第 N 轮，历史本身就可能超过 <code>max_tokens</code>，模型直接拒答或前端截断。</li>
+</ul>
+<p>压缩的核心思路是<strong>丢细节、留主干</strong>：把旧的、信息密度低的轮次交给 LLM 压成一段摘要，只保留最近的若干轮原样。模型看到的是「摘要 + 最近几轮」，既控制住了长度，又不丢关键事实。</p>
+<p>关键约束：<strong>不能从中间切断一轮工具调用</strong>。一轮工具调用在上下文里是一组连续消息——<code>user → assistant(tool_calls) → tool → tool → ...</code>。如果按固定条数硬切，可能把 <code>assistant</code> 的工具调用和它的 <code>tool</code> 观察结果拆到摘要两侧，破坏 <code>tool_call_id</code> 的对应关系，模型会困惑。所以用「用户轮」对齐切分点：被摘要的旧块永远是若干个<strong>完整轮次</strong>，保留块也总是从一条 <code>user</code> 消息开始。</p>
+<hr>
+<h2 id="03-实现contextcompressor短期记忆">03 实现：ContextCompressor（短期记忆）</h2>
+<p><code>src/memory/ContextCompressor.ts</code> 只做一件事：给定完整上下文，返回「发往模型」的压缩版。</p>
+<pre><code class="language-ts">export class ContextCompressor {
+  constructor(
+    private readonly summarizer: Summarizer,
+    private readonly keepRecentTurns = 6, // 保留最近 6 个用户轮原样
+  ) {}
+
+  async compress(messages: Message[]): Promise&lt;CompressResult&gt; {
+    const system = messages.filter((m) =&gt; m.role === "system");
+    const rest = messages.filter((m) =&gt; m.role !== "system");
+
+    // 数用户轮：没超阈值就整段原样发，不丢任何信息
+    const userIdx: number[] = [];
+    rest.forEach((m, i) =&gt; { if (m.role === "user") userIdx.push(i); });
+    if (userIdx.length &lt;= this.keepRecentTurns) {
+      return { messages, dropped: 0, summary: null };
+    }
+
+    // 按用户轮对齐：boundary 是第一个被保留的用户轮下标
+    const boundary = userIdx[userIdx.length - this.keepRecentTurns]!;
+    const older = rest.slice(0, boundary);   // 完整旧轮次，交给摘要器
+    const recent = rest.slice(boundary);     // 最近轮次，原样保留
+
+    const summary = await this.summarizer.summarize(older);
+    const summaryMsg: Message = {
+      role: "system",
+      content: `【对话历史摘要】\n${summary}`,
+    };
+    return { messages: [...system, summaryMsg, ...recent], dropped: older.length, summary };
+  }
+}
+</code></pre>
+<p>摘要器是一个接口 <code>Summarizer</code>，真实实现用 LLM 把旧消息拼成对话记录再压摘要（<code>LLMSummarizer</code>，依赖 <code>LLMClient.chat</code>）；测试与兜底用 <code>NoopSummarizer</code>（返回固定占位，不调模型）。这种「能力靠接口、实现可替换」的结构，和第 3 篇的 <code>Tool</code> 同源——便于单测，也便于以后换更便宜的摘要模型。</p>
+<p>注意 <code>keepRecentTurns</code> 默认 6 是按「用户轮」算，不是按消息条数。一轮可能含多条消息（工具调用尤其多），按轮对齐才稳。</p>
+<hr>
+<h2 id="04-实现memorystore长期记忆的落地">04 实现：MemoryStore（长期记忆的落地）</h2>
+<p>长期记忆的本质是「进程外的笔记本」。本篇用一份 JSON 文件实现，零依赖、逻辑直白。</p>
+<p><code>src/memory/MemoryStore.ts</code>：</p>
+<pre><code class="language-ts">export class MemoryStore {
+  constructor(private readonly path: string) {}
+
+  async save(key: string, content: string): Promise&lt;MemoryEntry&gt; {
+    const entries = await this.load();
+    const entry = { id: randomUUID(), key, content, createdAt: new Date().toISOString() };
+    entries.push(entry);
+    await this.persist(entries);
+    return entry;
+  }
+
+  async search(query: string, limit = 5): Promise&lt;MemoryEntry[]&gt; {
+    const entries = await this.load();
+    const q = query.trim().toLowerCase();
+    if (!q) return entries.slice(-limit).reverse();
+    const tokens = tokenize(q);                 // 中英文混合分词
+    return entries
+      .map((e) =&gt; {
+        const hay = `${e.key} ${e.content}`.toLowerCase();
+        const score = tokens.reduce((s, t) =&gt; (hay.includes(t) ? s + 1 : s), 0);
+        return { e, score };
+      })
+      .filter((x) =&gt; x.score &gt; 0)
+      .sort((a, b) =&gt; b.score - a.score || b.e.createdAt.localeCompare(a.e.createdAt))
+      .slice(0, limit)
+      .map((x) =&gt; x.e);
+  }
+  // load / update / remove / persist 略
+}
+</code></pre>
+<p>两个工程要点：</p>
+<ol>
+<li><strong>全量读写</strong>：文件通常很小（几百条以内），每次 <code>save</code> 重写整份，逻辑简单、不易出并发脏写。真要上量再换 SQLite / 向量库。</li>
+<li><strong>中文检索</strong>：<code>search</code> 不能直接按空格切词——中文没有空格，整句成一个 token 几乎永远匹配不上。这里的 <code>tokenize</code> 把 ASCII 词原样取出，把连续中文字符切成<strong>二元组（bigram）</strong>，于是「小明喜欢什么语言」里的「小明」能命中一条主题叫「用户的名字」的记忆。这是一个轻量但有效的折中：英文精确、中文靠字重叠，够用在「记得住、想得起来」，语义向量检索留到后面按需替换。</li>
+</ol>
+<p><code>load</code> 对文件不存在、解析失败一律返回空库，不让读盘错误崩掉 Agent；<code>persist</code> 写失败有限重试，规避受限环境的瞬时写错误。</p>
+<hr>
+<h2 id="05-两种长期记忆机制工具--自动注入">05 两种长期记忆机制：工具 + 自动注入</h2>
+<p>长期记忆在代码里以两种互补形态出现：</p>
+<p><strong>形态 A——主动工具（agentic）</strong>：<code>src/tools/memory.ts</code> 导出 <code>createRememberTool(store)</code> 和 <code>createRecallTool(store)</code>，闭包绑定同一个 <code>MemoryStore</code>。模型在推理中<strong>自己决定</strong>什么时候记、记什么、什么时候查。这是记忆与「固定提示词」最不同的地方：记忆不是写死在系统提示里，而是模型按需存取的状态。</p>
+<p><strong>形态 B——被动注入</strong>：Agent 每轮组装上下文时，用本轮用户输入去 <code>store.search</code>，把命中的相关事实拼进 system 提示的「长期记忆·相关事实」段。模型不必主动 <code>recall</code>，相关背景已经摆在眼前。</p>
+<p>二者互补：形态 A 让模型能「主动记」，形态 B 保证「记了就不会白记」。演示入口把两个工具收编进注册表，并把 store 同时交给 Agent 做注入。</p>
+<pre><code class="language-ts">const memoryStore = new MemoryStore(join(process.cwd(), "data", "memory.json"));
+const compressor = new ContextCompressor(new LLMSummarizer(client), 6);
+const registry = new ToolRegistry().registerAll([
+  ...allTools,
+  createRememberTool(memoryStore),
+  createRecallTool(memoryStore),
+]);
+const agent = new Agent(client, { registry, maxSteps: 8, compressor, memoryStore });
+</code></pre>
+<hr>
+<h2 id="06-接入-agentbuildcontext-是唯一的汇合点">06 接入 Agent：buildContext 是唯一的汇合点</h2>
+<p>Agent 内核改动极小。<code>run()</code> 不再直接把 <code>this.conversation</code> 发给模型，而是先过一遍 <code>buildContext</code>：</p>
+<pre><code class="language-ts">private async buildContext(currentUserInput: string): Promise&lt;Message[]&gt; {
+  const base = this.conversation.map((m) =&gt; ({ ...m })); // 拷贝，不动原件
+
+  // 1) 长期记忆注入：把相关事实塞进 system 提示
+  if (this.memoryStore) {
+    const hits = await this.memoryStore.search(currentUserInput, 5);
+    if (hits.length &gt; 0) {
+      const brief = hits.map((h) =&gt; `- [${h.key}] ${h.content}`).join("\n");
+      const idx = base.findIndex((m) =&gt; m.role === "system");
+      const augmented = `${base[idx]!.content}\n\n【长期记忆·相关事实】\n${brief}`;
+      if (idx &gt;= 0) base[idx]!.content = augmented;
+      else base.unshift({ role: "system", content: augmented });
+    }
+  }
+
+  // 2) 短期记忆压缩：旧轮次摘要，最近轮次保真
+  if (this.compressor) return (await this.compressor.compress(base)).messages;
+  return base;
+}
+</code></pre>
+<p>关键设计：<strong>压缩只发生在「发往模型」这一步，本地 <code>this.conversation</code> 永远保留全量历史</strong>。好处是简单、可调试；代价是本地内存仍随对话增长。真要无限对话，可把压缩后的摘要回写进 <code>this.conversation</code>，第 12 篇持久化时再处理。</p>
+<p><code>compressor</code> 与 <code>memoryStore</code> 都是<strong>可选</strong>注入，不传就退化为第 5 篇的行为，所有旧测试无需改动。</p>
+<hr>
+<h2 id="07-运行验证">07 运行验证</h2>
+<p>仓库配套 <code>scripts/demo-memory.ts</code> 跑三段对话：先让模型记住用户信息与项目代号，再「重启进程」（新 Agent 实例、共享同一记忆文件）回忆，最后连续多轮触发短期压缩。</p>
+<p>架构与验证截图：</p>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261115122629742-389920406.png" alt="记忆架构" loading="lazy"></p>
+<p><em>图 1：短期压缩（ContextCompressor）与长期持久化（MemoryStore + remember/recall）在 Agent 循环中的接入点。</em></p>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261115122615047-2022665071.png" alt="单元测试与类型检查" loading="lazy"></p>
+<p><em>图 2：<code>npm run typecheck</code> 零报错；<code>npm test</code> 6 个文件 46 例全绿；守卫确认本地 <code>.env</code> 被忽略、源码无硬编码密钥。</em></p>
+<p>真实模型（DeepSeek <code>deepseek-flash</code>）跑出的轨迹节选：</p>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261115122551860-1164592694.png" alt="真实对话轨迹" loading="lazy"></p>
+<p><em>图 3：会话一模型自主 <code>remember</code> 了姓名、职业、语言栈、项目代号；会话二「重启」后无需重复背景即 <code>recall</code> 出关键信息；会话三连续多轮后短期压缩反复触发，模型仍能从摘要里答对「前面算的几个数里最大的是 1664」。</em></p>
+<p>三张图共同说明：两种记忆都落地且可观测，且<strong>没有改动 Agent 内核循环</strong>。</p>
+<hr>
+<h2 id="08-坑与权衡">08 坑与权衡</h2>
+<ul>
+<li><strong>摘要会丢细节</strong>：压缩是「保主干、丢枝叶」，旧轮次里某个精确数字可能只在摘要里留下近似描述。对要求零误差的任务（如长链式算术），应调大 <code>keepRecentTurns</code> 或干脆关掉压缩。本篇会话三正是靠「最近轮次保真」才答对了 1664——被摘要的旧轮次若含关键数字，模型可能只能凭摘要近似回答。</li>
+<li><strong>中文分词是近似</strong>：bigram 检索会误命中（「明明」能命中「小明」），但配合打分排序与 <code>limit</code> 截断，演示场景足够。生产要语义检索，应换 embedding + 向量库，接口不用动（仍是 <code>search</code>）。</li>
+<li><strong>记忆不是银弹</strong>：模型可能记错、漏记、或把过时信息当真。真实产品需要「记忆可信度 / 来源 / 时间戳」与人工校正，这正是第 11 篇权限与人工介入要补的。</li>
+<li><strong>文件锁</strong>：单进程演示用全量重写没问题；多进程并发写同一份 <code>memory.json</code> 会互相覆盖，落地到服务要加锁或换数据库。</li>
+</ul>
+<hr>
+<h2 id="09-小结与下一步">09 小结与下一步</h2>
+<p>本篇补齐了 Agent 的两种记忆：<strong>短期记忆</strong>用 <code>ContextCompressor</code> 在上下文超阈值时把旧轮次摘要、最近轮次保真，解决上下文溢出；<strong>长期记忆</strong>用 <code>MemoryStore</code> 把事实落盘，并通过 remember/recall 工具（主动）与 system 提示注入（被动）两种形态让 Agent「跨会话记得住你」。两者都通过组合注入，<code>Agent</code> 内核循环零改动，<code>post-05</code> 的全部测试继续有效。</p>
+<p>下一步（第 7 篇）要解决的是：<strong>当任务复杂到一轮装不下时，Agent 怎么自己拆解步骤、分步执行、再汇总</strong>。也就是 Plan-and-Execute——记忆负责「不忘」，规划负责「不乱」。</p>
+<hr>
+<h2 id="如何运行本章代码">如何运行本章代码</h2>
+<pre><code class="language-bash"># 1. 克隆
+git clone https://github.com/mrhuo/agent-from-scratch.git
+cd agent-from-scratch
+
+# 2. 安装依赖
+npm install
+
+# 3. 配置密钥（复制模板后填入申请的 API Key）
+cp .env.example .env
+#   编辑 .env：
+#     OPENAI_API_KEY=sk-xxxxxxxx
+#     BASE_URL=https://api.deepseek.com   # DeepSeek 兼容地址【不带 /v1】
+#     MODEL=deepseek-flash
+
+# 4. 回到本篇代码起点
+git checkout post-06
+
+# 5. 启动交互式对话（已带记忆：会主动 remember，也会跨会话 recall）
+npm run dev
+
+# 6. 跑单元测试（mock，无需 key / 外网）
+npm test
+
+# 7. 类型检查
+npm run typecheck
+
+# 8. 跑记忆演示（真实模型，需联网与 key）：先后三段对话展示长/短期记忆
+npx tsx scripts/demo-memory.ts
+</code></pre>
+<blockquote>
+<p>注意：DeepSeek 的 OpenAI 兼容地址是 <code>https://api.deepseek.com</code>（<strong>不带 <code>/v1</code></strong>），与 OpenAI 官方的 <code>https://api.openai.com/v1</code> 不同。本地 <code>.env</code> 已被 <code>.gitignore</code> 忽略，不会进入提交；<code>data/memory.json</code> 是运行期记忆文件，同样被忽略。</p>
+</blockquote>
+<blockquote>
+<p>原文：<a href="https://mp.weixin.qq.com/s/CDBXbiAdHN4bBQ-E2Vqqrw" target="_blank" rel="noopener nofollow">https://mp.weixin.qq.com/s/CDBXbiAdHN4bBQ-E2Vqqrw</a></p>
+</blockquote>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261109130924799-248989987.png" alt="关注&nbsp;「开发者精选资讯」公众号" loading="lazy"></p>
+<p><img src="https://img2024.cnblogs.com/blog/316520/202611/316520-20261109130911673-265422935.png" alt="image" loading="lazy"></p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    专注互联网产品开发，分享工具心得。
+做好每一件或大或小的事情。
+http://www.mrhuo.com
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-15 12:28">2026-11-15 12:28</span>&nbsp;
+<a href="https://www.cnblogs.com/MrHuo">开发者精选资讯</a>&nbsp;
+阅读(<span id="post_view_count">24</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23671261);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FMrHuo%2Fp%2F23671261%2Fagent-from-scratch-06&amp;targetId=23671261&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
