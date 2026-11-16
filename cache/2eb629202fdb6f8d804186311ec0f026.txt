@@ -1,0 +1,770 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23686725" title="发布于 2026-11-17 07:01">
+    
+
+    <span role="heading" aria-level="2">Redis 核心机制 | 过期删除策略：惰性+定期+主动（二）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        Redis 的「过期」不等于「删除」。真正删键的只有三条通道加一条传播。本篇在 8.10.3 上把六个断言逐条跑了一遍：20 万键要 2~3.5 秒才清完；调高 effort 反让撞配额次数下降；只读从库根本不自删。附四个旋钮的越界行为、三条开销公式与八条常见坑。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>先把结论放前面：Redis 没有定时器，「过期」不等于「删除」。真正删键的只有<strong>三条通道 + 一条传播</strong>：访问触发的惰性删除、沿游标扫桶的键级定期删除、7.4 起的字段级定期删除；所谓「主动删除」，只是主库把删除动作传播给从库。把「什么时候删」写进 SLA，是最常见的架构错误。</p>
+<h1 id="本篇的角度与边界">本篇的角度与边界</h1>
+<p>只回答一个问题：键已经过期之后，谁在什么时候把它真正删掉。 不覆盖 TTL 命令语义、内存淘汰、Lazy Free 全量开关、键空间通知的可靠替代。基线固定为 Redis 8.10.3 单实例（非集群），客户端 <code>StackExchange.Redis 2.8.37 / .NET 10</code>。凡与流行说法冲突处，给实测反证，不给「据说」。</p>
+<p>六个实验都在 8.10.3 单实例的独立端口上跑，一主一从，不碰业务实例；每组前 <code>FLUSHDB</code>，改过的参数在组末改回去。文中写「实测」的地方是本机跑出来的数字，写「源码」的地方对着 <code>expire.c</code> 逐行核过。</p>
+<h1 id="一开篇三组-5-秒能跑出来的反证">一、开篇：三组 5 秒能跑出来的反证</h1>
+<pre><code class="language-bash"># 起一个专用实验实例：别连业务实例，本机映射 6379
+# 镜像先拉主版本线 8.10；起来后用 INFO server 的 redis_version 核对小版本
+docker run -d --name redis-expire -p 6379:6379 redis:8.10
+
+# ① 单键已过期：三个读数必须同时成立，才算「真的删了」
+# 预期输出：OK
+redis-cli -p 6379 SET k v PX 300
+
+# 等 1 秒（远超 300ms）；用 shell 的 sleep，不要用 DEBUG SLEEP
+# → DEBUG SLEEP 默认被禁，且它冻结的是整个事件循环，会把定期删除一起冻住，实验结论全废
+sleep 1
+
+# 读一次：预期空行（= nil）。这条读命令本身也触发了一次惰性删除
+redis-cli -p 6379 GET k
+
+# 是否还存在：预期 0
+redis-cli -p 6379 EXISTS k
+
+# 库大小：预期 0（说明物理删除已完成，不是「只剩逻辑过期」）
+redis-cli -p 6379 DBSIZE
+
+# ② 20 万个同时到期的键：清完要 2~3.5 秒，不是瞬间（采样脚本见第四节）
+# 预期输出：200000
+redis-cli -p 6379 EVAL "for i=1,200000 do redis.call('SET','big:'..i,'v','EX',2) end return 200000" 0
+</code></pre>
+<pre><code class="language-text">采样时刻     DBSIZE    Δexpired_keys   说明
+t+0.5s      200000        0            刚写完，几乎没开始清
+t+1.0s      131210     45068
+t+1.5s       49219    128750
+t+2.0s           0    197053           收敛（另一台机器复跑是 t+3.04s，会漂 1 秒以上）
+</code></pre>
+<p>三组读数对应三个结论，缺一个就会走偏。</p>
+<ul>
+<li><strong>① 单个键「过期即消失」是假象。</strong> 它消失是因为你「读」了它：惰性删除的判定点就在 <code>lookupKey</code>，读命令自己把删除做完了。没人读的话，它还能继续躺在库里占着内存，等游标一圈一圈扫过来。</li>
+<li><strong>② 批量到期有秒级残留窗口。</strong> 20 万键要 2~3.5 秒（净减 6~14 万键/秒）。这段时间 <code>used_memory</code> 还按旧值算，容量不能按「已过期」估，告警也别在这个窗口里炸。</li>
+<li><strong>③ 只读从库的键是「逻辑已死、物理还在」。</strong> <code>TTL</code> 返回 <code>-2</code>、<code>GET</code> 返回 <code>nil</code>、<code>EXISTS</code> 返回 <code>0</code>，但 <code>DBSIZE</code> 仍能数到它——前提是主库此刻还没删它。主库删完会传播 <code>DEL</code>/<code>UNLINK</code>，从库立刻跟着没有；想观察残留必须先把主库冻住（第四节验证 F 给了可复现写法）。</li>
+</ul>
+<p>这类事故的链条我见过几回：活动资格缓存预热 10 万键，统一 <code>EXPIRE 3600</code>；整点一起到期，慢循环被吃满，主线程开始出毛刺，<code>DBSIZE</code> 高位不降；运维先加机器，再把 <code>hz</code> 调到 100，毛刺反而更密；一周后才查到根因是 TTL 没打散。每一步单看都有道理，因为每一步都在治症状。<strong>调参治症状，TTL 设计才是病因。</strong></p>
+<p>三条必须写进设计文档的不变量：</p>
+<ol>
+<li><strong>过期键在被删之前一直占内存</strong>，且计入 <code>used_memory</code> 与淘汰判定，所以「过期」不能用来兜容量规划。</li>
+<li><strong>冷键（不被访问）完全依赖定期删除</strong>，而定期删除的一圈可能长达分钟级，所以「过期即清理」不能用来做数据可见性约束。</li>
+<li><strong>从库不保证「自己会删」</strong>，所以主从 <code>DBSIZE</code> 不可直接对比，容量与有效性必须分开取数。</li>
+</ol>
+<hr>
+<h1 id="二机制三条通道一条传播">二、机制：三条通道，一条传播</h1>
+<h2 id="21-一张表看清分工">2.1 一张表看清分工</h2>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>触发条件</th>
+<th>执行者</th>
+<th>有配额吗</th>
+<th>什么时候才生效</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>惰性删除</td>
+<td>任何读写命令 <code>lookupKey</code> 命中</td>
+<td>主线程（调用者）</td>
+<td>无</td>
+<td>该键被访问的那一刻</td>
+</tr>
+<tr>
+<td>键级定期删除（慢循环）</td>
+<td><code>serverCron</code> 按 <code>hz</code> 到达</td>
+<td>主线程</td>
+<td>有，且每 16 轮才检查一次</td>
+<td>游标扫到它的那一圈</td>
+</tr>
+<tr>
+<td>键级定期删除（快循环）</td>
+<td><code>beforeSleep</code>，需前置条件</td>
+<td>主线程</td>
+<td>有，单次 ≤1000µs</td>
+<td>残留率超阈值时补刀</td>
+</tr>
+<tr>
+<td>字段级定期删除（7.4+）</td>
+<td>挂在 <code>activeExpireCycle</code> 每轮开头</td>
+<td>主线程</td>
+<td>独立预算，不吃键的配额</td>
+<td>每轮开头</td>
+</tr>
+<tr>
+<td>传播</td>
+<td>主库删除后写 <code>DEL</code>/<code>UNLINK</code></td>
+<td>主库 → 从库</td>
+<td>无</td>
+<td>主库删完的下一批命令</td>
+</tr>
+</tbody>
+</table>
+<p>三条通道全在主线程上跑。所以你那条 <code>GET</code>，很可能正好撞上它在删键。监控上看到的是尖刺，不是持续的高延迟：平均值一直好看，P99 一直难看。</p>
+<p>惰性删除的执行细节值得单独说，因为它让「谁删的」这个问题在从库上直接失效。主库上，命令走到 <code>lookupKey</code> 判定已过期，就删掉这个键、返回「不存在」，再把 <code>DEL</code>/<code>UNLINK</code> 写进复制流和 AOF。同样一次判定，在从库上只返回「逻辑上过期」，不删也不写。所以在只读从库上问「这个键谁删的」是个伪问题：它没删，只是学会了撒谎。主从 <code>DBSIZE</code> 对不上、<code>GET</code> 却一致，就来自这里：读路径统一走逻辑过期，存储路径各走各的。</p>
+<p>传播方向也要说清楚，它决定了「主库删了，从库什么时候删」。删除动作作为 <code>DEL</code>/<code>UNLINK</code> 写进复制流，也写进 AOF，这也是为什么 AOF 里看到的是删除记录，而不是「过期标记」。所以从库的键会不会消失，不取决于从库自己的过期循环，只取决于主库有没有删、命令有没有到。主从切换后新主库上还能看到几个「早就过期」的键，那不是数据错误，是异步复制本来就有的窗口。</p>
+<p><code>CLIENT PAUSE</code> 期间整条链都停（源码里 <code>isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)</code> 直接 <code>return</code>），主从两侧一起冻住。切换和扩缩容窗口最容易踩这条：窗口内 <code>DBSIZE</code> 只增不减，而从库的 <code>TTL</code> 已经在说「这键不该存在」。</p>
+<h2 id="22-定期删除沿游标扫桶不是随机抽-20-个">2.2 定期删除：沿游标扫桶，不是随机抽 20 个</h2>
+<p>真实逻辑只有一条：沿着 <code>db-&gt;expires_cursor</code> 做增量扫描，扫完一圈游标回到 0。</p>
+<ul>
+<li>每轮从 <code>expires</code> 取 <code>num = min(挂 TTL 键数, 20 + 5×(effort−1))</code> 个键尝试删除；</li>
+<li>扫描按桶走，桶上限 <code>num × 20</code>。空桶过得极快，所以每轮至少能啃 20 个键，配额允许时反复啃；</li>
+<li>一轮结束后，若「本轮命中过期键占比 &gt; <code>acceptable_stale</code>」（默认 10%，effort=10 收紧到 1%），就在同一 DB 上 <code>repeat</code> 再扫一轮；</li>
+<li>时间配额不是每轮都查，是每 16 轮查一次；超时就置 <code>timelimit_exit</code> 退出，剩的留给下一轮或快循环。上一轮撞过配额，下一轮会把要处理的 DB 数放宽到全部。</li>
+</ul>
+<p>为什么不是随机抽 20 个？随机抽样有两个绕不过去的毛病。一是可能永远抽不到某些桶，冷键就一直不删；二是给不出收敛上界，你没法回答「扫完一圈要多久」。游标扫描正好补这两点：<code>dictScan</code> 用反向二进制增量推游标，扩容缩容期间已经扫过的桶不重不漏，一圈也有明确终点（游标回到 0）。代价是没有优先级，它不管谁更该删，只按桶顺序走。所以「先到期的那批先被删」是错觉，<code>expires</code> 里谁先被扫到谁先死。</p>
+<p>单键滞后时调 <code>hz</code> 几乎没用，原因在这：你提高的是每秒轮数，一圈的总时长只按比例缩短。想把「10 万键 8 分钟」压到 1 分钟，<code>hz</code> 得提到 80，代价是 <code>serverCron</code> 全套任务一起变密。</p>
+<p>我一开始也以为「躺了几分钟不删」是抽样运气差，直到把一圈的耗时算出来：每轮 20 键、每秒 10 轮，10 万键就是 8 分钟，100 万键要 83 分钟。跟运气无关，是游标还在赶路。反过来，开篇 20 万键 3 秒清完也不神秘：残留率远超 10%，<code>repeat</code> 连成了链，CPU 配额被反复拉满。<strong>积压越多，清得越快</strong>，这是自适应算法的自觉设计。</p>
+<p>还有两个线上常见的误判值得记一下。「加了从库以后主库过期变慢」多半是错觉，真实原因是主库的写量和 <code>expires</code> 规模都变了。「重启后内存掉了一大截」也不是过期生效，是启动加载时过期键根本不会被装进来（RDB/AOF 加载阶段的处理在 S5-5，这里不展开）。</p>
+<h2 id="23-快循环有前置条件的补刀">2.3 快循环：有前置条件的补刀</h2>
+<p>快循环挂在每次事件循环的 <code>beforeSleep</code> 里，看着频率极高，其实有两道闸门：上轮慢循环没撞配额，且 <code>expired_stale_perc×100</code> 低于 <code>acceptable_stale</code> 时，直接 <code>return</code>；两次之间还要求间隔 ≥ 2 倍单次预算。所以残留很少的实例上，快循环几乎不干活。它不是保底机制，是残留已经偏多时的加速器。把它当成「后台线程一直在扫」，是最常见的源码级误读。</p>
+<p>两档循环怎么配合，跑一次小规模突发到期就看清了。1000 个键同时到期，慢循环第一轮扫 20 个，命中率 100%，超过 10% 就 <code>repeat</code>；几轮后命中率掉到 10% 以下，慢循环停手，这时 <code>expired_stale_perc</code> 已经被推高；下一次 <code>beforeSleep</code> 的快循环发现超阈值，接着补刀；压回阈值以内，快循环立刻停。整个过程是先猛后缓、快慢交替，不是匀速。画一条 <code>expired_stale_perc</code> 曲线，这个呼吸节奏肉眼可见。</p>
+<h2 id="24-字段级dbsize-看不见的第三条通道">2.4 字段级：<code>DBSIZE</code> 看不见的第三条通道</h2>
+<p>7.4 起 Hash 支持字段级 TTL（<code>HEXPIRE</code>/<code>HTTL</code>/<code>HPTTL</code>/<code>HPERSIST</code>/<code>HEXPIRETIME</code>）。这类残留不改变键数、不改变 <code>expires</code> 的大小：一个 Hash 里 5 万个字段全部过期，<code>DBSIZE</code> 从头到尾只有一个数字 <code>1</code>。</p>
+<p>字段级的预算也是独立的：每轮最多清 <code>10000 / hz</code> 个字段，<code>hz=10</code> 就是每轮 1000 个、折合 1 万/秒；连续撞上限会按累积超出次数放大，最多 32 倍。我实测 5 万字段的清理速率约 <strong>5 万字段/秒</strong>，正好是基础预算的 5 倍，说明放大机制真的在工作。</p>
+<p>观测只能靠 <code>INFO keyspace</code> 的 <code>subexpiry</code>（挂着字段 TTL 的键数）和 <code>INFO stats</code> 的 <code>expired_subkeys</code>（累计过期字段数）。只盯 <code>DBSIZE</code> 和 <code>expires</code> 的监控，对字段级过期是瞎的。</p>
+<p>字段级 TTL 最容易踩的是混用和覆盖写。同一个 Hash 上既设整键 TTL、又设若干字段 TTL 时，整键到期整个键被删，字段 TTL 一起消失；字段到期只摘字段，键还在。「会话某个属性先失效、整个会话后失效」是合理需求，但排障时要分清是哪一层在生效：<code>TTL</code> 看键，<code>HTTL</code> 看字段，两个命令给出的答案可能完全相反。</p>
+<p>覆盖写更隐蔽，这是我在 8.10.3 上跑出来的：<code>HSET h f v</code> → <code>HEXPIRE h 100 FIELDS 1 f</code>（返回 1）→ <code>HTTL</code> 返回 100 → 再 <code>HSET h f v2</code> 覆盖同名字段 → <code>HTTL</code> 变 −1、<code>HEXPIRETIME</code> 变 −1。<strong>一次「只是更新了值」的写入，把字段 TTL 清掉了。</strong> 更麻烦的是 <code>INFO keyspace</code> 的 <code>subexpiry</code> 在该字段 TTL 被清掉后仍显示 1，连看 6 秒都没回落，它不是「当前有多少字段 TTL」的实时仪表。某个字段到底有没有 TTL，只能逐个 <code>HTTL</code> 查。</p>
+<p>还有规模的问题：一个 Hash 存 10 万字段、给其中 5 万设 TTL，每轮预算只有 1000 个，靠放大也要好几秒才清完，这期间 <code>DBSIZE</code> 一动不动。</p>
+<h2 id="25-版本演进决定你的断言在哪个版本成立">2.5 版本演进（决定你的断言在哪个版本成立）</h2>
+<table>
+<thead>
+<tr>
+<th>版本</th>
+<th>变化</th>
+<th>对本篇结论的影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7.0</td>
+<td>新增 <code>active-expire-effort</code></td>
+<td>终于有了「只调过期、不动全局」的旋钮</td>
+</tr>
+<tr>
+<td>7.4</td>
+<td><code>expires</code> 迁入 kvstore，改为游标扫桶；Hash 字段级 TTL 落地</td>
+<td>「随机抽样 20 个」的旧描述彻底作废；多出第三条通道</td>
+</tr>
+<tr>
+<td>8.10.3</td>
+<td>本篇基线</td>
+<td>全部断言以此为准</td>
+</tr>
+</tbody>
+</table>
+<p>写评审材料时得注意：同一个数字在不同版本上可能不是一回事。7.2 及更早没有 <code>expired_keys_active</code> 与 <code>expired_subkeys</code>，用「<code>expired_keys</code> − <code>expired_keys_active</code>」拆惰性贡献这套方法，在旧版本上会直接算成 0。</p>
+<hr>
+<h1 id="三旋钮能干预的只有四个东西">三、旋钮：能干预的只有四个东西</h1>
+<table>
+<thead>
+<tr>
+<th>旋钮</th>
+<th>默认</th>
+<th>作用范围</th>
+<th>越界行为（<strong>两者相反，最易记反</strong>）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hz</code></td>
+<td>10</td>
+<td>全局节拍（连带 <code>serverCron</code> 全套）</td>
+<td><strong>静默夹取</strong>：100000 → 500、501 → 500、0 → 1，命令都回 <code>OK</code></td>
+</tr>
+<tr>
+<td><code>active-expire-effort</code></td>
+<td>1</td>
+<td>只调过期，同调四个参数</td>
+<td><strong>直接报错</strong>：<code>must be between 1 and 10 inclusive</code></td>
+</tr>
+<tr>
+<td><code>lazyfree-lazy-expire</code></td>
+<td>no</td>
+<td>只改「释放」方式，不改「判定与摘键」</td>
+<td>布尔，无区间</td>
+</tr>
+<tr>
+<td><code>CLIENT PAUSE</code></td>
+<td>—</td>
+<td>冻结写与过期动作</td>
+<td>不是删除命令，却是切换窗口的常客</td>
+</tr>
+</tbody>
+</table>
+<p><code>active-expire-effort</code> 的四参数推导（<code>n</code> = 配置值，源码 <code>expire.c</code>，注意 <code>20/4</code> 是整数除法）：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>公式</th>
+<th>n=1</th>
+<th>n=10</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每轮键数 <code>keys_per_loop</code></td>
+<td><code>20 + 20/4×(n−1)</code></td>
+<td>20</td>
+<td>65</td>
+</tr>
+<tr>
+<td>快循环单次预算</td>
+<td><code>1000 + 1000/4×(n−1)</code> µs</td>
+<td>1000µs</td>
+<td>3250µs</td>
+</tr>
+<tr>
+<td>慢循环 CPU 配额</td>
+<td><code>25 + 2×(n−1)</code> %</td>
+<td>25%</td>
+<td>43%</td>
+</tr>
+<tr>
+<td>继续扫阈值 <code>acceptable_stale</code></td>
+<td><code>10 − (n−1)</code> %</td>
+<td>10%</td>
+<td>1%</td>
+</tr>
+</tbody>
+</table>
+<p>第四行是大部分资料漏掉的：effort 会把快循环的单次时长一起放大，两个时间配额同时变松。所以调高 effort 是三重叠加：扫得更多、扫得更久、更不容忍残留。它唯一不改的是全局节拍，什么时候开始一轮，还是只由 <code>hz</code> 决定。</p>
+<pre><code class="language-bash"># ① hz 的超限是静默夹取：命令回 OK，值却被改小
+# 预期输出：OK
+redis-cli -p 6379 CONFIG SET hz 100000
+
+# 预期输出两行：hz / 500（不是 100000）
+redis-cli -p 6379 CONFIG GET hz
+
+# ② 负数不夹取，直接报错；注意报错里的区间是 0~2147483647，不是 1~500
+redis-cli -p 6379 CONFIG SET hz -1
+
+# ③ effort 反过来：越界直接拒绝，不给你「看起来成功」的机会
+# 预期输出：OK
+redis-cli -p 6379 CONFIG SET active-expire-effort 2
+
+# 预期输出：ERR ... argument must be between 1 and 10 inclusive
+redis-cli -p 6379 CONFIG SET active-expire-effort 20
+
+# ④ 热改后必须回读：hz 是运行时值，configured_hz 是配置值（dynamic-hz 会让两者不同）
+redis-cli -p 6379 INFO server | grep -E 'hz:|configured_hz:'
+
+# ⑤ 异步释放只影响「释放」：开了它，键照样要先被判定过期、从 expires 摘掉
+redis-cli -p 6379 CONFIG GET lazyfree-lazy-expire
+</code></pre>
+<p>热改这里有个坑：<code>CONFIG SET</code> 回 <code>OK</code> 只说明参数名和类型合法，不说明值如你所愿。<code>hz</code> 会被夹取，<code>effort</code> 会报错，唯一可靠的确认手段是 <code>CONFIG GET</code> 或 <code>INFO server</code> 回读。Windows 原生 cmd 没有 <code>grep</code>，换 <code>Select-String</code>，或者 <code>redis-cli --no-raw INFO server</code>。</p>
+<p>几个观测面容易被忽略，但排查时很好用。<code>expired_stale_perc</code> 是本轮过期占比的 5%/95% 滑动平均，快循环靠它决定要不要启动。<code>expire_cycle_cpu_milliseconds</code> 是过期循环的累计 CPU 毫秒。<code>lazyfree_pending_objects</code> 是异步释放的积压。<code>LATENCY HISTORY expire-cycle</code> 得先 <code>CONFIG SET latency-monitor-threshold 1</code>，否则永远是空数组，这一条经常被当成「没有毛刺」的证据。</p>
+<p>调参顺序反了会白忙，我的排法是：先 <code>active-expire-effort</code>（只管过期，副作用最小），再 <code>lazyfree-lazy-expire</code>（削峰，不动判定），最后才动 <code>hz</code>（全局旋钮，副作用最大）。<code>hz</code> 提到 100，<code>serverCron</code> 的整套后台任务都跟着变密，不只是过期。</p>
+<p><code>hz</code> 的真实成本得说清楚。它控制 <code>serverCron</code> 的调用频率，而 <code>serverCron</code> 里排着的不只是过期：客户端超时检查、渐进式 rehash 的迁移步进、AOF 缓冲刷盘、从库心跳与超时判定、集群节点握手，一整套都在里面。从 10 提到 100，等于这一整套提速 10 倍，过期只是其中一项。这也是我把 <code>hz</code> 排在最后的原因：<strong>它从来不是「过期专用旋钮」</strong>。</p>
+<p>还有一个容易看反的机制：<code>dynamic-hz</code>（默认开）会在连接数增多时临时提高 <code>hz</code>，于是 <code>INFO server</code> 里的 <code>hz</code> 可能大于 <code>configured_hz</code>。判断「配置有没有生效」看 <code>configured_hz</code>，判断「当前跑多快」看 <code>hz</code>，两个字段名字相近，结论却相反。</p>
+<p>这两个旋钮怎么配，我只有三条经验。常态用默认，<code>hz=10</code>、<code>effort=1</code> 就够；只有 TTL 密度高、清理明显滞后时才动 <code>effort</code>，一次加 2 级观察一轮，别一步到 10。<code>hz</code> 我一般不超过 50，再往上 <code>serverCron</code> 的其他任务会先于过期暴露成本，心跳变密、rehash 步进变碎。<strong>永远不要靠 <code>hz</code> 解决「同时到期」</strong>，那是一次性冲击，抖动才是解。如果监控显示 <code>expired_stale_perc</code> 长期高位、<code>cpu_ms</code> 斜率却不高，说明有活干但没时间干，这时候提 <code>effort</code>（拉长单轮预算）比提 <code>hz</code>（增加轮次）对症。</p>
+<hr>
+<h1 id="四六个断言逐条实机验8103独立端口">四、六个断言，逐条实机验（8.10.3，独立端口）</h1>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>断言</th>
+<th>怎么验</th>
+<th>实测结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td>单键最终会被删，但不一定是「谁」删的</td>
+<td><code>SET PX 300</code> → 等 1s → <code>GET/EXISTS/DBSIZE</code></td>
+<td>三个读数归零、<code>expired_keys</code> 比基线 +1（必须记基线，绝对值含前序实验）</td>
+</tr>
+<tr>
+<td>B</td>
+<td>批量到期是秒级收敛，不是瞬间</td>
+<td>20 万键 + 0.5s 采样</td>
+<td>2~3.5 秒收敛，速率 6~14 万键/秒</td>
+</tr>
+<tr>
+<td>C</td>
+<td>effort 调高会让 <code>time_cap</code> 下降</td>
+<td>同脚本跑 effort=1 / 10</td>
+<td>42 → 21；复跑 109 → 62（轮次变少、单次变长）</td>
+</tr>
+<tr>
+<td>D</td>
+<td><code>time_cap</code> 不涨 ≠ 清理跟得上</td>
+<td><code>hz=1</code> 写 5 万键，只采样不访问</td>
+<td>一轮 250ms 清掉近 4.9 万键，<code>time_cap</code> 全程 0，仍有秒级滞后</td>
+</tr>
+<tr>
+<td>E</td>
+<td>字段级过期要单独观测</td>
+<td><code>HEXPIRE</code> + <code>HTTL</code> + <code>INFO keyspace</code></td>
+<td><code>HTTL</code> 返回秒、<code>HPTTL</code> 返回毫秒；<code>subexpiry=1</code>；不存在字段返回 −2</td>
+</tr>
+<tr>
+<td>F</td>
+<td>只读从库不自删、可写从库自删</td>
+<td>冻结主库 + 暂停窗口</td>
+<td>暂停中主从 <code>DBSIZE</code> 都是 1、从库 <code>TTL=-2</code>；<code>replica-read-only no</code> 后从库自己删、<code>slave_expires_tracked_keys</code> 1→0</td>
+</tr>
+</tbody>
+</table>
+<p>验证 A 的坑不在读数，在计数。<code>expired_keys</code> 是累计量，绝对值毫无意义（本篇实例上前序实验已经累计到 40 万）。<strong>先读基线、再比增量</strong>是唯一正确的姿势；期间要还有别的键到期，增量可能是 +N，不是 +1。</p>
+<h2 id="41-采样脚本验证-b--c-共用一字不差">4.1 采样脚本（验证 B / C 共用，一字不差）</h2>
+<pre><code class="language-bash"># 清库 + 固定 hz=10 + 力度回到 1（作为 effort=10 那组的对照）
+redis-cli -p 6379 FLUSHDB
+redis-cli -p 6379 CONFIG SET hz 10
+redis-cli -p 6379 CONFIG SET active-expire-effort 1
+
+# 记基线：两个累计计数器跨实验只能比增量，不能比绝对值
+BASE_EXP=$(redis-cli -p 6379 INFO stats | awk -F: '/^expired_keys:/{print $2+0}')
+BASE_CAP=$(redis-cli -p 6379 INFO stats | awk -F: '/^expired_time_cap_reached_count:/{print $2+0}')
+
+# 一次性写入 20 万个「2 秒后过期」的键；脚本自身约 1.9 秒，计时从它返回那一刻开始
+# 预期输出：200000
+redis-cli -p 6379 EVAL "for i=1,200000 do redis.call('SET','big:'..i,'v','EX',2) end return 200000" 0
+
+# 每 0.5 秒采样一次，共 8 次；依赖 bash + awk + seq（Linux/macOS/WSL/Git Bash 均可）
+for i in $(seq 1 8); do
+  # 读累计值，与基线相减得到本轮增量
+  EXP=$(redis-cli -p 6379 INFO stats | awk -F: '/^expired_keys:/{print $2+0}')
+  CAP=$(redis-cli -p 6379 INFO stats | awk -F: '/^expired_time_cap_reached_count:/{print $2+0}')
+  SIZE=$(redis-cli -p 6379 DBSIZE)
+
+  # 换算标称采样时刻（单次采样本身有几十毫秒开销，实际会略晚）
+  T=$(awk -v i="$i" 'BEGIN{printf "%.1f", i*0.5}')
+
+  # 一行三个量：残留键数、过期总数增量、撞满配额次数增量
+  echo "t+${T}s DBSIZE=${SIZE} dExpired=$((EXP-BASE_EXP)) timeCap=$((CAP-BASE_CAP))"
+
+  # 采样间隔
+  sleep 0.5
+done
+
+# 跑完把力度改回默认，别把实验参数留给下一个实验
+redis-cli -p 6379 CONFIG SET active-expire-effort 1
+</code></pre>
+<p>跑 effort=10 那组时，只改两行：把 <code>active-expire-effort</code> 设成 10，其余一字不动。这是控制变量：<code>hz</code> 与键名、TTL、数量完全一致，唯一的差异是力度。</p>
+<p>采样精度得交代，不然数字会被过度解读。单次采样是三次 <code>redis-cli</code> 往返拼出来的（两次 <code>INFO stats</code> 加一次 <code>DBSIZE</code>），Windows 上要 30~60ms，所以「t+0.5s」是标称值，实际略晚，三个读数之间还差几十毫秒。这也就解释了为什么 <code>Δexpired_keys</code> 与 <code>DBSIZE</code> 之和有时略大于 200000：不是计数错了，是两次读取之间又删了几个。想更准就把三个字段一次读回，单条 <code>INFO</code> 已经含 <code>db0</code> 行，可以省掉 <code>DBSIZE</code>。</p>
+<p>复现记录：上表是首跑的原始数据；换机复跑同一脚本得到 effort=1 收敛 2.0s / <code>Δtime_cap</code> 109，effort=10 收敛 1.5s / <code>Δtime_cap</code> 62。<strong>方向完全一致，绝对值会漂</strong>——同一台机器紧邻两轮，秒数都能差 1 秒以上。所以结论只能这么写：<strong>速率区间可比，绝对秒数与绝对计数不可跨环境引用</strong>。把「3 秒收敛」写进 SLA 的人，下一次换机器就会被打脸。</p>
+<p>验证 C 最反直觉：effort 从 1 调到 10，<code>expired_time_cap_reached_count</code> 反而从 42 掉到 21。这个计数器数的是「本轮撞满配额提前退出」的次数。effort 越高，单轮预算越长（25% → 43%）、每轮扫得越多（20 → 65 键），轮次就变少、每次变长，撞配额的次数自然少了。「effort 高 ⇒ 配额吃紧 ⇒ <code>time_cap</code> 更高」看着合理，实测是反的。</p>
+<h2 id="42-从库两态必须先冻住主库否则复现不出来">4.2 从库两态（必须先冻住主库，否则复现不出来）</h2>
+<p>这里有个方法论陷阱。主库过期循环正常时，删完就把 <code>DEL</code>/<code>UNLINK</code> 传播给从库，所以「写完等 3 秒、从库 <code>DBSIZE</code> 仍包含该键」这种写法根本复现不出来，我实测 3 秒后从库 <code>DBSIZE</code> 已经是 0。想看到「只读从库不自删」，得先让主库来不及删。</p>
+<pre><code class="language-bash"># 前置：6380 是 6379 的从库（已配置 replicaof 127.0.0.1 6379）；实验用独立端口，别碰生产主从
+# 预期输出：role:slave
+redis-cli -p 6380 INFO replication | grep role
+
+# 确认从库仍是默认的只读状态
+# 预期输出两行：replica-read-only / yes
+redis-cli -p 6380 CONFIG GET replica-read-only
+
+# 主库写一个 1 秒过期的键
+# 预期输出：OK
+redis-cli -p 6379 SET third v EX 1
+
+# 立刻冻结主库的写与过期动作 4 秒：不冻结的话，主库删完即传播，从库根本留不住
+# 预期输出：OK
+redis-cli -p 6379 CLIENT PAUSE 4000 WRITE
+
+# 在暂停窗口内、TTL 已过之后采样（1.8s &gt; 1s）
+sleep 1.8
+
+# 主库键数：预期 1（主库自己被冻结，没删）
+redis-cli -p 6379 DBSIZE
+
+# 从库键数：预期 1（键仍躺在从库键空间里）
+redis-cli -p 6380 DBSIZE
+
+# 从库 TTL：预期 -2（逻辑上已过期）
+redis-cli -p 6380 TTL third
+
+# 从库 GET：预期空行（nil）
+redis-cli -p 6380 GET third
+
+# 从库 EXISTS：预期 0（读命令看到的是「不存在」）
+redis-cli -p 6380 EXISTS third
+
+# 暂停解除后再等 2.5 秒：主库删掉并传播，两边一起归 0
+sleep 2.5
+redis-cli -p 6379 DBSIZE
+redis-cli -p 6380 DBSIZE
+</code></pre>
+<p>可写从库那一半更值得走一遍，结论更锋利：<code>CONFIG SET replica-read-only no</code>，在从库本地写 <code>SET localk v EX 1</code>（主库没这个键），<code>INFO stats</code> 的 <code>slave_expires_tracked_keys</code> 变 1，3 秒后 <code>DBSIZE=0</code>、<code>expired_keys</code> 与 <code>expired_keys_active</code> 同步 +1、tracked 回 0。可写从库有一份自己的过期键追踪表（<code>slaveKeysWithExpire</code>），会自己删本地写入的带 TTL 键。</p>
+<p>这里有个必须记住的口径：<strong>「<code>expired_keys</code> − <code>expired_keys_active</code> = 惰性贡献」只在主库成立</strong>。从库上这个差值会把 <code>expireSlaveKeys</code> 的贡献算进「定期」，横跨主从对账必然对不上。</p>
+<p>切换窗口的处置清单可以直接抄进 runbook。切前确认 <code>replica-read-only</code> 的取值。切换过程中别用 <code>DBSIZE</code> 做容量决策，暂停期间它只增不减。切完先等一轮传播落地（秒级），再看新主库 <code>DBSIZE</code> 是否收敛。新主库残留明显多于预期，查的是旧主库当时有没有删干净，不是新主库的 <code>hz</code>。</p>
+<h2 id="43-三条判据的口径">4.3 三条判据的口径</h2>
+<ul>
+<li><code>time_cap</code> 不是 CPU 指标，它数的是「本轮撞满配额而提前退出」的次数；CPU 占用看 <code>expire_cycle_cpu_milliseconds</code>。</li>
+<li><code>expired_keys</code> 是累计量，跨实验只能比增量，且必须记基线。</li>
+<li>「刚到期」是暂态：秒级；持续数分钟仍高位，才去查 <code>hz</code> / effort / 游标一圈的长度。</li>
+<li>同一时刻的 <code>DBSIZE</code> 与 <code>TTL</code> 可能互相矛盾：<code>CLIENT PAUSE</code> 窗口里 <code>DBSIZE</code> 说有、<code>TTL</code> 说没有。这不是 bug，是「物理存在」与「逻辑有效」两套语义没对齐。</li>
+</ul>
+<h2 id="44-如果结果和预期相反说明什么">4.4 如果结果和预期相反，说明什么</h2>
+<p>实验的价值一半在正着验证，另一半在反着排查。六个验证的反向判据列在下面，线上出异常可以直接对号：</p>
+<ul>
+<li>验证 A 反向：<code>DBSIZE</code> 归零但 <code>expired_keys</code> 不涨——键是被别的路径删掉的（<code>DEL</code>、覆盖写、<code>FLUSHDB</code>），不是过期；这时查业务代码比查 Redis 有效。</li>
+<li>验证 B 反向：几十分钟仍是高位——不是「清得慢」，而是根本没在清：先看 <code>expired_keys</code> 是否在涨，不涨就查 <code>hz</code> 是不是被夹成 1、实例是不是只读从库、或者正处于 <code>CLIENT PAUSE</code> 窗口。</li>
+<li>验证 C 反向：effort=10 反而更慢——多半是 <code>hz</code> 没控制在同一档，或写入脚本本身吃满主线程（<code>EVAL</code> 是阻塞的，脚本越慢，观测窗口越靠后）。</li>
+<li>验证 D 反向：<code>hz=1</code> 却几乎没滞后——键总量太小，一轮就扫完了。这条结论只在「键数远大于每轮预算」时成立，这是实验设计的前提，不是结论的漏洞。</li>
+<li>验证 E 反向：业务说「字段该过期了」但 <code>HTTL</code> 仍是正数——查是不是被 <code>HSET</code> 覆盖写清了 TTL（见 2.4）。</li>
+<li>验证 F 反向：暂停窗口内从库 <code>DBSIZE</code> 也是 0——主库其实没被冻住（暂停前已有别的连接在写，或参数用了 <code>ALL</code> 以外的组合），或者这个键根本没写成功。</li>
+</ul>
+<p>反向判据写进 runbook，比写「正常时应为 X」有用得多。排障时你面对的从来不是正常状态。</p>
+<hr>
+<h1 id="五生产落地">五、生产落地</h1>
+<h2 id="51-六个问题各配一条否决条件">5.1 六个问题，各配一条否决条件</h2>
+<ol>
+<li>这批键会同时到期吗？ 会 → 先加 TTL 抖动，别调参。判据：同一秒到期的键数 × 单键删除成本 &gt; 可接受延迟预算。</li>
+<li>有没有大 value？ 有（&gt;1MB，或元素上万的集合）→ 开 <code>lazyfree-lazy-expire yes</code> 并盯 <code>lazyfree_pending_objects</code>；同时考虑拆 key。</li>
+<li>键是冷数据吗？ 是 → 只能靠定期删除，接受「分钟级滞后」；把「过期即不可见」的业务约束从设计里拿掉。</li>
+<li>业务能接受逻辑过期吗？ 能 → value 内嵌过期时刻，读时判定 + 后台重建，时机最可控，也最容易测。</li>
+<li>需要准点触发业务动作吗？ 需要 → 过期事件/键空间通知全部否决，改调度器、Stream 或延迟队列。</li>
+<li>切换窗口里容量与有效性分别以什么为准？ 容量看主库 <code>DBSIZE</code>，有效性只看 <code>GET</code>/<code>EXISTS</code>；两者的差值就是残留窗口。</li>
+</ol>
+<p>决策树最容易变成「全都选是」，所以每问后面都跟一条否决条件，答不上这条就跳过：</p>
+<ul>
+<li>Q1 否决条件：同时到期键数 × 单键删除成本 &lt; 可接受延迟预算 → 抖动是过度设计，先别动。</li>
+<li>Q2 否决条件：用 <code>MEMORY USAGE</code> 量出大 value 的删除本身就在 1ms 以内 → 开 <code>lazyfree</code> 收益有限，优先拆 key。</li>
+<li>Q3 否决条件：冷数据同时要求「准时不可见」→ Redis 过期机制根本不适用，换存储或加读时校验。</li>
+<li>Q4 否决条件：逻辑过期需要业务侧兜底重建，没有幂等重建路径就别用。</li>
+<li>Q5 否决条件：业务其实能容忍秒级延迟 → 调度器才是唯一解；容忍不了，说明需求本身错位（Redis 给不了这个保证）。</li>
+<li>Q6 否决条件：没有。这一问必须答出来，答不出来就别上主从切换方案。</li>
+</ul>
+<h2 id="52-三个高频场景">5.2 三个高频场景</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>方案</th>
+<th>别做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>过期风暴（批量预热、整点刷新）</td>
+<td>TTL 随机抖动 <code>3600 + rand(-60, 60)</code>；热点键改逻辑过期</td>
+<td>别指望调 <code>hz</code> 根治；也别用「错峰预热」当唯一手段，写流量本身也会尖峰</td>
+</tr>
+<tr>
+<td>大 key 过期毛刺（P99 尖刺）</td>
+<td><code>lazyfree-lazy-expire yes</code> + 拆分为多个小 key</td>
+<td>别把 <code>lazyfree</code> 当「判定更早」用，它只改释放</td>
+</tr>
+<tr>
+<td>回收自检（跟不跟得上）</td>
+<td>四指标联判：<code>expired_keys</code> 增速 vs 写入速率、<code>DBSIZE</code> 趋势、<code>cpu_ms</code> 斜率、<code>expired_subkeys</code></td>
+<td>别看单一瞬时值，也别用 <code>time_cap</code> 代替 CPU 口径</td>
+</tr>
+</tbody>
+</table>
+<p>三个场景的参数别停在口号上，落地可以直接照抄。抖动用 <code>base + rand(-spread, +spread)</code>，<code>spread</code> 取基础 TTL 的 2%~5%（3600 秒对应 ±60~180 秒），下限兜底 10 秒。大 key 先用 <code>MEMORY USAGE</code> 量单个 value，超过 1MB 就拆，拆完再开 <code>lazyfree</code>，否则只是把一次长阻塞换成多次短阻塞。自检每 30 秒采一次、只记增量，<code>expired_keys</code> 增速低于写入速率的 80% 且持续 3 分钟就告警。这个 80% 是经验阈值，用来吸收 TTL 渐次到期的天然滞后，不是精确线。</p>
+<p>TTL 抖动只需要一处实现，别在业务代码里散落写 <code>3600</code>：</p>
+<pre><code class="language-csharp">// 抖动的唯一入口：基础 TTL 与抖动区间集中在这里，业务只调用
+static TimeSpan TtlWithJitter(int baseTtlSeconds, int spreadSeconds)
+{
+    // Random.Shared 是 .NET 6+ 的线程安全共享实例，避免每次 new Random() 撞同一种子
+    int ttl = baseTtlSeconds + Random.Shared.Next(-spreadSeconds, spreadSeconds);
+
+    // 下限兜底 10 秒：防止抖动出 0 或负值，导致「设 TTL 的瞬间键就过期」
+    return TimeSpan.FromSeconds(Math.Max(10, ttl));
+}
+</code></pre>
+<h2 id="53-自检工具接在前面连接之后可直接运行">5.3 自检工具（接在前面连接之后可直接运行）</h2>
+<pre><code class="language-csharp">// 连接串用 SE.Redis 自己的格式 host:port,key=value；redis:// URL 不被接受
+// 地址从环境变量 REDIS 取，换实验实例不用改代码
+string endpoint = Environment.GetEnvironmentVariable("REDIS") ?? "127.0.0.1:6379";
+
+// abortConnect=false：首次连不上不在构造阶段抛异常，交给后续命令超时处理
+using IConnectionMultiplexer muxer = ConnectionMultiplexer.Connect($"{endpoint},abortConnect=false,connectTimeout=3000");
+
+// 默认库（db 0）；过期策略按库独立
+IDatabase db = muxer.GetDatabase();
+
+// INFO 只取一次，解析成字典后所有字段复用，保证同一时刻的口径
+static Dictionary&lt;string, string&gt; ParseInfo(string info)
+{
+    // Ordinal：INFO 字段名大小写敏感，别用区域性比较
+    var map = new Dictionary&lt;string, string&gt;(StringComparer.Ordinal);
+
+    // 服务端按 CRLF 输出：先按 \n 切行，再逐行 Trim 掉 \r
+    foreach (var raw in info.Split('\n'))
+    {
+        // 去掉行尾空白（主要是 \r）
+        string line = raw.Trim();
+
+        // 空行与节标题（# 开头）不是字段行
+        if (line.Length == 0 || line.StartsWith('#'))
+            continue;
+
+        // 只按第一个冒号切分，避免值里含冒号时切错
+        int idx = line.IndexOf(':');
+
+        // 没有冒号或冒号在首位，不是合法字段行
+        if (idx &lt;= 0)
+            continue;
+
+        // 前半字段名、后半值；同名重复时后者覆盖前者
+        map[line[..idx]] = line[(idx + 1)..];
+    }
+    return map;
+}
+
+// 字段缺失返回 null 而不是 0：版本不认识该字段时必须能被看见（≤7.2 会走到这里）
+static long? Counter(IReadOnlyDictionary&lt;string, string&gt; map, string key)
+{
+    // 不存在 → null，与「存在但值为 0」区分开
+    if (!map.TryGetValue(key, out var v))
+        return null;
+
+    // InvariantCulture 解析，避免区域设置影响整数格式
+    return long.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : (long?)null;
+}
+
+// 两次 INFO 各一个往返：stats 给计数，server 给 hz 口径
+var stats = ParseInfo((string)(await db.ExecuteAsync("INFO", "stats"))!);
+var server = ParseInfo((string)(await db.ExecuteAsync("INFO", "server"))!);
+
+// 过期相关计数：前两个全版本都有，后三个 7.4 起才有（缺失时返回 null）
+long? expired = Counter(stats, "expired_keys");
+long? active = Counter(stats, "expired_keys_active");
+long? timeCap = Counter(stats, "expired_time_cap_reached_count");
+long? cpuMs = Counter(stats, "expire_cycle_cpu_milliseconds");
+long? subKeys = Counter(stats, "expired_subkeys");
+
+// hz 必须回读：configured_hz 是配置值，hz 是运行时值（dynamic-hz 开时两者可能不同）
+string hzRuntime = server.GetValueOrDefault("hz", "N/A");
+string hzConfig = server.GetValueOrDefault("configured_hz", "N/A");
+
+// 当前键总数，用来判断是否堆积
+long dbSize = (long)(await db.ExecuteAsync("DBSIZE"))!;
+
+// 惰性贡献 = expired_keys − expired_keys_active（仅主库成立，见 4.2）
+Console.WriteLine($"hz={hzRuntime}/{hzConfig}, expired={expired}, 定期={active}, " +
+                  $"惰性≈{(expired is null || active is null ? "N/A" : (expired - active).ToString())}, " +
+                  $"time_cap={timeCap}, cpu_ms={cpuMs}, subkeys={subKeys}, DBSIZE={dbSize}");
+
+// 确定性回收：绕开游标与访问判定直接删已知键；UNLINK 走异步释放
+// 2.8.37 的 IDatabase 没有 KeyUnlinkAsync，只能 ExecuteAsync（否则编译报 CS1061）
+long removed = (long)(await db.ExecuteAsync("UNLINK", "goods:1001"))!;
+Console.WriteLine($"UNLINK removed={removed}");
+</code></pre>
+<p>实测输出（8.10.3）。干净库首跑（刚起来、只写了 1 个字段 TTL 和 1 个 <code>goods:1001</code>）：</p>
+<pre><code class="language-text">hz=10/10, expired=0, 定期=0, 惰性≈0, time_cap=0, cpu_ms=0, subkeys=0, DBSIZE=2
+UNLINK removed=1
+</code></pre>
+<p>同一实例跑过前序实验后（计数器已累计）：<code>hz=10/10, expired=400204, 定期=400204, 惰性≈0, time_cap=171, cpu_ms=1555, subkeys=1, DBSIZE=101</code>。两行差别只在绝对计数上，说明「<code>expired</code> 与「定期」两列相等」才是判据，绝对数字只是历史。这套代码在 <code>TreatWarningsAsErrors=true</code> 下编译 0 警告 0 错误，上面两行都是真跑出来的。</p>
+<p>输出怎么读，三种典型组合就够：</p>
+<ul>
+<li><code>expired</code> 与「定期」相等、<code>DBSIZE</code> 平稳：全部由定期删除完成、无读流量，健康。</li>
+<li>两者差值持续变大、<code>time_cap</code> 也涨：惰性删除在承担主要工作，说明这批键正被高频访问；要警惕「访问一停，残留立刻堆积」。</li>
+<li>两者差值大、<code>time_cap</code> 不涨：惰性在干活、定期几乎不作为，通常是冷热极端分层（少数热键被反复访问，绝大多数冷键连游标都没扫到）；这时看 <code>expires</code> 规模与 <code>hz</code>，别去看 effort。</li>
+</ul>
+<h2 id="54-监控与告警">5.4 监控与告警</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>告警判断</th>
+<th>别踩的坑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>expired_keys</code></td>
+<td>增速低于写入速率 → 回收跟不上</td>
+<td>累计量，看斜率不看绝对值</td>
+</tr>
+<tr>
+<td><code>expired_keys_active</code></td>
+<td>与上者差值 = 惰性贡献（仅主库）</td>
+<td>从库上口径失真</td>
+</tr>
+<tr>
+<td><code>expired_time_cap_reached_count</code></td>
+<td>持续上涨 → 慢循环撞满配额</td>
+<td>不涨不代表跟得上</td>
+</tr>
+<tr>
+<td><code>expire_cycle_cpu_milliseconds</code></td>
+<td>增速接近 CPU 预算（<code>hz=10</code> 下约 250ms/秒）</td>
+<td>这才是 CPU 的正确口径</td>
+</tr>
+<tr>
+<td><code>DBSIZE</code></td>
+<td>长期高位不降</td>
+<td>先排除秒级暂态与 <code>CLIENT PAUSE</code> 窗口</td>
+</tr>
+<tr>
+<td><code>subexpiry</code> / <code>expired_subkeys</code></td>
+<td>字段级残留是否在涨</td>
+<td>键级指标看不见它</td>
+</tr>
+</tbody>
+</table>
+<h2 id="55-灰度与回滚">5.5 灰度与回滚</h2>
+<p>改动顺序固定：先上监控（一版只读看板）→ 再灰度 TTL 抖动（只改写入侧，最容易回滚）→ 观察一周 → 才动 <code>effort</code> → 最后才考虑 <code>hz</code>。回滚条件写死：<code>expire_cycle_cpu_milliseconds</code> 增速超过预期 1.5 倍、或 P99 延迟抬升超过 20%、或 <code>lazyfree_pending_objects</code> 持续上涨，任一命中即回滚上一步。<strong>别把三个旋钮一起改</strong>，否则你无法判断是哪一项带来的变化。</p>
+<p>灰度期间要盯三张曲线，不是一个数值：<code>expired_keys</code> 的增速（对不对得上写入）、<code>expire_cycle_cpu_milliseconds</code> 的斜率（吃不吃得消）、P99 延迟（业务有没有感）。三者里任意一条恶化，就说明这一步的收益不抵成本——先回退，再分析，别在原地叠加第二个改动。</p>
+<hr>
+<h1 id="六开销三个可以直接引用的数字">六、开销：三个可以直接引用的数字</h1>
+<p><strong>① CPU 天花板</strong>：<code>timelimit = slow_time_perc × 1e6 / hz / 100</code> 微秒。<code>hz=10</code>、effort=1 → 每轮 25ms、每秒 10 轮 → 250ms/秒 = <strong>单核 25%</strong>；effort=10 → 每轮 43ms → <strong>43%</strong>。两个必须写进 SLO 的修正项：</p>
+<ul>
+<li>配额每 16 轮才检查一次，实际占用会略超。effort=1 时最多少查 <code>16×20=320</code> 键，effort=10 时最多 <code>16×65=1040</code> 键；</li>
+<li>快循环另算：每次 ≤1000µs（effort=10 为 3250µs），两次之间只要求间隔 2 倍时长，理论上限约 50%，与慢循环极端叠加可到 ~75%。「过期最多占 25%」只能当常态上界。</li>
+</ul>
+<p>什么业务形态真会顶到 43%：TTL 密度高 + 写入持续的场景，会话、短链、限流计数都算，因为每轮都能扫到足量过期键、<code>repeat</code> 一直成立。反过来，TTL 稀疏的实例即使 <code>effort=10</code>，一轮扫 65 个键就结束了，预算根本用不满。判断很直接：看 <code>expire_cycle_cpu_milliseconds</code> 的增速是不是接近预算值。接近，说明打满了；远低于，说明没活干，这时候提 effort 是浪费。</p>
+<p><strong>② 清理吞吐</strong>：保守取 <strong>7 万键/秒</strong>（两次实测落在 6~14 万）。换算很好用：1 万键 ≈ 0.15s、10 万 ≈ 1.4s、100 万 ≈ 14s。注意这是净减速率，里面含到期和删除两部分，别当纯吞吐写进容量模型。</p>
+<p><strong>③ 内存</strong>：每个挂 TTL 的键，<code>expires</code> 额外约 <strong>26~32 字节（估 30）</strong>。测法只有一条——同一批键在「无 TTL / 有 TTL」两态各读一次 <code>used_memory</code>，差值除以键数：</p>
+<pre><code class="language-bash"># 清库并记基线（用 used_memory 字节数，不用 _human，避免单位换算误差）
+redis-cli -p 6379 FLUSHALL
+BASE=$(redis-cli -p 6379 INFO memory | awk -F: '/^used_memory:/{print $2+0}')
+
+# 写 10 万个不带 TTL 的键（用 Lua 批量，避免 10 万次往返）
+# 预期输出：1
+redis-cli -p 6379 EVAL "for i=1,100000 do redis.call('SET','k'..i,'v') end return 1" 0
+NO_TTL=$(redis-cli -p 6379 INFO memory | awk -F: '/^used_memory:/{print $2+0}')
+
+# 只给这批键挂远期过期（PEXPIREAT 到 2100-01-01），其它一概不动
+# 预期输出：1
+redis-cli -p 6379 EVAL "for i=1,100000 do redis.call('PEXPIREAT','k'..i,4102444800000) end return 1" 0
+WITH_TTL=$(redis-cli -p 6379 INFO memory | awk -F: '/^used_memory:/{print $2+0}')
+
+# 差值除以键数 = 单键的 expires 开销
+awk -v a="$NO_TTL" -v b="$WITH_TTL" 'BEGIN{printf "单键 %.1f 字节\n", (b-a)/100000}'
+</code></pre>
+<p>实测：同机紧邻两轮 25.7 / 26.0 字节，换机复跑 <strong>31.7 字节</strong>（10 万键差值 3,173,132）。我原先按 26 这个数写进文档，换台机器一跑成 31.7，只能把口径改成区间。差异来自 <code>expires</code> 桶数取整与 rehash 进度（主体是 <code>dictEntry</code> 24B + 桶指针 8B，取整余量 0~8B 浮动），所以按 26~32、估 30 更稳。100 万挂 TTL 的键，光 <code>expires</code> 就 约 25~32MB；<code>MEMORY STATS</code> 没有 <code>expires</code> 专项，只能差量测或按 30 字节估。跑完把键 <code>PERSIST</code> 掉，内存会回落到无 TTL 水平附近，差几 MB 分配器碎片属正常。</p>
+<p>把三笔账合成一张预算表才算落地。举例：1 亿键、其中 5% 挂 TTL（500 万）、value 平均 200B：</p>
+<table>
+<thead>
+<tr>
+<th>账目</th>
+<th>算法</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>expires</code> 额外内存</td>
+<td>500 万 × 30B</td>
+<td><strong>≈150MB</strong></td>
+</tr>
+<tr>
+<td>全量删除耗时</td>
+<td>500 万 ÷ 7 万每秒</td>
+<td><strong>≈71 秒</strong></td>
+</tr>
+<tr>
+<td>残留内存峰值</td>
+<td>已过期未删的键 × 200B</td>
+<td><strong>≈1GB 双重占用</strong></td>
+</tr>
+</tbody>
+</table>
+<p>三个数字里最容易被漏掉的是第三个：这 71 秒里键还占着内存，而容量规划通常按「已过期即释放」算，等于凭空多算了 1GB 余量。只算其中一个数字，等于没算。</p>
+<p>这三笔账要直接进 SLO 与容量评审，而不是留在文章里：CPU 那笔写进「单实例后台开销上限」，吞吐那笔写进「过期风暴恢复时间」，内存那笔写进「高水位预留」。三笔都写成「与键数、TTL 比例相关」的公式，评审时才能随业务量一起滚。</p>
+<p>说到底，惰性加定期这套东西，是用「删除时机不确定」换「CPU 开销可控」。接受这个不确定，用 TTL 抖动、<code>active-expire-effort</code>、Lazy Free 管副作用，比逼 Redis 准点删除现实得多。</p>
+<h1 id="七最容易踩的八条坑">七、最容易踩的八条坑</h1>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>坑</th>
+<th>纠正</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>「过期了内存就释放了」</td>
+<td>逻辑过期 ≠ 物理删除，残留窗口内照占内存，且计入淘汰判定</td>
+</tr>
+<tr>
+<td>2</td>
+<td>「定期删除是随机抽 20 个」</td>
+<td>沿游标扫桶，桶上限 <code>num×20</code>，一圈可能分钟级；积压越多清得越快</td>
+</tr>
+<tr>
+<td>3</td>
+<td>「调 <code>hz</code> 能加快过期」</td>
+<td>优先 <code>effort</code>（只管过期）；<code>hz</code> 全局且超 500 被静默夹取</td>
+</tr>
+<tr>
+<td>4</td>
+<td>「<code>CONFIG SET</code> 回 OK 就生效了」</td>
+<td>必须 <code>CONFIG GET</code> / <code>INFO</code> 回读，两者在越界行为上完全相反</td>
+</tr>
+<tr>
+<td>5</td>
+<td>「<code>time_cap</code> 涨了才是跟不上」</td>
+<td>反例：<code>hz=1</code> 全程 0 仍有秒级滞后；CPU 看 <code>cpu_ms</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td>「effort 调高 <code>time_cap</code> 会更高」</td>
+<td>实测反向（42 → 21）：轮次变少、单次变长</td>
+</tr>
+<tr>
+<td>7</td>
+<td>「从库 <code>DBSIZE</code> 大就是有问题」</td>
+<td>只读从库不自删（须冻住主库才观察得到）；可写从库会自删；容量以主库为准</td>
+</tr>
+<tr>
+<td>8</td>
+<td>「过期事件可以当定时器」</td>
+<td>只在真正被删时发、受游标周期影响、发后即忘；准点动作走调度器</td>
+</tr>
+</tbody>
+</table>
+<p>这八条的共同点是不对着指标就发现不了，静态读文档读不出来。所以每条后面配一个发现方式，比记结论有用：① 看 <code>used_memory</code> 与 <code>expires</code> 是否同步下降；② 画 <code>expired_stale_perc</code> 曲线看呼吸节奏；③ 对比 <code>hz</code> 改动前后的 P99；④ 每次 <code>CONFIG SET</code> 后强制读一次 <code>CONFIG GET</code> 并留痕；⑤ 把 <code>time_cap</code> 与 <code>cpu_ms</code> 放进同一张图；⑥ 做一次 effort 前后对照实验；⑦ 主从 <code>DBSIZE</code> 分开看板，容量告警只挂主库；⑧ 搜业务代码里有没有 <code>keyspace</code> 订阅。</p>
+<p>还有六个流传很广的说法，实测都不成立：①「<code>hz</code> 最大 500，所以填 1000 也行」——填 100000 也回 OK，但值是 500；②「<code>effort</code> 越界也会被夹取」——恰恰相反，直接报错；③「<code>HTTL</code> 返回毫秒」——返回秒，毫秒看 <code>HPTTL</code>；④「<code>HEXPIRE</code> 只返回 0/1」——还会返回 −2（字段不存在），<code>HPERSIST</code> 成功返回 1 后 <code>HTTL</code> 变 −1；⑤「<code>DEBUG SLEEP</code> 可以模拟阻塞」——默认被禁且会冻结定期删除，实验结论全废；⑥「<code>DBSIZE</code> 就是内存里的键数」——只读从库、字段级过期、<code>CLIENT PAUSE</code> 都会让它失真。</p>
+<h1 id="八小结与去向">八、小结与去向</h1>
+<ol>
+<li>没有定时器：三条清理通道 + 一条传播，全部在主线程，任何「准点删除」假设都站不住。</li>
+<li>逻辑过期 ≠ 物理删除：残留窗口秒级（20 万键 2~3.5 秒，速率 6~14 万键/秒），看 <code>expired_keys</code> + <code>DBSIZE</code> 且先排除暂态。</li>
+<li>冷键靠定期，热键靠惰性；定期的周期由「游标一圈」决定，10 万键约 8 分钟、100 万约 83 分钟。</li>
+<li>调参有优先级：<code>effort</code> → <code>lazyfree</code> → 最后才是 <code>hz</code>；热改必须回读，且两者越界行为相反。</li>
+<li>从库分两态：只读不自删、可写自删；<code>expired_keys − expired_keys_active</code> 只在主库成立。</li>
+<li>过期风暴的病因在 TTL 设计：抖动打散、热点走逻辑过期；容量校验用「同时到期键数 ÷ 7 万/秒」。</li>
+<li>过期事件不是定时器：准点动作走调度器 / Stream / 延迟队列。</li>
+<li>成本三笔账：<code>expires</code> 每键 26~32 字节、残留窗口的双重占用、删除峰值 CPU（25%~43%，快循环另算）。</li>
+</ol>
+<p>结论在什么条件下会被推翻，也写清楚，免得被当成永远成立的定律：</p>
+<ol>
+<li>如果 Redis 引入基于定时器/时间轮的精确过期并默认开启，「删除时机不确定」这条就不再成立；</li>
+<li>如果只读从库被允许自己执行惰性/定期删除（当前源码明确不允许），从库两态那一节作废；</li>
+<li>如果 <code>active-expire-effort</code> 的四个参数推导被改动（公式在 <code>expire.c</code> 顶部，改一行就变），第三章的表格需要重算；</li>
+<li>如果字段级过期的预算机制从「<code>10000/hz</code> + 最多 32 倍放大」换成别的策略，2.4 的速率断言需要重测。</li>
+</ol>
+<p>只要这四条没动，文里的数字与判据就能直接引用，但要带上环境标注：8.10.3、单机、空库起步、单实例非集群。</p>
+<p>下一篇讲淘汰：<strong>8 种淘汰策略怎么选才不丢数据</strong>。分界线很清楚：本篇讲「已过期的键什么时候被删」，下一篇讲「内存到顶时，没来得及过期的键里淘汰谁」。两者在 <code>volatile-*</code> 策略上交汇：淘汰依赖过期键的存在，但判定与执行是另一套机制。本篇留下的 <code>expired_keys</code> 与 <code>evicted_keys</code> 口径之别，正是下一篇的入口。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-17 07:01">2026-11-17 07:01</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23686725);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23686725&amp;targetId=23686725&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
