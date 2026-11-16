@@ -1,0 +1,443 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23673995" title="发布于 2026-11-16 07:16">
+    
+
+    <span role="heading" aria-level="2">Redis 核心机制 | 键生命周期与 TTL 管理</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        EXPIRE 存的是绝对 Unix 毫秒时刻，不是倒计时。本篇一次讲透 -1/-2 语义、TTL 取整、7.0 条件选项、从库传播与覆盖写清 TTL，并给出六组可复现验证、六问决策树、灰度回滚路线图、可编译的 .NET 10 代码与一页速查卡。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="开篇四组输出两条铁律">开篇：四组输出，两条铁律</h1>
+<p>多数人理解的 <code>EXPIRE key 60</code> 是「60 秒后这个键消失」。语义层面大致对，实现层面完全错：Redis 登记的是<strong>「这个键在哪个绝对时刻到期」</strong>，不是「还剩多少秒」。这一个设计决定派生出了后面所有的坑，也决定了 <code>TTL</code>、<code>EXPIRETIME</code>、主从复制、过期事件这些看似无关的东西为什么互相咬合。</p>
+<p>先看四组输出，每组都能推翻一个想当然。</p>
+<p><strong>现象一：两个负数，两件完全不同的事</strong></p>
+<pre><code class="language-redis-cli"># 键不存在：TTL 返回 -2
+TTL not-exist:key
+
+# 键存在但没有过期：先写一个不带 EX 的键
+SET keep:me v
+
+# 返回 -1：键在，永久驻留
+TTL keep:me
+</code></pre>
+<p>线上最常见的误判是把 <code>-1</code> 当成「查不到」。它其实是「查到了、没有过期」；<code>-2</code> 也常被当成异常抛出去，其实是「这个键确实没了」。这两个值在监控口径里必须分开统计。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225259570-1588378955.png" alt="" loading="lazy"></p>
+<p><strong>现象二：能直接读出那个绝对时刻</strong></p>
+<pre><code class="language-redis-cli"># 写一个约 27.8 小时后到期的键
+SET kk vv
+EXPIRE kk 100000
+
+# 服务端登记的到期秒戳：此后固定不变
+EXPIRETIME kk
+
+# 同一时刻的毫秒表示，末三位为 000
+PEXPIRETIME kk
+
+# 由「到期时刻 − 当前时刻」算出，此刻约 99999879
+PTTL kk
+</code></pre>
+<p>返回的是一个 Unix 时间戳（实测 <code>1794848482</code>），不是「还剩 100000 秒」。隔几秒再查，两个 <code>*EXPIRETIME</code> 纹丝不动，只有 <code>PTTL</code> 在变小：<strong>一个写死的时刻，一次实时减法</strong>。</p>
+<p><code>EXPIRETIME</code> 是 7.0 才有的只读命令，价值在于「审计而不打扰」：想确认某个键到底登记了哪个时刻，用它回读一次就够，不需要开 AOF、再去增量片段里翻 <code>PEXPIREAT</code> 那一行、把 13 位毫秒戳换算回秒。线上排查「这个键为什么提前没了」时，先 <code>EXPIRETIME</code> 回读、再和下发值比对，能立刻区分「下发时就算错了」和「存进去之后被改过」。</p>
+<p><strong>现象三：没人碰它，剩余时间照样变少</strong></p>
+<pre><code class="language-redis-cli"># 100 秒过期，立刻读
+SET rr vv EX 100
+TTL rr
+
+# 让服务端单线程阻塞 2 秒：期间不处理任何命令
+DEBUG SLEEP 2
+
+# 醒来再读：期望 98，不是 100
+TTL rr
+</code></pre>
+<p><code>DEBUG SLEEP</code> 期间没有任何后台任务在递减，剩余时间却少了 2 秒。同一个结论可以用停机实验复核：写一个 100 秒过期的键，<code>SAVE</code> 落一次盘再 <code>SHUTDOWN</code>，等几秒重启，<code>TTL</code> 会正好少掉停机的那段时间（前提是开了 RDB 或 AOF，否则键直接丢失）。停机期间没有任何进程在跑，时间却计入了。唯一解释是：一头存着绝对时刻，一头拿当前系统时间做减法。</p>
+<p>这也是「时钟回拨」成为真实故障的原因：把系统时间往回调 5 分钟，一批本该失效的键会重新「活过来」。Redis 对此不做特殊处理，时钟正确性属于基础设施的职责。</p>
+<p><strong>现象四：从库上 <code>TTL</code> 已经是 -2，<code>DBSIZE</code> 却还把它算进去</strong></p>
+<p>这个要额外条件才能稳定复现，留到第二节用 <code>DEBUG SET-ACTIVE-EXPIRE</code> 拆开看。</p>
+<p>四组现象收束成两条铁律：</p>
+<ol>
+<li><strong>存的是绝对到期时刻，不是剩余秒数。</strong> 所以停机照走、主从靠同一个时刻对齐、<code>TTL</code> 每次都要现算。</li>
+<li><strong>「判定为过期」与「物理删除」是两件事。</strong> 读命令先判定后返回，删除另有一套触发路径；从库只判定、不删除。</li>
+</ol>
+<p>这几条可以直接写进设计文档：</p>
+<ul>
+<li><strong>到期判定绑定系统时钟</strong>：时钟由基础设施负责（NTP 监控 + 回拨告警），这一条 Redis 不保证。</li>
+<li><strong>过期只保证回收，不保证准点</strong>：删除可能延迟，过期事件可能延迟甚至丢失，把它当定时器早晚出事。</li>
+<li><strong>需要「到点必失效」的正确性</strong>：在值里再存一个业务过期字段，读取时二次校验；TTL 只当回收手段。</li>
+</ul>
+<p>这篇只解一个链条上的问题：<strong>从执行 <code>EXPIRE</code> 到键消失，中间存了什么、算了什么、传了什么</strong>。删除策略与 CPU 代价是 S3-2 的范围；淘汰策略（<code>maxmemory-policy</code>）是另一种「键消失」的原因，S3-3 单独讲；<code>DEL</code> 大键的代价在 S3-4；持久化加载阶段的过期处理在 S5-5。读本篇时如果出现「键怎么突然没了」的疑问，先分清是过期、淘汰还是被显式删除。三者的现象很像，排查入口完全不同。</p>
+<h1 id="一机制存的是一个时刻判的是一个差值">一、机制：存的是一个时刻，判的是一个差值</h1>
+<h2 id="11-存什么一个-64-位毫秒戳">1.1 存什么：一个 64 位毫秒戳</h2>
+<p><code>EXPIRE k 60</code> 执行时，主线程算出 <code>now + 60 秒</code> 的绝对毫秒时刻，写进 <code>db-&gt;expires</code> 字典：键名 → when。没有定时器对象，没有每秒回调，也不存在「剩余秒数」这个字段。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225309540-1907736599.png" alt="" loading="lazy"></p>
+<p>由此能直接看出几件事：设置与查询都是 O(1)（一次哈希查表）；重启后时间戳依然有效，不存在「内存里的计时器被清空」的问题；<code>TTL</code> 每次都要现算，读的不是某个递减中的计数器。</p>
+<p>代价是每个带过期的键会在 <code>expires</code> 字典里多占一个条目：一次哈希表登记的开销，加上 8 字节时间戳。这部分成本与 TTL 长短无关，只与「多少键设了过期」线性相关；也正因为它是独立字典，清 TTL 才只是删一条记录，而不是去改值对象。</p>
+<h2 id="12-判什么判定与删除是两条路径">1.2 判什么：判定与删除是两条路径</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225313010-1859847784.png" alt="" loading="lazy"></p>
+<p>读命令拿到 <code>-2</code>、<code>nil</code>，是<strong>判定结果</strong>；<code>DBSIZE</code> 还把它算进去，是<strong>物理状态</strong>。两者不一致是设计如此，故障排查时别把它当成主从不一致。</p>
+<p>那没人访问的键谁来删？定期删除。它按 <code>hz</code> 频率触发，每次只抽一部分带过期的键，抽样比例与上限都是硬编码的，命中过期就删、删完继续抽，直到这一轮的时间预算用完。所以过期键的清除本质上是<strong>概率行为</strong>：采样没扫到的键会继续占着内存，等下一次触发或等一次读命中。这一点直接决定了「批量到期」时主线程会出现毛刺，代价的量级见第五节。</p>
+<p>加载路径另有一套规则：RDB / AOF 加载阶段的过期键处理，主库与从库的行为并不相同（从库不主动删，因此加载时会保留业务上已过期的键，等主库传播删除）。这块属于持久化篇章的范围，本篇只提醒一句：<strong>别用「加载后键还在」来反推 TTL 没生效</strong>。</p>
+<h2 id="13-传什么同一个绝对时刻">1.3 传什么：同一个绝对时刻</h2>
+<p>主库把相对时长改写成绝对时刻写进复制流与 AOF：<code>EXPIRE</code> 家族 → <code>PEXPIREAT k &lt;绝对毫秒&gt;</code>；<code>SET ... EX</code> → <code>SET k v PXAT &lt;绝对毫秒&gt;</code>。这不是转述，是在从库上 <code>MONITOR</code> 抓到的原文：</p>
+<pre><code class="language-text"># 主库执行 SET m1 v EX 60，从库收到：
+"SET" "m1" "v" "PXAT" "1794747852026"
+
+# 主库执行 EXPIRE m1 100，从库收到：
+"PEXPIREAT" "m1" "1794747892062"
+</code></pre>
+<p>为什么非改写不可：如果传的是 <code>EXPIRE k 60</code>，主从两端会因为网络时延各自得到不同的到期时刻，从库的时间线就和主库错开了。传同一个时刻，从库不需要知道「这条命令走了多少毫秒」。</p>
+<p>其余会进复制流的动作只有三类：清 TTL（<code>PERSIST</code>，传播为 <code>PERSIST</code> 本身）、删除（<code>DEL</code> / <code>UNLINK</code>）、改名（<code>RENAME</code>，改名后新键名继承原时刻）。由此可以估出复制放大：<strong>每条续期命令对应一条复制流记录</strong>，每秒续一次的会话在百万活跃会话下就是每秒百万条写命令，这个数字在设计评审时就要算出来，而不是等 <code>master_repl_offset</code> 曲线打脸。观测手段是现成的：<code>INFO replication</code> 看连接与延迟，连续两次采样 <code>master_repl_offset</code> 做差，差值就是这段时间写进复制流的字节量。</p>
+<h2 id="14-状态流转四种态三类终点">1.4 状态流转：四种态，三类终点</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225321497-664760016.png" alt="" loading="lazy"></p>
+<p>四个态是：键不存在（<code>TTL = -2</code>）、存在无过期（<code>-1</code>）、存在且登记了过期（正整数）、已过期但未被删除（<code>TTL</code> 读作 <code>-2</code>、物理记录仍在）。第一、二、三态之间的迁移由显式命令驱动，第四态是「判定已过期、物理还留着」的中间态，只在主库「到期但尚未被删」和从库「等主库传播删除」时出现。</p>
+<p>这个状态图用来排查：<code>TTL</code> 读 <code>-2</code> 却 <code>DBSIZE</code> 还在计数，说明处在第四态的前半段；<code>TTL</code> 从 100 突然跳到 <code>-1</code>，说明中途被裸写覆盖过；<code>TTL</code> 一直是固定值不变、<code>PTTL</code> 也不变，说明读的根本不是同一个键名。三种现象分别对应三类不同的问题，用同一张图就能定位到具体环节。</p>
+<h1 id="二主从-2-与-dbsize-打架的那几秒">二、主从：-2 与 DBSIZE 打架的那几秒</h1>
+<p>现象四的复现需要关掉主库的主动过期，否则后台任务会在你观察之前就把键删掉：</p>
+<pre><code class="language-redis-cli"># 空库起步，否则下面的 DBSIZE 绝对值对不上（相对变化仍一致）
+FLUSHALL
+
+# 主库：关闭主动过期，让到期键留在内存里
+DEBUG SET-ACTIVE-EXPIRE 0
+
+# 写一个 2 秒后到期的键
+SET rt hello PX 2000
+
+# 等 4 秒不读它，然后看主库计数：仍是 1，没人删
+DBSIZE
+
+# 从库读：逻辑上已过期，返回 nil
+GET rt
+
+# 从库 TTL：-2，命令视角键不存在
+TTL rt
+
+# 但物理记录还在：从库计数仍是 1
+DBSIZE
+
+# 回主库读一次，触发惰性删除，删除命令随后传播
+TTL rt
+
+# 稍等再查从库：计数降到 0
+DBSIZE
+</code></pre>
+<p>同一个键，命令视角已经没了，物理记录还在，为什么？实测结果与注释中的期望值一致（空库起步）：主库 <code>DBSIZE</code> 为 1，从库 <code>GET</code> 返回 <code>nil</code>、<code>TTL</code> 返回 <code>-2</code>、<code>DBSIZE</code> 仍为 1；主库读一次 <code>TTL</code> 触发惰性删除，一秒后两端 <code>DBSIZE</code> 都归零。实验结束务必恢复 <code>DEBUG SET-ACTIVE-EXPIRE 1</code>，否则测试实例的过期键会一直堆积。</p>
+<p>这几条要落进流程：</p>
+<ul>
+<li><strong>业务有效性一律用 <code>GET</code> / <code>EXISTS</code> 判</strong>，不要用 <code>DBSIZE</code> 反推；容量监控要把「逻辑已过期但物理还在」的那部分偏差单独扣掉。</li>
+<li><strong>一致性敏感的读走主库</strong>，从库读到 <code>nil</code> 不代表主库也没有。</li>
+<li><strong>过期事件同理不可靠</strong>：<code>expired</code> 事件在键被真正删除的那一刻才发，删除可能来自一次读命中，也可能来自后台抽样，与到期时刻不是同一件事；Pub/Sub 又是发后即忘，订阅端断连期间的事件全部丢失。</li>
+</ul>
+<p>主从这块还有两件事要说明。<strong>故障转移</strong>：从库被提升为主库时，<code>expires</code> 里登记的时刻是随复制流一起同步过来的，所以提升之后 TTL 不需要重新设置，也不会因为「换了主」而延长或缩短；但那些「逻辑已过期、物理还在」的键会在新主库上继续存在，直到被读到或被抽样到。<strong>写入侧</strong>：<code>expires</code> 条目由主库写入、从库被动接收，从库自己不会因为「时间到了」去改这个字典，这也是从库 <code>DBSIZE</code> 长期偏大的根源。</p>
+<p>需要「续期命令必须到达至少一个从库」的强一致场景，可以在续期后跟一条 <code>WAIT 1 100</code>（等待 1 个副本确认，超时 100 毫秒），但代价是每次续期多一个往返的等待时间；会话类场景通常不需要，因为会话丢了重新登录即可恢复。</p>
+<p><strong>复制延迟带来的偏差</strong>也要说清楚：从库上的 <code>TTL</code> 是按从库自己的时钟、对同一条登记时刻计算出来的，因此一旦有复制延迟，从库就会比主库更早判定过期，链路越慢提前得越多；但只要主库还没删，从库的 <code>DBSIZE</code> 仍会计数。这个偏差在秒级内通常无害，在跨机房链路（几十到几百毫秒延迟）上会让「缓存还有 1 秒」变成「从库已经读不到」，从而触发缓存击穿。缓存击穿的防护属于 S11-5 的范围，这里只给判断依据：<strong>到期前的那一小段窗口，别让流量打到从库</strong>。</p>
+<h1 id="三命令怎么写才不会把-ttl-弄丢">三、命令怎么写，才不会把 TTL 弄丢</h1>
+<p>先把命令认全，再谈规则。下表只留与键生命周期相关的部分，版本列为起点版本：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225330538-1388667410.png" alt="" loading="lazy"></p>
+<p>表里 <code>SET ... EXAT/PXAT</code> 那一行容易漏看。绝对时刻这条路在写入侧就能落地，不必「先 <code>SET</code> 再 <code>EXPIRE</code>」两步。</p>
+<h2 id="31-条件选项比的是到期时刻">3.1 条件选项比的是到期时刻</h2>
+<p><code>EXPIRE k 秒 [NX|XX|GT|LT]</code> 是 7.0 新增的能力。「更晚才生效」这类业务语义，用 <code>GT</code> 表达最省事，但它的比较基准常被误解：</p>
+<pre><code class="language-redis-cli"># 先造一个 100 秒过期的键
+SET k3 v EX 100
+
+# NX：只在键没有过期时间时才设置，此处失败，返回 0
+EXPIRE k3 200 NX
+
+# GT：新到期时刻更晚才生效，返回 1，TTL 变成 300
+EXPIRE k3 300 GT
+
+# GT：60 秒比现有的 300 秒更早，拒绝，返回 0，TTL 仍 300
+EXPIRE k3 60 GT
+
+# 换一个没有过期时间的键：GT 把它视为「无限远」，返回 0
+SET k4 v
+EXPIRE k4 100 GT
+
+# LT 与无限远比较必然成立，返回 1，TTL 变 100
+EXPIRE k4 100 LT
+TTL k4
+</code></pre>
+<p>最后两条要留意：<strong><code>GT</code> 对没有过期时间的键视为无限 TTL，所以永远返回 0</strong>。麻烦的是这恰恰是线上最常见的场景——别的服务一次裸 <code>SET k v</code>，TTL 没了，你这边的续期代码执行 <code>EXPIRE ... GT</code>，返回 0，日志里什么都看不出来，会话到点失效。开篇那个「从库 -2、主库还在」的现象，在业务层就是这个样子。四个选项互斥，一次只能给一个。</p>
+<p>补救的办法是把 <code>NX</code> 挂在 <code>GT</code> 失败之后：</p>
+<pre><code class="language-redis-cli"># 裸写冲掉 TTL：覆盖写会把过期时间一并清掉
+SET se:v v2
+TTL se:v
+
+# 此时用 GT：无过期时间，返回 0，续期失败
+EXPIRE se:v 1800 GT
+
+# 改用 NX：键没有过期时间，条件成立，返回 1
+EXPIRE se:v 1800 NX
+TTL se:v
+</code></pre>
+<p><code>NX</code> 在「本来就没有 TTL」的键上成功，在「已有更长 TTL」的键上失败，正好接住 <code>GT</code> 漏掉的那一类。反过来不行：<code>XX</code> 在无 TTL 的键上返回 0，拿它当补挂手段只会静默失败。因此续期逻辑的标准写法是「先 <code>GT</code>，返回 0 再 <code>NX</code>」，而不是依赖客户端自己判断。</p>
+<h2 id="32-ttl-是四舍五入到秒">3.2 <code>TTL</code> 是四舍五入到秒</h2>
+<p><code>TTL</code> 的计算口径是 <code>(剩余毫秒 + 500) / 1000</code> 向下取整，即四舍五入。由此得出两个反直觉的边界：剩余毫秒少于 500 时返回 <code>0</code>，但键还在；剩余 500 到 1499 毫秒时返回 <code>1</code>。把 <code>TTL == 0</code> 当成「已过期」是线上误删缓存的高发原因。</p>
+<pre><code class="language-redis-cli"># 400 毫秒：TTL 返回 0，但键仍然可读
+SET t1 v
+PEXPIRE t1 400
+TTL t1
+
+# 900 毫秒：TTL 返回 1，四舍五入的结果
+SET t2 v
+PEXPIRE t2 900
+TTL t2
+
+# 1400 毫秒：PTTL 约 1362，TTL 仍是 1
+SET t3 v
+PEXPIRE t3 1400
+PTTL t3
+TTL t3
+</code></pre>
+<p>判读规则记两条：<strong>要判断「还剩多少」用 <code>PTTL</code>，不要用 <code>TTL</code></strong>；<strong>要判断「还在不在」用 <code>EXISTS</code> 或 <code>GET</code>，不要用 <code>TTL</code></strong>。<code>TTL = 0</code> 是一个 1 秒以内的窗口，不是一个终态。</p>
+<h2 id="33-覆盖写会清掉-ttlkeepttl-留得住">3.3 覆盖写会清掉 TTL，<code>KEEPTTL</code> 留得住</h2>
+<p><code>SET</code> 重建整个键，过期时间一并丢失。缓存更新逻辑里最常见的漏 TTL 就是这一下。6.0 给了 <code>KEEPTTL</code>，6.2 给了 <code>EXAT</code> / <code>PXAT</code>，两种都能避开这个坑：</p>
+<pre><code class="language-redis-cli"># 有 100 秒过期，覆盖写之后 TTL 归 -1
+SET c1 v1 EX 100
+SET c1 v2
+TTL c1
+
+# 带上 KEEPTTL：TTL 保持 100
+SET c2 v1 EX 100
+SET c2 v2 KEEPTTL
+TTL c2
+
+# 只改内容的 INCR 完全不碰 TTL
+SET c3 1 EX 60
+INCR c3
+TTL c3
+
+# PERSIST：无过期时返回 0，有则返回 1 且 TTL 变 -1
+PERSIST c3
+PERSIST c3
+TTL c3
+</code></pre>
+<p>机制上并不神秘：<code>SET</code> 的实现路径是「删掉旧键、写入新键」，删键顺带清掉 <code>expires</code> 里的条目；<code>KEEPTTL</code> 只是让它在写入前先把旧时刻读出来，写完再登记回去。<code>INCR</code>、<code>APPEND</code>、<code>HSET</code>、<code>LPUSH</code>、<code>SADD</code>、<code>ZADD</code> 这类原地修改完全不重建键，因此 TTL 天然不受影响（这一点逐个实测确认过）。</p>
+<h2 id="34-按是否重建键归类">3.4 按「是否重建键」归类</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225346781-686062027.png" alt="" loading="lazy"></p>
+<p>两个容易忽略的返回值：<code>EXPIRE k 0</code>、<code>EXPIRE k -1</code>、以及指向过去时刻的 <code>EXPIREAT</code>，都返回 <code>1</code> 并立即删键。这里的 <code>1</code> 表示「命令成功」，不表示「键进入了倒计时」。这类删除发出的是 <code>del</code> 事件而不是 <code>expired</code> 事件，靠 <code>expired</code> 做业务补偿的链路会漏掉这一批。</p>
+<p>还有两个单位陷阱：<code>EXPIREAT</code> 吃秒、<code>PEXPIREAT</code> 吃毫秒，传错会把「若干年后过期」变成「刚才已过期」，键当场消失；<code>EXPIRE</code> 与 <code>PEXPIRE</code> 同理。跨服务传时间戳时，要么全程毫秒，要么在字段名里把单位写出来。</p>
+<h2 id="35-工程侧容易出错的地方">3.5 工程侧容易出错的地方</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225350214-835376731.png" alt="" loading="lazy"></p>
+<p><code>GETEX</code> 的实际用法两者都验证过：<code>GETEX k PERSIST</code> 之后 <code>TTL</code> 为 <code>-1</code>，<code>GETEX k EX 500</code> 之后 <code>TTL</code> 为 500。它适合「读会话时顺手续期」，省一次往返。</p>
+<pre><code class="language-redis-cli"># 写入 100 秒过期的会话键
+SET gx v EX 100
+
+# 读并清掉过期：TTL 变 -1
+GETEX gx PERSIST
+TTL gx
+
+# 读并把过期重设为 500 秒：TTL 变 500
+GETEX gx EX 500
+TTL gx
+</code></pre>
+<p><code>SET</code> 一侧还有一处容易忽略：<code>NX</code> 与 <code>XX</code> 互斥，<code>KEEPTTL</code> 与 <code>EX/PX/EXAT/PXAT</code> 互斥（同时给会报语法错误，而不是悄悄忽略其中一个）。「只在不存在时创建、并带过期」的标准写法是单条 <code>SET k v NX EX 300</code>（判定与登记压在一个原子动作里），比 <code>SETNX</code> 再 <code>EXPIRE</code> 两步可靠。</p>
+<h2 id="36-一次往返还是两条命令set--ex-的取舍">3.6 一次往返还是两条命令：<code>SET ... EX</code> 的取舍</h2>
+<p>写入并设过期有两种写法：<code>SET k v EX 60</code> 一条，或者 <code>SET k v</code> 之后再来一条 <code>EXPIRE k 60</code>。两者的差别不在语法，而在这条键在两次往返之间的状态：</p>
+<ul>
+<li><strong>单条命令</strong>：键要么不存在，要么带着完整的 TTL 存在，不存在「已写入但还没过期时间」的中间态。并发读者不会读到永久键。</li>
+<li><strong>两条命令</strong>：两次命令之间，键已经可读、且 TTL 为 <code>-1</code>。窗口很短（一个 RTT），但对「读到一个本应 60 秒后失效却永久驻留」的缓存来说，足以留下脏数据；如果第二条命令因为客户端异常而没发出去，这个键就永久留下来了。</li>
+</ul>
+<p>因此默认选单条：能用 <code>SET ... EX</code> 就不要拆两步，能用 <code>SET ... EXAT</code> 就不要「写完之后再算时刻」。后者还要多做一次时钟换算，凭空引入一层时钟偏差。只有在「写入与设置过期分属不同代码路径」（例如写入在数据访问层、过期策略在缓存层）时才拆开，这时应显式补上 <code>EXPIRE ... NX</code> 兜底，并对「返回 0」的情况打日志，而不是静默略过。</p>
+<h1 id="四落到业务几个场景里的取舍">四、落到业务：几个场景里的取舍</h1>
+<h2 id="41-会话滑动续期gt-优先nx-兜底">4.1 会话滑动续期：<code>GT</code> 优先，<code>NX</code> 兜底</h2>
+<p>会话续期的语义是「至少活到 N 秒后，更长的保留更长的」，对应 <code>EXPIRE ... GT</code>。但裸写会冲掉 TTL，<code>GT</code> 随后必然失败，所以代码里要显式处理两种状态：</p>
+<pre><code class="language-csharp">using StackExchange.Redis;
+
+/// &lt;summary&gt;
+/// 会话 TTL 的操作封装。核心是「续期只延长不缩短」，以及裸写之后的自愈。
+/// &lt;/summary&gt;
+public sealed class RedisSessionStore
+{
+    private readonly IDatabase _db;
+    private readonly TimeSpan _window;
+
+    public RedisSessionStore(IConnectionMultiplexer mux, TimeSpan window)
+    {
+        // 连接串取自配置，形如 127.0.0.1:6379；StackExchange.Redis 不接受 redis:// 前缀
+        _db = mux.GetDatabase();
+        _window = window;
+    }
+
+    /// &lt;summary&gt;
+    /// 续期会话：到期时刻只会被推迟，不会被提前。
+    /// &lt;/summary&gt;
+    public async Task&lt;bool&gt; TouchAsync(string sessionId)
+    {
+        var key = $"sess:{sessionId}";
+
+        // 优先用 GT：只有在「新到期时刻更晚」时才改写，避免并发续期互相缩短
+        var extended = await _db.KeyExpireAsync(key, _window, ExpireWhen.GreaterThanCurrentExpiry);
+
+        // 返回 false 有两种可能：键不存在，或键存在但没有 TTL（裸写冲掉过）
+        if (!extended)
+        {
+            // 用 NX 补挂：对「没有 TTL 的键」生效；键不存在时同样返回 false
+            extended = await _db.KeyExpireAsync(key, _window, ExpireWhen.HasNoExpiry);
+        }
+
+        return extended;
+    }
+}
+</code></pre>
+<p>这段代码有两个判断点：<code>GreaterThanCurrentExpiry</code> 保证并发续期时不会被后到的小窗口截短；<code>HasNoExpiry</code> 接住「其它服务裸写导致 TTL 丢失」这一类故障，让 TTL 自愈而不是等会话失效。实测路径：同值续期返回 <code>True</code>，从 60 秒续到 1800 秒返回 <code>True</code> 且 <code>TTL</code> 为 1800，裸写之后走 <code>NX</code> 分支把 TTL 补回 1800，键不存在时返回 <code>False</code>；反过来把 3000 秒的键「续」成 1800 秒会返回 <code>False</code>、<code>TTL</code> 保持 3000。这就是「只延长不缩短」的直接证据。</p>
+<p>续期失败的三种处理方式，按业务容忍度选，不要混用：<strong>重试</strong>：网络抖动导致的失败，隔几十毫秒重试一次通常能成功，但要设上限，避免把偶发失败变成放大流量。<strong>降级</strong>：续期失败即视为会话不可续，让用户重新登录，比「假装成功」安全。<strong>告警</strong>：键不存在（而不是条件不满足）大量出现，说明上游写入路径出了问题，这类要打点上报，不能只返回 <code>False</code>。线上最危险的做法是忽略返回值：调用方以为续上了，用户却在十分钟后被踢出登录。</p>
+<h2 id="42-缓存更新默认带上-keepttl">4.2 缓存更新：默认带上 <code>KEEPTTL</code></h2>
+<p>缓存更新走 <code>SET</code> 就会丢 TTL，于是「刚写的热点数据永不过期」这类问题反复出现。更隐蔽的是另一个变体：写的时候带了 <code>EX 600</code>，看着没问题，但这条 <code>SET</code> 把「原本还剩 3000 秒」改成了「现在起 600 秒」。<strong>更新动作意外缩短了缓存寿命</strong>，低峰期表现为缓存命中率断崖。</p>
+<pre><code class="language-csharp">using StackExchange.Redis;
+
+/// &lt;summary&gt;
+/// 缓存写入的统一入口：默认保留既有 TTL，只在首次创建时设过期。
+/// &lt;/summary&gt;
+public static class CacheWriter
+{
+    /// &lt;summary&gt;
+    /// 写入缓存值。已存在的键保留原 TTL，新键按 ttl 登记过期。
+    /// &lt;/summary&gt;
+    public static async Task WriteAsync(IDatabase db, string key, string value, TimeSpan ttl)
+    {
+        // 先用 SET ... KEEPTTL 覆盖：已存在的键保留原到期时刻，不会因为更新而延长或缩短
+        await db.StringSetAsync(key, value, keepTtl: true);
+
+        // KEEPTTL 只在键已存在时才有意义；返回值无法区分「新建」与「更新」，因此再判一次 TTL
+        var ttlNow = await db.KeyTimeToLiveAsync(key);
+
+        // TTL 为 null 说明键没有过期时间（新建或曾被裸写），此时补挂
+        if (ttlNow is null)
+        {
+            await db.KeyExpireAsync(key, ttl);
+        }
+    }
+}
+</code></pre>
+<p>这段代码没有追求「一次往返搞定」，因为 <code>KEEPTTL</code> 与 <code>EX</code> 互斥，无法合并成一条命令。真正的取舍在于：<strong>更新保留原寿命，是为了让缓存的过期时刻由首次写入决定，不被后续更新反复推后</strong>。否则热点数据会因持续更新而永不失效，退化成「缓存即数据库」。若业务确实需要「更新即续期」，那是滑动过期语义，应显式用 <code>EXPIRE ... GT</code>，而不是在 <code>SET</code> 里随手带 <code>EX</code>。</p>
+<h2 id="43-验证码一次性消费靠-getdel不靠-ttl">4.3 验证码：一次性消费靠 <code>GETDEL</code>，不靠 TTL</h2>
+<p>验证码的正确性要求是「读一次即失效」；TTL 只负责「过期回收」，两者不是一回事。<code>GETDEL</code>（6.2+）把读与删合成一个原子动作：</p>
+<pre><code class="language-redis-cli"># 写入验证码，5 分钟有效
+SET sms:13800000000 849201 EX 300
+
+# 第一次读：返回值并删除键，天然防重放
+GETDEL sms:13800000000
+
+# 第二次读：键已不在，返回 nil
+GETDEL sms:13800000000
+</code></pre>
+<p>实测第一次返回 <code>"849201"</code>，第二次 <code>(nil)</code>。若目标版本低于 6.2，退回 <code>MULTI</code>/<code>EXEC</code> 包住 <code>GET</code> + <code>DEL</code>，或写一段 Lua 脚本；用 <code>GET</code> 之后再 <code>DEL</code> 的两条独立命令会在并发下被重放。TTL 在这里只是清理残留（用户没来验证时别让键永久占内存），不是安全边界。</p>
+<h2 id="44-跨服务对齐下发绝对时刻不下发秒数">4.4 跨服务对齐：下发绝对时刻，不下发秒数</h2>
+<p>多服务协同的场景（活动开始/结束、库存释放、对账单截止），各服务时钟不一致，下相对秒数会让各端得到不同到期时刻。正确做法是统一在服务端算好绝对时刻：</p>
+<pre><code class="language-redis-cli"># 先写入键（这里给 60 秒，稍后被绝对时刻覆盖）
+SET promo:double11:stock 120 EX 60
+
+# 业务日界：次日 00:00 的 Unix 秒戳，由调用方按业务时区算出
+# 下面这个值对应 2026-11-17 00:00（Asia/Shanghai）
+EXPIREAT promo:double11:stock 1794844800
+
+# 回读：与下发值完全一致，证明存的就是这个时刻
+EXPIRETIME promo:double11:stock
+
+# PEXPIRETIME 末三位 000，说明秒级时刻被存成毫秒
+PEXPIRETIME promo:double11:stock
+</code></pre>
+<p>实测中 <code>EXPIRETIME</code> 回读正是下发的那个秒数，<code>PEXPIRETIME</code> 是它的毫秒形式。要点是：调用方算日界必须用<strong>业务时区</strong>（如 Asia/Shanghai），而不是服务器本地时区；服务端只负责登记，不参与换算。</p>
+<h2 id="45-过期事件只做旁路通知不做补偿">4.5 过期事件：只做旁路通知，不做补偿</h2>
+<p>过期事件是「删除之后的通知」，不是「到期时刻的闹钟」。要收到它，服务端得开启通知：<code>CONFIG SET notify-keyspace-events "Ex"</code>（<code>E</code> 是键事件、<code>x</code> 是过期类），回读会看到 <code>xE</code>。订阅端写法如下：</p>
+<pre><code class="language-csharp">using System;
+using StackExchange.Redis;
+
+/// &lt;summary&gt;
+/// 订阅过期事件的示例：只做旁路通知，不做业务补偿。
+/// &lt;/summary&gt;
+public static class ExpiredEventSubscriber
+{
+    /// &lt;summary&gt;
+    /// 订阅 __keyevent@0__:expired 通道，回调里只做轻量通知。
+    /// &lt;/summary&gt;
+    public static void Subscribe(IConnectionMultiplexer mux)
+    {
+        var sub = mux.GetSubscriber();
+
+        // 通道名是固定格式：__keyevent@&lt;库号&gt;__:&lt;事件名&gt;，库号必须与业务使用的库一致
+        sub.Subscribe(RedisChannel.Literal("__keyevent@0__:expired"), (channel, key) =&gt;
+        {
+            // 回调跑在客户端线程池里，耗时操作必须转队列，否则拖慢整个订阅连接
+            Console.WriteLine($"键已删除：{key}");
+
+            // 这里不要写「补偿库存」「发送通知」之类的业务动作：事件可能丢失、可能重复、可能晚到
+        });
+    }
+}
+</code></pre>
+<p>还有三种情况要留意。事件在<strong>真正删除</strong>的那一刻才发，而删除由「读命中」或「后台抽样」触发，因此与到期时刻不是同一件事；Pub/Sub 是发后即忘，订阅端断连期间的键事件全部丢失，重连后也不会补发；单个键的删除可能被 <code>DEL</code> 触发，此时发出的是 <code>del</code> 而非 <code>expired</code>（<code>EXPIRE</code> 传非正数就属于这一类）。所以让它做缓存失效通知、做审计流水；承担「必须执行」的业务补偿，得用延迟队列加幂等消费。</p>
+<h2 id="46-什么时候可以放心依赖-ttl">4.6 什么时候可以放心依赖 TTL</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225414896-100344698.png" alt="" loading="lazy"></p>
+<p>四个问题全答「是」，TTL 就可以放心用；有一条答否，就得在值里加业务字段兜底。这套判断比记「TTL 设多少秒」更有用。<code>TTL</code> 的长度是业务参数，上面四条才是机制边界。</p>
+<h1 id="五这套用法要付多少内存和带宽">五、这套用法要付多少内存和带宽</h1>
+<p>机制讲完，落地前得知道自己要付什么。TTL 的成本不在设置那一刻（登记一条记录几乎免费），而在<strong>内存的常驻开销、复制流的持续增量、批量到期时的主线程毛刺</strong>。</p>
+<p><strong>内存</strong>：每个带过期的键在 <code>expires</code> 字典里多一条记录，与 TTL 长短无关，只与「多少键设了过期」线性相关。想看本环境的真实单键开销，用三次采样：空库记一次 <code>used_memory</code>，批量写入 N 个不带 TTL 的键记第二次，再给同一批键批量 <code>PEXPIREAT</code> 记第三次；第三与第二次的差值除以 N，就是本环境的单键过期登记开销。</p>
+<p><strong>复制</strong>：每条续期命令对应一条复制流记录（<code>PEXPIREAT</code> 或 <code>SET ... PXAT</code>），键被删除时再加一条 <code>DEL</code>。续期频率乘以活跃会话数就是每秒写命令量，这是复制带宽的主要放大器。</p>
+<p><strong>毛刺</strong>：大量键在同一时刻到期时，删除动作与传播命令集中出现，主线程会出现可观测的延迟尖刺。缓解手段是给 TTL 加随机抖动打散到期时刻，把「同时到期」变成「一段窗口内陆续到期」。</p>
+<pre><code class="language-redis-cli"># 内存基线：空库时的已用内存
+INFO memory
+
+# 键空间与过期数量：expires 是登记了过期的键数
+INFO keyspace
+
+# 过期与删除的累计计数（8.x 还多一个 expired_keys_active）
+INFO stats
+
+# 复制偏移量：隔一段时间再采一次，差值即增量字节数
+INFO replication
+
+# 抽样遍历键空间，估带过期键的占比（COUNT 只是提示，不保证一次扫完）
+SCAN 0 COUNT 100
+</code></pre>
+<p><code>INFO keyspace</code> 的输出形如 <code>db0:keys=12,expires=9,avg_ttl=78032864,subexpiry=0</code>：<code>avg_ttl</code> 在 7.x 上恒为 0、8.x 会给出一个采样估算值（实测就是这个八位数量级），两个版本对不上属正常，别拿它当「精确剩余时间」；<code>subexpiry</code> 同样是 8.x 新增字段，7.x 上不会出现。</p>
+<p>上线前把三个数写进设计文档：<strong>① 带 TTL 的键数峰值</strong>（决定 <code>expires</code> 字典常驻内存）；<strong>② 每秒续期次数</strong>（决定复制流写命令量，约等于会话 QPS × 续期频率）；<strong>③ 到期键数的峰均比</strong>（决定抖动窗口，目标压到 2 以内）。这三个数比「TTL 设多少秒」更影响稳定性。</p>
+<p>毛刺怎么观测，给两个不要压测也能拿到的信号：<code>SLOWLOG GET 10</code> 看删除与续期命令是否进入慢日志；<code>LATENCY HISTORY expire-cycle</code> 看过期循环的延迟分布（前提是开启了 <code>latency-monitor-threshold</code>）。这两个都是被动观测，不改变生产行为，比造一轮峰值流量安全得多。若确实要做受控实验，做法是写入 10 万个同刻到期的键、在到期前打开 <code>INFO commandstats</code> 前后采样、对比 <code>expire-cycle</code> 相关计数与 P99 延迟。本篇不给数字，因为不同硬件与键大小下差距很大，抄数字比不抄更危险。</p>
+<p>三项成本随 TTL 长度的变化方向并不一致，设计时不要只盯着其中一项：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225421451-2108019632.png" alt="" loading="lazy"></p>
+<p>短 TTL 的隐性成本是「写命令多」：每次续期都是一条复制流记录，会话类场景的写放大会被 TTL 长度直接放大；长 TTL 的隐性成本是「到期集中」：所有键在同一个业务时刻失效，尖刺来得越晚但越猛。中间档通常最省心，代价是缓存的新鲜度。</p>
+<h1 id="六线上真会踩的坑与版本差异">六、线上真会踩的坑与版本差异</h1>
+<h2 id="61-高频坑">6.1 高频坑</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225425035-158305692.png" alt="" loading="lazy"></p>
+<p>坑 7 再说细一点。锁的租期意思是「我还活着」，续期失败就等于这句话不再成立，业务动作要停，不能接着干。<code>TTL</code> 回答不了「这把锁是不是我的」，它只说还剩几秒；要知道是不是自己的，只能比对 value 里的标识。</p>
+<p>坑 4 的口径要单独说清楚：<code>DBSIZE</code> 统计的是物理键数，逻辑上已过期的键仍被计入。容量报表用 <code>DBSIZE</code> 会偏大，用 <code>INFO keyspace</code> 的 <code>expires</code> 只能看「登记了过期的键数」，两者都不能回答「有多少键业务上还有效」。</p>
+<h2 id="62-结论与它们的失效条件">6.2 结论与它们的失效条件</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225428194-327165352.png" alt="" loading="lazy"></p>
+<h2 id="63-版本差异速查">6.3 版本差异速查</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225431618-1354316200.png" alt="" loading="lazy"></p>
+<p>版本基线之外的一句话：文中所有返回值都在 8.10.3 上实测，与 7.2 的命令语义一致；差异只在观测字段（上表最后一行）。如果你的目标版本是 7.2，把 <code>INFO</code> 的输出对照着看即可，不必改命令。</p>
+<h2 id="64-上线前检查清单">6.4 上线前检查清单</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225434832-590268357.png" alt="" loading="lazy"></p>
+<p>这张表可以当评审时的提问清单用：八条里有任意一条答不上来，就说明这套 TTL 用法还没有闭环。</p>
+<h1 id="七怎么选ttl-与其它失效机制的边界">七、怎么选：TTL 与其它失效机制的边界</h1>
+<p>TTL 只是「让数据自己消失」的一种手段，和它竞争的做法有三类。判断标准不是「哪个更强」，而是「你需要的是回收，还是必须发生的动作」：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261115225438101-630717446.png" alt="" loading="lazy"></p>
+<p>四类的组合方式很固定：<strong>TTL 负责回收内存，业务字段负责正确性，延迟队列负责必须执行的动作，扫表负责兜底对账</strong>。拿 TTL 顶替后两者是线上事故的常见起点。TTL 只承诺「最终会被回收」，从不承诺「在某一刻执行了什么」。</p>
+<p>反过来的误用也存在：给每个键都加业务字段、都上延迟队列，成本翻几倍，收益只是把一个「可以晚几秒」的场景做成「精确到毫秒」。判据是第一条：<strong>能接受延迟失效的，就只用 TTL；需要到点动作的，就不要指望它</strong>。</p>
+<h1 id="八下一篇">八、下一篇</h1>
+<p>过了「什么时候该失效」，接下来的问题是「到点之后谁去删、删得多快、花多少 CPU」：惰性删除只在有人读的时候触发，定期删除靠抽样，抽样比例与 <code>hz</code> 直接决定内存能不能及时回收，也决定主库在批量到期时会出现多大的毛刺。下一篇 S3-2 用同一套实测方法，把三套删除策略的触发条件、代价与调参边界逐条拆开。</p>
+<p>本篇能带走的东西：两条铁律与三条不变量（可直接写进设计文档）、四组可复现的命令输出（含主从对照实验）、一段能跑的续期与更新代码（<code>GT</code> + <code>NX</code> 兜底、<code>KEEPTTL</code> + 补挂）。需要速查卡的，私信「TTL速查」。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-16 07:17">2026-11-16 07:16</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">52</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23673995);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23673995&amp;targetId=23673995&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
