@@ -1,0 +1,605 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/netcasewqs/p/23696511" title="发布于 2026-11-17 17:43">
+    
+
+    <span role="heading" aria-level="2">被第三方库坑了二十多年，我把二十多个 .NET 轮子全造了一遍</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        从 .NET 1.0 写到 Native AOT，二十多年攒下二十多个自研库，本文系统梳理 Vane 平台的整体架构。平台按五层组织：L0 基座提供 DI、schema 序列化、零分配日志、对象映射与托管 DEFLATE；L1 用一套 Host 覆盖 TCP、UDS、QUIC 等八种介质；L2 是 Arrow 与 Parquet 列式格式；L3 为表达式与计算引擎 Flow；L4 是 ELinq、Voltcore、Vane.Sheet 组成的数据访问与表格层，另有三个运行时插件框架单独存放。四条公理贯穿其中：零第三方依赖、微内核一包一责、批是唯一数据单元、值语义零装箱。文中给出大量实测数字，日志单条 41.83µs、比 NLog 快 432 倍，Parquet 写 5M×5 列 261.7ms，Sheet 处理 22.5 亿行、100GB 文件峰值内存仅 194MB。文末列清哪些包已上 NuGet，哪些仍在路上。
+
+摘要抓了三条主线：架构分层、四条设计公理、可验证的性能账。这三点是全文的骨架，也是读者判断这套东西值不值得看下去的依据。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>从 .NET 1.0 写到现在，二十多年攒下二十多个自研库，准备逐个推出。这篇写清楚它长什么样、为什么长成这样、哪块还没长好。有几个包已经能 <code>dotnet add package</code>，其余排队。</p>
+<p>关键词：.NET、Native AOT、开源、架构、性能优化、Arrow、Parquet、ORM</p>
+<h2 id="一开场二十多年都干了什么">一、开场：二十多年都干了什么</h2>
+<p>2002 年前后，我在 Visual Studio 里编译出人生第一个 <code>.NET Framework 1.0</code> 程序。那会儿 WinForms 拖控件，WebForms 拖 <code>DataGrid</code>，数据库访问靠一个叫 <code>SqlHelper</code> 的类拼字符串。谁会写 <code>SqlHelper</code>，在项目组里就很有地位。</p>
+<p>再往后是 <code>.NET 2.0</code> 的泛型、<code>3.5</code> 的 LINQ、<code>WCF</code> 的契约优先、<code>Remoting</code> 的透明代理，然后 <code>.NET Core</code>、<code>.NET 8</code>、<code>.NET 10</code>，一路走到 Native AOT。</p>
+<p>项目做了不少，别人的库也用了一堆。用得越多，心里那本账越清楚：</p>
+<ul>
+<li>每个第三方依赖都是一笔迟早要还的债。它升级，你先跟；它不维护了，你的技术栈就原地冻结。</li>
+<li>每个全家桶早晚会挡一下路。一个程序集塞进二十几个命名空间，我只想用一份 DEFLATE，结果被迫把 Win32 API、调度器、消息总线一起拖进来。</li>
+<li>热路径上的每个 <code>object</code>，最后都会变成一次 GC。100 万行数据，每个值装一次箱，就是 100 万个对象排队等回收。</li>
+</ul>
+<p>于是我把每天要用的底层能力，自己写了一遍。</p>
+<p>一半为了快，一半为了不被依赖牵着走。我信不过别人的升级节奏，信不过接口哪天会不会改，也信不过它在我最忙的时候报一个我修不了的错。</p>
+<p>这就是 Vane，一个工具箱：二十多把螺丝刀，每把只管一种螺丝。这篇详写其中 13 条主线。缺哪把拿哪把，不用把整个工具箱背走。写到今天，我其实是在给自己修一条能走二十多年的路。</p>
+<p>成分先交代清楚：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>底座从哪来</th>
+<th>我在项目里的位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>入行头两年</td>
+<td>用别人的框架、现成的商业库</td>
+<td>会用，也被坑过；学着看懂别人的设计</td>
+</tr>
+<tr>
+<td>第三年起直到现在</td>
+<td>全部自研，每个项目开工先搭主干和核心架构，再往上盖业务</td>
+<td>每个项目的主干、核心架构都是我搭的</td>
+</tr>
+</tbody>
+</table>
+<p>这些库都由项目需求逼出来。日志是把前公司跑了十多年、内存和 CPU 都比同期主流低的那套组件经验搬过来，用零分配、零依赖重新实现；序列化是为了一堆写死的老接口；ORM 是为了不再手写 31 种方言的 SQL；Parquet 是为了一次差点把内存打爆的导入。每个库背后，都站着至少一个真实上线、真实挨过骂的系统。</p>
+<h2 id="二这堆东西到底解决什么问题">二、这堆东西到底解决什么问题</h2>
+<p>正经一点的定义：纯 C#、零第三方依赖、为 AOT 与流式而生的 .NET 基础设施库，覆盖通信与分发、列式格式、计算引擎、数据访问与表格四条能力带，外加一组薄基座。</p>
+<p>说直白些，它负责那些又脏又累、每个项目都得干一遍的活：怎么把字节从 A 送到 B、怎么把 100 万行数据不爆内存地读进来、怎么把 LINQ 翻译成 31 种数据库的 SQL、怎么打日志而不把 GC 打成筛子。</p>
+<p>很多人一听平台就以为要装一整套。这里说明它刻意避开了什么：</p>
+<ul>
+<li>没有统一框架。没有 Vane 全家桶启动器，没有全局 <code>ServiceLocator</code>。容器、日志、网络全是可选件，不用也能活。</li>
+<li>没有跨语言内核。Arrow 不做 Flight，也不做 IPC 加密；Parquet 核心不 P/Invoke native 库。</li>
+<li>不承诺热插拔。<code>Vane.Container</code> 只做组件导出和 DI，不做 Bundle 生命周期，也不做版本隔离。装插件那套是另一个物种，我有三个老项目专门干这个，没并进来，第九节解释原因。</li>
+</ul>
+<h3 id="四条公理">四条公理</h3>
+<table>
+<thead>
+<tr>
+<th>公理</th>
+<th>大白话</th>
+<th>落地证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>零第三方依赖</td>
+<td>核心只认 BCL。真要第三方，另开一个 adapter 包，别污染核心</td>
+<td>Arrow / Parquet / Flow 核心零 <code>PackageReference</code>；Zstd/LZ4 塞在 <code>Vane.Parquet.Compression</code> 里</td>
+</tr>
+<tr>
+<td>微内核 · 一包一责</td>
+<td>一个包只讲一件事。不做上帝类 <code>Options</code>，不做统一门面</td>
+<td><code>Vane.Dispatch</code> 只依赖一个 <code>ServiceResolver</code> 委托；<code>Vane.NET</code> 内核不依赖 Rpc/Dispatch</td>
+</tr>
+<tr>
+<td>批是唯一数据单元 · 流式</td>
+<td>数据一批一批走，别整表读进内存。内存和文件大小脱钩</td>
+<td>Parquet 的读批就是行组缓冲上的一个行区间视图；Sheet 滑窗档 RSS 恒定</td>
+</tr>
+<tr>
+<td>值语义 · 零装箱</td>
+<td>热路径上不许产生托管对象。行值、标量、日志条目全是结构体</td>
+<td><code>PqValue</code>（32 字节）、<code>CellValue</code>、<code>Scalar</code>、<code>LogEntry</code>、<code>StrView</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="三条产品线加一条基座">三条产品线加一条基座</h3>
+<table>
+<thead>
+<tr>
+<th>线</th>
+<th>库</th>
+<th>对外价值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>列式数据栈</td>
+<td><code>Vane.Arrow</code> → <code>Vane.Parquet</code> → <code>Vane.Flow</code></td>
+<td>内存列式表示 → 磁盘列式文件 → 表达式/计划/算子</td>
+</tr>
+<tr>
+<td>数据访问栈</td>
+<td><code>ELinq</code> → <code>Voltcore</code>（加 <code>VoltServer</code> / <code>VoltClient</code>）</td>
+<td>ORM 内核加关系库：内存、文件、网络三种形态，另带六种数据库协议仿真</td>
+</tr>
+<tr>
+<td>通信与分发栈</td>
+<td><code>Vane.NET</code> → <code>Vane.Rpc</code> / <code>Vane.Mqtt</code>、<code>Vane.Dispatch</code></td>
+<td>一套宿主覆盖 8 种介质，进程内和跨进程同一套契约外观</td>
+</tr>
+<tr>
+<td>基座</td>
+<td>Container / Pack / Logging / MiniMapper / ManagedLibDeflate</td>
+<td>DI、schema 序列化、零分配日志、对象映射、托管 DEFLATE</td>
+</tr>
+</tbody>
+</table>
+<p>这里详写的是 13 条能力主线（<code>Vane.Rpc</code> / <code>Vane.Mqtt</code> / <code>Vane.Rpc.Mqtt</code> 并进 <code>Vane.NET</code> 算一条）。往上数，储物间里还有 3 个插件框架（<code>OSGi.NET</code> / <code>GAF</code> / <code>Modular</code>，都在 ACL 那边）；再往前，ACL 那一代另有 12 个自有项目，6 个已被 Vane 取代、6 个保留未收编，更早还有一批没进文档的老轮子。造过的轮子保守说也有几十个，这篇只挑还在用的写，退役的只提不展开。</p>
+<p>性能、内存、易用性这三件事，每个库我都按开源界第一梯队的标准去做。做不到的、没测的，正文里写明未测和欠一点。文中那些 ns、MB、倍数都是账。</p>
+<h2 id="三一张图看懂五层楼外加一间储物间">三、一张图看懂：五层楼，外加一间储物间</h2>
+<p>给看不了图的朋友，文字版楼层表：</p>
+<pre><code>L4  数据访问与表格    ELinq · Voltcore(+VoltServer/Client) · Vane.Sheet
+L3  计算引擎          Vane.Flow
+L2  列式格式          Vane.Arrow · Vane.Parquet
+L1  通信与分发        Vane.NET(+Rpc/Mqtt/Rpc.Mqtt) · Vane.Dispatch
+L0  基座              Vane.Container · Vane.Pack · Vane.Logging · MiniMapper · ManagedLibDeflate
+─── 虚线储物间 ───    OSGi.NET · GAF · Modular
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>干嘛的</th>
+<th>住客</th>
+<th>进门门槛</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L0 基座</td>
+<td>DI、序列化、日志、映射、压缩</td>
+<td>Container / Pack / Logging / MiniMapper / ManagedLibDeflate</td>
+<td>只许依赖 BCL，不许引用楼上任何一层</td>
+</tr>
+<tr>
+<td>L1 通信与分发</td>
+<td>字节怎么送到对面；一次调用怎么被路由</td>
+<td>Vane.NET（加 Rpc/Mqtt）、Vane.Dispatch</td>
+<td>可依赖 L0；传输入口只许有一个门（<code>Host</code>）</td>
+</tr>
+<tr>
+<td>L2 列式格式</td>
+<td>列式数据在内存和文件里长什么样</td>
+<td>Vane.Arrow、Vane.Parquet</td>
+<td>核心零依赖；格式库不许懂查询，不许引用 L3</td>
+</tr>
+<tr>
+<td>L3 计算引擎</td>
+<td>表达式、计划、优化、算子</td>
+<td>Vane.Flow</td>
+<td>只许依赖格式的数据形状，不许抓住人家的实现 API</td>
+</tr>
+<tr>
+<td>L4 数据访问与表格</td>
+<td>用户真正伸手取数的地方：SQL/ORM、表格文件</td>
+<td>ELinq、Voltcore、Vane.Sheet</td>
+<td>可依赖 L0 到 L3</td>
+</tr>
+<tr>
+<td>储物间（保留区）</td>
+<td>没接住、也不能算重复的能力</td>
+<td>OSGi.NET、GAF、Modular</td>
+<td>不进主线，单独挂个牌子</td>
+</tr>
+</tbody>
+</table>
+<p>四条硬规矩：</p>
+<ol>
+<li>只许向下依赖。任何指向上层的 <code>ProjectReference</code> 都算违规，必须记账。</li>
+<li>实线真，虚线虚。虚线是设计依赖或语义桥，没接就是没接。</li>
+<li>一个门进出。RPC 就是挂在 <code>Host</code> 上的插件（<code>UseRpc</code> / <code>MapRpc</code>）。</li>
+<li>要第三方就另开包（<code>.Compression</code> / <code>.Mel</code> / <code>.VanePack</code> / <code>.AspNetCore</code>），核心包永不破例。</li>
+</ol>
+<h2 id="四l0-基座先把那个全家桶拆了">四、L0 基座：先把那个全家桶拆了</h2>
+<p>第一代代码是标准的 net48 时代产物：<code>Acl.Core</code> 3.5.5，一个程序集装下 23 个命名空间：Collections、Configuration、Data、IO、Log、Mapping、MessageBus、Scheduler、Security、Serialization、Win32API……听着很全，用起来很痛。想用一份 DEFLATE？连 Win32 API 一起拖走吧。想做 AOT？想都别想，反射撒得到处都是。</p>
+<p>第二代第一件事就是拆家：一个 <code>Core</code> 拆成六个库，一个个搬出去住。</p>
+<table>
+<thead>
+<tr>
+<th>库</th>
+<th>家底</th>
+<th>它管什么</th>
+<th>本机实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Vane.Container</code> 1.0.0</td>
+<td>net8/net10（csproj 还留着 net11）· 3 包加 SourceGen</td>
+<td>DI 加 MEF 形态组件导出：生命周期、keyed、集合解析、作用域、AOP、装饰器</td>
+<td>无依赖瞬态 7.2 ns / 24 B；两依赖 34.9 ns；Singleton 7.0 ns</td>
+</tr>
+<tr>
+<td><code>Vane.Pack</code> 0.1.0</td>
+<td>net10 独占 · 121 文件 / 18.4k 行</td>
+<td>schema 驱动的二进制序列化，线格式控制权归调用方，专门伺候写死的老系统（C 结构体、Pascal 记录、COBOL 报文）</td>
+<td>16 个用例 15 个打得过 MessagePack（1.22 倍到 4.15 倍）；Guid 16 B 对 38 B</td>
+</tr>
+<tr>
+<td><code>Vane.Logging</code> 1.0.0 GA</td>
+<td>net8/net10 · 178 文件 / 15.1k 行</td>
+<td>零分配日志：<code>LogEntry</code> 值语义加栈缓冲渲染加源生成零装箱派发；9 种 Appender、8 种过滤器、11×7 滚动（目录/文件/时间三轴可叠容量上限）</td>
+<td>单条端到端 41.83 µs；NLog 慢 432 倍、log4net 慢 466 倍、Serilog 慢 24.6 倍</td>
+</tr>
+<tr>
+<td><code>MiniMapper</code></td>
+<td>net8/net10 · 43 文件 / 8.5k 行</td>
+<td>对象映射，运行期映射加编译期源生成两条路，AOT 走生成器</td>
+<td>类到类 <code>Map</code> 6.007 ns / 40 B</td>
+</tr>
+<tr>
+<td><code>ManagedLibDeflate</code></td>
+<td>net8/net10 · 19 文件 / 5.8k 行</td>
+<td><code>libdeflate</code> 的纯托管实现，给不许引 native 的场合用</td>
+<td>解压 1.85 µs，跟 native 打平（1.01 倍）；压缩 10.6 µs，落后 2.4 倍</td>
+</tr>
+</tbody>
+</table>
+<p>日志这个库得单拎出来说一段。前公司有个项目，大数据高吞吐场景，一台日志服务器同时只能接 2 个客户端写日志，再多内存和 CPU 就顶不住。我接手改造时翻了一遍旧代码，又问了几位老同事，瓶颈在数据量：一百多台机器密集写入，那会儿的常规开源日志组件接不住。我硬着头皮自己做滚动策略，在多线程、异步、内存和性能上死磕。最后做成目录、文件、时间三个维度各自可以叠容量上限、自由组合，运维不用天天盯磁盘。排障最狠的一条是出错时只凭年、月、日、时就能径直翻到对应那本历史日志，不用 grep 半个 TB。</p>
+<p>我把这套理念搬过来，用零分配、零依赖的现代 .NET 重新落地，这就是 MiniLog，后来改名 <code>Vane.Logging</code>。它的血统来自十来年的产线打磨，加上一套今天才写得出来的实现方式。顺带一说，当年那套设计里的一些思路，Serilog 反复迭代十来年才在部分问题上慢慢靠过来。这份底气来自产线上十多年的真实日志量。</p>
+<p>有个取舍是在坑里蹲过才想明白的：</p>
+<ul>
+<li><code>Vane.Pack</code> 故意不做 per-value tag，按 schema 裸编码。好处是省，Guid 省 58%，对象省 15%；坏处是 null 和数据共用同一片编码空间，靠协议约定躲碰撞。这是给对接老系统交的保护费。</li>
+</ul>
+<h2 id="五l1-通信与分发一个门八条路">五、L1 通信与分发：一个门，八条路</h2>
+<table>
+<thead>
+<tr>
+<th>库</th>
+<th>家底</th>
+<th>定位</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Vane.NET</code></td>
+<td>net10/net11 · 147 文件 / 18.1k 行（含 <code>rpc/</code>）</td>
+<td>平台唯一的传输入口，纯托管、零第三方依赖，交付就一个 <code>Vane.NET.dll</code></td>
+</tr>
+<tr>
+<td><code>Vane.Rpc</code></td>
+<td>同上</td>
+<td>它是 <code>Vane.Dispatch</code> 的跨进程搬运工</td>
+</tr>
+<tr>
+<td><code>Vane.Mqtt</code> / <code>Vane.Rpc.Mqtt</code></td>
+<td>同上</td>
+<td>MQTT 协议栈（Client/Server/Broker）加把 RPC 架到 MQTT 上</td>
+</tr>
+<tr>
+<td><code>Vane.Dispatch</code></td>
+<td>net8/net10 · 74 文件 / 6.1k 行</td>
+<td>容器无关、AOT 友好的分发微内核。前身叫 <code>Ndf</code>，在内部项目里被我折磨了好几年才敢开源</td>
+</tr>
+</tbody>
+</table>
+<p><code>Vane.NET</code> 最得意的一点：一套 <code>Host</code> / <code>ClientBuilder</code> 覆盖 TCP、UDS、NamedPipe、InProcess、HTTP、WebSocket、QUIC、UDP 八种介质。介质差异全塞进 <code>Transport</code> 抽象，业务代码只看见 <code>PipeReader</code> / <code>PipeWriter</code>。帧层是插件化的，帧边界由业务自己定，内核不规定协议，一旦规定，就总有人要改它。内核里也不含 Rpc 和 Dispatch，它们是叠在上面的插件。</p>
+<p><code>Vane.Rpc</code> 的帧结构是 4 字节长度加 20 字节帧头加 JSON 元数据加原始正文，八条路共用一套；单连接按 <code>requestId</code> 多路复用；TLS 归传输层，消息层绝不碰 <code>SslStream</code>（早年我干过每层都加密一次的蠢事，TLS 握手三次，排查了三天）。内容协商交给 Dispatch 的 <code>FormatterSelector</code>，415 / 406 的语义跟进程内一模一样。</p>
+<p><code>Vane.Dispatch</code> 提供特性路由、五类值提供器（Body/Route/Header/Query/Services）、三态恒运行的过滤器、<code>CreateProxy&lt;T&gt;()</code> 把接口变进程内客户端，<code>Map</code> / <code>MapGet</code> / <code>MapPost</code> 对标 Minimal API。热路径用表达式编译的调用器，不用反射；<code>IsAotCompatible</code> / <code>IsTrimmable</code> 全开，反射相关 API 老实打上 <code>[RequiresUnreferencedCode]</code> 标记。</p>
+<p>性能：并发 1 时 40.13 µs / 5 KB，并发 64 时 1.52 ms / 313 KB。对手是 gRPC（65.33 µs / 669 KB）和 MagicOnion（67.53 µs / 765 KB）。TLS 同安全级 47.01 µs，gRPC 是 65.33 µs。</p>
+<p>这组数字是 <code>Dispatch + 编解码 + TCP</code> 的组合读数，算不上分发内核单独的成绩。<code>Vane.Dispatch</code> 和 <code>Vane.Rpc</code> 都还没有独立基准，我在各自的库条目里照实写了，这里不单开一节摊账。</p>
+<h2 id="六l2-列式格式它们不懂-sql这是故意的">六、L2 列式格式：它们不懂 SQL，这是故意的</h2>
+<p>这一层只有一条铁律：格式库不认识查询。它们只把列式数据摆成正确的形状，怎么算是楼上 L3 的事。也因为这条铁律，<code>Vane.Flow → Vane.Parquet</code> 到现在还是虚线。没接线就是没接线，我不给它画实线充胖子。</p>
+<h3 id="vanearrowc-里的-arrow-微内核">Vane.Arrow：C# 里的 Arrow 微内核</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>家底</td>
+<td>net8 · 25 文件 / 7.2k 行</td>
+</tr>
+<tr>
+<td>验证</td>
+<td>482 例（480 通过，2 例是 zstd Huffman 的已知缺陷）；与 pyarrow 26.0.1 双向互通</td>
+</tr>
+<tr>
+<td>打法</td>
+<td>数据直接写进页式 Arena（64 字节对齐），列只是一组地址；读写都是一次遍历加整段拷贝，热路径不产生托管对象</td>
+</tr>
+</tbody>
+</table>
+<p>类型覆盖很全：Null、全部定长类型（Decimal128 / Date/Time/Timestamp / Duration / Interval）、Bool、Utf8、Binary、FixedSizeBinary、Struct、List、LargeList、Map、Union、RunEndEncoded、Utf8View、BinaryView。</p>
+<p>读取侧有四个省法，都是一点点抠出来的：<code>null_count=0</code> 时干脆省略有效性位图；<code>Slice</code> 只改偏移不动数据；<code>MappedArena</code> 走 mmap 零拷贝；列裁剪不解码没选的列。IPC 写 V5、读 V4 加 V5，<code>Schema</code> / <code>DictionaryBatch</code> / <code>RecordBatch</code> / <code>EOS</code> / <code>Footer</code> 全手写，连 FlatBuffers 都用手写的读写器。没用官方 CodeGen，因为那套生成器在 AOT 下太重。</p>
+<p>性能：原始读 mmap 只要 41.15 µs，官方 Apache.Arrow 是 125.1 ms（这个差距我反复跑了三遍才敢写）；端到端含消费 63.38 ms / 21.7 KB，堆副本方案要 90.55 ms / 298.9 MB，四个数量级的分配差。这才是零装箱真正值钱的地方。</p>
+<p>明确不做的：delta 字典批、Flight、Parquet、IPC 加密。做不完的就写明不做，省得别人来问。</p>
+<h3 id="vaneparquet纯托管列式文件引擎">Vane.Parquet：纯托管列式文件引擎</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>家底</td>
+<td>net10 · 37 文件 / 12.4k 行 · 版本 <code>0.1.0-alpha</code>（1.0 之前 API 还可能动）</td>
+</tr>
+<tr>
+<td>验证</td>
+<td>单测 1756 通过 / 12 skip；479 份第三方语料 467 通过；duckdb / parquet-dotnet / Plank / carquet 四路交叉，文件大小跟 carquet 逐位一致（差 ≤0.1%）</td>
+</tr>
+</tbody>
+</table>
+<p>最得意的一手是变长列的表示：整列只有 <code>Blob</code> 加 <code>Offs</code> 两个数组，每行一个对象那套彻底丢掉。效果是读 100 万行字符串的托管分配从 47 到 94 MiB 掉到约 2 KiB。这背后是批才是唯一数据单元在这层的具体含义。</p>
+<p>另外几处细节：布尔列用 <code>Vector256</code> 提位拼 64 位字；RLE / bit-packed 用位累加器替掉逐位循环；<code>BYTE_STREAM_SPLIT</code> 的 8×8 分组让压缩率再涨一档。</p>
+<p>性能：写 5M 行 × 5 列 261.7 ms，parquet-dotnet 要 1441.3 ms（快 5.5 倍），分配 320 MB 对 815 MB，文件还小 37%；读侧领先 2.08 倍到 4.90 倍（String 18.67 倍、Int8 20.85 倍、Bytes 12.55 倍）；池化读 <code>Pooled=true</code> 后分配降到 4.9 MB/轮（降 98%）、峰值 158.8 MB，耗时基本不变。</p>
+<h2 id="七l3-计算引擎vaneflow唯一还没接上电的">七、L3 计算引擎：Vane.Flow，唯一还没接上电的</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>家底</td>
+<td>net10 · 105 文件 / 32.2k 行 · 零 <code>PackageReference</code></td>
+</tr>
+<tr>
+<td>文档</td>
+<td><code>polars/docs/工程结构.md</code>，那份文档本身就是结构契约</td>
+</tr>
+</tbody>
+</table>
+<p>结构上是 <code>Frame</code> 门面加 <code>Core</code>（<code>MemPool</code>/<code>MemBlock</code>、<code>NativeBuffer</code>、<code>ColumnarBatch</code>、<code>ColumnOps</code>、<code>Scalar</code> 标签联合、<code>SimdKernel</code> 三层分派）加 <code>Expressions</code> 加 <code>Plans</code>（逻辑计划、<code>Optimizer</code> 加 <code>OptimizationReport</code>）加 <code>Operators</code>（Pull 模型）。</p>
+<p>三个关键取舍：用 Pull 不用 Push（算子按需拉，天生支持短路和流式）；优化过程透明（<code>OptimizationReport</code> 会把改写了什么摊开给你看）；内存池自己管（<code>MemPool</code>，不指望 GC）。</p>
+<p>这层的实话：跟格式栈还没接线，要等阶段三才接 Parquet 解码，当前 IO 只有 CSV / NDJSON 这类文本入口；包名收口也没做完（G-05）。性能一个字都没测，没有基准工程。这块目前图纸画好了，电还没通。</p>
+<h2 id="八l4-数据访问与表格orm嵌入式库表格">八、L4 数据访问与表格：ORM、嵌入式库、表格</h2>
+<h3 id="elinq零依赖-orm-内核">ELinq：零依赖 ORM 内核</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>家底</td>
+<td>net8/net10 · 227 文件 / 51,630 行 / 435 个 public 类型</td>
+</tr>
+<tr>
+<td>方言面</td>
+<td>31 个具体方言（加 3 个族/基类）· <code>DbProviderType</code> 35 个值 · 能力矩阵 34 条 · 98 个函数键（70 通用加 23 时序加 5 空间）</td>
+</tr>
+<tr>
+<td>测试面</td>
+<td>24 个逐后端工程加 <code>Shared</code> 基座：MySQL、MySqlConnector、Oracle、PostgreSQL、SQLServer、SQLite、MsSqlite、MsSqlServer、Access、Firebird、GBase、Kingbase、Xugu、TDengine、QuestDb、DuckDb、Dameng、Voltcore、CSV、Excel、Text、ODBC、OdbcOracle、OdbcQuestDb</td>
+</tr>
+<tr>
+<td>实测</td>
+<td>Voltcore 套件 3391 通过 / 0 失败 / 4 跳过 / 46 秒；SQLite 套件 2884 通过 / 0 失败 / 7 跳过 / 74 秒</td>
+</tr>
+</tbody>
+</table>
+<p>它把 LINQ 表达式树翻译成多方言 SQL，顺带管 schema 生成、真实 savepoint、批量、分片、缓存和 AOT 双 Tier。</p>
+<p>跟老东家 <code>Acl.Data</code> 比，后者 633 文件 / 69,785 行 / 192 个公共类型 / 11 个方言。ELinq 用少 26% 的行数，做出约 3 倍的方言面，savepoint 还是真嵌套（老的是引用计数式假嵌套）。这个差距没必要谦虚。</p>
+<p>跟市面上比，方言覆盖、函数键密度、能力矩阵可导出、AOT 双 Tier 这四项我认为是领先的；对 SqlSugar 还是欠一点，缺 MongoDB、缺 Sybase，生态和真机验证深度也不如人家。这些数字都来自实测。</p>
+<p>欠账也列清楚：Db2 / HANA / ClickHouse 本机没实例也没连接串，24 个后端工程没全跑（P0 阻塞）；不提供变更跟踪、不提供延迟加载、没有 <code>TransactionScope</code> 环境事务；性能没测（有基准工程，没出报告）。</p>
+<h3 id="voltcore一副引擎三种形态">Voltcore：一副引擎，三种形态</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>家底</td>
+<td>net8/net10 · 187 文件 / 45.7k 行 · 1.0（文件格式 v1）</td>
+</tr>
+<tr>
+<td>形态</td>
+<td>内存（不配 <code>Data Source</code>，全在托管堆，MVCC 多版本）/ 文件（<code>Data Source=path.volt</code>，连续 WAL，崩了从段重放）/ 网络（<code>Server=host:port</code>，RESP 协议）</td>
+</tr>
+<tr>
+<td>入口</td>
+<td>ADO.NET（<code>VoltConnection</code> / <code>VoltCommand</code> / <code>VoltDataReader</code>，用法跟 <code>SqlConnection</code> 一样）/ 引擎 API（<code>VoltEngine.Execute</code> / <code>ExecuteScalar</code> / <code>QueryEntities&lt;T&gt;</code> / <code>ExecuteStream</code>）/ C ABI（<code>Voltcore.Native</code>，给 C、C++、Python、Rust、Go 做 P/Invoke）</td>
+</tr>
+<tr>
+<td>工程</td>
+<td><code>Voltcore</code>、<code>.Native</code>、<code>.Network2</code>、<code>.Arrow</code>、<code>.SourceGenerators</code>、<code>VoltServer</code>、<code>VoltClient</code>、<code>VoltModel</code>、<code>SqliteBridge</code>（加 Cli/Gui）</td>
+</tr>
+</tbody>
+</table>
+<p>纯托管、进程内，最初冲着 SQLite 去。SQL 能力不算寒酸：多类 <code>JOIN</code>、子查询、CTE、聚合、窗口函数、<code>DISTINCT</code>、<code>UPSERT</code>、<code>RETURNING</code>、<code>EXPLAIN</code>、<code>TOP n</code>；可编程性也有，<code>CREATE PROCEDURE</code> 加 <code>EXEC</code>、<code>CREATE TRIGGER</code>（BEFORE/AFTER，带 <code>NEW</code>/<code>OLD</code> 伪表、<code>SET NEW</code>、<code>RAISE</code>）、<code>CREATE VIEW</code>、<code>CREATE FUNCTION</code>（SQL 体或 C# 委托 UDF），<code>COLLATE</code> 可配。类型系统照着 SQL Server 抄：<code>decimal(p,s)</code>、<code>datetime2</code>、<code>uniqueidentifier</code>、<code>nvarchar</code>；方言模式 6 种可切（<code>None</code> / <code>MySql</code> / <code>Postgre</code> / <code>Oracle</code> / <code>SqlServer</code> / <code>Sqlite</code>），切过去连函数别名和操作符都跟着走。</p>
+<p>底下有真东西：MVCC 快照隔离加 OCC 写写冲突检测（先提交者赢）；行存、列存、<code>STORAGE DISK</code> 能按表指定；持久化是整体 <code>Checkpoint</code>（明文 CRC32，或者 AES-256-GCM 加密）加连续 WAL 增量，Durability 分三档。</p>
+<p>它有三副面孔：不配文件名就是内存库；配 <code>Data Source=path.volt</code> 就是文件库（默认连续 WAL，崩了从段重放，不做整体重写）；写 <code>Server=host:port</code> 就是网络库（RESP 协议）。同一套 SQL、同一套事务语义，换个连接串换了个身份。</p>
+<p>顺手还能查文件：<code>.csv</code> / <code>.tsv</code>（分隔符可配）/ <code>.json</code>（数组和 NDJSON 两种布局都认）/ <code>.jsonl</code> / <code>.ndjson</code> 直接当表 <code>SELECT</code>，也能写回（统一落 NDJSON，未知扩展名回退 CSV），扫描是流式的、边扫边推类型；<code>.arrow</code> 由 <code>Voltcore.Arrow</code> 在宿主初始化时往 <code>ScanSourceRegistry</code> 注册一行接入，核心执行路径一行没动；<code>.xlsx</code> / <code>.xlsm</code> 的直查已经在 <code>voltcore-feature-wip</code> 的 <code>Voltcore.Excel</code> 里跑通，主树还没合入，这里照实标注。拿 SQL 统计一堆表格文件这件事，不用先导库。</p>
+<p>最有意思的一段是数据库仿真：一个宿主同时立起 PostgreSQL / MySQL / SQL Server(TDS) / Oracle(TNS+TTC) / 达梦(DM) / 虚谷(Xugu) 六个数据库端点，另加自家 RESP、HTTP、TCP-RPC、QUIC、WebSocket、NamedPipe 六路接入。对端不用改代码，拿 Npgsql、MySqlConnector、Microsoft.Data.SqlClient、ODP.NET 这些原生 .NET 驱动，按各自正常的连接串连上来就能读写；<code>GetSchema</code> 和全类型都对过一遍，驱动完全不知道对面是另一套实现（真驱动往返在 <code>ServerTest.Postgres</code> / <code>MySql</code> / <code>SqlServer</code> / <code>Oracle</code> 和 <code>Voltcore.Network2.Tests</code> 里跑着）。第一次用 SSMS 连上自己写的引擎时，我确实乐了一会儿；也顺手验证了一件事：协议兼容比功能兼容难得多，报错码、字符集、握手协商，一个不对就只回你一句连接失败。</p>
+<p>远程这块跟通信层是接起来的：宿主用 <code>AddPg</code> / <code>AddMySql</code> / <code>AddSql</code> / <code>AddOracle</code> / <code>AddDm</code> / <code>AddXugu</code> 挂数据库端点，用 <code>AddVolt</code> / <code>AddHttp</code> / <code>AddTcpRpc</code> / <code>AddQuic</code> / <code>AddWebSocket</code> / <code>AddNamedPipe</code> 挂自家接入；连接和帧交给 <code>Vane.NET</code> 加 <code>Vane.Rpc</code> 加 <code>Vane.Dispatch</code>，协议原语在 <code>Voltcore.Network\Protocols\*</code>。它是这套平台的一个后端，并没有关起门来自己玩。</p>
+<p>性能（对 SQLite <code>:memory:</code>），先挑好看的：主键点查 4.1 倍、<code>SUM</code> 2218 倍、8 线程并发 COUNT 12.3 倍、8 读加 1 写混合 169 倍、<code>decimal</code> SUM 2129 倍、空库创建 5.4 倍。</p>
+<p>想省事也行：让它当 <code>ELinq</code> 的一个 provider，用 ORM 的方式增删改查，底下的 SQL 引擎照样是这一套。</p>
+<h3 id="vanesheet表格">Vane.Sheet：表格</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>家底</td>
+<td>net8/net10 · 268 文件 / 38.8k 行 · 尚未发布（没 git 远程、没发 NuGet，<code>RepositoryUrl</code> 还指着旧名字，G-09）</td>
+</tr>
+<tr>
+<td>打法</td>
+<td>格式无关的 <code>SheetFile</code> / <code>Workbook</code>，游标式读取；三档读策略（Fast / SlidingWindow / Standard）</td>
+</tr>
+</tbody>
+</table>
+<p>性能这块得说明白：这组数是前身 <code>Vane.Excel</code> 时代跑的，<code>Vane.Sheet</code> 还没自己重跑。100 万行 × 10 列，写 268 ms、读 TModel 1275 ms；MiniExcel 分别是 2890 ms 和 15770 ms（慢 10.8 倍 / 12.4 倍）。<code>DynamicRow</code> 读分配 0.11 MB、<code>DbDataReader</code> 读分配 0.06 MB，分配跟行数无关，这是游标式的功劳。</p>
+<p>这个库的定位就是文件再大也照开，而且真跑过：一个 22.5 亿行 / 100.45 GiB / 2146 个 sheet 的工作簿，写 38 分 59 秒（96.2 万行/秒；1 亿行档 117.8 万行/秒），读回 1 时 39 分 35 秒（37.6 万行/秒，缺格 0.000095%），写读两阶段峰值 RSS 194.2 MB、全程几乎不动。32GB 的机器写读 100GB 数据，内存跟文件大小彻底脱钩。每秒百万条在 1 亿行档是实测的，恒定内存是 194.2 MB 实测的，都不是估出来的。报告躺在仓库里（<code>Sheet/src/Vane.Sheet.Stress/压力测试汇报_22.5亿行.md</code>，另有 5 亿行、直通模式两份），谁都可以自己再跑一遍。唯一要说明的：这批数还是 <code>Vane.Excel</code> 时期跑的，<code>Vane.Sheet</code> 欠自己一次重跑，旧账先认，新数等它跑完再补。</p>
+<h2 id="九储物间三个看着重复其实不重复的老项目">九、储物间：三个看着重复其实不重复的老项目</h2>
+<p>这三个项目是同一族能力：让外部写好的代码在运行时被安装、解析、启动、卸载。它们不进主线，因为 <code>Vane.Container</code> 管的是启动期（注册表到容器），它们管的是运行期（安装包到解析到激活到卸载）。这俩是两回事。</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>家底（实测）</th>
+<th>工程面</th>
+<th>能力</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>OSGi.NET</code></td>
+<td>core 137 文件 / 18,659 行 / 51 公共类型（2012 年产出，产线稳定运行十余年，老东家项目至今在用），TFM <code>net452;net48;net6.0;net8.0</code></td>
+<td>19 个工程</td>
+<td>Bundle 六态生命周期、服务注册与追踪、版本区间匹配、起始级别、扩展点、类加载隔离、LDAP 过滤器、Preferences</td>
+</tr>
+<tr>
+<td><code>GAF</code></td>
+<td>core 50 文件 / 4,246 行 / 13 公共类型，<code>net8.0</code>（对标 OSGi.NET 而写，C/S 加 B/S 双支持）</td>
+<td>9 个工程</td>
+<td>Addin 仓库加 12 态生命周期加四类激活器加三档类加载器加目录/zip 两种包格式加全局程序集缓存加非托管库装载</td>
+</tr>
+<tr>
+<td><code>Modular</code></td>
+<td>16 文件 / 647 行，<code>net452;net48;net8.0</code>（小项目用的轻量插件框架，能力已整合进 GAF）</td>
+<td>1 个工程</td>
+<td><code>UseModular</code> / <code>AddModulesFromAssembly</code> 的最小模块约定</td>
+</tr>
+</tbody>
+</table>
+<p><code>OSGi.NET</code> 是按 OSGi 规范落地的运行时框架：<code>ServiceRegistry</code>（502 行）、<code>ServiceTracker</code>（784 行）、LDAP 式 <code>SimpleFilter</code>（597 行）、<code>VersionRange</code>（500 行）、<code>FrameworkStartLevelImpl</code>（469 行）、Bundle 级 <code>ClassLoader</code>（793 行）。<code>GAF</code> 比 OSGi 轻、比反射调个方法重，生命周期分段更细（多了 <code>Configuring</code> / <code>Configured</code> / <code>Matching</code> / <code>Matched</code> 四段，可以装好但不启动）。</p>
+<p><code>OSGi.NET</code> 是 2012 年写的。那会儿我还在 .NET 4.x 的世界里打滚，OSGi 这套包级生命周期加服务注册表加上类加载隔离在 Java 圈是标配，在 .NET 圈基本没人这么干。我一头扎进去写了很久，写完就往产线上扔，结果它在公司里稳定跑了十几年，直到今天，老东家那边的项目还在用它。</p>
+<p>这也是我没把它判重复然后删掉的原因。一个跑了十几年的东西，收编它需要时间，它在别人的机器上还活着，还在替人挡故障。我能做的只是把它挂在储物间，牌子写清楚：能力不重复，我没接住。</p>
+<p><code>GAF</code> 的出身是另一回事，它就是冲着对标 <code>OSGi.NET</code> 去的。当年 OSGi.NET 在 C/S 模式下顺得像刀切黄油，客户端装个包、解析、跑起来、用完卸掉，一套流程清清楚楚。可一到 B/S 就水土不服：面对新式 Web 框架（AspNetCore 那一套、MEL 的 DI 与配置），它基本对不上榫头，宿主集成这块只能自己另起炉灶。</p>
+<p>于是就写了 GAF：把 OSGi 好用的那部分（包、仓库、状态机、隔离类加载器）吸收进来，然后做轻、做现代，<code>net8.0</code>、直接吃 <code>Microsoft.Extensions.*</code>、自带 <code>Gaf.AspNetCore</code> 宿主集成，C/S 和 B/S 一起支持；生命周期还从 OSGi 的 6 态细化到 12 态（多出配置与匹配两段，可以装好但不启动）；类加载给了隔离、共享、轻量三档。</p>
+<p>一句话：OSGi.NET 是当年 C/S 的好答案，GAF 是我为 B/S 重写的那一版。这两个是构建大项目时的必备插件框架，项目一大，模块一多，没有装、解析、启、卸这套机制，最后一定退化成一堆手工拼装的 <code>if</code>。</p>
+<p><code>Modular</code> 的定位又不一样，它是给小项目准备的。十几个人、一两个月的项目，上 OSGi.NET 那套包加仓库加状态机加隔离类加载器，属于拿高射炮打蚊子；它真正需要的只是按约定把模块扫出来、注册进去、按顺序启动。Modular 就是这个最小约定：16 文件 / 647 行，<code>UseModular</code> 加 <code>AddModulesFromAssembly</code> 一句话接上，能跑就行，别搞复杂。</p>
+<p>后来这套轻量能力被整合进 GAF 了：GAF 里那条免打包、轻量加载的 Lite 路线（<code>LiteGafDemo</code> / <code>LiteActivatorDescriptor</code> / <code>LiteClassLoader</code>），就是 Modular 那套思路吸收进去之后的形态。</p>
+<p>这三个其实是一条产品线的三代：OSGi.NET 管大 C/S，GAF 管 C/S 加 B/S 并顺手把轻量路线收了进来，Modular 是它曾经最轻的那一版。</p>
+<h2 id="十三条数据流记住动词就记住了架构">十、三条数据流：记住动词，就记住了架构</h2>
+<p>图回答谁依赖谁，数据流回答数据怎么走。</p>
+<h3 id="101-列式读写流格式栈加引擎">10.1 列式读写流（格式栈加引擎）</h3>
+<pre><code>表格 / 文本                      列式文件
+SheetFile.读取 ──► SheetRow/Workbook ─┐
+CSV / NDJSON ────────────────────────┤
+                                     ▼
+                    Vane.Flow：DataFrame / LazyFrame
+                    表达式 → 逻辑计划 → Optimizer → 物理计划 → Pull 算子
+                                     │
+                                     ▼
+                    Vane.Arrow：Arena 列式批（64B 对齐页）
+                                     │  Ipc.OpenWriteFile → IpcWriter → Finish
+                                     ▼
+                    Vane.Parquet：SegmentSink 按行组 append
+                                     ▼
+                                  .parquet
+</code></pre>
+<p>回读就反着走：<code>ParquetFileReader.Open(...)</code> 到 <code>ReadNextAsync</code> 到 <code>PqTable</code>（行组上的行区间视图），需要 Arrow 就走语义桥，再 <code>Ipc.OpenReadFile</code> 到 <code>IpcFileReader.ReadNextAsync</code>（可切批、可跨块、可复用）。</p>
+<p>这条流有三个性质：一批一批走（没有 <code>ReadAll</code> 这种整表 API，我不给这种偷懒机会）、能不拷贝就不拷贝（<code>PqTable</code> 不复制行组缓冲，<code>Slice</code> 只改偏移）、元数据只解一次（footer 和 schema 全文件解析一遍，批次共享）。</p>
+<h3 id="102-数据访问流orm-加嵌入式库">10.2 数据访问流（ORM 加嵌入式库）</h3>
+<pre><code>业务代码
+   │  ELinq：LINQ → 表达式树 → 方言能力（IProviderDescriptor / ICapabilityMatrix）
+   │                        → CommandFactory 建命令 → DbConnection
+   ▼
+外部数据库（SqlServer / MySql / Postgre / Oracle / Sqlite …）
+   │
+   └─ 或者目标库就是嵌入式引擎：
+        VoltConnection / VoltCommand / VoltDataReader（ADO.NET 外观）
+        或 VoltEngine.Execute / QueryEntities&lt;T&gt; / ExecuteStream（引擎外观）
+</code></pre>
+<p>要点只有一个：同一套消费者 API，面对两种后端。Voltcore 既是 ELinq 的一个 provider，也能被业务代码直接当 SQLite 用。</p>
+<h3 id="103-通信与远程流宿主加契约">10.3 通信与远程流（宿主加契约）</h3>
+<pre><code>服务端                                      客户端
+Host.CreateDefault()                        RpcClient.Create()
+  Listen(addr)                                │
+  StartAsync(conn =&gt; Transport.Input/Output)  │
+  UseRpc(engine)  ← IDispatchEngine（同一份契约）
+  MapRpc(endpoint)                            │
+        │  帧 = 4B 长度 + 20B 帧头 + JSON 元数据 + 原始正文
+        └───────────── requestId 多路复用 ─────────────┘
+                          │
+        进程内：Dispatch.CreateProxy&lt;T&gt;() ← 同一套 IDispatchEngine，不出进程
+</code></pre>
+<p>同构点：进程内调用和跨进程调用的外观一模一样，同一个 <code>IDispatchEngine</code>、同一个契约名 <code>calc/Add</code>、同一套 415/406 语义。差别只有一条：帧要不要过网线。</p>
+<h2 id="十一开源状态哪些能马上装哪些还得等nuget-上的elinq-还是10几年前的版本一直没有更新过说来惭愧新版将来会改名vanedata">十一、开源状态：哪些能马上装，哪些还得等，nuget 上的elinq 还是10几年前的版本，一直没有更新过，说来惭愧，新版将来会改名，Vane.Data.</h2>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>库</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已上 NuGet</td>
+<td><code>Vane.Container</code> 1.0.0、<code>Vane.Dispatch</code> 1.1.0、<code>ELinq</code> 0.6.2.5、<code>ManagedLibDeflate</code> 0.1.0-alpha</td>
+<td>现在就能 <code>dotnet add package</code>；<code>ELinq</code> 线上还是 0.6.x，仓库收口 1.0 之后重发</td>
+</tr>
+<tr>
+<td>已上 NuGet（ACL 时代的老包）</td>
+<td><code>Acl.OSGi</code> 1.2.1、<code>Acl.Data</code> 3.3.6、<code>Acl.Excel</code> 4.0.1、<code>Acl.Modular</code> 3.2.0、<code>MiniLog</code> 1.0.1、<code>GAFi</code> 1.0.2</td>
+<td>老项目还在引用；<code>Acl.Excel</code> 是 <code>Vane.Excel</code> 的前身，<code>MiniLog</code> 是 <code>Vane.Logging</code> 的前身。GAF 的包名是 <code>GAFi</code>，<code>GAF</code> 这个 id 早被别人的遗传算法框架占了</td>
+</tr>
+<tr>
+<td>已开源（gitee，未上 NuGet）</td>
+<td><code>Vane.Logging</code>、<code>MiniMapper</code>、<code>Voltcore</code></td>
+<td>源码能拉能看，包还没推；<code>Voltcore</code> 1.0</td>
+</tr>
+<tr>
+<td>即将开源（本地 git，收尾中）</td>
+<td><code>Vane.Pack</code>、<code>Vane.NET</code>（加 Rpc/Mqtt）、<code>Vane.Arrow</code>、<code>Vane.Parquet</code>（<code>0.1.0-alpha</code>）、<code>Vane.Flow</code></td>
+<td>仓库已成型，还差 README、示例与发布流程</td>
+</tr>
+<tr>
+<td>未发布</td>
+<td><code>Vane.Sheet</code></td>
+<td>没有 git 远程、没发 NuGet，<code>RepositoryUrl</code> 还指着旧名字（G-09）</td>
+</tr>
+</tbody>
+</table>
+<p>我不打算一次性把所有包都推到 NuGet 上然后消失。一个一个来，每个都带文档和示例。我见过太多发完就跑的仓库，不想加入那个行列。</p>
+<p>想先试一口，四行就够（版本写死，免得装到半成品）：</p>
+<pre><code class="language-bash">dotnet add package Vane.Container    --version 1.0.0
+dotnet add package Vane.Dispatch     --version 1.1.0
+dotnet add package ELinq             --version 0.6.2.5
+dotnet add package ManagedLibDeflate --version 0.1.0-alpha
+</code></pre>
+<p>ACL 时代那批老包同理，名字得写对：<code>Acl.OSGi</code> 1.2.1、<code>Acl.Data</code> 3.3.6、<code>Acl.Excel</code> 4.0.1、<code>Acl.Modular</code> 3.2.0、<code>MiniLog</code> 1.0.1、<code>GAFi</code> 1.0.2。别搜 <code>GAF</code>，搜出来是别人的遗传算法框架，我第一次搜到时还愣了一下，以为自己的包被下架了。</p>
+<h2 id="十二写在最后二十多年为什么还在造轮子">十二、写在最后：二十多年，为什么还在造轮子</h2>
+<p>有人问过我：你都写了二十多年了，为什么不用现成的？.NET 生态什么都有，日志有 Serilog，序列化有 MessagePack，Parquet 有 parquet-dotnet，ORM 有 EF Core 和 SqlSugar，你图什么？</p>
+<p>我想了想，大概三个原因：</p>
+<ol>
+<li>穷过。早年项目预算紧，商业库买不起，只能自己写。写着写着发现，自己写的还更好改。</li>
+<li>怂。被依赖升级坑过太多次。半夜爬起来修一个上游改了个默认值的问题，那种滋味会改变一个人的技术观。</li>
+<li>轴。我就是受不了一个包塞二十个命名空间。这毛病不好，但它逼着我学会了分层、学会了记账、学会了给每条线找证据。</li>
+</ol>
+<p>还有一个原因说不清算体面还是高尚：这二十多年里我待过的每一个项目，主干和核心架构都是这套自研的东西在扛。除了入行头两年用别人的框架，之后每次开工都是同一套流程，先画主干、定分层、搭底座，再往里填业务。这套流程跑过太多次，跑到我已经不习惯等社区给我一个方案。它一直在工地上干活，只是现在工地的名字换成了 gitee。</p>
+<p>日志这一支有来历。前公司那套组件在产线上连续跑了十多年，大数据量下内存和 CPU 都比同期主流开源方案低，只凭年、月、日、时就能定位历史日志。我把这套被年复一年验证过的理念搬进 MiniLog，用零分配、零依赖重写；十多年后，Serilog 在某些方面才慢慢靠了过来。这话我只在家里说过，写进博客算是留个证据，顺便提醒自己，当年判断是对的，那就别在开源这件事上怂。</p>
+<p>二十多年下来，代码之外还攒下一套能自证的规矩：线必须能从 <code>csproj</code> 里查到，性能必须有原始报告，没测就写没测，缺口必须编号挂账。这套规矩比任何库都值钱，它让我在五十岁的时候还敢说这块我没做好。</p>
+<p>新包我会按第十一节的顺序一个一个整理干净推出去：补 README、补示例、补基准报告，再发 NuGet。已经上去的那几个先躺着，<code>Vane.Container</code>、<code>Vane.Dispatch</code>、<code>ELinq</code>、<code>ManagedLibDeflate</code>，还有 ACL 时代那一批老包。不承诺时间表，承诺不烂尾。</p>
+<p>如果你也在写 .NET，或者也在给自己造轮子，欢迎来看、来骂、来提 issue。二十多年的经验告诉我：一个人闷头造的轮子，得有人来踹两脚，才知道圆不圆。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.001388888888888889" data-date-updated="2026-11-17 17:46">2026-11-17 17:43</span>&nbsp;
+<a href="https://www.cnblogs.com/netcasewqs">风云</a>&nbsp;
+阅读(<span id="post_view_count">161</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23696511);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fnetcasewqs%2Fp%2F23696511&amp;targetId=23696511&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
