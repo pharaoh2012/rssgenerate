@@ -1,0 +1,135 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yellow3gold/p/23689542" title="发布于 2026-11-17 08:57">
+    
+
+    <span role="heading" aria-level="2">520 万数据迁移实战：Elasticsearch 索引重建与"改名"的完整踩坑记录</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        重建 ES 索引没法直接改名？本文记录一次真实迁移的全过程：MySQL 增量管道的隐藏 bug、date mapping 的 time_zone 坑、_reindex 提速三板斧、父任务进度 0/0 的假象、yellow 状态的正确解读。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>AI 生成声明</strong>：本文内容由 AI 生成或经 AI 辅助完成，请注意甄别。</p>
+</blockquote>
+<p>最近做完一次完整的 ES 索引重建 + 迁移，520 多万条数据，过程中踩了一串很有代表性的坑，整理成这篇记录。</p>
+<h2 id="背景">背景</h2>
+<p>历史原因，文档的创建/修改时间写入 ES 时用的是 epoch_millis 整数，需求改为北京时间字符串（<code>yyyy-MM-dd HH:mm:ss</code>），同时索引 mapping 也要升级（若干 text 字段换成 ik 分词器、date 字段改多格式）。ES 的 mapping 无法原地大改，只能<strong>重建索引</strong>；而业务方要求索引还得用回原来的名字——ES 又<strong>不支持索引改名</strong>。这就是本次迁移要解决的全部问题。</p>
+<h2 id="一es-索引改名的三种姿势">一、ES 索引"改名"的三种姿势</h2>
+<p>ES 不支持直接 rename 索引，可选方案：</p>
+<p><strong>方案一：别名切换（推荐）</strong></p>
+<p>把旧名字变成指向新索引的别名，秒级完成，应用代码零改动：</p>
+<pre><code class="language-json">POST /_aliases
+{
+  "actions": [
+    { "remove": { "index": "docs_index_old", "alias": "docs_index" } },
+    { "add":    { "index": "docs_index_new", "alias": "docs_index" } }
+  ]
+}
+</code></pre>
+<p>所有程序继续用原名字访问，读写透明地落到新索引。</p>
+<p><strong>方案二：_reindex 回迁</strong></p>
+<p>删掉旧索引 → 用新 mapping 建同名空索引 → <code>_reindex</code> 把数据从临时索引搬回来。成本是数据要再整体搬一遍，但最终拿到物理名一致的索引。</p>
+<p><strong>方案三：新写入直接换名字</strong>——对存量数据不适用，略过。</p>
+<p>我们的场景因为历史原因必须用物理索引名，选了方案二。<strong>如果你的场景能接受别名，强烈建议方案一</strong>，别为名字好看再搬一遍数据。</p>
+<h2 id="二时间格式转换painless-服务端处理">二、时间格式转换：Painless 服务端处理</h2>
+<p>迁移时要把 epoch_millis 转成东八区字符串。520 万条数据拉回本地逐条转换再写回，太慢了，直接在 <code>_reindex</code> 的 script 里服务端搞定：</p>
+<pre><code class="language-json">POST /_reindex
+{
+  "source": { "index": "docs_index_old" },
+  "dest":   { "index": "docs_index_new" },
+  "script": {
+    "lang": "painless",
+    "source": """
+      def ts = ctx._source.create_time;
+      if (ts instanceof Number) {
+        ctx._source.create_time = ZonedDateTime
+          .ofInstant(Instant.ofEpochMilli(ts), ZoneId.of("Asia/Shanghai"))
+          .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+      }
+    """
+  }
+}
+</code></pre>
+<p>时区显式用 <code>Asia/Shanghai</code>，不依赖运行机器的本地时区，在哪个环境跑结果都一致。</p>
+<p><strong>坑 1：date mapping 不支持 <code>time_zone</code> 参数。</strong> 我一开始把 <code>"time_zone": "+08:00"</code> 写进了 mapping，创建索引直接报错：</p>
+<pre><code>mapper_parsing_exception: unknown parameter [time_zone] on mapper [create_time] of type [date]
+</code></pre>
+<p><code>time_zone</code> 只是<strong>查询时</strong>的参数，不能出现在 mapping 里。正确做法就是上面这样在写入值时转好时区。mapping 里 date 字段用双格式兜底：</p>
+<pre><code class="language-json">"create_time": {
+  "type": "date",
+  "format": "yyyy-MM-dd HH:mm:ss||epoch_millis"
+}
+</code></pre>
+<p>这样即使某个环境的索引没来得及重建，字符串和毫秒数两种写法都能兼容写入，不会因为格式冲突导致整条文档写入失败。</p>
+<h2 id="三_reindex-提速三板斧">三、_reindex 提速三板斧</h2>
+<p>520 万条数据，默认配置的 <code>_reindex</code> 是很慢的，三个优化叠加能快好几倍：</p>
+<pre><code class="language-python">body = {
+    "source": {"index": SOURCE, "size": 5000},
+    "dest":   {"index": DEST}
+}
+es.indices.put_settings(index=DEST, body={
+    "index": {"refresh_interval": "-1", "number_of_replicas": 0}
+})
+resp = es.reindex(body=body, wait_for_completion=False,
+                  slices=10, requests_per_second=-1)
+</code></pre>
+<p><strong>1. <code>slices</code> 并行切片。坑 2：<code>slices="auto"</code> 是按源索引分片数并行的</strong>——如果源索引只有 1 个分片（不显式指定时的默认值），<code>auto</code> 等于<strong>单线程</strong>在跑！这种情况要显式给 <code>slices=8~10</code>（ES 7 的 sliced scroll 支持切片数超过分片数）。</p>
+<p><strong>2. <code>refresh_interval: -1</code>。</strong> 导入期间不每秒强制生成新段，消除 refresh 开销。</p>
+<p><strong>3. <code>number_of_replicas: 0</code>。</strong> 导入期间不写副本，每条少一倍写入放大。</p>
+<p><strong>别忘了收尾恢复</strong>：搬完后把 <code>refresh_interval</code> 调回 <code>1s</code>、<code>number_of_replicas</code> 调回原值并 <code>flush</code>，否则线上索引一直处于无副本无刷新的危险状态。执行期间也要暂停业务写入管道，避免切换窗口内的增量丢失。</p>
+<p>另外用 <code>wait_for_completion=False</code> 提交成异步任务再轮询进度，避免长任务触发 HTTP 30 秒超时。</p>
+<h2 id="四进度监控的坑父任务-status-一直-00">四、进度监控的坑：父任务 status 一直 0/0</h2>
+<p>迁移脚本跑起来后，轮询 <code>_tasks/&lt;task_id&gt;</code> 打印的进度一直是 <code>0/0</code>，一度以为卡死了。其实：</p>
+<p><strong>坑 4：sliced reindex 的父任务 status 不聚合子任务进度</strong>（或聚合严重滞后），一直显示 0 是正常现象。</p>
+<p>正确的验证姿势是看子任务：</p>
+<pre><code>GET /_tasks?actions=*reindex&amp;detailed=true
+</code></pre>
+<p>返回里每个 slice 一个子任务，各自带真实的 <code>total/created/updated</code>，数字在涨就没问题。</p>
+<p><strong>坑 5：<code>refresh_interval=-1</code> 期间别用 <code>_count</code> 验证进度。</strong> count 走搜索，看不到未刷新的文档，会一直是 0——这不是异常，是关 refresh 的预期效果。这段时间想确认数据在涨，看 Kibana 索引管理页里的<strong>索引体积</strong>变化即可（恢复 refresh 后 count 才会一次性出来）。</p>
+<h2 id="五收尾核对与-yellow-状态解读">五、收尾核对与 yellow 状态解读</h2>
+<p>迁移完成后核对三件事：</p>
+<ol>
+<li><strong>文档数对比</strong>：<code>GET index/_count</code>，源索引 5,237,437 = 目标索引 5,237,437，一条不差；</li>
+<li><strong>分片状态</strong>：<code>GET /_cat/shards/&lt;index&gt;</code>，我的输出是：</li>
+</ol>
+<pre><code>&lt;index&gt; 0 r INITIALIZING                node-2
+&lt;index&gt; 0 p STARTED      5237437 12.5gb node-3
+</code></pre>
+<p>主分片 <code>STARTED</code> 且文档数正确，副本 <code>INITIALIZING</code> 说明正在跨节点同步 12.5GB——这就是索引显示 <strong>yellow</strong> 的原因，同步完自动变 green。期间照常可以读写，不用等。</p>
+<p>顺带一提：如果是<strong>单节点集群</strong>，副本永远无法分配（副本不能和主分片同节点），只要 <code>replicas&gt;0</code> 索引就永远 yellow——无害，也可以干脆设 <code>number_of_replicas: 0</code> 让它变 green。</p>
+<ol start="3">
+<li><strong>清理</strong>：确认数据一致后删除临时索引释放磁盘，再恢复业务写入管道。</li>
+</ol>
+<h2 id="总结">总结</h2>
+<ul>
+<li>ES 索引"改名"首选<strong>别名切换</strong>，物理名必须一致才用 reindex 回迁；</li>
+<li>mapping 的 date 字段没有 <code>time_zone</code> 参数，时区在写入值时转换；<code>format</code> 用双格式兜底新旧写法；</li>
+<li><code>_reindex</code> 提速三板斧：显式 <code>slices</code>（源索引单分片时 auto 无效）、<code>refresh_interval=-1</code>、<code>replicas=0</code>，完成后必须恢复；</li>
+<li>sliced reindex 父任务进度显示 0/0 是假象，用 <code>_tasks?actions=*reindex&amp;detailed</code> 看子任务；</li>
+<li>yellow = 副本未分配/同步中，主分片数据完整可正常读写。</li>
+</ul>
+<p>一次迁移把 ES 运维的常见坑基本踩了一遍，希望对要做类似事情的同学有帮助。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.003472222222222222" data-date-updated="2026-11-17 09:02">2026-11-17 08:57</span>&nbsp;
+<a href="https://www.cnblogs.com/yellow3gold">新*</a>&nbsp;
+阅读(<span id="post_view_count">126</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23689542);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyellow3gold%2Fp%2F23689542&amp;targetId=23689542&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
