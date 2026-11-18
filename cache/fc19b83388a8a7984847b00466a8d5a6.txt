@@ -1,0 +1,525 @@
+
+	<div class="postTitle">
+		<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/SheepDog/p/23709471" title="发布于 2026-11-18 17:40">
+    
+
+    <span role="heading" aria-level="2">Caffeine+Redis 双重缓存：原理、两类脏读、方案与选型</span>
+    
+
+</a>
+
+	</div>
+	
+	<div class="postText">
+		<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<h1>Caffeine+Redis 双重缓存：原理、两类脏读、方案与选型</h1>
+<blockquote>
+<p>摘要：Caffeine+Redis 是业务层常用的多级缓存架构，很多人只知道它用来加速热点查询，却分不清两种脏读来源、不知道什么时候该上、什么时候坚决不能用。本文从架构链路、两类脏读（单机读写竞态 + 分布式跨节点脏读）、工程实现方案、适用边界完整梳理，附带可运行代码，适合开发学习、面试复盘。</p>
+</blockquote>
+<h2>一、先分清一个容易混淆的概念</h2>
+<p>很多同学会把它和 MyBatis 二级缓存搞混：</p>
+<ul>
+<li>MyBatis 二级缓存：框架内置的 Mapper/Namespace 层缓存，分布式场景极易脏读，线上大多关闭；</li>
+<li><strong>Caffeine + Redis 双重缓存</strong>：业务主动设计的多级缓存架构，链路：<code>Caffeine（JVM本地缓存） → Redis（分布式基准缓存） → DB</code>。</li>
+</ul>
+<p>核心定位：<strong>Redis 作为全局权威数据源，Caffeine 作为热点加速层</strong>。</p>
+<h2>二、什么时候才需要引入这套架构？（不是必选项）</h2>
+<blockquote>
+<p>原则：单用 Redis 能扛住流量、延迟达标，就不要额外引入 Caffeine，复杂度会显著上升。</p>
+</blockquote>
+<p>✅ 适合引入的条件（尽量同时满足）</p>
+<ol>
+<li>存在超高热点 Key，读 QPS 极高，单用 Redis CPU / 连接 / 带宽容易打满；</li>
+<li>接口对 RT 敏感，想要极致低延迟，消除 Redis 网络往返开销；</li>
+<li>读多写少，热点集中，缓存命中率高；</li>
+<li>共享 Redis 集群资源紧张，需要在应用层拦截流量、保护 Redis；</li>
+<li><strong>硬性前提：业务允许短暂不一致（几十 ms ~ 数秒脏读窗口）</strong>。</li>
+</ol>
+<p>🎯 它解决的 3 个核心问题</p>
+<ol>
+<li>降低查询 RT：Caffeine 命中直接读内存，没有网络 IO；</li>
+<li>拦截热点流量，削峰，避免热点 Key 击穿 Redis；</li>
+<li>提升系统吞吐，扩容实例时，不会同步放大 Redis 的压力。</li>
+</ol>
+<p>❌ 不适合引入的场景</p>
+<ol>
+<li>强一致性业务（库存、资金、钱包、订单、支付、优惠券核销），脏读会直接资损；</li>
+<li>QPS 低、Redis 压力很小，收益抵不上维护成本；</li>
+<li>写非常频繁，缓存频繁失效，Caffeine 命中率极低；</li>
+<li>Key 极度分散、没有稳定热点，本地缓存留不住数据。</li>
+</ol>
+<blockquote>
+<p>强一致业务缓存方案：去掉 Caffeine，只用 Redis；或者直接查 DB，必要时搭配分布式锁、Lua 脚本。</p>
+</blockquote>
+<h2>三、架构里的两类脏读（重点）</h2>
+<p>这套架构会遇到两种完全不同的脏读，成因、解决思路分开：</p>
+<h3>1. 单机读写竞态（单机、分布式所有实例内部都存在）</h3>
+<p>成因：同一个 JVM 内，读请求提前发起，但 DB 查询很慢；写请求先完成 DB 更新并清理缓存；等慢读请求拿到旧数据，回填缓存，脏数据驻留。 时序：</p>
+<ol>
+<li>T1（读线程）：Caffeine miss → Redis miss → 发起慢 DB 查询</li>
+<li>T2（写线程）：更新 DB 为新值 → 删除 Caffeine、Redis 缓存</li>
+<li>T1 返回旧数据，回填缓存，脏数据产生</li>
+</ol>
+<blockquote>
+<p>特点：脏数据是<strong>回填动作写进去的</strong>；和是否多机器无关。</p>
+</blockquote>
+<h3>2. 跨节点脏读（分布式多实例独有）</h3>
+<p>成因：所有实例共用一套 Redis，但每个实例的 Caffeine 是独立隔离的内存。Redis 只能删自己的数据，无法远程清除其他 JVM 里的 Caffeine。 时序：</p>
+<ol>
+<li>A、B 实例本地 Caffeine 都缓存了同一个 key 的旧值，Redis 也是旧值</li>
+<li>更新请求打到 A 实例：更新 DB、删除 Redis 缓存、发送失效广播消息</li>
+<li>消息到达 B 实例之前，查询打到 B，直接读取本机 Caffeine 旧值，脏读</li>
+<li>B 收到消息，删除本机 Caffeine，脏读窗口结束</li>
+</ol>
+<blockquote>
+<p>特点：脏数据本来就存在 B 节点本地缓存；通知机制只能缩小窗口，<strong>无法彻底消除短暂脏读</strong>，架构本身是最终一致。</p>
+</blockquote>
+<h2>四、单机读写竞态：4 套工程落地方案</h2>
+<p>前置约定：</p>
+<ul>
+<li>读链路：Caffeine → Redis → DB</li>
+<li>写顺序统一：<strong>先更新 DB，再清理缓存</strong></li>
+<li>公共基础工具类</li>
+</ul>
+<pre class="highlighter-hljs"><code>public class CacheUtil {
+    public final LoadingCache&lt;String, Object&gt; caffeineCache;
+    public final RedisTemplate&lt;String, Object&gt; redisTemplate;
+    public final ExecutorService cacheDelExecutor = Executors.newSingleThreadExecutor();
+
+    public CacheUtil(RedisTemplate&lt;String, Object&gt; redisTemplate) {
+        this.redisTemplate = redisTemplate;
+        this.caffeineCache = Caffeine.newBuilder()
+                .expireAfterWrite(5, TimeUnit.MINUTES)
+                .build();
+    }
+
+    public void clearBothCache(String key) {
+        caffeineCache.invalidate(key);
+        redisTemplate.delete(key);
+    }
+}</code></pre>
+<h3>方案 1：异步延迟双删 + TTL 兜底（绝大多数项目首选）</h3>
+<p>✅ 适用：普通业务、读多写少、允许短暂不一致（商品图文、首页配置） ✅ 优点：无锁、性能高、实现简单 ❌ 缺点：无法 100% 杜绝；如果 DB 耗时超过延迟时间，依然会脏</p>
+<pre class="highlighter-hljs"><code>@Service
+public class BizDelayDeleteService {
+    private final CacheUtil cacheUtil;
+    private static final long DELAY_MILLIS = 300;
+    private static final long REDIS_TTL_SEC = 5 * 60;
+
+    public BizDelayDeleteService(CacheUtil cacheUtil) {
+        this.cacheUtil = cacheUtil;
+    }
+
+    public Object getBizData(String key) {
+        Object val = cacheUtil.caffeineCache.getIfPresent(key);
+        if (val != null) return val;
+        val = cacheUtil.redisTemplate.opsForValue().get(key);
+        if (val != null) {
+            cacheUtil.caffeineCache.put(key, val);
+            return val;
+        }
+        val = dbService.selectById(key);
+        if (val != null) {
+            cacheUtil.redisTemplate.opsForValue().set(key, val, REDIS_TTL_SEC, TimeUnit.SECONDS);
+            cacheUtil.caffeineCache.put(key, val);
+        }
+        return val;
+    }
+
+    public void updateBizData(String key, Object newData) {
+        dbService.updateById(key, newData);
+        cacheUtil.clearBothCache(key);
+        // 异步延迟二次删除，兜底单机慢读回填竞态，不阻塞写接口
+        cacheUtil.cacheDelExecutor.submit(() -&gt; {
+            try {
+                Thread.sleep(DELAY_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            cacheUtil.clearBothCache(key);
+        });
+    }
+}</code></pre>
+<h3>方案 2：Key 粒度本地锁（单机热点 key，尽量不脏读）</h3>
+<p>✅ 适用：单机热点 key、不能接受脏读、并发可控 ✅ 优点：从根源杜绝时序竞态，保证一致 ❌ 缺点：热点 key 串行，并发下降；<strong>仅单机有效，分布式要换成 Redisson 分布式锁</strong></p>
+<pre class="highlighter-hljs"><code>@Service
+public class BizLocalLockService {
+    private final CacheUtil cacheUtil;
+    private final ConcurrentHashMap&lt;String, Object&gt; keyLockMap = new ConcurrentHashMap&lt;&gt;();
+    private static final long REDIS_TTL_SEC = 5 * 60;
+
+    public BizLocalLockService(CacheUtil cacheUtil) {
+        this.cacheUtil = cacheUtil;
+    }
+
+    private Object getLock(String key) {
+        return keyLockMap.computeIfAbsent(key, k -&gt; new Object());
+    }
+
+    public Object getBizData(String key) {
+        Object lock = getLock(key);
+        synchronized (lock) {
+            Object val = cacheUtil.caffeineCache.getIfPresent(key);
+            if (val != null) return val;
+            val = cacheUtil.redisTemplate.opsForValue().get(key);
+            if (val != null) {
+                cacheUtil.caffeineCache.put(key, val);
+                return val;
+            }
+            val = dbService.selectById(key);
+            if (val != null) {
+                cacheUtil.redisTemplate.opsForValue().set(key, val, REDIS_TTL_SEC, TimeUnit.SECONDS);
+                cacheUtil.caffeineCache.put(key, val);
+            }
+            return val;
+        }
+    }
+
+    public void updateBizData(String key, Object newData) {
+        Object lock = getLock(key);
+        synchronized (lock) {
+            dbService.updateById(key, newData);
+            cacheUtil.clearBothCache(key);
+        }
+    }
+}</code></pre>
+<blockquote>
+<p>优化：读多写少可替换为 StampedLock 乐观读，减少锁竞争。</p>
+</blockquote>
+<h3>方案 3：取消读侧自动回填，采用预热加载（老系统稳优先）</h3>
+<p>✅ 适用：老系统、不想承担回填竞态风险、追求稳定 ✅ 优点：不存在滞后回填竞态，逻辑稳定 ❌ 缺点：冷 key 缓存命中率低，需要维护预热任务</p>
+<pre class="highlighter-hljs"><code>@Service
+public class BizPreLoadService {
+    private final CacheUtil cacheUtil;
+    private static final long REDIS_TTL_SEC = 5 * 60;
+
+    public BizPreLoadService(CacheUtil cacheUtil) {
+        this.cacheUtil = cacheUtil;
+    }
+
+    public Object getBizData(String key) {
+        Object val = cacheUtil.caffeineCache.getIfPresent(key);
+        if (val != null) return val;
+        val = cacheUtil.redisTemplate.opsForValue().get(key);
+        if (val != null) {
+            cacheUtil.caffeineCache.put(key, val);
+            return val;
+        }
+        // DB查询后，不自动回填缓存
+        return dbService.selectById(key);
+    }
+
+    public void updateBizData(String key, Object newData) {
+        dbService.updateById(key, newData);
+        cacheUtil.clearBothCache(key);
+    }
+
+    @Scheduled(fixedRate = 60 * 1000)
+    public void preLoadHotKey() {
+        List&lt;String&gt; hotKeys = hotKeyManager.getHotKeyList();
+        for (String key : hotKeys) {
+            Object data = dbService.selectById(key);
+            if (data != null) {
+                cacheUtil.redisTemplate.opsForValue().set(key, data, REDIS_TTL_SEC, TimeUnit.SECONDS);
+                cacheUtil.caffeineCache.put(key, data);
+            }
+        }
+    }
+}</code></pre>
+<h3>方案 4：版本号校验回填（优雅无锁，业务表带有 version 字段）</h3>
+<p>✅ 适用：新业务，表自带 version 版本字段，想要无锁实现 ✅ 优点：无锁，精准拦截滞后旧数据回填 ❌ 缺点：业务侵入，老表需要新增 version 字段</p>
+<pre class="highlighter-hljs"><code>@Data
+public class VersionCacheDTO {
+    private Object data;
+    private Long version;
+}
+
+@Service
+public class BizVersionCheckService {
+    private final CacheUtil cacheUtil;
+    private static final long REDIS_TTL_SEC = 5 * 60;
+
+    public BizVersionCheckService(CacheUtil cacheUtil) {
+        this.cacheUtil = cacheUtil;
+    }
+
+    public Object getBizData(String key) {
+        VersionCacheDTO cacheDto = (VersionCacheDTO) cacheUtil.caffeineCache.getIfPresent(key);
+        if (cacheDto != null) return cacheDto.getData();
+
+        cacheDto = (VersionCacheDTO) cacheUtil.redisTemplate.opsForValue().get(key);
+        if (cacheDto != null) {
+            cacheUtil.caffeineCache.put(key, cacheDto);
+            return cacheDto.getData();
+        }
+
+        BizEntity entity = dbService.selectById(key);
+        if (entity == null) return null;
+        long newVersion = entity.getVersion();
+        VersionCacheDTO newDto = new VersionCacheDTO();
+        newDto.setData(entity);
+        newDto.setVersion(newVersion);
+
+        // 回填前版本校验，旧版本直接丢弃
+        VersionCacheDTO exist = (VersionCacheDTO) cacheUtil.redisTemplate.opsForValue().get(key);
+        if (exist == null || newVersion &gt; exist.getVersion()) {
+            cacheUtil.redisTemplate.opsForValue().set(key, newDto, REDIS_TTL_SEC, TimeUnit.SECONDS);
+            cacheUtil.caffeineCache.put(key, newDto);
+        }
+        return entity;
+    }
+
+    public void updateBizData(String key, Object newData) {
+        dbService.updateWithVersion(key, newData); // update set version = version + 1
+        cacheUtil.clearBothCache(key);
+    }
+}</code></pre>
+<h3>单机竞态方案选型汇总表</h3>
+<p>表格</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>一致性</th>
+<th>性能</th>
+<th>改造成本</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>异步延迟双删 + TTL</td>
+<td>短暂不一致</td>
+<td>很高</td>
+<td>低</td>
+<td>绝大多数读多写少业务</td>
+</tr>
+<tr>
+<td>Key 粒度本地锁</td>
+<td>强一致</td>
+<td>热点 key 会降速</td>
+<td>低</td>
+<td>单机热点 key，不能脏读</td>
+</tr>
+<tr>
+<td>取消读回填 + 预热</td>
+<td>强一致</td>
+<td>冷 key 命中率低</td>
+<td>中</td>
+<td>老系统，追求稳定</td>
+</tr>
+<tr>
+<td>版本号校验回填</td>
+<td>强一致</td>
+<td>高</td>
+<td>高（需要 version 字段）</td>
+<td>新业务，无锁优先</td>
+</tr>
+</tbody>
+</table>
+<h2>五、跨节点脏读：分布式失效工程方案</h2>
+<blockquote>
+<p>核心目标：更新完成后，通知集群内所有其他实例，删除它们本机 Caffeine 缓存，缩小脏读窗口。 注意：Redis 本身无法远程操作其他 JVM 的 Caffeine，只能依靠消息通知，<strong>所有方案都要搭配 TTL 兜底</strong>。</p>
+</blockquote>
+<h3>方案 1：Redis PubSub（轻量方案，中小项目首选）</h3>
+<p>原理：更新完成后，往固定 channel 推送失效 key；所有服务实例启动时订阅该 channel，收到消息，只删除本机 Caffeine。 优点：无需额外中间件，接入简单、延迟低； 缺点：PubSub 发后即忘，无持久化、无重试，服务离线期间消息丢失，依赖 TTL 兜底。</p>
+<pre class="highlighter-hljs"><code>/**
+ * 写侧：更新后发送失效消息
+ */
+@Service
+public class PubSubCacheService {
+    private final CacheUtil cacheUtil;
+    private final RedisTemplate&lt;String, Object&gt; redisTemplate;
+    private static final String INVALIDATE_CHANNEL = "cache:caffeine:invalidate";
+    private static final long DELAY_MILLIS = 300;
+
+    public PubSubCacheService(CacheUtil cacheUtil) {
+        this.cacheUtil = cacheUtil;
+        this.redisTemplate = cacheUtil.redisTemplate;
+    }
+
+    public Object getBizData(String key) {
+        // 读逻辑和上面【异步延迟双删】一致
+        Object val = cacheUtil.caffeineCache.getIfPresent(key);
+        if (val != null) return val;
+        val = redisTemplate.opsForValue().get(key);
+        if (val != null) {
+            cacheUtil.caffeineCache.put(key, val);
+            return val;
+        }
+        val = dbService.selectById(key);
+        if (val != null) {
+            redisTemplate.opsForValue().set(key, val, 5, TimeUnit.MINUTES);
+            cacheUtil.caffeineCache.put(key, val);
+        }
+        return val;
+    }
+
+    public void updateBizData(String key, Object newData) {
+        dbService.updateById(key, newData);
+        // 1. 清除当前实例的Caffeine + Redis
+        cacheUtil.clearBothCache(key);
+        // 2. 广播失效key，通知其他节点清本地Caffeine
+        redisTemplate.convertAndSend(INVALIDATE_CHANNEL, key);
+        // 3. 异步延迟双删，兜底单机慢读回填竞态
+        cacheUtil.cacheDelExecutor.submit(() -&gt; {
+            try {
+                Thread.sleep(DELAY_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            cacheUtil.clearBothCache(key);
+        });
+    }
+}
+
+/**
+ * 订阅监听器：所有实例统一注册，收到消息只清本机Caffeine
+ */
+@Component
+public class CaffeineInvalidateListener implements MessageListener {
+    private final CacheUtil cacheUtil;
+
+    public CaffeineInvalidateListener(CacheUtil cacheUtil, RedisMessageListenerContainer container) {
+        this.cacheUtil = cacheUtil;
+        // 订阅频道
+        container.addMessageListener(this, new ChannelTopic("cache:caffeine:invalidate"));
+    }
+
+    @Override
+    public void onMessage(Message message, byte[] pattern) {
+        String cacheKey = new String(message.getBody(), StandardCharsets.UTF_8);
+        // 只清本机Caffeine！Redis已经在写流程删除过了，不需要重复删Redis
+        cacheUtil.caffeineCache.invalidate(cacheKey);
+    }
+}</code></pre>
+<h3>方案 2：MQ 可靠通知方案（RocketMQ/Kafka，核心业务）</h3>
+<p>原理：更新成功，发送可靠消息到 MQ；所有消费端收到消息，删除本机 Caffeine。 优点：消息持久化、支持重试、死信队列，消息不会丢失； 缺点：引入中间件，运维、接入成本更高。</p>
+<pre class="highlighter-hljs"><code>@Service
+public class MqCacheService {
+    private final CacheUtil cacheUtil;
+    private final RocketMQTemplate rocketMQTemplate;
+    private static final String INVALIDATE_TOPIC = "cache_caffeine_invalidate_topic";
+
+    public MqCacheService(CacheUtil cacheUtil, RocketMQTemplate rocketMQTemplate) {
+        this.cacheUtil = cacheUtil;
+        this.rocketMQTemplate = rocketMQTemplate;
+    }
+
+    public void updateBizData(String key, Object newData) {
+        dbService.updateById(key, newData);
+        cacheUtil.clearBothCache(key);
+        // 发送可靠消息
+        rocketMQTemplate.syncSend(INVALIDATE_TOPIC, MessageBuilder.withPayload(key).build());
+        // 异步延迟双删兜底单机竞态
+        cacheUtil.cacheDelExecutor.submit(() -&gt; {
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            cacheUtil.clearBothCache(key);
+        });
+    }
+}
+
+/**
+ * MQ消费者，所有实例部署，收到消息清除本地Caffeine
+ */
+@RocketMQMessageListener(topic = "cache_caffeine_invalidate_topic", consumerGroup = "cache-invalidate-group")
+@Component
+public class CacheInvalidateConsumer implements RocketMQListener&lt;String&gt; {
+    private final CacheUtil cacheUtil;
+
+    public CacheInvalidateConsumer(CacheUtil cacheUtil) {
+        this.cacheUtil = cacheUtil;
+    }
+
+    @Override
+    public void onMessage(String key) {
+        cacheUtil.caffeineCache.invalidate(key);
+    }
+}</code></pre>
+<h3>方案 3：纯 TTL 兜底，不做消息广播（极简方案）</h3>
+<p>不引入任何订阅、MQ，只依靠 Caffeine 设置较短过期时间。</p>
+<ul>
+<li>优点：代码最简单，没有消息组件；</li>
+<li>缺点：脏读窗口等于 TTL 时长，适合字典、静态配置这类容忍长时间脏读的数据。</li>
+</ul>
+<blockquote>
+<p>实现：不需要额外写通知代码，只在构建 Caffeine 的时候设置 expireAfterWrite 即可。</p>
+</blockquote>
+<h3>跨节点失效方案对比表</h3>
+<p>表格</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>可靠性</th>
+<th>实时性</th>
+<th>接入成本</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Redis PubSub</td>
+<td>低，消息丢失无重试</td>
+<td>高</td>
+<td>低</td>
+<td>中小项目、非核心业务</td>
+</tr>
+<tr>
+<td>MQ（RocketMQ/Kafka）</td>
+<td>高，持久化 + 重试</td>
+<td>较高</td>
+<td>高</td>
+<td>核心业务，要求消息不丢失</td>
+</tr>
+<tr>
+<td>仅依赖 Caffeine TTL</td>
+<td>一般</td>
+<td>差（窗口 = TTL）</td>
+<td>极低</td>
+<td>静态配置、字典，容忍长时间脏读</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>重要提醒：无论 PubSub 还是 MQ，都必须搭配 TTL 兜底，防止消息丢失造成永久脏数据。</p>
+</blockquote>
+<h2>六、分布式生产标准完整写流程（整合两类脏读处理）</h2>
+<ol>
+<li>更新数据库</li>
+<li>删除当前实例 Caffeine + 删除 Redis 缓存</li>
+<li>发送失效消息（PubSub/MQ）广播 key，解决跨节点脏读</li>
+<li>其他实例消费消息，删除本机 Caffeine</li>
+<li>异步延迟双删（兜底单机内部慢查询回填竞态）</li>
+<li>Caffeine、Redis 统一设置 TTL 兜底，防止极端情况永久脏数据</li>
+</ol>
+<h2>七、典型业务落地清单</h2>
+<p>✅ 适合：商品图文、系统字典、功能开关、首页推荐、活动海报、用户头像昵称、行政区划等静态基础数据 ❌ 禁止：库存、资金、账户余额、订单状态、支付、优惠券核销</p>
+<h2>八、总结</h2>
+<p>Caffeine+Redis 是<strong>面向热点读的性能加速方案，不是通用缓存方案</strong>。 它的收益：本地内存低延迟、拦截热点流量、保护 Redis； 它的代价：引入最终一致，同时要处理两类脏读：</p>
+<ol>
+<li>单机读写竞态：JVM 内部读写时序错乱，靠延迟双删、锁、版本号、预热方案解决；</li>
+<li>跨节点脏读：多实例本地缓存不同步，靠 PubSub / MQ 广播失效缩小脏读窗口。</li>
+</ol>
+<p>选型一句话：<strong>有巨大热点、单用 Redis 扛不住、业务允许短暂不一致，才上双层缓存；不能接受脏读，直接放弃 Caffeine 本地缓存。</strong></p>
+
+</div>
+<div class="clear"></div>
+
+	</div>
+	
+	<div class="postfoot">
+		posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-18 17:40">2026-11-18 17:40</span>&nbsp;
+<a href="https://www.cnblogs.com/SheepDog">SheepDog1998</a>&nbsp;
+阅读(<span id="post_view_count">51</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23709471);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FSheepDog%2Fp%2F23709471&amp;targetId=23709471&amp;targetType=0" target="_blank">举报</a>
+
+	</div>
