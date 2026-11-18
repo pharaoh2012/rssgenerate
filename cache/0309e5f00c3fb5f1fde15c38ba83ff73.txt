@@ -1,0 +1,74 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/codigger/p/23703546" title="发布于 2026-11-18 10:07">
+    
+
+    <span role="heading" aria-level="2">ThreadLocal 会内存泄露吗？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>先说个几乎每个 Java 项目里都有的东西。用户登录态、请求链路的 traceId，要在一个请求的多个方法之间传来传去，又不想一层层传参，怎么办？老项目的标准答案就是 ThreadLocal：线程随身带的口袋，塞进去，走到哪都能掏出来。</p>
+<p>用的人多，误会也跟着多。<code>ThreadLocal 用完就会被 GC 回收</code>，这句话你大概听过不止一遍。但真实情况比这句话细得多。会不会泄露，取决于两件事：线程活多久，以及你有没有手动清掉塞进去的那个 value。</p>
+<p>先看结构。</p>
+<p>每个 Thread 对象里面都持有一个 ThreadLocalMap。这张 Map 是 ThreadLocal 自己专用的哈希表，属于 Thread 的一个成员变量。Map 里面的 Entry 存放两组数据：key 是 ThreadLocal 实例本身，value 是你放进去的业务对象。<br>
+看源码就能发现，Entry 直接继承自 <code>WeakReference&lt;ThreadLocal&lt;?&gt;&gt;</code>：<strong>key 是弱引用包装，value 是普通强引用</strong>。整个问题的根源，就在这里。</p>
+<p>弱引用是什么意思？垃圾回收执行的时候，只要对象没有任何强引用指向它，就可以被回收。<br>
+如果 ThreadLocal 是静态变量，它本身就一直存在，自然不会被回收。但如果外部不再有强引用持有这个 ThreadLocal（比如静态引用置空、ThreadLocal 是方法内局部变量，方法执行结束），下一次 GC，Map 里对应的 key 就会被回收，Entry 变成一个 key 为 null 的空壳。<br>
+简单理解：GC 跑过之后，口袋上面贴的名字标签掉了。</p>
+<p>但 value 呢？<br>
+value 被 Entry 强引用持有，Entry 被 ThreadLocalMap 持有，Map 又被 Thread 持有。<strong>只要这条线程还存活，这条引用链就不会断开，value 就无法被 GC 回收</strong>。你存入的业务对象，就这么孤零零挂在这个 key 为 null 的空 Entry 下面。这就是大家常说的 ThreadLocal 内存泄漏。</p>
+<p>有人会问：既然还是会泄露，那 key 干脆用强引用不行吗？</p>
+<p>恰恰相反。<br>
+反过来设想：如果 key 是强引用，就算外部把 ThreadLocal 的引用置为 null，Map 内部的 key 依然强引用着 ThreadLocal 实例。ThreadLocal 本身都无法回收，key + value 一起留在 Map 里，泄漏会更严重。<br>
+弱引用的设计本质是保底方案：至少保证 key 可以被回收，留下的空 Entry 还有机会被后续逻辑清扫。<strong>所以弱引用不是泄漏的元凶，它是来降低泄漏风险的，只是兜底能力有限。</strong></p>
+<p>那为什么 JDK 不做成全自动清理？<br>
+因为 GC 的时机是不可控的，只有 GC 执行那一刻才知道 key 是否失效。如果要全自动清理，就需要持续监听 GC 事件、遍历所有线程的 Map，开销非常大，性能无法接受。</p>
+<p>JDK 选择了一个折中方案：<strong>顺手清理</strong>。<br>
+ThreadLocalMap 在调用 <code>set()</code>、<code>get()</code>、<code>remove()</code> 的时候，会顺便扫描一遍 Map，把 key 已经为 null 的 Entry，连同里面的 value 一起清理掉。</p>
+<ul>
+<li><code>remove()</code>：定点清理当前 entry，最靠谱</li>
+<li><code>set()</code> / <code>get()</code>：路过式惰性清理，不保证一次性清理干净<br>
+如果这个 ThreadLocal 后续再也不调用 get/set/remove，那些 key 为 null 的 Entry 和 value 就会永久留在 Map 里。</li>
+</ul>
+<p>真正的大坑，在线程池。<br>
+线程池的线程是复用的，任务执行完线程不会销毁，等待下一个任务分配。<br>
+前一个请求往 ThreadLocal 存入数据，没有执行 remove；下一个请求复用这条线程，直接读到上一轮残留的数据。<br>
+这种脏读非常隐蔽：没有报错、没有异常栈，A 用户的数据展示给 B 用户，线上排查极其痛苦。<br>
+持续堆积的后果更严重：大量对象常驻堆里，几十条常驻线程叠加，最终堆内存耗尽触发 OOM。</p>
+<p>这也是几乎所有 Java 开发规范统一要求的：<strong>ThreadLocal 使用完毕，一定要在 finally 块调用 remove ()</strong>。<br>
+示例代码：</p>
+<pre><code>ThreadLocal&lt;Object&gt; tl = new ThreadLocal&lt;&gt;();
+try {
+    tl.set(xxx);
+    // 业务逻辑
+} finally {
+    tl.remove();
+}
+</code></pre>
+<p>顺带补充：如果你的线程是一次性线程，任务结束线程直接销毁，泄漏基本不用操心。线程销毁时，ThreadLocalMap 连同里面所有 Entry 一起失去可达性，GC 一次性回收。</p>
+<p>总结一句话：<br>
+ThreadLocal 内存泄漏成立的条件 = <strong>线程长期存活（线程池） + 存入的 value 没有手动清理</strong>，二者缺一不可。<br>
+弱引用、Map 惰性清理、手动 remove，三层机制依次兜底；如果前面两层兜底没触发，自己又不调用 remove，泄漏就发生了。</p>
+<p>我的习惯是：先写好 try-finally，把 remove () 先敲上，再去写 try 里面的业务代码。顺序反了很容易忘记清理。<br>
+忘记清理不一定马上出问题，但数据一直在堆里堆积。等到半夜告警堆内存，翻引用链追到线程池常驻线程，找到这个静态 ThreadLocal 的那一刻，再怪弱引用，就太晚了。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-18 10:08">2026-11-18 10:07</span>&nbsp;
+<a href="https://www.cnblogs.com/codigger">codigger</a>&nbsp;
+阅读(<span id="post_view_count">116</span>)&nbsp;
+评论(<span id="post_comment_count">3</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23703546);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fcodigger%2Fp%2F23703546&amp;targetId=23703546&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

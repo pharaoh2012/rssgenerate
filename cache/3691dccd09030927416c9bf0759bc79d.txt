@@ -1,0 +1,304 @@
+
+		<h1 class="postTitle">
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xingzheanan/p/23708836" title="发布于 2026-11-18 17:05">
+    
+
+    <span role="heading" aria-level="2">kubernetes 水平自动伸缩学习笔记（三）</span>
+    
+
+</a>
+
+		</h1>
+		<div class="clear"></div>
+		<div class="postBody">
+			<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p></p><div class="toc"><div class="toc-container-header">目录</div><ul><li><a href="#前言" rel="noopener nofollow">前言</a></li><li><a href="#设计" rel="noopener nofollow">设计</a></li><li><a href="#源码" rel="noopener nofollow">源码</a><ul><li><a href="#注册控制器" rel="noopener nofollow">注册控制器</a></li><li><a href="#调谐" rel="noopener nofollow">调谐</a><ul><li><a href="#拉取指标" rel="noopener nofollow">拉取指标</a></li><li><a href="#水平伸缩算法" rel="noopener nofollow">水平伸缩算法</a></li><li><a href="#时间窗" rel="noopener nofollow">时间窗</a></li></ul></li></ul></li><li><a href="#性能" rel="noopener nofollow">性能</a></li><li><a href="#参考资料" rel="noopener nofollow">参考资料</a></li></ul></div><p></p>
+<hr>
+<h1 id="前言">前言</h1>
+<p>前两篇笔记介绍了水平自动伸缩的设计及采集器的源码实现，本篇笔记继续介绍 hpa 控制器的实现逻辑。</p>
+<h1 id="设计">设计</h1>
+<p>相比于 <a href="https://www.cnblogs.com/xingzheanan/p/23660404" title="发布于 2026-11-14 00:43" target="_blank">kubernetes 水平自动伸缩学习笔记（一）</a> 中的控制器设计，kubernetes 的控制器设计有以下设计要点：</p>
+<ul>
+<li>控制器的同步周期不是通过定时器来做的，而是通过调谐器的优先级队列来实现的，把定时同步指标的功能下放到优先级队列，复用优先级队列的能力，妙妙妙。</li>
+<li>抽象出 autoscaling CRD 用于描述水平自动伸缩资源和指标的关系，控制器通过 List&amp;Watch autoscaling CR 来确定对哪些资源做水平自动伸缩，通过 CRD 解耦用户和控制器。</li>
+<li>通过内存中的环形队列声明水平伸缩资源的时间窗口，做防抖动设计。</li>
+<li>高可用采用一主多从实现，水平伸缩决策由主控制器决定。</li>
+<li>支持 Kubernetes 自带 Metrics API，还支持 <a href="https://github.com/kubernetes/design-proposals-archive/blob/main/instrumentation/custom-metrics-api.md" target="_blank" rel="noopener nofollow">自定义 Metrics API</a> 和 <a href="https://github.com/kubernetes/design-proposals-archive/blob/main/instrumentation/external-metrics-api.md" target="_blank" rel="noopener nofollow">外部 Metrics API</a> 等多种指标采集 API，可扩展性强。</li>
+<li>实现一套基于指标和当前副本数的 <a href="https://kubernetes.io/zh-cn/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/#algorithm-details" target="_blank" rel="noopener nofollow">水平自动伸缩算法</a>，灵活适用于多场景。</li>
+<li>支持快扩慢缩，对于多指标取每个指标最大值作为期望伸缩副本。</li>
+</ul>
+<p>控制器的交互逻辑并不复杂，难点在于要考虑的情况多，对算法的设计要求比较高，比如容忍窗口防抖动、指标缺失自动推断、伸缩窗口、多指标适配、各种自定义行为等等都要兼顾。</p>
+<h1 id="源码">源码</h1>
+<blockquote>
+<p>本源码基于 kubernetes release-1.20 解读</p>
+</blockquote>
+<h2 id="注册控制器">注册控制器</h2>
+<p>在 <a href="https://github.com/kubernetes/kubernetes/blob/release-1.20/cmd/kube-controller-manager/app/controllermanager.go#L402" target="_blank" rel="noopener nofollow">注册hpa控制器</a> 中注册 hpa 控制器到 controllers 控制器集合中：</p>
+<pre><code class="language-go">func NewControllerInitializers(loopMode ControllerLoopMode) map[string]InitFunc {  
+    controllers := map[string]InitFunc{}
+    ...
+    controllers["horizontalpodautoscaling"] = startHPAController
+    ...
+    return controllers
+}
+</code></pre>
+<p>并发运行控制器：</p>
+<pre><code class="language-go">func StartControllers(ctx ControllerContext, startSATokenController InitFunc, controllers map[string]InitFunc, unsecuredMux *mux.PathRecorderMux) error {
+	...
+	for controllerName, initFn := range controllers {
+		...
+		debugHandler, started, err := initFn(ctx)
+		...
+	}
+	...
+}
+</code></pre>
+<h2 id="调谐">调谐</h2>
+<p>hpa 控制器把周期获取指标的逻辑下放给 优先级队列和 informer，通过定义 resyncPeriod 来周期性获取指标：</p>
+<pre><code class="language-go">func CreateControllerContext(s *config.CompletedConfig, rootClientBuilder, clientBuilder clientbuilder.ControllerClientBuilder, stop &lt;-chan struct{}) (ControllerContext, error) {
+	...
+	ctx := ControllerContext{  
+       ClientBuilder:                   clientBuilder,  
+       InformerFactory:                 sharedInformers,  
+       ObjectOrMetadataInformerFactory: informerfactory.NewInformerFactory(sharedInformers, metadataInformers),  
+       ComponentConfig:                 s.ComponentConfig,  
+       RESTMapper:                      restMapper,  
+       AvailableResources:              availableResources,  
+       Cloud:                           cloud,  
+       LoopMode:                        loopMode,  
+       Stop:                            stop,  
+       InformersStarted:                make(chan struct{}),  
+       // 这里定义同步周期
+       ResyncPeriod:                    ResyncPeriod(s),  
+    }  
+    return ctx, nil  
+}
+
+func ResyncPeriod(c *config.CompletedConfig) func() time.Duration {  
+    return func() time.Duration {  
+       factor := rand.Float64() + 1  
+       return time.Duration(float64(c.ComponentConfig.Generic.MinResyncPeriod.Nanoseconds()) * factor)  
+    }  
+}
+</code></pre>
+<p>在调谐逻辑中计算期望的水平伸缩副本：</p>
+<pre><code class="language-go">func (a *HorizontalController) reconcileKey(key string) (deleted bool, err error) {  
+    namespace, name, err := cache.SplitMetaNamespaceKey(key)  
+    if err != nil {  
+       return true, err  
+    }  
+  
+	// 获取 autoscaling CR 资源
+    hpa, err := a.hpaLister.HorizontalPodAutoscalers(namespace).Get(name)  
+    if errors.IsNotFound(err) {  
+       ...
+    }  
+    if err != nil {  
+       return false, err  
+    }  
+  
+	// 调谐 autoscaling CR
+    return false, a.reconcileAutoscaler(hpa, key)  
+}
+</code></pre>
+<p><code>HorizontalController.reconcileAutoscaler</code> 调谐 autoscaling CR 资源：</p>
+<pre><code class="language-go">func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.HorizontalPodAutoscaler, key string) error {
+	...
+	// 获取 autoscale 的目标资源 scale 和 autoscaling CR targetGR
+	scale, targetGR, err := a.scaleForResourceMappings(hpa.Namespace, hpa.Spec.ScaleTargetRef.Name, mappings)  
+if err != nil {  
+    ... 
+    return fmt.Errorf("failed to query scale subresource for %s: %v", reference, err)  
+	}
+	
+	// 记录 scale 的当前副本数
+	currentReplicas := scale.Spec.Replicas  
+	// 记录初始副本到窗口 window
+	a.recordInitialRecommendation(currentReplicas, key)
+	...
+}
+</code></pre>
+<p><code>HorizontalController.reconcileAutoscaler</code> 获取要 scale 的目标资源和 autoscaling CR 资源，接着将目前资源的副本数记录到 <code>HorizontalController.recommendations</code> 窗口：</p>
+<pre><code class="language-go">func (a *HorizontalController) recordInitialRecommendation(currentReplicas int32, key string) {  
+    if a.recommendations[key] == nil {  
+       a.recommendations[key] = []timestampedRecommendation{{currentReplicas, time.Now()}}  
+    }  
+}
+</code></pre>
+<p>hpa 控制器根据 autoscaling CR 配置的行为和窗口来确定要伸缩的期望副本数。</p>
+<h3 id="拉取指标">拉取指标</h3>
+<p><code>HorizontalController.computeReplicasForMetrics</code> 拉取指标并根据指标计算期望伸缩副本数。</p>
+<pre><code class="language-go">func (a *HorizontalController) computeReplicasForMetrics(hpa *autoscalingv2.HorizontalPodAutoscaler, scale *autoscalingv1.Scale,metricSpecs []autoscalingv2.MetricSpec) (replicas int32, metric string, statuses []autoscalingv2.MetricStatus, timestamp time.Time, err error) {
+	...
+	// 分别计算不同类型指标
+	// 选择最大值作为期望伸缩副本数
+	for i, metricSpec := range metricSpecs {  
+		// 计算单类型指标
+	    replicaCountProposal, metricNameProposal, timestampProposal, condition, err := a.computeReplicasForMetric(hpa, metricSpec, specReplicas, statusReplicas, selector, &amp;statuses[i])  
+  
+	    if err != nil {  
+	       ...
+	    }  
+	    if err == nil &amp;&amp; (replicas == 0 || replicaCountProposal &gt; replicas) {  
+	       timestamp = timestampProposal  
+	       replicas = replicaCountProposal  
+	       metric = metricNameProposal  
+		}  
+	}
+	...
+	return replicas, metric, statuses, timestamp, nil
+}	
+</code></pre>
+<p>实际计算指标期望副本数是在 <code>HorizontalController.computeReplicasForMetric</code> ，其根据不同 <a href="https://github.com/kubernetes/kubernetes/blob/release-1.20/staging/src/k8s.io/api/autoscaling/v2beta2/types.go#L219" target="_blank" rel="noopener nofollow">autoscaling 指标类型</a> 走不同的 Metrics API 分支：</p>
+<pre><code class="language-go">func (a *HorizontalController) computeReplicasForMetric(hpa *autoscalingv2.HorizontalPodAutoscaler, spec autoscalingv2.MetricSpec,  
+    specReplicas, statusReplicas int32, selector labels.Selector, status *autoscalingv2.MetricStatus) (replicaCountProposal int32, metricNameProposal string,  
+    timestampProposal time.Time, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+    // 根据 autoscaling 类型走不通的 Metrics API
+    switch spec.Type {  
+	case autoscalingv2.ObjectMetricSourceType:
+		...
+	case autoscalingv2.PodsMetricSourceType:
+		...
+	case autoscalingv2.ResourceMetricSourceType:
+		replicaCountProposal, timestampProposal, metricNameProposal, condition, err = a.computeStatusForResourceMetric(specReplicas, spec, hpa, selector, status)  
+	case autoscalingv2.ContainerResourceMetricSourceType:
+		...
+	case autoscalingv2.ExternalMetricSourceType:
+		...
+	default:
+		...
+		return 0, "", time.Time{}, condition, err
+	}
+	return replicaCountProposal, metricNameProposal, timestampProposal, autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
+}
+</code></pre>
+<p>以 <code>autoscalingv2.ResourceMetricSourceType</code> 资源指标类型为例，计算期望副本数。</p>
+<p>计算流程如下：</p>
+<ol>
+<li>调用 metrics server client 获取 pod 指标数据；</li>
+<li>根据 autoscaling CR 中配置的 podSelector 获取 pod 列表；</li>
+<li>结合 pod 列表和 pod 指标数据生成 readyPodCount, unreadyPods, missingPods, ignoredPods 四类 pod 数据；</li>
+</ol>
+<p>在流程 3 中返回的四类数据表示：</p>
+<table>
+<thead>
+<tr>
+<th>变量名</th>
+<th>类型</th>
+<th>含义</th>
+<th>归类条件</th>
+<th>HPA 计算中的处理逻辑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>readyPodCount</code></td>
+<td><code>int32</code></td>
+<td><strong>就绪且有有效指标的 Pod 数量</strong>（基线分母）</td>
+<td>1. 在 <code>podList</code> 里（属于 HPA 管的 workload）；  <br>2. Pod <code>Condition Ready=true</code>；  <br>3. 不在 <code>ignoredPods</code> 里；  <br>4. 在 <code>metrics</code> 里有有效数据</td>
+<td>1. <strong>无异常时</strong>：新副本数 = <code>ceil(usageRatio × readyPodCount)</code>；  <br>2. <strong>有 missing/unready 时</strong>：参与重算的基线参考</td>
+</tr>
+<tr>
+<td><code>unreadyPods</code></td>
+<td><code>sets.Set[string]</code></td>
+<td><strong>未就绪的 Pod 集合</strong></td>
+<td>1. 在 <code>podList</code> 里；  <br>2. Pod <code>Condition Ready=false</code>（探针未通过、还在启动、CrashLoopBackOff 等）</td>
+<td>1. 先从 <code>metrics</code> 里<strong>删除</strong>（不参与第一次计算）；  <br>2. <strong>想扩容时</strong>（<code>usageRatio &gt; 1.0</code>）：把它们当作"使用率 0%"加回 <code>metrics</code> 重算（保守对待扩容）；  <br>3. <strong>想缩容时</strong>：不计入分母（避免缩掉还没启动的 Pod）</td>
+</tr>
+<tr>
+<td><code>missingPods</code></td>
+<td><code>sets.Set[string]</code></td>
+<td><strong>指标缺失的 Pod 集合</strong></td>
+<td>1. 在 <code>podList</code> 里（期望存在）；  <br>2. 但在 <code>metrics</code> 里<strong>完全找不到</strong>（kubelet 挂了、metrics-server 漏采、Pod 刚创建还没数据）</td>
+<td>1. <strong>想扩容时</strong>（<code>usageRatio &gt; 1.0</code>）：当作"使用率 0%"（最不利于扩容的保守值，防止盲目加 Pod）；  <br>2. <strong>想缩容时</strong>（<code>usageRatio &lt; 1.0</code>）：当作"使用率 100% 或 target"（最不利于缩容的保守值，防止误删 Pod）；  <br>3. 重算后若方向翻转/落入 <code>tolerance</code> 区间，<strong>直接返回当前副本数</strong>（不动）</td>
+</tr>
+<tr>
+<td><code>ignoredPods</code></td>
+<td><code>sets.Set[string]</code></td>
+<td><strong>被 HPA 主动忽略的 Pod 集合</strong></td>
+<td>1. 在 <code>podList</code> 里；  <br>2. 满足以下<strong>任一条件</strong>：  <br>a. 处于 <strong>CPU 初始化期</strong>（默认创建后 ≤ 2min，或 Ready 后 ≤ 10s 的不稳定窗口）；  <br>b. 被打 <code>autoscaling.kubernetes.io/suspend</code> 注解；  <br>c. 处于 Deleting 状态</td>
+<td>直接从 <code>metrics</code> 里<strong>永久移除</strong>，完全不参与任何计算——相当于这些 Pod 对 HPA "透明"</td>
+</tr>
+</tbody>
+</table>
+<p>这四类数据的作用是使 hpa 控制器去除不可靠 pod，用保守值兜底，核心是为快扩慢缩服务。</p>
+<p>当获取指标和 pod 信息后，就可以用它们根据水平伸缩算法算出期望副本数了。</p>
+<h3 id="水平伸缩算法">水平伸缩算法</h3>
+<p>水平伸缩算法流程如下：</p>
+<div class="mermaid">flowchart TD
+    A["groupPods 分组&lt;br/&gt;podList + metrics → 四类"] --&gt; B{"无 missing 且&lt;br/&gt;无 unready 想扩?"}
+
+    B --&gt;|是| C{"usageRatio 在&lt;br/&gt;tolerance 内?"}
+    C --&gt;|是| D["返回 currentReplicas&lt;br/&gt;不动"]
+    C --&gt;|否| E["ceil(usageRatio × readyPodCount)"]
+
+    B --&gt;|否| F["给 missingPods 兜底赋值&lt;br/&gt;缩时=100% / 扩时=0%"]
+    F --&gt; G["给 unreadyPods 兜底&lt;br/&gt;仅扩时=0%"]
+    G --&gt; H["重算 newUsageRatio"]
+    H --&gt; I{"方向翻转&lt;br/&gt;或在 tolerance 内?"}
+    I --&gt;|是| D
+    I --&gt;|否| J["newReplicas = ceil(newUsageRatio × len(metrics))"]
+    J --&gt; K{"newReplicas 方向反转?"}
+    K --&gt;|是| D
+    K --&gt;|否| L["返回 newReplicas"]
+</div><h3 id="时间窗">时间窗</h3>
+<p>为防止短期的指标抖动导致频繁扩缩容（通常是缩容时用时间窗防止缩太多副本导致服务不可用），hpa 控制器引入时间窗根据一段时间内的期望值来确定最终要伸缩的期望值。</p>
+<p>hpa 控制器通过环形队列实现时间窗，实现如下：</p>
+<pre><code class="language-go">// stabilizeRecommendation:  
+// - replaces old recommendation with the newest recommendation,  
+// - returns max of recommendations that are not older than downscaleStabilisationWindow.  
+func (a *HorizontalController) stabilizeRecommendation(key string, prenormalizedDesiredReplicas int32) int32 {  
+    maxRecommendation := prenormalizedDesiredReplicas  
+    foundOldSample := false  
+    oldSampleIndex := 0  
+    cutoff := time.Now().Add(-a.downscaleStabilisationWindow)  
+    for i, rec := range a.recommendations[key] {  
+       if rec.timestamp.Before(cutoff) {  
+          foundOldSample = true  
+          oldSampleIndex = i  
+       } else if rec.recommendation &gt; maxRecommendation {  
+          maxRecommendation = rec.recommendation  
+       }  
+    }  
+    if foundOldSample {  
+       a.recommendations[key][oldSampleIndex] = timestampedRecommendation{prenormalizedDesiredReplicas, time.Now()}  
+    } else {  
+       a.recommendations[key] = append(a.recommendations[key], timestampedRecommendation{prenormalizedDesiredReplicas, time.Now()})  
+    }  
+    return maxRecommendation  
+}
+</code></pre>
+<h1 id="性能">性能</h1>
+<p>hpa 控制器基于拉模型，默认每隔 15s 从 Metrics Server 拉取指标，并计算期望伸缩副本数。对于大部分场景是够用了，但是对于高并发瞬时请求导致的扩容， hpa 控制器并不能及时响应，可能会导致服务不可用。</p>
+<p>并且扩容出的新副本离提供服务还有一定距离：</p>
+<ul>
+<li>容器镜像要下载；</li>
+<li>容器要启动；</li>
+<li>探针检查要通过；</li>
+</ul>
+<p>对于大容器镜像，这里快速扩容还要搭配快速加载镜像一起使用，否则也会造成服务不可用。</p>
+<p>这里提出了性能问题，后续文章会介绍如何降低水平自动伸缩的性能问题。</p>
+<h1 id="参考资料">参考资料</h1>
+<ul>
+<li><a href="https://kubernetes.io/zh-cn/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/" target="_blank" rel="noopener nofollow">Pod 水平自动伸缩</a></li>
+</ul>
+<hr>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    芝兰生于空谷，不以无人而不芳。
+</div>
+<div class="clear"></div>
+
+		</div>
+		<div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-18 17:06">2026-11-18 17:05</span>&nbsp;
+<a href="https://www.cnblogs.com/xingzheanan">胡云Troy</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23708836);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxingzheanan%2Fp%2F23708836&amp;targetId=23708836&amp;targetType=0" target="_blank">举报</a>
+</div>
+	

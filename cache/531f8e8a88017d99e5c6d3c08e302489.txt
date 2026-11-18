@@ -1,0 +1,207 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yeyunfei/p/23665310/threejs-webgl-3d-greenhouse-environment-batches" title="发布于 2026-11-17 23:54">
+    
+
+    <span role="heading" aria-level="2">three.js/WebGL实现3D智慧温室管理 之 环境异常与种植批次追踪</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        农业温室三维系列第3篇，围绕环境与批次展开 three.js / WebGL 3D 场景实现，结合五张系统视图说明业务对象、数据绑定、交互状态与异常处理，并提供关键 JavaScript 代码。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<h2>序</h2>
+<p>温室前两篇，一个讲探头，一个讲灌溉，到了第三篇，总算可以把几类记录放在一起看看了。单独看温度曲线，一段往下掉；单独看操作列表，几条开窗、遮阳、巡查。每张表都能打开，但来回切几次以后，很容易忘了自己最开始想核对的是哪一段时间。</p>
+<p>更麻烦的是种植批次会换。同一张种植床，今天看是 LOT17，翻上个月的异常时，那里可能还是上一批。如果历史查询直接套现在的批次绑定，图上地点没错，记录对象却串了。这个错误不太显眼，页面还能顺顺当当把数据展示完，越顺当越容易漏过去。</p>
+<p>这一篇想做的，就是选一段异常，看看它发生时对应哪个区域、哪一批作物、附近有哪些操作记录。注意这里说的是放在一起核对，不是时间靠得近就断定原因。遮阳记录在前、温度变化在后，可以列出来看，不能顺手替种植人员下结论。</p>
+<p>场景还是温室，不过换到育苗区，种植床和风机墙更集中一些。重点放在连续异常确认、迟到采样、批次有效期和历史选择。三维负责把记录落到具体区域，时间轴负责把先后关系摆出来，最后留给人一个能查下去的入口。</p>
+<p><img alt="种植批次与环境区域" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114152650142-1486419208.png" class="lazyload"></p>
+<h2>一、先确定样本时间，别按消息到达顺序画线</h2>
+<p>采样时间用于分析，接收时间用于观察延迟。重复时间点按版本保留较新样本。一次查询限定时间窗口，窗口前补一个必要样本或明确标记边界未知，别把窗口起点当作异常真正开始时刻。</p>
+<pre><code class="language-javascript">function normalizeSamples(rows, start, end) {
+  const byTime = new Map(), issues = [];
+  for (const row of rows) {
+    if (!Number.isFinite(row.at) || !Number.isSafeInteger(row.version)) {
+      issues.push({ id: row.id, reason: '时间或版本无效' }); continue;
+    }
+    if (row.at &lt; start || row.at &gt;= end) continue;
+    const old = byTime.get(row.at);
+    if (!old || row.version &gt; old.version) byTime.set(row.at, { ...row });
+  }
+  return { samples: [...byTime.values()].sort((a, b) =&gt; a.at - b.at), issues };
+}
+
+function validSample(row) {
+  return row.quality === 'good' &amp;&amp; typeof row.value === 'number' &amp;&amp; Number.isFinite(row.value);
+}
+
+function lateSampleInfo(row) {
+  if (!Number.isFinite(row.receivedAt)) return { latency: null, late: null };
+  const latency = row.receivedAt - row.at;
+  return { latency, late: latency &gt; 30000, clockIssue: latency &lt; -5000 };
+}
+</code></pre>
+<p>下面只分析同一支探头、同一指标的采样；多支探头不能直接混成一条时间序列。区域汇总可以用上一篇的方法生成另一条明确标识的序列。</p>
+<p><img alt="采样窗口和迟到数据" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114152658345-169574568.png" class="lazyload"></p>
+<h2>二、连续越界一段时间，再形成异常区间</h2>
+<p>进入和恢复阈值分开，避免数值在边缘来回抖时不断新增事件。参数来自当前示例配置，不作为作物养护阈值。缺测超过允许间隔时切断区间，不能把未知时间算成持续异常。</p>
+<pre><code class="language-javascript">function detectLowEpisodes(samples, config) {
+  const { enterBelow, recoverAbove, minDuration, maxGap } = config;
+  if (!(recoverAbove &gt; enterBelow) || minDuration &lt; 0 || maxGap &lt;= 0) throw new Error('异常规则无效');
+  const episodes = [];
+  let candidate = null, previous = null;
+  function close(end, reason) {
+    if (candidate?.confirmed) episodes.push({ start: candidate.start, end,
+      min: candidate.min, confirmedAt: candidate.confirmedAt, endReason: reason });
+    candidate = null;
+  }
+  for (const row of samples) {
+    if (previous &amp;&amp; row.at - previous.at &gt; maxGap) close(previous.at, '数据间断');
+    if (!validSample(row)) { close(previous?.at ?? row.at, '采样无效'); previous = null; continue; }
+    if (!candidate &amp;&amp; row.value &lt; enterBelow) {
+      candidate = { start: row.at, min: row.value, confirmed: false, confirmedAt: null };
+    }
+    if (candidate) {
+      if (row.value &gt;= recoverAbove) close(row.at, '恢复条件满足');
+      else {
+        candidate.min = Math.min(candidate.min, row.value);
+        if (!candidate.confirmed &amp;&amp; row.at - candidate.start &gt;= minDuration) {
+          candidate.confirmed = true; candidate.confirmedAt = row.at;
+        }
+      }
+    }
+    previous = row;
+  }
+  if (candidate?.confirmed) episodes.push({ start: candidate.start, end: null,
+    lastObservedAt: previous.at, min: candidate.min,
+    confirmedAt: candidate.confirmedAt, endReason: '等待后续采样' });
+  return episodes;
+}
+</code></pre>
+<p>这里的“持续”是允许采样间隔内的观测结果，不意味着每一毫秒都被测量过。页面同时显示采样周期和最后观测时间，长时间没数据以后也不能让活动异常一直默默延长。</p>
+<p><img alt="连续异常的确认条件" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114152706335-690008002.png" class="lazyload"></p>
+<h2>三、批次绑定带有效期</h2>
+<p>种植批次与区域的关系使用起止时间。结束时间为空表示当前仍有效，区间前闭后开。换批次刚好发生在异常中间，就拆成两段关联，不能把整个异常都塞给新批次。</p>
+<pre><code class="language-javascript">function validateAssignments(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    if (!Number.isFinite(row.start) || (row.end !== null &amp;&amp;
+        (!Number.isFinite(row.end) || row.end &lt;= row.start))) throw new Error('批次有效期无效');
+    const list = groups.get(row.zoneId) ?? [];
+    list.push(row); groups.set(row.zoneId, list);
+  }
+  for (const [zoneId, list] of groups) {
+    list.sort((a, b) =&gt; a.start - b.start);
+    for (let i = 1; i &lt; list.length; i++) {
+      if ((list[i - 1].end ?? Infinity) &gt; list[i].start) throw new Error(`${zoneId}: 批次时间重叠`);
+    }
+  }
+  return groups;
+}
+
+function joinEpisodeToBatches(episode, zoneId, assignments, queryEnd) {
+  const end = episode.end ?? Math.min(queryEnd, episode.lastObservedAt);
+  const matches = [];
+  for (const assignment of assignments) {
+    if (assignment.zoneId !== zoneId) continue;
+    const from = Math.max(episode.start, assignment.start);
+    const to = Math.min(end, assignment.end ?? Infinity);
+    if (from &lt; to) matches.push({ batchId: assignment.batchId, from, to });
+  }
+  const duration = matches.reduce((sum, row) =&gt; sum + row.to - row.from, 0);
+  return { matches, uncoveredMs: Math.max(0, end - episode.start - duration) };
+}
+</code></pre>
+<p>同一区域确实允许多批并存时，应把区域细分到种植床或床位，再做这项互斥校验。不要为了让数据过关直接允许任意重叠，否则统计受影响批次时还会把问题带回来。</p>
+<h2>四、操作记录只做时间关联，不直接推断原因</h2>
+<p>围绕异常时间前后取一个观察窗口，按区域与时间筛记录。记录的业务时间和录入时间也分开，补录的一条巡查不该被当成刚刚发生。结果里保留与异常起点的时间差。</p>
+<pre><code class="language-javascript">function relatedOperations(episode, zoneId, operations, marginMs = 600000) {
+  const end = episode.end ?? episode.lastObservedAt;
+  return operations.filter(row =&gt; row.zoneId === zoneId &amp;&amp;
+    Number.isFinite(row.occurredAt) &amp;&amp; row.occurredAt &gt;= episode.start - marginMs &amp;&amp;
+    row.occurredAt &lt;= end + marginMs)
+    .sort((a, b) =&gt; a.occurredAt - b.occurredAt || a.id.localeCompare(b.id))
+    .map(row =&gt; ({ ...row, offsetFromStart: row.occurredAt - episode.start,
+      relation: '同区域相近时段记录，待核对' }));
+}
+
+function buildEpisodeDetail(episode, context) {
+  const { zoneId, assignments, operations, queryEnd } = context;
+  validateAssignments(assignments);
+  const batches = joinEpisodeToBatches(episode, zoneId, assignments, queryEnd);
+  return { zoneId, episode, batches,
+    operations: relatedOperations(episode, zoneId, operations),
+    needsReview: batches.uncoveredMs &gt; 0 || episode.endReason !== '恢复条件满足' };
+}
+</code></pre>
+<p><img alt="异常时间内的种植记录" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114152714912-22860828.png" class="lazyload"></p>
+<h2>五、点异常，三维和时间范围一起切换</h2>
+<p>模型还是同一个区域，但面板必须切到异常发生时的批次。查询采用请求编号挡住旧结果；先显示当前选择，再加载详情。没有历史绑定时明确提示，不能拿今天的批次补上。</p>
+<pre><code class="language-javascript">import * as THREE from 'three';
+
+function createEpisodeSelection({ zones, fetchContext, focus, renderPanel }) {
+  let request = 0, controller = null;
+  return {
+    async select(episode, zoneId) {
+      const current = ++request;
+      controller?.abort(); controller = new AbortController();
+      const object = zones.get(zoneId);
+      renderPanel({ zoneId, episode, loading: true });
+      if (object) {
+        object.updateWorldMatrix(true, true);
+        const box = new THREE.Box3().setFromObject(object);
+        if (!box.isEmpty()) focus(box.getCenter(new THREE.Vector3()), box.getSize(new THREE.Vector3()));
+      }
+      try {
+        const queryEnd = episode.end ?? episode.lastObservedAt;
+        const context = await fetchContext({ zoneId, start: episode.start,
+          end: queryEnd, signal: controller.signal });
+        if (current !== request) return;
+        const detail = buildEpisodeDetail(episode, { ...context, zoneId, queryEnd });
+        renderPanel({ ...detail, loading: false, modelBound: Boolean(object) });
+      } catch (error) {
+        if (current === request &amp;&amp; error.name !== 'AbortError') {
+          renderPanel({ zoneId, episode, loading: false, error: error.message });
+        }
+      }
+    },
+    dispose() { request++; controller?.abort(); }
+  };
+}
+</code></pre>
+<h2>六、迟到数据回来后，重新算这一段</h2>
+<p>历史异常区间可能因为补到的有效样本发生变化，所以查询结果带修订号。局部窗口重算时要补入窗口前的规则状态，或直接重算完整查询窗口；不能只拿新增的一条低温样本就新建一个异常。</p>
+<pre><code class="language-javascript">function recalculateWindow({ rows, start, end, rule, revision }) {
+  const normalized = normalizeSamples(rows, start, end);
+  const episodes = detectLowEpisodes(normalized.samples, rule);
+  return { start, end, revision, generatedAt: Date.now(),
+    episodes: episodes.map((episode, index) =&gt; ({
+      ...episode, viewKey: `${revision}:${index}`, boundary: '按当前查询窗口重建'
+    })), issues: normalized.issues };
+}
+</code></pre>
+<p><img alt="回溯列表与区域定位" data-src="https://img2024.cnblogs.com/blog/800616/202611/800616-20261114152724214-1554232293.png" class="lazyload"></p>
+<p>验收时可以把换批次时间放在异常中间，结果应关联两批；再插入一段缺测，异常持续时间不能跨过它；补一条迟到采样，修订后的区间应和重新完整计算一致。三维只定位这块区域，不替这些数据关系做猜测。</p>
+<p>温室三篇就写到这里。区域和探头、灌溉和回执、环境和批次，各自能单独用，合在一起也能顺着同一块地查下去。等这些关系清楚了，棚里的东西不用满屏乱动，画面也有事情可讲。</p>
+<p><img alt="" width="338" height="350" data-src="https://img2018.cnblogs.com/blog/800616/201903/800616-20190306111130020-1677299606.png" class="lazyload"></p>
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-17 23:55">2026-11-17 23:54</span>&nbsp;
+<a href="https://www.cnblogs.com/yeyunfei">魂断蓝桥666</a>&nbsp;
+阅读(<span id="post_view_count">179</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23665310);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyeyunfei%2Fp%2F23665310%2Fthreejs-webgl-3d-greenhouse-environment-batches&amp;targetId=23665310&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
