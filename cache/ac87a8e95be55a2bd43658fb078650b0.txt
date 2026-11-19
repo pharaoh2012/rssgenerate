@@ -1,0 +1,145 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/Qiniu-developer/p/23708543" title="发布于 2026-11-18 16:45">
+    
+
+    <span role="heading" aria-level="2">Anthropic：Agent 不必一直运行，也能持续工作</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3796273/202611/3796273-20261118164147166-212199966.png" alt="Anthropic：Agent 不必一直运行，也能持续工作" class="desc_img">
+        从事件唤醒到记忆接续，5 个组件撑起 Agent 持续工作的运行闭环
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>近期，围绕 Agent 如何持续工作，业内开始有更多关于系统架构的讨论。不久前，DeepSeek Harness 团队发表了《[Super-agent 设计探索：迈向更自主的 Agent 系统]》，小七对此做过一篇「[DeepSeek Super-agent：从单 Session 到持续运行的 Agent 系统]」的解读。文章重点介绍了如何通过 Router / Worker 双层架构、事件路由和任务生命周期管理，让 Agent 能够跨 Session 协调、并行推进多项工作。</p>
+<p>11 月 13 日，Anthropic 又发布了《[Building always-on agents]》，同样关注 Agent 的外围架构，但切入点有所不同：当模型不再持续运行，Agent 如何依然能够主动响应事件、接续工作，并在无人持续监督的情况下安全执行？</p>
+<p>这次我们就沿着 Anthropic 的思路，看看它如何通过一套外围运行架构，让 Agent 具备持续工作的能力。</p>
+<h2 id="run-和-session">Run 和 Session</h2>
+<p>理解这套架构，需要先区分 Run 和 Session。</p>
+<p>Run 是 Agent 被唤醒后的一段执行过程，包括接收事件、模型推理、工具调用和保存必要信息。Session 则保存消息和工具调用历史，为 Agent 提供执行上下文。一个 Session 可以包含多次 Run；新事件到达时，系统可以恢复已有 Session，也可以创建新的 Session。</p>
+<p>因此，Always-on 并不意味着模型一直运行。Anthropic 描述的 Agent 大部分时间处于休眠状态，只有事件到来时才启动 Run，完成当前工作后再次休眠，等待下一次唤醒。</p>
+<p><img alt="1" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202611/3796273-20261118164419999-382832342.gif" class="lazyload"></p>
+<p>图 1：Always-on Agent 的运行与休眠周期。图源：Anthropic</p>
+<p>模型可以判断什么时候需要继续工作，但实际调度由外围系统负责。例如，Agent 完成一次检查后，决定半小时后再次确认。它可以安排后续检查并结束当前 Run，由后台系统保存计划，到期后重新唤醒 Agent。</p>
+<p>那么，系统如何可靠地接收外部事件，又如何在没有新消息时按计划唤醒 Agent？</p>
+<h2 id="agent-休眠后如何重启工作">Agent 休眠后如何重启工作？</h2>
+<h3 id="event-inbox事件接收与执行分离">Event Inbox：事件接收与执行分离</h3>
+<p>对话式 Agent 主要由用户消息触发，而持续工作的 Agent 还需响应监控平台的 Webhook、定时任务到期通知、后台作业结果等外部事件。</p>
+<p>最直接的方式是收到事件后立即启动 Agent。但如果两个与同一故障有关的告警几乎同时到达，就可能启动两个执行实例，同时检查甚至修改相同的配置。如果执行途中进程异常退出，尚未处理的事件也可能丢失。</p>
+<p>Anthropic 建议引入持久化的 Event Inbox（事件收件箱），将事件接收与 Agent 执行分离。最简单的实现包含三个部分：</p>
+<ul>
+<li>
+<p><strong>Handler：</strong> 通常是一个 HTTP 接口，负责接收事件并写入数据库。</p>
+</li>
+<li>
+<p><strong>Inbox：</strong> 保存事件及其处理状态，并根据事件的唯一标识去重。</p>
+</li>
+<li>
+<p><strong>Worker：</strong> 后台处理服务，负责读取待处理事件、启动 Agent Run，并更新处理状态。</p>
+</li>
+</ul>
+<p><img alt="2" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202611/3796273-20261118164431357-1759932357.png" class="lazyload"></p>
+<p>图 2：Event Inbox 的事件接收与 Worker 执行流程。图源：Anthropic</p>
+<p>Handler 收到事件后，应尽快完成轻量检查和持久化写入并返回确认。部分 Webhook 提供方会将响应过慢视为失败，因此 Handler 不宜等待 Agent 完成工作。提示词注入等需要深入分析的风险，可以留到后续 Run 中检查。</p>
+<p>Handler 写入事件后会唤醒 Worker。Worker 随后从 Inbox 读取待处理事件，并判断是否需要恢复已有 Session。例如，用户回复了此前的审批请求，就可以恢复对应的 Session；如果是一项不相关的新工作，则创建新的 Session。</p>
+<p>由于事件已经持久化，即使 Worker 执行中断，系统仍然可以重新读取并处理。但事件去重和单 Worker 约束，并不意味着一次事件只会执行一次。如果 Agent 已经修改了外部系统，却在更新事件状态前崩溃，重试时就可能重复操作。因此，修改配置、提交代码等具有外部副作用的操作，还需要额外考虑幂等控制。</p>
+<p>并发同样需要约束。Anthropic 建议起步时为每个用户设置一个 Inbox，并确保同一 Inbox 同时只有一个活跃 Worker。如果运行期间又有新事件到达，可以留给下一次 Run、加入当前 Run，或者中断当前 Run 后重新启动。短时间内到达的多条消息也可以合并处理，减少重复的模型调用与回复。</p>
+<p>这种设计降低了并发协调的复杂度，但也限制了同一 Inbox 的并行能力。需要更高吞吐量时，可以进一步拆分 Inbox。不过，即使拆分到不同 Inbox，如果多个任务最终操作同一外部共享资源，例如同一个代码仓库或同一套生产环境，冲突仍需在业务层额外处理。</p>
+<h3 id="timers定时计划与唤醒">Timers：定时计划与唤醒</h3>
+<p>Event Inbox 解决了事件接收的问题，但有些工作需要在未来指定时间主动执行，例如半小时后重新检查监控指标，或者每天上午整理一次服务运行状态。</p>
+<p>为此，Anthropic 引入 Timers（定时器），并区分两种任务：Follow-up 是 Agent 根据当前工作安排的一次性跟进，例如稍后检查问题是否解决；Schedule 则按照固定周期执行，例如每天生成一份运行报告。</p>
+<p>定时任务保存在独立的持久化存储中，由 Scheduler（调度器）定期检查。发现任务到期后，Scheduler 会更新对应记录：一次性的 Follow-up 标记为完成，周期性的 Schedule 更新下一次触发时间；随后将事件写入 Event Inbox，由 Worker 启动 Agent。</p>
+<p><img alt="3" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202611/3796273-20261118164441770-1712012983.png" class="lazyload"></p>
+<p>图 3：Timers、Scheduler 与 Event Inbox 的关系。图源：Anthropic</p>
+<p>Timers 与 Inbox 分开管理，是因为两者承担不同的职责：Timers 保存未来的执行计划，Inbox 管理已经准备好处理的事件。通过 Scheduler 将两者连接起来，Agent 就可以在当前 Run 中安排后续工作，然后结束执行，等到期后再由后台系统唤醒。</p>
+<p>这样，无论是外部事件还是定时计划，都可以触发新的 Run。但对于需要接续的工作，Agent 被唤醒后还得知道此前做过什么、现在应该从哪里继续。</p>
+<h2 id="新-run-如何继续之前的工作">新 Run 如何继续之前的工作？</h2>
+<p>假设 Agent 半小时后重新检查服务状态，它不仅需要读取最新的监控指标，还要知道上次检查发现了什么、为什么安排这次跟进、用户设置了哪些操作限制，以及此前已经向开发者报告过什么。</p>
+<p>这些信息需要在不同 Run 之间保留。为此，Anthropic 将 Memory 设计为独立于 Worker 的持久化组件，让 Agent 即使结束当前运行，也能在后续工作中找回必要的信息。</p>
+<h3 id="session-历史与持久化记忆">Session 历史与持久化记忆</h3>
+<p>Session 保存消息和工具调用历史。恢复已有 Session，可以带回此前的交互和执行过程，帮助 Agent 接着之前的工作继续。但随着 Run 次数增加，这些历史记录会不断增长，反复加载大量内容也会增加 Token 消耗和执行延迟。</p>
+<p>因此，长期运行不能只依赖 Session 历史。Anthropic 建议将需要跨运行保留的信息单独写入 Memory，主要分为四类：</p>
+<ul>
+<li>
+<p><strong>User instructions（用户长期指令）：</strong> 保存用户对 Agent 行为的持续性要求，例如未经批准不得修改生产环境配置。这类信息在每次运行开始时加载，确保用户不在线时，Agent 仍能遵循已有指令。</p>
+</li>
+<li>
+<p><strong>User notes（用户信息）：</strong> 保存用户角色、偏好及此前纠正过的信息。内容较少时可以集中存储，增长后再拆分为多个文件，运行时只加载索引，需要时再读取详细内容。</p>
+</li>
+<li>
+<p><strong>Past messages（已发送的消息）：</strong> 记录 Agent 已经向用户报告过什么，避免重复通知。可以保存在独立文件中，也可以由 Worker 加载最近几条已发送消息。</p>
+</li>
+<li>
+<p><strong>Task progress（任务进度）：</strong> 记录正在进行的工作完成了什么、还剩哪些事项。后续 Run 可以读取相关进度，接着之前的工作继续执行。</p>
+</li>
+</ul>
+<p>这些记忆可以通过文件目录组织。例如，用户长期指令和记忆索引在每次运行时加载，具体的用户笔记、任务进度则按需读取。文件目录只是组织形式，底层可以映射到数据库或对象存储等持久化系统，使记忆不受 Worker 生命周期的影响。</p>
+<p><img alt="4" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202611/3796273-20261118164500012-1160968009.png" class="lazyload"></p>
+<p>图 4：Memory 文件组织示例，区分每次加载的信息与按需读取的信息。图源：Anthropic</p>
+<p>对于外部系统中已有的信息，Anthropic 还建议尽量保存引用，而不是在 Memory 中复制一份。</p>
+<p>例如，Agent 可以记录告警编号、此前的分析结论和后续检查目标，但告警当前是否已经恢复，仍应重新查询监控平台。否则，之前保存的状态可能已经过期，影响后续判断。</p>
+<p>因此，Session 历史、Memory 和外部系统各有用途：Session 保留此前的交互与执行过程，Memory 保存需要长期保留的信息，外部系统则提供最新的业务状态。Agent 在后续运行中结合这些信息，才能继续处理工作。</p>
+<h3 id="上下文加载与压缩">上下文加载与压缩</h3>
+<p>启动 Run 时，系统需要向模型提供 System Prompt、工具定义和必要的 Memory。新建 Session 时，还要加入本次触发事件；恢复已有 Session 时，则会带回此前的消息和工具调用历史。</p>
+<p>这些内容都会占用上下文窗口。Anthropic 建议尽量控制初始上下文的大小，并使用提示词缓存（Prompt Caching）降低重复加载的成本。不常用的信息可以通过 Memory 索引按需读取，避免每次都加载全部内容。</p>
+<p>随着 Session 历史增长，系统可以通过上下文压缩（Compaction）将较早的消息整理成摘要，或者直接创建新的 Session。不过，这两种方式都可能丢失部分细节，因此重要信息应在运行过程中及时写入 Memory，而不是等到上下文过长时才保存。</p>
+<p>除了在 Run 中主动保存记忆，Anthropic 还简要提到了可选的 Dreaming 机制：通过回顾历史 Session 整理长期记忆、替换过期信息，并发现多次运行中反复出现的规律。原文对此着墨不多，并指向另一篇记忆组件文章做进一步说明。Dreaming 属于外部记忆的整理过程，并非 Always-on 架构的必选项，也不意味着模型权重本身在持续学习。</p>
+<p>通过 Session、Memory 和外部系统的配合，Agent 可以在不同 Run 之间接续工作。但即使恢复了必要的信息，也不代表它能够在用户不在场时执行所有操作。长期自主运行还需要明确工具调用的权限边界。</p>
+<h2 id="agent-可以自主做到哪一步">Agent 可以自主做到哪一步？</h2>
+<p>持续工作的 Agent 可能需要读取代码仓库、调用内部 API、修改文件，甚至操作生产系统。如果每次工具调用都需要人工确认，就很难独立推进工作；但如果完全不加限制，又可能给真实业务环境带来风险。</p>
+<p>Anthropic 从凭据隔离、自动化风险审查和延迟工具调用三个方面讨论了权限管理，分别解决凭据如何安全使用、哪些操作可以自主执行，以及需要用户审批时如何继续工作。</p>
+<h3 id="凭据隔离与自动化风险审查">凭据隔离与自动化风险审查</h3>
+<p>Agent 调用外部服务时，往往需要 API Token、访问密钥等敏感凭据。Anthropic 建议在 Agent 运行环境之外部署代理，由代理保管真实凭据。Agent 发送不包含密钥的请求，代理再添加必要凭据，并转发到目标服务。</p>
+<p>这样，Agent 可以使用外部服务，却不需要直接接触真实密钥。但凭据隔离并不能决定操作是否应该被允许，即使 Agent 无法获取密钥，也可能通过代理发起具有副作用的请求。</p>
+<p>对于工具操作本身，Anthropic 以 Claude Code 的 Auto Mode 为例，介绍了通过分类器审查较高风险操作的方式。被判定为危险的操作会受到阻止，Agent 则尝试寻找更安全的执行方式。这可以减少对人工确认的依赖，但重要决策仍然需要用户审查。</p>
+<p>因此，工具调用除了允许执行或直接阻止，还可能需要等待用户批准。对于持续工作的 Agent，接下来就要解决如何在不长期占用运行资源的情况下等待审批。</p>
+<h3 id="deferred-tool-calls审批等待与恢复">Deferred Tool Calls：审批等待与恢复</h3>
+<p>例如，Agent 判断需要修改生产环境配置，但这项操作必须经过开发者批准。开发者可能几分钟后回复，也可能几个小时后才能处理。如果让当前工具调用一直等待，就会占用 Agent 的运行过程。</p>
+<p>Anthropic 介绍了 Deferred Tool Calls（延迟工具调用）机制。Claude Code 已经支持通过 Hook 延迟工具调用、等待用户补充输入，类似方式也可以用于持续工作的 Agent。</p>
+<p>当 Agent 准备执行需要审批的操作时，系统可以暂时挂起工具调用，保存当前 Session，并结束这次 Run。审批请求随后展示给用户，例如通过交互卡片呈现。用户批准、拒绝或补充信息后，系统将回应作为新事件写入 Event Inbox，再启动新的 Run，恢复之前的 Session，根据用户反馈决定如何继续处理这次工具调用。</p>
+<p>这样，等待审批期间，Worker 可以处理其他事件，不必一直被当前任务占用。用户回应后，Agent 也能从之前保存的上下文继续工作，无需重新开始整个任务。</p>
+<p>对于生产环境中的敏感操作，如果审批等待时间较长，恢复执行时还应重新检查操作目标、环境状态和授权条件是否变化。这属于进一步落地时需要考虑的安全措施，原文没有展开具体实现。</p>
+<p>通过这些机制，Agent 可以自主执行获得允许的操作，并在需要人工决策时暂停和恢复工作。不过，长期运行还涉及一个面向用户的问题：Agent 每完成一次 Run，都需要向用户发送消息吗？</p>
+<h2 id="持续工作的-agent-何时通知用户">持续工作的 Agent 何时通知用户？</h2>
+<p>传统对话式 Agent 通常会持续输出工具调用进度和执行结果，用户可以跟随整个处理过程。但持续工作的 Agent 可能每天都会执行多次 Run，如果每次都发送消息，用户很快就会被大量状态通知打扰。</p>
+<p>例如，Agent 每半小时检查一次服务指标。如果没有新的异常，就不必反复报告“状态正常”；但如果异常恶化，或者需要开发者审批操作，就应该及时通知。</p>
+<p>Anthropic 将一次 Run 的结果分成三种情况：发送消息、无需发送，或者通过 Deferred Tool Call 请求用户提供信息或批准操作。</p>
+<p>对于简单的系统，Agent 可以直接通过 Send Tool 向用户发送消息。如果需要控制消息发送节奏，或在交付失败后重新尝试，则可以引入正式的 Outbox（发件箱）。</p>
+<p>Outbox 通常使用独立的数据库表保存待发送消息及其处理状态。Agent 将消息写入 Outbox 后，由后台的 Dispatcher（消息分发器）读取待处理记录，判断哪些消息需要发送，再调用相应接口完成交付。</p>
+<p><img alt="5" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202611/3796273-20261118164516345-1384500058.png" class="lazyload"></p>
+<p>图 5：Outbox 与消息交付流程。图源：Anthropic</p>
+<p>这样，Agent 生成消息与实际发送消息就分开了。例如，Agent 已经生成故障报告，但消息服务暂时不可用，只要待发送记录仍然保存在 Outbox 中，Dispatcher 就可以在服务恢复后重新尝试。前面提到的人工审批请求，也可以通过 Outbox 交付，或者直接展示在应用界面中。</p>
+<p>不过，Outbox 主要解决消息交付与发送节奏的管理，不能代替 Agent 判断哪些事情值得通知用户。消息太多会造成干扰，太少又可能遗漏重要信息。</p>
+<p>Anthropic 因此建议通过评测调整通知策略，初期尽量保持克制，再根据实际效果逐步优化。对于持续工作的 Agent，用户更需要了解重要进展和需要自己处理的事项，而不必持续关注每一次后台运行。</p>
+<h2 id="结语">结语</h2>
+<p>将前面介绍的机制连接起来，就形成了 Anthropic 所描述的 Always-on Agent：通过 Event Inbox 和 Timers 按需唤醒，在 Session 中结合 Memory 恢复工作，并通过 Permissions 控制自主操作，最后根据需要由 Outbox 向用户交付消息。</p>
+<p><img alt="6" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3796273/202611/3796273-20261118164526534-1214712365.gif" class="lazyload"></p>
+<p>图 6：五个基础组件组成的 Always-on Agent 整体架构。图源：Anthropic</p>
+<p>这套架构让模型可以间歇运行，而 Agent 仍能持续响应外部事件、处理周期任务，以及跟进尚未完成的工作。一次 Run 结束，不再意味着所有工作都要等待用户重新安排。</p>
+<p>当然，这些基础机制并不能解决长期自主执行的所有问题。事件重试可能带来重复操作，持久化记忆无法保证模型判断始终正确，自动化权限审查也不能代替所有人工决策。实际生产系统仍需结合业务要求，进一步处理故障恢复、状态一致性和资源预算等问题。</p>
+<p>Anthropic 这篇文章提供的是一套基础架构设计，而非覆盖各类场景的完整实现。它让我们看到，Agent 可以继续使用现有的推理与工具调用循环，但要让它持续参与实际工作，还需要外围系统承担那些不能随着一次 Run 结束而消失的职责。</p>
+<p>最后，再回到开头提到的 DeepSeek Super-agent。两篇文章都在讨论如何让 Agent 摆脱单次会话的限制，持续响应环境事件并推进工作，只是关注的架构重点有所不同。</p>
+<p>DeepSeek 更侧重系统如何组织任务与执行单元：通过 Router / Worker 双层架构、事件驱动、异步交互、计算与状态及执行环境的分离，以及 Watchdog，支撑跨 Session 的连续交互、多任务并行和长期运行中的异常恢复。</p>
+<p>Anthropic 则把持续工作的运行闭环拆解为五项基础机制，重点讨论事件如何进入系统并触发 Run、上下文与记忆如何跨运行保留、权限如何约束自主操作，以及结果如何交付给用户。</p>
+<p>简单来说，DeepSeek 更关注「如何组织多项工作并让它们协同推进」，Anthropic 更关注「模型间歇运行时，如何让每次 Run 都能可靠地接上下一步」。两者从不同层次提供了互补的架构视角，共同帮助我们理解如何构建能够长期、持续工作的 Agent。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-18 16:46">2026-11-18 16:45</span>&nbsp;
+<a href="https://www.cnblogs.com/Qiniu-developer">小七-七牛开发者</a>&nbsp;
+阅读(<span id="post_view_count">87</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23708543);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FQiniu-developer%2Fp%2F23708543&amp;targetId=23708543&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
