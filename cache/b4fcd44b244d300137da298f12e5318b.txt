@@ -1,0 +1,1084 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zw-awa/p/23735000" title="发布于 2026-11-20 20:23">
+    
+
+    <span role="heading" aria-level="2">姿态是怎么算出来的：互补解算、四元数和欧拉角</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3791643/202611/3791643-20261120201630660-1992663058.png" alt="姿态是怎么算出来的：互补解算、四元数和欧拉角" class="desc_img">
+        三个角为什么不能直接累加，四元数又凭什么能替它把姿态转过去？合成出来的姿态里，偏航角为什么始终拉不回来——要补上它，还得请谁进门？
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h2 id="经典三问">经典三问</h2>
+<p>Q: 姿态估计是什么？<br>
+A: 用角速度和加速度两路数据，算出物体相对重力方向的三个角。</p>
+<p>Q: 为什么不能直接拿三个角累加？<br>
+A: 欧拉角带着旋转顺序，某些姿态下两个角会粘在一起；用四元数保存姿态能绕开这件事。</p>
+<p>Q: 它用在哪？<br>
+A: 车头朝向、云台稳定、平衡车、飞控、机器人——凡是需要知道“我现在歪成什么样”的地方。</p>
+<hr>
+<p>把角速度走低通、加速度走卡尔曼之后，手里有两路干净的数据：一路是角速度，又平又快；一路是加速度，稳得住偏。</p>
+<p>但<strong>角度还没有出来</strong>。这两路各自都缺一样东西：角速度只告诉你“转得多快”，要变成角度得积分，而积分会把零偏一路累进去；加速度告诉你“哪边是下”，可它分不清那个方向是重力还是车在加速。</p>
+<p>下面把两路合起来。做法分三步：<strong>互补解算</strong>（用加速度把姿态往重力方向拉）、<strong>四元数解算</strong>（用角速度把姿态推着往前走）、<strong>欧拉角计算</strong>（转成屏幕上那三个能读的数）。</p>
+<h2 id="先把姿态说清楚">先把姿态说清楚</h2>
+<p>姿态是相对某个参考说的。这里直接拿重力方向做参考：<strong>重力指向地面</strong>。姿态就是指芯片自己相对重力方向转了多少。</p>
+<p>三个角的名字和范围先定下来：</p>
+<table>
+<thead>
+<tr>
+<th>角</th>
+<th>绕哪根轴转</th>
+<th>范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>俯仰 <code>pitch</code></td>
+<td>绕 Y 轴（点头）</td>
+<td>−90 ~ 90 度</td>
+</tr>
+<tr>
+<td>横滚 <code>roll</code></td>
+<td>绕 X 轴（侧倾）</td>
+<td>−180 ~ 180 度</td>
+</tr>
+<tr>
+<td>偏航 <code>yaw</code></td>
+<td>绕 Z 轴（转向）</td>
+<td>−180 ~ 180 度</td>
+</tr>
+</tbody>
+</table>
+<p>俯仰为什么只有 ±90？因为它是用反正弦算出来的——反正弦的值域就只有这么大。这不是约定，是三角函数的边界。</p>
+<p>坐标系按芯片手册理解：<strong>Z 轴垂直于芯片表面、从正面指出去，X、Y 在板子平面内，三者构成右手系</strong>；绕某根轴按右手定则转，角速度读数就是正的。</p>
+<p>按这套约定，芯片<strong>平放、Z 朝上</strong>静止时，加速度计三轴读到的是 <code>(0, 0, +1g)</code>——±16g 档下就是 <code>(0, 0, 2048)</code> 那个样子。这里要说清一件事：加速度计测的是<strong>比力</strong>，静止时它指向“哪边朝上”这个支撑方向，不是指向地面。代码里那个参考向量 <code>(0, 0, 1)</code> 说的就是这件事。</p>
+<p>本文的 <code>q</code> 是把<strong>机体系</strong>转成<strong>世界系</strong>的那个旋转（body→world），世界系取 Z 轴朝上。所以 <code>q = (1,0,0,0)</code> 表示芯片平放、和世界系对齐。</p>
+<p>内部算的时候用<strong>弧度</strong>，显示的时候才换成度。这里两个方向都要用到，所以先备好一个常数：</p>
+<pre><code class="language-c">#define ATTITUDE_RAD_TO_DEG   57.2957795f
+#define ATTITUDE_DEG_TO_RAD   0.01745329252f
+
+#define ATTITUDE_ACC_TOL_G          0.15f   /* 加速度模长偏离 1g 超过这么多，这一拍就不信它 */
+#define ATTITUDE_INTEGRAL_MAX       0.5f    /* 积分项上限，单位弧度每秒，防 windup */
+#define ATTITUDE_YAW_DEADZONE_DPS   0.5f    /* 偏航死区，这台模块静置测出来的，不是通用参数 */
+</code></pre>
+<p>角速度那一侧不用再换算了：讲两路滤波那一回拿到的 <code>gyro_x_dps</code> 已经是度每秒，<code>accel_x_g</code> 已经是 g，这里直接接着用。</p>
+<h2 id="为什么不能直接拿三个角累加">为什么不能直接拿三个角累加</h2>
+<p>最直接的想法是：三个角各自积分，加三个变量，不用四元数。</p>
+<p><strong>欧拉角带着旋转顺序。</strong> “先绕 Z 转 30 度再绕 Y 转 20 度”和“先绕 Y 转 20 度再绕 Z 转 30 度”，最后到达的姿态不是同一个。所以三个角不是三个独立的数，它们是一组有顺序的数。</p>
+<p>顺序带来的麻烦在极端姿态上最明显：<strong>把模块立起来，让俯仰接近 90 度，再去绕竖直轴转。</strong> 屏幕上会出现这样的事：</p>
+<pre><code class="language-text">pitch  接近 90 度不动
+yaw    转了半天几乎不动
+roll   乱跳
+</code></pre>
+<p>明明是在转向，<code>yaw</code> 却不动，而 <code>roll</code> 在乱跳。这不是代码写错了，是<strong>欧拉角在这一点上丢了一个自由度</strong>——转轴和另一个轴重合了，两个角只能“一起”描述一个转动。行业里管这个叫万向节锁。</p>
+<p>结论是：<strong>屏幕上用三个角没问题，用它保存姿态会出事。</strong> 需要一种不带顺序、也不会在某个姿态上退化的表示。</p>
+<h2 id="四元数是什么">四元数是什么</h2>
+<p>四元数用四个数表示一次旋转：</p>
+<pre><code class="language-c">typedef struct
+{
+    float w;
+    float x;
+    float y;
+    float z;
+} Quaternion;
+
+typedef struct
+{
+    float pitch;
+    float roll;
+    float yaw;
+} Euler_Angle;
+
+typedef struct
+{
+    Quaternion  q;              /* 姿态本体：一组单位四元数 */
+    float       kp;             /* 比例修正：拉得多快 */
+    float       ki;             /* 积分修正：把残差慢慢吃掉 */
+    float       integral_x;
+    float       integral_y;
+    float       integral_z;     /* 修正项的积分部分 */
+    Euler_Angle angle;          /* 换算出来的三个角，给屏幕和控制环用 */
+} Attitude;
+</code></pre>
+<p>四个数不是四个传感器，也不是“多测了一个方向”。它们是<strong>一次旋转的四个分量</strong>：<code>w</code> 和转过的角度有关，<code>x</code>、<code>y</code>、<code>z</code> 和“绕哪根轴转”有关。写成公式就是</p>
+<pre><code class="language-text">w = cos(θ/2)          轴方向 × sin(θ/2) = (x, y, z)
+</code></pre>
+<p>姿态就是“从初始朝向转到现在这个朝向”的那次旋转，所以用一组四元数就能存下来。它有两个好处：</p>
+<ul>
+<li><strong>不带顺序</strong>：四元数相乘就是两次旋转的叠加，谁先谁后由乘法顺序表达，不存在三个角互相耦合的问题；</li>
+<li><strong>不会在某个姿态上退化</strong>：它没有“两个轴重合”这种事，转多少圈都连续。</li>
+</ul>
+<p>代价是四个数不直观，而且长度必须是 1（这叫单位四元数）。<strong>所以姿态内部用四元数存，要显示、要送进控制环的时候再换成欧拉角</strong>——这就是前面说的三步里的第三步。</p>
+<p>初始状态用水平放着的那一组：</p>
+<pre><code class="language-c">void Attitude_Init(Attitude *att, float kp, float ki)
+{
+    att-&gt;q.w = 1.0f;
+    att-&gt;q.x = 0.0f;
+    att-&gt;q.y = 0.0f;
+    att-&gt;q.z = 0.0f;
+    att-&gt;kp = kp;
+    att-&gt;ki = ki;
+    att-&gt;integral_x = 0.0f;
+    att-&gt;integral_y = 0.0f;
+    att-&gt;integral_z = 0.0f;
+    att-&gt;angle.pitch = 0.0f;
+    att-&gt;angle.roll = 0.0f;
+    att-&gt;angle.yaw = 0.0f;
+}
+</code></pre>
+<p><code>w = 1</code>、其余三个 0 表示“没有转过”。上电时如果模块不是水平的，这个初始姿态就是错的，第一段时间里它会自己往真值上靠。</p>
+<h2 id="互补解算让加速度计把姿态拉回重力方向">互补解算：让加速度计把姿态拉回重力方向</h2>
+<p>互补解算要回答一个问题：<strong>“我现在的姿态，说重力应该指向哪里？”</strong> 再拿它和加速度计实测的方向比一比，差多少就往回修多少。</p>
+<p>这套“叉乘算误差、比例加积分反馈、再用角速度推四元数”的结构，文献里叫 <strong>Mahony 互补滤波</strong>——Mahony 2008 年那篇讲的就是面向低成本 IMU 的非线性互补滤波器，其中还带在线估计陀螺零偏。下面这几步是它的标准形式。</p>
+<p><strong>第一步：算出“我认为”的重力方向。</strong> 四元数里直接能取出来：</p>
+<pre><code class="language-c">gravity_x = 2.0f * ((q1 * q3) - (q0 * q2));
+gravity_y = 2.0f * ((q0 * q1) + (q2 * q3));
+gravity_z = 1.0f - (2.0f * ((q1 * q1) + (q2 * q2)));
+</code></pre>
+<p>这三行是把四元数对应的旋转矩阵的<strong>第三行</strong>取出来（也就是 <code>Rᵀ</code> 的第三列）——按上面那个约定，它正好是“世界系的 Z 轴在机体系里长什么样”，也就是“姿态认为，我这边哪个方向朝上”。不用背，知道它取的是“姿态说重力在哪个方向”就够了。</p>
+<p><strong>第二步：量出实际的重力方向。</strong> 加速度计静止时测的就是重力，但得先归一化：</p>
+<pre><code class="language-c">norm = sqrtf((accel_x * accel_x) + (accel_y * accel_y) + (accel_z * accel_z));
+
+/* 模长读不出来，或者离 1g 太远——说明这一拍在加速——都不信这次测量 */
+if ((norm &gt; 0.001f) &amp;&amp; (isfinite(norm)) &amp;&amp; (fabsf(norm - 1.0f) &lt; ATTITUDE_ACC_TOL_G))
+{
+    use_accel = 1U;
+
+    accel_x /= norm;
+    accel_y /= norm;
+    accel_z /= norm;
+}
+</code></pre>
+<p><strong>归一化这一步不是可选的。</strong> 不归一化，加速度的<strong>大小</strong>就一起参与进来了：车一加速，合加速度大于 1g，滤波器会以为姿态转得更快，姿态跟着被带偏。归一化之后只剩下方向，大小那部分信息直接丢掉——这正是我们想要的，因为“哪边是下”只和方向有关。</p>
+<p><strong>但归一化只修“大小”，修不了“方向”。</strong> 车一加速，合加速度的方向本身就偏了，归一化之后得到的还是一个单位向量，只不过它指的不是重力。所以上面那个 <code>use_accel</code> 判断不是可有可无的保险：模长离 1g 太远，这一拍干脆不用加速度修正。顺带说一句，这里只挡了加速度的模长，陀螺读数和 <code>dt_s</code> 没验。</p>
+<p><strong>还要记住：模长接近 1g，不等于方向可信。</strong> 匀加速前进、匀速转弯、被人推着走，合加速度都可能接近 1g，方向却已经偏了；这道门只是最便宜的一道筛子。真要把这件事做稳，得看<strong>新息</strong>——实际测量减去滤波器预测的那个差，有没有系统性偏大。</p>
+<p><strong>第三步：两个方向的叉乘，就是“该往哪边转”。</strong></p>
+<pre><code class="language-c">error_x = (accel_y * gravity_z) - (accel_z * gravity_y);
+error_y = (accel_z * gravity_x) - (accel_x * gravity_z);
+error_z = (accel_x * gravity_y) - (accel_y * gravity_x);
+</code></pre>
+<p>两个单位向量叉乘出来的还是一个向量，方向垂直于它们俩，大小和它们的夹角正弦成正比。<strong>姿态和重力对得越准，这个误差越小；歪得越多，它越大。</strong> 它天然就是一个“往回修”的量。</p>
+<p><strong>第四步：把误差按比例补进角速度</strong>，同时留一份积分项：</p>
+<pre><code class="language-c">gx = gyro_x_dps * ATTITUDE_DEG_TO_RAD;
+gy = gyro_y_dps * ATTITUDE_DEG_TO_RAD;
+gz = gyro_z_dps * ATTITUDE_DEG_TO_RAD;
+
+if (use_accel != 0U)
+{
+    gx += (att-&gt;kp * error_x) + att-&gt;integral_x;
+    gy += (att-&gt;kp * error_y) + att-&gt;integral_y;
+    gz += (att-&gt;kp * error_z) + att-&gt;integral_z;
+
+    att-&gt;integral_x += att-&gt;ki * error_x;
+    att-&gt;integral_y += att-&gt;ki * error_y;
+    att-&gt;integral_z += att-&gt;ki * error_z;
+
+    /* 积分项要夹住，不然一次大误差能把它堆成一个收不回来的数 */
+    if (att-&gt;integral_x &gt; ATTITUDE_INTEGRAL_MAX)  { att-&gt;integral_x = ATTITUDE_INTEGRAL_MAX; }
+    if (att-&gt;integral_x &lt; -ATTITUDE_INTEGRAL_MAX) { att-&gt;integral_x = -ATTITUDE_INTEGRAL_MAX; }
+    if (att-&gt;integral_y &gt; ATTITUDE_INTEGRAL_MAX)  { att-&gt;integral_y = ATTITUDE_INTEGRAL_MAX; }
+    if (att-&gt;integral_y &lt; -ATTITUDE_INTEGRAL_MAX) { att-&gt;integral_y = -ATTITUDE_INTEGRAL_MAX; }
+    if (att-&gt;integral_z &gt; ATTITUDE_INTEGRAL_MAX)  { att-&gt;integral_z = ATTITUDE_INTEGRAL_MAX; }
+    if (att-&gt;integral_z &lt; -ATTITUDE_INTEGRAL_MAX) { att-&gt;integral_z = -ATTITUDE_INTEGRAL_MAX; }
+}
+</code></pre>
+<p><code>kp</code> 决定“拉得多快”，<code>ki</code> 决定“积累得多快”。从 <code>kp = 0.8</code>、<code>ki = 0.0003</code> 这样一组数开始试。</p>
+<p><strong>别直接照抄别的实现的参数。</strong> Adafruit 那套用的是“半个误差”（叉乘完再乘 0.5），所以它的 <code>twoKp</code>、<code>twoKi</code> 数值是这里的差不多两倍；它还把 <code>dt</code> 显式乘进积分项，而这里已经把 <code>dt</code> 并进了 <code>ki</code>。数对不上不是谁写错了，是约定不同。</p>
+<p><code>if (use_accel != 0U)</code> 这一层是整套代码最容易被写漏的地方。加速度不可用的那一拍，<strong>不该让姿态原地不动</strong>——角速度还是好的，姿态照样要往前推，只是这一拍不做“拉回重力”的修正。写成 <code>return 0U</code> 直接退出，等于把陀螺的数据一起扔了；车一颠簸，姿态就跟着卡一下。</p>
+<p>上面那六行夹紧是同一个担心的另一半。Adafruit 那边在 <code>ki</code> 设成 0 的时候干脆把积分清零，注释写的是 prevent integral windup——两种写法，防的是同一件事。</p>
+<p>这里的 <code>ki</code> 已经把采样周期算进去了——积分项累加时不乘 <code>dt</code>，等于把 <code>dt</code> 并进了系数里。所以换了节拍（比如 10 毫秒改成 5 毫秒），同一组 <code>ki</code> 就不再是同一回事，得重新试。</p>
+<p><strong>这就是“互补”两个字的意思</strong>：陀螺仪负责跟手（角速度是主项，一路推着姿态走），加速度只负责轻轻拉一把（修正项很小，只在姿态慢慢偏掉重力方向时才起作用）。讲滤波是什么那一回里那条“两个来源按权重相加”的式子，在这里变成了“权重由叉乘误差算出来”。</p>
+<h3 id="为什么它修不了偏航">为什么它修不了偏航</h3>
+<p>看第三行误差：<code>error_z</code> 里只有加速度的水平分量。而<strong>绕着重力轴转，重力方向一点不变</strong>——模块原地转身，加速度计看到的还是同一个方向，叉乘出来的误差在竖直方向上没有分量，修不了。</p>
+<p>想让它长期不漂，得再给一个“北在哪”的参考（磁力计、卫星航向、视觉这类能给出绝对方向的）。编码器差速给不了“北”，它约束的只是“这一段路转了多少”。</p>
+<h3 id="kp-和-ki-各自管什么"><code>kp</code> 和 <code>ki</code> 各自管什么</h3>
+<p>一组真跑出来的数（10 毫秒节拍，从水平起步，初始误差人为摆成 10 度和 5 度，噪声用这块模块静置时采到的实测值、不是仿真，看误差降到 1 度要多久）：</p>
+<table>
+<thead>
+<tr>
+<th><code>kp</code></th>
+<th>误差降到 1 度</th>
+<th>稳定后的偏差</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2.0</td>
+<td>107 拍（约 1.1 秒）</td>
+<td>0.20 度</td>
+</tr>
+<tr>
+<td>0.8</td>
+<td>233 拍（约 2.3 秒）</td>
+<td>0.44 度</td>
+</tr>
+<tr>
+<td>0.2</td>
+<td>500 拍（约 5 秒）</td>
+<td>1.67 度</td>
+</tr>
+</tbody>
+</table>
+<p><strong><code>kp</code> 小，拉得慢、最后也拉不齐</strong>——因为比例项要靠“还剩多少误差”来产生修正，误差太小它就使不上劲。<code>kp</code> 大，收敛快、留下的偏差小，但加速度里的运动成分也更容易被它拉进来。这就是这一节的取舍。</p>
+<p>这些数是在一块模块、一种节拍下测出来的：初始误差是人为摆出来的，稳定偏差取的是收敛之后一段区间的均值。换模块、换节拍、换噪声水平，数都会变——看趋势就够了（<code>kp</code> 越大越快，但越容易把运动成分拉进来），别把小数点后面那位当成通用结论。</p>
+<p><code>ki</code> 的作用要换一个场合才看得出来：陀螺仪带一个<strong>大零偏</strong>的时候。还是静止不动，零偏给到 5 度每秒，跑 30 秒：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>第 5 秒</th>
+<th>第 30 秒</th>
+<th>真值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ki = 0</code></td>
+<td>pitch 13.53、roll 11.19</td>
+<td>pitch 13.74、roll 11.36</td>
+<td>10 / 5</td>
+</tr>
+<tr>
+<td><code>ki = 0.0003</code></td>
+<td>pitch 13.57、roll 10.79</td>
+<td>pitch 11.41、roll 7.25</td>
+<td>10 / 5</td>
+</tr>
+<tr>
+<td><code>ki = 0.003</code></td>
+<td>pitch 12.85、roll 7.68</td>
+<td>pitch 9.98、roll 5.00</td>
+<td>10 / 5</td>
+</tr>
+</tbody>
+</table>
+<p>看第一行：<strong>只有比例项的时候，姿态被零偏顶在一个固定的偏差上不动了</strong>——第 5 秒和第 30 秒几乎一样。因为比例修正只能把姿态拉到“误差恰好抵消零偏”的那个位置，它没有能力把那部分偏差消掉。加上积分项以后，误差被持续累积起来，零偏被一点点吃回去，<code>ki = 0.003</code> 时 30 秒就回到了 9.98 / 5.00。</p>
+<p>顺带说一句分寸：<strong>零偏小的时候，积分项的作用并不明显</strong>（零偏 0.5 度每秒时，加不加积分项分别是 0.27 度和 0.35 度的偏差）。零偏已经在静止校准里减过一遍，剩下的是残差和温漂，<code>ki</code> 主要负责收拾这一部分——它收拾不了一个很大的零偏，那时候该回去查校准。</p>
+<h2 id="四元数解算积分与归一化">四元数解算：积分与归一化</h2>
+<p>有了“补进修正之后的角速度”，就可以把姿态往前推一拍。用的是四元数微分方程的离散形式（一阶龙格库塔）：</p>
+<pre><code class="language-c">half_dt = 0.5f * dt_s;
+
+next_w = q0 + ((-q1 * gx) - (q2 * gy) - (q3 * gz)) * half_dt;
+next_x = q1 + (( q0 * gx) + (q2 * gz) - (q3 * gy)) * half_dt;
+next_y = q2 + (( q0 * gy) - (q1 * gz) + (q3 * gx)) * half_dt;
+next_z = q3 + (( q0 * gz) + (q1 * gy) - (q2 * gx)) * half_dt;
+</code></pre>
+<p>三件事要说清：</p>
+<ul>
+<li><strong><code>gx</code>、<code>gy</code>、<code>gz</code> 必须是弧度每秒</strong>。四元数这套运算的角度全是弧度制，混了度进去，姿态会用一种“看起来很合理、但倍率不对”的方式慢慢歪掉——这是个很隐蔽的坑。</li>
+<li><strong><code>half_dt</code> 里的 0.5 不是笔误</strong>，它来自四元数微分方程里那个 1/2 系数。</li>
+<li><strong>更新完必须归一化</strong>：</li>
+</ul>
+<pre><code class="language-c">norm = sqrtf((next_w * next_w) + (next_x * next_x) +
+             (next_y * next_y) + (next_z * next_z));
+
+q0 = next_w / norm;
+q1 = next_x / norm;
+q2 = next_y / norm;
+q3 = next_z / norm;
+</code></pre>
+<p>浮点运算有舍入误差，跑久了四元数的长度会慢慢偏离 1。长度不是 1 的四元数不再是“一次旋转”，姿态会跟着变形。<strong>每一拍归一化，这件事不能省。</strong></p>
+<p>看到归一化，我不由得想起这段代码：</p>
+<pre><code class="language-c">float Q_rsqrt( float number )
+{
+    long i;
+    float x2, y;
+    const float threehalfs = 1.5F;
+
+    x2 = number * 0.5F;
+    y  = number;
+    i  = * ( long * ) &amp;y;                       // evil floating point bit level hacking
+    i  = 0x5f3759df - ( i &gt;&gt; 1 );               // what the fuck?
+    y  = * ( float * ) &amp;i;
+    y  = y * ( threehalfs - ( x2 * y * y ) );   // 1st iteration
+//  y  = y * ( threehalfs - ( x2 * y * y ) );   // 2nd iteration, this can be removed
+
+    return y;
+}
+</code></pre>
+<p>我现在看到依旧十分震撼，简直就是鬼斧神工啊。<br>
+也忍不住要喊一句 what the fuck?</p>
+<p>顺带一提，Adafruit 的 Mahony 实现里那个 <code>invSqrt()</code> 用的就是这个数，只是它用 <code>union</code> 做类型转换、没走 <code>*(long *)&amp;y</code> 那种指针双关，而且跑了两轮牛顿迭代。</p>
+<h2 id="欧拉角计算把姿态换成三个角">欧拉角计算：把姿态换成三个角</h2>
+<p>由四元数对应的旋转矩阵，按本文的轴序和符号约定，组合出俯仰和横滚：</p>
+<pre><code class="language-c">vecx_z = 2.0f * ((q0 * q2) - (q1 * q3));
+vecy_z = 2.0f * ((q2 * q3) + (q0 * q1));
+vecz_z = 1.0f - (2.0f * ((q1 * q1) + (q2 * q2)));
+
+if (vecx_z &gt; 1.0f)
+{
+    vecx_z = 1.0f;
+}
+else if (vecx_z &lt; -1.0f)
+{
+    vecx_z = -1.0f;
+}
+
+att-&gt;angle.pitch = asinf(vecx_z) * ATTITUDE_RAD_TO_DEG;
+att-&gt;angle.roll  = atan2f(vecy_z, vecz_z) * ATTITUDE_RAD_TO_DEG;
+</code></pre>
+<p><code>asinf</code> 的输入超出 ±1 会返回 <code>NaN</code>，而浮点误差下 <code>vecx_z</code> 完全可能到 1.0000001，所以上面先夹一下——夹不住的话，姿态会从某一拍开始整个变成 <code>NaN</code>，而且再也回不来。</p>
+<p>俯仰用反正弦、横滚用反正切，和讲从寄存器到角度那一回里“用加速度算两个角”是同一对函数，区别只是这里的输入来自四元数而不是原始读数。</p>
+<p>偏航也从同一组四元数里取，别另外攒一个变量：</p>
+<pre><code class="language-c">att-&gt;angle.yaw = atan2f(2.0f * ((q0 * q3) + (q1 * q2)),
+                        1.0f - (2.0f * ((q2 * q2) + (q3 * q3)))) * ATTITUDE_RAD_TO_DEG;
+</code></pre>
+<p>这个写法不是自己凑的：x-io 的 Fusion AHRS 里写的是 <code>atan2f(Q.w * Q.z + Q.x * Q.y, 0.5f - Q.y * Q.y - Q.z * Q.z)</code>，Adafruit 的 Mahony 里是 <code>atan2f(q1 * q2 + q0 * q3, 0.5f - q2 * q2 - q3 * q3)</code>——分子分母同乘 2，就是上面这一行。横滚那两行同理，它们的 <code>atan2f(q0 * q1 + q2 * q3, 0.5f - q1 * q1 - q2 * q2)</code> 同乘 2 就是这里的 <code>vecy_z</code> 和 <code>vecz_z</code>。</p>
+<p>这一步别省。如果偏航单独用一个累加器、俯仰横滚却从四元数取，屏幕上的三个角就不再是同一个姿态的三种说法——模块一倾斜，两份状态会各走各的；而且这正好是前面第三章反对的“用三个角保存姿态”。</p>
+<p><code>atan2f</code> 的结果本来就落在 ±180 度里，不用再折返；俯仰和横滚靠上面那个钳位保证不出 <code>NaN</code>。</p>
+<p><strong>偏航仍然是积分出来的。</strong> 四元数里那个转角完全靠陀螺推，没有外部参考把它拉住，所以它照样会漂——只是坏在“误差”上，不坏在“结构”上。</p>
+<p>这里还有一个我自己的经验值：<strong>Z 轴角速度上有个 ±0.5 度每秒的死区</strong>，加在原始读数上、进四元数积分之前。静止时角速度的残差就在零点几度每秒的量级，不掐掉它，偏航会自己慢慢爬。注意它剪的是 <code>gz</code>，而 <code>gz</code> 是乘进四元数的三个分量之一——<strong>严格说三个角都会受影响</strong>，只有在接近水平时，才近似看成“只动偏航”。</p>
+<p>这个 <code>0.5</code> 是拿手边这块模块静置测出来的，换一块模块要重测；嫌它把很慢的真实转动也吃掉，就设成 <code>0</code>。它不是通用参数，更不是“标准做法”——真要做细，靠的是静止检测加零偏校准（讲零偏那一回），而不是在角速度上剪一刀。</p>
+<h2 id="把三步写成一份代码">把三步写成一份代码</h2>
+<p>上面分开讲的三步，落在代码里就是一个函数。每 10 毫秒调一次，一次做完“互补解算、四元数解算、欧拉角计算”：</p>
+<pre><code class="language-c">/* 每拍调一次：gyro 单位是度每秒，accel 单位是 g，dt_s 单位是秒；返回 1 表示这一拍用上了加速度修正 */
+uint8_t Attitude_Update(Attitude *att, const Sensor_Data *sensor, float dt_s)
+{
+    float norm;
+    float accel_x = sensor-&gt;accel_x_g;
+    float accel_y = sensor-&gt;accel_y_g;
+    float accel_z = sensor-&gt;accel_z_g;
+    float gz_dps = sensor-&gt;gyro_z_dps;
+    float gravity_x;
+    float gravity_y;
+    float gravity_z;
+    float error_x;
+    float error_y;
+    float error_z;
+    float gx;
+    float gy;
+    float gz;
+    float half_dt;
+    float q0 = att-&gt;q.w;
+    float q1 = att-&gt;q.x;
+    float q2 = att-&gt;q.y;
+    float q3 = att-&gt;q.z;
+    float next_w;
+    float next_x;
+    float next_y;
+    float next_z;
+    float vecx_z;
+    float vecy_z;
+    float vecz_z;
+    uint8_t use_accel = 0U;
+
+    /* 一、先判断这一拍的加速度能不能信 */
+    norm = sqrtf((accel_x * accel_x) + (accel_y * accel_y) + (accel_z * accel_z));
+
+    if ((norm &gt; 0.001f) &amp;&amp; (isfinite(norm)) &amp;&amp; (fabsf(norm - 1.0f) &lt; ATTITUDE_ACC_TOL_G))
+    {
+        use_accel = 1U;
+
+        accel_x /= norm;
+        accel_y /= norm;
+        accel_z /= norm;
+    }
+
+    /* 二、角速度转成弧度每秒；死区只加在原始读数上，不碰后面的修正项 */
+    if ((gz_dps &lt; ATTITUDE_YAW_DEADZONE_DPS) &amp;&amp; (gz_dps &gt; -ATTITUDE_YAW_DEADZONE_DPS))
+    {
+        gz_dps = 0.0f;
+    }
+
+    gx = sensor-&gt;gyro_x_dps * ATTITUDE_DEG_TO_RAD;
+    gy = sensor-&gt;gyro_y_dps * ATTITUDE_DEG_TO_RAD;
+    gz = gz_dps * ATTITUDE_DEG_TO_RAD;
+
+    /* 三、加速度可信时，才算误差、补比例和积分；不可信就只靠陀螺推 */
+    if (use_accel != 0U)
+    {
+        gravity_x = 2.0f * ((q1 * q3) - (q0 * q2));
+        gravity_y = 2.0f * ((q0 * q1) + (q2 * q3));
+        gravity_z = 1.0f - (2.0f * ((q1 * q1) + (q2 * q2)));
+
+        error_x = (accel_y * gravity_z) - (accel_z * gravity_y);
+        error_y = (accel_z * gravity_x) - (accel_x * gravity_z);
+        error_z = (accel_x * gravity_y) - (accel_y * gravity_x);
+
+        gx += (att-&gt;kp * error_x) + att-&gt;integral_x;
+        gy += (att-&gt;kp * error_y) + att-&gt;integral_y;
+        gz += (att-&gt;kp * error_z) + att-&gt;integral_z;
+
+        att-&gt;integral_x += att-&gt;ki * error_x;
+        att-&gt;integral_y += att-&gt;ki * error_y;
+        att-&gt;integral_z += att-&gt;ki * error_z;
+
+        if (att-&gt;integral_x &gt; ATTITUDE_INTEGRAL_MAX)  { att-&gt;integral_x = ATTITUDE_INTEGRAL_MAX; }
+        if (att-&gt;integral_x &lt; -ATTITUDE_INTEGRAL_MAX) { att-&gt;integral_x = -ATTITUDE_INTEGRAL_MAX; }
+        if (att-&gt;integral_y &gt; ATTITUDE_INTEGRAL_MAX)  { att-&gt;integral_y = ATTITUDE_INTEGRAL_MAX; }
+        if (att-&gt;integral_y &lt; -ATTITUDE_INTEGRAL_MAX) { att-&gt;integral_y = -ATTITUDE_INTEGRAL_MAX; }
+        if (att-&gt;integral_z &gt; ATTITUDE_INTEGRAL_MAX)  { att-&gt;integral_z = ATTITUDE_INTEGRAL_MAX; }
+        if (att-&gt;integral_z &lt; -ATTITUDE_INTEGRAL_MAX) { att-&gt;integral_z = -ATTITUDE_INTEGRAL_MAX; }
+    }
+
+    /* 四、一阶龙格库塔，把姿态往前推一拍：加速度不可用也照推 */
+    half_dt = 0.5f * dt_s;
+
+    next_w = q0 + (((-q1 * gx) - (q2 * gy) - (q3 * gz)) * half_dt);
+    next_x = q1 + ((( q0 * gx) + (q2 * gz) - (q3 * gy)) * half_dt);
+    next_y = q2 + ((( q0 * gy) - (q1 * gz) + (q3 * gx)) * half_dt);
+    next_z = q3 + ((( q0 * gz) + (q1 * gy) - (q2 * gx)) * half_dt);
+
+    /* 五、归一化；范数算不出来就原地不动，别把 NaN 传下去 */
+    norm = sqrtf((next_w * next_w) + (next_x * next_x) +
+                 (next_y * next_y) + (next_z * next_z));
+
+    if ((norm &gt; 0.000001f) &amp;&amp; (isfinite(norm)))
+    {
+        q0 = next_w / norm;
+        q1 = next_x / norm;
+        q2 = next_y / norm;
+        q3 = next_z / norm;
+
+        att-&gt;q.w = q0;
+        att-&gt;q.x = q1;
+        att-&gt;q.y = q2;
+        att-&gt;q.z = q3;
+    }
+
+    /* 六、三个角全部从同一组四元数换算出来 */
+    vecx_z = 2.0f * ((q0 * q2) - (q1 * q3));
+    vecy_z = 2.0f * ((q2 * q3) + (q0 * q1));
+    vecz_z = 1.0f - (2.0f * ((q1 * q1) + (q2 * q2)));
+
+    if (vecx_z &gt; 1.0f)
+    {
+        vecx_z = 1.0f;
+    }
+    else if (vecx_z &lt; -1.0f)
+    {
+        vecx_z = -1.0f;
+    }
+
+    att-&gt;angle.pitch = asinf(vecx_z) * ATTITUDE_RAD_TO_DEG;
+    att-&gt;angle.roll  = atan2f(vecy_z, vecz_z) * ATTITUDE_RAD_TO_DEG;
+    att-&gt;angle.yaw   = atan2f(2.0f * ((q0 * q3) + (q1 * q2)),
+                              1.0f - (2.0f * ((q2 * q2) + (q3 * q3)))) * ATTITUDE_RAD_TO_DEG;
+
+    return use_accel;
+}
+</code></pre>
+<p>六步和前面讲的顺序一致，只有一处顺序上的讲究：<strong>先归一化四元数、再算欧拉角</strong>。反过来的话，拿到的是一组长度不是 1 的四元数算出来的角度，误差会跟着长度一起漂。</p>
+<h2 id="写完先跑这四条">写完先跑这四条</h2>
+<p>改完别急着往车上装，先让它在桌面上把这四条过了：</p>
+<ul>
+<li>平放、静止，俯仰和横滚应该停在 0 附近，偏航停在一个固定的数——不是 0 也正常，它没有绝对参考。</li>
+<li>只绕 Z 轴转 90 度，<code>yaw</code> 应该走到 90 度附近。这条专治偏航公式抄错分子：抄错的话它要么纹丝不动，要么跳到别的象限。</li>
+<li>快速晃一下模块（让加速度模长明显偏离 1g），四元数应该照常跟着陀螺变化，而不是卡住不动。</li>
+<li>一直晃着不放，积分项不应该越涨越大——那是 <code>ATTITUDE_INTEGRAL_MAX</code> 在上限位拦住了它。</li>
+</ul>
+<h2 id="一份完整的程序">一份完整的程序</h2>
+<p>把两路滤波那一回的输出和前面这三步接起来：</p>
+<pre><code class="language-c">static Attitude g_attitude;
+
+void Attitude_ShowOnOled(void)
+{
+    OLED_ShowString(0, 0, "P:", OLED_8X16);
+    OLED_ShowSignedNum(24, 0, (int32_t)g_attitude.angle.pitch, 3, OLED_8X16);
+
+    OLED_ShowString(64, 0, "R:", OLED_8X16);
+    OLED_ShowSignedNum(88, 0, (int32_t)g_attitude.angle.roll, 3, OLED_8X16);
+
+    OLED_ShowString(0, 16, "Y:", OLED_8X16);
+    OLED_ShowSignedNum(24, 16, (int32_t)g_attitude.angle.yaw, 4, OLED_8X16);
+
+    OLED_ShowString(0, 32, "q", OLED_8X16);
+    OLED_ShowSignedNum(24, 32, (int32_t)(g_attitude.q.w * 1000.0f), 5, OLED_8X16);
+
+    OLED_Update();
+}
+
+void Attitude_PrintCsv(void)
+{
+    printf("%d,%d,%d,%d,%d,%d\r\n",
+           (int32_t)(g_attitude.angle.pitch * 100.0f),
+           (int32_t)(g_attitude.angle.roll * 100.0f),
+           (int32_t)(g_attitude.angle.yaw * 100.0f),
+           (int32_t)(g_sensor.gyro_x_dps * 100.0f),
+           (int32_t)(g_sensor.gyro_y_dps * 100.0f),
+           (int32_t)(g_sensor.gyro_z_dps * 100.0f));
+}
+
+int main(void)
+{
+    uint32_t read_last_ms = 0U;
+    uint32_t show_last_ms = 0U;
+    float dt_s;
+
+    OLED_Init();
+    MPU6050_Init();                     /* 里面先读一次身份寄存器 */
+    Gyro_LpfInit();                     /* 角速度那一路的低通 */
+    Accel_KfInit();                     /* 加速度那一路的卡尔曼 */
+    Attitude_Init(&amp;g_attitude, 0.8f, 0.0003f);
+
+    while (1)
+    {
+        if ((uint32_t)(tick_ms - read_last_ms) &gt;= 10U)
+        {
+            dt_s = (float)((uint32_t)(tick_ms - read_last_ms)) * 0.001f;
+            read_last_ms = tick_ms;
+
+            Sensor_Update();                                    /* 读、换算、去偏、两路滤波 */
+            Attitude_Update(&amp;g_attitude, &amp;g_sensor, dt_s);      /* 互补解算 + 四元数解算 */
+        }
+
+        if ((uint32_t)(tick_ms - show_last_ms) &gt;= 200U)
+        {
+            show_last_ms = tick_ms;
+            Attitude_ShowOnOled();
+            Attitude_PrintCsv();
+        }
+    }
+}
+</code></pre>
+<p><code>Sensor_Update</code>、<code>Gyro_LpfInit</code>、<code>Accel_KfInit</code> 和 <code>g_sensor</code>（里面是低通后的角速度、卡尔曼后的加速度）都是讲两路滤波那一回写好的；<code>tick_ms</code> 是每毫秒加一的时间轴；OLED 那几个函数分别写字符串和带符号整数；<code>printf</code> 已经在把字符接到串口那一回接好，输出的是逗号隔开的整数，小数点往后挪两位就是真实值。</p>
+<h2 id="五个现场">五个现场</h2>
+<p><strong>一、静止十秒。</strong> 模块放稳，看屏幕上的三个数。<code>pitch</code> 和 <code>roll</code> 会在零点几度里晃——这是加速度那一路的噪声通过修正项传进来的，量级很小；<code>yaw</code> 会缓慢地往一个方向走，因为那一路只有角速度积分，死区只挡住了零点几度每秒以下的部分。</p>
+<p><strong>二、沿 X 轴、Y 轴慢慢倾斜。</strong> 先抬 X 轴那一侧，看 <code>pitch</code> 变还是 <code>roll</code> 变；再抬 Y 轴那一侧。慢动作时加速度计看到的几乎就是重力，修正项最有效，姿态跟得很紧。方向反了先查轴映射和符号，不要先去改 <code>kp</code>。</p>
+<p><strong>三、快速晃动和敲桌子。</strong> 快晃的时候加速度计测到的不只是重力，还有运动本身——这时候姿态会被“错误的重力方向”拽一下，屏幕上表现为跟着晃一下再回来。敲桌面同理，只是短促。这一条说明修正项有前提：<strong>当前合加速度主要来自重力</strong>。真要滤掉这种冲击，别在姿态里使劲，回到加速度那一侧调它的滤波参数；或者接受它——毕竟车真的有振动。</p>
+<p><strong>四、绕 Z 轴转一圈，再转回原位。</strong> <code>yaw</code> 会跟着转过去，但转回来以后通常<strong>不回到原来的数</strong>，会差几度。原因在前面写过：偏航没有参考，那一路就是积分出来的，误差只会积累。</p>
+<p><strong>五、把 <code>yaw</code> 从 179 推过 −180。</strong> 从 <code>179</code> 继续往同方向转，显示会跳到 <code>−179</code>。这是 <code>atan2f</code> 的值域决定的，不是姿态真的瞬移。麻烦在这之后：如果控制环里写 <code>target_yaw - current_yaw</code>，它可能算出 358 度——同一个方向，被当成转了将近一整圈。所以<strong>送进控制环之前要先对角度差归一化</strong>，把它折到 −180 ~ 180 之间再比较。</p>
+<h2 id="换一个表示三维里解不出来的用四维解">换一个表示：三维里解不出来的，用四维解</h2>
+<p>回头看，前面最不“工程”的一步，反而是最该记住的一步。</p>
+<p>姿态在三个角里做不下去——转到 90 度附近会退化，两个角粘在一起。我们做的事不是“把公式写得更复杂”，而是<strong>换了一个装得下这个问题的空间</strong>：从三个角换成四个数。问题没有变难，是原来那个盒子太小了。</p>
+<p>这一招不是姿态估计发明的，数学和工程里到处都有它的影子。</p>
+<p><strong>实数装不下的时候，就换到复数。</strong> 解一元三次方程的求根公式，中途会冒出负数开平方——在实数里没有答案。当年只能绕开走，后来发现绕不过去，干脆把这类数也当成数，于是有了复数。再往后，交流电的阻抗、相位、傅里叶变换全建立在这上面。<strong>当初为了让一个公式走通而引入的东西，后来变成了一整片地方的语言。</strong></p>
+<p><strong>三个数装不下的时候，就升到四个。</strong> 机器人算关节运动时会遇到同一件事：一个 3×3 的矩阵能表示“转”，但表示不了“平移”；把坐标升一维、用四个数表示一个点（齐次坐标），旋转和平移就能合成同一个矩阵，一串关节的变换就是一串乘法。同一个动作：<strong>升一维，问题从“凑不出来”变成“乘一乘”。</strong></p>
+<p><strong>状态不够装的时候，就多一个格子。</strong> 讲卡尔曼那一篇里有一模一样的例子：一维滤波里，“零偏”这个东西没有位置可放，所以只能开机校一次；给它加一个状态，它就能在跑的过程中被估出来，角度的误差被摁在零点几度里。滤波器本身没有变强，是<strong>状态空间里多了一个格子</strong>。</p>
+<p>把四个例子摆在一起，形状是一样的：</p>
+<table>
+<thead>
+<tr>
+<th>原来的表示</th>
+<th>卡在哪</th>
+<th>换到哪</th>
+<th>换来什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>实数</td>
+<td>负数开平方没答案</td>
+<td>复数</td>
+<td>阻抗、相位、频域分析的语言</td>
+</tr>
+<tr>
+<td>三个欧拉角</td>
+<td>某些姿态下退化（万向节锁）</td>
+<td>四元数</td>
+<td>连续、任何姿态都不退化</td>
+</tr>
+<tr>
+<td>3×3 矩阵加一个向量</td>
+<td>平移塞不进同一个矩阵</td>
+<td>齐次坐标（多一维）</td>
+<td>旋转和平移可以连乘</td>
+</tr>
+<tr>
+<td>一维状态</td>
+<td>零偏无处安放</td>
+<td>两状态</td>
+<td>没测到的量能被估出来</td>
+</tr>
+</tbody>
+</table>
+<p>以后在工程里，这种时刻会一次次出现：公式没错、代码也对、数据也看着正常，可在现在这套描述里怎么都做不下去。那时候除了继续调参数，还有一句要先问自己——<strong>是不是把问题放错了地方？</strong> 换个表示、多一个维度、换一组坐标，很多卡了很久的事会突然变成“照公式写就行”。</p>
+<p>不过也要说清分寸：<strong>升维解决的是“能不能描述”，不解决“数据准不准”。</strong> 四元数不直观、每拍都得归一化；复数要理解虚部；齐次坐标多一个数、计算量跟着涨——这些都是换表示要付的钱。而传感器坏了、模块装歪了、轴映射反了，换到几维都救不了，它们不在表示这一层。</p>
+<h2 id="工程版带输入检查与异常计数的实现">工程版：带输入检查与异常计数的实现</h2>
+<p>前面那份是为了讲清楚，只有两百来行。真装到车上，还差八样东西——都不是算法，是“线上会出事”的地方：</p>
+<pre><code class="language-c">/* ============================================================
+ * 六轴 Mahony，工程版
+ * 比教科书版多出来的八样：
+ *   1. 输入先验一遍：陀螺读数、dt_s 里只要有 NaN、无穷、非正或大得离谱，整拍丢弃
+ *   2. 陀螺超限单独计数：撞车和"数据坏了"是两件事，别混成一个数
+ *   3. 加速度分两道门：「有效」（模长算得出来）和「合理」（模长接近 1g）
+ *   4. 合理性判断带滞回：进 0.15、出 0.10，避免在边界上反复开关
+ *   5. 可信度三档：无效 = 0，可疑久了 = 0.25，可信 = 1——降权，不是二选一
+ *   6. 启动期大增益：前 3 秒快速对准，之后切回正常值
+ *   7. 积分按秒计、限幅、权重为 0 时不累加
+ *   8. 归一化失败保留上一拍的姿态、只记一个数，不重置成单位四元数
+ * ============================================================ */
+
+#include &lt;math.h&gt;
+#include &lt;stdint.h&gt;
+
+#define AHRS_KP                 0.5f
+#define AHRS_KI_RATE            0.03f          /* 积分增益，单位：每秒，乘的是 dt_s */
+#define AHRS_STARTUP_KP        10.0f           /* 启动期增益（经验值，见正文） */
+#define AHRS_STARTUP_MS      3000U             /* 启动期多长 */
+#define AHRS_ACC_ENTER_G        0.15f          /* 模长偏离超过这个：判为可疑 */
+#define AHRS_ACC_EXIT_G         0.10f          /* 回到这个以内：判为可信 */
+#define AHRS_ACC_REJECT_MS     500U            /* 连续可疑这么久：降到低可信度 */
+#define AHRS_ACC_LOW_WEIGHT     0.25f          /* 低可信度时 kp、ki 都乘这个 */
+#define AHRS_GYRO_LIMIT_DPS   1000.0f          /* 超过就当这一拍饱和 */
+#define AHRS_INTEGRAL_MAX       0.5f           /* 积分项上限，弧度每秒 */
+#define AHRS_DT_MAX_S           1.0f           /* 单拍间隔上限：超过就当数据断了 */
+
+typedef struct
+{
+    Quaternion q;              /* 姿态本体 */
+    float      integral_x;
+    float      integral_y;
+    float      integral_z;
+    uint32_t   startup_left_ms;/* 启动期还剩多少 */
+    uint16_t   reject_ms;      /* 已经连续可疑多久 */
+    uint8_t    accel_used;     /* 这一拍加速度有没有参与（滞回靠它） */
+    uint32_t   sample_count;   /* 一共跑了多少拍 */
+    uint32_t   reject_count;   /* 加速度可疑/无效的拍数 */
+    uint32_t   input_fault_count; /* 输入不合法，整拍丢弃的拍数 */
+    uint32_t   gyro_limit_count;  /* 其中因为陀螺超限丢的 */
+    uint32_t   norm_fault_count;  /* 归一化失败过几次 */
+} Ahrs;
+
+void Ahrs_Init(Ahrs *ahrs)
+{
+    ahrs-&gt;q.w = 1.0f;
+    ahrs-&gt;q.x = 0.0f;
+    ahrs-&gt;q.y = 0.0f;
+    ahrs-&gt;q.z = 0.0f;
+    ahrs-&gt;integral_x = 0.0f;
+    ahrs-&gt;integral_y = 0.0f;
+    ahrs-&gt;integral_z = 0.0f;
+    ahrs-&gt;startup_left_ms = AHRS_STARTUP_MS;
+    ahrs-&gt;reject_ms = 0U;
+    ahrs-&gt;accel_used = 0U;
+    ahrs-&gt;sample_count = 0U;
+    ahrs-&gt;reject_count = 0U;
+    ahrs-&gt;input_fault_count = 0U;
+    ahrs-&gt;gyro_limit_count = 0U;
+    ahrs-&gt;norm_fault_count = 0U;
+}
+
+/* 每拍调一次。返回 1 表示这一拍姿态更新了；
+ * 这一拍有没有用上加速度，看 ahrs-&gt;accel_used——两件事分开，别用一个返回值兼着说 */
+uint8_t Ahrs_Update(Ahrs *ahrs, const Sensor_Data *sensor, float dt_s)
+{
+    float ax = sensor-&gt;accel_x_g;
+    float ay = sensor-&gt;accel_y_g;
+    float az = sensor-&gt;accel_z_g;
+    float gx;
+    float gy;
+    float gz;
+    float norm;
+    float dev;
+    float gravity_x;
+    float gravity_y;
+    float gravity_z;
+    float error_x;
+    float error_y;
+    float error_z;
+    float kp;
+    float half_dt;
+    float q0 = ahrs-&gt;q.w;
+    float q1 = ahrs-&gt;q.x;
+    float q2 = ahrs-&gt;q.y;
+    float q3 = ahrs-&gt;q.z;
+    float next_w;
+    float next_x;
+    float next_y;
+    float next_z;
+    uint32_t step_ms;
+    float accel_weight = 0.0f;
+    uint8_t accel_valid = 0U;
+    uint8_t input_bad = 0U;
+    uint8_t state_updated = 0U;
+
+    ahrs-&gt;sample_count++;
+
+    /* 一、输入先验一遍。周期不合法、陀螺读数不是数，整拍丢弃 */
+    if ((!isfinite(dt_s)) || (dt_s &lt;= 0.0f) || (dt_s &gt; AHRS_DT_MAX_S) ||
+        (!isfinite(sensor-&gt;gyro_x_dps)) || (!isfinite(sensor-&gt;gyro_y_dps)) ||
+        (!isfinite(sensor-&gt;gyro_z_dps)))
+    {
+        input_bad = 1U;
+    }
+    else if ((fabsf(sensor-&gt;gyro_x_dps) &gt; AHRS_GYRO_LIMIT_DPS) ||
+             (fabsf(sensor-&gt;gyro_y_dps) &gt; AHRS_GYRO_LIMIT_DPS) ||
+             (fabsf(sensor-&gt;gyro_z_dps) &gt; AHRS_GYRO_LIMIT_DPS))
+    {
+        input_bad = 2U;           /* 饱和：撞车、摔模块 */
+    }
+    else
+    {
+        input_bad = 0U;
+    }
+
+    if (input_bad != 0U)
+    {
+        ahrs-&gt;input_fault_count++;
+
+        if (input_bad == 2U)
+        {
+            ahrs-&gt;gyro_limit_count++;
+        }
+
+        ahrs-&gt;integral_x = 0.0f;     /* 软重启：积分丢掉，别带着错零偏继续跑 */
+        ahrs-&gt;integral_y = 0.0f;
+        ahrs-&gt;integral_z = 0.0f;
+
+        return 0U;                   /* 姿态没更新 */
+    }
+
+    /* 这一步放在检查之后：dt_s 是无穷大的时候，转成整数是未定义行为 */
+    step_ms = (uint32_t)(dt_s * 1000.0f);
+
+    if (step_ms == 0U)
+    {
+        step_ms = 1U;
+    }
+
+    /* 二、第一道门「有效」：模长算得出来、不是零向量。这道门永远不放开 */
+    norm = sqrtf((ax * ax) + (ay * ay) + (az * az));
+
+    if ((isfinite(norm)) &amp;&amp; (norm &gt; 0.001f))
+    {
+        accel_valid = 1U;
+    }
+
+    /* 三、可信度三档：无效 0、可疑久了 0.25、可信 1 */
+    if (accel_valid != 0U)
+    {
+        dev = fabsf(norm - 1.0f);
+
+        if (dev &lt; ((ahrs-&gt;accel_used != 0U) ? AHRS_ACC_EXIT_G : AHRS_ACC_ENTER_G))
+        {
+            ahrs-&gt;reject_ms = 0U;
+            accel_weight = 1.0f;
+        }
+        else
+        {
+            /* 有效但可疑：先完全不用；拒久了就降到低可信度，慢慢修一点，不硬拽 */
+            if (ahrs-&gt;reject_ms &lt;= (0xFFFFU - step_ms))
+            {
+                ahrs-&gt;reject_ms = (uint16_t)(ahrs-&gt;reject_ms + step_ms);
+            }
+            else
+            {
+                ahrs-&gt;reject_ms = 0xFFFFU;
+            }
+
+            ahrs-&gt;reject_count++;
+
+            if (ahrs-&gt;reject_ms &gt;= AHRS_ACC_REJECT_MS)
+            {
+                ahrs-&gt;reject_ms = AHRS_ACC_REJECT_MS;  /* 停在这一档，不再累加 */
+                accel_weight = AHRS_ACC_LOW_WEIGHT;
+            }
+        }
+    }
+    else
+    {
+        ahrs-&gt;reject_ms = 0U;
+        ahrs-&gt;reject_count++;
+        /* 无效数据权重恒为 0，永远走不到下面的除法 */
+    }
+
+    ahrs-&gt;accel_used = (accel_weight &gt; 0.0f) ? 1U : 0U;
+
+    /* 四、启动期用大增益，几秒后切回正常值 */
+    kp = (ahrs-&gt;startup_left_ms &gt; 0U) ? AHRS_STARTUP_KP : AHRS_KP;
+
+    if (ahrs-&gt;startup_left_ms &gt; 0U)
+    {
+        ahrs-&gt;startup_left_ms = (step_ms &gt;= ahrs-&gt;startup_left_ms)
+                              ? 0U : (ahrs-&gt;startup_left_ms - step_ms);
+    }
+
+    /* 五、角速度转弧度。这里不做死区——慢速转动是真实信息 */
+    gx = sensor-&gt;gyro_x_dps * ATTITUDE_DEG_TO_RAD;
+    gy = sensor-&gt;gyro_y_dps * ATTITUDE_DEG_TO_RAD;
+    gz = sensor-&gt;gyro_z_dps * ATTITUDE_DEG_TO_RAD;
+
+    /* 六、按权重修正：可疑的时候 kp 和 ki 一起降，而不是要么全信要么全关 */
+    if (accel_weight &gt; 0.0f)
+    {
+        ax /= norm;
+        ay /= norm;
+        az /= norm;
+
+        gravity_x = 2.0f * ((q1 * q3) - (q0 * q2));
+        gravity_y = 2.0f * ((q0 * q1) + (q2 * q3));
+        gravity_z = 1.0f - (2.0f * ((q1 * q1) + (q2 * q2)));
+
+        error_x = (ay * gravity_z) - (az * gravity_y);
+        error_y = (az * gravity_x) - (ax * gravity_z);
+        error_z = (ax * gravity_y) - (ay * gravity_x);
+
+        gx += (kp * accel_weight * error_x) + ahrs-&gt;integral_x;
+        gy += (kp * accel_weight * error_y) + ahrs-&gt;integral_y;
+        gz += (kp * accel_weight * error_z) + ahrs-&gt;integral_z;
+
+        /* 积分按秒算，权重一起乘：不信任的测量也不该往积分里灌 */
+        ahrs-&gt;integral_x += AHRS_KI_RATE * accel_weight * error_x * dt_s;
+        ahrs-&gt;integral_y += AHRS_KI_RATE * accel_weight * error_y * dt_s;
+        ahrs-&gt;integral_z += AHRS_KI_RATE * accel_weight * error_z * dt_s;
+
+        if (ahrs-&gt;integral_x &gt; AHRS_INTEGRAL_MAX)  { ahrs-&gt;integral_x = AHRS_INTEGRAL_MAX; }
+        if (ahrs-&gt;integral_x &lt; -AHRS_INTEGRAL_MAX) { ahrs-&gt;integral_x = -AHRS_INTEGRAL_MAX; }
+        if (ahrs-&gt;integral_y &gt; AHRS_INTEGRAL_MAX)  { ahrs-&gt;integral_y = AHRS_INTEGRAL_MAX; }
+        if (ahrs-&gt;integral_y &lt; -AHRS_INTEGRAL_MAX) { ahrs-&gt;integral_y = -AHRS_INTEGRAL_MAX; }
+        if (ahrs-&gt;integral_z &gt; AHRS_INTEGRAL_MAX)  { ahrs-&gt;integral_z = AHRS_INTEGRAL_MAX; }
+        if (ahrs-&gt;integral_z &lt; -AHRS_INTEGRAL_MAX) { ahrs-&gt;integral_z = -AHRS_INTEGRAL_MAX; }
+    }
+
+    /* 七、不管加速度用不用，陀螺都要推 */
+    half_dt = 0.5f * dt_s;
+
+    next_w = q0 + (((-q1 * gx) - (q2 * gy) - (q3 * gz)) * half_dt);
+    next_x = q1 + ((( q0 * gx) + (q2 * gz) - (q3 * gy)) * half_dt);
+    next_y = q2 + ((( q0 * gy) - (q1 * gz) + (q3 * gx)) * half_dt);
+    next_z = q3 + ((( q0 * gz) + (q1 * gy) - (q2 * gx)) * half_dt);
+
+    /* 八、归一化。失败就停在上一拍——姿态突然跳回“没转过”，比带着误差更危险 */
+    norm = sqrtf((next_w * next_w) + (next_x * next_x) +
+                 (next_y * next_y) + (next_z * next_z));
+
+    if ((isfinite(norm)) &amp;&amp; (norm &gt; 0.000001f))
+    {
+        ahrs-&gt;q.w = next_w / norm;
+        ahrs-&gt;q.x = next_x / norm;
+        ahrs-&gt;q.y = next_y / norm;
+        ahrs-&gt;q.z = next_z / norm;
+        state_updated = 1U;
+    }
+    else
+    {
+        ahrs-&gt;norm_fault_count++;   /* 这一拍不算，姿态仍是上一拍的值 */
+    }
+
+    return state_updated;
+}
+
+/* 三个角全部从同一组四元数换算，和前面那套公式一字不差 */
+void Ahrs_GetEuler(const Ahrs *ahrs, Euler_Angle *angle)
+{
+    float q0 = ahrs-&gt;q.w;
+    float q1 = ahrs-&gt;q.x;
+    float q2 = ahrs-&gt;q.y;
+    float q3 = ahrs-&gt;q.z;
+    float vecx_z;
+
+    vecx_z = 2.0f * ((q0 * q2) - (q1 * q3));
+
+    if (vecx_z &gt; 1.0f)       { vecx_z = 1.0f; }
+    else if (vecx_z &lt; -1.0f) { vecx_z = -1.0f; }
+
+    angle-&gt;pitch = asinf(vecx_z) * ATTITUDE_RAD_TO_DEG;
+    angle-&gt;roll  = atan2f(2.0f * ((q2 * q3) + (q0 * q1)),
+                          1.0f - (2.0f * ((q1 * q1) + (q2 * q2)))) * ATTITUDE_RAD_TO_DEG;
+    angle-&gt;yaw   = atan2f(2.0f * ((q0 * q3) + (q1 * q2)),
+                          1.0f - (2.0f * ((q2 * q2) + (q3 * q3)))) * ATTITUDE_RAD_TO_DEG;
+}
+</code></pre>
+<p>主循环里就一行替换：</p>
+<pre><code class="language-c">Ahrs_Update(&amp;g_ahrs, &amp;g_sensor, dt_s);
+</code></pre>
+<p>调参时盯四个数：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>看哪个计数</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>姿态跟不上</td>
+<td><code>reject_count</code> 一直在涨</td>
+<td>加速度总被拒，先查是不是振动太大或模长门限太紧</td>
+</tr>
+<tr>
+<td>姿态偶尔卡住</td>
+<td><code>input_fault_count</code> 在涨</td>
+<td>输入不合法被整拍丢弃；再看 <code>gyro_limit_count</code> 分清是撞了还是数据坏了</td>
+</tr>
+<tr>
+<td>某一拍姿态没动、之后又正常</td>
+<td><code>norm_fault_count</code> 在涨</td>
+<td>归一化算出 0 或 NaN，那一拍姿态停在原处</td>
+</tr>
+<tr>
+<td>静止时俯仰横滚慢慢偏</td>
+<td><code>reject_count</code> 不涨但姿态在走</td>
+<td>加速度没问题、修正没被拒，回头查 <code>kp</code> 是不是太小</td>
+</tr>
+</tbody>
+</table>
+<p><strong>和教科书版的八处差别，逐条说清为什么：</strong></p>
+<ul>
+<li><strong>输入先验 + 分开计数</strong>：周期不合法、陀螺读数不是数，整拍丢弃；角速度超量程（撞车那一刻几百度每秒）也丢，但<strong>单独记一个数</strong>——“撞了”和“数据坏了”是两件事，混成一个计数器，调参时就分不清该查哪边。丢掉一拍，代价是这十毫秒姿态少推一点，比积分到一个回不来位置强。</li>
+<li><strong>滞回</strong>：单门限会在 0.15 附近反复开关，每开一次就“拉一下、松一下”，屏幕上表现为姿态轻微抖。两个门限把这个抖动消掉。</li>
+<li><strong>可信度三档，不是二选一</strong>：无效（NaN、零向量）权重 0，永远不进除法；有效但可疑（车在振、合加速度被运动加速度污染）先当 0，连续可疑超过 500 毫秒就降到 0.25；可信就是 1。降下来的是 <code>kp</code> 和 <code>ki</code> 两个——只降 <code>kp</code>，积分项还在往错的误差上灌；全关掉，俯仰横滚又会退回纯陀螺积分、顺着零偏漂走。中间这一档才是那个“两头都别走极端”的位置。</li>
+<li><strong>启动期大增益</strong>：上电时 <code>q = (1,0,0,0)</code>，如果模块实际是歪的，正常增益要几秒才追得上；前 3 秒把增益开到 20 倍（<code>AHRS_KP</code> 是 0.5，<code>AHRS_STARTUP_KP</code> 是 10），零点几秒就对准，之后切回来。</li>
+<li><strong>积分按秒、限幅、权重为 0 时不累加</strong>：<code>AHRS_KI_RATE</code> 的单位是 1/秒、乘的是 <code>dt_s</code>，所以周期变了、积分强度跟着变，不用改常数；教学版把 <code>dt</code> 并进了 <code>ki</code>，只在 10 毫秒固定节拍下等价。积分项一旦被一次大误差堆到很大的值，会顶着姿态一直往一边偏、自己回不来，所以要限幅；权重乘在误差上，不可信的测量灌不进积分。</li>
+<li><strong><code>isfinite</code> 全链路</strong>：一个 NaN 进去，四元数就永远是 NaN，屏幕全 <code>nan</code>，而且看不出是从哪一拍开始的。这里连 <code>dt_s</code> 和三个陀螺读数一起验了——教学版只挡了加速度模长和四元数范数，照着抄容易把“挡了模长”当成“全都挡了”。</li>
+<li><strong>归一化失败就停在上一拍</strong>：算出 0 或者 NaN 的时候退回单位四元数看着“安全”，其实是把姿态瞬间拉回“没转过”，控制环会跟着看到一个几十度的误差。保留上一拍、记一个数，由上层决定要不要重新初始化，比硬跳回去温和。</li>
+<li><strong>计数</strong>：这五个计数器比波形便宜得多，出问题时先看它们涨不涨，能一步分到“测量被拒”、“输入不合法”、“归一化失败”还是“参数不够”。</li>
+</ul>
+<p><strong>教科书版那个 ±0.5 度每秒的死区，工程版里没有。</strong> 真要做的是静止检测 + 零偏校准（讲零偏那一回），让积分项自己把零偏吃掉；死区只是“看着干净”，代价是慢速转动被扔掉——而慢速转动在循迹和云台里恰恰是最常见的工况。</p>
+<p><strong>但有一件事得写清楚，它是六轴的边界、不是参数问题：</strong> 如果加速度长期完全不可信，六轴 IMU 没办法同时做到“不漂”和“不被错误的重力方向带偏”——观测信息就那么多，再怎么调都只是在这两者之间挪。真要往上走，靠的是别的手段：电机振动的机械隔离与陷波、用新息的残差而不只是 <code>|norm − 1|</code> 判断可信度、静止时做零偏更新，以及磁力计、视觉、轮速这类外部参考。专业的实现一般也是“拒绝 + 降权 + 创新检验”几种组合着用，既不会永久关掉，也不会无条件强行融合。</p>
+<h2 id="平地小车只关心航向融合陀螺与轮编码器">平地小车只关心航向：融合陀螺与轮编码器</h2>
+<p>前面那份代码把三个角都算出来了。可小车在平地上跑，天天真正用到的只有<strong>航向</strong>——转了多少度、有没有跑偏。俯仰和横滚呢？车不上坡、不爬台阶的时候，它们变化很小，小到可以不当成控制目标。</p>
+<p>这里要小心一个措辞：这叫<strong>有条件的先验</strong>，不叫“把数据改成理想值”。先验成立要三个条件——车基本水平、IMU 装正了、任务只关心平面上的转向。条件破了（上坡、明显侧倾、模块本身装歪了），这条先验就不成立，得退回完整的三维姿态。把 <code>roll</code>、<code>pitch</code> 无条件钉死成 0，等于把真实的侧倾当成误差消掉，比不做还糟。</p>
+<h3 id="先分清准是哪一种">先分清“准”是哪一种</h3>
+<p>“航向要准”这句话，至少能拆成三种要求，做法完全不一样：</p>
+<table>
+<thead>
+<tr>
+<th>要求</th>
+<th>靠什么</th>
+<th>能做到什么程度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>短时间转了多少度，要跟手</td>
+<td>陀螺积分</td>
+<td>很好，几十毫秒级的响应基本无损</td>
+</tr>
+<tr>
+<td>走一段路之后，相对出发时的航向要准</td>
+<td>陀螺 + 左右轮编码器</td>
+<td>好，但受打滑和标定影响</td>
+</tr>
+<tr>
+<td>相对场地或者真北的绝对航向要准</td>
+<td>必须有外部航向参考</td>
+<td>六轴 IMU 加轮编码器都做不到</td>
+</tr>
+</tbody>
+</table>
+<p>这一节只做前两种。第三种在上一节已经说透：绕着重力轴转，加速度计看不出任何变化，六轴里没有“北”这个东西。</p>
+<h3 id="加速度计为什么拉不回航向">加速度计为什么拉不回航向</h3>
+<p>一句话重述：重力方向是竖直的，绕竖直轴转一圈，重力的方向和大小都不变。所以叉乘出来的误差在竖直方向上没有分量，<code>error_z</code> 始终约等于零，修正项使不上劲。航向只能靠角速度积分，而积分会把零偏一点点攒成角度漂移——这就是六轴 IMU 的 yaw 只能“短时间可信”的原因。</p>
+<p>那怎么办？给它第二个来源。小车身上现成就有一个：<strong>左右轮编码器</strong>。</p>
+<h3 id="两条来源不同的这一拍转了多少">两条来源不同的“这一拍转了多少”</h3>
+<p>差速车转弯时，左右轮走过的距离不一样。轮距（两轮接地点中心距）记作 <code>B</code>，一个采样周期里左右轮各走 <code>Δs_L</code>、<code>Δs_R</code>，那么这一拍转过的角度约等于：</p>
+<pre><code class="language-text">Δyaw_wheel ≈ (Δs_R − Δs_L) / B      （弧度）
+</code></pre>
+<p>陀螺那边是另一条来源不同的估计：</p>
+<pre><code class="language-text">Δyaw_gyro = (gyro_z − gyro_bias) × Δt   （度）
+</code></pre>
+<p>两条路各有各的毛病，而且<strong>主要的误差机理不同</strong>：</p>
+<p>注意“来源不同”不等于“完全独立”。时间戳没对齐、标定有错、车身被撞一下，这些会同时影响两边，融合不会自动把它们消掉。</p>
+<pre><code class="language-text">陀螺 z × dt        → 这一拍转了多少（快、平滑，但零偏会积成漂）
+左右轮增量 / 轮距  → 这一拍转了多少（低速时计数有量化，还受轮地接触和打滑影响）
+              ↓
+        按可信度加权相加
+              ↓
+   yaw：相对启动那一刻的航向变化
+</code></pre>
+<p>注意最后那个限定：<strong>它相对的是“启动那一刻”，不是真北，也不是场地</strong>。编码器算出来的是里程计，走得越久越不准；两路融合能让它更稳，但不会自动变成绝对航向。</p>
+<h3 id="一段能跑的融合代码">一段能跑的融合代码</h3>
+<p>编码器那边直接用前面速度环里那套读数，每 20 毫秒读一次左右轮的增量计数。在这之前先把前提说清楚：<strong>只有 IMU 的 Z 轴与车体竖直轴对齐、俯仰和横滚都比较小、车在平面上运动时，车体的转向角速度才约等于 <code>gyro_z</code></strong>。车明显侧倾或者模块贴歪了，这三个量之间差一个投影，得先转过一次坐标，或者干脆用完整的三维姿态去取航向。</p>
+<pre><code class="language-c">#define WHEEL_DIAMETER_MM   65.0f      /* 轮子直径，量出来或者跑一圈算出来 */
+#define WHEEL_TRACK_MM     140.0f      /* 两轮接地点中心距 */
+#define COUNTS_PER_REV     780.0f      /* 线数 × 4 倍频 × 减速比 */
+
+#define YAW_ALPHA             0.98f    /* 每拍留给陀螺的权重，与 20ms 周期绑定 */
+#define YAW_CONSIST_LIMIT_DEG  3.0f    /* 两路增量差超过它，这一拍就当不一致 */
+
+static float yaw_cont_deg       = 0.0f;  /* 连续累加的航向，不折返 */
+static float yaw_wheel_cont_deg = 0.0f;  /* 编码器自己积的那份，同样连续累加 */
+static float gyro_bias_dps      = 0.0f;  /* 静止时测出来的零偏，由标定那步写入 */
+
+static float Wrap180(float deg)
+{
+    while (deg &gt; 180.0f)  { deg -= 360.0f; }
+    while (deg &lt; -180.0f) { deg += 360.0f; }
+    return deg;
+}
+
+static float Counts_ToMm(int16_t counts)
+{
+    return ((float)counts) * (3.1415926f * WHEEL_DIAMETER_MM / COUNTS_PER_REV);
+}
+
+void Yaw_Update(int16_t left_counts, int16_t right_counts,
+                float gyro_z_dps, float dt_s)
+{
+    float d_left_mm  = Counts_ToMm(left_counts);
+    float d_right_mm = Counts_ToMm(right_counts);
+
+    /* 左转为正：右轮走得远，差值为正 */
+    float d_wheel_deg = ((d_right_mm - d_left_mm) / WHEEL_TRACK_MM) * 57.29578f;
+    float d_gyro_deg  = (gyro_z_dps - gyro_bias_dps) * dt_s;
+
+    /* 陀螺是推手，先按它往前走；两个状态都保持连续，不在这里折返 */
+    yaw_cont_deg += d_gyro_deg;
+
+    if (fabsf(d_wheel_deg - d_gyro_deg) &lt;= YAW_CONSIST_LIMIT_DEG)
+    {
+        yaw_wheel_cont_deg += d_wheel_deg;
+
+        /* 编码器那份把陀螺积出来的漂往回调一点点 */
+        yaw_cont_deg += (1.0f - YAW_ALPHA) * (yaw_wheel_cont_deg - yaw_cont_deg);
+    }
+    else
+    {
+        /* 这一拍不信编码器：也别留一个过期的基准，直接对齐到当前航向 */
+        yaw_wheel_cont_deg = yaw_cont_deg;
+    }
+}
+
+float Yaw_GetDeg(void)
+{
+    return Wrap180(yaw_cont_deg);   /* 只有对外的接口才折回 ±180 */
+}
+</code></pre>
+<p>0.98 的意思是<strong>每一拍只让编码器拉一点点</strong>：陀螺负责这一拍转了多少，编码器负责长期把慢慢积起来的漂移往回调。这个数不是随便定的——按 alpha = tau / (tau + dt) 倒推，0.98 配 20 毫秒的节拍，约等于<strong>一秒的修正时间常数</strong>。把节拍改成 10 毫秒还照抄 0.98，时间常数就只剩半秒，滤波器会变得更容易被编码器的抖动带跑；换算公式就是上面那条，改周期得重新算、重新试。</p>
+<h3 id="打滑轮径轮距三个会把结果带偏的东西">打滑、轮径、轮距：三个会把结果带偏的东西</h3>
+<ul>
+<li><strong>打滑</strong>：轮子转但车没走，或者车走了轮子没转。原地打转、急加速、过光滑地面、压到线缆，都会让编码器的这一段里程直接失真。所以前面那个门限不是可选项。</li>
+<li><strong>轮径</strong>：左右轮直径差一点的后果是<strong>持续往一边偏</strong>，因为每一段里程都带着同一个比例的误差，最后积成一条弧线。这个不能只拿尺子量，要跑一条直线，看车是不是歪着走，用它去校正系数。</li>
+<li><strong>轮距</strong>：<code>B</code> 直接进分母，量错 2%，转 90 度就差将近 2 度。比起拿卡尺量，更靠谱的办法是让车<strong>原地慢慢转一个已知角度</strong>（比如对着地面画的 90 度、180 度），用陀螺读到的角度和编码器算出的角度反推有效轮距——轮胎会压扁、接触点会移动，有效轮距和图纸上的中心距本来就不完全是一回事。</li>
+</ul>
+<p>这个门限的量级要认清：3 度是<strong>每一拍</strong>的差值门限，除上 20 毫秒约等于 <strong>150 度每秒</strong>的残差——它只能拦住很严重的不一致，比如轮子空转、撞了一下、某一路编码器接线松了。叫它“测量一致性门限”比叫“打滑检测”准确：超过它只说明这一拍两个来源对不上，具体是打滑还是撞了，还得看现场。这个数要按实际的轮径、噪声和地面标定，别照抄 3。</p>
+<h3 id="陀螺这边还有一件能做的小事静止时更新零偏">陀螺这边还有一件能做的小事：静止时更新零偏</h3>
+<p>编码器能补航向，但补不了陀螺零点本身。开机能校一次零偏（前面那五秒钟），可零偏会随温度慢慢走。一个便宜的做法是：<strong>车停着、两个编码器都不动、陀螺读数也很平稳</strong>的时候，把这段时间的均值拿去做零偏的低速更新；车一动就停更。判断条件写保守一点，宁可少更新几次，也别在车转弯的时候把“真实转动”当成零偏减掉。</p>
+<h3 id="怎么才算更准几个能报数的指标">怎么才算“更准”：几个能报数的指标</h3>
+<p>别停在“感觉稳多了”，写成能对比的数：</p>
+<ul>
+<li><strong>静置漂移</strong>：车不动，放一分钟，看 <code>Yaw_GetDeg()</code> 跑了多少度——<strong>度每分钟</strong>。</li>
+<li><strong>原地回转</strong>：慢慢转一圈回到原位，看 <code>Yaw_GetDeg()</code> 是不是回到 0；再反向转一圈，看两个方向是不是都回得来（单向误差多半说明符号约定或者左右轮的有效尺度有一边不对）。</li>
+<li><strong>直线行驶</strong>：在平地上直走几米，看 <code>Yaw_GetDeg()</code> 有没有系统性偏移；走得越远偏得越多，主要指向<strong>左右轮有效尺度不一致、打滑或者机械上的偏差</strong>——轮距误差主要影响的是转弯时算出来的角度比例，直线行驶本来就用不到轮距。</li>
+<li><strong>换地面</strong>：瓷砖、地毯、水泥各来一遍。同一组参数在不同地面的表现差别，比调参数本身更能说明问题。</li>
+</ul>
+<h3 id="一个容易犯的错同一份信息喂两遍">一个容易犯的错：同一份信息喂两遍</h3>
+<p>轮子推出来的东西有一串：左右轮速、角速度、航向、位置。它们<strong>不是彼此独立的测量</strong>——全是从同一对编码器算出来的。如果把这些一股脑都送进融合器，估计器会“重复相信”同一份信息，结果是过度自信：算出来的不确定度很小，实际误差很大。</p>
+<p>要求简单的话只喂两样就够：<strong>陀螺的 z 轴角速度和编码器的左右轮增量</strong>。这一对来源不同、误差机理不同，互补才有意义。</p>
+<h3 id="想要绝对航向还得再给一个北">想要绝对航向，还得再给一个“北”</h3>
+<p>如果任务真要求“对准场地某个方向”，融合陀螺和轮编码器也到不了——里程计漂就是漂。这条路得再加一层：</p>
+<ul>
+<li><strong>磁力计</strong>：能给出航向参考，但电机、电流、铁件都是磁干扰源。要紧贴着电机用，先做校准（转圈拟合椭圆），再做干扰检测（磁场模长突然偏离就降权），别把一次干扰当成转了 30 度。</li>
+<li><strong>视觉地标</strong>：场地里放标记，相机看到就知道自己在哪、朝哪，但要处理识别延迟和遮挡。</li>
+<li><strong>双天线 GNSS</strong>：直接给航向，但价格、体积和可用环境都不是小车初学的选项。</li>
+</ul>
+<p>把它们当“外部参考”看，而不是“更好的陀螺”。外部参考的价值在于<strong>误差不累积</strong>，代价是更新慢、有延迟、还可能断。</p>
+<p><strong>平地上要一个更可靠的相对航向，融合陀螺和轮编码器；要绝对航向，再加一个外部参考。</strong></p>
+<h2 id="最后橘猫说">最后橘猫说</h2>
+<p>短时间里跟住车体的转动，用重力把俯仰和横滚摁住、不让它们跟着零偏一起漂，把姿态存成连续的四元数、不在任何姿态上退化；加一层门控和降权，加速度不可靠时也不被带偏；再配上轮编码器，平地上的相对航向能守得比单靠陀螺久。想要偏航，先给它一个“北”：磁力计、卫星航向、视觉这类绝对方向参考；编码器差速只能约束这一路转了多少，给不了北。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-20 20:23">2026-11-20 20:23</span>&nbsp;
+<a href="https://www.cnblogs.com/zw-awa">Zw-awa</a>&nbsp;
+阅读(<span id="post_view_count">29</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23735000);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzw-awa%2Fp%2F23735000&amp;targetId=23735000&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
