@@ -1,0 +1,569 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23723004" title="发布于 2026-11-20 07:06">
+    
+
+    <span role="heading" aria-level="2">Redis 核心机制 | 事务：执行序列的原子性、乐观锁与 8.x 条件写</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        Redis事务（MULTI/EXEC）仅保证命令序列在执行期间不被外部插入，不提供回滚机制。它无法确保“全或无”原子性，运行时错误会导致部分命令生效，需应用层补偿。入队期仅做语法检查，类型错误等在EXEC时才暴露。WATCH可实现乐观锁，但仅在EXEC时验证，且不支持部分取消。高并发多键操作应优先使用单键CAS（SET IFEQ）或Lua脚本。核心原则：事务只保证串行执行，不保证一致性，业务需自行处理幂等与对账。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="一先给结论它保证什么不保证什么">一、先给结论：它保证什么、不保证什么</h1>
+<p>先看三个真实形状，它们对应三种不同的误判：</p>
+<ul>
+<li>电商扣库存：<code>DECR</code> 已入队，<code>INCR</code> 销量也入队，EXEC 时销量那条撞上 WRONGTYPE。库存扣了、销量没加，当天没人发现——库存与销量的日终差值每天几十条，查下来全是这一条。</li>
+<li>订单流水：以为"MULTI 里两条命令要么都写要么都不写"，于是不做幂等、不做对账，重放时把同一条流水写了两次。</li>
+<li>配置覆盖：读 <code>config:timeout=30</code>，改成 60 时另一个管理员已改成 45，直接 <code>SET</code> 覆盖，两边都以为自己的值生效了。</li>
+</ul>
+<p>前两个错在把"连续执行"当成"回滚"，第三个错在漏了 CAS。这篇就围绕这两个词展开：连续执行，以及 WATCH 打的那个乐观锁标记。</p>
+<blockquote>
+<p><strong>决策卡</strong>：MULTI/EXEC 只能保证 EXEC 期间没有别的命令插进来，回滚它给不了。所以拿它当"要么全成要么全败"用，出事是必然的。只有"部分失败 + 应用层补偿"在业务上可接受，它才是候选方案；需要"全或无"先压到单键（<code>SET IFEQ</code>），高竞争多键用 Lua，跨槽先归槽。</p>
+</blockquote>
+<p><strong>保证</strong>：EXEC 期间执行序列不被其他客户端插入；WATCH 的键在 WATCH 之后、EXEC 之前被修改（任何客户端、任何连接、含本连接自身的写命令、含过期删除与淘汰）时，EXEC 放弃执行并返回 nil；EXEC 返回与入队命令一一对应的结果数组。</p>
+<p><strong>不保证</strong>：运行时错误后的回滚；入队命令在 EXEC 时一定成功；集群下跨槽的原子执行；数据库意义上的隔离级别。看不到"中间态"，只是因为主线程一条接一条在跑，跟隔离机制没关系——它靠串行化挡住了插队，挡不住"你读到的值已经被别人改过"。后一个问题只能靠 WATCH 或条件写解决。</p>
+<p>换成架构的说法：它是执行序列的原子性（串行化），ACID 意义上的原子性（回滚）它没有。官方文档写的是"命令顺序执行、外部请求无法插入"，并明确 "does not support rollbacks"。</p>
+<p>状态机（单客户端视角；DIRTY_CAS 由<strong>事务态之外</strong>的写命令置位，只在 EXEC 时兑现）：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119190951515-1971874378.png" alt="" loading="lazy"></p>
+<p>这两条我实测过，跟不少帖子的写法是反的：</p>
+<ul>
+<li>进入事务态的唯一入口是 MULTI：事务态内再发 MULTI 报 <code>ERR MULTI calls can not be nested</code>，但不终止事务、不置 DIRTY_EXEC，后续命令照常 QUEUED、EXEC 照常提交。</li>
+<li>WATCH 必须早于 MULTI：事务态内 WATCH 报 <code>ERR WATCH inside MULTI is not allowed</code>，同样不是入队期错误。依据在 <code>multi.c</code>——<code>watchCommand</code> 在 <code>CLIENT_MULTI</code> 下只 <code>addReplyError</code> 然后返回，不置脏标记，而且 WATCH 压根不走入队路径。</li>
+</ul>
+<p>判据（读完就能用）：</p>
+<ol>
+<li><code>QUEUED</code> 只代表入队成功，不代表执行成功；除非入队期 <code>-ERR</code>、WATCH 拒绝、连接断开，否则命令会被提交。</li>
+<li>EXEC 数组里出现 <code>(error)</code> = 该条执行期失败，但其他命令已生效，必须回查数据，别以为回滚了。</li>
+<li>入队期返回 <code>-ERR</code> 而非 <code>QUEUED</code> → EXEC 报 EXECABORT，一条都不执行。</li>
+<li>WATCH 返回 OK 只表示"开始监视"，变化在 EXEC 那一刻才被检查；键被改（含本连接自己改、过期、淘汰）→ EXEC 返回 <code>(nil)</code>。</li>
+<li>无 MULTI 直接 EXEC 返回 <code>ERR EXEC without MULTI</code>；DISCARD 后再 EXEC 同样报错（均实测）。</li>
+<li>8.4+ 单键 CAS 不必用 WATCH：<code>SET key value IFEQ old</code> 一次往返，命中 <code>OK</code>、不命中 <code>(nil)</code>。</li>
+<li>事务内读不到结果：MULTI 里的 <code>GET</code> 只会回 <code>QUEUED</code>，值得从 EXEC 的结果数组里取。这也是"读-判断-写"必须整体放进 Lua、塞进事务没用的原因。</li>
+</ol>
+<p>入队与提交是两个阶段。入队阶段只做语法检查和入队，命令一条都不执行；提交阶段的 EXEC 才真正跑，而且跑的时候不接受任何外部插入：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119190954627-820006883.png" alt="" loading="lazy"></p>
+<h1 id="二两类错误入队期拒绝-vs-执行期部分生效">二、两类错误：入队期拒绝 vs 执行期部分生效</h1>
+<p>MULTI 出错只有两个位置：入队的时候，和 EXEC 的时候。第一次把 <code>LPOP</code> 塞进一个字符串键的事务，我以为入队就会被拦下，结果它回了 <code>QUEUED</code>——类型检查根本不在入队期做。</p>
+<p>执行期错误（命令语法合法、成功入队，EXEC 时才失败）：</p>
+<pre><code class="language-redis"># 提示符 127.0.0.1:6379&gt; 仅为示例；连接参数 -h 主机 -p 端口 -a 密码（无密码省略 -a）
+# 把一个字符串键当余额
+127.0.0.1:6379&gt; SET balance "100"
+OK
+# 开启事务：后续命令只入队
+127.0.0.1:6379&gt; MULTI
+OK
+# 扣 30，参数正确 → 入队（入队≠执行）
+127.0.0.1:6379&gt; DECRBY balance 30
+QUEUED
+# 对字符串做列表操作：入队期只查参数个数，不查类型
+127.0.0.1:6379&gt; LPOP balance
+QUEUED
+# 加回 10
+127.0.0.1:6379&gt; INCRBY balance 10
+QUEUED
+# EXEC 逐条跑：第 2 条失败不影响第 3 条
+127.0.0.1:6379&gt; EXEC
+1) (integer) 70
+2) (error) WRONGTYPE Operation against a key holding the wrong kind of value
+3) (integer) 80
+# 最终 80：既没回滚到 100，也不是 70
+127.0.0.1:6379&gt; GET balance
+"80"
+</code></pre>
+<p>入队期错误（命令根本没进队列，事务被打上脏标记）：</p>
+<pre><code class="language-redis"># 进入事务
+127.0.0.1:6379&gt; MULTI
+OK
+# 正常入队
+127.0.0.1:6379&gt; SET a 1
+QUEUED
+# 缺参数：入队期即拒绝，并把事务标记为 DIRTY_EXEC
+127.0.0.1:6379&gt; INCR
+ERR wrong number of arguments for 'incr' command
+# 后续命令仍可入队，但脏标记不会被洗掉
+127.0.0.1:6379&gt; SET b 2
+QUEUED
+# EXEC 放弃整个队列
+127.0.0.1:6379&gt; EXEC
+EXECABORT Transaction discarded because of previous errors.
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191005944-748544927.png" alt="" loading="lazy"></p>
+<p>两处容易误判的细节。"键不存在"不是错误——对不存在的整数键 <code>DECRBY</code> 会直接得到负数（实测 <code>DECRBY</code> 一个不存在的键返回 <code>-50</code>），这属于业务语义问题，不是事务错误。<code>INCR</code> 碰到 64 位有符号整数上界时报 <code>increment or decrement would overflow</code>，属于执行期错误，该条失败而其余照跑。OOM 则属于入队期：<code>noeviction</code> 下内存满了写命令直接被拒，随后 EXEC 返回 EXECABORT，表现跟语法错误一模一样。我第一次碰上就是把它当代码 bug 查了半天，最后发现是 <code>maxmemory</code> 打满了。</p>
+<p><strong>为什么不做回滚</strong>：官方表述是 "Redis does not support rollbacks … would have a significant impact on the simplicity and performance"。语法错误属于编程错误，开发期就该发现；运行时数据错误交给业务层。为已经执行过的命令保存逆操作，对一个定位在"高性能数据结构服务器"的东西不划算。</p>
+<p>我目前只用三段式：入队前预检（类型、编码、库存/余额够不够，能提前挡掉绝大多数执行期失败），事务里只放不会失败的写命令，提交后按需对账（把 EXEC 数组的 <code>(error)</code> 位跟"本来应该发生什么"逐条比，差异落补偿队列）。别的写法我没见过能长期活下来的——指望事务帮忙回滚的项目，最后都得回到这三段重做一遍。</p>
+<h1 id="三命令配置与服务端结构">三、命令、配置与服务端结构</h1>
+<p>六个命令、四组配置，先把能查的都查清楚，机制上一节讲完了。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191009647-1850661822.png" alt="" loading="lazy"></p>
+<p>WATCH 和 UNWATCH 的组合规则值得单列：WATCH 调多次是累加，<code>WATCH a</code> 再 <code>WATCH b</code> 等于 <code>WATCH a b</code>；UNWATCH 一次清空全部，没法只取消某一个键；WATCH 盯的是键的"内容版本"而不是值本身——把值改走再改回来，EXEC 照样返回 nil。这一点跟 C# 侧 <code>Condition</code> 的"值相等"正好相反，后面 5.4 会撞上。</p>
+<p>三个服务端结构（细节见 S10-x）：<code>mstate</code>（<code>commands</code> 数组 + <code>count</code>，这份队列在服务端内存、按连接隔离，连接断开即全部丢弃，不落 AOF/RDB）；<code>flags</code>（<code>CLIENT_MULTI</code> / <code>CLIENT_DIRTY_EXEC</code> / <code>CLIENT_DIRTY_CAS</code>）；<code>watched_keys</code>（服务端全局字典，键为 db+key，值是监视该键的客户端链表——任何写命令执行后都要查它并置位 DIRTY_CAS，所以监视键越多、监视同一键的连接越多，写命令的额外开销越大）。</p>
+<p>"事务内读不到结果"值得亲手看一眼，它决定了"读-判断-写"为什么不能靠 MULTI：</p>
+<pre><code class="language-redis"># 开事务
+127.0.0.1:6379&gt; MULTI
+OK
+# 预置库存
+127.0.0.1:6379&gt; SET stock 10
+QUEUED
+# 想读回库存做判断：只得到 QUEUED，拿不到值
+127.0.0.1:6379&gt; GET stock
+QUEUED
+# 只有 EXEC 之后才知道库存是 10
+127.0.0.1:6379&gt; EXEC
+1) OK
+2) "10"
+</code></pre>
+<p><strong>边界与可逆性</strong></p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191016219-62320627.png" alt="" loading="lazy"></p>
+<p>表里真正没法兜底的是 EXEC 不可逆：Lua 至少还有 <code>lua-time-limit</code> 和 <code>SCRIPT KILL</code> 可以打断（边界见第 6 篇），事务一旦开始跑，除了等没有第二个选择。所以我给队列配了两道闸——条数 ≤20，单条命令不许是 O(N) 的大命令（<code>KEYS</code>、大 <code>SMEMBERS</code>、百万成员的 <code>DEL</code>），合起来把一次 EXEC 压在几十毫秒以内。这个数不是拍出来的，是照着你自己的 p99 容忍度倒推的。</p>
+<p>现场确认队列确实在服务端：在另一条连接上 <code>CLIENT LIST</code>，能看到事务态连接的 <code>multi</code>、<code>watch</code> 与 <code>multi-mem</code> 三个字段（<code>multi=-1</code> 表示未在事务态，<code>multi=N</code> 表示队列里有 N 条，<code>multi-mem</code> 是该连接队列占用的字节数）：</p>
+<pre><code class="language-bash"># 开一个连接入队若干命令后，在另一个终端执行
+redis-cli CLIENT LIST | grep -o 'multi=[0-9-]* multi-mem=[0-9]*'
+# 输出形如 multi=2 multi-mem=64：队列字节数随入队命令增长（具体数值以实际输出为准）
+</code></pre>
+<p>客户端一崩，队列就没了——它本来就没落盘。所以排查"命令没执行"，先看这条连接中间断没断过，别一上来就怀疑 Redis。</p>
+<p>配置上事务没有专属项。间接相关的四组（默认值为 8.10.3 实测，生产以目标实例 <code>CONFIG GET</code> 复核）：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191022739-233836061.png" alt="" loading="lazy"></p>
+<p>对照项 <code>lua-time-limit</code> 默认 <code>5000</code>：它不管事务，只说明"主线程连续执行"这类阻塞在 Lua 侧才有兜底开关，事务没有。</p>
+<h1 id="四亲手验证脚本-35前两段见第二节">四、亲手验证（脚本 3–5，前两段见第二节）</h1>
+<p>四段演示，每段都能照抄。前两段（执行期错误不回滚、入队期错误全批不执行）的转录在第二节，这里只补判读：前者看 EXEC 数组里有没有 <code>(error)</code>，若 <code>INCR</code> 返回整数说明该键曾被写成数字串，先 <code>DEL</code> 重来；后者看是否返回 <code>EXECABORT</code>，若 <code>a</code>、<code>b</code> 反而被写入，说明版本低于 2.6.5（当时由客户端负责检查），核对 <code>INFO server</code> 的 <code>redis_version</code>。</p>
+<p><strong>脚本 3 · WATCH 冲突</strong>（两个独立连接）：</p>
+<pre><code class="language-redis"># 终端 A：准备快照
+127.0.0.1:6379&gt; SET num 100
+OK
+# 登记监视，必须在 MULTI 之前
+127.0.0.1:6379&gt; WATCH num
+OK
+# 进入事务并入队扣减
+127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379&gt; DECRBY num 10
+QUEUED
+# 此时在终端 B（另一条连接）执行：SET num 999
+# 回到终端 A：EXEC 发现键被动过，返回单独的 nil（不是数组）
+127.0.0.1:6379&gt; EXEC
+(nil)
+# DECRBY 没执行，值是 B 写的 999
+127.0.0.1:6379&gt; GET num
+"999"
+</code></pre>
+<p>判读：<code>(nil)</code> 是"整个事务放弃"，跟"数组里某个元素为 nil"必须分开——前者是 CAS 失败，后者只是某条命令本身没值。我第一次跑没看到 nil，原因很俗：我图省事用了同一个 <code>redis-cli</code> 进程开了两个会话，WATCH 是连接维度的，等于自己监视自己。</p>
+<p><strong>脚本 4 · 事务态内 WATCH 只报错、不弄脏事务</strong>：</p>
+<pre><code class="language-redis"># 先进事务
+127.0.0.1:6379&gt; MULTI
+OK
+# 这里报错，但不入队、不置 DIRTY_EXEC
+127.0.0.1:6379&gt; WATCH somekey
+ERR WATCH inside MULTI is not allowed
+# 其余命令照常入队
+127.0.0.1:6379&gt; SET a 1
+QUEUED
+# EXEC 正常提交，不是 EXECABORT
+127.0.0.1:6379&gt; EXEC
+1) OK
+</code></pre>
+<p>把 <code>WATCH somekey</code> 换成再发一次 <code>MULTI</code>，得到 <code>ERR MULTI calls can not be nested</code>，行为同样只报错、不弄脏。</p>
+<p><strong>脚本 5 · 8.4+ 单键条件写</strong>：</p>
+<pre><code class="language-redis"># 准备旧值
+127.0.0.1:6379&gt; SET ifq old
+OK
+# 旧值仍是 old 才写：命中返回 OK
+127.0.0.1:6379&gt; SET ifq new IFEQ old
+OK
+# 不命中：不写入，返回 nil（不是错误）
+127.0.0.1:6379&gt; SET ifq nope IFEQ wrong
+(nil)
+# 条件删除：当前值仍是 new 才删，返回删除个数
+127.0.0.1:6379&gt; DELEX ifq IFEQ new
+(integer) 1
+# 键已不存在
+127.0.0.1:6379&gt; EXISTS ifq
+(integer) 0
+</code></pre>
+<p>判读：<code>(nil)</code> = 条件不成立、什么都没写，交给上层重读或直接放弃。若报 <code>ERR syntax error</code>，实例低于 8.4.0（<code>COMMAND DOCS SET</code> 里 <code>IFEQ</code> 的 since 为 8.4.0），回到 WATCH 或升级。<code>DELEX</code> 返回 <code>(integer) 0</code> 也别当异常——那是"值已经不是 new 了、没删"。把 0 和 1 分成两个分支处理，才能分清"别人先改了"和"我确实删掉了"。</p>
+<h1 id="五落地四条路与四段代码">五、落地：四条路与四段代码</h1>
+<p>四条路，能力从弱到强，四段都能直接编译。包引用统一锁 <code>StackExchange.Redis 3.4.35</code>（锁小版本是为了避免还原到别的版本后方法签名漂移）：<code>dotnet new console -n RedisTranDemo -f net10.0</code> → <code>dotnet add package StackExchange.Redis --version 3.4.35</code>。</p>
+<p>先说清账。连续执行保证（WATCH 能做 CAS 全靠它）、语法简单不用学 Lua、入队期就能拿到语法错误，这三样是用它的理由；"伪原子性"带来的静默偏差、EXEC 阻塞、WATCH 重试风暴（表 A 那个 26 秒就是重试堆出来的），这三样是不用它的理由。另外三种情况出现就直接换路线：需要"失败即回滚"、竞争激烈、队列里有重命令。</p>
+<h2 id="51-单键条件写set--ifeq--delex--ifeq">5.1 单键条件写：<code>SET ... IFEQ</code> / <code>DELEX ... IFEQ</code></h2>
+<p>需求：更新配置字符串，只有它仍等于读到的值才写入。<code>ValueCondition.Equal</code> 在协议层就是 <code>SET ... IFEQ</code>，把"读-比-写"压成一次往返，比 WATCH+MULTI 少两次往返，也没有 Lua 那一层部署与维护成本。</p>
+<pre><code class="language-csharp">using System;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+internal static class ConditionalWrite
+{
+    // 进程内应单例复用 ConnectionMultiplexer，这里用 using 仅为演示释放
+    private static async Task Main()
+    {
+        // 有密码时连接串写成 "127.0.0.1:6379,password=***"
+        using var muxer = ConnectionMultiplexer.Connect("127.0.0.1:6379");
+        IDatabase db = muxer.GetDatabase();
+        RedisKey key = "config:timeout";
+
+        // 模拟"管理员 A 读到的旧值"
+        await db.StringSetAsync(key, "30");
+        // 条件写只保证"旧值仍是它才写"，判断仍由应用层做
+        RedisValue snapshot = await db.StringGetAsync(key);
+        // 键不存在时按"新建"处理，不能拿 null 去比条件
+        if (snapshot.IsNull)
+        {
+            return;
+        }
+
+        // 等价于 SET key value IFEQ old；Expiration.Default 会丢原有 TTL，要保留改用 KeepTtl
+        bool written = await db.StringSetAsync(key, "60", Expiration.Default,
+            ValueCondition.Equal(snapshot));
+        // 条件不成立时服务端一字不写，返回 false 而非抛异常
+        Console.WriteLine(written ? "写入成功" : "值已被他人改动，本次未写入");
+        Console.WriteLine($"当前值 = {await db.StringGetAsync(key)}");
+
+        // 条件删除同理，避免删掉别人刚写入的新值
+        bool deleted = db.StringDeleteAsync(key, ValueCondition.Equal("60"));
+        Console.WriteLine($"条件删除 = {deleted}，键是否仍在 = {await db.KeyExistsAsync(key)}");
+    }
+}
+</code></pre>
+<p>实跑输出：<code>写入成功</code> / <code>当前值 = 60</code> / <code>条件删除 = True，键是否仍在 = False</code>。</p>
+<p>这里有个第一次写就容易错的地方：条件不成立走的是返回值 <code>false</code>，不是异常。我第一版把它包在 <code>try/catch</code> 里等异常，白等了两周才发现在判断分支里——服务端只回 <code>(nil)</code>，客户端把它翻成 false，只有服务端真出错才抛。所以别给它套 <code>try/catch</code> 兜条件失败。</p>
+<p>关于失效边界：条件涉及两个以上键的联动，或者需要"读后按业务规则算完再写"，它就帮不上忙了——<code>IFEQ</code> 只比较你算好的新值，算错了它照样原子地写进去。值特别大时改用摘要比较，省掉整值传输。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191040306-1087518561.png" alt="" loading="lazy"></p>
+<h2 id="52-双键扣减watch--退避重试">5.2 双键扣减：WATCH + 退避重试</h2>
+<p>需求：扣库存与加销量必须一起生效，两键同槽。两个键没法压成一个，<code>SET IFEQ</code> 护不住，只能回到"两键都 WATCH → 读快照 → 判断 → MULTI 包裹 → EXEC"，冲突就指数退避。</p>
+<pre><code class="language-csharp">using System;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+internal static class StockWatch
+{
+    private static async Task Main()
+    {
+        using var muxer = ConnectionMultiplexer.Connect("127.0.0.1:6379");
+        IDatabase db = muxer.GetDatabase();
+        // 库存与销量必须是十进制整数字符串，DECR/INCR 才能解析
+        await db.StringSetAsync("stock:1001", 10);
+        await db.StringSetAsync("sold:1001", 0);
+
+        bool ok = await TryDeductAsync(db, "stock:1001", "sold:1001", 1, maxRetries: 5);
+        Console.WriteLine($"扣减结果 = {ok}，库存 = {await db.StringGetAsync("stock:1001")}，销量 = {await db.StringGetAsync("sold:1001")}");
+    }
+
+    private static async Task&lt;bool&gt; TryDeductAsync(
+        IDatabase db, RedisKey stockKey, RedisKey soldKey, int amount, int maxRetries)
+    {
+        // 有界重试：上限就是业务可接受的最大延迟预算
+        for (int attempt = 1; attempt &lt;= maxRetries; attempt++)
+        {
+            RedisValue snapshot = await db.StringGetAsync(stockKey);
+            // 键不存在/非整数/库存不足都是业务结论，直接返回，不重试
+            if (snapshot.IsNull || !int.TryParse(snapshot.ToString(), out int stock) || stock &lt; amount)
+            {
+                return false;
+            }
+
+            ITransaction tran = db.CreateTransaction();
+            // 两个键都要做条件：少一个就会出现"库存扣了、销量没加"
+            tran.AddCondition(Condition.StringEqual(stockKey, snapshot));
+            RedisValue soldSnapshot = await db.StringGetAsync(soldKey);
+            tran.AddCondition(Condition.StringEqual(soldKey, soldSnapshot));
+
+            // 只拿到 Task，命令尚未执行
+            Task&lt;long&gt; stockTask = tran.StringDecrementAsync(stockKey, amount);
+            Task&lt;long&gt; soldTask = tran.StringIncrementAsync(soldKey, amount);
+
+            bool committed;
+            try
+            {
+                // false = 条件不成立，服务端放弃，队列一条都没执行
+                committed = await tran.ExecuteAsync();
+            }
+            catch (RedisServerException ex)
+            {
+                // 入队期错误（EXECABORT）属于代码问题，重试无用
+                Console.WriteLine($"入队期错误，事务被拒绝：{ex.Message}");
+                return false;
+            }
+
+            if (!committed)
+            {
+                // 10/20/40/80 ms 退避，打散各客户端重试相位
+                await Task.Delay(TimeSpan.FromMilliseconds(10 * (1 &lt;&lt; (attempt - 1))));
+                continue;
+            }
+
+            try
+            {
+                // 逐条 await 才能拿到执行期失败信号
+                long remaining = await stockTask;
+                await soldTask;
+                Console.WriteLine($"第 {attempt} 次提交成功，剩余库存 {remaining}");
+                return true;
+            }
+            catch (RedisServerException ex)
+            {
+                // 执行期错误意味着"部分生效"，必须走业务补偿
+                Console.WriteLine($"执行期错误，需业务补偿：{ex.Message}");
+                return false;
+            }
+        }
+
+        return false;
+    }
+}
+</code></pre>
+<p>实跑输出：<code>第 1 次提交成功，剩余库存 9</code> / <code>扣减结果 = True，库存 = 9，销量 = 1</code>。</p>
+<p>这里最容易漏的是少 WATCH 一个键：只盯库存不盯销量，"库存扣了、销量没加"照样提交成功，而且一条报错都没有——这类漏项只能靠 code review 和"两键一起写"的约定防住。另一个低级错误是把 <code>amount</code> 写成负数，<code>DECR -5</code> 实际在加库存，业务校验得拦住。</p>
+<p><strong>值编码约定</strong>：<code>DECR</code>/<code>INCR</code> 只认十进制整数字符串。库存要是被 JSON 编码写进去（<code>{"qty":10}</code>），这段代码会一路返回 false，业务那边看起来就是"库存不足"，查半天查不到原因。我现在的做法是统一整数编码，要放结构化数据就用 <code>HINCRBY</code> 存 <code>qty</code>；实在想留字符串语义，就退到 <code>SET IFEQ</code>——它比完整值，不要求可解析。</p>
+<h2 id="53-无-cas-的连续写execute-的-true-不能当成功信号">5.3 无 CAS 的连续写：<code>Execute()</code> 的 true 不能当成功信号</h2>
+<p>需求：订单状态与流水两条命令连续执行、中间不插队。不需要 CAS，普通 MULTI + EXEC 就够，但结果必须逐条读。</p>
+<pre><code class="language-csharp">using System;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+internal static class ContinuousWrite
+{
+    private static async Task Main()
+    {
+        using var muxer = ConnectionMultiplexer.Connect("127.0.0.1:6379");
+        IDatabase db = muxer.GetDatabase();
+        // 清残留，避免 WRONGTYPE 干扰演示
+        await db.KeyDeleteAsync(new RedisKey[] { "order:2001", "ledger:2001" });
+
+        ITransaction tran = db.CreateTransaction();
+        // 没有 AddCondition：事务不会被放弃，ExecuteAsync 恒为 true
+        Task&lt;bool&gt; hashTask = tran.HashSetAsync("order:2001", "status", "paid");
+        Task&lt;long&gt; listTask = tran.ListRightPushAsync("ledger:2001", "order:2001 paid");
+
+        // true 只代表"服务端执行了"，不代表每条都成功
+        bool executed = await tran.ExecuteAsync();
+        Console.WriteLine($"事务是否被服务端执行 = {executed}");
+
+        try
+        {
+            // 只有逐条 await 才能拿到 WRONGTYPE 这类执行期错误
+            bool hashOk = await hashTask;
+            long pushed = await listTask;
+            Console.WriteLine($"两条命令均成功：HSET={hashOk}，RPUSH 长度={pushed}");
+        }
+        catch (RedisServerException ex)
+        {
+            // 第一条可能已生效：落到业务补偿（重放、对账），不要当整体失败
+            Console.WriteLine($"存在执行期失败，需业务补偿：{ex.Message}");
+        }
+    }
+}
+</code></pre>
+<p>实跑输出：<code>事务是否被服务端执行 = True</code> / <code>两条命令均成功：HSET=True，RPUSH 长度=1</code>。</p>
+<p>陷阱很直接：第二条运行时失败（比如目标键被改成不兼容类型）时第一条已经生效，数据处于部分写入，<code>Execute()</code> 照样返回 true——它回答的是"事务有没有被执行"，不是"每条命令是否成功"。</p>
+<p>这条路的止损条件也明确：业务能对"部分写入"做幂等补偿（重放不产生重复数据、对账能发现差异）才可接受。一旦业务方说"订单与流水必须一致"，那就不是调参的事了，是路线问题——改 Lua（同槽前提下先校验再写）或者落库。</p>
+<h2 id="54-双键转账值相等条件的语义边界">5.4 双键转账：值相等条件的语义边界</h2>
+<p>需求：A 扣 50 加到 B。<code>Condition</code> 类里没有 <code>KeyNotChanged</code>，值相等是它能表达"未被修改"的唯一形式（C# 侧等价于两个 <code>WATCH</code>）。为什么不直接 <code>SET IFEQ</code>：转账要动两个值（A 的新余额与 B 的新余额），<code>IFEQ</code> 一次只护得住一个键，硬拆成两条 <code>SET</code> 就退化成"两步各自原子、整体不原子"，中间失败会留下"扣了没入账"。</p>
+<pre><code class="language-redis"># 先初始化两个账户；对不存在的键 DECRBY 会直接扣成负数（实测返回 -50）
+127.0.0.1:6379&gt; SET balance:A 1000
+OK
+127.0.0.1:6379&gt; SET balance:B 1000
+OK
+# 两个键一起监视（MULTI 之前）
+127.0.0.1:6379&gt; WATCH balance:A balance:B
+OK
+127.0.0.1:6379&gt; MULTI
+OK
+# 扣款、入账入队
+127.0.0.1:6379&gt; DECRBY balance:A 50
+QUEUED
+127.0.0.1:6379&gt; INCRBY balance:B 50
+QUEUED
+# 提交：950 / 1050；期间任一账户被改则返回 (nil) 且两边都不动
+127.0.0.1:6379&gt; EXEC
+1) (integer) 950
+2) (integer) 1050
+</code></pre>
+<pre><code class="language-csharp">using System;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+internal static class TransferCas
+{
+    private static async Task Main()
+    {
+        using var muxer = ConnectionMultiplexer.Connect("127.0.0.1:6379");
+        IDatabase db = muxer.GetDatabase();
+        // 集群下两键必须同槽（用 {acct}: 这类 Hash Tag）
+        await db.StringSetAsync("balance:A", 1000);
+        await db.StringSetAsync("balance:B", 1000);
+
+        bool ok = await TransferAsync(db, "balance:A", "balance:B", 50, maxRetries: 5);
+        Console.WriteLine($"转账结果 = {ok}，A = {await db.StringGetAsync("balance:A")}，B = {await db.StringGetAsync("balance:B")}");
+    }
+
+    private static async Task&lt;bool&gt; TransferAsync(
+        IDatabase db, RedisKey from, RedisKey to, long amount, int maxRetries)
+    {
+        for (int attempt = 1; attempt &lt;= maxRetries; attempt++)
+        {
+            RedisValue snapFrom = await db.StringGetAsync(from);
+            RedisValue snapTo = await db.StringGetAsync(to);
+            // 键不存在或余额不足：业务结论，直接失败
+            if (snapFrom.IsNull || snapTo.IsNull
+                || !long.TryParse(snapFrom.ToString(), out long balance) || balance &lt; amount)
+            {
+                return false;
+            }
+
+            ITransaction tran = db.CreateTransaction();
+            // 值相等 ≠ 键未被修改：改走又改回原值同样能通过校验
+            tran.AddCondition(Condition.StringEqual(from, snapFrom));
+            tran.AddCondition(Condition.StringEqual(to, snapTo));
+            Task&lt;long&gt; debitTask = tran.StringDecrementAsync(from, amount);
+            Task&lt;long&gt; creditTask = tran.StringIncrementAsync(to, amount);
+
+            bool committed = await tran.ExecuteAsync();
+            if (!committed)
+            {
+                // 被放弃的事务里，队列命令的 Task 会以 TaskCanceledException 结束，绝不 await
+                await Task.Delay(TimeSpan.FromMilliseconds(10 * (1 &lt;&lt; (attempt - 1))));
+                continue;
+            }
+
+            try
+            {
+                long newFrom = await debitTask;
+                long newTo = await creditTask;
+                Console.WriteLine($"第 {attempt} 次提交成功：{from} = {newFrom}，{to} = {newTo}");
+                return true;
+            }
+            catch (RedisServerException ex)
+            {
+                // 会导致"只扣不入"或"只入不扣"，交给对账收敛
+                Console.WriteLine($"执行期错误，需对账补偿：{ex.Message}");
+                return false;
+            }
+        }
+
+        return false;
+    }
+}
+</code></pre>
+<p>实跑输出：<code>第 1 次提交成功：balance:A = 950，balance:B = 1050</code> / <code>转账结果 = True，A = 950，B = 1050</code>。</p>
+<p>值比较的天花板就在这儿：它分不出"从未被动过"和"动过又复原"。这是所有"比旧值"方案的固有短板，不是这个 SDK 的锅。金融级场景不能接受，就换数据库事务，或者自己引入版本号（每次写递增一个版本键）。</p>
+<p>DISCARD 平时用不上，但入队后业务条件不满足时要靠它零副作用退出——清队列、清 WATCH、退出事务态，实测随后 <code>GET</code> 那个被入队的键是 nil。连接池场景仍然建议归还前统一 <code>UNWATCH</code> 或 <code>RESET</code>。StackExchange.Redis 3.4.35 不暴露显式 DISCARD，<code>CreateTransaction()</code> 在 <code>Execute</code> 之前只是本地命令缓冲，服务端并不会留下一个已开启的事务，这点容易被人误判成"事务泄漏"。</p>
+<p>四条路的失效条件汇总：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191056785-529005513.png" alt="" loading="lazy"></p>
+<h1 id="六一次事务贵在哪怎么盯住它">六、一次事务贵在哪，怎么盯住它</h1>
+<p>一次事务贵在哪？贵在你没法中断它。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191100295-1332104238.png" alt="" loading="lazy"></p>
+<p>RTT 的账要算清：一个 N 条命令的事务是 <code>1(MULTI) + N(入队) + 1(EXEC)</code> 次往返，等于把 N 条普通命令的往返换成了 N+2 次，一点没省。省 RTT 请用 Pipeline（第 9 篇），事务买的是"不插队"，这两件事别混着当理由。</p>
+<p>观测上有个坑先记住：<code>LATENCY HISTORY</code> 依赖 <code>latency-monitor-threshold</code>，默认 0（关闭），不开永远拿不到历史（实测空）；另外 redis-cli 里没有管道语义，<code>|</code> 是 shell 的东西。</p>
+<pre><code class="language-redis"># redis-cli 内执行：先确认延迟监控开关（0 = 关闭）
+127.0.0.1:6379&gt; CONFIG GET latency-monitor-threshold
+# 打开监控（示例 100 ms 阈值），才有 LATENCY 事件可查
+127.0.0.1:6379&gt; CONFIG SET latency-monitor-threshold 100
+# 命令级统计：cmdstat_exec 的 calls / usec_per_call / rejected_calls / failed_calls
+127.0.0.1:6379&gt; INFO commandstats
+# 命令级延迟分位，字段形如 latency_percentiles_usec_exec:p50=…,p99=…,p99.9=…
+127.0.0.1:6379&gt; INFO latencystats
+# 慢查询（默认阈值 10 ms，即 slowlog-log-slower-than=10000 微秒）
+127.0.0.1:6379&gt; SLOWLOG GET 10
+# 未开监控时这里恒为空数组
+127.0.0.1:6379&gt; LATENCY HISTORY command
+</code></pre>
+<pre><code class="language-bash"># shell 内执行；redis-cli 默认连 127.0.0.1:6379，可加 -h/-p/-a
+redis-cli INFO commandstats | grep cmdstat_exec
+# 只看 EXEC 的延迟分位（字段名以实际输出为准）
+redis-cli INFO latencystats | grep latency_percentiles_usec_exec
+# 客户端侧 RTT 采样，判断毛刺是否与 EXEC 高峰重叠
+redis-cli --latency
+# 同上，按时间片输出历史，便于对齐业务高峰
+redis-cli --latency-history
+# 统计事务态连接分布：multi=-1 表示未在事务态，multi=N 表示队列里有 N 条
+redis-cli CLIENT LIST | grep -o 'multi=[0-9-]*' | sort | uniq -c
+# 统计残留监视：watch=N 表示当前监视 N 个键
+redis-cli CLIENT LIST | grep -o 'watch=[0-9]*' | sort | uniq -c
+</code></pre>
+<p><code>redis-benchmark</code> 不会发 MULTI，压不出 WATCH 竞争；必须写客户端脚本（WATCH → GET → MULTI → SET → EXEC，统计 nil 次数和耗时）。三方对照（WATCH / <code>SET IFEQ</code> / Lua）得固定四个参数：并发客户端数、更新总次数、监视键数、客户端到实例的 RTT，否则数字之间没法比。</p>
+<p>公开数据可以当参照，别当绝对值——差异常来自部署形态、同步复制、SDK 实现和网络。</p>
+<p><strong>表 A（Upstash 官方基准，单键 1000 次增量更新 + 最多 100 次尝试）</strong></p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191111485-750217488.png" alt="" loading="lazy"></p>
+<p>表注：Lua 的 48 ms 是同一份基准的对照值，两者差三个数量级。看那一列放弃次数和命令数就够了——100 并发下 WATCH 有 253 次整个事务白跑。</p>
+<p><strong>表 B（同一 API 微基准，Docker 单实例，含重试耗时）</strong></p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191114706-1753927667.png" alt="" loading="lazy"></p>
+<p><strong>表 C（单键竞争 QPS，10 并发，吞吐视角）</strong></p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191118116-1179722493.png" alt="" loading="lazy"></p>
+<p>这三张表我最初是混着看的，结论只有一句"WATCH 有时快有时慢"——等于没结论。分开看才有用：表 A 告诉你冲突要付多少条命令的代价，表 B 告诉你单次本身多贵，表 C 告诉你天花板在哪。绝对值一个都别直接抄进容量模型，不同环境的复制模式、SDK 实现、网络 RTT 差得远，只有同环境对比才算数。但三张表指向同一个斜率：并发写源一多，WATCH 的收益就转负。</p>
+<p>拐点判据（可以直接抄进选型会）：</p>
+<ul>
+<li>并发写源 ≤3、冲突率低 → WATCH 可用，重试上限 5 次、指数退避从 10 ms 起。</li>
+<li>并发写源 ≥5 → 首选 Lua（第 6 篇）或分段库存/串行化；4 个处于过渡区，按实测 EXEC 返回 nil 的比例决定，&gt;5% 立即切。</li>
+<li>单事务队列 10~20 条，且不含 O(N) 大命令（<code>KEYS</code>、大 <code>SMEMBERS</code>、大 <code>DEL</code>）。</li>
+<li>单键 CAS 先看 <code>SET IFEQ</code>（8.4+），它把冲突成本降到 0 次重试。</li>
+</ul>
+<p>上面那四个参数我直接写在压测脚本头部，谁跑谁填——缺一个，结论就作废。这也是本文把表 A/B/C 分开列的原因：它们回答的是三个不同问题（冲突成本、单次耗时、吞吐上限），混着看只会得出"WATCH 有时快有时慢"这种没用的结论。同一句"混着看没用"，我在评审里被问过两次，索性把这句话写进正文。</p>
+<p>现网观测量与告警：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191121758-1565974692.png" alt="" loading="lazy"></p>
+<p>监控我就看三项：冲突率（<code>rejected_calls</code> 的相对增长，实际用 EXEC 返回 nil 的比例更准）、EXEC 的 p99、挂着 WATCH 没清的连接数。第三项最能提前发现问题，它比延迟早一步暴露。均值会把一次 200 ms 的 EXEC 摊平成一串漂亮数字，慢事务长期查不出来就是这么来的。</p>
+<p>复制、AOF 与故障转移的边界，这部分经常被当成"事务能保证"的：</p>
+<ul>
+<li>MULTI/EXEC 会整体作为一个复制单元发送：主库收到并执行后，以 MULTI…EXEC 形式传给副本，从库不会看到"只执行一半"的中间态。</li>
+<li><code>WAIT</code> 必须在 EXEC 之后单独调用：它确认"此前所有写命令已被 N 个副本接收"，不是同步复制；超时返回未达成的副本数；集群中只统计当前分片的副本。</li>
+<li>AOF 侧：事务按执行顺序逐条记入（AOF 记录的是执行后的命令，不是 MULTI 本身）；重写由当前数据集生成，事务边界自然体现在命令序列里，不需要额外处理；关注点是重写期间的内存与延迟毛刺，不是语义。</li>
+<li>崩溃一致性：尾部被截断时默认 <code>aof-load-truncated yes</code> 会在加载时截断并继续启动（日志告警），显式设 <code>no</code> 才拒绝启动；7.0+ 的 AOF 是多文件目录（<code>appendonlydir</code>），校验要对目录执行 <code>redis-check-aof</code>。</li>
+<li>故障转移会丢"已 EXEC 但未同步"的写：异步复制那段窗口，事务抹不平，EXEC 成功 ≠ 已落盘/已到副本。</li>
+</ul>
+<h1 id="七选型与数据库条件写luapipeline-的横向对比">七、选型：与数据库、条件写、Lua、Pipeline 的横向对比</h1>
+<p>同一件事该选谁，先看判决依据，再看上线前清单。</p>
+<p>Redis 事务和关系型数据库事务只是同名，不是同一样东西：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191124965-991082521.png" alt="" loading="lazy"></p>
+<p>一句话：Redis 事务是"批量连续执行器 + 乐观锁标记"，数据库事务是"ACID 保证器"。把它当数据库事务用，丢更新是必然的。</p>
+<p>四条路的分工：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191128255-432692462.png" alt="" loading="lazy"></p>
+<p>落地链路：单键条件写走 <code>SET IFEQ</code>；多键同槽 + 低竞争走 MULTI/WATCH；高竞争或复合逻辑走 Lua；只要吞吐不要原子走 Pipeline；要 ACID 回滚，去用关系数据库。生产级分布式锁不要拿 WATCH 实现。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191131840-36487664.png" alt="" loading="lazy"></p>
+<p>上线前清单：错误语义已对齐（团队接受"入队期拒绝 + 执行期部分生效"）；代码逐条检查 EXEC 数组或 <code>await</code> 每个 Task（禁止只看 <code>Execute()</code> 布尔值）；单独 nil 走重试、数组内 nil 走逐条校验，两个分支显式区分；有 <code>maxRetries</code> + 指数退避，无无限自旋；单键场景没有滥用 WATCH；单事务 ≤20 条且无大命令；异常分支有 <code>DISCARD</code>/<code>UNWATCH</code>/<code>RESET</code> 兜底；集群下 <code>CLUSTER KEYSLOT</code> 验证过所有键同槽；参与增减的键统一十进制整数编码；已接入 <code>cmdstat_exec</code>、<code>SLOWLOG</code>、<code>multi</code>/<code>watch</code> 监控；冲突率 &gt;5% 的切换预案已写好。</p>
+<p>清单里每一条都对应一次事故的形状，所以别把它当形式文档看。通过标准写的是可验证的事实——跑过命令、看到过字段、截图进过工单，不是"我们讨论过"。</p>
+<h1 id="八哪个版本才能用-ifeq">八、哪个版本才能用 IFEQ</h1>
+<p>版本节点只列跟这套机制有关的，判断"某个能力能不能用"看这张表就够。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191137102-1781662292.png" alt="" loading="lazy"></p>
+<p>升级上有两点要盯。从 &lt;2.6.5 升到 7.x/8.x，入队报错后仍发 EXEC 的代码会从"部分执行"变成"EXECABORT"，这是行为变更，必须审计。RESP3 下 EXEC 结果数组的协议格式有差异，业务逻辑不用改，客户端协议层适配就行。</p>
+<p>跨大版本升级前的三项自查：一是审计"入队报错后是否仍发 EXEC"（影响 2.6.5 行为变更）；二是检查运维脚本里的 AOF 路径（7.0 起是 <code>appendonlydir</code> 目录，<code>redis-check-aof</code> 要对目录执行）；三是确认客户端库支不支持新能力（<code>ValueCondition</code> / <code>StringDeleteAsync(key, condition)</code> 在 StackExchange.Redis 3.4.x 可用，更老的版本没有这些重载）。</p>
+<h1 id="九12-个坑按现象排">九、12 个坑，按现象排</h1>
+<p>12 条坑，全是我在线上或者压测里踩到的形状。验证命令都能直接粘（redis-cli 里分号不是语句分隔符，逐行敲，或者写成 shell 一行）。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261119191140890-129738409.png" alt="" loading="lazy"></p>
+<p>三条最值得立刻加进巡检的采样命令（shell 一行）：</p>
+<pre><code class="language-bash"># 事务态连接数：multi&gt;0 的连接就是"开了 MULTI 没 EXEC"的嫌疑对象
+redis-cli CLIENT LIST | grep -o 'multi=[0-9-]*' | sort | uniq -c
+# 入队期拒绝数：持续增长说明有代码在发非法命令，属开发期缺陷
+redis-cli INFO commandstats | grep -o 'rejected_calls=[0-9]*'
+# 执行期失败数：增长说明存在类型/编码类脏数据，需要跑对账
+redis-cli INFO commandstats | grep -o 'failed_calls=[0-9]*'
+</code></pre>
+<h1 id="十小结">十、小结</h1>
+<ul>
+<li>MULTI/EXEC 的本质是执行序列的原子性：EXEC 期间不插队、WATCH 提供 CAS 标记，没有回滚，也没有隔离级别。</li>
+<li>错误分两类：入队期 <code>-ERR</code> → EXECABORT（全批不执行）；执行期 <code>(error)</code> 元素 → 部分生效，必须逐条检查。<code>QUEUED</code> 只是"已入队"。</li>
+<li>事务态内 WATCH / 嵌套 MULTI 只报错、不弄脏事务；DISCARD 会清 WATCH；<code>RESET</code> 最彻底。</li>
+<li>8.4.0 起单键 CAS 首选 <code>SET IFEQ</code> / <code>DELEX IFEQ</code>：一次往返、零重试；多键同槽 ≤3 并发源用 WATCH，≥5 用 Lua，4 是过渡区。</li>
+<li>事务队列在服务端 <code>client.mstate</code>，EXEC 阻塞不可中断；集群必须同槽；<code>WAIT</code> 不是同步复制。</li>
+<li>上线顺序是"先压单键 → 再数并发源 → 最后才轮得到事务"。能不 WATCH 就不 WATCH，这个顺序别倒过来。</li>
+<li>上线前我只问两个问题：EXEC 里哪条命令可能失败？失败了谁来补？答不上来就别上，先去写对账。</li>
+</ul>
+<p>下一篇进入 <strong>Lua 脚本与 Functions</strong>：脚本化原子如何做到"一次调用、无冲突重试"，<code>lua-time-limit</code> / <code>SCRIPT KILL</code> 的真实边界，以及 <code>EVALSHA</code> 的缓存一致性怎么运维。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-20 07:07">2026-11-20 07:06</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">24</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23723004);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23723004&amp;targetId=23723004&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

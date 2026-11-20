@@ -1,0 +1,418 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shanyou/p/23726584" title="发布于 2026-11-20 08:56">
+    
+
+    <span role="heading" aria-level="2">七条语义，十六条变异：一个 Windows Job 持有者的护栏体检</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        讲清变异测试在干什么，再把七条语义逐条拆开，说清每条为什么容易写错、实现长什么样、以及用什么变异去撞它的护栏
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>移植一个 Node 的子进程管理模块到 .NET，最难的部分往往落在那些「一行代码里塞了三个时序约定」的地方。</p>
+<p><code>WindowsJobOwner</code> 就是这样一处。它管的范围很窄，只有三个动作：问 runner 连没连、发一条终止消息、同步强杀。但真写起来，七条语义全挤在这四十行里，而且互相牵制。牵制的地方就是变异测试该盯的地方。</p>
+<p>下面先讲清变异测试在干什么，再把七条语义逐条拆开，说清每条为什么容易写错、实现长什么样、以及用什么变异去撞它的护栏。</p>
+<h2 id="变异测试是什么">变异测试是什么</h2>
+<p>几乎所有写测试的人都遇到过一个困惑。</p>
+<p>CI 上绿灯亮着，覆盖率 90%。你打开一个函数，把 <code>&gt;=</code> 改成 <code>&gt;</code>，提交，绿灯。再改回来，改成 <code>!</code>，还是绿灯。你开始怀疑这些测试到底在测什么。</p>
+<p>覆盖率只回答一个问题：这行代码被执行过吗。它不回答另一个问题：<strong>这行代码被改坏的时候，会有人发现吗</strong>。一行代码可以被一百个测试执行到，却没有任何一个测试在它变错时失败。执行过和被指望，是两件事。</p>
+<p>变异测试就是来问第二个问题的。它的做法很朴素：<strong>在源码里故意种一个能编译、但语义错了的小改动，然后跑测试，看有没有测试变红。</strong></p>
+<p>这个改坏的动作叫「变异」，被改坏的那份代码叫「变异体」。种一个 bug 进去，等测试来抓。</p>
+<p>结果只有三类，名字都很直白。</p>
+<p><strong>killed，杀死</strong>：有测试红了，而且包含你预期的那条判据，说明这条语义有护栏兜着。</p>
+<p><strong>survived，存活</strong>：一条都没红，说明整套测试对这条语义免疫。存活是你最该看的那一格，每一个存活都指向一处真实漏检，而覆盖率报告对它们一无所知。</p>
+<p><strong>stillborn，死胎</strong>：编译不过、或者测试压根没跑起来。这次变异本身无效，不算击杀成功。</p>
+<p>第三类最容易被漏掉。只写「有没有红」的脚本，会把一个 import 失败的变异记成「成功杀死」，报告很漂亮，结论全错。所以合格的变异脚本必须同时核对测试总数：总数变了，红的原因就不是断言失败，而是测试没运行。</p>
+<p>整个回路长这样：</p>
+<p><img src="https://img2024.cnblogs.com/blog/510/202611/510-20261120085415597-2110907724.svg" alt="变异测试原理图：基线全绿后种入一处变异，构建并跑两遍取红集交集，按预期判据分成杀死、存活、误杀三种结局；左侧红色虚线是构建失败的死胎旁路" loading="lazy"></p>
+<p>图中左侧那条红色虚线值得留意。死胎是从「构建并跑两遍」这一步分叉出去的：编译不过或者测试压根没启动，这次变异就没有资格参与判定，必须单独归类，不能混进「杀死」。</p>
+<p>按变异怎么产生，工具分两派。</p>
+<p>一派是随机的，Stryker、PIT 这类工具属于这一派，随机翻转运算符、随机删语句，撒一大批。产出率高，但大部分结果要么是死胎，要么红了也说不清在测什么。</p>
+<p>另一派是手工设计的，叫定向变异。它反过来做：先问「这条语义如果没有护栏，会造成什么后果」，再设计一处恰好违反它的改动。每条变异都绑定一条具体语义和一个预期会红的判据。</p>
+<p>这篇讲的是后一派。代价是慢，收益是每一条结论都能落到一行代码上。</p>
+<h2 id="这个类管着什么">这个类管着什么</h2>
+<p>上游是 Node 版的 <code>WindowsJobOwner</code>，负责在父进程侧管一个 Windows Job 的 runner 子进程。它有几个状态需要在同一个地方记住：</p>
+<pre><code class="language-csharp">private object? _cancellationReason;
+private bool _cancellationReasonSet;
+private bool _terminationSent;
+</code></pre>
+<p>三个字段。第一、二个字段合起来表达三态：没记过、记过一个 null、记过某个对象。第三个字段是终止消息投递的闩。</p>
+<p>构造函数的四个入参：runner 的窄面（<code>Connected</code> / <code>Send</code> / <code>Kill</code>）、一个表示 runner 退出的 <code>Task</code>、一个返回「当前拿到的直接结果类型」的委托，以及一个上报基础设施故障的回调。</p>
+<p>写测试时用的假 runner 只需要实现三个成员，不需要仿真整个 <code>ChildProcess</code> 事件面。这一点很关键，因为它决定了这七条语义能不能在零进程的情况下被驱动。</p>
+<h2 id="一条变异在脚本里长什么样">一条变异在脚本里长什么样</h2>
+<p>定向变异的脚本没有魔法，本质上是一张表。每条记录五个字段：</p>
+<pre><code class="language-python">("M3", "wjo", TERM_LATCH, TERM_LATCH_OFF, {"T703"})
+#  编号  文件   变异前文本    变异后文本     预期会红的判据
+</code></pre>
+<p><code>TERM_LATCH</code> 是一段原样拷贝自源码的字符串，<code>TERM_LATCH_OFF</code> 是它被改坏之后的样子。脚本的动作只有三步：把前者替换成后者、重新构建、跑测试，然后从输出里抓哪些判据红了。</p>
+<p>这套设计里最要命的一条规则是：<strong>变异前文本必须在整个文件里恰好出现一次</strong>。不是「至少一次」，是恰好一次。</p>
+<p>因为替换函数只换第一处。如果这段文本在文件里出现了三次，脚本会默默改掉第一处，你以为在测 A 处的语义，实际动的是 B 处。跑出来的结论看起来有模有样，全是错的。所以脚本在动手之前先做一次计数，不等于 1 就直接退出，拒绝在一个它不认识的代码状态上给出结论。</p>
+<p>另外还有一个隐含要求：改坏的版本必须仍然能编译。如果改完编译不过，那是死胎，不是击杀，这条变异的结论作废。有些语义要制造出「能编译的错」并不容易，后面会看到一个为此多改一行的例子。</p>
+<p>每次变异跑完，脚本必须把源码还原，而且要用两层 <code>finally</code> 兜住：内层管单条变异，外层管整个循环。因为在跑的过程中你会中断、会超时、会去调脚本。源码被留在变异态一次，后面所有结论都是废的。</p>
+<p>把上面这些拼起来，整个框架只有这么几块：</p>
+<p><img src="https://img2024.cnblogs.com/blog/510/202611/510-20261120085526568-2104330499.svg" alt="定向变异框架架构图：脚本内含变异表、锚点校验与 reds 正则，驱动 dotnet 构建与测试进程；还原机制在每次变异后整份写回原文，最后重跑基线自证并产出判定表" loading="lazy"></p>
+<p>右边三个灰色框都是外部工具，脚本本身不含任何被测逻辑。它做的事只有一件：读表、写文件、起进程、抓输出、比对预期。</p>
+<p>中间那个绿色框是最容易被低估的部分。还原不做增量撤销，而是把原文整份读进内存、还原时整块写回。这样无论中间发生中断还是异常，只要 <code>finally</code> 能跑，文件就回到原样。它还刻意保留原始换行风格，否则 CRLF 和 LF 一混，<code>git diff</code> 会把整份文件都标成改动。</p>
+<p>现在再回头看那七条语义，就有一个统一的视角：每条语义都去找一个「删掉或改掉一个词，程序还能编译，但行为已经错了」的位置。</p>
+<h2 id="-取消原因只记第一次">① 取消原因只记第一次</h2>
+<p>上游语义：先到先得，后到的 <code>SIGKILL</code> 不能盖掉真正的取消理由。</p>
+<pre><code class="language-csharp">if (!_cancellationReasonSet)
+{
+    _cancellationReason = cancellationReason;
+    _cancellationReasonSet = true;
+}
+</code></pre>
+<p>这段代码朴素得像废话。问题在于它和后面的投递闩不在同一个位置，所以「记 reason」和「发 terminate」是两件独立的事。第一次 <code>Signal</code> 记下 reason 并投递，第二次 <code>Signal</code> 不投递，但仍然会走到前面这段代码外面。</p>
+<h3 id="对应的变异">对应的变异</h3>
+<pre><code class="language-python"># M1：取消原因每次都覆盖
+LATCH_REASON = """        if (!_cancellationReasonSet)
+        {
+            _cancellationReason = cancellationReason;
+            _cancellationReasonSet = true;
+        }
+"""
+LATCH_REASON_OFF = """        _cancellationReason = cancellationReason;
+        _cancellationReasonSet = true;
+"""
+</code></pre>
+<p>删掉那个 <code>if</code>。改动之后，任何一次后续 <code>Signal</code> 都会把先记的 reason 顶掉。</p>
+<p>期望打红 T701、T702 和 T713。T701 传两个不同的异常对象，断言拿到的是第一个；T702 更刁，第一次传对象、第二次传 <code>null</code>，断言仍然是第一个对象。T702 存在的理由是：如果实现改成「只在 reason 非 null 时覆盖」，T701 会活下来而 T702 会红。两条判据卡的是两个不同的错法。T713 是第三种错法——它一开始就传 <code>null</code>，断言这个 <code>null</code> 被保住而不被后来的对象顶掉。</p>
+<h2 id="-终止只投递一次">② 终止只投递一次</h2>
+<pre><code class="language-csharp">if (_terminationSent || !_runner.Connected)
+{
+    return;
+}
+
+_terminationSent = true;
+</code></pre>
+<p>注意 <code>_terminationSent = true</code> 写在 <code>Send</code> <strong>之前</strong>。这个顺序有讲究：如果写在 <code>Send</code> 之后，而 <code>Send</code> 同步抛异常，闩就没置上，下一个 <code>Signal</code> 会再投一条。终止消息重复投递在 IPC 层不致命，但它会让 runner 侧收到两条 <code>terminate</code>，而 runner 的行为不保证幂等。</p>
+<h3 id="对应的变异-1">对应的变异</h3>
+<pre><code class="language-python"># M3：终止每次都投递
+TERM_LATCH_OFF = """        if (!_runner.Connected)
+        {
+            return;
+        }
+
+        _terminationSent = true;
+"""
+</code></pre>
+<p>从条件里摘掉 <code>_terminationSent</code>。判据 T703 连发三次 <code>Signal</code>，断言 <code>runner.Sent</code> 里只有一条。</p>
+<p>判据里还有一句值得看：</p>
+<pre><code class="language-csharp">Assert.Single(runner.Sent, m =&gt; m is not null &amp;&amp;
+    m.GetType().Name.Contains("TerminateMessage", StringComparison.Ordinal));
+</code></pre>
+<p>只数条数不够。<code>Send</code> 收到的东西得确实是终止消息，而不是别的什么。<code>TerminateMessage</code> 是个私有嵌套 record，只能靠类型名匹配，这是这套判据里唯一的类型名断言。</p>
+<h2 id="-断连后早返回但仍然记-reason">③ 断连后早返回，但仍然记 reason</h2>
+<p>这条语义的名字容易让人写错判据。断连时「不发也不抛」，可 reason <strong>照样要记</strong>。因为 <code>MapStartFailure</code> 后面要靠这个 reason 把启动被取消还原回去，而断连恰恰是启动失败最常见的时刻。</p>
+<p>所以顺序必须是：先记 reason，再判闸门。</p>
+<pre><code class="language-csharp">if (!_cancellationReasonSet)   // 先记
+{
+    _cancellationReason = cancellationReason;
+    _cancellationReasonSet = true;
+}
+
+if (_terminationSent || !_runner.Connected)   // 再判
+{
+    return;
+}
+</code></pre>
+<h3 id="对应的变异有两条">对应的变异有两条</h3>
+<pre><code class="language-python"># M4：断连仍投递
+CONNECTED_GATE_OFF = """        if (_terminationSent)
+        {
+            return;
+        }
+"""
+
+# M5：把门挪到 latch 之前，断连时就不记 reason 了
+</code></pre>
+<p>M4 摘掉 <code>!_runner.Connected</code>，M5 把两段代码整体换序。两条都期望打红 T704，而 T704 的断言是三句话：</p>
+<pre><code class="language-csharp">Assert.Empty(runner.Sent);        // 不发
+Assert.False(owner.TerminationSent);  // 闩不置
+Assert.Same(reason, owner.CancellationReason);  // 但 reason 记了
+</code></pre>
+<p>M4 撞第一句，M5 撞第三句。同一个判据，两个不同方向，这是合起来的价值：它证明这三句断言是三条独立的护栏，而不是一句的三种说法。</p>
+<h2 id="-投递失败要上报再强杀">④ 投递失败要上报再强杀</h2>
+<p>两条路径。回调带非 null 错误，或者 <code>Send</code> 本身同步抛。</p>
+<pre><code class="language-csharp">_runner.Send(
+    WindowsJobMessages.Terminate,
+    error =&gt;
+    {
+        if (error is null || _directResultType() is not null)
+        {
+            return;
+        }
+
+        _failInfrastructure(error);
+        TerminateForHostExit();
+    });
+</code></pre>
+<pre><code class="language-csharp">catch (Exception error)
+{
+    _failInfrastructure(error);
+    TerminateForHostExit();
+}
+</code></pre>
+<p>两个分支体的最后两行一模一样。这看起来像可以提取成局部函数，但没提。原因是提取之后变异就没法只改一处而干净地只影响一条路径，见下。</p>
+<h3 id="对应的变异-2">对应的变异</h3>
+<pre><code class="language-python"># M6：回调失败只上报不强杀
+CALLBACK_KILL     = """                    _failInfrastructure(error);
+                    TerminateForHostExit();"""
+CALLBACK_KILL_OFF = """                    _failInfrastructure(error);"""
+
+# M7：同步抛只上报不强杀
+THROW_KILL     = """        catch (Exception error)
+        {
+            _failInfrastructure(error);
+            TerminateForHostExit();
+        }"""
+THROW_KILL_OFF = """        catch (Exception error)
+        {
+            _failInfrastructure(error);
+        }"""
+</code></pre>
+<p>两条锚点各自带足上下文（缩进、<code>catch</code> 行），所以每个锚点在文件里唯一。如果当初把这两行提成一个方法，这两条变异就会指向同一处，红了以后分不清是哪条路径失去了强杀。</p>
+<p>这不是反对重构。只是在这个类里，「两个分支各自完整」比「复用两行」换来的可诊断性更值。</p>
+<p>M6 期望打红 T705 和 T710，M7 期望 T706。T705 走回调路径，T706 走同步抛路径，T710 是 T709 的正对照（结果没到时迟到回执照旧报故障）。</p>
+<h2 id="-宿主退出强杀要吞掉失败">⑤ 宿主退出强杀要吞掉失败</h2>
+<pre><code class="language-csharp">public void TerminateForHostExit()
+{
+    try
+    {
+        _runner.Kill("SIGKILL");
+    }
+    catch (Exception)
+    {
+        // Host exit continues with other live runners.
+    }
+}
+</code></pre>
+<p>语义④要求投递失败必须上报，语义⑤要求 kill 失败必须吞掉。两条正好相反，而它们相隔不到二十行。这是整个类里最容易被「顺手统一」的地方：有人看到两个 <code>catch</code>，会觉得风格不一致，把其中一个改齐。</p>
+<h3 id="对应的变异-3">对应的变异</h3>
+<pre><code class="language-python"># M9：kill 失败冒泡
+KILL_SWALLOW_OFF = """        catch (Exception)
+        {
+            throw;
+        }"""
+</code></pre>
+<p>期望打红 T708，它的断言只有一句 <code>Assert.Empty(failures)</code>，外面那层是 <code>Assert.DoesNotThrow</code> 的隐含要求（抛了测试就红）。</p>
+<p>还有一条变异不是删代码，是往里塞：</p>
+<pre><code class="language-python"># M8：宿主退出强杀前先上报一个不该有的故障
+HOST_KILL_OFF = """        _failInfrastructure(new InvalidOperationException("host exit"));
+        try
+        {
+            _runner.Kill("SIGKILL");
+        }
+        ...
+"""
+</code></pre>
+<p>这条专门对付「断言只检查做过什么、不检查没做什么」的判据。如果 T707 只断言 <code>Killed</code> 里有 <code>SIGKILL</code>，那 M8 会活下来：强杀照做了，只是顺带报了个假故障。所以 T707 必须同时断言 <code>Assert.Empty(failures)</code>。</p>
+<p>反向注入比删代码更能暴露结构松散的断言。删代码只能测「该做的做了没有」，塞代码才能测「不该发生的发生了没有」。</p>
+<p>M8 期望打红的面比较大，T705、T706、T707、T708、T710 都在里面。因为这些判据都构造了 <code>WindowsJobOwner</code> 并检查 <code>failures</code> 列表，而 M8 一进 <code>TerminateForHostExit</code> 就往里加东西。这个多余的红不算误杀，是变异本身设计得粗，接受它，因为结论方向仍然对：这条语义确实有护栏。</p>
+<h2 id="-结果已到之后迟到的回执不算故障">⑥ 结果已到之后，迟到的回执不算故障</h2>
+<p>这条最像竞态补丁，事实也是。</p>
+<p>父进程发 <code>terminate</code> 之后，runner 可能已经把结果通过另一条通道送回来了。这时候 <code>send</code> 的回调才姗姗来迟，带着一个 <code>EPIPE</code> 之类的错误。按语义④，这该上报；但语义⑥说，如果 <code>_directResultType()</code> 已经返回非 null，就别报了。</p>
+<p>理由：结果已经落地的操作，不该被一封迟到的回执推翻。</p>
+<pre><code class="language-csharp">if (error is null || _directResultType() is not null)
+{
+    return;
+}
+</code></pre>
+<p>一个 <code>if</code> 里塞了两个条件，对应两件事：<code>error is null</code> 是成功回执，<code>_directResultType() is not null</code> 是结果已到。两个条件都通向同一个 <code>return</code>，所以很容易只测其中一个。</p>
+<h3 id="对应的变异-4">对应的变异</h3>
+<pre><code class="language-python"># M10：砍掉结果门，只留成功门
+RESULT_GUARD_OFF = """                    if (error is null)
+                    {
+                        return;
+                    }
+"""
+
+# M11：砍掉成功门。⚠️ 锚点要连 _failInfrastructure(error) 一起换
+CALLBACK_BODY_OFF = """                    if (_directResultType() is not null)
+                    {
+                        return;
+                    }
+
+                    _failInfrastructure(error ?? new Exception("delivery failed"));
+                    TerminateForHostExit();"""
+</code></pre>
+<p>M11 那行注释是踩过坑的。如果只改 <code>if</code> 那一行，<code>error</code> 的可空状态会漏进 <code>Action&lt;Exception&gt;</code>，编译器报 CS8604，构建失败。构建失败在变异测试里是 Stillborn，不是击杀，会被算成「OTHER」而不是「RED」。为了让它成为一次有效的语义变异，必须把 <code>_failInfrastructure(error)</code> 一起换成 <code>_failInfrastructure(error ?? new Exception(...))</code>。</p>
+<p>这种「为了让变异能编译而必须多改一点」的情况，是变异设计和编译器的持续摩擦。原则是只改到刚好能编译，不能改出第二个语义差异。</p>
+<p>M10 期望 T709。T709 的构造方式值得抄：</p>
+<pre><code class="language-csharp">var runner = new FakeRunner { DeferCallbacks = true };  // 回调先存着
+WindowsDirectResultKind? directResult = null;
+var owner = new WindowsJobOwner(runner, CompletedExited(), () =&gt; directResult, failures.Add);
+
+owner.Signal("SIGTERM");
+directResult = WindowsDirectResultKind.TargetExit;   // 结果到了
+var callback = Assert.Single(runner.PendingCallbacks);
+callback(new InvalidOperationException("late EPIPE"));  // 回执才到
+
+Assert.Empty(failures);
+Assert.Empty(runner.Killed);
+</code></pre>
+<p>假 runner 的 <code>DeferCallbacks</code> 把回调扣住，让判据能精确控制「结果已到」和「回执到达」的先后。这个开关是整个测试文件里唯一为时序而存在的设施。</p>
+<p>M11 期望 T711，就是那条不带任何失败的回调。它断言 <code>failures</code> 和 <code>Killed</code> 都为空。</p>
+<h2 id="-mapstartfailure-的三态问题">⑦ mapStartFailure 的三态问题</h2>
+<p>这条是整个类里最难的一条，也是最容易在评审里被放过的一条。</p>
+<p>上游签名是 <code>mapStartFailure(failure, serialized)</code>：如果这条失败恰好是「启动被取消」，就把调用方当初给的 reason 还给他；否则原样返回 <code>failure</code>。</p>
+<p>「恰好是启动被取消」的判定很严：</p>
+<pre><code class="language-csharp">internal static bool IsWindowsStartCancellationError(SerializedRunnerError error)
+{
+    return error.Name == "Error"
+        &amp;&amp; error.Message == "subprocess target start was cancelled"
+        &amp;&amp; error.Code is null
+        &amp;&amp; error.Syscall is null
+        &amp;&amp; error.Path is null;
+}
+</code></pre>
+<p>三个可选字段必须同时缺席。上游逐位比 <code>undefined</code>，哪怕 <code>code</code> 是空字符串也不算。这一层是为了防止把用户自己的 <code>ENOENT</code> 误认成取消。</p>
+<p>真正的难点在另一个地方：那个 reason 的类型是 <code>object?</code>。</p>
+<p>判据里有三种传法：传一个异常对象、传 <code>null</code>、不传（走默认值 <code>null</code>）。而「传 <code>null</code>」和「不传」在 C# 里落到调用点上是同一个值。</p>
+<pre><code class="language-csharp">public void Signal(string signal, object? cancellationReason = null)
+</code></pre>
+<p>所以「记过没有」这件事，不能靠 reason 是不是 null 来判断。必须有一个独立的 bool。</p>
+<pre><code class="language-csharp">return _cancellationReasonSet &amp;&amp; IsWindowsStartCancellationError(serialized)
+    ? _cancellationReason
+    : failure;
+</code></pre>
+<p>前面那个 <code>_cancellationReasonSet</code> 就是全部的意义。少了它，「没记过」和「记过 null」会合流，而它们的语义完全不同：前者说明没有取消请求，不该还原；后者说明调用方确实取消了，只是没带原因，应该还原成 <code>null</code>。</p>
+<h3 id="对应的变异-5">对应的变异</h3>
+<pre><code class="language-python"># M2：用 null 判「记过没有」
+LATCH_BOOL     = "        return _cancellationReasonSet &amp;&amp; IsWindowsStartCancellationError(serialized)"
+LATCH_BOOL_OFF = "        return _cancellationReason is not null &amp;&amp; IsWindowsStartCancellationError(serialized)"
+</code></pre>
+<p>只换一个词。改动之后，如果最近一次记的 reason 是 <code>null</code>，<code>MapStartFailure</code> 会认为「没记过」，把 <code>failure</code> 原样返回。</p>
+<p>期望打红 T713 和 T714。T713 走「记过 null」这一态：先 <code>Signal("SIGTERM", null)</code>，再 <code>Signal("SIGKILL", 某个对象)</code>，因为 Latches 语义①，第二次不覆盖，所以记的仍然是 <code>null</code>，然后断言映射回来是 <code>null</code>。T714 走「不传」：<code>Signal("SIGTERM")</code>，断言映射回来也是 <code>null</code>。</p>
+<p>注意这两条判据断言的结果<strong>一样</strong>，都是 <code>null</code>。差别只在路径：T713 是「记过 null」，T714 是「没记过但确实 cancel 过」。M2 只能杀死 T713，杀不死 T714，因为 T714 那条路径上 <code>_cancellationReasonSet</code> 和 <code>_cancellationReason is not null</code> 的表现恰好一致。</p>
+<p>这个不对称说明了一件重要的事：<strong>判据的断言相同，不代表判据重复</strong>。它们卡的是实现里两个不同的分支，而某个变异只能撞到其中一个。如果写判据时看到两条断言一样就合并掉，M2 就没人管了。</p>
+<p>另外三条变异打的是 <code>MapStartFailure</code> 之间的逻辑：</p>
+<pre><code class="language-python"># M12：未 signal 也还原（砍掉 latch 检查）
+MAP_LATCH_OFF = "        return IsWindowsStartCancellationError(serialized)"
+
+# M13：非取消错误也还原（砍掉形状检查）
+MAP_SHAPE_OFF = "        return _cancellationReasonSet"
+</code></pre>
+<p>M12 期望 T716（没 signal 过就不该还原），M13 期望 T715（严格的 provider 错误不该被还原，即使发过 terminate）。</p>
+<p>M13 这里得说一句：<code>MAP_SHAPE_OFF</code> 写成 <code>return _cancellationReasonSet</code> 是有问题的。</p>
+<p>方法签名返回 <code>object?</code>，<code>return _cancellationReasonSet</code> 会把 bool 装箱成一个对象返回，编译能过。但它造出的错法是「返回一个 bool」，跟「不看形状、只看记没记」差得远。这会让所有走 <code>MapStartFailure</code> 的判据都对不上：T712 期望拿到 reason，得到的是 <code>true</code>；T713、T714 期望 <code>null</code>，得到 <code>true</code>；T716 期望 <code>failure</code>，得到 <code>false</code>。全部变红，而 <code>expected</code> 里只写了 T715。</p>
+<p>按脚本自己的判定逻辑，这一条会被标成 NOT-DISCRIMINATING，<code>extra</code> 一栏塞满。真正想表达「非取消错误也还原」应该写成：</p>
+<pre><code class="language-csharp">return _cancellationReasonSet ? _cancellationReason : failure;
+</code></pre>
+<p>也就是只摘掉 <code>IsWindowsStartCancellationError(serialized)</code> 这一半，不用 <code>? :</code>。这样 M13 才是一条干净的、只撞 T715 的变异。</p>
+<p>写变异时最常犯的错就是这一类：改动足够让测试红，但红的原因不是你声称的那条语义。红了不等于对了。</p>
+<p>形状本身还有两条：</p>
+<pre><code class="language-python"># M14：放过 code
+SHAPE_CODE_OFF = "            &amp;&amp; true"
+
+# M15：放过 message
+SHAPE_MSG_OFF = "            &amp;&amp; error.Message is not null"
+</code></pre>
+<p>M14 期望 T717，T717 是那个用 <code>[Theory]</code> 和三个 <code>InlineData</code> 的判据，分别给 <code>code</code>、<code>syscall</code>、<code>path</code> 各塞一个值。M15 期望 T720，专钉 name 和 message 的精确值。</p>
+<h2 id="第八块waitforexit-的异常归属">第八块：waitForExit 的异常归属</h2>
+<p>七条语义之外还有一条，编号上算第八条，实现上只有一行：</p>
+<pre><code class="language-csharp">public Task WaitForExitAsync() =&gt; _exited;
+</code></pre>
+<p>构造函数里挂了一个只观察不改变的延续：</p>
+<pre><code class="language-csharp">_ = exited.ContinueWith(
+    static task =&gt; _ = task.Exception,
+    CancellationToken.None,
+    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+    TaskScheduler.Default);
+</code></pre>
+<p>这行的作用是压掉「没人 await 时的未处理拒绝」。上游那句 <code>void this.exited.catch(() =&gt; {})</code> 的意图一样：只是不让进程因为一个没人接的拒绝而崩，不改变 await 的结果。</p>
+<p>区别在于 <code>.catch(() =&gt; {})</code> 返回一个新的已解决 Promise，而 <code>ContinueWith</code> 返回的是另一条任务链，<code>await _exited</code> 拿到的仍然是原始异常。这是移植时容易搞反的地方：C# 里如果把 <code>ContinueWith</code> 的返回值赋给 <code>_exited</code>，异常就被真正吞掉了。</p>
+<h3 id="对应的变异-6">对应的变异</h3>
+<pre><code class="language-python"># M16：waitForExit 吞掉失败
+WAIT_RETURN_OFF = """    public async Task WaitForExitAsync()
+    {
+        try
+        {
+            await _exited;
+        }
+        catch (Exception)
+        {
+            // swallow
+        }
+    }"""
+</code></pre>
+<p>这里没有去模拟「<code>ContinueWith</code> 吞掉异常」那种写法，因为它在 C# 里要改构造函数的赋值，改动面会波及另一个语义。改成在 <code>WaitForExitAsync</code> 里加 <code>try/catch</code> 更干净，语义落点相同：调用方拿不到 runner 退出的真实原因。</p>
+<p>期望打红 T719。T719 用 <code>TaskCompletionSource</code> 造一个会失败的退出，然后断言 <code>Assert.ThrowsAsync</code> 拿到的异常对象就是当初塞进去的那个。M16 之后它拿不到任何异常。</p>
+<p>M16 和 M17 在最初的脚本里都有，后来 M17（让构造函数不观察未处理拒绝）被删掉了：它没有可靠的观测点。未处理拒绝在 .NET 里发生在外层 <code>TaskScheduler</code> 上，测试进程不会因此变红，只能靠进程退出码，而 xunit runner 会把它报成别的东西。一条永远拿不到判据的变异，留着只会污染统计。</p>
+<h2 id="判据编号怎么分配">判据编号怎么分配</h2>
+<p>这里有个算不上坑但会反复踩的细节。</p>
+<p>变异脚本的 <code>reds()</code> 从测试输出里抓的是方法名：</p>
+<pre><code class="language-python">FAIL_RE = re.compile(
+    r"^\s+(Dsh\.Tools\.Tests\.WindowsJobOwnerTests\.[A-Za-z0-9_]+)(?:\(.*\))? \[FAIL\]",
+    re.M,
+)
+</code></pre>
+<p>理论测试（<code>[Theory]</code>）的每一组 <code>InlineData</code> 在输出里带的是同一个方法名，括号里那部分被 <code>(?:\(.*\))?</code> 吃掉了。所以去重之后剩一个 key。</p>
+<p>整个测试文件是 19 个 <code>[Fact]</code> 加 1 个 <code>[Theory]</code>，理论有三组数据，共 22 个用例，但只有 20 个可观测的方法名。</p>
+<p>T 号按方法分配，T701 到 T720 一共二十个。<code>InlineData</code> 的三种情形不占独立 T 号，它们是 T717 名下的三组数据。判定逻辑用集合包含：<code>expected ⊆ actual</code> 且 <code>actual ⊆ expected</code>，多出来的红单独记为 collateral。</p>
+<p>如果按用例数分配二十一个 T 号，会有一个 T 号永远匹配不上 <code>reds()</code> 的输出，在报告里被误报成 Survived。那种假的漏检比真的漏检更难查，因为你会去翻测试代码找为什么它没红，而它其实红了。</p>
+<h2 id="脚本守住的三件事">脚本守住的三件事</h2>
+<p>十六条变异写完，剩下的都是工程。</p>
+<p>锚点唯一性检查放在所有事情之前：</p>
+<pre><code class="language-python">for row in MUTATIONS:
+    label, key, anchor, replacement = row[0], row[1], row[2], row[3]
+    count = originals[key].count(anchor)
+    if count != 1:
+        print(f"ANCHOR {label}: expected 1 hit in {key}, got {count}")
+        problems += 1
+</code></pre>
+<p>不是「找不到就报错」，是「不恰好一次就报错」。多命中时 <code>replace(..., 1)</code> 会默默改掉第一处，你以为在测 A，实际动了 B。</p>
+<p>这条检查在开发过程中真的起过作用。写脚本的时候源码的 <code>Signal</code> 被改成过无条件覆盖版本，M1 和 M5 两个锚点同时命中 0 次。脚本直接 <code>return 2</code> 拒绝执行。如果它照跑下去，会产出一张「全部七条语义无护栏」的表，而真相是源码退化了，不是测试退化了。</p>
+<p>还原用两层 <code>finally</code>：内层管单条变异，外层管整个循环。因为在跑的过程中你会中断、会超时、会去调脚本。源码被留在变异态一次，后面所有结论都是废的。</p>
+<p>跑完十六条之后重新构建、再跑一遍基线：</p>
+<pre><code class="language-python">baseline_ok = (
+    restore_code == 0
+    and all(code == 0 for code, _ in restore_outs)
+    and all("Total: 22" in out for _, out in restore_outs)
+    and not (reds(restore_outs[0][1]) &amp; reds(restore_outs[1][1]))
+)
+</code></pre>
+<p><code>Total: 22</code> 那一条比看起来重要。总数变了说明测试根本没跑起来，程序集加载崩了，那不是断言失败。只检查「有没有红」的脚本会把这种情况记成击杀成功。</p>
+<h2 id="一个没做对的取舍">一个没做对的取舍</h2>
+<p>M8 那种反向注入，期望打红的面太宽，占了五条判据。严格按 <code>extra</code> 为空来判，它会被标成 NOT-DISCRIMINATING。</p>
+<p>有两种处理。一是把 <code>failures</code> 的检查从那些判据里摘出去，让它们专注各自的语义；二是接受这个粗，在报告里说明它是宽面变异。</p>
+<p>我选了后者，因为摘掉 <code>Assert.Empty(failures)</code> 会让 T705、T706、T707 失去「不该发生的没发生」这一层，那是它们的核心价值。宁可承认一条变异的粒度不细，也不要为了让报告漂亮而削掉判据。</p>
+<p>这类取舍在变异测试里会一直出现：<strong>报告好看和判据结实往往是反向的</strong>。</p>
+<h2 id="现在的状态">现在的状态</h2>
+<pre><code class="language-text">该测试类     22 用例（19 Fact + 1 Theory×3 InlineData）
+登记变异     16 条
+T 号         20 个（T701–T720，按方法名分配）
+锚点检查     16/16 唯一命中
+全量基线     Total: 678，Failed: 0，Skipped: 7
+已知待修     M13 的替换文本写法错（见上），M8 粒度偏宽（见上）
+</code></pre>
+<p>七条语义里，①到⑦各有至少一条变异指着它，第八块（<code>waitForExit</code>）由 M16 指着。⑥里 M2 只能杀死 T713 而杀不死 T714，这个不对称不是缺陷，它说明这两个看似重复的判据守着两个不同的分支。</p>
+<p>判据编号里还有个空号：T712 有判据但没有任何变异指着它。它测的是 <code>MapStartFailure</code> 端到端还原出 reason 这条主路径，理论上 M12 和 M13 都会波及它（M12 砍掉 latch 检查后，没 signal 也还原，T712 因为先 signal 过所以不受影响；M13 会把它一起打红，但那是上面说的错误红）。给它配一条只改 latch 位置、不动形状检查的变异，这份表才算齐。</p>
+<p>判断一套判据结不结实，看覆盖率没用。得看你在每个关键锚点上种一个错，有没有人喊。而且要能说清——它为什么喊。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>欢迎大家扫描下面二维码成为我的客户，扶你上云</p>
+<img src="https://images.cnblogs.com/cnblogs_com/shanyou/57459/o_220125090408_%E9%82%80%E8%AF%B7%E4%BA%8C%E7%BB%B4%E7%A0%81-258px.jpeg" width="170">
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-20 08:57">2026-11-20 08:56</span>&nbsp;
+<a href="https://www.cnblogs.com/shanyou">张善友</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23726584);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshanyou%2Fp%2F23726584&amp;targetId=23726584&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
