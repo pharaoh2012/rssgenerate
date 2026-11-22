@@ -1,0 +1,195 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/jeff-tsai/p/23728641/day-25-audit-trail" title="发布于 2026-11-20 11:09">
+    
+
+    <span role="heading" aria-level="2">Day 25：审计轨迹与变更的前后值</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3864267/202611/3864267-20261120110852285-1611062181.png" alt="Day 25：审计轨迹与变更的前后值" class="desc_img">
+        一行审计为什么把用户名、公司名称、应用程序名称通通抄一份。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="Day 25：审计轨迹与变更的前后值" loading="lazy" data-src="https://raw.githubusercontent.com/jeff377/blog-images/main/2026-day-25-sc.png" class="lazyload"></p>
+<p>有人来问「这一笔的金额上个月是谁改的」，多半已经是几个月以后的事。问的人手上没有当时的界面、没有当时的程序版本，只有当时留下来的那几行记录。谁登录、谁把哪一个字段从什么改成什么、谁看了哪一笔，审计这一层的每一个决定都得先假设这个场景，包括那些看起来只是省空间的决定。</p>
+<p>本篇说明：</p>
+<ol>
+<li>为什么名字也要抄一份，不是存个代号再 join 回去</li>
+<li>一个字段就把登录的结果编完，而失败原因为什么要跟给用户看的那一句分开</li>
+<li>查看为什么只记读单笔，也是三张里唯一默认关着的</li>
+<li>变更一次保存记一行，而它为什么排在 transaction 外面、写失败了怎么办</li>
+<li>改了什么记成一段 DiffGram，而截取它的位置只有一个</li>
+</ol>
+<hr>
+<h2 id="一三张表及共通列">一、三张表及共通列</h2>
+<p>把每一次调用都记下来是走不通的，读取远多于写入，数据量会直接爆炸。审计要回答的问题收成三个，一个问题一张表：</p>
+<table>
+<thead>
+<tr>
+<th>要回答的问题</th>
+<th>落在哪里</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>谁登录了，结果是什么</td>
+<td><code>st_log_login</code></td>
+</tr>
+<tr>
+<td>谁看了哪一笔</td>
+<td><code>st_log_access</code></td>
+</tr>
+<tr>
+<td>谁对哪一笔做了什么，哪些字段从什么改成什么</td>
+<td><code>st_log_change</code></td>
+</tr>
+</tbody>
+</table>
+<p>三张表住在 <code>log</code> 这个数据库分类，整体默认是关的，三张各有一个子开关。而不管是哪一张，每一行都先铺同一组共通列。</p>
+<p>要记下「谁做的」，直觉的作法是存一个用户的行标识，显示名字的时候再 join 回去。</p>
+<p>这里走不通，而且不是性能问题。<code>log</code> 是一个独立的数据库分类（Day 11 谈过记录可以自己占一个数据库），它与 <code>common</code>、<code>company</code> 物理分离，可以被搬到另一台机器、甚至依年份分成好几个库。跨库的 join 不是比较慢，是不存在。一个必须 join 才有意义的字段，在这里就是一个没有意义的字段。</p>
+<p>所以每一组身分都存两列，标识码一列、显示名称一列（节选自 <a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Definition/Logging/AuditEntry.cs" target="_blank" rel="noopener nofollow"><code>AuditEntry.cs</code></a>）：</p>
+<pre><code class="language-csharp">columns.Add(new AuditColumn("user_id", UserId));
+columns.Add(new AuditColumn("user_name", UserName));
+columns.Add(new AuditColumn("company_id", CompanyId));
+columns.Add(new AuditColumn("company_name", CompanyName));
+// access_token / trace_id / client_ip / source ...
+columns.Add(new AuditColumn("api_key_id", ApiKeyId));
+columns.Add(new AuditColumn("api_key_name", ApiKeyName));
+</code></pre>
+<p>这份数据不规范化，而且刻意不规范化。用户改了名字、公司改了抬头，旧行留着的是当时那个名字，跟现在的 <code>st_user</code> 对不起来。这正是审计要的：一份记录要说的是那一刻的状况，不是今天的状况。同一个取舍在别的地方会是缺陷，在这里是规格。</p>
+<p>密钥那一组里，标识码不是秘密，所以它进得了审计行；秘密则是框架发放之后自己手上都没有明文，所以它进不去。这一组字段最有用的地方在登录那一张表：一串登录失败集中在同一个应用，跟同样一串分散在好几个应用，读起来是两件事。</p>
+<hr>
+<h2 id="二登录记录">二、登录记录</h2>
+<p>三张里最单纯的一张，主开关打开就跟着开。它比共通列多的是一个事件值，加一句失败原因。</p>
+<p>事件值自己就带着结果，不另外开一个成功与否的列。登录成功、登录失败、账号被锁、注销，再加上信任的近端调用替某个用户开出来的 session，五个值各是一种结果。少了那一列，「事件值跟结果列对不起来」这种情况就不会发生。</p>
+<p>失败原因那一列跟登录界面上显示的那一句管的不是同一件事。界面上的消息一律简要，不会告诉用户是「账号不存在」还是「密码错了」，这是通例：只要分得出来，登录这个接口就成了试账号存不存在的工具。审计这一列没有这个顾虑，它的读者是事后查账的人，记得越具体越有用。</p>
+<hr>
+<h2 id="三查看记录">三、查看记录</h2>
+<p>调出一笔数据来看，这件事本身也要留下记录。谁在什么时候调出了哪一位客户的完整数据，在合规的问法里跟谁改了它一样重要。Day 11 那张分类表把 <code>log</code> 写成「操作、登录与变更的记录」，「操作」指的就是这一轴。</p>
+<p>它比共通列多的是哪一张表单，加那一笔的键。调出单笔明细本来就是把整笔载进来，所以「谁」加「哪一笔」就是一行记录的单位。</p>
+<p>三张里只有它默认是关的，因为它的数据量跟着查询次数走。部署层那个开关可以全开，逐张表单也可以单独开，客户主表值得记，代码表不值得。</p>
+<p>写下这一行的是读单笔那一个，清单查询与弹窗选取不留记录。</p>
+<hr>
+<h2 id="四变更记录">四、变更记录</h2>
+<p>表单保存一次，审计就记一行。那一行写的是谁、什么时候、哪一张表单的哪一笔，做的是添加修改还是删除，另外带一个敏感旗标。</p>
+<p>同一行还装着变更明细：改了哪些字段、每一列从什么变成什么，全部收在同一个字段里，下一节谈那一列怎么来的。</p>
+<p>添加、修改还是删除，看主表那一行的状态。只改了明细而主表一个字没动，仍然算修改，因为那一整笔记录确实变了。</p>
+<p>主开关关着就整套不记。打开之后，变更这一轴跟登录一样默认是开的，而逐张表单的规则可以改掉这个默认：变更与查看各有一个三态值，跟着部署层的默认走、强制记、强制不记。</p>
+<h3 id="写入排在-transaction-外面">写入排在 transaction 外面</h3>
+<p>审计那一行写在 transaction 外面，保存成功了就是成功了，它没写进去也不会把保存拉下来：框架记一笔 error，业务照常结束。</p>
+<p>Day 14 把这个决定跟它的对照摆在一起讲过：主表与明细必须同 transaction，变更审计接受非原子。两个决定相反，因为坏掉的样子不一样：明细漏掉是留下一张不齐的单而且不报错，审计漏掉是少一行记录、数据本身是对的。</p>
+<p>不挡业务不等于可以随便掉，每一种写不进去的情况都有一条路：</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一般</td>
+<td>进一条有上限的内存队列，后台批量写进 log 数据库</td>
+</tr>
+<tr>
+<td>队列满了</td>
+<td>当场改成同步写，不丢</td>
+</tr>
+<tr>
+<td>log 数据库写不进去</td>
+<td>设了退路文件就落地成文件，没设就只剩那一笔 error</td>
+</tr>
+</tbody>
+</table>
+<p>一条「不能掉」的队列，满载时的正确行为不是等，是换一条路。</p>
+<p>还有一件事只有这一层会遇到：审计写入本身就是一次数据库访问，而慢的数据库访问框架会另外记一笔，那一笔又是一次审计写入。解法是打 log 数据库的时候不做这个检测，循环就断在那里。</p>
+<p>横切所有层的机制，最容易漏掉的不是谁没被盖到，是它盖到了自己。</p>
+<hr>
+<h2 id="五变更明细">五、变更明细</h2>
+<p>「记下改了什么」一般的作法是逐列比对，一个字段一行。它的字段级查询力最强，某一列在过去一年被谁改过几次，一句 SQL 就答得出来；代价是行数等于变更次数乘上列数，比对逻辑还要自己写一套，而那份查询力在多数「这张单改了什么」的问法上用不到。</p>
+<p>框架改用 <code>DataSet</code> 本来就有的东西：<code>GetChanges()</code> 拿到变更集，<code>WriteXml</code> 以 DiffGram 模式写成一段同时带新值与旧值的 XML，前面再附上当时的字段结构，包在同一个外层元素里。一次保存写一行，主表与所有明细的新旧值都在那一列里面，零自定义比对程序。</p>
+<p>把一张订单的状态与运费改掉，那一列存下来的就是这个形状：</p>
+<pre><code class="language-text">&lt;AuditChanges&gt;
+  &lt;xs:schema id="form" ...&gt;
+    ...  sys_id / status / freight 各自的类型  ...
+  &lt;/xs:schema&gt;
+  &lt;diffgr:diffgram ...&gt;
+    &lt;form&gt;
+      &lt;Order diffgr:id="Order1" diffgr:hasChanges="modified"&gt;
+        &lt;status&gt;Confirmed&lt;/status&gt;
+        &lt;freight&gt;41.90&lt;/freight&gt;
+      &lt;/Order&gt;
+    &lt;/form&gt;
+    &lt;diffgr:before&gt;
+      &lt;Order diffgr:id="Order1"&gt;
+        &lt;status&gt;Draft&lt;/status&gt;
+        &lt;freight&gt;32.38&lt;/freight&gt;
+      &lt;/Order&gt;
+    &lt;/diffgr:before&gt;
+  &lt;/diffgr:diffgram&gt;
+&lt;/AuditChanges&gt;
+</code></pre>
+<p>截取与写入则分别落在保存的两边：保存前取得变更集，保存之后才写进轨迹。这个位置被 <code>DoBeforeSave</code> 与 <code>DoSave</code> 两侧同时钉住，Day 14 讲过为什么；这里看的是它在代码里长什么样（节选自 <a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Business/Form/FormBusinessObject.Write.cs" target="_blank" rel="noopener nofollow"><code>FormBusinessObject.Write.cs</code></a>）：</p>
+<pre><code class="language-csharp">bool auditChange = ChangeAuditEnabled();
+using var changes = auditChange ? args.DataSet.GetChanges() : null;
+var (rowKey, changeKind) = auditChange
+    ? ExtractMasterChange(args.DataSet, masterTableName) : (null, ChangeKind.Update);
+
+DoSave(context);
+
+if (auditChange &amp;&amp; changes != null)
+    WriteChangeAudit(changeKind, rowKey, AuditDiffGram.Serialize(changes), masterTableName, ...);
+</code></pre>
+<p>那个布尔值也是成本控制：关掉的时候一次 <code>GetChanges</code> 都不做。</p>
+<p>位置排错不会报错，只会少东西。移到 <code>DoSave</code> 后面，数据库写成功之后行状态与原值一起被清掉，<code>GetChanges()</code> 回来的是 null，那一次保存在轨迹上完全不存在；移到 <code>DoBeforeSave</code> 前面，记下的是计算列与规则还没填之前的值。删除那一格拿不到变更集，作法是先载一份删除前的快照、把每一行标成删除，再走同一个 <code>GetChanges</code>，拿到的就是那一笔被删掉之前的完整内容。</p>
+<p>读回来那一侧就靠那份结构：先把它读出来，再把 DiffGram 读进去，得到一个真正的 <code>DataSet</code>，改了哪些字段由比对原值与现值得出。结构是那一行自己带的，不是今天的定义，所以三年后那张表多两列、少一列、改了类型，三年前那一行轨迹读回来还是当时的样子。早期写下的那些没有这一段结构，框架靠最外层那个元素分辨新旧、各走各的解法，一行旧数据都不必搬。</p>
+<hr>
+<h2 id="回到-northwind">回到 Northwind</h2>
+<p>案例把审计打开，登录与变更跟着开、查看留在关，后台写入改成同步直写，这样才演示得出来。规则那张表放了三行：订单与客户把查看强制打开，分类把变更强制关掉。</p>
+<p>改一笔客户的联系人与城市，<code>st_log_change</code> 就多一行：</p>
+<pre><code class="language-text">user_id      = demo          company_id   = NORTHWIND
+user_name    = Demo User     company_name = Northwind Traders
+source       = Customer.Save prog_id      = Customer
+change_kind  = 2             is_sensitive = 1
+row_key      = ALFKI 那一行的 sys_rowid
+api_key_id   = (空)          api_key_name = (空)
+</code></pre>
+<p>装改动内容的那一列里，<code>contact_name</code> 与 <code>city</code> 各有改前与改后两个值。<code>is_sensitive</code> 的 <code>1</code> 来自客户那一行规则。</p>
+<p>强制关掉与强制打开各验过一次：改一笔分类，数据进去了而轨迹一行都没有多；读单笔那一轴相反，部署层是关的，而订单与客户各读一次就各留下一行。同一份部署、同一段代码，记与不记的差别全在那三行上。</p>
+<p>密钥那两列是空的，而空得有道理：案例一把密钥都还没发，验证器根本没去查密钥，标识码无从记起。一个没有生效的机制，在审计上的痕迹不是零行，是每一行都少两列。</p>
+<p>轨迹留下来了，而案例自己读不到它。审计查询那几个声明的是 <code>Encrypted</code>，拿 Day 23 那种明文请求打过去，回的是 <code>This API requires encoded or encrypted transmission.</code>；改走会做密钥交换的路径再打一次，过了那一关，回来的是 <code>Not authorized to read the audit log.</code>。</p>
+<p>原因是案例一笔权限模型都没有。审计读取这道判定不挂在 <code>FormSchema</code> 上，它直接拿保留的 ProgId 去问授权服务，所以昨天那个「表单没声明就整套跳过」的开口在这里不存在。写入挂在一个布尔开关上，读取挂在一套权限模型上，而只有写入那一侧打开的部署，恰好最需要有人提醒它把读取那一侧接上去。</p>
+<hr>
+<h2 id="小结">小结</h2>
+<p>审计轨迹在被写下的当天完全没有读者，而且只会一直长下去，长到得搬去另一台机器、依年份切成好几个库。这正是身分那几列要连名字一起抄的理由：到那个时候，join 不是慢不慢的问题，是根本没有那条路。</p>
+<p>所以这一篇的每一个决定，验收日期都不是今天。记哪些事，决定的是那一天问得出什么；每一行自己说得完整，决定的是那一天读不读得懂；那一列自己带着当时的结构，决定的是数据表改版之后还读不读得回；transaction 外面那一笔写入，决定的是它到底有没有被写下来。</p>
+<p>这一章的四篇换过四种角度看同一次调用：它是一段要被序列化的 bytes、一段要被保护的 bytes、一个要被判定权限的请求、一件要被记下来的事。而四篇的底线是同一条：调用端送上来的每一样东西都是主张，不是事实。</p>
+<p>凡是能决定结果的东西，都不能由调用端说了算；凡是要被记下来的东西，记的就得是调用端真的送了什么。两句看起来相反，实际上是同一条分界线的两侧。</p>
+<p>明天换一个层面，谈这些被存下来、被记下来的值本身：一个数字在系统里到底代表什么。</p>
+<hr>
+<p>本文为 2026 iThome 铁人赛参赛文章，原文为繁体中文。</p>
+<p><a href="https://ithelp.ithome.com.tw/articles/10408997" target="_blank" rel="noopener nofollow">iThome 原文</a> ｜ <a href="https://hackmd.io/@jeff377/day-25-audit-trail" target="_blank" rel="noopener nofollow">HackMD 版</a></p>
+<p>系列完整目录：<a href="https://www.cnblogs.com/jeff-tsai/p/23459221/ironman-2026" target="_blank">ERP 架构师笔记：定义驱动的框架设计</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-20 11:09">2026-11-20 11:09</span>&nbsp;
+<a href="https://www.cnblogs.com/jeff-tsai">Jeff-Tsai</a>&nbsp;
+阅读(<span id="post_view_count">106</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23728641);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjeff-tsai%2Fp%2F23728641%2Fday-25-audit-trail&amp;targetId=23728641&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
