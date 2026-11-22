@@ -1,0 +1,260 @@
+
+	<div class="postTitle">
+		<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/SheepDog/p/23732720" title="发布于 2026-11-20 16:15">
+    
+
+    <span role="heading" aria-level="2">Java 后端通用监听回调模式：从 Redis PubSub 落地，看懂所有监听器代码</span>
+    
+
+</a>
+
+	</div>
+	
+	<div class="postText">
+		<div id="cnblogs_post_body" class="blogpost-body blogpost-body-html">
+<h1>Java 后端通用监听回调模式：从 Redis PubSub 落地，看懂所有监听器代码</h1>
+<h2>摘要</h2>
+<p>监听回调模式是后端开发里无处不在的基础设计模式，Redis PubSub、RabbitMQ 消费、Spring 事件、WebSocket、Netty IO 回调底层都是同一套思想。很多开发只会复制粘贴监听器代码，分不清「注册」「调度」「回调」三者职责。本文结合 Caffeine+Redis 双重缓存中 PubSub 广播失效的业务场景，抽象出通用模板，帮你建立统一的分析思路，以后遇到任意监听代码都能快速拆解、自主落地。</p>
+<p>标签：#Java #回调模式 #RedisPubSub #Caffeine #设计模式 #Spring</p>
+<h2>前言</h2>
+<p>在做 Caffeine+Redis 双重缓存架构，解决分布式多实例跨节点脏读的时候，我们会引入 Redis PubSub 广播缓存失效消息。 写这段监听器代码的时候，很多人只会照搬，搞不清几个核心问题：</p>
+<ul>
+<li>为什么要把监听器注册到 Container？</li>
+<li>接口里的回调方法，为什么不需要我们手动调用？</li>
+<li>RabbitMQ、Spring 事件、WebSocket 写法看着不一样，底层是不是同一套东西？</li>
+<li>什么时候用手动注册，什么时候直接注解就可以？</li>
+</ul>
+<blockquote>
+<p>前置业务背景：Caffeine+Redis 双重缓存，分布式场景下每个实例都有独立本地 Caffeine 缓存。数据更新后，通过 Redis PubSub 广播 key，所有节点收到消息，清除本机 Caffeine，解决跨节点脏读。</p>
+</blockquote>
+<h2>一、监听回调模式核心定义</h2>
+<p>监听回调模式，本质是<strong>事件驱动的解耦方案</strong>： 框架 / 中间件负责底层的连接、等待事件、线程管理；开发者只需要定义「事件到来之后要执行什么业务」，并且把这个处理器注册给调度器。 <strong>调度器持有监听器列表，事件到达时，主动回调我们定义好的业务方法。</strong></p>
+<p>它最大价值：</p>
+<ol>
+<li>业务代码和底层 IO、网络等待、重连逻辑解耦；</li>
+<li>统一事件入口，新增业务逻辑只需要新增监听器，不用修改底层调度逻辑；</li>
+<li>适配异步场景，不用我们自己写循环阻塞轮询。</li>
+</ol>
+<h3>模式四大固定角色（通用，所有场景通用）</h3>
+<ol>
+<li><strong>事件源</strong>：事件的生产者，产生消息 / 事件。比如 Redis、RabbitMQ、前端 WebSocket、业务代码、TCP 客户端。</li>
+<li><strong>调度器（Dispatcher / Container）</strong>：模式的核心载体 维护和事件源的连接、监听事件、线程池管理、异常捕获、保存监听器注册表；事件到达后，遍历已注册监听器，执行回调。
+<blockquote>
+<p>常见命名：XXXListenerContainer、Multicaster、EventLoop</p>
+</blockquote>
+</li>
+<li><strong>回调契约（回调接口）</strong>：框架定义的接口，约定回调方法名、入参。相当于一份规范：如果你要做事件处理器，必须实现这个方法。</li>
+<li><strong>自定义监听器（业务处理器）</strong>：我们开发者编写，实现回调契约，只写业务逻辑。<strong>我们不主动触发回调方法</strong>，只负责定义事件到来后的行为。</li>
+</ol>
+<h3>标准执行流程</h3>
+<ol>
+<li>定义业务监听器，实现框架提供的回调接口，实现回调方法；</li>
+<li>将监听器实例<strong>注册到调度器</strong>（两种注册方式：手动注册 / 注解自动注册）；</li>
+<li>调度器持续监听事件源，阻塞等待事件；</li>
+<li>事件抵达 → 调度器查找注册表，在线程池执行监听器回调方法；</li>
+<li>回调执行完毕，本次事件处理结束。</li>
+</ol>
+<blockquote>
+<p>重点区分两个动作： ✅ 注册：只是建立绑定关系，登记监听器，<strong>不会执行业务回调</strong> ✅ 回调：事件到达之后，调度器主动触发，执行业务逻辑</p>
+</blockquote>
+<h2>二、业务落地：Redis PubSub 实现缓存失效监听（模式实例）</h2>
+<h3>1. 依赖说明</h3>
+<p><code>RedisMessageListenerContainer</code>、<code>MessageListener</code> 来自 Spring Data Redis，Container 就是调度器，MessageListener 是回调契约。 我们的业务目标：监听缓存失效频道，收到消息，删除本地 Caffeine 缓存。</p>
+<p>配置类（创建调度器，交给 Spring 管理）</p>
+<pre class="highlighter-hljs"><code>@Configuration
+public class RedisPubSubConfig {
+    public static final String CACHE_INVALIDATE_CHANNEL = "cache:caffeine:invalidate";
+
+    @Bean
+    public RedisMessageListenerContainer redisMessageListenerContainer(RedisConnectionFactory factory) {
+        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+        container.setConnectionFactory(factory);
+        // 配置回调执行线程池，隔离IO线程和业务线程
+        container.setTaskExecutor(Executors.newFixedThreadPool(4));
+        return container;
+    }
+}</code></pre>
+<blockquote>
+<p>这里的 Container 就是调度器：维护 Redis 订阅长连接、断线重连、消息接收、线程调度。</p>
+</blockquote>
+<p>自定义监听器（业务处理器，实现回调契约）</p>
+<pre class="highlighter-hljs"><code>@Component
+public class CaffeineInvalidatePubSubListener implements MessageListener {
+    private final CacheUtil cacheUtil;
+
+    public CaffeineInvalidatePubSubListener(CacheUtil cacheUtil, RedisMessageListenerContainer container) {
+        this.cacheUtil = cacheUtil;
+        // 【核心：手动注册】把当前监听器注册给调度器，绑定频道
+        container.addMessageListener(this, new ChannelTopic(RedisPubSubConfig.CACHE_INVALIDATE_CHANNEL));
+    }
+
+    @Override
+    public void onMessage(Message message, byte[] pattern) {
+        // 回调方法：事件到来，执行业务（清除本地Caffeine缓存）
+        String cacheKey = new String(message.getBody(), StandardCharsets.UTF_8);
+        cacheUtil.caffeineCache.invalidate(cacheKey);
+    }
+}</code></pre>
+<p>生产者（发布事件，事件源）</p>
+<pre class="highlighter-hljs"><code>// 更新数据库之后，发布失效事件
+redisTemplate.convertAndSend(RedisPubSubConfig.CACHE_INVALIDATE_CHANNEL, cacheKey);</code></pre>
+<p>对照四角色：</p>
+<ul>
+<li>事件源：Redis（其他实例 publish 消息）</li>
+<li>调度器：RedisMessageListenerContainer</li>
+<li>回调契约：MessageListener</li>
+<li>自定义监听器：CaffeineInvalidatePubSubListener</li>
+</ul>
+<h2>三、两种注册方式：手动注册 VS 注解自动注册</h2>
+<p>这是日常开发最容易混淆的点，<strong>底层模式完全一致，只是注册动作由谁完成</strong>。</p>
+<h3>方式 1：手动注册（Redis PubSub、Netty 常用）</h3>
+<p>需要显式调用 <code>addXXXListener</code>，把监听器交给调度器。 优点：灵活，支持动态订阅、动态取消订阅、运行时新增 / 移除监听器； 缺点：需要手写注册代码，模板代码多。 代表：Redis PubSub、Netty pipeline.addLast ()</p>
+<h3>方式 2：注解自动注册（Spring 做封装，开发最常用）</h3>
+<p>框架启动时扫描注解，自动帮我们完成注册逻辑，对开发者透明。</p>
+<blockquote>
+<p>底层依然是：找到调度器，把监听器注册进去，只是注册代码被框架隐藏了。 代表：</p>
+</blockquote>
+<ul>
+<li>@EventListener：Spring 内置事件监听</li>
+<li>@RabbitListener：RabbitMQ 消费监听</li>
+</ul>
+<p>示例：Spring 事件注解版（不用手动 addListener）</p>
+<pre class="highlighter-hljs"><code>// 只需要注解，框架自动完成注册
+@Component
+public class BizEventListener {
+    @EventListener
+    public void handleBizEvent(BizEvent event) {
+        // 回调业务逻辑
+    }
+}</code></pre>
+<h2>四、横向对比：不同框架的监听回调实现</h2>
+<p>同一个模式，在不同中间件、框架里的命名、使用形态不一样，但是角色一一对应：</p>
+<table>
+<thead>
+<tr><th>场景</th><th>回调契约（接口）</th><th>调度器</th><th>事件源</th><th>注册方式</th><th>使用场景</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>Redis PubSub</td>
+<td>MessageListener</td>
+<td>RedisMessageListenerContainer</td>
+<td>Redis PUBLISH</td>
+<td>手动 addMessageListener</td>
+<td>广播通知、跨节点本地缓存失效</td>
+</tr>
+<tr>
+<td>RabbitMQ 消费</td>
+<td>MessageListener</td>
+<td>SimpleMessageListenerContainer</td>
+<td>RabbitMQ Broker 推送消息</td>
+<td>手动注册 / @RabbitListener</td>
+<td>可靠异步消息消费</td>
+</tr>
+<tr>
+<td>Spring 内置事件</td>
+<td>ApplicationListener</td>
+<td>ApplicationEventMulticaster</td>
+<td>代码 publishEvent</td>
+<td>自动注册 / @EventListener</td>
+<td>进程内业务解耦，无网络</td>
+</tr>
+<tr>
+<td>Netty IO</td>
+<td>ChannelInboundHandler</td>
+<td>NioEventLoop</td>
+<td>TCP 报文</td>
+<td>pipeline.addLast</td>
+<td>底层网络 IO 回调</td>
+</tr>
+<tr>
+<td>Spring WebSocket</td>
+<td>WebSocketHandler</td>
+<td>WebSocket 调度器</td>
+<td>前端消息</td>
+<td>注册 Handler</td>
+<td>长连接实时通信</td>
+</tr>
+</tbody>
+</table>
+<p>区分要点：</p>
+<ol>
+<li>进程内事件：Spring Event，不走网络，只在当前 JVM；</li>
+<li>跨进程消息：Redis PubSub、RabbitMQ，依赖中间件，跨实例通信；</li>
+<li>IO 层回调：Netty、WebSocket，操作系统网络事件驱动。</li>
+</ol>
+<h2>五、纯 Java 极简 Demo，剥离框架，直观感受模式</h2>
+<p>不依赖任何中间件，手写一套调度器 + 回调契约，复刻这套模型，方便理解本质：</p>
+<pre class="highlighter-hljs"><code>// 1. 回调契约（接口）
+interface CustomListener {
+    void onEvent(String data);
+}
+
+// 2. 调度器：管理监听器列表，事件到来执行回调
+class EventDispatcher {
+    private final List&lt;CustomListener&gt; listeners = new ArrayList&lt;&gt;();
+
+    // 注册方法
+    public void registerListener(CustomListener listener) {
+        listeners.add(listener);
+    }
+
+    // 模拟收到事件源消息，触发回调
+    public void receiveEvent(String data) {
+        for (CustomListener listener : listeners) {
+            listener.onEvent(data);
+        }
+    }
+}
+
+// 3. 业务监听器，实现回调契约
+class CacheInvalidateListener implements CustomListener {
+    @Override
+    public void onEvent(String data) {
+        System.out.println("收到事件，执行业务：清除缓存key=" + data);
+    }
+}
+
+public class ListenerDemo {
+    public static void main(String[] args) {
+        EventDispatcher dispatcher = new EventDispatcher();
+        CacheInvalidateListener listener = new CacheInvalidateListener();
+
+        // 注册
+        dispatcher.registerListener(listener);
+        // 事件源产生事件，调度器自动回调
+        dispatcher.receiveEvent("user:1001");
+    }
+}</code></pre>
+<h2>六、落地选型与避坑指南</h2>
+<h3>什么时候适合这套监听回调模式？</h3>
+<p>✅ 事件驱动场景：消息消费、缓存广播、状态变更通知、IO 事件、业务解耦； ✅ 希望底层逻辑和业务逻辑隔离，不想写循环轮询； ✅ 同一个事件，需要多个独立处理器（一个事件，多个监听器分别处理）。</p>
+<h3>常见坑（结合我们 Caffeine+Redis 场景）</h3>
+<ol>
+<li>注册重复：同一个监听器多次注册，同一个事件会多次回调，重复执行业务；</li>
+<li>回调方法阻塞：回调里面写耗时同步逻辑，会占满调度器线程池，导致后续事件堆积；</li>
+<li>消息可靠性：Redis PubSub 无持久化，离线消息丢失，对可靠性要求高的场景改用 MQ；</li>
+<li>线程认知：回调执行在调度器自己的线程池，不是主线程，注意线程安全。</li>
+</ol>
+<p>&nbsp;</p>
+<h2>七、总结</h2>
+<p>监听回调模式是事件驱动的基础，它的核心是<strong>分层解耦</strong>： 底层调度器负责处理复杂的连接、等待、线程管理；框架定义统一回调契约；开发者只聚焦事件到来后的业务。 不管是 Redis PubSub、RabbitMQ、Spring 事件还是 Netty，都只是这套模式在不同组件上的实现。 掌握这套四角色模型，以后再看任何监听、消费、回调代码，都可以快速剥离框架糖衣，看懂主干逻辑，自主编写、排查问题。</p>
+<blockquote>
+<p>回到我们的双重缓存架构：Redis PubSub 只是监听回调模式的一个业务落地，用来完成分布式节点之间缓存失效广播；如果业务要求消息不丢，我们只需要把事件源和调度器替换成 RabbitMQ，监听器的业务逻辑几乎不用改动，这就是模式带来的扩展性。</p>
+</blockquote>
+
+</div>
+<div class="clear"></div>
+
+	</div>
+	
+	<div class="postfoot">
+		posted on 
+<span id="post-date" data-last-update-days="0.0006944444444444445" data-date-updated="2026-11-20 16:17">2026-11-20 16:15</span>&nbsp;
+<a href="https://www.cnblogs.com/SheepDog">SheepDog1998</a>&nbsp;
+阅读(<span id="post_view_count">103</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23732720);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2FSheepDog%2Fp%2F23732720&amp;targetId=23732720&amp;targetType=0" target="_blank">举报</a>
+
+	</div>
