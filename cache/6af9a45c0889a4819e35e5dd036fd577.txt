@@ -1,0 +1,317 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/jeff-tsai/p/23702283/day-23-payload-pipeline" title="发布于 2026-11-18 09:02">
+    
+
+    <span role="heading" aria-level="2">Day 23：API Payload 安全管道：顺序、保护等级与密钥</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/3864267/202611/3864267-20261118090221272-1001631175.png" alt="Day 23：API Payload 安全管道：顺序、保护等级与密钥" class="desc_img">
+        序列化、压缩、加密三段的顺序，以及调换之后会坏在哪里。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p><img alt="Day 23：API Payload 安全管道：顺序、保护等级与密钥" loading="lazy" data-src="https://raw.githubusercontent.com/jeff377/blog-images/main/2026-day-23-sc.png" class="lazyload"></p>
+<p>昨天结尾说今天看 <code>value</code> 上的另一半。<code>Encoded</code> 与 <code>Encrypted</code> 在 API payload 上只差一个数字，底下却是三段有先后的处理，而回程走的时候，顺序不只是倒着跑一遍。</p>
+<p>一套 ERP 的 API 要回答两个彼此独立的问题：一次调用的内容该处理成什么样子，以及谁有资格决定它可以少处理一点。前者是一条固定的管道，后者是一句写在方法上的声明。两件事分开放，只在访问控制那一站被比在一起。</p>
+<p>本篇说明：</p>
+<ol>
+<li>序列化、压缩、加密三段的顺序，以及调换之后会坏在哪里</li>
+<li><code>ApiProtectionLevel</code> 与 <code>PayloadFormat</code> 是两个不同的东西，访问控制怎么把它们比在一起</li>
+<li><code>aes-cbc-hmac</code> 这个名字底下实际做了哪几件事</li>
+<li>密钥从哪里来，以及密码学原语与安全政策为什么分居两层</li>
+</ol>
+<hr>
+<h2 id="一三段的顺序">一、三段的顺序</h2>
+<p><code>Encoded</code> 的 <code>value</code> 送出去是一段 Base64。从一个对象走到那段 Base64，中间发生三段处理，每一段各由一个接口承担，也各自可以整个换掉：</p>
+<table>
+<thead>
+<tr>
+<th>段</th>
+<th>做什么</th>
+<th>现行实现</th>
+<th>还能换成什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>序列化</td>
+<td>对象变成 bytes</td>
+<td><code>messagepack</code></td>
+<td><code>json</code></td>
+</tr>
+<tr>
+<td>压缩</td>
+<td>bytes 变短</td>
+<td><code>gzip</code></td>
+<td><code>none</code></td>
+</tr>
+<tr>
+<td>加密</td>
+<td>bytes 变成带认证码的 bytes</td>
+<td><code>aes-cbc-hmac</code></td>
+<td><code>none</code></td>
+</tr>
+</tbody>
+</table>
+<p>后两个名字写在部署的那份 <code>SystemSettings</code> 里，第一个由调用端逐次声明在 API payload 上，没有声明就是 <code>messagepack</code>，昨天那张「三个组件，两种决定方式」的表讲的就是这件事。可以换掉的是每一段的实现，不是它们的先后。编码那一个（<a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Api.Core/Transformers/ApiPayloadTransformer.cs" target="_blank" rel="noopener nofollow"><code>ApiPayloadTransformer</code></a>）只有两行，源代码把顺序写在行末：</p>
+<pre><code class="language-csharp">byte[] bytes = serializer.Serialize(payload, type);              // Serialize
+return ApiServiceOptions.PayloadCompressor.Compress(bytes);      // Compress
+</code></pre>
+<p>加密不在这两行里。它是外面那一层依格式决定要不要多做的一步，<code>Encoded</code> 停在这里，<code>Encrypted</code> 再多走一段。</p>
+<p>压缩之所以排在加密之前，是因为压缩对密文完全无效。一份良好加密的输出在统计上与随机数据没有差别，而压缩算法找的正是重复与偏态。拿案例那份订单的 <code>FormSchema</code> 跑一次就看得出来：</p>
+<table>
+<thead>
+<tr>
+<th>顺序</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>序列化 → 压缩 → 加密</td>
+<td>压完剩下四分之一出头，加密再多加几十个字节</td>
+</tr>
+<tr>
+<td>序列化 → 加密 → 压缩</td>
+<td>压完比压之前还大，最后的体积是前者的三倍以上</td>
+</tr>
+</tbody>
+</table>
+<p>把顺序调换不会让任何一次调用失败，也不会有任何一道检查出声。它只是让压缩那一段从此不做事。</p>
+<p>回程的顺序是反过来的三步：解密、解压缩、反序列化。但反向真正的重点不在「倒着跑」，在于每一段只看得到通过上一段的 bytes。认证码的验证发生在解密之前，解密又在解压缩之前，所以那个 gzip 解压器从头到尾拿不到一段没有验过的数据。</p>
+<p>解压器是一个吃任意 bytes 的解析器，把一段改过一个比特的密文直接喂给它，它会照样开始解析，然后因为读不出结构丢出异常。这条顺序让它没有机会走到那里。</p>
+<hr>
+<h2 id="二声明的等级与实际用的格式">二、声明的等级，与实际用的格式</h2>
+<p><code>PayloadFormat</code> 的三个值昨天讲过。访问控制那一站要看的不是它一个，是它跟另一个 enum 比出来的结果，而那个 enum 有四个值。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>回答的问题</th>
+<th>几个值</th>
+<th>谁决定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PayloadFormat</code></td>
+<td>这一次调用实际做了什么</td>
+<td>三个</td>
+<td>调用端，写在 API payload 上</td>
+</tr>
+<tr>
+<td><code>ApiProtectionLevel</code></td>
+<td>这一个方法最低接受什么</td>
+<td>四个</td>
+<td>写这个方法的人，挂在方法或类型上</td>
+</tr>
+</tbody>
+</table>
+<p>两个 enum 有两个值同名（<code>Encoded</code> 与 <code>Encrypted</code>），很容易被当成同一件事的两种说法。它们不是：一个记录事实，一个声明要求。</p>
+<p>四个等级各要求什么，适合放哪一种方法：</p>
+<table>
+<thead>
+<tr>
+<th>等级</th>
+<th>意思</th>
+<th>可以用在哪</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Public</code></td>
+<td>HTTPS 就够了</td>
+<td>内容被服务器看到也无妨的调用，例如连通性探测 <code>Ping</code></td>
+</tr>
+<tr>
+<td><code>Encoded</code></td>
+<td>至少要编码过</td>
+<td>不想让人抓包就直接读出来，但不值得付加密成本的</td>
+</tr>
+<tr>
+<td><code>Encrypted</code></td>
+<td>要加密过</td>
+<td>内容在服务器里也不该是明文的，例如 API 密钥的管理</td>
+</tr>
+<tr>
+<td><code>LocalOnly</code></td>
+<td>不接受远程调用</td>
+<td>只该由主机进程自己发起的，例如写入定义</td>
+</tr>
+</tbody>
+</table>
+<p>框架自己的方法怎么分布在这四级上，本身是一个决定：把信任界线画在 HTTPS 上，只有写方法的人明确判断「进了服务器之后也不能被看到」的那几个才标 <code>Encrypted</code>。中间那一级现行没有人声明，那是格式那一侧的落点，不是等级这一侧的要求。</p>
+<p>画在 HTTPS 上不代表应用层加密没有用。HTTPS 只保护数据在网络上跑的那一段，一进到服务器就解开了，后面经手的每一站看到的都是明文：节点被入侵、记录与监控把内容留了下来、跨网段或 VPN 上被拦下来重放，这些在 ERP 的实际部署里都是真的。</p>
+<p>线画在 <code>Public</code>，换到的是没有 .NET 运行环境的前端不必先实现整条加密管道才调用得到第一个方法；代价是走这一级的调用，<code>value</code> 进了服务器之后就看得见，需要那一层的方法得自己标上去。</p>
+<p>判准是：实际的格式要大于或等于声明的等级，多做无妨，少做拒绝。下面这张矩阵讲的都是远程调用，而远程调用不管格式做到哪一级，都过不了 <code>LocalOnly</code>：</p>
+<table>
+<thead>
+<tr>
+<th>实际格式 ＼ 声明等级</th>
+<th><code>Public</code></th>
+<th><code>Encoded</code></th>
+<th><code>Encrypted</code></th>
+<th><code>LocalOnly</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Plain</code></td>
+<td>通过</td>
+<td>拒绝</td>
+<td>拒绝</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>Encoded</code></td>
+<td>通过</td>
+<td>通过</td>
+<td>拒绝</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>Encrypted</code></td>
+<td>通过</td>
+<td>通过</td>
+<td>通过</td>
+<td>拒绝</td>
+</tr>
+</tbody>
+</table>
+<p>对着案例的端点打，三种拒绝各带各的消息：</p>
+<pre><code class="language-text">Plain   调用 System.ListApiKeys → This API requires encoded or encrypted transmission.
+Encoded 调用 System.ListApiKeys → This API requires encrypted transmission.
+Plain   调用 System.SaveDefine  → This API is restricted to local calls only.
+</code></pre>
+<p>「多做无妨」那一半同样实测过：拿一个 <code>Encoded</code> 的 API payload 调用 <code>Public</code> 的清单查询，通过，而且回来的也是 <code>Encoded</code>。服务端不动格式，它照着调用端送来的那个值把回应包回去，所以一次往返的两个方向永远是同一个格式。</p>
+<p><code>LocalOnly</code> 不是「更严格的加密」，它问的是另一件事：这个方法根本不从网络进来。既然不在同一条轴上，它就不跟格式比大小，是单独判的。Day 17 说过服务端有几个方法只接受同进程调用，指的就是这一格。它们仍然叫得动，只是不从网络叫。近端调用一进这道检查就被整个放行，连格式都不看，上面那张矩阵管不到它们。</p>
+<p>这道检查能排在解密之前，是因为它要比的两个值一开始就拿得到：格式是 API payload 上的一个数字，等级挂在类型上、编译完就固定了。两边都不必拆开 <code>value</code> 看一眼。Day 16 说过访问控制排在还原之前、不替没通过的请求做解密工作，成立的条件就在这里。</p>
+<p>没有声明的方法不是「不受限制」，是直接抛异常。找的顺序是方法自己、它重写的那一个、再到声明它的类型。代价是漏掉声明要等有人第一次调用才会发现，所以构建期另有一条规则会把这种方法指出来。</p>
+<hr>
+<h2 id="三aes-cbc-hmac-这个名字底下有几件事">三、<code>aes-cbc-hmac</code> 这个名字底下有几件事</h2>
+<p>这个名字把三个部分写在一起：一个对称加密算法、一个工作模式、一个消息认证码。实现上是四个决定，加解密的主体是 <a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Base/Security/AesCbcHmacCryptor.cs" target="_blank" rel="noopener nofollow"><code>AesCbcHmacCryptor</code></a>：</p>
+<ul>
+<li>传进去的是一把 64 个字节的密钥，切成两把用：前 32 个当 AES 的密钥、后 32 个当 HMAC 的密钥。同一把密钥不兼两职。</li>
+<li>每一次加密现场产生新的 IV，本身以明文写进输出（解密要用它）。实测同一份数据、同一把密钥连续加密两次，出来的 bytes 不一样。</li>
+<li>先加密，再对加密的结果盖认证码，不是反过来。换到的是解密端在解密之前就把数据挡掉，反过来做的版本得先解密才验得了，等于让解密器先吃一段来路不明的数据。第一节那条「每一段只看得到通过上一段的 bytes」，起点就在这里。</li>
+<li>验证认证码用固定时间的比对，不是 <code>==</code>。一般的循环会在第一个不同的字节就返回，于是「猜对了几个字节」变成从外面量得出来的事，攻击者可以一个字节一个字节把认证码凑出来。</li>
+</ul>
+<p>固定时间比对那一条在解密那一段就是三行：</p>
+<pre><code class="language-csharp">byte[] computedHmac = hmac.ComputeHash(dataToVerify);
+if (!CryptographicOperations.FixedTimeEquals(hmacBytes, computedHmac))
+    throw new CryptographicException("HMAC validation failed.");
+</code></pre>
+<p>消息本身也藏着一个选择。实测三种不同的破坏方式：改一个比特的密文、改一个比特的认证码、换一把完全无关的密钥，回来的都是同一则 <code>HMAC validation failed.</code>。分不出来是对的，能分辨「认证码不对」与「密钥不对」本身就是一个可以拿来试探的信号。</p>
+<hr>
+<h2 id="四密钥从哪里来">四、密钥从哪里来</h2>
+<p>上一节那四个决定全部做对，还是没有回答一件事：那把 64 个字节的密钥是谁给的。框架把这件事跟上一节分在两层：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>位置</th>
+<th>放什么</th>
+<th>举例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>密码学原语</td>
+<td><code>Bee.Base</code></td>
+<td>给定输入算出输出，没有业务语义</td>
+<td>AES-CBC-HMAC、RSA、密码哈希、密钥生成器、文件哈希</td>
+</tr>
+<tr>
+<td>安全政策</td>
+<td><code>Bee.Definition</code></td>
+<td>密钥从哪里来、谁能访问、怎么验</td>
+<td>主密钥来源、密钥的保护、访问令牌验证、第二节那个保护等级</td>
+</tr>
+</tbody>
+</table>
+<p>分界只要问一句话：这段程序知不知道它算的是什么？上一节那个加密程序只认得 bytes 与密钥，不知道自己在加密一则 API 调用，所以它住在原语那一层，也因此本篇的 payload 与接下来要谈的密钥保护用的是同一个程序。</p>
+<h3 id="主密钥是链条的第一份">主密钥是链条的第一份</h3>
+<p>Day 4 那条启动依赖链的结论在这里直接沿用：主密钥是链条的第一份，它自己不能加密，所以 <code>SystemSettings</code> 只记它在哪里。框架默认的那一份（<a href="https://github.com/jeff377/bee-library/blob/main/src/Bee.Definition/Defaults/SystemSettings.xml" target="_blank" rel="noopener nofollow"><code>SystemSettings.xml</code></a>）记的是一个环境变量名称：</p>
+<pre><code class="language-xml">&lt;MasterKeySource&gt;
+  &lt;Type&gt;Environment&lt;/Type&gt;
+  &lt;Value&gt;BEE_MASTER_KEY&lt;/Value&gt;
+&lt;/MasterKeySource&gt;
+</code></pre>
+<p>环境变量是现行的默认，文件是另一个选项。两条路各有各的暴露面，选环境变量不是因为比较安全，是因为容器与 secret 管理工具一律以环境变量注入，走文件要么挂一份 volume、要么把文件烤进镜像。主密钥不直接拿来加密任何一则调用，它的用途是解开配置文件里其他的密钥，那些密钥存的是密文，包住它们的正是 <code>AesCbcHmacCryptor</code>。</p>
+<h3 id="传输密钥是逐个-session-一把">传输密钥是逐个 session 一把</h3>
+<p>Day 13 列过 session 上有哪些属性，其中一个是这条连接的对称密钥，当时就指名了这一篇。它由一个接口提供，而框架给了三种实现：</p>
+<table>
+<thead>
+<tr>
+<th>提供者</th>
+<th>一把密钥怎么来</th>
+<th>撑不撑得住 session 重建</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>共用式</td>
+<td>整个部署共用一把</td>
+<td>撑得住</td>
+</tr>
+<tr>
+<td>推导式（默认）</td>
+<td>由根密钥与访问令牌推导出来</td>
+<td>撑得住</td>
+</tr>
+<tr>
+<td>随机式</td>
+<td>登录时随机产生，只活在 session 里</td>
+<td>撑不住</td>
+</tr>
+</tbody>
+</table>
+<p>第三列决定的是 Day 13 那个从数据库 seed 重建 session 能不能成立。接口上有一个属性专门回答它：密钥救不回来的话，重建出来的 session 会让用户看起来还在线，而每一次加密调用都失败。</p>
+<p>推导式的根密钥默认由主密钥推出来，配置文件另外指定的话以配置文件为准。选它当默认的代价是同一个访问令牌推出来的永远是同一把密钥，不是每次登录都随机。换到的是这把密钥不必存、每个节点各自算得出来，而令牌本身是一个猜不到的 GUID、根密钥不离开服务器。这一段的顺序因此是反直觉的：令牌必须先产生，密钥才推得出来。</p>
+<h3 id="那把密钥怎么交到调用端手上">那把密钥怎么交到调用端手上</h3>
+<p>登录时调用端产生一对 RSA 密钥，公钥写进登录请求；服务端建好 session 之后，用那把公钥把对称密钥包起来，跟访问令牌一起返回。之后每一次要求加密的调用都用它。</p>
+<p>Day 17 写过浏览器那一头的异常：那里产不出 RSA 密钥对，于是公钥送的是空字符串，服务端回的也是空字符串。降级发生在调用端而不是服务端，要求 <code>Encrypted</code> 的调用在手上没有密钥时自己退到 <code>Encoded</code>。对照第二节那张矩阵就知道这条退路能走多远：<code>Encoded</code> 这个格式过得了 <code>Public</code> 与 <code>Encoded</code> 两级，过不了标了 <code>Encrypted</code> 的那几个。</p>
+<hr>
+<h2 id="回到-northwind">回到 Northwind</h2>
+<p>案例跟这一篇有关的应用代码只有启动那几行：环境变量没设就塞一把 demo 主密钥进去，把定义文件里的 payload 选项建成组件，然后在启动框架时允许自动创建。其余全在定义文件里：压缩用 <code>gzip</code>、加密用 <code>aes-cbc-hmac</code>、主密钥来自 <code>BEE_MASTER_KEY</code>；<code>value</code> 那一格案例没有另外声明，走的是默认的 <code>messagepack</code>。</p>
+<p><code>[ApiAccessControl]</code> 在整个案例是零处。订单那个 BO 重写了 <code>GetNewData</code>，重写的方法上没有挂声明，靠的正是第二节那条「找不到就往它重写的那一个找」。</p>
+<p>不加密的那个实现只允许在调试模式下建出来，而案例的调试模式是开着的（Day 18 用过同一个旗标，那里决定的是错误消息要不要被屏蔽），于是那道检查在这里形同不存在，案例仍然选了真正的加密。这道检查本身还有一个缺口：它只挡得住依名字建实现的那一条路，直接把组件交进去的那一条绕得过它。</p>
+<p>真正让案例的加密不算数的不是那道检查，是那把写在源代码里的 demo 主密钥。它旁边的注释自己就写着 production 必须在启动之前用真正的部署机制注入一把。框架判别不出自己现在跑在哪一种环境，硬要在启动时挡下来会误杀想跑演示数据的测试环境，所以这件事只写在注释里。</p>
+<hr>
+<h2 id="小结">小结</h2>
+<p>一次调用的 <code>value</code> 上有三段处理与一句声明：</p>
+<ul>
+<li>三段的顺序是序列化、压缩、加密，回程反过来走，而反过来走的意义是每一段只看得到通过上一段检查的 bytes</li>
+<li>保护等级记的是这个方法最低接受什么，格式记的是这次调用实际做了什么，比的是前者小于等于后者；四个等级里有三个在同一条轴上，第四个只是借了那条轴来排队</li>
+<li>加密那一段的四个决定都可以逐项验证：两把密钥、每次新的 IV、先加密再盖认证码、固定时间比对</li>
+</ul>
+<p>这三件全都验得出来。顺序调换过的管道，压缩率当场就看得出来；等级挡不挡得住，对着端点各打一次就知道；认证码有没有盖在对的位置，改一个比特试一次就有答案。</p>
+<p>只有一件不行。那把主密钥是不是真的只有部署的人知道，从框架里面看不出来，也量不出来。前面那三件全部做对之后，整套的强度就等于那个环境变量里放的是什么，而那件事发生在代码之外：真正的防护线是部署的检查清单。</p>
+<p>一条安全管道里，做得对不对的部分可以被验证，值不值得信任的部分不能。前者是设计题，写进机制就结案了；后者每一次部署都要重新回答一次。</p>
+<p>明天换一条轴。保护等级管的是一次调用的形式，它从头到尾没有问过「这个人可以看到哪些数据」。</p>
+<hr>
+<p>本文为 2026 iThome 铁人赛参赛文章，原文为繁体中文。</p>
+<p><a href="https://ithelp.ithome.com.tw/articles/10408423" target="_blank" rel="noopener nofollow">iThome 原文</a> ｜ <a href="https://hackmd.io/@jeff377/day-23-payload-pipeline" target="_blank" rel="noopener nofollow">HackMD 版</a></p>
+<p>系列完整目录：<a href="https://www.cnblogs.com/jeff-tsai/p/23459221/ironman-2026" target="_blank">ERP 架构师笔记：定义驱动的框架设计</a></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-18 09:02">2026-11-18 09:02</span>&nbsp;
+<a href="https://www.cnblogs.com/jeff-tsai">Jeff-Tsai</a>&nbsp;
+阅读(<span id="post_view_count">86</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23702283);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fjeff-tsai%2Fp%2F23702283%2Fday-23-payload-pipeline&amp;targetId=23702283&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

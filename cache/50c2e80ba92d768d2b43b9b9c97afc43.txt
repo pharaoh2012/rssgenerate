@@ -1,0 +1,389 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/shanyou/p/23745802" title="发布于 2026-11-22 14:38">
+    
+
+    <span role="heading" aria-level="2">Supabase 自托管接 Keycloak：两条路线与六个静默失败</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        自托管 Supabase 的 Studio 里 OAuth 面板是禁用的，一切都得改 docker-compose.yml。而 Keycloak 与 Supabase 之间有两种完全不同的信任关系，选错不是改配置，是架构返工
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>自托管 Supabase 的 Studio 里 OAuth 面板是禁用的，一切都得改 <code>docker-compose.yml</code>。<br>
+而 Keycloak 与 Supabase 之间有两种完全不同的信任关系，选错不是改配置，是架构返工。</p>
+<p>配套代码：<a href="https://github.com/geffzhang/supabase-keycloak" target="_blank" rel="noopener nofollow">https://github.com/geffzhang/supabase-keycloak</a></p>
+<hr>
+<h2 id="一先决定最终的-token-由谁签发">一、先决定：最终的 token 由谁签发</h2>
+<pre><code>方案 A：Keycloak 只是身份源，Supabase Auth 换发自己的 token
+  浏览器 → Keycloak → GoTrue ─签发→ Supabase JWT → PostgREST
+                        （在 auth.users 里建用户镜像）
+
+方案 B：Keycloak 直接签发，Supabase 只验不签
+  浏览器 → Keycloak ─签发→ Keycloak JWT → PostgREST（用 Keycloak 公钥验签）
+                                          auth.users 保持空表
+</code></pre>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>A：GoTrue 换发</th>
+<th>B：直信 Keycloak</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>token 签发方</td>
+<td>Supabase Auth</td>
+<td>Keycloak</td>
+</tr>
+<tr>
+<td><code>auth.users</code></td>
+<td>有用户镜像</td>
+<td>空表</td>
+</tr>
+<tr>
+<td><code>auth.uid()</code> / 会话 / MFA</td>
+<td>原生可用</td>
+<td>无，登出不吊销 token</td>
+</tr>
+<tr>
+<td>密钥轮换</td>
+<td>GoTrue 管</td>
+<td>手工重做 JWKS 并重建容器</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>新项目要 RLS 全家桶</td>
+<td>已有生产 Keycloak 不想迁用户</td>
+</tr>
+</tbody>
+</table>
+<p>选择标准只有一条：用户到底归属谁。</p>
+<p>如果目标是「用户由 Keycloak 统一管理」，A 就不成立。它会在 <code>auth.users</code> 留一份镜像，<br>
+Keycloak 改名不改、删用户不清。双份存储的代价就在这里。选 B。</p>
+<hr>
+<h2 id="二信任链长什么样">二、信任链长什么样</h2>
+<p>一次请求带两个头，分别服务两个目的：</p>
+<pre><code>apikey: &lt;ANON_KEY&gt;             ← HS256，用 JWT_SECRET 签的，证明"这是个合法客户端"
+Authorization: Bearer &lt;jwt&gt;    ← RS256，Keycloak 签的，证明"这是谁"
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/510/202611/510-20261122143602813-1571508572.png" alt="Supabase 与 Keycloak 信任链数据流" loading="lazy"></p>
+<p>完整链路是：</p>
+<pre><code>Keycloak ──签发 RS256 token──▶ 浏览器
+   │                              │
+   └──导出公钥──▶ JWKS 端点        │ 双头请求
+                     │            ▼
+                     │      Supabase 网关（只按 apikey 字符串比对）
+                     │            │
+                     ▼            ▼
+              ├──▶ PostgREST / Storage / Realtime（用合并 JWKS 验签）
+              │            │
+              │            ▼
+              └──▶  Postgres · RLS（auth.jwt() -&gt;&gt; 'sub'）
+</code></pre>
+<p>三个关键点：</p>
+<ol>
+<li>网关不验证用户 token，只做 <code>apikey</code> 的字符串比对。验签在下游各家自己完成。</li>
+<li>公钥要「导出再合并」，不能直接把 Keycloak 的 JWKS 塞给下游（原因见 4.1）。</li>
+<li>验签只回答「你是谁」，RLS 才回答「你能看哪一行」。后面所有坑都从这里长出来：<br>
+两者任一环节错了，表现都是「登录成功但查不到数据」。</li>
+</ol>
+<hr>
+<h2 id="三方案-b-的三个注入点">三、方案 B 的三个注入点</h2>
+<pre><code class="language-yaml">services:
+  rest:
+    environment:
+      PGRST_JWT_SECRET: ${KEYCLOAK_JWKS}
+      PGRST_APP_SETTINGS_JWT_SECRET: ${KEYCLOAK_JWKS}
+  storage:
+    environment:
+      JWT_JWKS: ${KEYCLOAK_JWKS}
+      AUTH_JWT_SECRET: ${JWT_SECRET}       # 不能清空
+      PGRST_JWT_SECRET: ${KEYCLOAK_JWKS}   # storage 也读它
+  realtime:
+    environment:
+      API_JWT_JWKS: ${KEYCLOAK_JWKS}
+      API_JWT_SECRET: ${JWT_SECRET}
+</code></pre>
+<p>漏配表现各不相同：只配 rest，能查库传不了文件；只配 storage，能传文件但订阅 401。</p>
+<p>而 <code>KEYCLOAK_JWKS</code> 本身必须是合并出来的，不是 Keycloak 的公钥集。</p>
+<p><strong>顺带说方案 A。</strong> 如果选 A，改动小得多：只需把 Keycloak 配成 GoTrue 的一个<br>
+OIDC provider，不需要碰 rest/storage/realtime：</p>
+<pre><code class="language-yaml">auth:
+  environment:
+    GOTRUE_EXTERNAL_KEYCLOAK_ENABLED: "true"
+    GOTRUE_EXTERNAL_KEYCLOAK_CLIENT_ID: "supabase"
+    GOTRUE_EXTERNAL_KEYCLOAK_SECRET: "&lt;client secret&gt;"
+    GOTRUE_EXTERNAL_KEYCLOAK_REDIRECT_URI: "https://example.com/auth/v1/callback"
+    GOTRUE_EXTERNAL_KEYCLOAK_URL: "https://kc.example.com/realms/supabase"
+    GOTRUE_EXTERNAL_KEYCLOAK_SCOPES: openid
+</code></pre>
+<p>三个必填项别漏：<code>_URL</code> 要用 issuer 形式（不带 <code>/auth</code> 前缀）；<code>_SCOPES</code> 必须含<br>
+<code>openid</code>（Keycloak 22 起不传会直接失败）；改完必须 <code>--force-recreate auth</code>，<br>
+<code>restart</code> 不重读环境变量。</p>
+<p>验证方式是 <code>curl -H 'apikey: &lt;key&gt;' https://.../auth/v1/settings</code>，返回体里<br>
+<code>external.keycloak</code> 必须为 <code>true</code>。这条不过就不是前端问题。</p>
+<hr>
+<h2 id="四六个静默失败">四、六个静默失败</h2>
+<p>下面每一条都实测撞过。共同特征是：报错信息和真正原因相距很远，<br>
+或者干脆不报错。</p>
+<h3 id="1-jwks-必须合并两套密钥">1. JWKS 必须合并两套密钥</h3>
+<p>只放 Keycloak 公钥，<code>anon</code> 和 <code>service_role</code> 那两把 HS256 密钥就验不过了。<br>
+未登录请求 401、Studio 打不开、后端全废。现象特别像「Keycloak 配错了」，<br>
+实际是把自家的钥匙扔了。</p>
+<p>正确做法是把 <code>JWT_SECRET</code> 转成 RFC 7517 的 <code>oct</code> 密钥，和公钥放进同一个 JWKS：</p>
+<pre><code class="language-json">{"keys":[
+  {"kty":"RSA","alg":"RS256","use":"sig","kid":"...","n":"...","e":"AQAB"},
+  {"kty":"oct","k":"&lt;base64url(JWT_SECRET)&gt;","alg":"HS256"}
+]}
+</code></pre>
+<p><strong>务必过滤 <code>use=enc</code>。</strong> Keycloak 同时导出签名密钥（RS256）和加密密钥（RSA-OAEP）。<br>
+后者混进去会让验签库因「找不到可用算法」整体拒绝。</p>
+<p>从请求生命周期看会更清楚为什么必须合并。一次带用户身份的请求到 PostgREST，<br>
+验签器要用同一份密钥集校验两个不同来源的 token：</p>
+<table>
+<thead>
+<tr>
+<th>请求里的位置</th>
+<th>谁签的</th>
+<th>用 JWKS 里哪把</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>apikey</code> 头</td>
+<td><code>JWT_SECRET</code>（HS256）</td>
+<td><code>oct</code> 密钥</td>
+</tr>
+<tr>
+<td><code>Authorization</code> 头</td>
+<td>Keycloak（RS256）</td>
+<td>RSA 公钥</td>
+</tr>
+</tbody>
+</table>
+<p>换成只放公钥，第一行就验不过了。而未登录请求、Studio 打开页面、后端用<br>
+service_role 调接口，全都只带 <code>apikey</code>，所以这些路径会一起挂掉。</p>
+<p>这也是为什么 <code>sync-jwks.sh</code> 要读你 <code>.env</code> 里的 <code>JWT_SECRET</code>：它必须和现有密钥<br>
+完全一致，不能另生成一个。</p>
+<p>写进 shell 环境时还有两个小坑：JWKS 里的 <code>/</code>、<code>&amp;</code>、<code>"</code> 会破坏 <code>sed</code> 表达式，<br>
+得用脚本读改写；<code>docker compose config</code> 输出的 YAML 引号会骗人，<br>
+要验证实际值请用 <code>--format json</code> 反解。</p>
+<h3 id="2-storage-需要-pgrst_jwt_secret清空-auth_jwt_secret-会反复重启">2. Storage 需要 <code>PGRST_JWT_SECRET</code>，清空 <code>AUTH_JWT_SECRET</code> 会反复重启</h3>
+<p>直觉上想「只用 JWKS 就把旧变量清空」，结果：</p>
+<pre><code>Error: PGRST_JWT_SECRET is undefined
+</code></pre>
+<p>storage-api 的配置读取器强制要求这个变量存在。三个都得给（见上面 yaml）。</p>
+<h3 id="3-healthready-在-9000不在-8080">3. <code>/health/ready</code> 在 9000，不在 8080</h3>
+<p><code>--health-enabled=true</code> 只让管理端口多出 <code>/health</code>。在 8080 探永远 404。<br>
+这个 404 看起来像「Keycloak 没起来」或「realm 导入失败」，实际只是探错了端口。</p>
+<p>另外 Keycloak 26 基于 ubi-micro，镜像里没有 curl / wget / bash，不能写容器内<br>
+healthcheck，只能用宿主机脚本探。</p>
+<h3 id="4-realm-导入时内置-client-scope-还不存在sub-会丢">4. realm 导入时内置 client scope 还不存在，<code>sub</code> 会丢</h3>
+<p>首次导入会刷一串 <code>WARN Referenced client scope 'profile' doesn't exist</code>。<br>
+这条 warning 看起来无害，但后果是 token 里没有 <code>sub</code>，没有任何用户标识。</p>
+<p>原因：realm JSON 引用了 <code>openid</code>/<code>profile</code>/<code>email</code> 这些内置 scope，<br>
+但导入阶段它们还没被创建，引用被静默丢弃，连带里面的 base claim mapper 也没了。</p>
+<p>解法是在自定义 scope 内显式声明 <code>sub</code>，不依赖内置 scope：</p>
+<pre><code class="language-json">{
+  "name": "sub",
+  "protocolMapper": "oidc-sub-mapper",
+  "config": { "access.token.claim": "true", "id.token.claim": "true" }
+}
+</code></pre>
+<h3 id="5-db-首次启动要跑几十个-init-script官方-healthcheck-等不及">5. <code>db</code> 首次启动要跑几十个 init-script，官方 healthcheck 等不及</h3>
+<p>官方是 <code>5s × 10 ≈ 50 秒</code>，实测需要 30 秒以上，慢机器就超时。超时后果是连锁的：</p>
+<pre><code>db unhealthy → 所有 depends_on 它的服务报 dependency failed to start
+</code></pre>
+<p>看上去像配置写错了。加启动宽限期：</p>
+<pre><code class="language-yaml">db:
+  healthcheck:
+    start_period: 180s
+    retries: 20
+</code></pre>
+<h3 id="6-两份-env-直接拼装会产生重复键后者覆盖前者">6. 两份 <code>.env</code> 直接拼装会产生重复键，后者覆盖前者</h3>
+<p>官方模板和项目变量有 3 个同名键（<code>JWT_SECRET</code> / <code>API_EXTERNAL_URL</code> / <code>SITE_URL</code>），<br>
+而 Compose 读 <code>.env</code> 时后者覆盖前者：</p>
+<pre><code class="language-bash">$ grep -n "^JWT_SECRET=" .env
+33:JWT_SECRET=your-super-secret-...   # 模板里的有效值
+430:JWT_SECRET=                       # 追加进来的空值 ← 生效的是这个
+</code></pre>
+<p>所有请求 401，而你以为 secret 已经设过了。正确做法是逐个 <code>sed</code> 替换已有键，<br>
+只对模板里没有的键用 <code>&gt;&gt;</code> 追加。合并后自检：</p>
+<pre><code class="language-bash">grep -oE '^[A-Z_]+=' .env | sort | uniq -d    # 期望为空
+</code></pre>
+<hr>
+<h2 id="五两个正常设计的假故障">五、两个「正常设计」的假故障</h2>
+<p><strong><code>/rest/v1/</code> 返回 403 <code>RBAC: access denied</code> 是对的。</strong> 那是 OpenAPI root，<br>
+官方 Envoy 网关只允许 admin 级密钥，anon 必然被拒。有效探针是具体表路径：<br>
+验签通过 → 404（表不存在），验签失败 → 401。</p>
+<p><strong><code>storage.objects.owner</code> 是 <code>uuid</code> 列。</strong> migration 0017 只删了外键没改类型，<br>
+0018 另加了 <code>owner_id text</code> 取代它。上传时 Storage 把 <code>sub</code> 写进 <code>owner</code>，<br>
+所以 <code>sub</code> 必须是 UUID：</p>
+<pre><code>500 invalid input syntax for type uuid: "auth0|user_abc123"
+</code></pre>
+<p>Keycloak 自建用户的 <code>sub</code> 天生是 UUID v4；风险在<strong>导入用户</strong>或外部 user storage。</p>
+<hr>
+<h2 id="六最小可跑-demo">六、最小可跑 demo</h2>
+<p>不依赖仓库里没有的文件，五步走完。</p>
+<p><strong>1. 拿基线 + 覆盖文件</strong></p>
+<pre><code class="language-bash">mkdir sb-kc &amp;&amp; cd sb-kc
+
+# 官方自托管基线（不需要改它）
+curl -fsSLO https://raw.githubusercontent.com/supabase/supabase/master/docker/docker-compose.yml
+
+# 本项目的覆盖文件与脚本
+git clone --depth 1 https://github.com/geffzhang/supabase-keycloak.git pkg
+cp pkg/docker-compose.keycloak.yml \
+   pkg/docker-compose.supabase-thirdparty.yml \
+   pkg/.env.example .
+cp -r pkg/keycloak pkg/scripts .
+</code></pre>
+<p><strong>2. 补 env</strong></p>
+<p>官方 compose 需要 60+ 个变量，<code>pkg/.env.example</code> 只覆盖 Keycloak 侧。<br>
+从官方模板起步，但不要直接 <code>cat &gt;&gt;</code> 追加。两份文件有 3 个同名键<br>
+（<code>JWT_SECRET</code> / <code>API_EXTERNAL_URL</code> / <code>SITE_URL</code>），而 Compose 读 <code>.env</code> 时<br>
+后者覆盖前者，追加会让 <code>pkg</code> 里的空值把模板里的有效值覆盖掉。</p>
+<p>正确做法是逐个替换：</p>
+<pre><code class="language-bash">curl -fsSLO https://raw.githubusercontent.com/supabase/supabase/master/docker/.env.example
+mv .env.example .env
+
+JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+KEYCLOAK_HOST=localhost:8081
+
+# 只替换已有键，不新增行
+sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${JWT_SECRET}|" .env
+sed -i "s|^API_EXTERNAL_URL=.*|API_EXTERNAL_URL=http://localhost:8000/auth/v1|" .env
+sed -i "s|^SITE_URL=.*|SITE_URL=http://localhost:3000|" .env
+
+# Keycloak 侧变量在模板里没有，安全追加
+cat &gt;&gt; .env &lt;&lt;EOF
+
+KEYCLOAK_HOST=${KEYCLOAK_HOST}
+KEYCLOAK_REALM=supabase
+KEYCLOAK_ADMIN=admin
+KEYCLOAK_ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=')
+KEYCLOAK_DB_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=')
+KEYCLOAK_CLIENT_ID=supabase
+KEYCLOAK_JWKS=
+KC_SCHEME=http
+EOF
+
+# 确认没有重复键（应为空）
+grep -oE '^[A-Z_]+=' .env | sort | uniq -d
+</code></pre>
+<p><code>POSTGRES_PASSWORD</code> 也建议换掉：</p>
+<pre><code class="language-bash">sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=')|" .env
+</code></pre>
+<p><code>ANON_KEY</code> / <code>SERVICE_ROLE_KEY</code> 不能沿用模板里那两把。它们是示例 secret 签的，<br>
+换了 <code>JWT_SECRET</code> 就必然验签失败，而且网关只报 <code>invalid apikey</code>，很难查到根因。<br>
+用同一把 secret 重签：</p>
+<pre><code class="language-bash">export JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+python3 - &lt;&lt;'PY'
+import base64, hashlib, hmac, json, os, time
+secret = os.environ["JWT_SECRET"].encode()
+b64 = lambda b: base64.urlsafe_b64encode(b).decode().rstrip("=")
+def sign(role):
+    now = int(time.time())
+    h = b64(json.dumps({"alg":"HS256","typ":"JWT"}, separators=(",",":")).encode())
+    p = b64(json.dumps({"role":role, "iss":"supabase", "iat":now,
+                        "exp":now+60*60*24*365*10}, separators=(",",":")).encode())
+    return f"{h}.{p}." + b64(hmac.new(secret, f"{h}.{p}".encode(), hashlib.sha256).digest())
+print("ANON_KEY="+sign("anon"))
+print("SERVICE_ROLE_KEY="+sign("service_role"))
+PY
+</code></pre>
+<p>把输出的两行替换进 <code>.env</code> 的对应项，<code>JWT_SECRET</code> 也用同一个值。</p>
+<p><strong>3. 起 Keycloak</strong></p>
+<pre><code class="language-bash">docker compose -f docker-compose.keycloak.yml up -d keycloak-db keycloak
+./scripts/wait-keycloak.sh http://localhost:9000/health/ready 180
+</code></pre>
+<p><code>wait-keycloak.sh</code> 的默认参数就是 9000，直接跑也行。看到 <code>keycloak is ready</code> 再继续。</p>
+<p>realm 会自动导入。进去改两处占位符：Clients → <code>supabase</code> → Credentials → Regenerate；<br>
+Users → <code>demo</code> → Credentials。</p>
+<p><strong>4. 合并 JWKS 再起 Supabase</strong></p>
+<pre><code class="language-bash">./scripts/sync-jwks.sh
+docker compose -f docker-compose.yml -f docker-compose.supabase-thirdparty.yml up -d
+</code></pre>
+<p><code>sync-jwks.sh</code> 会做三件事：拉 Keycloak 公钥、过滤掉 <code>use=enc</code>、把 <code>JWT_SECRET</code><br>
+转成 <code>oct</code> 密钥一起写进 <code>.env</code> 的 <code>KEYCLOAK_JWKS</code>。跑完确认长度不为 0：</p>
+<pre><code class="language-bash">grep -c '^KEYCLOAK_JWKS=.\{50,\}' .env    # 期望输出 1
+</code></pre>
+<p>首次起 Supabase 要等 db 跑完初始化，约 30 秒以上。</p>
+<p><strong>5. 验证</strong></p>
+<pre><code class="language-bash">SUPABASE_URL=http://localhost:8000 \
+SUPABASE_KEY=$(grep '^ANON_KEY=' .env | cut -d= -f2) \
+KEYCLOAK_HOST=localhost:8081 \
+KC_SCHEME=http \
+./scripts/verify.sh b
+</code></pre>
+<p>期望看到 <code>全部通过</code>。<code>verify.sh</code> 查四层：issuer 形状、JWKS 是否非对称且带 kid、<br>
+token 里的 <code>sub</code>/<code>role</code>/<code>preferred_username</code>、以及 Keycloak token 能否穿过<br>
+PostgREST 和 Storage。</p>
+<p><strong>想连 RLS 一起验</strong>，建张探针表再跑一次：</p>
+<pre><code class="language-bash">docker exec -i supabase-db psql -U postgres &lt; pkg/sql/roles-and-rls.sql
+RLS_PROBE_TABLE=notes … ./scripts/verify.sh b   # 多出「写自己 201 / 越权 403」
+</code></pre>
+<hr>
+<h2 id="七验证要有负向判据">七、验证要有负向判据</h2>
+<p>只验「admin 能访问 admin 端点」是不够的。权限校验被整体跳过时它也会通过。<br>
+必须同时验「非 admin 被拒」：</p>
+<pre><code>admin    → 404（业务错误：无此审批单，权限已过）
+operator → 403（requires role 'admin'）
+</code></pre>
+<p>只有后者也对了，前者才有意义。同理，RLS 不能只验「能写自己的」，<br>
+还要验「写别人的被拒 403」和「查列表只看到自己的」。</p>
+<hr>
+<h2 id="八角色进库的永远只有-authenticated">八、角色：进库的永远只有 authenticated</h2>
+<p>Keycloak 的 <code>app_admin</code> <strong>不会</strong>变成 Postgres 角色。写成 <code>to app_admin</code> 会直接报<br>
+<code>role "app_admin" does not exist</code>。要区分管理员得建映射表，用 RLS 去查：</p>
+<pre><code class="language-sql">create policy todos_admin on public.todos
+  for all to authenticated
+  using (exists (
+    select 1 from public.user_roles
+    where subject = (select auth.jwt() -&gt;&gt; 'sub')
+      and app_role = 'admin'
+  ));
+</code></pre>
+<p>另外<strong>不要用 <code>auth.uid()</code></strong>：<code>sub</code> 不是合法 UUID 时它抛异常而不是返回 null，<br>
+整条请求 500。统一用 <code>(select auth.jwt() -&gt;&gt; 'sub')</code>，外层 <code>select</code> 让 Postgres<br>
+走 InitPlan 缓存，否则每个 policy 都要对每一行重新解析一次 json。</p>
+<hr>
+<h2 id="小结">小结</h2>
+<p>这套集成的难点不在「怎么配」，而在默认行为是静默的：</p>
+<ul>
+<li>密钥配错 → 401，日志只写 <code>invalid apikey</code></li>
+<li>claim 丢了 → 权限降级，两边都不报错</li>
+<li>health 探错端口 → 404，像服务没起来</li>
+<li>属性被丢弃 → 写入返回 204，实际没存</li>
+</ul>
+<p>背配置项省不了时间，给每一层配一条能红的判据才省。<br>
+上面六个坑各自对应一条断言，红了才说明配错了。</p>
+<p>版本基线：Supabase <code>docker@4ead4b0</code>、Keycloak <code>26.0</code>、验证于 2026-11。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    <p>欢迎大家扫描下面二维码成为我的客户，扶你上云</p>
+<img src="https://images.cnblogs.com/cnblogs_com/shanyou/57459/o_220125090408_%E9%82%80%E8%AF%B7%E4%BA%8C%E7%BB%B4%E7%A0%81-258px.jpeg" width="170">
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-22 14:38">2026-11-22 14:38</span>&nbsp;
+<a href="https://www.cnblogs.com/shanyou">张善友</a>&nbsp;
+阅读(<span id="post_view_count">54</span>)&nbsp;
+评论(<span id="post_comment_count">2</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23745802);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fshanyou%2Fp%2F23745802&amp;targetId=23745802&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
