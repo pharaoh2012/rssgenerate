@@ -1,0 +1,307 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/yellow3gold/p/23765742" title="发布于 2026-11-24 13:32">
+    
+        <img src="/images/aigc-marker.svg" class="text-front-icon" title="本文内容由AI生成" alt="AIGC标识">
+
+    <span role="heading" aria-level="2">ES 7.17 三节点 Docker 集群的自动备份：从 NFS 被拦住到用 ACL 根治权限</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        给 3 节点 Docker 化的 ES 7.17 集群配每日自动快照，走完了 NFS 被云安全组拦截、改用 SSHFS、路径配置踩坑、容器重建丢插件、跨节点属主竞态导致快照长期 PARTIAL、最终用 POSIX 默认 ACL 根治的全过程。附完整命令、时区陷阱与容量估算。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<blockquote>
+<p><strong>AI 生成声明</strong>：本文内容由 AI 生成或经 AI 辅助完成，请注意甄别。</p>
+</blockquote>
+<h2 id="需求与最终方案">需求与最终方案</h2>
+<p>一套 3 节点的 Elasticsearch 7.17 集群，节点跑在 Docker 里（<code>--net=host</code>，16g 堆），数据目录挂宿主机。需求很朴素：<strong>每天凌晨自动做一次索引快照，保留最近 3 份</strong>，能随时恢复。</p>
+<p>最终落地的方案是：</p>
+<ul>
+<li>用 <strong>SLM（Snapshot Lifecycle Management）</strong> 每天定时触发，<code>fs</code> 类型仓库；</li>
+<li>存储目录放在一台机器上（<code>/data/es-backups</code>），另外两台通过 <strong>SSHFS</strong> 挂载到同一路径；</li>
+<li>三个节点都在 <code>elasticsearch.yml</code> 里配同一个 <code>path.repo</code>，容器都把该目录挂进去；</li>
+<li>权限用 <strong>POSIX 默认 ACL</strong> 兜底，避免新目录回落到 775。</li>
+</ul>
+<p>看起来只是"注册仓库 + 建策略"两步，实际前面有四五个坑，其中一个反复出现了五次。</p>
+<h2 id="一先理清三层概念">一、先理清三层概念</h2>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>是什么</th>
+<th>本次取值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>仓库 repository</td>
+<td>快照存放的位置，<code>fs</code> 类型就是一个目录</td>
+<td><code>daily_backup</code> → <code>/data/es-backups</code></td>
+</tr>
+<tr>
+<td>快照 snapshot</td>
+<td>某一时刻若干索引的完整副本，增量存储</td>
+<td><code>daily-snapshot-2026.xx.xx-xxxx</code></td>
+</tr>
+<tr>
+<td>策略 SLM</td>
+<td>定时执行快照 + 自动清理过期快照</td>
+<td>每天一次，保留 3 份</td>
+</tr>
+</tbody>
+</table>
+<p><code>fs</code> 仓库有一个硬性前提：<strong>集群里所有 master/data 节点都能以同一个路径访问这个目录</strong>，否则注册时直接报错，或者快照只写了一半。</p>
+<h2 id="二存储方案nfs-走不通换-sshfs">二、存储方案：NFS 走不通，换 SSHFS</h2>
+<h3 id="nfs111-通2049-不通">NFS：111 通，2049 不通</h3>
+<p>第一反应是 NFS。服务端导出目录、客户端 mount，结果卡在：</p>
+<pre><code>mount.nfs: trying 192.168.1.11 prog 100003 vers 3 prot TCP port 2049
+mount.nfs: trying 192.168.1.11 prog 100005 vers 3 prot TCP port 43087
+mount.nfs: portmap query failed: RPC: Timed out
+</code></pre>
+<p>换成 NFSv4（只依赖 2049）依然超时。用 <code>telnet</code> 测：111 端口通，2049 不通——典型的云平台安全组只放行了常用端口，NFS 的动态端口和 2049 都被拦在外面。改安全组需要走审批，短期内没法动。</p>
+<blockquote>
+<p>判断方法：<code>rpcinfo -p &lt;server&gt;</code> 能看到注册端口，但能不能连上要看 <code>telnet &lt;server&gt; 2049</code>。</p>
+</blockquote>
+<h3 id="sshfs只需要-22-端口">SSHFS：只需要 22 端口</h3>
+<p>既然三台机器之间本来就靠 SSH 管理，用 SSHFS 最省事——不需要额外开任何端口。</p>
+<pre><code class="language-bash">sudo apt install -y sshfs
+
+sudo sshfs -o allow_other,uid=1000,gid=1000,umask=000,reconnect \
+  -o IdentityFile=/home/deploy/.ssh/id_rsa \
+  deploy@192.168.1.11:/data/es-backups /data/es-backups
+</code></pre>
+<p>几个参数都有用：</p>
+<ul>
+<li><code>allow_other</code>：让容器里的进程（非挂载用户）也能访问；</li>
+<li><code>uid=1000,gid=1000</code>：把远端文件映射成容器内 ES 用户的 uid；</li>
+<li><code>umask=000</code>：让通过 SSHFS 新建的目录默认就是 777，这一点后面是关键的；</li>
+<li><code>reconnect</code>：断线自动重连，备份跑几十分钟时很必要。</li>
+</ul>
+<p>写进 <code>/etc/fstab</code> 才能扛住重启：</p>
+<pre><code>deploy@192.168.1.11:/data/es-backups /data/es-backups fuse.sshfs allow_other,uid=1000,gid=1000,umask=000,IdentityFile=/home/deploy/.ssh/id_rsa,reconnect,defaults,_netdev 0 0
+</code></pre>
+<h3 id="为什么不用每个节点本地目录">为什么不用"每个节点本地目录"</h3>
+<p>也考虑过更简单的方案：三台各自建 <code>/tmp/es-backups</code>。它确实能让仓库注册通过，但快照数据会按分片散落在三台机器上，任何一台挂了、目录被清理了，整份快照就不可恢复；而且 <code>/tmp</code> 重启即清空。省下的是配置成本，付出的是备份的可用性，不划算。</p>
+<h2 id="三配置步骤">三、配置步骤</h2>
+<h3 id="1-准备目录与挂载">1. 准备目录与挂载</h3>
+<pre><code class="language-bash"># 存储节点
+sudo mkdir -p /data/es-backups
+sudo chown -R deploy:deploy /data/es-backups
+sudo chmod -R 777 /data/es-backups
+
+# 另外两台
+sudo mkdir -p /data/es-backups
+sudo sshfs -o allow_other,uid=1000,gid=1000,umask=000,reconnect \
+  -o IdentityFile=/home/deploy/.ssh/id_rsa \
+  deploy@192.168.1.11:/data/es-backups /data/es-backups
+mount | grep es-backups   # 确认参数里有 umask=000
+</code></pre>
+<h3 id="2-配置-pathrepo">2. 配置 path.repo</h3>
+<p>三台的 <code>elasticsearch.yml</code> 都加上，<strong>只能有一行</strong>：</p>
+<pre><code class="language-yaml">path.repo: /data/es-backups
+</code></pre>
+<h3 id="3-重建容器并挂载目录">3. 重建容器并挂载目录</h3>
+<p>容器内必须能看到这个路径，否则 <code>path.repo</code> 指向的是容器自己的文件系统：</p>
+<pre><code class="language-bash">sudo docker stop es-node-2 &amp;&amp; sudo docker rm es-node-2
+sudo docker run -d --name es-node-2 --restart=always --net=host \
+  -e "ES_JAVA_OPTS=-Xms16g -Xmx16g" \
+  -v /data/elasticsearch/data:/usr/share/elasticsearch/data \
+  -v /data/elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml \
+  -v /data/elasticsearch/config/elastic-certificates.p12:/usr/share/elasticsearch/config/elastic-certificates.p12 \
+  -v /data/es-backups:/data/es-backups \
+  docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+</code></pre>
+<blockquote>
+<p>注意：重建容器会把之前装在容器里的插件一起丢掉。这次重建后 IK 分词器消失，索引分片分配失败，集群直接 red，报 <code>analyzer [ik_max_word] has not been configured in mappings</code>。需要重新装插件、重启，再 <code>_cluster/reroute?retry_failed=true</code>。插件目录一定要单独挂载持久化。</p>
+</blockquote>
+<h3 id="4-注册仓库">4. 注册仓库</h3>
+<pre><code class="language-bash">curl -s -u "elastic:${ES_PWD}" -X PUT "http://localhost:9200/_snapshot/daily_backup" \
+  -H 'Content-Type: application/json' -d'
+{
+  "type": "fs",
+  "settings": {
+    "location": "/data/es-backups",
+    "compress": true
+  }
+}'
+
+# 校验仓库对每个节点都可用
+curl -s -u "elastic:${ES_PWD}" -X POST "http://localhost:9200/_snapshot/daily_backup/_verify?pretty"
+</code></pre>
+<p><code>_verify</code> 返回三台节点且没有 error，才说明路径和权限都通了。</p>
+<h3 id="5-创建-slm-策略">5. 创建 SLM 策略</h3>
+<pre><code class="language-bash">curl -s -u "elastic:${ES_PWD}" -X PUT "http://localhost:9200/_slm/policy/daily-snapshot-policy" \
+  -H 'Content-Type: application/json' -d'
+{
+  "schedule": "0 0 18 * * ?",
+  "name": "&lt;daily-snapshot-{now/d}&gt;",
+  "repository": "daily_backup",
+  "config": {
+    "indices": ["docs_index_a1", "docs_index_a2", "docs_index_a3"],
+    "include_global_state": false
+  },
+  "retention": {
+    "expire_after": "3d",
+    "min_count": 3,
+    "max_count": 3
+  }
+}'
+</code></pre>
+<p>两个容易踩的点：</p>
+<ul>
+<li><strong><code>schedule</code> 是 UTC 时间</strong>。<code>0 0 2 * * ?</code> 不是凌晨 2 点，而是北京时间上午 10 点；要凌晨 2 点得写 <code>0 0 18 * * ?</code>。第一次配错后，备份确实在上午 10 点跑了起来。</li>
+<li><strong>快照名里的 <code>{now/d}</code> 也按 UTC 算</strong>。北京时间 11 月 23 日凌晨 2 点的快照，名字是 <code>daily-snapshot-2026.11.22-xxx</code>。看列表时按名字判断"昨天有没有备份"，会得出相反结论。</li>
+</ul>
+<h3 id="6-手动触发并观察">6. 手动触发并观察</h3>
+<pre><code class="language-bash">curl -s -u "elastic:${ES_PWD}" -X POST "http://localhost:9200/_slm/policy/daily-snapshot-policy/_execute"
+
+curl -s -u "elastic:${ES_PWD}" "http://localhost:9200/_snapshot/daily_backup/_all?pretty"
+</code></pre>
+<h2 id="四踩坑记录">四、踩坑记录</h2>
+<h3 id="坑-1pathrepo-写两次节点起不来">坑 1：<code>path.repo</code> 写两次，节点起不来</h3>
+<p>第一次配了 <code>/data/es-backups</code>，后来试本地方案又追加了一行 <code>/tmp/es-backups</code>，结果：</p>
+<pre><code>SettingsException[Failed to load settings from ...]
+Duplicate field 'path.repo'
+</code></pre>
+<p>用 <code>sed -i '/path.repo/d'</code> 清掉后<strong>忘了加回来</strong>，下一次注册仓库变成：</p>
+<pre><code>repository_exception: location [/data/es-backups] doesn't match any of the
+locations specified by path.repo because this setting is empty
+</code></pre>
+<p>这个报错很直白：<code>path.repo</code> 是空的。改配置后一定要 <code>cat elasticsearch.yml</code> 复核，并重启容器（不是 <code>restart</code> 配置没生效的问题，而是确认挂载进去的文件内容）。</p>
+<h3 id="坑-2容器没挂载备份目录">坑 2：容器没挂载备份目录</h3>
+<p><code>path.repo</code> 配在宿主机上没问题，但容器里的 <code>/data/es-backups</code> 是容器自己的目录。没加 <code>-v /data/es-backups:/data/es-backups</code> 时，快照会静默写进容器可写层，容器一删就全没了。注册仓库不会报错，这是最隐蔽的一种。</p>
+<h3 id="坑-3chmod-777-只改顶层不够">坑 3：<code>chmod 777</code> 只改顶层，不够</h3>
+<p>第一版快照直接失败：</p>
+<pre><code class="language-json">"state": "PARTIAL",
+"reason": "ElasticsearchException[failed to create blob container];
+           nested: AccessDeniedException[/data/es-backups/indices]"
+</code></pre>
+<p>原因：ES 会在 <code>indices/&lt;索引UUID&gt;/&lt;分片号&gt;/</code> 下面创建目录，只给顶层 777、没递归，子目录仍然写不进去。必须 <code>chmod -R 777</code>。</p>
+<h3 id="坑-4真正的元凶跨节点创建同一个-uuid-目录">坑 4：真正的元凶——跨节点创建同一个 <code>UUID</code> 目录</h3>
+<p>递归 777 之后仍然反复失败，而且每次都是同一类报错，只是目录 UUID 变了：</p>
+<pre><code>AccessDeniedException[/data/es-backups/indices/clMovi_kTnOUlPVJYULbXw/0]
+</code></pre>
+<p>把 <code>_cat/shards</code> 拉出来对比才发现规律：</p>
+<ul>
+<li>单分片的 <code>docs_index_a1</code>、<code>docs_index_a2</code> 都成功；</li>
+<li>3 分片的 <code>docs_index_a3</code>，主分片分布在两台机器上，只有落在另一台的那个分片失败，0.2 秒内直接 FAILURE。</li>
+</ul>
+<p>根因是<strong>目录属主竞态</strong>：</p>
+<ol>
+<li>快照目录 <code>indices/&lt;uuid&gt;/</code> 由最先到达的节点创建，属主就归谁；</li>
+<li>存储节点本机的 ES 容器以 <code>uid=1000</code> 直连磁盘，另外两台是通过 SSHFS，实际落到 <code>sshd</code> 的登录用户（<code>uid=1001</code>）创建；</li>
+<li>目录默认权限是 775，只对属主友好。谁先建，另一边就写不进去；</li>
+<li>每次重建索引 UUID 都会变，于是"修好一次、下次又坏"，从 8 月到 11 月反复出现。</li>
+</ol>
+<p><code>chmod -R 777</code> 只能救已经存在的目录，新建的目录又会按各自进程的 umask 落回 775。</p>
+<p><strong>根治办法：POSIX 默认 ACL。</strong> 父目录设了默认 ACL 后，在它下面新建的目录不受任何进程 umask 影响，直接继承 <code>rwxrwxrwx</code>：</p>
+<pre><code class="language-bash">sudo apt install -y acl
+sudo chmod -R 777 /data/es-backups
+sudo chown -R deploy:deploy /data/es-backups
+sudo setfacl -R -m d:u::rwx,d:g::rwx,d:o::rwx /data/es-backups
+
+sudo getfacl /data/es-backups/indices   # 应看到 default:user/group/other::rwx
+</code></pre>
+<p>再配合 SSHFS 的 <code>umask=000</code>（并写进 fstab），两边新建的目录天然可写。改完后快照一次通过，五轮 PARTIAL 之后终于拿到第一份 SUCCESS。</p>
+<h3 id="坑-5in_progress-卡了-8-小时">坑 5：<code>IN_PROGRESS</code> 卡了 8 小时</h3>
+<p>第一次全量（单索引约 300GB、单分片）跑在 SSHFS 上，状态长时间停在 <code>IN_PROGRESS</code>，<code>failed: 1</code>。原因有两个：一是前面说的权限问题导致个别 shard 已经失败但整体还在跑；二是在快照写入过程中反复执行 <code>chown/chmod</code>，属主一改就可能触发新的 <code>AccessDeniedException</code>。</p>
+<p>教训：<strong>快照运行期间不要动目录权限</strong>。观察进度只看 <code>_status</code> 的 <code>processed</code> 字节数是否在涨。</p>
+<h3 id="坑-6partial-快照没有保留价值">坑 6：PARTIAL 快照没有保留价值</h3>
+<p><code>FAILURE</code> 的 shard 不会被重试，快照跑完必然是 <code>PARTIAL</code>，恢复时这个索引会缺分片数据。正确做法是删掉整份快照再触发：</p>
+<pre><code class="language-bash">curl -s -u "elastic:${ES_PWD}" -X DELETE \
+  "http://localhost:9200/_snapshot/daily_backup/daily-snapshot-2026.11.23-xxxx"
+curl -s -u "elastic:${ES_PWD}" -X POST \
+  "http://localhost:9200/_slm/policy/daily-snapshot-policy/_execute"
+</code></pre>
+<h3 id="坑-7容量按份数--单份大小算别按索引大小算">坑 7：容量按"份数 × 单份大小"算，别按索引大小算</h3>
+<p>实测数据：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>数据量</th>
+<th>耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>首次全量（单索引，SSHFS）</td>
+<td>约 159 GB</td>
+<td>约 70 分钟</td>
+</tr>
+<tr>
+<td>日常增量</td>
+<td>变化很小</td>
+<td>2.6 ~ 4.6 分钟</td>
+</tr>
+<tr>
+<td>三索引首次全量（共 5 个分片）</td>
+<td>220.9 GB / 907 文件</td>
+<td>约 88 分钟</td>
+</tr>
+</tbody>
+</table>
+<p>每份快照约 220GB，<code>max_count: 3</code> 意味着峰值接近 660GB。加索引前先 <code>df -h</code> 看余量，必要时把 <code>max_count</code> 降到 2 或把 <code>expire_after</code> 缩到 2d。注意 <code>min_count</code> 是保底数量，<code>expire_after</code> 过期但不够 <code>min_count</code> 时仍会保留。</p>
+<h2 id="五验证与恢复">五、验证与恢复</h2>
+<p>日常巡检看三条就够：</p>
+<pre><code class="language-bash"># 列表与状态
+curl -s -u "elastic:${ES_PWD}" "http://localhost:9200/_snapshot/daily_backup/_all?pretty"
+# 单份进度
+curl -s -u "elastic:${ES_PWD}" "http://localhost:9200/_snapshot/daily_backup/&lt;快照名&gt;/_status?pretty"
+# 是否有任务在跑
+curl -s -u "elastic:${ES_PWD}" "http://localhost:9200/_snapshot/daily_backup/_current?pretty"
+</code></pre>
+<p>判断成功只看两个字段：<code>"state": "SUCCESS"</code> 且 <code>"failed": 0</code>（<code>shards_stats</code> 里也应为 0）。</p>
+<p>恢复时建议换个索引名，避免覆盖线上数据：</p>
+<pre><code class="language-bash">curl -s -u "elastic:${ES_PWD}" -X POST \
+  "http://localhost:9200/_snapshot/daily_backup/&lt;快照名&gt;/_restore" \
+  -H 'Content-Type: application/json' -d'
+{
+  "indices": "docs_index_a1",
+  "rename_pattern": "docs_index_(.+)",
+  "rename_replacement": "restore_docs_index_$1"
+}'
+
+curl -s -u "elastic:${ES_PWD}" "http://localhost:9200/_cat/recovery?v"
+</code></pre>
+<p>恢复前要确认目标索引不存在（重名会直接拒绝），恢复过程同样用 <code>_cat/recovery</code> 看进度。</p>
+<h2 id="六经验清单">六、经验清单</h2>
+<ol>
+<li><code>fs</code> 仓库要求所有节点同一路径可达，先解决"共享目录"再谈快照；</li>
+<li>云上 NFS 经常被安全组拦在 2049/mountd，SSHFS 是最低成本的替代，但要配 <code>reconnect</code> 和 fstab；</li>
+<li><code>path.repo</code> 只写一行，配置改了要复核文件内容并重启容器；</li>
+<li>容器必须挂载备份目录，否则快照写进可写层；</li>
+<li>重建容器会丢插件，插件和配置目录都要持久化挂载；</li>
+<li>多节点写同一目录时，<strong>目录属主竞态是硬伤</strong>，<code>chmod -R 777</code> 治不了新建目录，用默认 ACL + SSHFS <code>umask=000</code> 才能根治；</li>
+<li>SLM 的 <code>schedule</code> 和 <code>{now/d}</code> 都是 UTC，写策略时记得换算；</li>
+<li>快照运行中不要改权限，<code>PARTIAL</code> 直接删掉重跑；</li>
+<li>容量按 <code>单份大小 × max_count</code> 估，加索引前先看磁盘；</li>
+<li>每次配完手动 <code>_execute</code> 一次，确认 <code>SUCCESS + failed: 0</code>，比等第二天看结果靠谱。</li>
+</ol>
+<p>坦白说，<code>fs</code> 仓库架在 SSHFS 上，本质是用文件系统属主规则去协调三个不同 uid 的写入者，ACL 只是把问题按住。长期看，S3 类型仓库没有属主概念、权限由密钥统一授予，才是这类环境更彻底的解法——如果哪天有机会重构，这是首选方向。</p>
+<blockquote>
+<p>注：文中 IP、主机名、账号、密码、索引名、集群与仓库命名等均已做匿名化处理，示例密码统一用 <code>${ES_PWD}</code> 环境变量代替。</p>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0.0020833333333333333" data-date-updated="2026-11-24 13:36">2026-11-24 13:32</span>&nbsp;
+<a href="https://www.cnblogs.com/yellow3gold">新*</a>&nbsp;
+阅读(<span id="post_view_count">50</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23765742);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fyellow3gold%2Fp%2F23765742&amp;targetId=23765742&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
