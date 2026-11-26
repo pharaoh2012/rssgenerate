@@ -1,0 +1,196 @@
+
+		<h2>
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/liuziyi1/p/23791288" title="发布于 2026-11-26 15:20">
+    
+
+    <span role="heading" aria-level="2">openGauss 的 PITR（Point-In-Time Recovery，时间点恢复）</span>
+    
+
+</a>
+
+		</h2>
+		<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<hr>
+<h2 id="一原理与前提">一、原理与前提</h2>
+<p>openGauss 的 PITR 基于<strong>基础热备 + WAL 预写日志 + WAL 归档日志</strong>：</p>
+<ul>
+<li>物理备份提供数据页基线；</li>
+<li>恢复时 <code>StartupXLOG</code> 读取 <code>backup_label</code>，把重放起点定位到备份点；</li>
+<li>再通过 <code>restore_command</code> 拉取归档 WAL 段不断前滚，<code>recovery_target_*</code> 控制停止点；</li>
+<li>重放可在任意点停止，因此能恢复到"自开始备份以来的任意时刻"。</li>
+</ul>
+<p><strong>两个硬前提</strong>：</p>
+<ol>
+<li>存在经过物理备份的全量数据文件（如 <code>base.tar.gz</code>，或 <code>pg_basebackup</code>/<code>gs_probackup</code> 生成的备份）；</li>
+<li>存在<strong>连续</strong>的归档 WAL 日志文件（示例归档目录 <code>/ogarchive</code>）。</li>
+</ol>
+<blockquote>
+<p>重要边界：<strong><code>gs_probackup</code> 本身不支持基于连续 WAL 归档的任意点 PITR</strong>，它的 <code>--recovery-target-*</code> 只能指定备份集内的 stop lsn、recovery-name、recovery-time、recovery-xid。要做任意时间点 PITR，必须走"物理备份 + 连续 WAL 归档 + <code>recovery.conf</code>"这套流程。</p>
+</blockquote>
+<hr>
+<h2 id="二开启-wal-归档pitr-的基础">二、开启 WAL 归档（PITR 的基础）</h2>
+<p>在 <code>postgresql.conf</code> 中配置（<code>wal_level</code> 必须为 <code>archive</code>，<code>minimal</code> 时 <code>archive_mode</code> 不可用）：</p>
+<pre><code class="language-conf">wal_level = archive            # 归档所需信息级别
+archive_mode = on              # 开启归档模式
+archive_command = 'cp %p /ogarchive/%f'   # 归档命令，%p 源文件路径、%f 文件名
+</code></pre>
+<ul>
+<li><code>archive_command</code> 要保证<strong>归档成功</strong>，否则 WAL 会堆积在 pg_xlog，最终导致写满。</li>
+<li>改完需重启生效（<code>archive_mode</code> 为 postmaster 级参数）。</li>
+<li>检查归档是否生效：<pre><code class="language-sql">SHOW archive_mode;
+SHOW archive_command;
+-- 强制切一个 WAL 段验证归档
+SELECT pg_switch_xlog();       -- 新版可能为 pg_switch_wal()
+</code></pre>
+到 <code>/ogarchive</code> 下确认有对应 WAL 文件生成。</li>
+</ul>
+<hr>
+<h2 id="三备份全量物理基线">三、备份：全量物理基线</h2>
+<h3 id="方式-1pg_basebackup推荐用于-pitr-基线">方式 1：pg_basebackup（推荐用于 PITR 基线）</h3>
+<pre><code class="language-bash"># 以 omm 用户执行，生成基础备份到 /backup/base
+pg_basebackup -D /backup/base -h 127.0.0.1 -p 26000 -U omm -F t -X stream -P
+</code></pre>
+<ul>
+<li><code>-F t</code>：tar 格式（可得到 <code>base.tar.gz</code> 类备份包）；</li>
+<li><code>-X stream</code>：备份期间同步传输 WAL，避免备份不一致；</li>
+<li>备份期间会触发 checkpoint，并在 <code>backup_label</code> 中记录备份起点，这是后续 PITR 能对接 redo 点的关键。</li>
+</ul>
+<h3 id="方式-2gs_probackup适合增量定期备份">方式 2：gs_probackup（适合增量/定期备份）</h3>
+<pre><code class="language-bash"># 初始化备份目录
+gs_probackup init -B /home/omm/gs_bak
+
+# 添加实例
+gs_probackup add-instance -B /home/omm/gs_bak -D /opt/huawei/install/data/dn --instance=dn1
+
+# 全量备份
+gs_probackup backup -B /home/omm/gs_bak --instance=dn1 -b full
+
+# 查看备份列表 / 归档情况
+gs_probackup show -B /home/omm/gs_bak --instance=dn1
+gs_probackup show -B /home/omm/gs_bak --instance=dn1 --archive
+</code></pre>
+<p><code>show --archive</code> 会列出 TLI、Min/Max Segno、段数、大小、N backups、Status，用来确认 WAL 归档段覆盖区间是否连续。</p>
+<h3 id="方式-3gs_roach集群场景">方式 3：gs_roach（集群场景）</h3>
+<pre><code class="language-bash">gs_roach backup -d /backup/roach --cluster --backup-type full --compress --parallel 8
+</code></pre>
+<blockquote>
+<p>该命令为流程模板，具体参数以实际部署介质版本为准。</p>
+</blockquote>
+<p><strong>备份策略建议</strong>：定期全量基线 + 连续 WAL 归档不中断，保证任意目标时间点都落在"某次全备之后、WAL 归档连续"的区间内。</p>
+<hr>
+<h2 id="四pitr-恢复步骤核心">四、PITR 恢复步骤（核心）</h2>
+<blockquote>
+<p>前提：数据库已停止；目标实例目录、物理备份、归档 WAL 目录（如 <code>/ogarchive</code>）已就绪。<strong>建议先恢复到独立目录/独立实例验证</strong>，确认数据无误再切生产。</p>
+</blockquote>
+<h3 id="步骤-1还原物理备份到目标数据目录">步骤 1：还原物理备份到目标数据目录</h3>
+<pre><code class="language-bash"># 例：用 tar 备份包还原
+cd /opt/huawei/install/data/dn
+tar -xzf /backup/base/base.tar.gz
+# 如为 gs_probackup 备份，则用 gs_probackup restore 指定恢复目录/实例
+</code></pre>
+<h3 id="步骤-2清空-pg_xlog-目录">步骤 2：清空 pg_xlog 目录</h3>
+<pre><code class="language-bash">rm -f /opt/huawei/install/data/dn/pg_xlog/*
+</code></pre>
+<blockquote>
+<p>清空后由归档 WAL 重新填充，避免残留的旧 WAL 干扰重放起点。注意新版 openGauss/PG 体系目录可能叫 <code>pg_wal</code>，以实际版本目录名为准。</p>
+</blockquote>
+<h3 id="步骤-3让归档-wal-可用二选一">步骤 3：让归档 WAL 可用（二选一）</h3>
+<ul>
+<li><strong>方式 A：手动复制</strong>归档 WAL 到 pg_xlog：<pre><code class="language-bash">cp /ogarchive/* /opt/huawei/install/data/dn/pg_xlog/
+</code></pre>
+</li>
+<li><strong>方式 B：用 <code>recovery.conf</code> 的 <code>restore_command</code> 自动拉取</strong>（推荐，见步骤 4）。</li>
+</ul>
+<h3 id="步骤-4创建-recoveryconf指定恢复目标">步骤 4：创建 recovery.conf，指定恢复目标</h3>
+<p>在数据目录（dn 目录）下创建 <code>recovery.conf</code>：</p>
+<pre><code class="language-conf">restore_command = 'cp /ogarchive/%f %p'
+archive_cleanup_command = 'pg_archivecleanup /ogarchive %r'
+recovery_target_time = '2026-11-26 10:00:00'
+recovery_target_inclusive = true
+</code></pre>
+<ul>
+<li><code>restore_command</code>：恢复时按需从归档目录取 WAL；</li>
+<li><code>recovery_target_time</code>：恢复到指定时间戳；</li>
+<li><code>recovery_target_inclusive</code>：是否包含目标时间点本身（true 表示包含）；</li>
+<li><strong><code>recovery_target_name / time / xid / lsn</code> 四项只能同时指定一项</strong>；不指定则恢复到最新 WAL 日志点。</li>
+</ul>
+<h3 id="步骤-5启动数据库并验证">步骤 5：启动数据库并验证</h3>
+<pre><code class="language-bash">gs_ctl -D /opt/huawei/install/data/dn start
+# 或 gs_om -t start
+</code></pre>
+<p>连接数据库验证是否到达预期状态：</p>
+<pre><code class="language-sql">SELECT now();
+-- 核对关键业务表数据是否满足目标时间点
+</code></pre>
+<p>此时实例处于恢复后的只读/待确认状态。</p>
+<h3 id="步骤-6确认后使主节点对外服务">步骤 6：确认后使主节点对外服务</h3>
+<pre><code class="language-sql">SELECT pg_xlog_replay_resume();
+</code></pre>
+<p>执行后主节点正式对外提供读写服务（新版可能为 <code>pg_wal_replay_resume()</code>）。</p>
+<hr>
+<h2 id="五关键坑点务必注意">五、关键坑点（务必注意）</h2>
+<table>
+<thead>
+<tr>
+<th>坑点</th>
+<th>说明与处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>gs_probackup 不支持连续归档 PITR</strong></td>
+<td>其 <code>--recovery-target-*</code> 只能指向备份集内 stop lsn / recovery-name / recovery-time / recovery-xid。任意点 PITR 必须用物理备份 + 连续 WAL 归档 + <code>recovery.conf</code>。</td>
+</tr>
+<tr>
+<td><strong><code>failed to translate name to xlog in GetOldestXLOGSegNo</code></strong></td>
+<td>清空 pg_xlog、配好 recovery.conf 后 <code>gs_ctl start</code> 报此错，多因归档 WAL 未正确放入 pg_xlog。处理：手动 <code>cp /ogarchive/* .../pg_xlog/</code> 后重启。</td>
+</tr>
+<tr>
+<td><strong>archive_mode 依赖 wal_level</strong></td>
+<td><code>wal_level=minimal</code> 时 <code>archive_mode</code> 不可用，必须 <code>wal_level=archive</code>。</td>
+</tr>
+<tr>
+<td><strong>WAL 归档断档 / 被回收（58P01）</strong></td>
+<td>归档不全或备机落后超过保留窗口，WAL 段被回收，报 <code>requested WAL segment has already been removed</code>，PITR 无法连续前滚，只能重建。务必保证归档连续、监控归档成功率。</td>
+</tr>
+<tr>
+<td><strong>归档目录写满</strong></td>
+<td><code>archive_command</code> 失败会导致 pg_xlog 堆积写满，直接卡死数据库。需监控归档目录空间和归档延迟。</td>
+</tr>
+<tr>
+<td><strong>版本差异</strong></td>
+<td><code>pg_xlog</code>/<code>pg_switch_xlog</code>/<code>pg_xlog_replay_resume</code> 在新版本中可能改名为 <code>pg_wal</code>/<code>pg_switch_wal</code>/<code>pg_wal_replay_resume</code>；<code>recovery.conf</code> 在部分新版本改为 <code>postgresql.conf</code> 中的 <code>recovery_target_*</code> 参数。以目标版本手册为准。</td>
+</tr>
+<tr>
+<td><strong>缺少演练</strong></td>
+<td>建议每月做一次单机 PITR 演练，目标点设为最近故障演练时间点，记录 RTO/RPO 实测值，验证恢复能力。</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="六最小操作清单速查">六、最小操作清单（速查）</h2>
+<pre><code class="language-text">1) 开归档：wal_level=archive + archive_mode=on + archive_command，重启生效
+2) 全备基线：pg_basebackup -F t -X stream（或 gs_probackup backup -b full）
+3) 持续 WAL 归档不中断，确认 /ogarchive 连续
+4) 恢复：还原物理备份 → 清空 pg_xlog
+        → 复制归档 WAL 或用 restore_command
+        → 写 recovery.conf（recovery_target_time）
+        → gs_ctl start → 验证 → pg_xlog_replay_resume()
+</code></pre>
+
+
+</div>
+<div class="clear"></div>
+
+		<p class="postfoot">
+			posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-26 15:21">2026-11-26 15:20</span>&nbsp;
+<a href="https://www.cnblogs.com/liuziyi1">刘子毅</a>&nbsp;
+阅读(<span id="post_view_count">17</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23791288);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fliuziyi1%2Fp%2F23791288&amp;targetId=23791288&amp;targetType=0" target="_blank">举报</a>
+
+		</p>
+	

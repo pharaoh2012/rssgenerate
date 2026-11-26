@@ -1,0 +1,688 @@
+
+		<h1 class="postTitle">
+			<a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/zackstang/p/23791268" title="发布于 2026-11-26 15:41">
+    
+
+    <span role="heading" aria-level="2">多模态文档检索中的 Late Interaction 模型：原理、评测与 OpenSearch 实践</span>
+    
+
+</a>
+
+		</h1>
+		<div class="clear"></div>
+		<div class="postBody">
+			<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>在 RAG 场景里，企业文档往往是 PDF、扫描件、报表和幻灯片，里面有大量表格、图表和版面信息。传统做法是先做 OCR 和版面解析，再切块做文本 embedding，流程长，图表里的信息也容易丢。近一年多来，以 ColPali、ColQwen 为代表的视觉文档检索模型把每一页直接当成图片来编码，再用 late interaction（延迟交互）的方式和查询做 token 级匹配，在公开评测上明显超过了"解析 + 文本 embedding"的方案。本文以 ColQwen2 为例，首先拆解模型的输入构建流程和 MaxSim 打分的计算细节；随后在 ViDoRe 的两个公开数据集上，对比单向量、多向量和两阶段检索的效果与存储开销；最后在 Amazon OpenSearch Service 上实现一遍"k-NN 召回 + lateInteractionScore 重排"，并记录实测中遇到的几个配置问题。</p>
+<h2 id="1-三种检索架构">1. 三种检索架构</h2>
+<p>先简单回顾一下检索模型的三种架构：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Bi-encoder</th>
+<th>Late interaction</th>
+<th>Cross-encoder</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>编码方式</td>
+<td>查询、文档分开编码</td>
+<td>查询、文档分开编码</td>
+<td>拼接后一起编码</td>
+</tr>
+<tr>
+<td>表示</td>
+<td>每段文本 1 个向量</td>
+<td>每个 token 1 个向量</td>
+<td>不产生向量，直接输出分数</td>
+</tr>
+<tr>
+<td>交互时机</td>
+<td>只在最后算一次相似度</td>
+<td>编码之后做 token 级匹配</td>
+<td>编码过程中全程交互</td>
+</tr>
+<tr>
+<td>文档能否预计算</td>
+<td>能</td>
+<td>能</td>
+<td>不能</td>
+</tr>
+<tr>
+<td>典型模型</td>
+<td>Cohere Embed v4、bge-m3（dense）</td>
+<td>ColBERT、ColPali、ColQwen</td>
+<td>bge-reranker、Cohere Rerank</td>
+</tr>
+</tbody>
+</table>
+<p>Late interaction 的打分方式叫 MaxSim。设查询有 N_q 个 token 向量 E_q，文档有 N_d 个 token 向量 E_d，则：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1287132/202611/1287132-20261126152158546-1742535796.png" alt="image" loading="lazy"></p>
+<p>也就是对查询里的每个 token，找它在文档所有 token 里最相似的那一个，再把这些最大值加起来。文档的向量可以提前算好存起来，查询时只需要编码查询，再做向量运算，所以它比 cross-encoder 快得多；同时每个查询 token 都能找到自己在文档里的最佳匹配，比把整页压成一个向量的 bi-encoder 更精细。</p>
+<p>ColPali 系列模型把这个思路用到了图片上：文档页面经过视觉语言模型后，每个图像 patch 输出一个向量；查询仍然是文本，每个 token 输出一个向量，再用 MaxSim 打分。</p>
+<h2 id="2-colqwen2-推理">2. ColQwen2 推理</h2>
+<p>本文使用 vidore/colqwen2-v1.0-hf，底座是 Qwen2-VL-2B-Instruct（Apache 2.0），在 ViDoRe V1 上的平均 nDCG@5 为 89.3。实验环境是 NVIDIA L4 24GB，transformers 5.24.1，torch 2.14.1。</p>
+<h3 id="21-示例代码">2.1 示例代码</h3>
+<p>首先看一个对单页文档和单条查询做编码，再手动计算 MaxSim 的例子，示例代码如下：</p>
+<pre><code class="language-python">import torch
+from datasets import load_dataset
+from transformers import ColQwen2ForRetrieval, ColQwen2Processor
+
+model_name = "vidore/colqwen2-v1.0-hf"
+model = ColQwen2ForRetrieval.from_pretrained(
+    model_name, dtype=torch.bfloat16, device_map="cuda"
+).eval()
+processor = ColQwen2Processor.from_pretrained(model_name)
+
+# 取 ViDoRe 能源领域数据集的第一页和它对应的查询
+ds = load_dataset("vidore/syntheticDocQA_energy_test", split="test")
+image, query = ds[0]["image"], ds[0]["query"]
+
+# 文档侧：页面图片
+batch_images = processor(images=[image], return_tensors="pt").to(model.device)
+# 查询侧：文本
+batch_query = processor(text=[query], return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    d = model(**batch_images).embeddings  # (1, Nd, 128)
+    q = model(**batch_query).embeddings   # (1, Nq, 128)
+
+# 手算 MaxSim
+sim = q[0].float() @ d[0].float().T        # (Nq, Nd)
+max_per_q = sim.max(dim=1)                 # 每个查询 token 取最大值
+score_manual = max_per_q.values.sum().item()
+score_lib = processor.score_retrieval(q, d)[0, 0].item()
+print(score_manual, score_lib)
+</code></pre>
+<p>运行结果（省略部分日志）：</p>
+<pre><code>原始图片尺寸 (W, H): (2200, 1700)
+查询: What types of road improvements are planned for Greenmount Road in Belleville, Illinois?
+image input  input_ids        shape=(1, 755) dtype=torch.int64
+image input  attention_mask   shape=(1, 755) dtype=torch.int64
+image input  pixel_values     shape=(1, 2976, 1176) dtype=torch.float32
+image input  image_grid_thw   shape=(1, 3) dtype=torch.int64
+image_grid_thw: [[1, 48, 62]]
+&lt;|image_pad|&gt; 个数: 744
+去掉 image_pad 后的文本模板: '&lt;|im_start|&gt;user\n&lt;|vision_start|&gt;&lt;|vision_end|&gt;Describe the image.&lt;|im_end|&gt;&lt;|endoftext|&gt;'
+query input_ids shape: (1, 30)
+文档多向量 shape: (1, 755, 128) 查询多向量 shape: (1, 30, 128)
+向量 L2 范数(前 3 个): [1.0011, 0.9996, 1.0025]
+相似度矩阵 shape: (30, 755)
+手算 MaxSim: 23.2398  processor.score_retrieval: 23.25
+</code></pre>
+<h3 id="22-文档侧输入说明">2.2 文档侧输入说明</h3>
+<p>这里着重看一下文档页面是怎么变成 755 个向量的。</p>
+<ol>
+<li><strong>动态分辨率</strong>。原始页面是 2200 × 1700。ColQwen2 不会像 ColPali 那样把图片强制缩放成 448 × 448 的正方形，而是保持宽高比，在像素上限内缩放到 patch size（14）的整数倍。image_grid_thw 为 [1, 48, 62]，也就是高 48 个 patch、宽 62 个 patch，对应缩放后的分辨率为 672 × 868，宽高比 1.29，和原图的 1.294 基本一致。</li>
+<li><strong>pixel_values 的形状</strong>。第一维 2976 = 48 × 62，就是原始 patch 的数量。第二维 1176 = 2 × 3 × 14 × 14，其中 3 是 RGB 通道，14 × 14 是每个 patch 的像素，2 来自 Qwen2-VL 的 temporal_patch_size=2。这个参数是为视频设计的，每 2 帧合成一个时间 patch；输入单张图片时，图片会被复制成 2 帧来凑齐这一维。</li>
+<li><strong>空间合并</strong>。Qwen2-VL 的 spatial_merge_size=2，会把相邻 2 × 2 个 patch 合并成 1 个视觉 token，所以视觉 token 数为 2976 / 4 = 744，正好等于 input_ids 里 &lt;|image_pad|&gt; 的个数。模型卡里说明了这个版本"最多生成 768 个 image patch"，指的就是合并后的视觉 token 上限。</li>
+<li><strong>文本模板</strong>。去掉 &lt;|image_pad|&gt; 之后，剩下的模板是 <code>&lt;|im_start|&gt;user\n&lt;|vision_start|&gt;&lt;|vision_end|&gt;Describe the image.&lt;|im_end|&gt;&lt;|endoftext|&gt;</code>，共 11 个 token。所以最终序列长度为 744 + 11 = 755，模型对每个位置都输出一个 128 维向量，得到 755 × 128 的文档多向量。</li>
+</ol>
+<p>在后面的批量实验里，能源数据集 977 页的向量数最少 731、最多 770、平均 754 个，基本都卡在上限附近。ArxivQA 是单张论文插图，小图只有 119 个向量。</p>
+<h3 id="23-查询侧输入说明">2.3 查询侧输入说明</h3>
+<p>查询的 input_ids 长度为 30，decode 之后是：</p>
+<pre><code>'Query: What types of road improvements are planned for Greenmount Road in Belleville, Illinois?&lt;|endoftext|&gt;&lt;|endoftext|&gt;...（共 10 个）\n'
+</code></pre>
+<p>这里有两处需要注意：</p>
+<ul>
+<li>查询前面加了 "Query: " 前缀，这是这个 checkpoint 训练时使用的格式。模型卡特别提醒，colpali-engine 0.3.13 之后的版本不再加这个前缀，所以和 transformers 原生实现得到的向量会有细微差别。</li>
+<li>查询后面补了 10 个 &lt;|endoftext|&gt;。这是 ColBERT 的 query augmentation 做法：这些补充 token 也会输出向量并参与 MaxSim，相当于让模型给查询"扩写"出一些额外的匹配信号。</li>
+</ul>
+<h3 id="24-maxsim-的计算">2.4 MaxSim 的计算</h3>
+<p>模型输出的每个向量都做过 L2 归一化（范数约为 1），所以点积就等于余弦相似度。查询的 30 个向量和文档的 755 个向量两两点积，得到 30 × 755 的相似度矩阵；每一行取最大值再求和，就是 MaxSim 分数。手算结果 23.2398，和 processor.score_retrieval 的 23.25 一致，差别来自 bf16 的精度。</p>
+<p>把每个查询 token 的最大值和它匹配到的文档位置打印出来：</p>
+<pre><code>  ' road'            max=0.749  doc_pos=314
+  ' improvements'    max=0.789  doc_pos=670
+  ' planned'         max=0.705  doc_pos=605
+  ' Green'           max=0.720  doc_pos=159
+  'mount'            max=0.783  doc_pos=160
+  ' Road'            max=0.802  doc_pos=471
+  ' Bellev'          max=0.689  doc_pos=385
+  ' Illinois'        max=0.681  doc_pos=169
+  ...
+  '&lt;|endoftext|&gt;'    max=0.840  doc_pos=171
+</code></pre>
+<p>可以看到，"Green" 和 "mount" 分别匹配到了相邻的两个文档位置 159 和 160，不同的查询词各自找到了页面上不同的区域，这就是 token 级匹配的含义。另外，10 个 &lt;|endoftext|&gt; 的最大相似度在 0.65 到 0.85 之间，对总分的贡献并不小。</p>
+<h2 id="3-效果评测">3. 效果评测</h2>
+<p>在理解了单页的计算过程后，继续在公开数据集上做批量对比。</p>
+<h3 id="31-数据集与对比方法">3.1 数据集与对比方法</h3>
+<p>选用 ViDoRe 基准里的两个数据集：</p>
+<table>
+<thead>
+<tr>
+<th>数据集</th>
+<th>内容</th>
+<th>页面数</th>
+<th>查询数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vidore/syntheticDocQA_energy_test</td>
+<td>能源领域 PDF 页面，查询由 Claude 3 Sonnet 根据页面生成</td>
+<td>977（去重后）</td>
+<td>100</td>
+</tr>
+<tr>
+<td>vidore/arxivqa_test_subsampled</td>
+<td>arXiv 论文插图，查询是针对图表内容的问题</td>
+<td>500</td>
+<td>500</td>
+</tr>
+</tbody>
+</table>
+<p>每条查询只有一个相关页面。对比以下几种方法：</p>
+<ol>
+<li><strong>Cohere Embed v4</strong>：Amazon Bedrock 上的单向量多模态 embedding（cohere.embed-v4:0，输出 1536 维），把整页图片作为输入，每页一个向量。</li>
+<li><strong>ColQwen2 mean pooling</strong>：把 ColQwen2 每页的多向量取平均再归一化，得到一个 128 维向量。这也是 OpenSearch 官方教程里第一阶段 k-NN 用的单向量。</li>
+<li><strong>ColQwen2 MaxSim 全量计算</strong>：对所有页面暴力计算 MaxSim。</li>
+<li><strong>两阶段</strong>：先用单向量（Cohere Embed v4 或 mean pooling）召回 top-K，再用 MaxSim 重排。</li>
+<li><strong>Token pooling</strong>：对每页的多向量做层次聚类，把相似的 patch 向量合并取平均（Clavié et al., 2024），减少每页的向量数。</li>
+</ol>
+<p>编码性能（g6.xlarge，batch size 4，bf16）：</p>
+<pre><code>[energy] doc encode 277.4s (284 ms/page), query encode 0.3s (3.4 ms/query)
+[energy] tokens/page min=731 max=770 avg=754
+[energy] peak GPU mem 4.7 GiB
+[arxivqa] doc encode 141.3s (283 ms/page), query encode 2.1s (4.2 ms/query)
+</code></pre>
+<p>编码时 GPU 利用率不高，瓶颈在 CPU 上的图片解码和缩放（g6.xlarge 只有 4 个 vCPU）。查询编码只要几毫秒，在线查询的模型开销很小。</p>
+<p>Cohere Embed v4 通过 Bedrock 的 InvokeModel 调用，图片以 base64 data URI 传入，长边先缩放到 2048 像素以内。从 CloudWatch 的 InputTokenCount 看，每页图片约消耗 1.2 万个输入 token。这和 Bedrock 文档给出的计算方式一致：超过 2,458,624 像素的图片会被服务端缩小到这个像素数，图片 token 数约为像素数 ÷ 784 × 4，即 2,458,624 ÷ 784 × 4 ≈ 12,544。Embed v4 按需调用的配额是每分钟 15 万 token，所以单用一个模型 ID 每分钟只能处理约 12 页。这里把请求轮流发给 cohere.embed-v4:0、us.cohere.embed-v4:0 和 global.cohere.embed-v4:0（跨区域推理配置文件各有独立的 token 配额），977 页加 100 条查询耗时 892 秒。批量写入大量图片时，需要提前确认 token 配额。</p>
+<h3 id="32-评测结果">3.2 评测结果</h3>
+<p>指标为 nDCG@5 和 Recall@1/5，均为百分比。</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>Energy nDCG@5</th>
+<th>Energy R@1</th>
+<th>Energy R@5</th>
+<th>ArxivQA nDCG@5</th>
+<th>ArxivQA R@1</th>
+<th>ArxivQA R@5</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cohere Embed v4（单向量，1536 维）</td>
+<td>90.7</td>
+<td>84.0</td>
+<td>96.0</td>
+<td>82.3</td>
+<td>76.2</td>
+<td>87.2</td>
+</tr>
+<tr>
+<td>ColQwen2 mean pooling（单向量，128 维）</td>
+<td>73.0</td>
+<td>58.0</td>
+<td>85.0</td>
+<td>62.0</td>
+<td>52.2</td>
+<td>70.8</td>
+</tr>
+<tr>
+<td><strong>ColQwen2 MaxSim 全量</strong></td>
+<td><strong>95.9</strong></td>
+<td><strong>94.0</strong></td>
+<td><strong>97.0</strong></td>
+<td><strong>86.9</strong></td>
+<td><strong>81.0</strong></td>
+<td><strong>92.0</strong></td>
+</tr>
+<tr>
+<td>两阶段：mean pooling top-10 + MaxSim</td>
+<td>85.9</td>
+<td>84.0</td>
+<td>87.0</td>
+<td>75.0</td>
+<td>72.8</td>
+<td>76.8</td>
+</tr>
+<tr>
+<td>两阶段：mean pooling top-20 + MaxSim</td>
+<td>87.3</td>
+<td>85.0</td>
+<td>89.0</td>
+<td>79.7</td>
+<td>76.6</td>
+<td>82.4</td>
+</tr>
+<tr>
+<td>两阶段：mean pooling top-50 + MaxSim</td>
+<td>92.3</td>
+<td>90.0</td>
+<td>94.0</td>
+<td>84.1</td>
+<td>79.6</td>
+<td>88.0</td>
+</tr>
+<tr>
+<td>两阶段：mean pooling top-100 + MaxSim</td>
+<td>93.9</td>
+<td>92.0</td>
+<td>95.0</td>
+<td>86.1</td>
+<td>80.6</td>
+<td>90.8</td>
+</tr>
+<tr>
+<td>两阶段：Cohere v4 top-10 + MaxSim</td>
+<td><strong>96.4</strong></td>
+<td><strong>94.0</strong></td>
+<td><strong>98.0</strong></td>
+<td>86.7</td>
+<td>81.4</td>
+<td>91.0</td>
+</tr>
+<tr>
+<td>两阶段：Cohere v4 top-20 + MaxSim</td>
+<td>96.3</td>
+<td>94.0</td>
+<td>98.0</td>
+<td><strong>87.6</strong></td>
+<td><strong>81.4</strong></td>
+<td><strong>93.0</strong></td>
+</tr>
+<tr>
+<td>两阶段：Cohere v4 top-50 + MaxSim</td>
+<td>95.9</td>
+<td>94.0</td>
+<td>97.0</td>
+<td>87.2</td>
+<td>81.0</td>
+<td>92.6</td>
+</tr>
+<tr>
+<td>两阶段：Cohere v4 top-100 + MaxSim</td>
+<td>95.9</td>
+<td>94.0</td>
+<td>97.0</td>
+<td>86.9</td>
+<td>80.8</td>
+<td>92.2</td>
+</tr>
+<tr>
+<td>Token pooling factor=2（约 370 向量/页）</td>
+<td>95.9</td>
+<td>94.0</td>
+<td>97.0</td>
+<td>86.8</td>
+<td>81.6</td>
+<td>91.0</td>
+</tr>
+<tr>
+<td>Token pooling factor=3（约 250 向量/页）</td>
+<td>96.0</td>
+<td>93.0</td>
+<td>98.0</td>
+<td>86.4</td>
+<td>80.6</td>
+<td>91.4</td>
+</tr>
+<tr>
+<td>Token pooling factor=4（约 185 向量/页）</td>
+<td>95.9</td>
+<td>94.0</td>
+<td>97.0</td>
+<td>86.3</td>
+<td>80.8</td>
+<td>91.0</td>
+</tr>
+</tbody>
+</table>
+<p>每页的存储开销（按 Energy 数据集平均 754 个向量计算）：</p>
+<table>
+<thead>
+<tr>
+<th>表示</th>
+<th>每页大小</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ColQwen2 多向量 FP32</td>
+<td>377 KB</td>
+</tr>
+<tr>
+<td>ColQwen2 多向量 FP16</td>
+<td>188 KB</td>
+</tr>
+<tr>
+<td>Token pooling factor=3，FP16</td>
+<td>约 63 KB</td>
+</tr>
+<tr>
+<td>Cohere v4 单向量（1536 维 FP32）</td>
+<td>6 KB</td>
+</tr>
+<tr>
+<td>mean pooling 单向量（128 维 FP32）</td>
+<td>0.5 KB</td>
+</tr>
+</tbody>
+</table>
+<p>从结果可以看出几点：</p>
+<ol>
+<li><strong>单向量模型之间差距很大</strong>。同样是每页一个向量，Cohere Embed v4 在 Energy 和 ArxivQA 上分别是 90.7 和 82.3，而把 ColQwen2 的多向量直接取平均只有 73.0 和 62.0。ColQwen2 是按 MaxSim 训练的，它的 token 向量取平均之后并不是一个好的单向量表示。</li>
+<li><strong>多向量 MaxSim 仍然更准，但和好的单向量模型差距不大</strong>。ColQwen2 全量 MaxSim 为 95.9 和 86.9，比 Cohere Embed v4 高 4 到 5 分，主要提升在 R@1：Energy 从 84 提高到 94，ArxivQA 从 76.2 提高到 81.0。R@10 两者接近（98 vs 99，92.4 vs 95.0），说明 Cohere 大多数时候能把正确页面召回到前 10，只是排序不够靠前。</li>
+<li><strong>两阶段的效果取决于第一阶段的召回</strong>。用 Cohere Embed v4 召回 top-10 再用 MaxSim 重排，两个数据集分别为 96.4 和 86.7，已经达到甚至略高于全量 MaxSim。而用 mean pooling 召回 top-10，因为有 13% 的相关页面没进前 10（R@10 只有 87%），重排后只有 85.9 和 75.0，要把候选扩到 top-100 才能接近全量结果。也就是说，第一阶段召回越准，需要重排的候选就越少。这一点直接影响后面 OpenSearch 里的重排延迟。</li>
+<li><strong>Token pooling 几乎不损失效果</strong>。把每页的向量数减到四分之一（约 185 个），两个数据集的 nDCG@5 变化都在 0.6 分以内，存储也降到四分之一。ColPali 论文里也有类似结论：页面里很多 patch 是空白背景，信息高度冗余。</li>
+</ol>
+<h2 id="4-在-amazon-opensearch-service-中实现两阶段检索">4. 在 Amazon OpenSearch Service 中实现两阶段检索</h2>
+<p>OpenSearch 3.3 开始提供 lateInteractionScore 函数，可以在 rescore 阶段用 Painless 脚本计算 MaxSim。这里在 Amazon OpenSearch Service 上创建了一个 OpenSearch 3.9 的单节点域（r7g.large.search），把 Energy 数据集的 977 页写进去做测试。</p>
+<h3 id="41-索引映射与写入">4.1 索引映射与写入</h3>
+<p>按照官方教程的做法，多向量存在一个 enabled: false 的 object 字段里，只保存在 _source 中，不建索引；mean pooling 的单向量存在 knn_vector 字段里，用于第一阶段的 HNSW 检索：</p>
+<pre><code class="language-python">client.indices.create(index="energy_pages", body={
+    "settings": {"index.knn": True, "number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {"properties": {
+        "page_id": {"type": "keyword"},
+        "colbert_vectors": {"type": "object", "enabled": False},
+        "knn_vector": {"type": "knn_vector", "dimension": 128, "space_type": "innerproduct",
+                       "method": {"name": "hnsw", "engine": "faiss"}},
+    }}})
+
+# 每个文档: knn_vector 为 128 维 mean pooling 向量, colbert_vectors 为 [[128 维] x ~754]
+helpers.bulk(client, actions(), chunk_size=20)
+</code></pre>
+<p>977 页的写入耗时 164 秒。force merge 之后的索引大小为 430 MiB，平均每页 451 KB，比 FP32 的原始向量（377 KB）还大，因为多向量是以 JSON 浮点数组的形式存在 _source 里的。</p>
+<p>为了对比第一阶段的召回模型，后面又给同一个索引加了一个 1536 维的 knn_vector 字段 cohere_vector，写入 Cohere Embed v4 的页面向量（put_mapping 加字段，再用 bulk update 写入）。这样同一份多向量可以分别搭配 mean pooling 和 Cohere 两种第一阶段召回。</p>
+<h3 id="42-查询">4.2 查询</h3>
+<p>查询时，第一阶段用 mean pooling 向量做 k-NN，第二阶段在 rescore 里调用 lateInteractionScore：</p>
+<pre><code class="language-python">body = {
+    "size": 10,
+    "_source": False,
+    "query": {"knn": {"knn_vector": {"vector": mean_pooled_query, "k": 100}}},
+    "rescore": {
+        "window_size": 100,
+        "query": {
+            "query_weight": 0.0,
+            "rescore_query": {"script_score": {
+                "query": {"match_all": {}},
+                "script": {
+                    "source": "lateInteractionScore(params.query_vectors, 'colbert_vectors', params._source, params.space)",
+                    "params": {"query_vectors": query_multi_vectors, "space": "innerproduct"}
+                }
+            }}
+        }
+    }
+}
+</code></pre>
+<p>先验证一下打分是否正确。对同一个查询和它的相关页面，本地算的 MaxSim 是 23.2334，而 lateInteractionScore 在不同 space type 下的返回值为：</p>
+<pre><code>default(l2) lateInteractionScore=21.0632  local MaxSim(dot)=23.2334  Nq=30
+  space=l2           score=21.0632
+  space=innerproduct score=53.2334
+  space=cosinesimil  score=26.6193
+</code></pre>
+<p>这里有个容易踩的坑：<strong>不传第四个参数时，默认的 space type 是 l2，不是点积</strong>。查看 k-NN 插件的源码（KNNPainlessScriptUtils.java）可以确认，三个参数的重载调用的是 SpaceType.DEFAULT，也就是 l2。三种 space type 都是先对每个 token 对算出一个分数，每个查询 token 取最大值，再求和，区别在于 token 对的相似度怎么换算成分数：</p>
+<ul>
+<li>innerproduct：点积 ≥ 0 时得分为 dot + 1，点积 &lt; 0 时为 1 / (1 − dot)。查询 token 的最大相似度基本都是正数，所以总分 = MaxSim + Nq，53.2334 = 23.2334 + 30。</li>
+<li>cosinesimil：得分为 (1 + cos) / 2，是 cos 的线性变换，所以总分 = (Nq + MaxSim) / 2，26.6193 = (30 + 23.2334) / 2。</li>
+<li>l2：得分为 1 / (1 + 距离²)。用本地向量按这个公式计算，结果为 21.0632，和 OpenSearch 返回的一致。</li>
+</ul>
+<p>那么这个场景应该用哪一种？ColQwen 在训练时就是用点积计算 MaxSim 的，并且输出的向量都做了 L2 归一化。所以 MaxSim 应该按点积或余弦计算，这样才和模型训练时的打分方式一致：</p>
+<ul>
+<li><strong>cosinesimil 和原始 MaxSim 的排序完全一致</strong>。它对每个 token 对的分数做的是同一个线性变换，求和后只是整体平移和缩放，不改变排序，也不依赖"相似度为正"这个前提。</li>
+<li><strong>innerproduct 在相似度为正时也完全一致</strong>。只有某个查询 token 和文档所有 token 的点积都是负数时才会有偏差，对归一化后的 ColQwen 向量来说基本不会发生。它不需要计算向量的范数，计算量比 cosinesimil 略小。</li>
+<li><strong>l2 只是近似</strong>。对单位向量来说，距离² = 2 − 2·dot，1 / (1 + 距离²) = 1 / (3 − 2·dot)，它随点积单调递增，所以每个查询 token 匹配到的文档 token 不变。但这个变换是非线性的，相似度高的 token 对被放大得更多，求和后文档之间的排序就会和 MaxSim 有差别。</li>
+</ul>
+<p>所以在这个场景下，应该显式传入第四个参数，用 innerproduct 或 cosinesimil。如果不确定向量有没有归一化，用 cosinesimil 更稳妥。</p>
+<h3 id="43-实测结果">4.3 实测结果</h3>
+<p>对 Energy 的 100 条查询，在不同配置下的结果如下（took 为 OpenSearch 返回的服务端耗时）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>nDCG@5</th>
+<th>R@1</th>
+<th>took p50</th>
+<th>took p90</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只做 k-NN（mean pooling，k=100）</td>
+<td>73.0</td>
+<td>58.0</td>
+<td>4 ms</td>
+<td>4 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，官方教程写法（默认 window_size，默认 l2）</td>
+<td>85.4</td>
+<td>83.0</td>
+<td>392 ms</td>
+<td>407 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，window_size=100，默认 l2</td>
+<td>93.4</td>
+<td>91.0</td>
+<td>3,894 ms</td>
+<td>3,954 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，window_size=100，innerproduct</td>
+<td>93.9</td>
+<td>92.0</td>
+<td>3,903 ms</td>
+<td>4,029 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，window_size=100，l2，query_weight=0</td>
+<td>93.5</td>
+<td>91.0</td>
+<td>3,885 ms</td>
+<td>3,997 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，window_size=100，cosinesimil，query_weight=0</td>
+<td>93.9</td>
+<td>92.0</td>
+<td>3,918 ms</td>
+<td>3,994 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，window_size=100，innerproduct，query_weight=0</td>
+<td>93.9</td>
+<td>92.0</td>
+<td>3,895 ms</td>
+<td>4,016 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，window_size=50，innerproduct，query_weight=0</td>
+<td>92.3</td>
+<td>90.0</td>
+<td>1,948 ms</td>
+<td>2,018 ms</td>
+</tr>
+<tr>
+<td>k-NN + rescore，window_size=20，innerproduct，query_weight=0</td>
+<td>87.3</td>
+<td>85.0</td>
+<td>780 ms</td>
+<td>797 ms</td>
+</tr>
+</tbody>
+</table>
+<p>innerproduct 和 cosinesimil 的结果完全相同，都等于第 3 节本地 top-100 重排的 93.9；l2 低 0.4 到 0.5 分。三种 space type 的耗时没有差别，说明计算相似度本身不是瓶颈。</p>
+<p>为了排除第一阶段召回的影响，又在本地按 OpenSearch 三种 space type 的打分公式，对全部页面做了一遍全量 MaxSim：</p>
+<table>
+<thead>
+<tr>
+<th>space type</th>
+<th>Energy nDCG@5</th>
+<th>Energy R@1</th>
+<th>ArxivQA nDCG@5</th>
+<th>ArxivQA R@1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始 MaxSim（点积）</td>
+<td>95.9</td>
+<td>94.0</td>
+<td>86.9</td>
+<td>81.0</td>
+</tr>
+<tr>
+<td>innerproduct</td>
+<td>95.9</td>
+<td>94.0</td>
+<td>86.9</td>
+<td>81.0</td>
+</tr>
+<tr>
+<td>cosinesimil</td>
+<td>95.9</td>
+<td>94.0</td>
+<td>86.9</td>
+<td>81.0</td>
+</tr>
+<tr>
+<td>l2</td>
+<td>95.5</td>
+<td>93.0</td>
+<td>86.1</td>
+<td>80.0</td>
+</tr>
+</tbody>
+</table>
+<p>innerproduct 和 cosinesimil 与原始 MaxSim 的结果完全一致，l2 在两个数据集上都低 0.4 到 0.8 分，和上面的分析相符。</p>
+<p>最后看第一阶段换成 Cohere Embed v4 的结果（innerproduct，query_weight=0）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>nDCG@5</th>
+<th>R@1</th>
+<th>took p50</th>
+<th>took p90</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只做 k-NN（Cohere Embed v4，k=100）</td>
+<td>90.7</td>
+<td>84.0</td>
+<td>4 ms</td>
+<td>4 ms</td>
+</tr>
+<tr>
+<td>Cohere k-NN + rescore，window_size=10</td>
+<td><strong>96.4</strong></td>
+<td><strong>94.0</strong></td>
+<td>396 ms</td>
+<td>415 ms</td>
+</tr>
+<tr>
+<td>Cohere k-NN + rescore，window_size=20</td>
+<td>96.3</td>
+<td>94.0</td>
+<td>787 ms</td>
+<td>805 ms</td>
+</tr>
+</tbody>
+</table>
+<p>第一阶段换成 Cohere 之后，只重排前 10 个就能达到 96.4，比 mean pooling 重排 100 个（93.9，约 3.9 秒）效果更好，延迟只有十分之一。这和第 3 节本地评测的结论一致。</p>
+<p>结合结果，有几个需要注意的地方：</p>
+<ol>
+<li><strong>rescore 默认只重排前 10 个结果</strong>。官方教程的查询模板设置了 k=100，但没有设置 rescore 的 window_size，而 OpenSearch 的 rescore 默认 window_size 是 10，所以实际只重排了 k-NN 返回的前 10 个文档。用 mean pooling 召回时，nDCG@5 只有 85.4，和第 3 节本地"mean pooling top-10 + MaxSim"的 85.9 基本一致；把 window_size 设成 100 后提高到 93.9。window_size 设多大，取决于第一阶段召回的质量：mean pooling 需要 100，Cohere Embed v4 只要 10。</li>
+<li><strong>重排的耗时主要花在读取 _source 上</strong>。只做 k-NN 时服务端耗时 4 ms；重排 10 个文档需要约 390 ms，重排 100 个文档需要约 3.9 秒，耗时和重排文档数基本成正比，平均每个文档约 39 ms。lateInteractionScore 要从 _source 里取出 754 × 128 的 JSON 浮点数组，再逐个转换成 float 数组计算。作为对比，第 3 节在 4 vCPU 上用 PyTorch 对 977 页全量暴力计算 MaxSim，每条查询约 122 ms。所以在当前实现下，与其加大 window_size，不如用一个更好的单向量模型做第一阶段召回，把需要重排的候选数控制在 10 到 20 个；数据量大时也可以配合 token pooling 减少每页的向量数。另外，第一次测试时没有关闭 _source 返回，只做 k-NN 的耗时就有 134 ms，因为返回结果时也要加载完整的 _source，所以查询时一定要设置 "_source": false 或者排除多向量字段。</li>
+<li><strong>rescore 的总分默认是两部分相加</strong>。rescore 的最终得分 = query_weight × 原始分数 + rescore_query_weight × 重排分数，两个权重默认都是 1。k-NN 的分数在 0 到 2 之间，MaxSim 的分数在 20 到 50 之间，所以大多数情况下影响不大，本次测试中 query_weight 设为 1 和 0 的结果完全相同；如果希望严格按 MaxSim 排序，可以把 query_weight 设为 0。</li>
+</ol>
+<p>OpenSearch 社区正在把 Lucene 10.3 的 LateInteractionField 集成进 k-NN 插件，届时多向量会以二进制 doc values 的形式存储，不需要再解析 JSON，并且可以用 SIMD 加速计算。截至本文写作时（2026 年 11 月 24 日），k-NN 插件 main 分支里还没有相关代码。</p>
+<h2 id="5-业界进展">5. 业界进展</h2>
+<p>ColQwen2 是 2024 年底的模型，这一年多来视觉文档检索模型进步很快。ViDoRe 团队后来又推出了更难的 ViDoRe V3，覆盖金融、工业、制药、HR、能源等 10 个企业文档场景。下面是 MTEB 结果仓库中 ViDoRe V3 的公开结果（10 个任务的平均 nDCG@10，非本文实测）：</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>类型</th>
+<th>参数量</th>
+<th>V3 nDCG@10</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VultronRetrieverPrime-Qwen3.5-8B-v2</td>
+<td>多向量</td>
+<td>8.4B</td>
+<td>67.2</td>
+</tr>
+<tr>
+<td>ColQwen3.5-4.5B-v4</td>
+<td>多向量</td>
+<td>4.5B</td>
+<td>66.8</td>
+</tr>
+<tr>
+<td>tencent/EVIE-8B</td>
+<td>多向量</td>
+<td>8.4B</td>
+<td>66.2</td>
+</tr>
+<tr>
+<td>Nemotron-3.5-Embed-8B</td>
+<td>单向量</td>
+<td>8B</td>
+<td>60.2</td>
+</tr>
+<tr>
+<td>Qwen3-VL-Embedding-8B</td>
+<td>单向量</td>
+<td>8B</td>
+<td>57.8</td>
+</tr>
+<tr>
+<td>colqwen2.5-v0.2</td>
+<td>多向量</td>
+<td>3B</td>
+<td>51.9</td>
+</tr>
+<tr>
+<td>colqwen2-v1.0（本文使用）</td>
+<td>多向量</td>
+<td>2B</td>
+<td>44.7</td>
+</tr>
+<tr>
+<td>colpali-v1.3</td>
+<td>多向量</td>
+<td>3B</td>
+<td>43.1</td>
+</tr>
+</tbody>
+</table>
+<p>头部模型的原理和 ColPali 相同，都是 MaxSim late interaction，主要改进在于：底座换成 Qwen3.5 / Qwen3-VL 这类更强的视觉语言模型；注意力从因果注意力改成双向注意力；每个 token 的向量维度从 128 提高到 2048 到 4096 维，并用 Matryoshka 训练支持截断；每页的视觉 token 增加到约 1,800 个；训练时加入蒸馏、模型融合和多语言合成数据。需要注意的是，4096 维的多向量每页在 FP16 下约 14 MB，实际部署基本都要截断维度或做 token pooling。</p>
+<p>另外，ViDoRe 官方的 pipeline 排行榜里，在多向量召回之后再加一个视觉大模型做重排或 agent 式检索，可以再提高 4 到 6 分。例如 nemotron-colembed-vl-8b-v2 单独使用为 64.4，加上 Claude Opus 4.5 作为 agent 多轮改写查询并选出最终页面后为 69.2（8 个公开任务，英文查询）。这类方案每次查询要多次调用大模型，延迟和成本都明显更高，更适合本来就要调用大模型生成答案的问答场景。</p>
+<h2 id="6-总结">6. 总结</h2>
+<p>本文以 ColQwen2 为例，拆解了视觉文档检索模型从页面图片到多向量的输入构建过程，以及 MaxSim 打分的计算细节；随后在 ViDoRe 的 Energy 和 ArxivQA 两个数据集上做了对比：ColQwen2 多向量 MaxSim 比 Cohere Embed v4 单向量高 4 到 5 分，主要提升在 Top-1 的准确率；用 Cohere Embed v4 召回前 10 到 20 页再做 MaxSim 重排，效果达到甚至略高于全量 MaxSim；token pooling 可以在几乎不损失效果的情况下把多向量存储降到四分之一。最后在 Amazon OpenSearch Service 上实现了"k-NN 召回 + lateInteractionScore 重排"，并记录了几个实际使用中需要注意的配置：lateInteractionScore 默认的 space type 是 l2，这个场景应显式指定 innerproduct 或 cosinesimil；rescore 默认只重排前 10 个结果；重排耗时和候选数成正比，每个候选约 39 ms，所以第一阶段召回越准，整体延迟越低。后续我们将进一步测试更新的多向量模型（如 EVIE、ColQwen3.5）在中文文档上的效果，以及多向量的量化和维度截断对存储与延迟的影响。</p>
+<h2 id="references">References</h2>
+<ol>
+<li>ColPali: Efficient Document Retrieval with Vision Language Models：<a href="https://arxiv.org/abs/2407.01449" target="_blank" rel="noopener nofollow">https://arxiv.org/abs/2407.01449</a></li>
+<li>ColPali / ColQwen 代码与模型列表：<a href="https://github.com/illuin-tech/colpali" target="_blank" rel="noopener nofollow">https://github.com/illuin-tech/colpali</a></li>
+<li>vidore/colqwen2-v1.0 模型卡：<a href="https://huggingface.co/vidore/colqwen2-v1.0" target="_blank" rel="noopener nofollow">https://huggingface.co/vidore/colqwen2-v1.0</a></li>
+<li>ViDoRe 排行榜：<a href="https://huggingface.co/spaces/vidore/vidore-leaderboard" target="_blank" rel="noopener nofollow">https://huggingface.co/spaces/vidore/vidore-leaderboard</a></li>
+<li>MTEB 结果仓库：<a href="https://github.com/embeddings-benchmark/results" target="_blank" rel="noopener nofollow">https://github.com/embeddings-benchmark/results</a></li>
+<li>OpenSearch：Reranking by a field using a late interaction model：<a href="https://docs.opensearch.org/latest/search-plugins/search-relevance/rerank-by-field-late-interaction/" target="_blank" rel="noopener nofollow">https://docs.opensearch.org/latest/search-plugins/search-relevance/rerank-by-field-late-interaction/</a></li>
+<li>OpenSearch k-NN 插件 KNNPainlessScriptUtils.java：<a href="https://github.com/opensearch-project/k-NN/blob/main/src/main/java/org/opensearch/knn/plugin/script/KNNPainlessScriptUtils.java" target="_blank" rel="noopener nofollow">https://github.com/opensearch-project/k-NN/blob/main/src/main/java/org/opensearch/knn/plugin/script/KNNPainlessScriptUtils.java</a></li>
+<li>Clavié et al., Reducing the Footprint of Multi-Vector Retrieval with Minimal Performance Impact via Token Pooling：<a href="https://arxiv.org/abs/2409.14683" target="_blank" rel="noopener nofollow">https://arxiv.org/abs/2409.14683</a></li>
+<li>Cohere Embed v4 on Amazon Bedrock：<a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-embed-v4.html" target="_blank" rel="noopener nofollow">https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-embed-v4.html</a></li>
+</ol>
+
+
+</div>
+<div class="clear"></div>
+
+		</div>
+		<div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-26 15:42">2026-11-26 15:41</span>&nbsp;
+<a href="https://www.cnblogs.com/zackstang">ZacksTang</a>&nbsp;
+阅读(<span id="post_view_count">51</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23791268);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fzackstang%2Fp%2F23791268&amp;targetId=23791268&amp;targetType=0" target="_blank">举报</a>
+</div>
+	

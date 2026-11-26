@@ -1,0 +1,732 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23773378" title="发布于 2026-11-26 10:00">
+    
+
+    <span role="heading" aria-level="2">Redis 核心机制 | Pipeline 与 Batch：降低网络 RTT</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文通过实测分析 Redis Pipeline 的收益本质：省的是网络往返时延（RTT），而非服务端算力。在低 RTT 环境（如本地回环）下，批量发送提升有限；跨网络场景中，其性能优势显著。Pipeline 不保证原子性、隔离性或失败回滚，命令仍逐条执行，可能被其他客户端插入干扰。批处理仅优化通信效率，需结合实际网络延迟评估效果。错误处理必须逐条检查，且过大数据量会增加内存压力。结论：先量 RTT，再决定是否用 Pipeline，避免误判性能瓶颈。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="一收益从哪来先量-rtt">一、收益从哪来：先量 RTT</h1>
+<p>本节解决一个问题：批量发送到底省了什么、什么时候根本省不出来。Pipeline 不改服务端的算力，它把 N 次「发一条、等一条」压缩成一次「发 N 条、等一批」。服务端执行每条命令的代码路径完全一样；瓶颈在网络往返时它是杠杆，瓶颈在服务端 CPU 或内存时，它只是把压力更集中地压过去，甚至放大尾延迟。</p>
+<p>只从客户端视角讨论批量发送与 RTT 优化：线上批量作业的阈值治理、命令执行全通道与 RESP 细节、事务入队与 WATCH、集群键路由与大 Key 治理，均不在本节范围，需要时读本系列相关篇章。实测环境：Redis 8.10.3（redis-cli 8.10.3），客户端 .NET 10（net10.0）+ StackExchange.Redis（版本待验证）。命令可在该版本复现；命令行示例按 Linux/Docker 或 WSL 书写，Windows 原生环境把 <code>/tmp</code> 换成本机临时目录、<code>seq</code> 换成 PowerShell 循环、<code>nc</code> 换成等效连接工具。开始前用 <code>redis-cli --version</code>、<code>redis-benchmark --version</code> 核对工具版本，用 <code>redis-cli HELP SET</code> 核对参数顺序。</p>
+<p>决策问题贯穿全文，读完每节都回到这四点：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033300981-2098838680.png" alt="" loading="lazy"></p>
+<h2 id="11-一个可复现的变快假象">1.1 一个可复现的「变快」假象</h2>
+<pre><code class="language-bash"># 方式 A：逐条 SET，每条命令都单独启动一次 redis-cli，耗时含进程启动开销
+time (for i in $(seq 1 10000); do redis-cli SET key:$i val:$i &gt; /dev/null; done)
+
+# 方式 B：先把 10000 条命令写成一行一条的文本文件
+for i in $(seq 1 10000); do echo "SET key:$i val:$i"; done &gt; /tmp/cmds.txt
+
+# --pipe 从标准输入连续发送，末尾打印 errors 与 replies 统计
+time redis-cli --pipe &lt; /tmp/cmds.txt
+</code></pre>
+<p><code>time</code> 输出 <code>real</code>/<code>user</code>/<code>sys</code> 三行，比较看 <code>real</code>。本地回环下方式 A 常为数秒量级，方式 B 常不到一秒，但<strong>这组差值不能直接算 Pipeline 收益</strong>：方式 A 每轮都启动新进程，进程启动开销占了大头。要隔离 RTT，用同一进程内的 <code>redis-benchmark -P 1</code> 与 <code>-P 16</code> 对比。</p>
+<p>跨网络场景更干净：假设 RTT≈15ms（跨机房举例，按实测替换），连续 10 条 <code>SET</code> 逐条发约 <code>10 × 15ms = 150ms</code>，服务端执行总耗时在微秒级；一次批发送则降到约 15~20ms。结论只有一句：<strong>省的是 RTT，不是服务端算力</strong>；服务端已饱和时，Pipeline 只会让回复排队、内存上涨。</p>
+<h2 id="12-回环上的反直觉现象">1.2 回环上的反直觉现象</h2>
+<pre><code class="language-bash"># 持续采样本机往返延迟，输出 min/max/avg 三项；loopback 通常在亚毫秒量级
+redis-cli --latency
+</code></pre>
+<p>输出示例：<code>min: 0, max: 1, avg: 0.11 (2385 samples)</code>，本机回环 RTT 只有 0.1 毫秒量级。</p>
+<pre><code class="language-bash"># 批深度 1：同一进程内逐条发送，作为 RTT 基线
+redis-benchmark -h 127.0.0.1 -p 6379 -t set -n 100000 -c 50 -P 1
+
+# 批深度 16：每批打包 16 条，对比吞吐与延迟分位的变化
+redis-benchmark -h 127.0.0.1 -p 6379 -t set -n 100000 -c 50 -P 16
+</code></pre>
+<p>关注 <code>requests per second</code> 与 <code>p50</code>/<code>p99</code>。多数人预期 <code>-P 16</code> 快十几倍，实际两者往往同一量级；把测试搬到相隔一个机房的客户端上重跑，吞吐才会有数量级抬升。<strong>收益与 RTT 成正比</strong>：回环 RTT 极小，可省的部分也极小。<code>-P</code> 提升不明显不能直接推出服务端有瓶颈——先在目标网络量 RTT，跨网络仍无提升才怀疑命令复杂度或 I/O 线程。</p>
+<h2 id="13-原子性误判monitor-下的真实执行序列">1.3 原子性误判：<code>MONITOR</code> 下的真实执行序列</h2>
+<pre><code class="language-bash"># 终端 1：观察服务端实际收到的命令流，先开这个窗口再发命令
+redis-cli MONITOR
+</code></pre>
+<pre><code class="language-bash"># 终端 0：设置已知初值，便于核对后续 INCR 与 DEL 的结果
+redis-cli SET counter 100
+</code></pre>
+<pre><code class="language-bash"># 终端 2：用 nc 模拟 Pipeline，不等待每条回复就连续发送
+# 末尾 sleep 让连接保持打开以收齐回复；预期返回 +OK/+OK/+OK/:101/:1/:1
+(printf "SET key1 value1\r\nSET key2 value2\r\nSET key3 value3\r\nINCR counter\r\nDEL counter\r\nINCR counter\r\n"; sleep 1) | nc localhost 6379
+</code></pre>
+<p>服务端几乎在同一毫秒内连续收到这 6 条并按序执行，返回 +OK / +OK / +OK / :101 / :1 / :1。这<strong>只说明一批命令被逐条处理，不会被当成一个整体</strong>——<code>DEL counter</code> 与两个 <code>INCR</code> 写进同一连接也不会合并执行。</p>
+<p>要看到别的客户端插进来，需两个独立连接：</p>
+<pre><code class="language-bash"># 终端 A：设置初值后，把两条 INCR 写进同一批连续发出
+redis-cli SET counter 100
+(printf "INCR counter\r\nINCR counter\r\n"; sleep 1) | nc localhost 6379
+</code></pre>
+<pre><code class="language-bash"># 终端 B：在 A 的两条 INCR 之间插入 DEL，实际落点由到达顺序决定，不保证
+(printf "DEL counter\r\n"; sleep 1) | nc localhost 6379
+</code></pre>
+<p>交错顺序没有保证，最终 <code>counter</code> 取决于 <code>DEL</code> 落在两条 <code>INCR</code> 之前、之间还是之后——可能得到 2、1，或键已不存在。<strong>这就是 Pipeline 与事务的分界</strong>：Pipeline 不锁定执行序列，<code>MULTI/EXEC</code> 才把一批命令锁定为连续执行。</p>
+<h2 id="14-本节判定依据">1.4 本节判定依据</h2>
+<ol>
+<li>遇到「逐条操作慢」，先 <code>redis-cli --latency</code> 量 RTT，再决定是否批处理，而不是先怀疑 Redis。</li>
+<li>批内某条命令报错，其余照常执行；错误必须逐条检查每个任务的返回结果与异常，一个外层 <code>try/catch</code> 不够，也没有回滚。</li>
+<li>服务端要为未读回复分配输出缓冲区，批过大推高内存甚至触发断连。</li>
+<li>要原子性时 Pipeline 不能替代事务：<code>MULTI/EXEC</code> 保证连续执行不被打断。</li>
+<li><code>FireAndForget</code> 适合「写了就不管」，不提供送达确认，超时或断连时数据可能丢失。</li>
+<li>先在目标网络量 RTT，再解释 <code>-P</code> 的提升幅度；回环下提升小属正常。</li>
+<li>请求条数、回复条数与业务期望对不上，先检查是否按顺序逐条回收了回复与错误。</li>
+</ol>
+<h1 id="二机制保证什么不保证什么">二、机制：保证什么、不保证什么</h1>
+<p>本节解决一个问题：哪些语义是 Pipeline 明确给出的、哪些必须自己兜住责任。据 Redis 官方文档的 Pipelines 章节，Pipeline 是通过减少 RTT 成本的技术，服务端并不把它当作不可分割的单元——命令只在一个 TCP 段或连续读写中送达，仍逐条执行，其他连接的命令可以在间隙被处理。</p>
+<h2 id="21-保证与不保证">2.1 保证与不保证</h2>
+<p><strong>保证</strong>：N 条命令连续写入同一连接，不必每条后等待；服务端按序逐条处理并按相同顺序返回 N 条回复。N 条命令共享一次请求往返，每条分摊的往返时间降到 <code>RTT / N</code>。大批量在物理层仍可能拆成多个 TCP 段、客户端也可能分多次读取，但逻辑上只有一次往返。</p>
+<p><strong>不保证</strong>：原子性与隔离性；不保证中间不插入其他客户端命令；不保证服务端总处理时间下降；不保证失败回滚——某条异常，其余照常执行。</p>
+<p><strong>决策边界</strong>：只要业务要求「这批命令之间不能被插入」或「要么全成要么全不成」，Pipeline 直接出局，改用事务或 Lua。</p>
+<p><strong>批内报错不阻断后续命令</strong>，用下面这份 RESP 文件验证。RESP 的 <code>$</code> 后面必须写字节数：<code>err:a</code>、<code>err:b</code> 各 5 字节，<code>INVALIDCMD</code> 是 10 字节且只有一个参数：</p>
+<pre><code class="language-text">*3
+$3
+SET
+$5
+err:a
+$1
+1
+*1
+$10
+INVALIDCMD
+*3
+$3
+SET
+$5
+err:b
+$1
+2
+</code></pre>
+<p>执行 <code>cat pipeline_err.txt | redis-cli --pipe</code>：<code>SET err:a=1</code> 成功，<code>INVALIDCMD</code> 报错，<code>SET err:b=2</code> <strong>依旧成功执行</strong>；随后 <code>GET err:a</code>、<code>GET err:b</code> 两个 key 都存在。这是最高频的踩坑点。若报文长度写错，服务端在解析阶段报协议错误并断连，后续命令不会执行，这个验证就失效了。</p>
+<h2 id="22-rtt-通道与阻塞点">2.2 RTT 通道与阻塞点</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033334533-1944790927.png" alt="" loading="lazy"></p>
+<p>触发点是客户端是否在收到上一条回复前就发送下一条；阻塞点在两端——客户端读整批回复时被占用，服务端回复队列增长时消耗内存。执行主体始终是 Redis 主线程，Pipeline 不改变这一点。</p>
+<p>服务端没有专属数据结构：命令进入连接的<strong>输入缓冲区</strong>（query buffer），事件循环读取解析，执行后回复写入<strong>输出缓冲区</strong>（reply / output buffer）。<code>CLIENT LIST</code> 里 <code>qbuf</code> 看查询缓冲、<code>obl</code> 看固定输出缓冲长度、<code>oll</code> 看回复链表长度、<code>omem</code> 看该连接输出缓冲占用的内存；<code>omem</code> 只在 <code>CLIENT LIST</code> 中，<code>INFO clients</code> 不提供。客户端批处理对象维护待发队列与按序期望队列，这是「请求与回复一一对应」的依据。状态机是 <code>攒批 → 发送 → 服务端执行 → 回收</code>，没有中间持久态，连接断开即全部作废。</p>
+<h2 id="23-触发条件与协作关系">2.3 触发条件与协作关系</h2>
+<p>Pipeline 在客户端触发，不需要服务端参数。触发条件是<strong>同一连接上连续发送多条命令而不等中间响应</strong>：</p>
+<ul>
+<li><strong>StackExchange.Redis</strong>：并发发起异步命令且不立即 <code>await</code> 时，多路复用器自动合并（隐式）；<code>CreateBatch()</code> 显式控制边界。</li>
+<li><strong>Jedis</strong>：<code>Pipeline</code> 对象缓冲后 <code>sync()</code>；<strong>Lettuce</strong>：显式开启批处理上下文；<strong>FreeRedis</strong>：<code>StartPipe()</code> / <code>EndPipe()</code>；<strong>redis-cli</strong>：<code>--pipe</code> 从标准输入连续写入。</li>
+</ul>
+<p>三层协作关系混淆就会选错工具：</p>
+<ol>
+<li><strong>批处理 + 连接复用</strong>：同一连接攒批、同一连接收回复，不增加连接数。</li>
+<li><strong>批处理 + 事务</strong>：叠加但不等价，事务可以整体用 Pipeline 发出，但原子性来自 <code>MULTI/EXEC</code>；传输层优化与执行层保证正交。</li>
+<li><strong>批处理 + 批量命令</strong>：<code>MSET</code>/<code>MGET</code> 是服务端批量语义（固定形状），Pipeline 是客户端批量传输（任意命令）。同为 string 类型取多个键优先 <code>MGET</code>，连组包开销也省掉；命令形状不一或键类型混杂才用 Pipeline。</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033337513-1117593450.png" alt="" loading="lazy"></p>
+<p><strong>决策含义</strong>：批里混进 <code>O(N)</code> 命令（如一次返回数万元素的 <code>ZRANGE</code>），主线程连续占用时间被放大，所有连接都会感到延迟毛刺；这类命令拆出批次单独处理。判定依据是端到端 P99 与 <code>SLOWLOG</code> 中单条耗时，不是命令条数。</p>
+<h1 id="三命令配置与-api">三、命令、配置与 API</h1>
+<p>本节解决一个问题：在命令行、服务端参数、客户端库三个层面，具体用什么、默认值多少、验证命令是什么。</p>
+<h2 id="31-命令行两个工具两种批深度">3.1 命令行：两个工具，两种批深度</h2>
+<p><code>redis-cli --pipe</code> 从标准输入读命令（RESP 格式或按行）连续写入连接，最后读取所有回复；适合导入与测试，不适合业务代码中的精细控制。</p>
+<pre><code class="language-bash"># 生成命令文件，每行一条命令，键名带序号便于核对写入结果
+for i in $(seq 1 1000); do echo "SET user:$i:name user_$i"; done &gt; /tmp/users.txt
+
+# --pipe 从文件读命令批量灌入，末尾打印 errors 与 replies
+redis-cli --pipe &lt; /tmp/users.txt
+</code></pre>
+<p>结束打印 <code>All data transferred</code>、<code>Last reply received from server.</code> 与 <code>errors: 0, replies: 1000</code>。<code>errors</code> 是<strong>传输层</strong>错误计数，不等于命令语义错误——类型不匹配失败的命令照样计入 <code>replies</code>，必须靠结果逐条判断。生产写入用客户端库的 Pipeline API。</p>
+<p><code>redis-benchmark -P</code> 表示「每批发 N 条」：</p>
+<pre><code class="language-bash"># 批深度 1：逐条发送的基线，记录 requests per second 与 p50/p99
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 100000 -c 50 -P 1
+
+# 批深度 16：每批 16 条，与基线对比吞吐和延迟分位
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 100000 -c 50 -P 16
+</code></pre>
+<p><code>-P</code> 越大吞吐通常越高，但单条延迟分位可能被拉高。集群下同一批命令必须落在同一节点，跨节点要按节点分组再批。</p>
+<h2 id="32-服务端参数护栏不是旋钮">3.2 服务端参数：护栏，不是旋钮</h2>
+<p>默认值以目标版本 <code>CONFIG GET</code> 为准，下表为参考值；不要为了 Pipeline 盲目调大。最容易混淆的是：<code>client-query-buffer-limit</code> 管「进去的命令有多大」，<code>client-output-buffer-limit</code> 管「出来的回复堆多少」，批处理会同时推高两边；<code>redis-benchmark -P</code> 是发送策略，与服务端 <code>io-threads</code> 无关。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033347802-2074820012.png" alt="" loading="lazy"></p>
+<p><code>io-threads</code> 不会让单条命令变快：先保持 <code>io-threads 1</code> 取基线，只有吞吐明显提升且延迟分位没有恶化才保留。</p>
+<h2 id="33-stackexchangeredis隐式合并与显式批次">3.3 StackExchange.Redis：隐式合并与显式批次</h2>
+<p>隐式合并：同时发起异步命令且不立即 <code>await</code>，<code>ConnectionMultiplexer</code> 内部合并到一次往返；代码简洁，但无法精确决定哪些命令同批，也无法阻止库中途插入其他命令。显式 <code>IBatch</code>：<code>db.CreateBatch()</code> 返回的批次只在 <code>Execute()</code> 后发送，期间不混入非批次命令。零散异步命令交给隐式合并，需要隔离批次边界时用显式批次。</p>
+<p>下面示例同时演示两种方式与错误处理，依赖为 net10.0 + NuGet 包 StackExchange.Redis，类型均来自 <code>StackExchange.Redis</code> 命名空间：</p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis；下列 API 来自 StackExchange.Redis 命名空间
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+class PipelineDemo
+{
+    static async Task Main()
+    {
+        // 前置：本机启动 Redis 8.10.3，监听 6379
+        var options = ConfigurationOptions.Parse("127.0.0.1:6379");
+
+        // 连接暂时不可用时不要立即抛异常，便于示例程序继续演示
+        options.AbortOnConnectFail = false;
+
+        // using 声明保证连接对象在退出作用域时释放
+        using var mux = ConnectionMultiplexer.Connect(options);
+
+        // 取默认数据库（索引 0），后续命令都在同一连接上发出
+        IDatabase db = mux.GetDatabase();
+
+        // 方式一：隐式自动合并，多个异步命令都不立即 await
+        Task&lt;bool&gt; set1 = db.StringSetAsync("pipe:key1", "val1");
+        Task&lt;bool&gt; set2 = db.StringSetAsync("pipe:key2", "val2");
+        Task&lt;RedisValue&gt; get1 = db.StringGetAsync("pipe:key1");
+
+        // 显式转成 Task 数组，避免 WhenAll 的泛型重载在混合返回类型时推断失败
+        await Task.WhenAll(new Task[] { set1, set2, get1 });
+
+        // 回复已收齐，此时读取结果不会阻塞
+        Console.WriteLine($"隐式合并结果：{await get1}");
+
+        // 方式二：显式批次，命令先排队，Execute 之前不会发送
+        IBatch batch = db.CreateBatch();
+
+        // 收集排队命令的任务，便于提交后统一等待
+        var pending = new List&lt;Task&gt;();
+        pending.Add(batch.StringSetAsync("batch:key1", "value1"));
+        pending.Add(batch.KeyExpireAsync("batch:key1", TimeSpan.FromMinutes(30)));
+        pending.Add(batch.StringGetAsync("batch:key2"));
+
+        // 必须在全部入队后调用 Execute，命令才会真正发出
+        batch.Execute();
+
+        try
+        {
+            // Execute 之后才能统一等待；排队阶段 await 会导致任务永远不完成
+            await Task.WhenAll(pending);
+        }
+        catch (RedisTimeoutException ex)
+        {
+            // 等待回复超时，常见原因是批过大或网络抖动；它继承自 RedisException，须先捕获
+            Console.WriteLine($"等待回复超时：{ex.Message}");
+        }
+        catch (RedisException ex)
+        {
+            // 命令层错误，例如对 string 键执行 HSET 造成的类型不匹配
+            Console.WriteLine($"命令执行失败：{ex.Message}");
+        }
+    }
+}
+</code></pre>
+<p><strong>关键规则</strong>：排队阶段就 <code>await</code> 会永久挂起——任务要等 <code>Execute()</code> 才可能完成，而 <code>Execute()</code> 又要等 <code>await</code> 之后才执行；StackExchange.Redis 把它标记为错误 SER305，分析器会在编译期报错。<strong>忘记 <code>Execute()</code> 则命令永远不发</strong>，这是「程序无报错但 Redis 没数据」的经典原因。</p>
+<h2 id="34-fire-and-forget-与连接级开关">3.4 Fire-and-Forget 与连接级开关</h2>
+<p><code>CommandFlags.FireAndForget</code>（<code>CommandFlags.NoReply</code> 是同一取值的别名）让客户端发命令后不等回复：异步方法返回已完成的 <code>Task</code>，同步方法返回默认值，结果都没有意义。</p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis
+using System;
+using StackExchange.Redis;
+
+class FireAndForgetDemo
+{
+    static void Main()
+    {
+        // 连接本机 Redis；using 声明保证退出时释放连接对象
+        using var mux = ConnectionMultiplexer.Connect("127.0.0.1:6379");
+
+        // 取默认数据库，FireAndForget 命令由它在同一连接上发出
+        IDatabase db = mux.GetDatabase();
+
+        // 只让写入发生，不读取回复，也拿不到成功与否的信号
+        db.StringSet("log:entry:1001", "user_login", flags: CommandFlags.FireAndForget);
+
+        // 同步方法在 FireAndForget 下返回的 0 没有意义，直接丢弃
+        db.StringIncrement("stats:pv", 1, flags: CommandFlags.FireAndForget);
+    }
+}
+</code></pre>
+<p>它省去接收回复的开销，代价是<strong>完全失去错误可见性</strong>：断网、OOM、类型错误、超时客户端都不知道。只适合日志、记录、非关键计数；核心业务数据写入禁止使用，后续逻辑依赖结果的也不能用。</p>
+<p>服务端另有 <code>CLIENT REPLY OFF</code>（关闭该连接后续所有命令的回复，需 <code>CLIENT REPLY ON</code> 显式恢复）与 <code>CLIENT REPLY SKIP</code>（只跳过紧接着的一条）。两者作用位置不同：客户端 FireAndForget 只影响该命令是否读回复，连接级开关影响该连接后续所有读取。不要用连接级开关实现单命令 no-ack；引入版本待验证，按目标版本官方文档的 CLIENT 章节确认。</p>
+<h2 id="35-客户端参数速查">3.5 客户端参数速查</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033357544-729803554.png" alt="" loading="lazy"></p>
+<blockquote>
+<p>落地结论：<strong>先用 100 条/批跑通，观察 <code>INFO clients</code> 的输出缓冲是否稳定，再按 QPS 需求向 100~500 调优，单批不要超过 10MB。</strong> 服务端两个 buffer 是护栏不是旋钮，<code>io-threads</code> 只按实测评估。</p>
+</blockquote>
+<p>RESP 报文文件也能手工模拟批量，适合验证协议层行为——每个 <code>*N</code> 声明参数个数、每个 <code>$N</code> 声明其后字符串的字节数：</p>
+<pre><code class="language-text">*3
+$3
+SET
+$2
+k1
+$2
+v1
+*3
+$3
+SET
+$2
+k2
+$2
+v2
+</code></pre>
+<p>执行 <code>cat pipeline.txt | redis-cli --pipe</code>。保持护栏的服务端配置片段：</p>
+<pre><code class="language-conf"># 普通客户端输出缓冲不设硬上限，避免大批量回复被断连
+client-output-buffer-limit normal 0 0 0
+# 单客户端输入缓冲总量上限，防止一次写入过大撑爆内存
+client-query-buffer-limit 1gb
+# 网络读写用 4 个 I/O 线程，命令执行仍在主线程；按核数压测后再定
+io-threads 4
+# 写操作不交给 I/O 线程，先保持默认 no
+io-threads-do-writes no
+# 禁用 Nagle 算法，降低小包延迟
+tcp-nodelay yes
+</code></pre>
+<h1 id="四亲手验证与开销量化">四、亲手验证与开销量化</h1>
+<p>本节解决一个问题：收益怎么测、成本在哪看、批大小拐点怎么判定。</p>
+<h2 id="41-四段验证">4.1 四段验证</h2>
+<p><strong>第一段：脚本</strong>。统计重置必须发生在产生负载之前，否则 <code>usec_per_call</code> 读到的是重置前后混合的累计值：</p>
+<pre><code class="language-bash"># 站 0：清空测试库，避免上一次运行的残留键干扰结果
+redis-cli FLUSHDB
+
+# 站 1：先量本机 RTT，作为判断收益空间的基线
+redis-cli --latency
+
+# 站 2：统计重置放在产生负载之前，让 commandstats 只覆盖本轮压测
+redis-cli CONFIG RESETSTAT
+
+# 逐条写入 5000 条，每条单独启动一次 redis-cli，耗时含进程启动开销
+time (for i in $(seq 1 5000); do redis-cli SET single:$i v$i &gt; /dev/null; done)
+
+# 生成 pipeline 命令文件，一行一条，供 --pipe 从标准输入读取
+for i in $(seq 1 5000); do echo "SET pipe:$i v$i"; done &gt; /tmp/pipe_test.txt
+
+# 用 --pipe 一次性灌入并计时，与上面的逐条循环对比
+time redis-cli --pipe &lt; /tmp/pipe_test.txt
+
+# 站 3：同进程压测对比，批深度 1 作为基线
+redis-benchmark -h 127.0.0.1 -p 6379 -t set -n 100000 -c 50 -P 1
+
+# 批深度 16，读取 requests per second 与 p50/p99 与基线对比
+redis-benchmark -h 127.0.0.1 -p 6379 -t set -n 100000 -c 50 -P 16
+
+# 站 4：观察输出缓冲峰值，判断批大小是否推高内存
+redis-cli INFO clients
+
+# omem 是每连接字段，只在 CLIENT LIST 中，不在 INFO clients 里
+redis-cli CLIENT LIST | grep omem
+
+# 压测完成后再读统计，与重置后的起点形成对照
+redis-cli INFO commandstats
+
+# 整体吞吐与连接拒绝计数
+redis-cli INFO stats
+</code></pre>
+<p><strong>第二段：预期输出</strong>。逐条循环每条都启动一次 <code>redis-cli</code>，耗时含进程启动开销；<code>redis-benchmark -P 1</code> 才是同进程循环、由 RTT 逐条累加主导，两组成本不同不能混谈。<code>--pipe</code> 通常远快于逐条启动进程的循环：</p>
+<pre><code class="language-text">All data transferred. Waiting for the last reply...
+Last reply received from server.
+errors: 0, replies: 5000
+</code></pre>
+<p>压测的站 3 打印含 <code>requests per second</code> 的汇总；站 1 打印 <code>min/max/avg</code> 三个 RTT 值。</p>
+<p><strong>第三段：判读</strong>。对比站 3 两次压测的 <code>requests per second</code>：<strong>同机 loopback 上往往接近</strong>，因为 RTT 本就极小；用 <code>INFO clients</code> 的 <code>client_recent_max_output_buffer</code> 看输出缓冲是否随批增大堆积。<code>usec_per_call</code> 是自统计重置以来的累计平均，混合了所有客户端调用，批处理造成的局部变慢会被稀释，只能作辅助；判定服务端饱和看端到端 P99 与 <code>SLOWLOG</code>。若 <code>--pipe</code> 没有明显更快，检查命令是否走同一连接（<code>--pipe</code> 是）与 RTT 是否本就极低。</p>
+<p><strong>第四段：结果不符说明什么</strong>。批深 16 提升小 → 同机正常，到真实跨网络复测；跨网络仍无提升 → 查命令复杂度、I/O 线程、批次间是否有不必要的等待；<code>--pipe</code> 的 <code>errors</code> 非 0 → 查 <code>client-query-buffer-limit</code> 或报文格式，没有 <code>replies</code> 可能是断连或缓冲超限。</p>
+<h2 id="42-成本构成与对业务的三层影响">4.2 成本构成与对业务的三层影响</h2>
+<p>成本集中在三处：<strong>客户端内存</strong>（待发命令缓冲）、<strong>服务端输出缓冲区</strong>（未读回复排队）、<strong>客户端等待延迟</strong>（要等整批回复）。RTT 节省是收益；批越大，单次等待的尾延迟越长。</p>
+<ul>
+<li><strong>CPU</strong>：服务端不变，命令仍逐条执行；客户端少了 N 次系统调用与协议栈往返，RESP 序列化有少量开销。观测：<code>INFO commandstats</code> 的 <code>usec_per_call</code>（先 <code>CONFIG RESETSTAT</code>，仅辅助）、端到端 P99。</li>
+<li><strong>内存</strong>：客户端待发队列 + 服务端 query buffer / output buffer，随批大小线性增长（每命令约 100~500 字节量级，估算值）。观测：<code>INFO clients</code>、<code>CLIENT LIST</code> 的 <code>qbuf</code> / <code>obl</code> / <code>oll</code> / <code>omem</code>。</li>
+<li><strong>网络</strong>：省往返次数与 TCP 头部开销，包头字节量变化很小；FireAndForget 再省返回报文。观测：<code>--latency-history</code>、抓包看 TCP 段大小。</li>
+<li><strong>一致性</strong>：不提供保证，非原子，存在部分成功中间态。观测：逐条任务的返回结果与 <code>MONITOR</code> 执行序列。</li>
+</ul>
+<p><strong>收益层</strong>：RTT 主导场景（跨机房、公网、容器网络多跳）下 QPS 提升可接近线性直到平台期，<code>RTT / N</code> 让单命令等效延迟下降。据 Redis 官方文档引用的基准，特定条件下吞吐可提升到基线约 10 倍；倍数依赖测量环境，回环几乎为零，跨城高 RTT 更明显。<strong>风险层</strong>：错误逐条看每个任务的返回结果与异常；整批等待超时时，未收到回复的命令状态未知，按幂等重放处理。<strong>失效路径</strong>：服务端 CPU 饱和时继续加批只会让队列更长、延迟更高，应减小批次或加节点；批太小退回逐条往返；错误不处理则静默丢数据。</p>
+<p><strong>临界值与边界</strong>：单批 100~500 条进入吞吐平台期，继续增大收益递减、内存上升，可逆；超过 1000 条没有硬限制，但输出缓冲暴涨会触发慢消费者与断连，伴随网络分片、延迟抖动，可逆；单批超过 10MB 时网络分片、客户端内存压力上升，可逆；顶破 <code>client-query-buffer-limit</code> 时服务端断开该客户端、待发命令丢失，重连可恢复；输出缓冲超过 <code>client-output-buffer-limit normal</code> 时连接被强制关闭、待发回复丢失且不可逆；批内语法或类型错误只影响该条、其余继续，属静默部分成功，可修复重试；批内混入大 Key 或 <code>O(N)</code> 命令时主线程被连续占用，延迟毛刺不可逆；FireAndForget 遇断连时命令可能未到达且不可逆。</p>
+<p><strong>决策清单</strong>：收益看 <code>RTT / N</code> 是否大于单命令处理时间；风险看业务能否接受部分成功；失效看端到端 P99 与 <code>client_recent_max_output_buffer</code> 是否随批上升。</p>
+<h2 id="43-压测量级参考与拐点">4.3 压测、量级参考与拐点</h2>
+<p>压测固定条件：Redis 8.10.3 单实例、无持久化（<code>appendonly no</code>、<code>save ""</code>），记录部署形态与 RTT、客户端硬件；对照逐条同步 <code>SET</code>，实验为批深 <code>-P 1 / 16 / 64</code>（或客户端批 50 / 200 / 500），固定 <code>-n</code>、<code>-c</code>，每轮 3 次取中位数。</p>
+<pre><code class="language-bash"># 当前 RTT 基线：单次往返的最小值、最大值与平均值
+redis-cli --latency
+
+# RTT 随时间变化，观察是否稳定或抖动
+redis-cli --latency-history
+
+# 输出缓冲峰值：client_recent_max_output_buffer
+redis-cli INFO clients
+
+# 每连接输出缓冲 omem 不在 INFO clients 中，需从 CLIENT LIST 读取
+redis-cli CLIENT LIST | grep omem
+
+# 压测开始前重置统计，压测完成后再读，才能形成同一起点的对照
+redis-cli CONFIG RESETSTAT
+
+# 命令统计：usec_per_call 是累计平均，只作辅助观察
+redis-cli INFO commandstats
+
+# 吞吐与连接拒绝：total_commands_processed / instantaneous_ops_per_sec / rejected_connections
+redis-cli INFO stats
+
+# 批内 O(N) 命令的慢日志，默认记录执行超过阈值的命令
+redis-cli SLOWLOG GET
+</code></pre>
+<p><code>requests per second</code> 与 <code>p50</code>/<code>p99</code> 不在上面的命令里，而是 <code>redis-benchmark</code> 汇总行的字段。<strong>压测报告最小字段</strong>：网络 RTT、客户端与服务端版本、批大小、payload 大小、并发数 <code>-c</code>、总请求数 <code>-n</code>、P50/P99、输出缓冲峰值；缺一项两组数字就不可比。</p>
+<p><strong>跨机参考测量</strong>（15ms 为跨机房举例、12ms 为日志场景假设、14ms 为本表参考测量平均值，量级一致来源不同；测量条件：跨机平均 RTT≈14ms、每条 SET value 约 50 字节、每组 1000 条 SET，客户端为 .NET + StackExchange.Redis；下表为量级参考，绝对值须在目标环境复现）：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033417468-1465441599.png" alt="" loading="lazy"></p>
+<p><strong>RTT 模型推算</strong>（公式：批深 N 时单命令等效耗时 ≈ 处理时间 + RTT / N，处理时间取 0.05ms 量级）：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033420755-768086318.png" alt="" loading="lazy"></p>
+<p><strong>拐点判定</strong>：当 <code>RTT / N</code> 降到与单命令处理时间同一量级，瓶颈已从网络转到服务端主线程，继续加批吞吐不再上涨。这解释了开篇现象：同机 RTT≈0.1ms，<code>RTT / N</code> 一开始就很小。进入 100~500 平台期后，边缘收益快速衰减而风险快速上升；<strong>变坏的信号</strong>是单批回复体积超过客户端可用内存的合理比例，或 <code>client_recent_max_output_buffer</code> 持续爬升不回落。</p>
+<p><strong>批大小自适应</strong>：以 <code>RTT / N</code> 与端到端 P99 为输入，从 100 条起按 ±50 逐轮调整；每轮固定并发与总请求数跑 3 次取中位数，吞吐上升且 P99 未明显恶化就继续加，进入平台期或输出缓冲持续爬升就回退一个步长并停在该点。不同客户端实现、payload、网络环境下绝对值差异很大——「本机回环数倍提升」多见于不同进程或客户端实现的对比，「回环几乎无差别」多见于同一进程内 <code>-P</code> 对比，任何数字都要在目标环境自测。</p>
+<h2 id="44-监控指标">4.4 监控指标</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033424212-1345696338.png" alt="" loading="lazy"></p>
+<blockquote>
+<p>权衡结论：Pipeline 用<strong>客户端等待延迟和内存</strong>换<strong>RTT 次数</strong>。RTT 主导时收益显著，服务端 CPU 主导时代价大于收益；批大小存在拐点，不要一味求大；警惕部分成功的非原子语义，核心业务禁止 FireAndForget。</p>
+</blockquote>
+<h1 id="五生产落地六个场景">五、生产落地：六个场景</h1>
+<p>本节解决一个问题：每类业务的选型、判定前提、失效条件和替代路径分别是什么。六个场景的公共规则是——先确认命令之间无依赖、业务能接受部分成功，再建批；要求整段原子或一条不丢时，Pipeline 单独都不够。</p>
+<h2 id="51-批量写行为日志">5.1 批量写行为日志</h2>
+<p><strong>需求</strong>：每秒数千条事件写入 List / Hash 供实时看板，跨机房 RTT≈12ms（场景假设，按实测替换），允许少量失败、不需原子。逐条 <code>LPUSH</code> 在高并发下延迟不可接受。<strong>选型</strong>：显式 <code>IBatch</code>，每 200 条 <code>Execute()</code>；不用隐式合并，是为了不让日志写入与同连接缓存读取混批、拖长读延迟；不开 FireAndForget，保留返回值捕获异常。<strong>失效</strong>：要求日志一条不丢时本方案失效，改用带确认的写入或外部队列。</p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+class BehaviorLogWriter
+{
+    IDatabase db;
+
+    // 由外部注入数据库对象，连接复用交由调用方管理
+    public BehaviorLogWriter(IDatabase db) { this.db = db; }
+
+    public async Task WriteBehaviorLogsAsync(
+        IEnumerable&lt;(string userId, string action)&gt; events)
+    {
+        // 显式批次隔离日志写入，避免与同连接的读命令互相拖累
+        var batch = db.CreateBatch();
+
+        // 收集入队任务，提交后逐条检查
+        var tasks = new List&lt;Task&gt;();
+
+        foreach (var (userId, action) in events)
+        {
+            // 按用户与日期分键，便于按天清理与统计
+            var key = $"behavior:{userId}:{DateTime.UtcNow:yyyyMMdd}";
+
+            // ListLeftPushAsync 返回 Task&lt;long&gt;，可隐式转为 Task 存入列表
+            tasks.Add(batch.ListLeftPushAsync(key, action));
+        }
+
+        // 全部入队后才发送，提前 await 会让任务永远不完成
+        batch.Execute();
+
+        // 把每条任务转成不会抛异常的任务，避免一条失败中断对其余结果的检查
+        await Task.WhenAll(tasks.Select(t =&gt; t.ContinueWith(_ =&gt; { })));
+
+        // 逐条检查原始任务，定位失败项
+        for (int i = 0; i &lt; tasks.Count; i++)
+        {
+            if (tasks[i].IsFaulted)
+            {
+                // 从 Exception 读取该条命令的错误，不让一条失败掩盖其余结果
+                Console.WriteLine($"第 {i} 条日志写入失败：{tasks[i].Exception?.GetBaseException().Message}");
+            }
+        }
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：200 条中一条 <code>LPUSH</code> 打到 string 键触发类型错误，其余 199 条仍执行；异常要从失败任务的 <code>Exception</code> 逐条读，<code>await Task.WhenAll(tasks)</code> 会在第一条失败处抛出、后面结果取不到。<code>client_recent_max_output_buffer</code> 持续上升时把批次降到 50，用部分吞吐换内存稳定；单批超输出缓冲上限则拆批。要严格顺序且不丢，用外部消息队列缓冲后再写。</p>
+<h2 id="52-批量读用户画像">5.2 批量读用户画像</h2>
+<p><strong>需求</strong>：渲染前读 100 个用户的画像 Hash，跨机房逐条 <code>HGETALL</code> RTT 累加明显。<strong>选型</strong>：同类键、只取 string 值时优先 <code>MGET</code>（一条命令，连组包开销也省）；键类型不一或需条件处理时用 <code>CreateBatch</code> 批量 <code>HashGetAllAsync</code>，并自行维护用户 ID 到结果的映射——回复顺序与排队顺序一致，但映射责任在业务侧，这是最易被忽略的正确性点。Hash 键不能用 <code>MGET</code> 取字段。</p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+class ProfileReader
+{
+    IDatabase db;
+
+    // 由外部注入数据库对象，连接复用交由调用方管理
+    public ProfileReader(IDatabase db) { this.db = db; }
+
+    public async Task&lt;Dictionary&lt;string, HashEntry[]&gt;&gt; GetUserProfilesAsync(
+        IReadOnlyList&lt;string&gt; userIds)
+    {
+        // 显式批次保证这批 HGETALL 一次发出
+        var batch = db.CreateBatch();
+
+        // 用用户 ID 作键保存任务，回复与请求的映射由业务侧维护
+        var tasks = new Dictionary&lt;string, Task&lt;HashEntry[]&gt;&gt;();
+
+        foreach (var uid in userIds)
+        {
+            // HashGetAllAsync 返回 Task&lt;HashEntry[]&gt;，字段顺序由 Redis 决定
+            var key = $"profile:{uid}";
+            tasks[uid] = batch.HashGetAllAsync(key);
+        }
+
+        // 入队完成后统一发送
+        batch.Execute();
+
+        // Execute 之后才能等待，否则任务不会完成
+        await Task.WhenAll(tasks.Values);
+
+        // 按用户 ID 还原结果，避免只按顺序对应导致错位
+        var result = new Dictionary&lt;string, HashEntry[]&gt;();
+        foreach (var (uid, task) in tasks)
+        {
+            result[uid] = await task;
+        }
+        return result;
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：key 不存在时 <code>HashGetAllAsync</code> 返回空数组、不抛异常，业务按空值处理。单个 Hash 数百字段时，100 个 <code>HGETALL</code> 的总回复可达数 MB，应减小批次或改用 <code>HMGET</code> 只取需要的字段。画像键全为 string 时直接用 <code>StringGet(RedisKey[])</code>，Pipeline 无额外价值。</p>
+<h2 id="53-批量写--错误逐条处理">5.3 批量写 + 错误逐条处理</h2>
+<p><strong>需求</strong>：写 5000 个计数器，个别命令因类型不匹配失败、其余键可能已存在；既不整体回退，也不静默丢失败信息。<strong>选型</strong>：要「部分成功 + 逐条可见」用批处理，不用事务（事务本就不回滚）。<strong>失效</strong>：失败必须整体撤销时改用 Lua 保证整段原子；前提是业务能为失败项单独补偿。</p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+class CounterWriter
+{
+    IDatabase db;
+
+    // 由外部注入数据库对象，连接复用交由调用方管理
+    public CounterWriter(IDatabase db) { this.db = db; }
+
+    public async Task&lt;(int succeeded, List&lt;int&gt; failed)&gt; WriteCountersAsync()
+    {
+        var batch = db.CreateBatch();
+        var tasks = new List&lt;Task&lt;bool&gt;&gt;();
+        for (int i = 0; i &lt; 5000; i++)
+        {
+            // 用 NotExists 让已存在的键返回 false，作为可复现的「未写入」结果
+            tasks.Add(batch.StringSetAsync($"counter:{i}", 1, when: When.NotExists));
+        }
+
+        // counter:0 已是 string 键，对它执行 HashSetAsync 触发 WRONGTYPE，制造真实的命令层异常
+        tasks.Add(batch.HashSetAsync("counter:0", new[] { new HashEntry("f", "v") }));
+
+        // 全部入队后才发送
+        batch.Execute();
+
+        // 先把失败任务转成不会抛出的任务，WhenAll 才不会中断后面的遍历
+        await Task.WhenAll(tasks.Select(t =&gt; t.ContinueWith(_ =&gt; { })));
+
+        var failed = new List&lt;int&gt;();
+        for (int i = 0; i &lt; tasks.Count; i++)
+        {
+            Task&lt;bool&gt; task = tasks[i];
+            if (task.IsFaulted)
+            {
+                // 命令层异常逐条记录，本例第 5001 条是 WRONGTYPE 类型错误
+                Console.WriteLine($"第 {i} 条命令失败：{task.Exception?.GetBaseException().Message}");
+                failed.Add(i);
+            }
+            else if (!task.Result)
+            {
+                // 返回 false 表示键已存在，按未写入计入失败项
+                Console.WriteLine($"第 {i} 条未写入（键已存在）");
+                failed.Add(i);
+            }
+        }
+        // 成功数等于总任务数减去失败项数
+        return (tasks.Count - failed.Count, failed);
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：失败分两类——命令层异常从 <code>IsFaulted</code> / <code>Exception</code> 读（本例第 5001 条 WRONGTYPE），返回值 <code>false</code> 表示条件未满足；<code>await Task.WhenAll(tasks)</code> 遇第一类直接抛出。5000 条一次入批会让客户端内存与服务端输出缓冲同时上涨，拆成每批 100~500、延迟敏感场景 10~50。不能假设整批回滚，失败项单独补偿。</p>
+<h2 id="54-记录统计fire-and-forget">5.4 记录统计（Fire-and-Forget）</h2>
+<p><strong>需求</strong>：每秒数百次记录写入，允许少量丢失，业务线程不等待回复。<strong>选型</strong>：<code>FireAndForget</code> 把发送开销压到最低，代价是拿不到结果与错误，<strong>禁止用于核心业务数据</strong>；这条写入一旦必须成功，方案立即失效，换成普通异步调用并检查结果。</p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis
+using System;
+using System.Collections.Generic;
+using StackExchange.Redis;
+
+class StatReporter
+{
+    IDatabase db;
+
+    // 由外部注入数据库对象，连接复用交由调用方管理
+    public StatReporter(IDatabase db) { this.db = db; }
+
+    public void ReportStats(IReadOnlyList&lt;string&gt; statKeys)
+    {
+        // FireAndForget 不等待回复，逐个发出即可，不需要显式批次
+        foreach (var key in statKeys)
+        {
+            // 异步方法返回已完成的 Task，无需 await，也无法感知错误
+            db.StringIncrementAsync(key, flags: CommandFlags.FireAndForget);
+        }
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：Redis OOM、网络闪断时这批记录静默丢失，业务无感；必须配外部监控——对比 <code>INFO commandstats</code> 调用次数与记录侧记录数。<code>rejected_connections</code> 反映连接被拒绝（常见原因 <code>maxclients</code>），不反映记录丢失。FireAndForget 不需要显式批次：它本就不等回复，加 <code>IBatch</code> 只多出 <code>Execute()</code> 步骤、把「写了就不管」变复杂。<strong>要不丢又不想等回复</strong>：用「本地队列 + 普通异步写入 + 失败重试」——业务线程写入进程内队列立即返回，后台线程普通异步发送并检查结果，失败项进重试队列；多付队列内存与重试逻辑，换来失败可见与可补偿，核心计数应走这条。</p>
+<h2 id="55-pipeline--multiexec批量且原子">5.5 Pipeline + MULTI/EXEC：批量且原子</h2>
+<p><strong>需求</strong>：既省 RTT，又要求这批命令连续执行不被打断。<strong>实现</strong>：客户端用 Pipeline 打包 <code>MULTI</code> + N 条命令 + <code>EXEC</code>；<strong>原子性来自 <code>MULTI/EXEC</code>，不是 Pipeline</strong>。</p>
+<pre><code class="language-text">*1
+$5
+MULTI
+*3
+$3
+SET
+$2
+ma
+$2
+11
+*3
+$3
+SET
+$2
+mb
+$2
+22
+*1
+$4
+EXEC
+</code></pre>
+<p>执行 <code>cat pipeline_multi.txt | redis-cli --pipe</code>。入队期错误让整段拒绝执行；执行期错误只影响出错那条，其余照常生效——事务不回滚，「不会部分写入」的说法是错的。</p>
+<p>StackExchange.Redis 中原子批量由事务对象提供，传输层批量已包含在内，无需也不能用 <code>IBatch</code> 手写 MULTI/EXEC（<code>IBatch</code> 没有 MULTI/EXEC 方法）：入口是 <code>IDatabase.CreateTransaction()</code>，提交是 <code>ITransaction.ExecuteAsync()</code>。</p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis
+using System;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+class TransactionBatchDemo
+{
+    IDatabase db;
+
+    // 由外部注入数据库对象，连接复用交由调用方管理
+    public TransactionBatchDemo(IDatabase db) { this.db = db; }
+
+    public async Task RunAsync()
+    {
+        // 事务对象把入队命令一次发出，兼具传输层批量与执行层原子
+        var tran = db.CreateTransaction();
+
+        // 在事务对象上排队命令，此时尚未提交
+        Task&lt;bool&gt; setMa = tran.StringSetAsync("ma", "11");
+        Task&lt;bool&gt; setMb = tran.StringSetAsync("mb", "22");
+
+        // ExecuteAsync 返回是否提交；带前置条件时条件不满足会返回 false
+        bool committed = await tran.ExecuteAsync();
+
+        // 提交结果为 false 时命令未执行，不做后续读取
+        Console.WriteLine($"事务是否提交：{committed}");
+
+        if (committed)
+        {
+            // 提交后逐个检查，执行期错误体现在失败任务上，不回滚其余命令
+            if (setMa.IsFaulted)
+            {
+                // 执行期错误从 Exception 读取，其余命令仍然生效
+                Console.WriteLine($"ma 写入失败：{setMa.Exception?.GetBaseException().Message}");
+            }
+            else
+            {
+                // 成功任务的结果可直接 await 读取
+                Console.WriteLine($"ma 写入结果：{await setMa}");
+            }
+
+            if (setMb.IsFaulted)
+            {
+                // 第二条命令同样逐条检查，互不影响
+                Console.WriteLine($"mb 写入失败：{setMb.Exception?.GetBaseException().Message}");
+            }
+            else
+            {
+                // 成功任务的结果可直接 await 读取
+                Console.WriteLine($"mb 写入结果：{await setMb}");
+            }
+        }
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：原子性是「连续执行不被打断」，不是「出错全部回滚」；入队期错误整段拒绝，执行期错误其余继续。集群下多 key 必须同一槽，跨槽事务失效，要按槽重组或改单键方案。</p>
+<h2 id="56-批量缓存预热">5.6 批量缓存预热</h2>
+<p><strong>需求</strong>：启动时写 10000 个商品信息作为缓存，允许逐批失败重试。<strong>选型</strong>：key 相互独立、不要求一次原子写入，Pipeline 最合适；MULTI/EXEC 与 Lua 的原子性用不上，属于过度设计。每批 500（平台期上沿）分 20 轮。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033646561-31847737.png" alt="" loading="lazy"></p>
+<pre><code class="language-csharp">// 依赖：net10.0 + NuGet 包 StackExchange.Redis
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using StackExchange.Redis;
+
+class CacheWarmer
+{
+    IDatabase db;
+
+    // 由外部注入数据库对象，连接复用交由调用方管理
+    public CacheWarmer(IDatabase db) { this.db = db; }
+
+    public async Task WarmAsync()
+    {
+        const int batchSize = 500;
+        const int totalKeys = 10000;
+
+        // 每轮独立建批，避免单批过大推高输出缓冲
+        for (int batchStart = 0; batchStart &lt; totalKeys; batchStart += batchSize)
+        {
+            var batch = db.CreateBatch();
+            var tasks = new List&lt;Task&gt;();
+
+            // 最后一批可能不足 batchSize，取较小值作为结束位置
+            int end = Math.Min(batchStart + batchSize, totalKeys);
+            for (int i = batchStart; i &lt; end; i++)
+            {
+                // 复制循环变量，避免闭包捕获到变化后的 i
+                int idx = i;
+
+                // 插值中的双花括号输出字面花括号，生成合法 JSON 字符串
+                tasks.Add(batch.StringSetAsync(
+                    $"product:{idx}",
+                    $"{{ \"id\": {idx}, \"name\": \"Product {idx}\" }}"));
+            }
+
+            // 本批全部入队后发送
+            batch.Execute();
+
+            // 等本批完成再进入下一轮，避免多批回复同时堆积
+            await Task.WhenAll(tasks);
+
+            // 打印进度，便于定位失败发生在哪一轮
+            Console.WriteLine($"已完成批次 {batchStart / batchSize + 1}（{tasks.Count} 个键）");
+        }
+    }
+}
+</code></pre>
+<p><strong>边界</strong>：单批超输出缓冲上限就减小 <code>batchSize</code>；服务端中途重启时应用层要做幂等重试——<code>SET</code> 天然幂等，换成 <code>INCR</code> 这类非幂等命令重放会放大计数，必须改用带版本号的幂等写入。</p>
+<h1 id="六不该用的场景与横向选型">六、不该用的场景与横向选型</h1>
+<p>本节解决一个问题：哪些条件一出现就否决 Pipeline，以及否决之后换什么、代价多大。原则性否决只有两条：命令之间不能被插入、要求「要么全成要么全不成」。</p>
+<ol>
+<li><strong>命令之间有依赖</strong>：后一条参数要用到前一条返回值，无法预构造。替代：拆多次往返（收益归零）或 Lua 在服务端内取中间结果（键要同槽、纳入代码审计）。</li>
+<li><strong>需要原子性</strong>：库存扣减、状态机迁移——用事务或 Lua。代价：事务执行期错误不回滚；Lua 要求键同槽且有脚本维护成本。</li>
+<li><strong>单条命令本身就是瓶颈</strong>：如 <code>ZRANGE</code> 返回数万元素，Pipeline 只让大回复排队、内存倍增而延迟改善有限。替代：拆批或先治理大 Key，前者牺牲吞吐，后者要数据迁移。</li>
+<li><strong>本机回环极低 RTT</strong>：<code>RTT</code> 趋零时 <code>RTT / N</code> 也趋零，额外封装反而增加复杂度。此处不建批没有替代代价。</li>
+<li><strong>核心业务写入</strong>：不要 FireAndForget，错误不可感知。替代：普通异步逐条检查（多付一次 RTT），或「本地队列 + 异步写入 + 失败重试」。</li>
+<li><strong>一次请求只有一两条命令</strong>：没有可批的量，强行建批只多出对象创建与 <code>Execute()</code> 开销。</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033653774-1910365335.png" alt="" loading="lazy"></p>
+<p><strong>一句话选型</strong>：要省 RTT 用 Pipeline；要原子性用事务或 Lua；要「写了不管」用 FireAndForget；同类键批量操作优先 MSET/MGET。四者可组合（事务可在 Pipeline 里发出，原子性仍由事务负责），不可互相替代。落到判断：命令完全独立 → Pipeline；既要省往返又要连续执行 → Pipeline 包装 MULTI/EXEC；命令存在计算依赖 → Lua；只取多个同类型键 → <code>MGET</code> / <code>StringGet(RedisKey[])</code>。</p>
+<p><strong>集群分组要点</strong>：先按 <code>hash slot</code> 对键分组，再为每组建批——同一 <code>IBatch</code> 的键必须落在同一节点，跨节点会收到 MOVED/ASK。计算槽位时可用 <code>Hash Tag</code>（键名里的 <code>{tag}</code>）强制同槽，代价是这些键挤在一个节点、热点集中，只对确实要一起操作的少数键使用。识别方式：<code>CROSSSLOT Keys in request don't hash to the same slot</code> 说明同批跨槽，按槽重组；MOVED/ASK 说明批发错节点，刷新槽位映射后重发。</p>
+<h1 id="七高频坑点与版本差异">七、高频坑点与版本差异</h1>
+<p>本节解决一个问题：线上排障时按「现象 → 根因 → 规避 → 验证」直接对照，以及升级时要确认哪些差异。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033657206-105589157.png" alt="" loading="lazy"></p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261125033700406-2119076559.png" alt="" loading="lazy"></p>
+<p>不同客户端 API 不同，核心原理一致：客户端打包多条 RESP 命令，一次发送、一次回收；多路复用器会自动聚合，过度嵌套手动批次不会再提升性能。</p>
+<h1 id="八关键结论与决策边界">八、关键结论与决策边界</h1>
+<p>本节解决一个问题：把全文判断收拢成五条带失效条件的结论。</p>
+<p><strong>结论一：Pipeline 省的是客户端侧的 RTT，不改变服务端对每条命令的执行成本。</strong> 依据：服务端仍逐条解析执行，批处理作用域在客户端组包与网络传输。判断服务端是否饱和看端到端 P99 与 <code>SLOWLOG</code>；<code>usec_per_call</code> 是累计平均、混合所有客户端调用，压测前 <code>CONFIG RESETSTAT</code> 后也只能作辅助，不能当作「处理开销不变」的直接佐证——把「服务端批量执行」理解为「并行执行」是错的。<strong>失效条件</strong>：RTT 趋零且服务端 CPU 空闲时收益趋零；若未来版本引入批处理执行优化，本条需重新验证。</p>
+<p><strong>结论二：Pipeline 是传输层批量，不提供原子性；事务是执行层批量，保证连续执行但不回滚。</strong> 据 Redis 官方文档，Pipelines 与 Transactions 分列两节，不存在「Pipeline 等于轻量事务」的说法；Pipeline 不插入服务端状态标记，<code>MULTI</code> 会设置客户端 MULTI 标志并进入入队模式。<strong>失效条件</strong>：若未来版本引入 Pipeline 级原子语义则修订；在 8.10.3 下要原子性只能靠事务或 Lua。</p>
+<p><strong>结论三：批大小是核心可调参数，且存在拐点。</strong> 从 100 起测、观察输出缓冲，平台期通常在 100~500；太小退回逐条往返，太大推高客户端内存与服务端两侧缓冲甚至断连。<strong>失效条件</strong>：payload 很大或 RTT 极高时拐点位置移动，必须重新压测，不要套用参考表数字。</p>
+<p><strong>结论四：错误必须逐条感知，服务端参数是护栏不是旋钮。</strong> Pipeline 无回滚，FireAndForget 吞错误；两个 buffer 参数用于防事故，<code>io-threads</code> 按实测评估。<strong>替代方案</strong>：要「全成或全不成」用事务或 Lua；要知道每条结果就逐条检查任务；允许丢失的记录才用 FireAndForget 并配监控。</p>
+<p><strong>结论五：显式批次的适用性取决于客户端实现。</strong> 隐式合并够用时，<code>IBatch</code> 必要性降低；只在需要隔离批次边界（避免读写混批互相拖累）或明确提交时机时用它。<strong>失效条件</strong>：不同客户端 API 与提交方式不同，迁移时不能直接照搬 StackExchange.Redis 写法。</p>
+<h1 id="下一篇客户端缓存">下一篇：客户端缓存</h1>
+<p>Pipeline 解决「客户端怎么更快地把命令批量送出去」，优化请求发送路径；客户端缓存解决「服务端怎么主动告诉客户端哪些数据过期了」，优化重复读取路径。下一篇讲 <code>CLIENT TRACKING</code> 的默认、<code>OPTIN</code>、<code>OPTOUT</code>、<code>BCAST</code> 四种模式，失效推送的时序与网络开销，以及缓存漂移的成因与规避。两者方向相反、互为补充：一个是客户端发起的批量发送，一个是服务端推送的失效通知。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-26 10:01">2026-11-26 10:00</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">85</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23773378);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23773378&amp;targetId=23773378&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
