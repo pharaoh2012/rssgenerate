@@ -1,0 +1,305 @@
+
+        <h2 class="post-title">
+            <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/xyyt/p/23779058/harmonyos-arkweb-video-stream-down-black-screen-mask" title="发布于 2026-11-26 09:13">
+    
+
+    <span role="heading" aria-level="2">鸿蒙 Web 播放器断流不报错：黑屏提示从 70 秒优化到 2 秒</span>
+    
+
+</a>
+
+        </h2>
+            <div id="cnblogs_post_description" style="display: none">
+        <img src="https://img2024.cnblogs.com/blog/546882/202611/546882-20261125145327624-224783476.png" alt="鸿蒙 Web 播放器断流不报错：黑屏提示从 70 秒优化到 2 秒" class="desc_img">
+        在 HarmonyOS NEXT 上播放直播或点播流时，Web 容器的视频组件断流往往不触发任何错误事件，`play` 事件也早于真实画面到达，导致依赖事件驱动的加载提示出现"迟迟不出、自行消失、再也收不掉"三类问题。本文记录一次完整修复：改用 `timeupdate` 的进度推进作为唯一判据，配合超时看门狗与两档全屏遮罩，把无提示黑屏时间从 40~70 秒压缩到约 2 秒，并附上跨端改动的产物级验证方法。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h4 id="1-问题背景">1. 问题背景</h4>
+<p>先交代技术栈，便于判断结论的适用范围：HarmonyOS NEXT 应用，前端用 uni-app（Vue3）跨端框架，直播观看页里的视频是框架的 <code>&lt;video&gt;</code> 组件——在鸿蒙端它最终落在系统的 ArkWeb（Web 容器）里播放，而不是原生 AVPlayer。同一份代码在 Android 端走的是 app-plus 的 video 实现。</p>
+<p><strong>如果你不用 uni-app，只要视频是通过鸿蒙 Web 容器（ArkWeb / <code>&lt;video&gt;</code> / webview 内嵌播放器）播放的，本文的三条结论同样适用。</strong></p>
+<p>要解决的现象：主播断播之后，观众端画面先卡住、随后变黑，中间有一大段时间没有任何提示，用户体验为"app 坏了"。</p>
+<h4 id="2-现象拆解三段式黑屏">2. 现象拆解：三段式黑屏</h4>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>时长</th>
+<th>现象</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>缓冲余量耗尽前</td>
+<td>0~30 秒</td>
+<td>画面停在最后一帧，看似正常</td>
+</tr>
+<tr>
+<td>显示 surface 被刷黑</td>
+<td>约 10 秒</td>
+<td>纯黑，无任何提示</td>
+</tr>
+<tr>
+<td>超时判定链跑完</td>
+<td>40~70 秒</td>
+<td>才出现"主播暂时离开"提示</td>
+</tr>
+</tbody>
+</table>
+<p>提示出现之后还有两个衍生问题：</p>
+<ul>
+<li>提示约 12 秒后自行消失，画面依然是黑的；</li>
+<li>若干次重连之后，提示再也无法收起。</li>
+</ul>
+<p>原来的判定链是这样的（单看每一步都合理，串联起来就非常慢）：</p>
+<pre><code>进度心跳超时 10s → 重连退避 5 次（2+4+6+8+10 ≈ 30s）→ 耗尽才进入 error 分支
+→ 启动轮询刷新播放地址 → 连续 3 轮失败（30s）→ 才置为「主播离开」状态
+</code></pre>
+<p>提示 UI 挂在这条链的末端，因此用户必须等 40~70 秒。</p>
+<h4 id="3-根因arkweb-视频组件的三条特性">3. 根因：ArkWeb 视频组件的三条特性</h4>
+<p>以下均为真机取证结论，不是推测。</p>
+<h5 id="31-断流是静默的">3.1 断流是静默的</h5>
+<p>一次真实断播的回调序列（时间戳相对化）：</p>
+<pre><code>[ 0.0s] @error   errMsg="" errCode=undefined   ← 空事件
+[ 3.2s] @waiting                               ← 此后彻底静默
+[ 3.2s] ~ 之后无任何事件
+</code></pre>
+<p>也就是说，断流不保证给出 <code>@error</code>、<code>@ended</code>、<code>@waiting</code> 中的任何一个；即便给出 <code>@error</code>，其 <code>code / message</code> 也常常是空值，无法用于错误分类。Android 端的 video 组件自带原生"正在连接"提示，恰好把这个空窗盖住了，所以同一份代码在两端观感差异极大。</p>
+<h5 id="32-play-事件早于真实画面">3.2 <code>play</code> 事件早于真实画面</h5>
+<p>收到 <code>@play</code> 时，解码器可能尚未输出任何一帧画面。若以 <code>@play</code> 作为收起黑屏遮罩的时机，就会出现"遮罩没了、画面还是黑的"——这正是提示约 12 秒后自行消失的原因。</p>
+<h5 id="33-对已死掉的流重连会偶发僵尸-play">3.3 对已死掉的流重连，会偶发僵尸 <code>play</code></h5>
+<p>对一条不存在的流执行 <code>stop() + play()</code>，ArkWeb 有时会立即回调一个 <code>@play</code>，随后不再有任何事件。如果据此切换为"正在恢复"文案，等于向用户谎报进度。</p>
+<p>综合成一条设计约束：<strong>任何视觉状态都不应由 <code>play</code> 事件驱动。</strong> 这条约束最终以注释形式固化在代码里，防止后续重构时被"顺手优化"掉。</p>
+<h4 id="4-判据重构从事件驱动改为证据驱动">4. 判据重构：从事件驱动改为证据驱动</h4>
+<p>唯一可靠的证据是 <code>timeupdate</code> 中 <code>currentTime</code> 的真实推进：</p>
+<pre><code class="language-ts">// 三段闸门：只有越过基线才算"画面真的在动"
+function onTimeUpdate(time: number) {
+  // ① 大幅回跳 = 重锚（切流、seek 都走这里，否则新流会被旧基线全部拦掉）
+  if (time &lt; lastProgressTime - 1) {
+    lastProgressTime = time;
+    return;
+  }
+  // ② 未越过基线 + 容差 = 只是缓冲，不算进展
+  if (time &lt;= lastProgressTime + 0.5) return;
+  // ③ 真实推进：这才是"画面回来了"的证据
+  lastProgressTime = time;
+  armProgressWatchdog();      // 续心跳
+  armNoProgressHint(2000);    // 续轻提示定时器
+  onPlayingConfirmed();       // 上抛：允许收起遮罩
+}
+</code></pre>
+<p>配套动作是在 <code>@play</code> 回调里把 <code>lastProgressTime</code> 复位为初始值。这一步对应"提示再也收不掉"那个问题：</p>
+<blockquote>
+<p>重连会切到一条新流，<code>currentTime</code> 从 0 重新开始，而旧基线可能停在 800 多秒。单调闸门因此把新流的全部 <code>timeupdate</code> 拦截，"真实推进"这个唯一可靠证据再也不会触发，提示就一直挂在屏幕上。</p>
+</blockquote>
+<p>所以「基线复位」与「回跳重锚」两个动作缺一不可。只做其中一个也能通过大部分场景测试，但换流时机不凑巧时就会漏。</p>
+<h4 id="5-方案提示链与判死链解耦">5. 方案：提示链与判死链解耦</h4>
+<p>判定"流已死"的节奏一行未改（改动它会与重连退避互相叠加，引入新的卡顿风险），只是把视觉提示拆成独立的、响应快得多的档位：</p>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th>触发条件</th>
+<th>文案</th>
+<th>是否暂停底层视频</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>loading</code></td>
+<td>2 秒无真实进度；<code>waiting</code> 时收紧到 1 秒；进房首轮放宽到 3.5 秒</td>
+<td>正在恢复画面… / 从未出过画面时"正在连接直播…"</td>
+<td><strong>否</strong></td>
+</tr>
+<tr>
+<td><code>away</code></td>
+<td>心跳 10 秒判死 / <code>@error</code> / 重连链启动 / 主播主动离开信令</td>
+<td>主播暂时离开</td>
+<td><strong>是</strong></td>
+</tr>
+<tr>
+<td><code>recovering</code></td>
+<td><strong>仅</strong>由恢复推流信令驱动</td>
+<td>正在恢复画面</td>
+<td>是</td>
+</tr>
+</tbody>
+</table>
+<p>两处需要说明的取舍：</p>
+<ul>
+<li><strong><code>loading</code> 档不暂停视频。</strong> 2 秒无进度可能只是网络抖动，此时 <code>pause()</code> 反而会打断一次正常观看。只有确认判死或主播主动离开时才暂停，目的是冻结画面，防止缓冲的旧帧从半透明遮罩底下透出。</li>
+<li><strong><code>recovering</code> 只能由信令驱动，不能由 <code>@play</code> 推断</strong>，理由见 3.3。</li>
+</ul>
+<p>状态迁移全貌：</p>
+<pre><code>断播
+  ├─ 缓冲余量继续播放 → timeupdate 正常推进 → 无遮罩（画面在动，符合预期）
+  ├─ 缓冲耗尽 → surface 刷黑（可能伴随 @waiting）
+  │    └─ 2s 无真实进度 → loading 档：「正在恢复画面…」+ 轮播点   ← 裸黑屏被压到约 2s
+  ├─ 10s 心跳超时 → 判死 → away 档：「主播暂时离开」+ pause()
+  ├─ 收到恢复信令 → recovering 档：「正在恢复画面」
+  │    └─ 刷新播放地址 + stop + reconnect
+  └─ timeupdate 真实推进 → 清除全部状态 → 遮罩收起
+</code></pre>
+<p>档位判定集中在一个计算属性里（优先级：主动离开信令 &gt; 已判死 &gt; 已收到恢复 &gt; 仅无进度），标题、副文案、是否带轮播点三个计算属性只做映射。把条件链分散在三处写，后续再加一档必然产生冲突。</p>
+<h4 id="6-承载方式为什么不能用轻量提示框">6. 承载方式：为什么不能用轻量提示框</h4>
+<p><code>uni.showLoading</code> 或任何居中的 loading 胶囊都不适用：它只覆盖屏幕中央一小块，底下整片黑屏照样露出来，用户感知仍是"黑屏 + 一个转圈"。</p>
+<p>需要的是高遮罩度的全屏容器：</p>
+<pre><code class="language-html">&lt;view v-if="showMask" class="stream-mask"&gt;
+  &lt;view class="stream-card"&gt;
+    &lt;text class="stream-title"&gt;{{ maskTitle }}&lt;/text&gt;
+    &lt;text class="stream-desc"&gt;{{ maskDesc }}&lt;/text&gt;
+  &lt;/view&gt;
+&lt;/view&gt;
+</code></pre>
+<pre><code class="language-css">.stream-mask {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 9; background-color: rgba(0, 0, 0, 0.72);
+  justify-content: center; align-items: center;
+}
+</code></pre>
+<p>即便使用 0.72 的半透明黑，仍需配合第 5 节提到的暂停——遮罩压在视频层之上，视频层自身刷黑时会从底部透出。</p>
+<p>另外一个平台限制：nvue 环境下无法确定 CSS <code>@keyframes</code> 是否可靠执行，因此"加载中"的观感改用文本轮播实现：</p>
+<pre><code class="language-ts">const dots = ref(0);
+setInterval(() =&gt; { dots.value = (dots.value + 1) % 4; }, 400);
+// 标题：'正在恢复画面' + '...'.slice(0, dots.value)
+</code></pre>
+<h4 id="7-定时器清单">7. 定时器清单</h4>
+<p>四个定时器职责互不重叠，各自的清除时机也要写全——漏掉一个就会出现"离开页面之后仍在判定断流"。</p>
+<table>
+<thead>
+<tr>
+<th>定时器</th>
+<th>周期</th>
+<th>到点动作</th>
+<th>重挂时机</th>
+<th>清除时机</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>起播看门狗</td>
+<td>一次性 12 秒</td>
+<td>上抛 <code>STARTUP_STALL</code>，进入恢复链</td>
+<td>进入房间时挂一次</td>
+<td>收到 <code>@play</code></td>
+</tr>
+<tr>
+<td>进度心跳</td>
+<td>10 秒</td>
+<td>置 <code>isPlaying = false</code>，判死</td>
+<td>每次真实进度</td>
+<td>判死后不再续期</td>
+</tr>
+<tr>
+<td>无进度轻提示</td>
+<td>2 秒（waiting 1 秒）</td>
+<td>上抛 <code>onNoProgressHint</code> 撑起居罩</td>
+<td>每次真实进度</td>
+<td>判死后交给心跳接手</td>
+</tr>
+<tr>
+<td>卡顿看门狗</td>
+<td>15 秒 × 3 轮</td>
+<td>置 <code>isStalled</code>，加速重连</td>
+<td>重挂</td>
+<td>手动重试 / 进度推进</td>
+</tr>
+</tbody>
+</table>
+<p>两条实现细节：</p>
+<p><strong>其一，轻提示档只在"本该有画面"时续期。</strong></p>
+<pre><code class="language-ts">onNoProgressHint();
+if (isPlaying.value) armNoProgressHint(noProgressTimeout);
+</code></pre>
+<p>判死之后 <code>isPlaying</code> 已被置 <code>false</code>，轻提示档使命结束，不再自挂——否则每 2 秒刷一条日志，真机取证时会被自己的输出淹没。</p>
+<p><strong>其二，必须补一个进房起播看门狗。</strong> 当主播根本没有推流时，用户进入页面既收不到 <code>@play</code> 也收不到 <code>@error</code>，而进度心跳只在 play 或进度时挂载，于是恢复链永远不会启动，界面永久黑屏。结论具有一般性：<strong>所有基于"上一次进度"的超时，在"从未有过进度"的场景下都是失效的。</strong></p>
+<h4 id="8-参数取值">8. 参数取值</h4>
+<p>页面侧只暴露 <code>maxRetries</code>，其余使用默认值，便于按平台调优：</p>
+<table>
+<thead>
+<tr>
+<th>常量</th>
+<th>值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>noProgressTimeout</code></td>
+<td>2000ms</td>
+<td>轻提示阈值</td>
+</tr>
+<tr>
+<td><code>firstFrameHintDelay</code></td>
+<td>≈3500ms</td>
+<td>首帧宽限期，避免正常建连阶段闪出遮罩</td>
+</tr>
+<tr>
+<td><code>waitingHintDelay</code></td>
+<td>1000ms</td>
+<td><code>waiting</code> 表示播放器自己承认无数据，阈值收紧</td>
+</tr>
+<tr>
+<td><code>progressTimeout</code></td>
+<td>10000ms</td>
+<td>心跳判死</td>
+</tr>
+<tr>
+<td>起播看门狗</td>
+<td>12000ms</td>
+<td>一次性</td>
+</tr>
+<tr>
+<td><code>stallTimeout</code> / <code>maxStallRounds</code></td>
+<td>15000 / 3</td>
+<td>卡顿看门狗</td>
+</tr>
+</tbody>
+</table>
+<h4 id="9-附跨端改动的产物级验证">9. 附：跨端改动的产物级验证</h4>
+<p>改动全部包在条件编译块（<code>#ifdef APP-HARMONY</code>）内，因此需要证明"代码只进入鸿蒙产物，其他端产物零残留"。验证过程中踩到两个坑：</p>
+<ul>
+<li>打包后的 <code>app-service.js</code> 是 4.6MB 的单行文件，<code>Select-String</code>、grep 这类按行匹配的工具会给出<strong>假阴性</strong>——实际命中了却不显示，容易被误判为"改动没有生效"。</li>
+<li>改为读取全文后统计出现次数：</li>
+</ul>
+<pre><code class="language-powershell">function Count-Occur([string]$s, [string]$k) {
+  $n = 0; $i = 0
+  while (($i = $s.IndexOf($k, $i)) -ge 0) { $n++; $i += $k.Length }
+  return $n
+}
+</code></pre>
+<ul>
+<li>另一个更隐蔽的坑：脚本中包含中文字面量时，<strong>Windows PowerShell 5.1 读取无 BOM 的 .ps1 会按 GBK 解码</strong>，导致整轮取证结果全部为 0。含中文的 .ps1 必须保存为带 BOM 的 UTF-8。</li>
+</ul>
+<p>判据应当挑选<strong>只可能来自新代码</strong>的文案或日志词；同时保留一个对照组——选取已知会被条件编译裁掉的其他端专属文案，其命中数应为 0。</p>
+<h4 id="10-小结">10. 小结</h4>
+<ol>
+<li>不要信任 Web 容器视频组件的事件用于驱动 UI 状态——断流可能是静默的，<code>play</code> 可能早于真实画面。应当以"进度推进"作为唯一证据，并用超时机制兜住证据缺失的情况。</li>
+<li>提示链与判死链应当分离。判死属于恢复策略，需要保守与退避；提示属于观感策略，要求响应快。两者绑定必然导致提示迟缓。</li>
+<li>重连之后必须复位进度基线，否则证据永远不再成立。</li>
+<li>遮罩承载不能用小弹窗；半透明遮罩需要配合冻结底层画面。</li>
+<li>需要为"从未出过画面"的进房场景单独设置起播超时。</li>
+<li>跨端改动的回归风险应通过条件编译隔离与产物级取证来自证，而不是依赖人工观察。</li>
+</ol>
+<h4 id="11-尚未解决的问题">11. 尚未解决的问题</h4>
+<p>有一种机型上，画面已经黑掉但 <code>timeupdate</code> 仍在推进（伴音正常）。此时"无进度"档不会触发，黑屏仍会露出，目前只能靠 <code>waiting → 1 秒</code> 覆盖一部分场景。</p>
+<p>下一步的判据应改为<strong>端到端延时</strong>：直播场景下 <code>currentTime</code> 与真实直播时间的差值，本身就是画面有效性的信号——延时持续增大说明画面已经陈旧，这一判据与播放器是否给出事件无关，也比"是否有进度"更接近用户的实际观感。</p>
+
+
+</div>
+<div id="MySignature" role="contentinfo">
+    个人原创博客，转载请注明来源地址：https://www.cnblogs.com/xyyt
+</div>
+<div class="clear"></div>
+
+        <p class="postfoot">
+            posted on 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-26 09:14">2026-11-26 09:13</span>&nbsp;
+<a href="https://www.cnblogs.com/xyyt">码间留白</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23779058);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fxyyt%2Fp%2F23779058%2Fharmonyos-arkweb-video-stream-down-black-screen-mask&amp;targetId=23779058&amp;targetType=0" target="_blank">举报</a>
+
+        </p>
+    
