@@ -1,0 +1,896 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/hugogoos/p/23788502" title="发布于 2026-11-27 09:37">
+    
+
+    <span role="heading" aria-level="2">Redis 核心机制 | 客户端缓存（Client-side Caching）</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                    <div id="cnblogs_post_description" style="display: none">
+        
+        本文聚焦Redis客户端缓存（Client-side Caching）的失效推送机制，解析其核心原理与实践陷阱。服务端通过跟踪表记录“谁读过哪个键”，写操作触发主动失效通知，实现强一致性。关键点包括：默认模式消耗服务端内存、仅推送失效消息不传数据值、协议版本（RESP2/RESP3）影响消息投递路径。需关注三大排障判据：OK但收不到失效、偶发旧值、连接异常或误推。机制依赖客户端主动清除本地缓存，否则易变脏。合理使用OPTIN/OPTOUT可降低内存开销，避免因跟踪表满或网络阻塞导致消息积压。
+    </div>
+<div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="讨论范围与边界">讨论范围与边界</h1>
+<p>客户端缓存（Client-side Caching）特指<strong>服务端协助的失效推送机制</strong>：Redis 记录谁读过哪个键，键被修改时主动通知读过的连接；它不同于"客户端自己建字典存值 + TTL 到期"的本地缓存，后者的一致性窗口由时间决定、不可控。核心聚焦"谁该收到哪条失效"，本地缓存容量、多级分层、穿透雪崩防护与底层结构见本系列相关篇章。</p>
+<p>全文围绕三件事：服务端凭什么记、何时推、把哪类失效推给哪个连接，四种模式各记了什么；失效产生后由谁发送、走哪条连接、在哪里积压；代价落在哪里——跟踪表内存、推送流量、主线程耗时点，误用还会让本地缓存变脏。带着三条排障判据往下读：</p>
+<ol>
+<li>返回 <code>OK</code> 却收不到失效 → 查协议版本（RESP2/RESP3）、<code>REDIRECT</code>、订阅频道、消息处理器是否注册。</li>
+<li>偶发读到旧值，或内存无业务增长却上涨 → 前者查断连到重连的窗口与重连清空逻辑；后者查 <code>INFO stats</code> 的 <code>tracking_total_keys</code>、<code>tracking_total_items</code> 与 <code>tracking-table-max-keys</code>。</li>
+<li>连接被断开，或只改一个键却收到成片失效 → 前者查 <code>CLIENT LIST</code> 的 <code>omem</code>、<code>obl</code>；后者查是否用了 BCAST 或跟踪表逼近上限。想省服务端内存优先 <code>OPTIN</code> / <code>OPTOUT</code>。</li>
+</ol>
+<h1 id="一开篇本地缓存为什么会读到旧值">一、开篇：本地缓存为什么会读到旧值</h1>
+<p>本地缓存没有失效机制时，读到旧值是必然结果。.NET 应用用 <code>MemoryCache</code> 缓存 <code>product:1001</code> 库存，TTL 设 5 秒，第一次取回 50；3 秒后另一服务改成 30，应用仍在这 5 秒窗口返回 50。把 TTL 压到 500ms 只是缩短窗口，回源频率上升而旧值仍在。三种妥协各有代价：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112705846-1053616967.png" alt="" loading="lazy"></p>
+<p>Redis 6.0 引入的 Client-side Caching 让服务端记住你读过哪些键，别人改了主动推一条失效消息；失效由写事件驱动，不再猜 TTL。两个反直觉点决定这套机制能否用对：</p>
+<ul>
+<li><strong>默认模式消耗服务端内存</strong>：Redis 维护一张"键 → 哪些连接读过"的表，读的键越多、跟踪的连接越多，表越大，不是免费的。</li>
+<li><strong>只推失效通知，不推数据值</strong>：数据仍要客户端自己 <code>GET</code> 回源；开通 Tracking 不会自动清掉 <code>MemoryCache</code> 里的旧值。</li>
+</ul>
+<p>最容易踩空的协议缺口：RESP2 连接上执行 <code>CLIENT TRACKING ON</code> 会返回 <code>OK</code>，但失效不会推回原连接——必须指定投递目标（<code>REDIRECT</code>）或换用 RESP3。<strong><code>OK</code> 只代表跟踪状态已开启，不代表消息有路可走</strong>（复现见第四章验证 1 与验证 3）。</p>
+<p>实测环境：Redis 8.10.3，redis-cli 8.10.3。在 RESP3 连接上开跟踪、<code>GET</code> 一个键，另一连接改写，原连接收到一条只含键名的 <code>invalidate</code> 推送。记住这一点，后面大部分坑都能自己推出来：服务端说"通知了"，不等于客户端真收到。</p>
+<h1 id="二机制tracking-怎么跑">二、机制：Tracking 怎么跑</h1>
+<h2 id="21-保证与不保证">2.1 保证与不保证</h2>
+<p><strong>保证</strong>：某个键被修改（显式写入、过期删除、内存淘汰、整库清空都在内），服务端向"读过这个键、并且开了跟踪"的连接推送一条失效消息。<strong>不保证</strong>：消息一定送达（连接断开即丢，不补发）；只推你真正用过的键（BCAST 与表满裁剪都会多推）；送达时序（异步投递）；携带新值（只说"失效了"，删本地缓存是客户端的事）；服务端内存零代价。这套机制自 Redis 6.0 起提供，官方称为 Tracking。</p>
+<h2 id="22-失效推送时序">2.2 失效推送时序</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112710119-469528276.png" alt="" loading="lazy"></p>
+<p>两处关键点：<strong>触发点</strong>是任意连接对已跟踪键的写命中；<strong>耗时点</strong>在失效投递那一步，由主线程写事件投递，消费者处理不及时会把消息堆在输出缓冲区。步骤⑤容易被忽略——键一旦失效就从跟踪表移除，要重新读一次才再次登记；这样表大小跟着"仍被读取的键"走，而不是累计所有历史读过的键，代价是每次写命中都要做一次移除。</p>
+<h2 id="23-触发失效的五类事件与协作关系">2.3 触发失效的五类事件与协作关系</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112713523-386645754.png" alt="" loading="lazy"></p>
+<p>Tracking 本身不删数据，只做两件事：记录"谁读了什么"与"谁改了被读过的键"。真正的一致性依赖客户端收到消息后<strong>主动删本地条目</strong>；客户端没处理消息（连接断、push 处理器未注册、没维护键到条目的映射）本地缓存就会变脏。与协议层的三条协作关系同时成立：</p>
+<ul>
+<li><strong>跟踪状态绑定单个 TCP 连接</strong>：断开后上下文全部销毁，重连必须重开 <code>CLIENT TRACKING ON</code>，并把断连期间视为整表失效。</li>
+<li><strong>本连接自己修改键，默认也会收到失效</strong>；<code>NOLOOP</code> 用来跳过这类自触发消息，读写同连接时通常要开。</li>
+<li><strong>RESP2 的失效经 <code>REDIRECT</code> 转到订阅连接，RESP3 才能在数据连接上直接收 push</strong>；命令语义见第三章。</li>
+</ul>
+<h2 id="24-执行主体数据结构与读写路径">2.4 执行主体、数据结构与读写路径</h2>
+<p>失效推送是纯主线程行为，没有 BIO 线程参与，成本只体现在消息量和跟踪表内存两项可测指标上。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112716757-1821287943.png" alt="" loading="lazy"></p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112720261-912187151.png" alt="" loading="lazy"></p>
+<p><strong>读路径（默认模式）</strong>：客户端 <code>GET product:1001</code> → 主线程执行命令并在返回前把键登记进跟踪表 → 若条目数超过 <code>tracking-table-max-keys</code> 则裁剪，删掉部分记录并向受影响连接发伪失效，防止客户端继续持有旧值。</p>
+<p><strong>写路径（默认模式）</strong>：客户端 B 执行 <code>SET product:1001 "30"</code> → 主线程查跟踪表（默认模式）或前缀表（BCAST）找出受影响连接 → 把该键从 <code>TrackingTable</code> 移除（失效已成事实，要重读才再登记）→ 推送失效：RESP3 是 <code>invalidate</code> push 携带键名，RESP2 通过 <code>REDIRECT</code> 指定连接的 <code>__redis__:invalidate</code> 频道发送，开 <code>NOLOOP</code> 时跳过发起写的连接 → 客户端删本地对应键。</p>
+<p><code>FLUSHALL</code> / <code>FLUSHDB</code> 走另一条路径：遍历 <code>TrackingTable</code> 广播一条空载荷消息，随后清空跟踪表；客户端收到空载荷要把本地缓存整表作废。空载荷在 RESP2 里表现为 nil 或空数组，精确形态标为<strong>待验证</strong>，验证方式：在 8.10.3 上执行 <code>FLUSHDB</code> 观察频道消息的第三段。风险点在投递：网络阻塞或慢消费者场景下，消息堆在输出缓冲区，客户端不会立刻收到失效。</p>
+<h2 id="25-临界值与边界">2.5 临界值与边界</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112723711-1602637598.png" alt="" loading="lazy"></p>
+<h2 id="26-版本与实现线索">2.6 版本与实现线索</h2>
+<p>四种模式在 Redis 6.0 即可用，<code>CLIENT TRACKINGINFO</code> 自 6.2 可用；各选项精确引入版本标为<strong>待验证</strong>，以目标版本官方文档与 <code>COMMAND INFO</code> 为准（版本差异见第七章）。源码线索是 <code>tracking.c</code> 的 <code>trackingInvalidateKey</code> 与 <code>networking.c</code> 的推送路径，函数级实现见本系列相关篇章。</p>
+<h1 id="三命令配置与-api-全集">三、命令、配置与 API 全集</h1>
+<h2 id="31-client-tracking-参数逐项">3.1 CLIENT TRACKING 参数逐项</h2>
+<p><code>CLIENT TRACKING</code> 是开启与配置 Tracking 的核心命令，作用于当前连接。</p>
+<pre><code class="language-bash"># 语法模板：ON/OFF 二选一，其余方括号内都是可选参数
+# REDIRECT 把失效消息投递给指定 id 的连接，id 由 CLIENT ID 取得
+# PREFIX 可重复书写，仅在 BCAST 模式下用于限定监听前缀
+# BCAST / OPTIN / OPTOUT 是互斥模式；NOLOOP 决定本连接自写键是否收到失效
+CLIENT TRACKING ON|OFF
+    [REDIRECT client-id]
+    [PREFIX prefix [PREFIX prefix ...]]
+    [BCAST] [OPTIN] [OPTOUT] [NOLOOP]
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112705846-1053616967.png" alt="" loading="lazy"></p>
+<p>返回值：<code>OK</code> 表示跟踪状态已切换，否则返回错误。</p>
+<h2 id="32-cachingtrackinginfogetredirid">3.2 CACHING、TRACKINGINFO、GETREDIR、ID</h2>
+<p><code>CLIENT CACHING YES|NO</code> 只在 OPTIN 或 OPTOUT 模式下有意义，控制的是<strong>紧随其后的下一条只读命令</strong>是否被登记，而不是切换整条连接的跟踪状态。中间只要插入别的命令（包括 <code>PING</code>），标记就失效；pipeline 场景必须把 <code>CACHING YES</code> 和 <code>GET</code> 放在同一批次或同一事务块连续执行（事务写法见坑 5）。</p>
+<pre><code class="language-bash"># 连接参数：redis-cli -h 127.0.0.1 -p 6379（本机默认值可省略 -h/-p）
+# -3 是 --resp3 的简写，用 RESP3 建连；版本不支持时用完整写法 --resp3
+# 认证：设了密码就追加 -a '密码'，或用 REDISCLI_AUTH 环境变量避免密码出现在命令行
+# 自查：redis-cli --version 看版本；redis-cli HELP CLIENT 看命令用法
+# 下面各行的 "127.0.0.1:6379&gt;" 是提示符，实际只输入提示符之后的命令
+# 查看当前连接的跟踪状态
+127.0.0.1:6379&gt; CLIENT TRACKINGINFO
+# flags 列出已启用的开关，redirect=0 表示消息投递回本连接（RESP3）
+1) "flags"
+2) 1) "on" 2) "noloop" 3) "optin"
+3) "redirect"
+4) (integer) 0
+# prefixes 为空表示没有用 BCAST 注册任何前缀
+5) "prefixes"
+6) (empty array)
+</code></pre>
+<p>flags 取值：<code>on</code> 已启用；<code>bcast</code> / <code>optin</code> / <code>optout</code> / <code>noloop</code> 对应各模式；<code>caching-yes</code> / <code>caching-no</code> 表示下一条命令的临时状态；<code>broken_redirect</code> 表示重定向目标已失效。<code>CLIENT GETREDIR</code> 返回当前重定向目标：正整数是目标连接的 id；<code>-1</code> 表示没有配置重定向目标；<code>0</code> 在部分版本表示消息投递回本连接。三种状态与跟踪开关的对应关系标为<strong>待验证</strong>，验证方式：在 8.10.3 上依次执行 <code>CLIENT TRACKING OFF</code>、<code>CLIENT TRACKING ON</code>（RESP3）、<code>CLIENT TRACKING ON REDIRECT &lt;id&gt;</code>，每步后调用 <code>CLIENT GETREDIR</code> 并用 <code>CLIENT TRACKINGINFO</code> 的 flags 对照。<code>CLIENT ID</code> 取本连接 id，配 <code>REDIRECT</code> 用。</p>
+<h2 id="33-冷门与易混淆的参数">3.3 冷门与易混淆的参数</h2>
+<ul>
+<li><strong>BCAST 不带 PREFIX</strong>：等价于空前缀，会收到<strong>所有</strong>被修改键的失效消息，不是"只收我读过的"。这是线上失效风暴最常见的来源。</li>
+<li><strong>前缀不能相互覆盖</strong>：<code>foo</code> 与 <code>foob</code> 会同时匹配 <code>foobar</code>；<code>user:</code> 与 <code>user:profile:</code> 不要同时注册。只保留范围更合适的那一个。</li>
+<li><strong>前缀追加成本</strong>：前缀表按 radix tree 实现，单次添加应接近前缀长度，而不是随前缀数 N 二次增长；"接近 O(N²)"的说法没有依据，标为<strong>待验证</strong>。验证方式：在 8.10.3 上递增前缀数量，测量 <code>CLIENT TRACKING ON BCAST PREFIX ...</code> 的耗时曲线。无论结果如何前缀数量都应克制，能用两个互不覆盖的前缀解决，就不要堆十几个。</li>
+<li><strong>写事件会移除被写键的跟踪记录</strong>：无论是否开 <code>NOLOOP</code>，键被写后都会从跟踪表移除，后续别人再改也不会通知，除非重新读一次。<code>NOLOOP</code> 只决定"本连接自己写的那条失效要不要发给本连接"，不改变移除行为。若业务期望"自己改完也刷新本地缓存"，要么不开 <code>NOLOOP</code> 并在写后手动删本地条目，要么把写放到另一条连接。</li>
+<li><strong>REDIRECT 由客户端库托管</strong>：不少 SDK 内部用一条长连接专门收失效消息。应用层不要随手改 client-id，改错就丢消息。</li>
+</ul>
+<h2 id="34-配置项与运行时命令速查">3.4 配置项与运行时命令速查</h2>
+<p>两类要分清：配置项用 <code>CONFIG GET</code> / <code>CONFIG SET</code> 改，运行时命令用 <code>CLIENT ...</code> 下发。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112936159-903001360.png" alt="" loading="lazy"></p>
+<p>两个默认值在 8.10.3 上的精确取值标为<strong>待验证</strong>，以 <code>CONFIG GET</code> 实际返回为准。适用场景：<code>tracking-table-max-keys</code> 用于默认模式与 OPTOUT 限制内存；<code>client-output-buffer-limit pubsub</code> 用于 REDIRECT 接收连接与 BCAST 订阅连接。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126112939881-130099453.png" alt="" loading="lazy"></p>
+<h2 id="35-redis-cli-双协议与-c-实现对照">3.5 redis-cli 双协议与 C# 实现对照</h2>
+<p><strong>RESP3 同连接收 push</strong>（推荐路径，终端可直接观察）：</p>
+<pre><code class="language-bash"># 用 RESP3 建连：-3 等价于 --resp3，若不识别该短选项改用 --resp3
+# 非本机时补 -h 主机 -p 端口；有密码时补 -a '密码' 或用 REDISCLI_AUTH
+redis-cli -3 -p 6379
+# 握手切到 RESP3；返回 3 表示成功，握手后连接即支持服务端 push
+127.0.0.1:6379&gt; HELLO 3
+# 在当前连接开跟踪；NOLOOP 让本连接自己写键时不回推失效
+127.0.0.1:6379&gt; CLIENT TRACKING ON NOLOOP
+OK
+# 读一个键，服务端把 bar 登记为"本连接读过"
+127.0.0.1:6379&gt; GET bar
+"1"
+</code></pre>
+<p>另一个终端执行 <code>SET bar 2</code>，本连接收到：</p>
+<pre><code class="language-text">1) "invalidate"
+2) 1) "bar"
+</code></pre>
+<p>推荐 RESP3 的理由：失效 push 与数据在同一条连接上，省掉一条专门收消息的订阅连接及其重连管理；代价是需要客户端库支持 RESP3 push 回调。</p>
+<p><strong>RESP2 双连接 REDIRECT</strong>（兼容路径）：</p>
+<pre><code class="language-bash"># 接收连接：取自己的 id，后续数据连接把失效重定向到这个 id
+127.0.0.1:6379&gt; CLIENT ID
+(integer) 14
+# 接收连接订阅失效频道；进入订阅后该连接只能收消息，不能再发普通命令
+127.0.0.1:6379&gt; SUBSCRIBE __redis__:invalidate
+1) "subscribe"
+2) "__redis__:invalidate"
+3) (integer) 1
+</code></pre>
+<p>另一个连接做数据读写：</p>
+<pre><code class="language-bash"># 数据连接：把失效投递到 id=14 的接收连接；14 由上一条 CLIENT ID 实际返回替换
+127.0.0.1:6379&gt; CLIENT TRACKING ON REDIRECT 14 NOLOOP
+OK
+# 读键会在服务端登记，之后该键失效会推给接收连接而非本连接
+127.0.0.1:6379&gt; GET product:1001
+"50"
+</code></pre>
+<p>订阅连接收到：</p>
+<pre><code class="language-text">1) "message"
+2) "__redis__:invalidate"
+3) 1) "product:1001"
+</code></pre>
+<p>两种载荷结构不同：RESP3 是 <code>invalidate + 键数组</code>，RESP2 是 <code>message + 频道 + 键数组</code>。解析逻辑不能混用。</p>
+<p><strong>C# 可运行示例（net10.0 + StackExchange.Redis，RESP2 + REDIRECT + Pub/Sub）</strong>：这条示例走 RESP2 + REDIRECT 路径，因为 StackExchange.Redis 默认以 RESP2 建连，且 <code>ISubscriber.Subscribe</code> 的回调只暴露标量 <code>RedisValue</code>，而失效载荷是键数组，拿不到数组元素。若所用版本提供能返回原始 <code>RedisResult</code> 或 RESP3 push 的 API，可替换接收部分，写法标为<strong>待验证</strong>，以所用版本官方文档为准。net10.0 项目实际解析到哪个 StackExchange.Redis 版本也标为<strong>待验证</strong>，它决定是否需要自写接收器：若该版本已支持返回原始 push，优先改用该 API。</p>
+<p>项目引用（.csproj 中添加，版本按实际解析结果确认）：</p>
+<p><strong>代码见附件1</strong></p>
+<p>代码要点：<code>FallbackTtl</code> 给出了推送丢失时的本地过期时间，不能删。<code>GetTracked</code> 用一把锁把"标记—回源—写入本地缓存"串在一起：既避免别的命令插进 <code>CACHING YES</code> 与 <code>GET</code> 之间，也避免失效落在"回源完成"与"写入缓存"之间——后者一旦发生旧值被写进本地缓存，而该键已从跟踪表移除，不会再有第二条失效纠正。判定标准是"写缓存前是否持有同一把锁"，代价是同一连接上的热点读被串行化；读并发很高时可改为每条读命令单独占一条连接。</p>
+<p>另有一处必须实测：<code>CACHING YES</code> 与随后的 <code>StringGet</code> 都通过 <code>IDatabase</code> 下发，应用层锁只保证它们在业务侧串行，不保证 StackExchange.Redis 把它们固定在同一个物理连接上；若底层换了连接，标记会落空、该次读不被跟踪。判定方式：在 8.10.3 上用 <code>CLIENT TRACKINGINFO</code> 观察 flags 中 <code>caching-yes</code> 的临时状态，并在 <code>CACHING YES</code> 后改键确认是否收到推送；这一行为标为<strong>待验证</strong>。StackExchange.Redis 在 2.x 版本线没有开箱即用的 Client-side Caching 封装，收到失效后由业务代码删除本地条目；若改用 FreeRedis，其 <code>UseClientSideCaching</code> 提供封装，但 <code>KeyFilter</code> 是客户端侧过滤，不会减少服务端跟踪表内存——是否走 OPTIN 需用 <code>CLIENT TRACKINGINFO</code> 观察 flags 实测确认。</p>
+<h1 id="四业务影响与亲手验证">四、业务影响与亲手验证</h1>
+<h2 id="41-对业务的三层影响">4.1 对业务的三层影响</h2>
+<p><strong>收益</strong>：读请求的 P99 延迟从"网络 RTT + Redis 执行时间"降到"本地内存访问时间"，跨可用区部署时尤其明显，Redis 上的重复读下降、节点 CPU 与网络压力降低。失效由写事件驱动，旧值窗口比固定 TTL 短得多，也不用业务自己写发布订阅逻辑。前置条件：网络 RTT 越大、本地命中率越高收益越大；回环地址或命中率很低时收益接近于零。</p>
+<p><strong>成本与风险</strong>：跟踪表内存与读键基数成正比，100 万键按每条目数百字节估算可达数百 MB 量级，上限设得过大而键基数不可控时内存会成为问题。写热点键触发大量失效推送，主线程写 socket 压力上升；消费者不及时会把消息堆在输出缓冲区，超限即被断开。一致性从"定时过期"变成"事件驱动"但仍是异步——写入到收到失效之间有窗口，连接断开会把窗口拉长到重连之前。</p>
+<p><strong>一致性变差时的表现与替代方案</strong>：失效消息丢失（断连、处理异常、输出缓冲溢出）会让本地缓存变脏；表满裁剪产生伪失效，让命中率骤降且回源尖峰。客户端缓存是优化，不是强一致承诺。任何一条通道出问题都能退回"应用 MemoryCache + 较短 TTL"；要求强一致的读直接走 Redis 或数据库，不设本地缓存。表满裁剪或重连后的回源尖峰可用请求合并与随机延迟抑制：同一键的并发回源合并为一次，重试加随机错峰。</p>
+<h2 id="42-亲手验证">4.2 亲手验证</h2>
+<p><strong>验证 1：默认模式生效与 RESP3 push</strong></p>
+<pre><code class="language-bash"># 终端 A：用 RESP3 建连（-3 等价 --resp3）
+redis-cli -3
+# 开跟踪，默认模式登记所有读键，NOLOOP 屏蔽自写键的失效
+127.0.0.1:6379&gt; CLIENT TRACKING ON
+OK
+# 读 product:1001，服务端登记该键；预期返回 "50"
+127.0.0.1:6379&gt; GET product:1001
+"50"
+</code></pre>
+<p>另一个终端：</p>
+<pre><code class="language-bash"># 终端 B：改写被跟踪的键；预期返回 OK，并触发终端 A 收到失效
+127.0.0.1:6379&gt; SET product:1001 "30"
+OK
+</code></pre>
+<p>预期：终端 A 出现 <code>1) "invalidate" 2) 1) "product:1001"</code>；第一个元素是 <code>invalidate</code>，第二个是键数组。不符时先用 <code>CLIENT LIST</code> 的 <code>resp</code> 字段确认真在 RESP3，再看 <code>CLIENT TRACKING ON</code> 是否返回 <code>OK</code>。</p>
+<p><strong>验证 2：RESP2 双连接看清真实载荷</strong></p>
+<pre><code class="language-bash"># 连接 1（接收端）：取自身 id，记下整数值供下一步 REDIRECT 使用
+127.0.0.1:6379&gt; CLIENT ID
+(integer) 14
+# 连接 1 订阅失效频道，进入订阅态后不再接受普通命令
+127.0.0.1:6379&gt; SUBSCRIBE __redis__:invalidate
+</code></pre>
+<p>另一个连接：</p>
+<pre><code class="language-bash"># 连接 2（数据端）：把失效重定向到 id=14；14 换成上一步实际返回值
+127.0.0.1:6379&gt; CLIENT TRACKING ON REDIRECT 14
+OK
+# 读 foo，服务端登记；预期返回 "1"
+127.0.0.1:6379&gt; GET foo
+"1"
+</code></pre>
+<p>第三个连接：</p>
+<pre><code class="language-bash"># 连接 3（写入端）：改 foo 触发失效，预期返回 OK
+127.0.0.1:6379&gt; SET foo 2
+OK
+</code></pre>
+<p>预期：订阅连接收到 <code>1) "message" 2) "__redis__:invalidate" 3) 1) "foo"</code>；第三个元素是只含键名的数组，不是裸字符串。不符多半是没真正订阅，或 <code>REDIRECT</code> 填错了 id。</p>
+<p><strong>验证 3：RESP2 不配 REDIRECT 的边界</strong></p>
+<pre><code class="language-bash"># RESP2 连接只开跟踪、不设 REDIRECT，验证"OK 不等于可达"
+127.0.0.1:6379&gt; CLIENT TRACKING ON
+OK
+# 读 baz，服务端登记；预期返回 "1"
+127.0.0.1:6379&gt; GET baz
+"1"
+</code></pre>
+<p>另一个终端执行 <code>SET baz 2</code>，本连接应无任何输出——命令成功不等于消息可达。若居然收到消息，说明这条连接实际是 RESP3，或客户端库在底层替你订阅了失效频道。</p>
+<p><strong>验证 4：NOLOOP 与 OPTIN 的开关效果</strong></p>
+<pre><code class="language-bash"># 终端 A：RESP3 建连并开 NOLOOP
+redis-cli -3
+127.0.0.1:6379&gt; CLIENT TRACKING ON NOLOOP
+OK
+# 本连接自己写 demo:test，因 NOLOOP 不应收到失效
+127.0.0.1:6379&gt; SET demo:test "v1"
+OK
+127.0.0.1:6379&gt; GET demo:test
+"v1"
+127.0.0.1:6379&gt; SET demo:test "v2"
+OK
+</code></pre>
+<p>预期：本连接自己修改键收不到失效推送，<code>CLIENT TRACKINGINFO</code> 的 flags 含 <code>noloop</code>。接着验证 OPTIN：</p>
+<pre><code class="language-bash"># 换一条 RESP3 连接，同时开 NOLOOP 与 OPTIN
+redis-cli -3
+127.0.0.1:6379&gt; CLIENT TRACKING ON NOLOOP OPTIN
+OK
+# OPTIN 下没打标记的读不会被登记，改 opt:1 不会推送
+127.0.0.1:6379&gt; SET opt:1 "a"
+OK
+127.0.0.1:6379&gt; GET opt:1
+"a"
+# 给下一条读命令打标记；标记只对该条 GET 有效
+127.0.0.1:6379&gt; CLIENT CACHING YES
+OK
+127.0.0.1:6379&gt; SET opt:2 "b"
+OK
+# opt:2 被登记，其他终端改它时会收到推送
+127.0.0.1:6379&gt; GET opt:2
+"b"
+</code></pre>
+<p>预期：其他终端改 <code>opt:1</code> 无推送，改 <code>opt:2</code> 有推送。不符多半是漏了 <code>CLIENT CACHING YES</code>，或标记与读命令之间插了别的命令。</p>
+<p><strong>验证 5：跟踪表规模与内存</strong></p>
+<pre><code class="language-bash"># 查看容量上限；预期默认返回 "1000000"，以实际 CONFIG GET 为准
+127.0.0.1:6379&gt; CONFIG GET tracking-table-max-keys
+1) "tracking-table-max-keys"
+2) "1000000"
+# 看跟踪键数与条目数
+127.0.0.1:6379&gt; INFO stats
+# 看 used_memory，比较跟踪开关前后的差异
+127.0.0.1:6379&gt; INFO memory
+</code></pre>
+<p><code>INFO stats</code> 关注 <code>tracking_total_keys</code> / <code>tracking_total_items</code> / <code>tracking_total_prefixes</code>，<code>INFO memory</code> 关注 <code>used_memory</code>。判读：用脚本连续读 5 万个互不相同的键，两项应同步上涨——<code>tracking_total_keys</code> 是被跟踪的唯一键数，<code>tracking_total_items</code> 是"键 × 客户端"的条目总和，后者更直接对应内存。若两项都是 0 说明这条连接实际没开跟踪；若内存几乎不涨，检查 flags 或键名是否极短。</p>
+<h1 id="五生产落地实战">五、生产落地实战</h1>
+<p>下面四个场景覆盖了大多数人真正会遇到的取舍，区别只在热点能否枚举、前缀能否覆盖、协议能不能升级、连接稳不稳。</p>
+<h2 id="51-场景一配置中心与商品详情页用-optin-只跟踪热点键">5.1 场景一：配置中心与商品详情页，用 OPTIN 只跟踪热点键</h2>
+<p><strong>需求</strong>：商品详情页 QPS 极高但频繁读的只有约 5000 个热门商品；配置中心里版本号、开关、字典表几乎只读却要求"一改就生效"。全量默认跟踪会把所有读过的键（含长尾）记进跟踪表，浪费内存。</p>
+<p><strong>选型与判定标准</strong>：热点键数量可控、远小于读过的键总数时选 OPTIN，只把真正要缓存的键登记进跟踪表。失效条件是"热点判定本身出错"——把大量冷键标成热点，表照样膨胀；此时改用更严格的键名前缀过滤，或退回短 TTL 本地缓存。</p>
+<pre><code class="language-bash"># 接收连接：取自身 id，记下供数据连接 REDIRECT 使用
+127.0.0.1:6379&gt; CLIENT ID
+(integer) 21
+# 接收连接订阅失效频道
+127.0.0.1:6379&gt; SUBSCRIBE __redis__:invalidate
+</code></pre>
+<p>数据连接：</p>
+<pre><code class="language-bash"># 数据连接：OPTIN 模式，失效重定向到 id=21，NOLOOP 屏蔽自写失效
+127.0.0.1:6379&gt; CLIENT TRACKING ON OPTIN REDIRECT 21 NOLOOP
+OK
+# 给紧随其后的 GET 打标记，才会在 OPTIN 下被登记
+127.0.0.1:6379&gt; CLIENT CACHING YES
+OK
+# 读版本号，预期返回 "v3"
+127.0.0.1:6379&gt; GET config:app:version
+"v3"
+</code></pre>
+<p>C# 核心片段（net10.0 + StackExchange.Redis，接上节 <code>TrackingCache</code>）：</p>
+<pre><code class="language-csharp">// 集合类型：HashSet 与 StringComparer 来自这两个命名空间
+using System;
+using System.Collections.Generic;
+
+// 维护一份热点键集合，只有集合内的键才标记追踪
+var hotKeys = new HashSet&lt;string&gt;(StringComparer.Ordinal)
+{
+    "goods:hot:100",
+    "goods:hot:101"
+};
+
+// 构造 OPTIN 模式的缓存实例；using 保证退出作用域时释放连接
+using var cache = new TrackingCache("127.0.0.1:6379", "optin");
+string key = "goods:hot:100";
+
+// 热点键走登记与本地缓存；冷键直接回源，不进本地缓存也不登记
+string? value = hotKeys.Contains(key)
+    ? cache.GetTracked(key)
+    : cache.GetUntracked(key);
+
+// 打印结果，未命中时用占位文案
+Console.WriteLine(value ?? "未命中");
+</code></pre>
+<p><strong>失效条件与替代方案</strong>：<code>CLIENT CACHING YES</code> 只对下一条读命令有效，pipeline 中若与 <code>GET</code> 分到不同批次标记就失效——把两者放进同一批次或同一事务块。热点数量暴涨时 <code>tracking_total_items</code> 同步上升，按第六章估算留足内存；超过阈值就关闭客户端缓存，退回 <code>MemoryCache</code> + 短 TTL。</p>
+<h2 id="52-场景二多实例共享命名空间用-bcast--prefix">5.2 场景二：多实例共享命名空间，用 BCAST + PREFIX</h2>
+<p><strong>需求</strong>：一组实例共享 <code>user:*</code>、<code>order:*</code> 两个命名空间，每个实例缓存哪些键事先不确定，也不希望服务端逐键记录。默认模式要为每个实例记录读过的每个键，跟踪表很大。</p>
+<p><strong>选型与判定标准</strong>：键集合大、每个实例读哪几个键不可预测、但这些键能被少数互不覆盖的前缀覆盖时选 BCAST——服务端只存前缀订阅，内存几乎为零。BCAST 的失效量与"前缀内的写入频率"成正比，与"缓存了多少键"无关；前缀下写入频繁时推送流量成为主要成本。</p>
+<pre><code class="language-bash"># 接收连接：取 id 并订阅失效频道，两个前缀的失效都会推到这里
+127.0.0.1:6379&gt; CLIENT ID
+(integer) 21
+127.0.0.1:6379&gt; SUBSCRIBE __redis__:invalidate
+1) "subscribe"
+2) "__redis__:invalidate"
+3) (integer) 1
+</code></pre>
+<pre><code class="language-bash"># 数据连接：BCAST 按前缀广播；REDIRECT 填上面实际返回的 id，占位符需替换
+127.0.0.1:6379&gt; CLIENT TRACKING ON BCAST PREFIX user: PREFIX order: REDIRECT &lt;订阅连接id&gt; NOLOOP
+OK
+# 写 user:999 会向所有订阅 user: 的连接推送失效，尽管它们没读过这个键
+127.0.0.1:6379&gt; SET user:999 x
+OK
+</code></pre>
+<p>所有订阅 <code>user:</code> 的连接都会收到失效，哪怕从没读过 <code>user:999</code>。</p>
+<p>C# 核心片段：</p>
+<pre><code class="language-csharp">// Console 用于输出结果
+using System;
+
+// 构造 BCAST 模式缓存，传入两个互不覆盖的前缀
+using var cache = new TrackingCache(
+    "127.0.0.1:6379", "bcast", "user:", "order:");
+
+// 失效解析、整表作废与重连自愈复用 3.5 节同一个实现
+string? name = cache.GetTracked("user:1001");
+Console.WriteLine(name ?? "未命中");
+</code></pre>
+<p><strong>什么时候不该用 BCAST</strong>：写频率高、前缀下键数量达百万级、本地命中率依赖精确失效的场景。BCAST 的规则是"宁可多推，不可漏推"，业务若无法容忍大量假失效带来的回源，就改用 OPTIN 或默认模式。除了 <code>user:</code> 与 <code>user:profile:</code> 这类相互覆盖的前缀，也要避免在热点前缀上承载高频写入。</p>
+<h2 id="53-场景三客户端只支持-resp2用-redirect-桥接">5.3 场景三：客户端只支持 RESP2，用 REDIRECT 桥接</h2>
+<p><strong>需求</strong>：现有客户端库只支持 RESP2，又想用 Tracking。<strong>方案与判定标准</strong>：一条连接做数据读写并开启 <code>CLIENT TRACKING ON REDIRECT &lt;id&gt;</code>，另一条连接取自己的 <code>CLIENT ID</code> 并订阅 <code>__redis__:invalidate</code> 收失效。判定标准是"能否长期维护这条接收连接"——接收连接断开后数据连接仍开着跟踪，消息发往一个不存在的连接，全部丢失。</p>
+<p><strong>失效条件与替代方案</strong>：客户端必须在重连后重新取 id、重新 <code>CLIENT TRACKING ON REDIRECT</code>，并在本地整表作废；做不到这套连接管理就不要用 RESP2 桥接，改用带短 TTL 的本地缓存，或升级客户端库到支持 RESP3 的版本。3.5 节的 <code>TrackingCache</code> 已包含重连后重新取 id、重开 REDIRECT 与整表作废的完整实现。</p>
+<h2 id="54-场景四连接会瞬断把断连当作整表失效">5.4 场景四：连接会瞬断，把断连当作整表失效</h2>
+<p><strong>需求</strong>：进程与 Redis 之间可能瞬断，断连期间产生的失效消息永远收不到，重连后本地缓存仍是旧值。<strong>方案与判定标准</strong>：在连接恢复事件里清空本地缓存并重开跟踪，把"断连"直接当成"整表失效"，判定标准是"清空本地缓存造成的回源尖峰能否承受"——重连瞬间命中率跌到 0。<strong>失效条件与替代方案</strong>：若 Redis 频繁抖动，先用退避与熔断控制重连节奏，否则清空缓存的压力会转移到后端存储；仍不稳定就关闭客户端缓存，回到纯本地缓存方案。</p>
+<p>断连自愈的四个状态：</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113048912-29728870.png" alt="" loading="lazy"></p>
+<p>C# 核心片段：</p>
+<pre><code class="language-csharp">// Console 与超时异常类型分别来自这两个命名空间
+using System;
+using StackExchange.Redis;
+
+// 实例放在 try 外，catch 中才能作废本地缓存
+TrackingCache? cache = null;
+try
+{
+    // 构造缓存并读一个配置键；默认 OPTIN 模式
+    cache = new TrackingCache("127.0.0.1:6379");
+    string? value = cache.GetTracked("config:app:version");
+    Console.WriteLine(value ?? "未命中");
+}
+catch (RedisTimeoutException ex)
+{
+    // 超时期间失效可能已丢失，回源前先整表作废
+    cache?.InvalidateAll();
+    Console.WriteLine($"已作废本地缓存，准备回源：{ex.Message}");
+}
+finally
+{
+    // 无论成功失败都释放连接，避免句柄泄漏
+    cache?.Dispose();
+}
+</code></pre>
+<h2 id="55-什么时候不该用客户端缓存">5.5 什么时候不该用客户端缓存</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113055726-171230197.png" alt="" loading="lazy"></p>
+<p>集群环境下有一条当下可用的判断：单节点验证通过前，先不要在集群上开默认模式与 BCAST 无前缀这两种行为——它们对跨槽与消息路由最敏感。还有一处运维风险：应用若向 <code>__redis__:invalidate</code> 频道发布消息，会让订阅客户端清空本地缓存；用 Redis ACL 限制普通业务账号对该频道的 <code>PUBLISH</code> 权限。示例里那个 30~60 秒的取值只是演示，上线前按业务的写入频率重测一遍再定。</p>
+<h1 id="六性能与开销量化">六、性能与开销量化</h1>
+<h2 id="61-开销构成">6.1 开销构成</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113059159-1293920400.png" alt="" loading="lazy"></p>
+<h2 id="62-观测与压测方法">6.2 观测与压测方法</h2>
+<p><strong>测量条件与数据来源</strong>：6.3 的绝对数字来自 Redis 7.2.5 单实例、非集群、无持久化、回环地址（127.0.0.1），客户端为直连 Redis 协议的 Python socket 客户端，键名长度不超过 12 字节，单次观测的内存项重复 3 次取一致值；QPS 项为 Redis 7.2、8 核 16GB、局域网、redis-cli 模拟。实测环境为 Redis 8.10.3，这些数字的精确值需按 8.10.3 复核，标为<strong>待验证</strong>；未测真实网络 RTT 与多客户端并发，实际值随环境变化。第九章坑点中出现的计数变化与伪失效条数，同样来自上述 7.2.5 条件，8.10.3 待复核。这组数我会先压到 8.10.3 上复测再改结论，复测前只拿来定方向、不拿来定容量。</p>
+<pre><code class="language-bash"># 看跟踪键数、条目数与前缀数（tracking_total_* 系列）
+INFO stats
+# 看跟踪客户端数与最大输出缓冲（tracking_clients 等）
+INFO clients
+# 看每连接的 flags / redir / omem / obl，判断跟踪是否生效与消息是否堆积
+CLIENT LIST
+# 看本连接跟踪状态：flags、redirect、prefixes
+CLIENT TRACKINGINFO
+</code></pre>
+<p><code>INFO stats</code> 看 <code>tracking_total_keys</code> / <code>tracking_total_items</code> / <code>tracking_total_prefixes</code>，<code>INFO clients</code> 看 <code>tracking_clients</code> / <code>client_recent_max_output_buffer</code>，<code>CLIENT LIST</code> 看 <code>flags</code> 列是否含 <code>t</code>、<code>redir</code> 的重定向目标、<code>omem</code> 的输出缓冲占用。用 <code>CLIENT TRACKINGINFO</code> 确认模式生效，<code>INFO memory</code> 的 <code>used_memory</code> 看跟踪前后差异，<code>INFO stats</code> 的 <code>total_net_output_bytes</code> 看推送流量。没有直接的 <code>tracking_table_size</code> 字节指标，可用 <code>used_memory</code> 增量结合 <code>tracking_total_items</code> 估算。<strong>对照组</strong>是同样的读请求但不开启跟踪，用来剥离纯读操作本身的内存影响。</p>
+<h2 id="63-实测对比表与拐点">6.3 实测对比表与拐点</h2>
+<p>绝对数字按 Redis 7.2.5 实测，8.10.3 的精确值待复核，不直接当作本版本结论。</p>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113106275-1703729276.png" alt="" loading="lazy"></p>
+<p>先看内存这条边界：跟踪表内存由"唯一键数 × 客户端数"（即 <code>tracking_total_items</code>）决定，不是由总请求量决定——同一批键被 3 个客户端各读一遍，内存约为单客户端的 3 倍。唯一键数超过数十万且客户端较多时，内存占用不可忽视。再看伪失效：<code>tracking-table-max-keys</code> 设得越低，越早进入大批伪失效区间（上表上限 50 对应 150 条伪失效）。最后是推送流量：BCAST 下写频率超过每秒数百次、订阅者超过数十个时，推送流量与主线程 socket 写入开始产生可测量的延迟；写频率升高时推送近似线性放大，拐点位置随环境与订阅者数变化，需按实际场景重测。成本落在的地方不一样：默认模式和 OPTOUT 吃服务端内存，BCAST 吃推送流量。同一批键被复用的次数越少，默认模式越不划算——你付了内存，没省下几次回源。</p>
+<h2 id="64-监控指标与告警">6.4 监控指标与告警</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113109021-860634782.png" alt="" loading="lazy"></p>
+<p>一旦指标触发阈值，业务可动态关闭客户端缓存退回普通 <code>MemoryCache</code>；也可在业务侧抽样比对版本号，定期校验本地数据与 Redis 是否一致。</p>
+<h1 id="七横向对比与选型">七、横向对比与选型</h1>
+<h2 id="71-四种模式内部对比">7.1 四种模式内部对比</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113112298-1850285757.png" alt="" loading="lazy"></p>
+<h2 id="72-与其他一致性方案对比">7.2 与其他一致性方案对比</h2>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113115662-1314432054.png" alt="" loading="lazy"></p>
+<p><strong>选型结论</strong>：能用协议内建的跟踪，就不要自己拼 Pub/Sub 广播——失效推送把"谁该收到哪条失效"放到服务端，噪声和实现成本都更低。反例边界：业务若已有一套消息总线在传播数据变更事件，复用现有通道做失效反而更省，不必为失效单独引入跟踪表。落到选择上：能接受毫秒级窗口且读量很大，选默认模式或 OPTIN；完全不能接受旧值就不要用本地缓存，直接读 Redis；写压力大或 SDK 不支持 RESP3，就用应用 MemoryCache 搭配合理 TTL。</p>
+<h1 id="八版本演进与兼容差异">八、版本演进与兼容差异</h1>
+<p><img src="https://img2024.cnblogs.com/blog/386841/202611/386841-20261126113119158-1395296885.png" alt="" loading="lazy"></p>
+<p>BCAST 自 6.0 提供，并非 7.0 才可用；生产使用前以目标版本官方文档与 <code>COMMAND INFO</code> 确认具体行为，集群/分片场景按 7.0+ 评估。服务端只推送键的失效通知，永远不会推 Value 数据，回源仍需客户端执行 <code>GET</code>；过期与内存淘汰同样会触发失效推送，不能按"只有显式写入才推"设计。以上依据 Redis 官方文档的 Client-side Caching 与 CLIENT TRACKING 章节。Redis Cluster 下客户端缓存行为存在限制，跨槽场景下键的追踪更复杂，生产集群要单独评估，见本系列相关篇章；单节点验证通过前，不要在集群上开默认模式与 BCAST 无前缀。</p>
+<h1 id="九高频线上坑点">九、高频线上坑点</h1>
+<p><strong>坑 1：<code>CLIENT TRACKING ON</code> 成功却收不到失效消息</strong>。最常见的现场：<code>CLIENT TRACKING ON</code> 返回了 OK，读也正常，改键之后连接一点动静没有，本地缓存还是旧值。查下去通常是两件事之一——RESP2 没配 <code>REDIRECT</code>，消息没地方投；或者客户端根本没处理 push，既没订阅失效频道，也没注册处理器。我的建议是 RESP2 一律配 <code>REDIRECT</code> 或改用 RESP3，先在客户端打一条收到推送的日志，再看 <code>CLIENT LIST</code> 的 <code>resp</code> 和 <code>redir</code>：日志没有就查投递路径，日志有就查本地删条目的代码。</p>
+<p><strong>坑 2：跟踪表撑爆内存</strong>。现象：<code>used_memory</code> 持续上涨但数据量没明显增加，<code>tracking_total_keys</code> 只增不减。根因：默认模式下大量不同的读键被跟踪，读命令只登记不自动回收，客户端断开也不会立即回收。规避：设合理的 <code>tracking-table-max-keys</code>，热点有限时改 OPTIN，海量随机键不开普通跟踪。验证：<code>CONFIG GET tracking-table-max-keys</code> 加 <code>INFO memory</code> 趋势，<code>CLIENT TRACKING OFF</code> 后观察内存是否回落。</p>
+<p><strong>坑 3：BCAST 假失效打垮回源</strong>。现象：开启 BCAST 后数据库或后端 QPS 飙升，客户端收到大量没读过的键的失效。根因：BCAST 按前缀广播，与"是否读过"无关，前缀过粗时失效量随写频率线性放大。规避：只在写频率低、前缀范围窄的场景用，前缀切到业务边界且互不覆盖，收到失效后先判断本地是否存在该键。验证：对比开启前后 <code>total_net_output_bytes</code> 与后端 QPS，<code>CLIENT TRACKINGINFO</code> 看订阅前缀。</p>
+<p><strong>坑 4：REDIRECT 目标连接断开后失效静默丢失</strong>。你可能会发现缓存过一阵子自己"好了"——其实是 TTL 到期把旧值熬没了，不是失效推送起作用。这种情况基本都是接收连接断过：数据连接的跟踪还开着，消息发往一个已经不存在的连接；跟踪状态绑定 TCP 连接，重连后没重新执行 <code>CLIENT TRACKING ON</code> 就再也收不到失效。规避：重连后重新 <code>CLIENT ID</code> 加 <code>CLIENT TRACKING ON REDIRECT</code>，本地整表作废并设过期时间作为最后保障。验证：手动断开接收连接观察客户端日志是否记录重连，重连后查 <code>CLIENT TRACKINGINFO</code>。</p>
+<p><strong>坑 5：OPTIN 下 <code>CLIENT CACHING YES</code> 放错位置</strong>。现象：打了标记键却没被跟踪。根因：<code>CLIENT CACHING YES</code> 必须紧接只读命令，中间插入其他命令（含 <code>PING</code>）即失效，pipeline 分到不同批次也会失效。规避：把 <code>CACHING YES</code> 和 <code>GET</code> 放在同一批次或同一事务块连续执行。验证：<code>CLIENT TRACKINGINFO</code> 不直接显示某个键是否被跟踪，可改这个键观察是否收到推送。</p>
+<p>与事务结合的正确写法是把标记与读命令放进同一个 <code>MULTI</code> / <code>EXEC</code> 块，二者连续入队不会被其他命令插入：</p>
+<pre><code class="language-bash"># 先在 RESP3 连接上以 OPTIN + NOLOOP 开跟踪；预期 OK
+127.0.0.1:6379&gt; CLIENT TRACKING ON OPTIN NOLOOP
+OK
+# 开启事务，接下来的命令只入队不执行；预期 OK
+127.0.0.1:6379&gt; MULTI
+OK
+# 标记只作用于紧随其后的读命令；入队返回 QUEUED
+127.0.0.1:6379&gt; CLIENT CACHING YES
+QUEUED
+# 读命令紧跟标记入队；入队返回 QUEUED
+127.0.0.1:6379&gt; GET cfg:version
+QUEUED
+# 执行事务，按入队顺序返回两条结果：标记 OK、读值 "v3"
+127.0.0.1:6379&gt; EXEC
+1) OK
+2) "v3"
+</code></pre>
+<p>pipeline 下判定标准相同：<code>CACHING YES</code> 与 <code>GET</code> 必须在同一批次连续下发，中间不能夹入别的命令，跨批次下发等于没标记。</p>
+<p><strong>坑 6：NOLOOP 与自改键的跟踪表移除</strong>。现象：读写同连接时自己改过的键之后被别人改也不再通知；反过来没开 NOLOOP 时本连接写键也会收到大量无意义推送。根因：写命中会把该键从跟踪表移除（7.2.5 实测改 1 键后计数 5→4，重读后恢复 5，8.10.3 待复核），NOLOOP 跳过本连接造成的失效。规避：自改后重新读一次，或把写放到独立连接；若希望自改也刷新本地缓存就不开 NOLOOP 并在写后手动删本地条目。验证：同连接 <code>SET</code> 后观察是否收到推送与 <code>tracking_total_keys</code> 计数变化。</p>
+<p><strong>坑 7：大量客户端跟踪同一热点键 / 订阅连接被断开</strong>。现象：热点键写入时主线程延迟毛刺，写 QPS 高时部分客户端被服务端主动断开。根因：写操作要向所有读过该键的连接推送，连接多时写 socket 耗时可观；客户端消费慢，输出缓冲超过 <code>client-output-buffer-limit pubsub</code> 硬限即被断开（回环测试中 20 万条堆积未触发，真实网络需重测）。规避：控制跟踪同一键的连接数，或接受短毛刺，监控 <code>omem</code>。验证：<code>LATENCY HISTORY</code> 看写命令是否有尖刺，<code>CLIENT LIST</code> 看 <code>omem</code> / <code>obl</code>。</p>
+<p><strong>坑 8：表裁剪伪失效与推送丢失造成缓存漂移</strong>。现象：<code>tracking-table-max-keys</code> 接近上限时收到大批失效、命中率骤降，或键已改却没收到失效长期读到旧值。根因：表满裁剪旧记录并推送伪失效（7.2.5 实测上限 50、读 200 键约 150 条伪失效，8.10.3 待复核）；TCP 阻塞、输出缓冲满、缓冲区丢失都会让推送不到达——推送不保证可靠投递。规避：上限按峰值放大到"唯一键数 × 客户端数 × 1.5~2"，本地缓存必须设过期时间作为最后保障，强一致读仍走 Redis 或数据库。验证：<code>tracking_total_keys</code> 是否顶在上限，业务侧抽样比对版本号定期校验本地与 Redis 是否一致。</p>
+<h1 id="十结论与复查条件">十、结论与复查条件</h1>
+<h2 id="101-小结">10.1 小结</h2>
+<ul>
+<li>Tracking 是服务端失效推送协议，不是本地缓存库：服务端只推键的失效通知，不推数据值，本地缓存与回源都由客户端负责。适用条件是读多写少、键集合可控、能接受毫秒级异步窗口。</li>
+<li>四种模式的差别在"谁记录什么"：默认记录每个读过的键，OPTIN 只记录标记过的，OPTOUT 排除标记的，BCAST 只记录前缀。选择就是在服务端内存与假失效之间取平衡，判定依据是读基数、写入频率和键能否被少数前缀覆盖。</li>
+<li>协议与连接决定消息能否到达：RESP2 必须 <code>REDIRECT</code>，RESP3 才能同连接收 push；跟踪状态绑定 TCP 连接，重连后整表作废并重开跟踪。排障顺序固定：先看协议是不是 RESP3，再看 <code>REDIRECT</code> 目标在不在，最后看收到消息后删本地条目的代码有没有跑。</li>
+<li>服务端代价按"唯一键数 × 客户端数"估算，容量上限按峰值放大；断连漏真失效、表满产生伪失效，都要靠容量估算与自愈逻辑处理。绝对数字按 7.2.5 实测，8.10.3 待复核。</li>
+<li>推送可能丢，本地缓存必须有过期时间作为最后保障，做不到强一致；强一致的读直接走 Redis 或数据库。写压力高、海量随机键、RESP2 无法桥接、短连接频繁重建时不适合用客户端缓存。</li>
+</ul>
+<h2 id="102-命令与版本文">10.2 命令与版本文</h2>
+<p>实测环境 Redis 8.10.3，redis-cli 8.10.3，客户端 net10.0 + StackExchange.Redis；Client-side Caching 自 Redis 6.0 起提供，四种模式在 6.0 即可用，<code>CLIENT TRACKINGINFO</code> 自 6.2 可用（精确引入版本待验证），BCAST 自 6.0 提供、集群/分片场景按 7.0+ 评估。准确命令清单：<code>CLIENT TRACKING ON/OFF</code>、<code>REDIRECT</code>、<code>BCAST</code>、<code>PREFIX</code>、<code>OPTIN</code>、<code>OPTOUT</code>、<code>NOLOOP</code>、<code>CLIENT CACHING YES/NO</code>、<code>CLIENT TRACKINGINFO</code>、<code>CLIENT GETREDIR</code>、<code>CLIENT ID</code>、<code>CLIENT LIST</code>、<code>INFO stats/clients/memory</code>、<code>CONFIG GET/SET tracking-table-max-keys</code>、<code>SUBSCRIBE __redis__:invalidate</code>、<code>HELLO 3</code>。</p>
+<h2 id="103-复查条件">10.3 复查条件</h2>
+<ul>
+<li>接入真实网络 RTT（明显大于回环）或多客户端并发读同一批键时，第六章的内存与网络开销结论要重测。</li>
+<li>目标版本若引入跟踪表大小的直接指标、改变压缩与回收策略，"断连不回收"的结论要重新验证。</li>
+<li><code>tracking-table-max-keys</code>、<code>client-output-buffer-limit pubsub</code> 等默认值在 8.10.3 上的精确取值，以该版本 <code>CONFIG GET</code> 为准，标为<strong>待验证</strong>，不照抄旧版本数字。</li>
+<li>第六章的绝对数字按 7.2.5 实测，8.10.3 待复核；重测时保留原条件（回环、无持久化、键名长度 &lt;= 12 字节）才能横向比较。</li>
+<li>StackExchange.Redis 若在后续版本加入高层 Caching 封装或能返回原始 push 消息，"需自行解析失效"的结论要更新；RESP3 push 事件 API 的准确写法以所用版本官方文档为准，标为<strong>待验证</strong>。</li>
+</ul>
+<h1 id="十一下一篇预告">十一、下一篇预告</h1>
+<p>下一篇聚焦 Redis 遍历机制：<code>KEYS</code> 会阻塞主线程，生产环境禁止直接使用；SCAN 用游标迭代可安全遍历，但 <code>COUNT</code> 是提示值而非精确条数。会覆盖游标哈希桶迭代原理（反转二进制迭代）、<code>HSCAN</code> / <code>SSCAN</code> / <code>ZSCAN</code> 的类型特定用法，以及生产环境安全遍历脚本。下一篇讲 SCAN：怎么在大库里安全地把键捞出来，以及遍历中为什么会出现重复和遗漏。</p>
+<h1 id="附件1">附件1</h1>
+<pre><code class="language-xml">&lt;!-- net10.0 目标框架；StackExchange.Redis 提供数据连接 API --&gt;
+&lt;PropertyGroup&gt;
+  &lt;TargetFramework&gt;net10.0&lt;/TargetFramework&gt;
+  &lt;Nullable&gt;enable&lt;/Nullable&gt;
+&lt;/PropertyGroup&gt;
+&lt;!-- 客户端库；具体版本以项目还原结果为准 --&gt;
+&lt;ItemGroup&gt;
+  &lt;PackageReference Include="StackExchange.Redis" Version="*" /&gt;
+&lt;/ItemGroup&gt;
+</code></pre>
+<pre><code class="language-csharp">#nullable enable
+using System;
+// 失效回调与读线程会同时改缓存，用 ConcurrentDictionary 省掉一层锁
+using System.Collections.Concurrent;
+// 模式参数个数不固定，用 List 拼完再转成 Execute 需要的 object[]
+using System.Collections.Generic;
+// IOException、EndOfStreamException：socket 关闭与 RESP 流提前结束的信号
+using System.IO;
+// TcpClient、NetworkStream：原生接收连接，用来拿到带键数组的失效载荷
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+// ConnectionMultiplexer、IDatabase、RedisValue、ConnectionFailedEventArgs：数据连接 API
+using StackExchange.Redis;
+
+// 目标框架 net10.0；实测环境 Redis 8.10.3
+public sealed class TrackingCache : IDisposable
+{
+    // 缓存条目只存值与绝对过期时间；过期判据不依赖可变的相对 TTL
+    private readonly record struct CacheEntry(string Value, DateTimeOffset ExpiresAt);
+
+    // 推送丢失时的最后保障：条目最长存活 60 秒，取值按业务重测
+    private static readonly TimeSpan FallbackTtl = TimeSpan.FromSeconds(60);
+
+    // 主机与端口拆开保存，接收连接重连时要用
+    private readonly string _host;
+    private readonly int _port;
+    // 跟踪模式：optin / bcast / 其余按默认模式处理
+    private readonly string _mode;
+    // BCAST 监听前缀，仅在 bcast 模式下生效
+    private readonly string[] _prefixes;
+    // 数据连接复用器与默认库句柄
+    private readonly ConnectionMultiplexer _dataMux;
+    private readonly IDatabase _db;
+    // 把"标记—回源—写本地缓存"与"删本地缓存"串行化，避免旧值覆盖
+    private readonly object _gate = new();
+    // 键到本地缓存条目的映射
+    private readonly ConcurrentDictionary&lt;string, CacheEntry&gt; _local = new();
+    // 取消后台接收循环的信号源
+    private readonly CancellationTokenSource _cts = new();
+    // 后台接收任务，Dispose 时等待它退出
+    private readonly Task _receiverTask;
+
+    // 接收连接的 socket 与流，重连时整体替换
+    private TcpClient _subSocket;
+    private NetworkStream _subStream;
+    // 接收连接 id，数据连接的 REDIRECT 指向它
+    private long _subId;
+    // 保证 Dispose 的释放逻辑只执行一次
+    private int _disposed;
+
+    // endpoint 形如 "host:port"；mode 取 optin/bcast/其他；prefixes 只在 bcast 下用
+    public TrackingCache(string endpoint, string mode = "optin", params string[] prefixes)
+    {
+        // 用最后一个冒号切分，兼容 IPv4 与主机名
+        int colon = endpoint.LastIndexOf(':');
+        _host = endpoint[..colon];
+        _port = int.Parse(endpoint[(colon + 1)..]);
+        _mode = mode;
+        _prefixes = prefixes;
+
+        // 数据连接交给 StackExchange.Redis 管理，默认以 RESP2 建连
+        _dataMux = ConnectionMultiplexer.Connect(endpoint);
+        _db = _dataMux.GetDatabase();
+
+        // 先建接收连接并订阅，拿到它的 id 才能配置数据连接的 REDIRECT
+        _subSocket = new TcpClient(_host, _port);
+        _subStream = _subSocket.GetStream();
+        OpenReceiverSession();
+
+        // 数据连接恢复事件里重置本地缓存并重开跟踪
+        _dataMux.ConnectionRestored += OnDataRestored;
+        // 后台循环读取失效消息，取消信号来自 _cts
+        _receiverTask = Task.Run(() =&gt; ReceiveLoop(_cts.Token));
+    }
+
+    // 取接收连接 id、订阅失效频道、按当前模式配置数据连接的跟踪
+    private void OpenReceiverSession()
+    {
+        // CLIENT ID 返回单个整数（RESP2 的 :14），ReadResp 解析成字符串而非数组
+        Send(_subStream, "CLIENT", "ID");
+        object? idReply = ReadResp(_subStream);
+        // 把字符串形式的整数转成 long，作为后续 REDIRECT 的目标
+        _subId = Convert.ToInt64(idReply?.ToString());
+
+        // 订阅失效频道；返回的是 subscribe 确认消息，读掉以保持流对齐
+        Send(_subStream, "SUBSCRIBE", "__redis__:invalidate");
+        ReadResp(_subStream);
+
+        // 接收通道就绪后再让数据连接开跟踪，避免失效无处投递
+        ApplyTracking();
+    }
+
+    // 把 OPTIN / BCAST、REDIRECT、NOLOOP 一次性下发给数据连接
+    private void ApplyTracking()
+    {
+        var cmd = new List&lt;string&gt; { "TRACKING", "ON" };
+        if (_mode == "bcast")
+        {
+            // BCAST 模式下每个前缀都要单独跟一个 PREFIX 参数
+            cmd.Add("BCAST");
+            foreach (string prefix in _prefixes)
+            {
+                cmd.Add("PREFIX");
+                cmd.Add(prefix);
+            }
+        }
+        else if (_mode == "optin")
+        {
+            // OPTIN 模式下读命令需要 CACHING YES 才会被登记
+            cmd.Add("OPTIN");
+        }
+        // 失效投递到前面订阅连接，REDIRECT 后跟十进制 id
+        cmd.Add("REDIRECT");
+        cmd.Add(_subId.ToString());
+        // 读写同连接，屏蔽本连接自写键触发的失效
+        cmd.Add("NOLOOP");
+
+        // Execute 的第二个参数是 params object[]，需把字符串列表转成对象数组
+        var args = new object[cmd.Count];
+        for (int i = 0; i &lt; cmd.Count; i++)
+        {
+            args[i] = cmd[i];
+        }
+        // 等价于 CLIENT TRACKING ON ...，返回值是 OK
+        _db.Execute("CLIENT", args);
+    }
+
+    // 热点键：登记跟踪，本地缓存带绝对过期时间；锁让 CACHING YES 与 GET 之间不插入别的命令
+    public string? GetTracked(string key)
+    {
+        lock (_gate)
+        {
+            // 命中且未过期时直接返回本地值
+            if (_local.TryGetValue(key, out CacheEntry hit))
+            {
+                if (hit.ExpiresAt &gt; DateTimeOffset.UtcNow)
+                {
+                    return hit.Value;
+                }
+                // 已过期的条目先移除，再走回源
+                _local.TryRemove(key, out _);
+            }
+
+            // OPTIN 下先打标记，且必须与随后的 GET 连续执行
+            if (_mode == "optin")
+            {
+                _db.Execute("CLIENT", "CACHING", "YES");
+            }
+            // 本地没有有效值，回源读取
+            RedisValue value = _db.StringGet(key);
+            // 服务端没有该键，不写本地缓存
+            if (!value.HasValue)
+            {
+                return null;
+            }
+
+            // RedisValue 显式转字符串；显式转换前已确认 HasValue
+            string text = (string)value!;
+            // 写入本地缓存并 stamped 绝对过期时间，防止推送丢失后永久留旧值
+            _local[key] = new CacheEntry(text, DateTimeOffset.UtcNow + FallbackTtl);
+            return text;
+        }
+    }
+
+    // 冷键：直接回源，不进本地缓存，也不登记跟踪
+    public string? GetUntracked(string key)
+    {
+        RedisValue value = _db.StringGet(key);
+        return value.HasValue ? (string)value! : null;
+    }
+
+    // 整表作废：断连、FLUSH、超时等场景下调用
+    public void InvalidateAll()
+    {
+        lock (_gate)
+        {
+            _local.Clear();
+        }
+    }
+
+    private void ReceiveLoop(CancellationToken token)
+    {
+        // 取消时 socket 被释放，读操作会抛异常；最外层吞掉，避免任务进入 Faulted 状态
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        // 读一条推送消息；RESP2 下形如 ["message", 频道, [键...]]
+                        object? message = ReadResp(_subStream);
+                        // 只处理三段以上的消息，第三段才是键数组载荷
+                        if (message is object?[] parts &amp;&amp; parts.Length &gt;= 3)
+                        {
+                            HandlePayload(parts[2]);
+                        }
+                    }
+                }
+                catch (Exception) when (!token.IsCancellationRequested)
+                {
+                    // 断连期间的失效不会补发，先整表作废再重连
+                    InvalidateAll();
+                    ReconnectReceiver(token);
+                }
+            }
+        }
+        catch (Exception) when (token.IsCancellationRequested)
+        {
+            // 正常关闭，不向上抛
+        }
+    }
+
+    private void ReconnectReceiver(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                // 旧 socket 可能已断，先释放再重建
+                _subSocket.Dispose();
+                _subSocket = new TcpClient();
+                _subSocket.Connect(_host, _port);
+                _subStream = _subSocket.GetStream();
+                // 重连后 id 会变，重新取 id 并重开 REDIRECT
+                OpenReceiverSession();
+                return;
+            }
+            catch (Exception)
+            {
+                // 重连失败，等待半秒后重试，直到取消
+                token.WaitHandle.WaitOne(500);
+            }
+        }
+    }
+
+    // 空载荷或空数组来自 FLUSHALL / FLUSHDB，整表作废；否则逐个删键
+    private void HandlePayload(object? payload)
+    {
+        lock (_gate)
+        {
+            // nil 载荷表示整库作废
+            if (payload is null)
+            {
+                _local.Clear();
+                return;
+            }
+            if (payload is object?[] keys)
+            {
+                // 空键数组同样是 FLUSH 的空载荷
+                if (keys.Length == 0)
+                {
+                    _local.Clear();
+                    return;
+                }
+                // 逐键删除，只处理字符串元素
+                foreach (object? item in keys)
+                {
+                    if (item is string key)
+                    {
+                        _local.TryRemove(key, out _);
+                    }
+                }
+            }
+        }
+    }
+
+    private void OnDataRestored(object? sender, ConnectionFailedEventArgs e)
+    {
+        // 数据连接恢复但断连期失效已丢，先整表作废
+        InvalidateAll();
+        // 连接对象可能已换，重新下发跟踪配置
+        ApplyTracking();
+    }
+
+    public void Dispose()
+    {
+        // 原子交换保证并发调用时只释放一次
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        // 先发取消信号，让接收循环退出
+        _cts.Cancel();
+        // 退订事件，避免释放后回调
+        _dataMux.ConnectionRestored -= OnDataRestored;
+        // 释放数据连接复用器
+        _dataMux.Dispose();
+        try
+        {
+            // 释放接收 socket
+            _subSocket.Dispose();
+        }
+        catch (IOException)
+        {
+            // socket 已关闭时忽略
+        }
+        // 取消期异常已在 ReceiveLoop 内吞掉；这里再兜一层，保证 Dispose 不抛
+        try
+        {
+            // 最多等两秒让接收任务退出
+            _receiverTask.Wait(TimeSpan.FromSeconds(2));
+        }
+        catch (AggregateException)
+        {
+            // 任务异常结束也不影响释放流程
+        }
+        // 最后释放信号源
+        _cts.Dispose();
+    }
+
+    private static void Send(NetworkStream stream, params string[] args)
+    {
+        // RESP 数组以 * 开头，后跟元素个数
+        var builder = new StringBuilder();
+        builder.Append('*').Append(args.Length).Append("\r\n");
+        foreach (string arg in args)
+        {
+            // 每个元素用 $ 声明字节数，长度按 UTF-8 计算而非字符数
+            builder.Append('$').Append(Encoding.UTF8.GetByteCount(arg)).Append("\r\n");
+            // 元素内容后跟 CRLF
+            builder.Append(arg).Append("\r\n");
+        }
+        // 一次性编码为字节并写入流
+        byte[] packet = Encoding.UTF8.GetBytes(builder.ToString());
+        stream.Write(packet, 0, packet.Length);
+        stream.Flush();
+    }
+
+    private static string? ReadLine(NetworkStream stream)
+    {
+        // 逐字节读到 LF，跳过 CR
+        var bytes = new System.Collections.Generic.List&lt;byte&gt;();
+        int b;
+        while ((b = stream.ReadByte()) != -1)
+        {
+            if (b == '\n')
+            {
+                break;
+            }
+            if (b != '\r')
+            {
+                bytes.Add((byte)b);
+            }
+        }
+        // 流结束且没读到任何字节时返回 null
+        return bytes.Count == 0 &amp;&amp; b == -1 ? null : Encoding.UTF8.GetString(bytes.ToArray());
+    }
+
+    private static string? ReadBulk(NetworkStream stream, int length)
+    {
+        // RESP 的 null bulk string 用 -1 表示
+        if (length &lt; 0)
+        {
+            return null;
+        }
+        // 按声明长度读满，短读要续读
+        var buffer = new byte[length];
+        int offset = 0;
+        while (offset &lt; length)
+        {
+            int n = stream.Read(buffer, offset, length - offset);
+            if (n == 0)
+            {
+                throw new EndOfStreamException();
+            }
+            offset += n;
+        }
+        // 读完内容后消费结尾的 CRLF
+        stream.ReadByte();
+        stream.ReadByte();
+        return Encoding.UTF8.GetString(buffer);
+    }
+
+    // 递归解析 RESP2：数组返回 object?[]，bulk string 返回 string，nil 返回 null
+    private static object? ReadResp(NetworkStream stream)
+    {
+        // 每个 RESP 值都以一行类型头开始
+        string? line = ReadLine(stream);
+        if (line is null || line.Length == 0)
+        {
+            throw new EndOfStreamException();
+        }
+
+        // 首字符是类型标记，其余是长度或数值文本
+        char kind = line[0];
+        string body = line[1..];
+        if (kind == '*')
+        {
+            // 数组：先取元素个数，-1 表示 null 数组
+            int count = int.Parse(body);
+            if (count &lt; 0)
+            {
+                return null;
+            }
+            // 递归解析每个元素
+            var items = new object?[count];
+            for (int i = 0; i &lt; count; i++)
+            {
+                items[i] = ReadResp(stream);
+            }
+            return items;
+        }
+        if (kind == '$')
+        {
+            // bulk string：按声明长度读取
+            return ReadBulk(stream, int.Parse(body));
+        }
+        if (kind == '-')
+        {
+            // 错误回复直接抛异常，异常文本即服务端错误
+            throw new IOException(body);
+        }
+        // + 简单字符串与 : 整数都按文本返回；CLIENT ID 的整数值走这里
+        return body;
+    }
+}
+</code></pre>
+<p>本章完！</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-27 09:38">2026-11-27 09:37</span>&nbsp;
+<a href="https://www.cnblogs.com/hugogoos">IT规划师</a>&nbsp;
+阅读(<span id="post_view_count">90</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23788502);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fhugogoos%2Fp%2F23788502&amp;targetId=23788502&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
