@@ -1,0 +1,67 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/anye1991/p/23797158" title="发布于 2026-11-27 01:23">
+    
+
+    <span role="heading" aria-level="2">纯 Go 手搓 L3/L4 防火墙：从日志双写导致服务器假死，到一键 nftables 内核真实丢包</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>摘要： 放弃笨重的 iptables 和商业网关，用纯 Go (CGO_ENABLED=0) 打造一个自带 Web UI 的单二进制网络防火墙。本文深度拆解 gofw 的底层架构，分享如何通过运行时热切换、内核 nftables 真实丢包与防锁死护栏，并复盘一次因“日志双写”导致的服务器假死排坑记录。</p>
+<p>正文：</p>
+<p>在云原生时代，面对公网上每天海量的恶意扫描，很多开发者的第一反应是配置一堆复杂的 iptables 规则，或者直接买商业高防。</p>
+<p>但 iptables 规则一旦复杂起来，极易导致维护灾难，稍不注意就把自己的 SSH 给锁死了。最近，为了给一台低配云主机做底层的安全加固，我干脆用纯 Go 手搓了一个单二进制的网络层防火墙：gofw。</p>
+<p>没有外部依赖（仅 yaml.v3，CGO_ENABLED=0），编译出来只有一个 11MB 的文件，却内置了抓包引擎、DPI 协议识别、GeoIP 地理围栏和一个完整的 Web 管理界面。今天咱们从底层网络协议的视角，拆解一下它的架构与踩坑。</p>
+<p>一、 核心架构：Monitor 与 nftables 的双轨制<br>
+开源防火墙最容易犯的毛病，就是一上来就直接切断流量，结果管理员自己也进不去服务器了。gofw 的设计极其克制，它在运行时支持两种执行后端：</p>
+<p>Monitor 模式（用户态）：抓包、匹配、决策、统计全跑，但不真实丢包。非常适合刚上线时试跑，看日志找问题。</p>
+<p>nftables 内核模式：一键切换，由 Linux 的 table inet gofw 真正执行内核级 DROP。</p>
+<p>最惊艳的设计在于它的“防锁死护栏”：<br>
+在 Web 界面的“系统增强”页，可以从 Monitor 一键切到内核模式。但切换前，系统会强制进行预检（nft 命令是否存在、CAP_NET_ADMIN 权限是否足够）。<br>
+切过去之后，如果在 30 秒内没有点击“确认保留”，系统会自动回滚到 Monitor 模式，并把内核表清空。这种“带着降落伞跳伞”的架构，极大降低了运维把服务器搞断网的背锅风险。</p>
+<p>二、 真实排坑：低配机器为何会“假死”？<br>
+在测试阶段，线上机器出现了一个极其诡异的 bug：<br>
+ping 能通，22 端口和 18081 端口用 telnet 也能建立连接，但 SSH 就是拿不到 banner，Web 页面一个字节都不回。同时，journald 出现时间戳倒挂，systemd 反复报 gofw.service: Failed with result 'timeout'。</p>
+<p>排查了内存和 CPU（当时内存还有富余），最后发现，这是用户态进程被日志 IO 拖死导致的假死。</p>
+<p>根因链条极其清晰：</p>
+<p>AF_PACKET 将网卡置为混杂模式，抓到了整个网段的包（含广播、ARP 等）。</p>
+<p>引擎的 OnDecision 对每一个数据包都执行了 log.Printf。</p>
+<p>--log-file 使用了 io.MultiWriter，每行日志同时写 journal 和文件，造成双写。</p>
+<p>Web 页面每隔几秒轮询 API，自己也在制造包，超时重试又制造更多包，瞬间形成正反馈死循环。</p>
+<p>工程解法（已在线验证）：<br>
+在底层引入了 --log-packet-rate 固定窗口限速，对每包决策日志限速 20 行/秒。被抑制的日志行数会在统计接口的 log_suppressed 中如实汇总。同时给 logrotate 和 journald 加了严格的容量限制。<br>
+压测验证：80 次并发 API 请求（711 个包）期间，只写出约 100 行日志，页面 0.03s 秒回，负载回落到 0.41，彻底根治了假死。</p>
+<p>三、 纯 Go 流式加载 141 万条 GeoIP<br>
+做网络层防御，直接按国家阻断是最简单粗暴的。</p>
+<p><img alt="QQ20261127-012229" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3862860/202611/3862860-20261127012251906-2065954292.png" class="lazyload"></p>
+<p>gofw 完全没有依赖外部的 C 库，纯用 Go 实现了 GeoIP 的流式加载。启动时读取 DBIP Country Lite 的 CSV，总计 1,411,297 条 CIDR（IPv4 597K，IPv6 814K）。<br>
+利用最长前缀二分索引，把全球 250 个国家的网段在内存中构建成极速的查询表。支持 --geoip-reload-interval 热加载，库文件 mtime 变化时自动原子替换，零停机完成特征库升级。</p>
+<p>四、 真实的线上运转状态<br>
+在 190 条 nftables 规则全量下发的情况下，系统通过内核态真实拦截了数十万的恶意包。深色质感的 Web UI 把底层复杂的网络配置，变成了可视化的操作表单（见文末截图）。总包量 3.01M，放行 2.98M，拦截 26.3K，流量 2.67G。</p>
+<p>总结：</p>
+<p>现代的网络防护，不应该停留在堆积木式的加规则上。用纯 Go 实现、零依赖、自带 Web 面板的单文件防火墙，不仅极大降低了部署成本，配合严谨的护栏回滚机制，也让高危的内核级操作变得安全可控。</p>
+<p>开源地址：<br>
+👉 <a href="https://github.com/anye1991/gofw" target="_blank" rel="noopener nofollow">https://github.com/anye1991/gofw</a></p>
+<p>欢迎各位搞底层网络和 Go 开发的老哥在评论区交流抓包与内核态丢包的实战经验。</p>
+<p><img alt="QQ20261127-011236" loading="lazy" data-src="https://img2024.cnblogs.com/blog/3862860/202611/3862860-20261127012104743-1135543919.png" class="lazyload"></p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-27 01:23">2026-11-27 01:23</span>&nbsp;
+<a href="https://www.cnblogs.com/anye1991">anye1991</a>&nbsp;
+阅读(<span id="post_view_count">112</span>)&nbsp;
+评论(<span id="post_comment_count">1</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23797158);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fanye1991%2Fp%2F23797158&amp;targetId=23797158&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
