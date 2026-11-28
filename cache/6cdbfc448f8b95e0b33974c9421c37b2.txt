@@ -1,0 +1,189 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/leikooo/p/23810623" title="发布于 2026-11-28 11:09">
+    
+
+    <span role="heading" aria-level="2">你有没有好奇过 Linux 定时任务如何实现的？</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>大家在服务器上应该都写过这样一行：</p>
+<pre><code>0 3 * * * /opt/backup.sh
+</code></pre>
+<p>每天凌晨 3 点，备份脚本准时跑起来，从来不用管。类似的事情还有很多：</p>
+<ul>
+<li>每 5 分钟拉一次监控数据；</li>
+<li>每天零点切一次日志；</li>
+<li>工作日早上 9 点给群里推一条日报。</li>
+</ul>
+<p>用久了难免会好奇：机器是怎么知道「到点了」的？是不是有个进程一直在盯着表，一秒一秒地问「到 3 点没？到 3 点没？」？如果真是这样，一台机器上几十个定时任务，岂不是一直在白白烧 CPU？</p>
+<p>这篇文章顺着三个问题把它讲清楚：Linux 的定时任务<strong>是什么</strong>（what），它<strong>怎么做到准时</strong>（how），以及它<strong>为什么不需要一直轮询</strong>（why）。</p>
+<h2 id="crontab-是一张时间表crond-是对表的人">crontab 是一张时间表，crond 是对表的人</h2>
+<p>先说<strong>是什么</strong>。Linux 上最常见的定时任务是 cron，它由两部分组成：</p>
+<ul>
+<li><strong>crontab</strong>：一张时间表，每一行写「什么时候」加「做什么」；</li>
+<li><strong>crond</strong>：一个常驻的守护进程，负责拿着这张表去对时间，到点了就把命令跑起来。</li>
+</ul>
+<p>一行 crontab 有五个时间字段，依次是分钟、小时、日、月、星期，最后是要执行的命令。拿一个稍复杂的例子来看：</p>
+<pre><code>*/15 9-18 * * 1-5 /opt/report.sh
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261128110257490-657863960.png" alt="一行 crontab：五个时间字段，加一条命令" loading="lazy"></p>
+<p>逐个字段翻译一下：</p>
+<ul>
+<li><strong>分钟 <code>*/15</code></strong>：0、15、30、45，共 4 个值；</li>
+<li><strong>小时 <code>9-18</code></strong>：9 点到 18 点，共 10 个值；</li>
+<li><strong>日、月 <code>*</code></strong>：不限；</li>
+<li><strong>星期 <code>1-5</code></strong>：周一到周五，共 5 个值。</li>
+</ul>
+<p>合起来就是「工作日 9:00 到 18:45，每 15 分钟跑一次」，一周触发 <code>4 × 10 × 5 = 200</code> 次。</p>
+<p><strong>cron 的时间粒度是分钟。</strong> 五个字段里最小的单位就是分钟，crontab 根本写不出「每 10 秒」这种需求。这一点很关键，后面 crond 的整个工作方式都是围绕「分钟」设计的。</p>
+<h2 id="crond-怎么对表睡到下一分钟醒来查几个位">crond 怎么对表：睡到下一分钟，醒来查几个位</h2>
+<p>再说<strong>怎么做</strong>。大家现在在大多数发行版上用到的 crond 是 cronie，它是从 1987 年的 Vixie cron 演化来的。它的主循环拆开来看只有五步：</p>
+<ol>
+<li><strong>算距离</strong>：现在离下一个整分钟还差几秒；</li>
+<li><strong>sleep</strong>：睡这么多秒；</li>
+<li><strong>看表改没改</strong>：crontab 被 <code>crontab -e</code> 改过就重新加载，用 inotify 等内核通知，或者退回去比较文件的修改时间 mtime；</li>
+<li><strong>逐条匹配</strong>：把当前的分、时、日、月、星期和每一行比一遍；</li>
+<li><strong>fork 执行</strong>：命中的任务交给子进程去跑，自己回到第 1 步。</li>
+</ol>
+<p>比如 crond 在 02:59:37 启动，它算出离 03:00:00 还差 23 秒，就 <code>sleep(23)</code>。醒来时正好 3 点整，<code>0 3 * * *</code> 的 backup.sh 命中，fork 出去执行。然后再算距离、再睡 60 秒，03:01:00 醒来，没有命中，接着睡。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261128110258241-1367926775.png" alt="crond 的主循环：每分钟醒一次，其余时间都在睡" loading="lazy"></p>
+<p>cronie 源码 <code>src/cron.c</code> 里负责睡觉的函数叫 <code>cron_sleep()</code>，注释只有一句：</p>
+<blockquote>
+<p>Try to just hit the next minute.</p>
+</blockquote>
+<p>所以答案的前半句已经出来了：<strong>cron 确实是在轮询，但它一分钟只问一次，一天 1440 次，其余时间都在睡觉。</strong> 睡着的进程不在 CPU 的运行队列里，不消耗任何 CPU 时间。</p>
+<p><strong>每分钟醒来，对表要花多久？</strong> 几乎不花。crond 解析 crontab 时，会把每个字段展开成一个<strong>位图</strong>。cronie 的 <code>structs.h</code> 里，每一条任务长这样：</p>
+<pre><code class="language-c">bitstr_t bit_decl(minute, MINUTE_COUNT);   // 60 位
+bitstr_t bit_decl(hour,   HOUR_COUNT);     // 24 位
+bitstr_t bit_decl(dom,    DOM_COUNT);      // 31 位
+bitstr_t bit_decl(month,  MONTH_COUNT);    // 12 位
+bitstr_t bit_decl(dow,    DOW_COUNT);      // 星期
+</code></pre>
+<p><code>*/15</code> 展开后，分钟位图就是第 0、15、30、45 位为 1，其余全为 0：</p>
+<pre><code>100000000000000100000000000000100000000000000100000000000000
+</code></pre>
+<p>到了 2026-11-27（周五）09:30 这一刻，crond 要做的事情只是查三个位：<code>minute[30]</code>、<code>hour[9]</code>、<code>dow[5]</code>，三个都是 1，日和月是 <code>*</code>，命中。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261128110258912-2060399233.png" alt="对表就是查位：2026-11-27 周五 09:30，三个位都是 1" loading="lazy"></p>
+<p>这就像图书馆管理员手里有一张排班表，表上每个格子要么打勾要么空着。每到整点抬头看一眼钟，然后扫一眼对应的格子，有勾就去干活，没勾就继续打盹。一次对表就是几次位运算，几十条任务加起来也只是微秒级的事。</p>
+<p><strong>为什么第 3 步要每分钟看一次表？</strong> 因为大家随时可能 <code>crontab -e</code> 改任务，crond 得在下一分钟之前知道。cronie 默认用 inotify 让内核在文件变化时通知自己，不支持 inotify 时才退回到每分钟比较一次 mtime。</p>
+<p><strong>万一 crond 醒晚了呢？</strong> 比如机器挂起、或者管理员把系统时间往后调了 3 分钟。cronie 的主循环专门处理了这种「时间跳变」：它把当前时间和自己记的「虚拟时间」相减，差 1 分钟是正常情况，差 2 到 5 分钟就把中间漏掉的分钟逐个补跑一遍，差得更多或者时间倒退了，就按另外的规则处理，避免任务被重复执行或者大面积漏掉。</p>
+<h2 id="睡着之后是谁在看时间">睡着之后，是谁在看时间</h2>
+<p>到这里大家可能会接着问：crond 是睡了，那 <code>sleep(23)</code> 又是谁来数这 23 秒的？是不是内核在替它轮询？</p>
+<p>答案是：<strong>内核也不轮询，它把这件事交给了硬件。</strong> 整个链路是这样的：</p>
+<ol>
+<li><strong>系统调用</strong>：glibc 里的 <code>sleep</code> 最终走到 <code>clock_nanosleep</code> 系统调用，内核把 crond 标成睡眠状态，从运行队列里拿掉，CPU 让给别人；</li>
+<li><strong>挂一个 hrtimer</strong>：内核给 crond 建一个高精度定时器（hrtimer），插进一棵按到期时间排序的<strong>红黑树</strong>里，树的最左节点永远是最早到期的那个；</li>
+<li><strong>给硬件上弦</strong>：内核只看最左节点，把它的到期时刻写进 CPU 旁边的<strong>时钟事件设备</strong>（比如 x86 上的 Local APIC 定时器），相当于定一个闹钟；</li>
+<li><strong>硬件到点</strong>：时钟事件设备是一个硬件倒计时器，数到 0 就向 CPU 发出一个定时器中断；</li>
+<li><strong>中断处理</strong>：内核从红黑树里取出所有已到期的节点，把对应的进程唤醒，放回运行队列，再把硬件闹钟定到下一个最左节点；</li>
+<li><strong>回到用户态</strong>：crond 从 <code>sleep</code> 返回，继续对表。</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261128110259602-236284437.png" alt="sleep(23) 背后：内核记下闹钟，硬件到点来叫" loading="lazy"></p>
+<p>关键在第 3 步和第 4 步之间：这 23 秒里，<strong>没有任何一行代码在反复看时间</strong>。如果整台机器都没别的事干，CPU 可以直接进入 idle 状态省电，等中断来了再醒。</p>
+<p><strong>那内核里的周期性 tick 呢？</strong> 老的 Linux 内核确实有一个「心跳」：每秒固定触发 HZ 次时钟中断（常见 HZ 是 250 或 1000），每次中断都检查一下有没有定时器到期。这其实就是内核层面的轮询，空闲的 CPU 也得一秒醒 1000 次。2007 年的 Linux 2.6.21 引入了 tickless（<code>NO_HZ</code>）：CPU 空闲时把周期性 tick 也停掉，只按最近的那个定时器设置硬件闹钟。这也正是上面那条链路能成立的前提。</p>
+<p><strong>内核里只有红黑树这一种定时器吗？</strong> 不是。hrtimer 用来处理 <code>sleep</code>、<code>timerfd</code> 这类需要准时的场景；内核里还有一种数量大得多的低精度定时器 <code>timer_list</code>，主要用于网络重传、磁盘 I/O 这类<strong>超时</strong>。超时有个特点：绝大多数在到期之前就被取消了（数据包按时回来了，超时就没用了）。为了让插入和删除都是 O(1)，<code>timer_list</code> 用的是<strong>分层时间轮</strong>。</p>
+<p>Linux 4.8 重写后的时间轮，在 HZ=1000 时有 9 层，每层 64 个桶，一共 <code>9 × 64 = 576</code> 个桶。每往上一层，桶的粒度乘以 8：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>桶的粒度</th>
+<th>覆盖范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>1 ms</td>
+<td>0 到 63 ms</td>
+</tr>
+<tr>
+<td>1</td>
+<td>8 ms</td>
+<td>64 到 511 ms</td>
+</tr>
+<tr>
+<td>2</td>
+<td>64 ms</td>
+<td>512 ms 到约 4 s</td>
+</tr>
+<tr>
+<td>3</td>
+<td>512 ms</td>
+<td>约 4 s 到约 32 s</td>
+</tr>
+<tr>
+<td>4</td>
+<td>约 4 s</td>
+<td>约 32 s 到约 4 分钟</td>
+</tr>
+<tr>
+<td>...</td>
+<td>...</td>
+<td>...</td>
+</tr>
+<tr>
+<td>8</td>
+<td>约 4 小时</td>
+<td>约 1 天到约 12 天</td>
+</tr>
+</tbody>
+</table>
+<p>一个 23 秒后到期的超时，会落进第 3 层，按 512 ms 一格归桶。也就是说它可能晚几百毫秒才触发，但对超时来说完全无所谓。</p>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261128110300291-1175395596.png" alt="内核的分层时间轮：离得越远，格子越粗" loading="lazy"></p>
+<p>这就像大家记日程：今天下午的会精确到几点几分，下周的事只记到「周三」，下个月的事只记到「中旬」。越远的事记得越粗，本子就不用很厚。内核源码 <code>kernel/time/timer.c</code> 的注释里说得很直白：超时大多会被取消，真到期了说明已经出问题了，晚一点无所谓，所以用粒度换空间是划算的。</p>
+<h2 id="为什么不用一直轮询">为什么不用一直轮询</h2>
+<p>前面讲完了怎么做，现在回到最开始的疑问：为什么要这么设计？先想清楚我们真正想要什么。</p>
+<p>一个定时机制要同时满足两点：<strong>到点要准</strong>，<strong>没到点时不花 CPU</strong>。把能想到的办法逐个过一遍：</p>
+<ol>
+<li><strong>办法一：忙等。</strong> 写一个 <code>while (now &lt; target) {}</code>，一直看时间。准是准，但一个核被占满。本机用 Python 实测：忙等 2 秒，消耗 CPU 1.999 秒；同样等 2 秒换成 <code>sleep</code>，只消耗 0.000134 秒。每秒大约能取 1569 万次时间，一天下来是 1.36 万亿次「到点没」，几乎全是废话。</li>
+<li><strong>办法二：每秒醒一次看看。</strong> CPU 是省下来了，但一天要醒 86400 次，而且精度也只有 1 秒。任务越少越亏：一天只有 03:00 一个任务，86399 次都白醒了。</li>
+<li><strong>办法三：每分钟醒一次（cron 的做法）。</strong> 一天 1440 次，正好对上 crontab 的分钟粒度。每次醒来只花几微秒查位图，总代价很小。它的好处是简单：crontab 随时可能被改，日和星期的组合规则也有点绕（两个字段都不是 <code>*</code> 时是「或」的关系），每分钟老老实实对一遍表，就不需要提前算「下一次是什么时候」，也就不怕算错。</li>
+<li><strong>办法四：算好下一次，直接睡到点（systemd timer 的做法）。</strong> systemd 读到 <code>OnCalendar=*-*-* 03:00:00</code> 后，先算出下一次触发的具体时刻，再用 <code>timerfd</code> 设一个定时器，然后进 <code>epoll</code> 等着。一天只有这一个任务的话，就只醒 1 次。大家可以用 <code>systemctl list-timers</code> 看到每个 timer 的 <code>NEXT</code> 列，那就是它算好的下一次时间。</li>
+</ol>
+<p><img src="https://img2024.cnblogs.com/blog/3674726/202611/3674726-20261128110300925-1910721998.png" alt="同样是等到 03:00，一天要「醒」多少次" loading="lazy"></p>
+<p>四个办法排在一起，规律就出来了：从办法一到办法四，问「到点没」的次数越来越少，但没有一个办法是真的「不问」，只是<strong>问的人越来越往下沉</strong>：</p>
+<ul>
+<li>忙等是应用程序自己一直问；</li>
+<li>cron 是应用程序一分钟问一次，中间交给内核；</li>
+<li>内核不问，它把所有闹钟按时间排好序，只把最近的一个交给硬件；</li>
+<li>硬件也不「问」，它只是一个往下数的计数器，数到 0 自然就发中断。</li>
+</ul>
+<p>所以定时的精髓可以压成一句话：<strong>把所有闹钟按时间排好，只给最近的那一个上弦。</strong> 红黑树负责「排好」，时钟事件设备负责「上弦」，剩下的时间谁都不用醒。</p>
+<p>想通这一点，几个设计就都是推论了：</p>
+<ol>
+<li><strong>tickless 能成立</strong>，是因为内核只关心最近的那个定时器，没有定时器要到期时，连心跳都可以停；</li>
+<li><strong>systemd timer 比 cron 醒得少</strong>，是因为它把「算下一次」这件事在用户态就做了，直接把最近的时刻交给内核；</li>
+<li><strong>systemd 默认的 <code>AccuracySec=1min</code></strong> 也是同一个思路的延伸：允许触发时间有最多 1 分钟的误差，好让多个 timer 尽量凑在同一时刻一起醒，减少唤醒次数，对笔记本省电尤其有用；</li>
+<li><strong>cron 每分钟醒一次也没什么问题</strong>，因为它醒来时本来就只做几次位运算，1440 次乘以几微秒，一天加起来不到一秒，换来的是几十年都不用改的简单代码。</li>
+</ol>
+<h2 id="回到开头">回到开头</h2>
+<p>回到最开始的三个问题，各用一句话回答：</p>
+<ul>
+<li><strong>是什么</strong>：crontab 是一张以分钟为粒度的时间表，crond 是一个拿着这张表对时间、到点就 fork 子进程的守护进程；</li>
+<li><strong>怎么做</strong>：crond 每分钟醒一次，查几个位图决定跑不跑；它睡着的那段时间，由内核把定时器挂进红黑树，再把最近的到期时刻交给硬件倒计时器，到点用中断把它叫醒；</li>
+<li><strong>为什么</strong>：因为「一直问到点没」太浪费，所以每一层都把问题交给下一层，最后只剩硬件里一个往下数的计数器，精髓就是：把所有闹钟按时间排好，只给最近的那一个上弦。</li>
+</ul>
+<p>所以下次看到 <code>0 3 * * * /opt/backup.sh</code>，大家可以想象这样一个画面：crond 每分钟睁一次眼，看一眼表又睡过去；而在它睡着的时候，整台机器上真正在「数时间」的，只有 CPU 旁边那个默默倒数的小计数器。凌晨 3 点它数到 0，轻轻敲一下 CPU，备份就开始了。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-28 11:10">2026-11-28 11:09</span>&nbsp;
+<a href="https://www.cnblogs.com/leikooo">leikooo</a>&nbsp;
+阅读(<span id="post_view_count">33</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23810623);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fleikooo%2Fp%2F23810623&amp;targetId=23810623&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
