@@ -1,0 +1,133 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/ucfar/p/23814295" title="发布于 2026-11-28 21:45">
+    
+
+    <span role="heading" aria-level="2">01-日程和待办挤进 300×380：桌面组件「今日安排」实现笔记</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<h1 id="日程和待办挤进-300380桌面组件今日安排实现笔记">日程和待办挤进 300×380：桌面组件「今日安排」实现笔记</h1>
+<blockquote>
+<p>桌面组件深度解析系列 01 / 16。UCalendar 是一个 Windows 桌面日历，技术栈是 Tauri 2 + React + Rust + SQLite。这是其中 16 个桌面组件的第一篇。</p>
+</blockquote>
+<p>UCalendar 第一次启动时会打开两个桌面组件：桌面日历和今日安排。后者默认 300×380、透明度 80%，贴在壁纸上，不抢焦点。它的任务很明确：让用户不打开主面板，也能在一秒内知道今天要做什么、什么已经拖了几天、还剩多少没做完。</p>
+<p>主面板可以滚动、弹窗、分页，桌面组件没有这些退路。300×380 里每一行都得有用，每一个像素都在参与取舍。</p>
+<p><img src="https://img2024.cnblogs.com/blog/32765/202611/32765-20261128214249450-2029664254.png" alt="01-data-flow" loading="lazy"></p>
+<h2 id="一个-kind-一个窗口">一个 kind 一个窗口</h2>
+<p>每个桌面组件都是一个独立的 Tauri 窗口，URL 带 <code>?widget=agenda</code>，React 按 kind 渲染对应组件。窗口透明、无边框、默认置顶、不抢焦点。组件和主面板走同一套 bridge 消息，数据落在 SQLite。</p>
+<p>这个结构有个副作用：组件之间没有共享内存。桌面日历里改了一条日程，今日安排得靠广播重新拉数据；反过来说，任何组件都不能假设自己手里的列表是最新的，所有写操作都以宿主返回的广播为准。</p>
+<p>组件是独立 WebView，也就有自己的 JS 堆和定时器。需要定时刷新的组件统一走 <code>useNow</code>，时钟是 1 秒、倒计时是 1 分钟，<code>document.hidden</code> 时停表；今日安排也只需要分钟级精度，所以自己起了一个 60 秒的 interval，跨午夜后 <code>todayKey</code> 变化，逾期判定和月份集合跟着一起滚动。</p>
+<h2 id="只拉当前视图需要的月份">只拉当前视图需要的月份</h2>
+<p>组件顶部有四个 tab：今日、本周、本月、全年。它们请求的数据量完全不同。</p>
+<p><code>useMonthsEvents</code> 把月份编码成 <code>year * 12 + (month - 1)</code>，按当前视图决定请求几个月的 <code>get_month_events</code>：今日 1 个；本周 1 到 2 个，跨月时去重；本月 1 个；全年 12 个。每个月的结果合并进同一个 <code>byDay</code> Map。</p>
+<p>这里有两个容易写错的地方。</p>
+<p>第一，同月数据重到时，必须先按 <code>YYYY-MM</code> 前缀清掉该月旧键，否则删除一个事件后，旧圆点或旧行还会残留：</p>
+<pre><code class="language-ts">// useMonthEvents.ts:78
+const prefix = `${msg.year}-${String(msg.month).padStart(2, '0')}`;
+for (const k of [...acc.byDay.keys()]) if (k.startsWith(prefix)) acc.byDay.delete(k);
+</code></pre>
+<p>第二，切换视图时要先清空再请求。否则从本月切到本周，上个月的圆点会留在共享的首尾格里。</p>
+<p>事件和待办的保存、删除、批量删除、恢复，以及日历订阅同步、标签变更，都会触发对应月份重新请求，而不是整窗刷新。今日安排只消费 <code>byDay</code>；<code>todoDates</code> 和 <code>projectSpans</code> 是给桌面日历画圆点和项目跨格条用的。待办列表来自另一个 hook <code>useTodos</code>，它监听 <code>todos_result</code> 和 <code>todos_changed</code> 等失效事件。</p>
+<p>两条数据流最后在 <code>groups</code> 这个 <code>useMemo</code> 里汇合。这也是为什么组件里没有全局 store：日历事件按月拉，待办一次拉全量，两者的失效频率和缓存粒度都不一样，硬塞进一个 store，最后还是得写两套失效逻辑。</p>
+<h2 id="合流一条时间轴上先放谁">合流：一条时间轴上先放谁</h2>
+<p>单日的合流逻辑都在 <code>buildDayRows</code> 里。它做三件事：全天事件置顶，定时事件和待办按时间排序，事件之间补空闲块。</p>
+<pre><code class="language-ts">// Widgets.tsx:778
+evs.filter(e =&gt; e.isAllDay).forEach(e =&gt; rows.push({ kind: 'event', time: '全天', ... }));
+
+const seq = [
+  ...evs.filter(e =&gt; !e.isAllDay)
+    .map(e =&gt; ({ kind: 'event', e, sort: hhmm(new Date(e.startTime)) })),
+  ...dayTodos.map(t =&gt; ({ kind: 'todo', t, sort: dueSort(t) })),
+].sort((a, b) =&gt; a.sort.localeCompare(b.sort));
+</code></pre>
+<p>排序键看起来简单，实际上有三个决定。</p>
+<p><strong>待办没有时刻时，按 23:59 排。</strong> <code>dueSort</code> 的规则是：有具体时刻用时刻，否则用 <code>'23:59'</code>。于是「今天 18:00 前交」会排在 18:00 的会议旁边，而「今天做完」会沉到当天最后。理由很实际：没有时刻的待办，用户默认就是「今天结束前」。</p>
+<p><strong>00:00 不是时刻，是「仅日期」。</strong> 日期选择器经常产出 <code>2026-11-28T00:00:00</code> 这种午夜 datetime。如果按分钟比较，所有仅日期待办会在当天 00:01 就变红。所以逾期判定分两种精度：</p>
+<pre><code class="language-ts">// lib/todoPanel.ts:28
+const time = dueDate.length &gt; 10 ? dueDate.slice(11, 16) : '';
+if (!time || time === '00:00') return dueDate.slice(0, 10) &lt; todayKey;
+return dueCompareKey(dueDate) &lt; nowKey;
+</code></pre>
+<p>仅日期按天比较，当天不算逾期；真实时刻才按分钟。显示上同理，<code>00:00</code> 渲染成「截止」而不是「00:00」。</p>
+<p><strong>跨天事件只出现一次。</strong> 一个三天的出差如果每天都被后端命中，周、月、年视图里就会重复三遍。<code>dedupeSpan</code> 用 <code>Set&lt;id&gt;</code> 保证它只在首日出现：</p>
+<pre><code class="language-ts">const isSpanEv = (e) =&gt; e.startTime.slice(0, 10) !== (e.endTime || e.startTime).slice(0, 10);
+const dedupeSpan = (evs, seen) =&gt;
+  evs.filter(e =&gt; !isSpanEv(e) || (!seen.has(e.id) &amp;&amp; seen.add(e.id)));
+</code></pre>
+<p><img src="https://img2024.cnblogs.com/blog/32765/202611/32765-20261128214317273-1963959240.png" alt="01-day-timeline" loading="lazy"></p>
+<p>空闲块是这套规则里唯一一个「不是内容」的行。两个定时事件之间如果间隔 ≥15 分钟，且中间没有待办，就插一行「空闲 1h30m」。但它只是修饰，不算条目。</p>
+<p>第一版把它和事件、待办一起计数，分组头显示「11 项」，用户数了半天只有 8 条。后来把 gap 从计数、空态判断、批量操作里全部排除，悬浮提示再拆成「N 日程 · M 待办」，数字才对上。<code>Widgets.tsx:1222</code> 那条注释就是这次返工的现场。</p>
+<p>年视图还会关掉空闲块，并在行首加「日」前缀。十二个月全展示，因为用户切到全年就是想扫一遍，不是想让组件替他省略。</p>
+<h2 id="逾期没有字段全靠推导">逾期：没有字段，全靠推导</h2>
+<p>逾期在数据库里没有字段，它是「截止时间 &lt; 现在」的推导结果。推导本身不难，难的是边界。</p>
+<p>比较之前必须把 ISO 字符串里的 <code>T</code> 换成空格。后端下发 <code>2026-11-28T09:00:00</code>，前端拼的现在是 <code>2026-11-28 09:00</code>。字典序里 <code>'T'</code>（0x54）大于 <code>' '</code>（0x20），同一天带时间的待办会被判成「还没逾期」，永远不标红。</p>
+<pre><code class="language-ts">// lib/todoPanel.ts:22
+export const dueCompareKey = (d) =&gt;
+  d.length &gt; 10 ? d.replace('T', ' ').slice(0, 16) : d;
+</code></pre>
+<p>逾期行的时间列也要换语义。拖过一天之后，原时刻已经不重要，用户想知道的是拖了多久。所以时间列会变成「昨天」「前天」「3 天前」「10 月 8 日」，超过七天用绝对日期。当天到点未完成的保留原时刻——它还没过夜，用户需要知道是几点的事。</p>
+<p>今日 tab 的分组顺序是：置顶（最多 3 条）、已逾期（按截止日升序）、今天、未来。无日期待办追加在今日列表末尾，因为「没定日子」的事最应该今天决定。</p>
+<p>已完成的显隐状态存在 <code>localStorage['ucalendar_agenda_showdone']</code>，这里默认展开。归组用 <code>completedAt</code> 而不是 <code>dueDate</code>，所以「今天做完的」会进今天；旧数据没有 <code>completedAt</code> 才退回截止日。这个细节很小，但用户对「今天完成了什么」的感知很直接。</p>
+<h2 id="顺延和-6-秒撤销">顺延和 6 秒撤销</h2>
+<p>逾期待办最常见的动作是「我今天做，但没做完，挪到今天」。看起来简单，实际有四个约束：不能改已完成的，不能丢掉原来的时刻，重复规则的锚点不能漂，用户点错了要能撤销。</p>
+<p>前端的准入条件先挡掉假动作：</p>
+<pre><code class="language-ts">// lib/todoPanel.ts:55
+if (!dueDate || dueDate.slice(0, 10) &gt;= todayKey) return false;
+const time = dueDate.length &gt; 10 ? dueDate.slice(11, 16) : '';
+return !time || time === '00:00' || `${todayKey} ${time}` &gt; nowKey;
+</code></pre>
+<p>只有日期在昨天及以前的才给顺延按钮。如果原时刻是 14:00、现在已经是 15:00，顺延到今天仍然逾期，所以不给按钮，只显示「逾期」标。少了这个判断，用户点完顺延发现还是红的，这个动作就白做了。</p>
+<p>点击后先拍快照，再发批量消息：</p>
+<pre><code class="language-ts">const snapshots = rows.map(t =&gt; ({
+  id: t.id,
+  dueDate: t.dueDate ?? null,
+  snoozeUntil: t.snoozeUntil ?? null,
+  recurrenceRule: t.recurrenceRule ?? null,
+}));
+void batchTodoAction('reschedule_today', rows.map(t =&gt; t.id));
+// antd notification, duration: 6
+// 撤销 → undoReschedule(snapshots)
+</code></pre>
+<p>后端在一个 <code>BEGIN IMMEDIATE</code> 事务里逐条更新，SQL 的关键是 <code>WHERE Id=? AND IsDone=0</code>：</p>
+<pre><code class="language-rust">// src-tauri/src/bridge.rs:3845
+UPDATE Todos SET DueDate=?1, RecurrenceRule=?2, SnoozeUntil=NULL, UpdatedAt=?3
+WHERE Id=?4 AND IsDone=0
+</code></pre>
+<p>这四列都不是顺手写的。<code>DueDate = today.and_time(原 time)</code> 只换日期、保留时刻；<code>SnoozeUntil = NULL</code> 表示用户主动顺延，旧的「稍后提醒」作废；<code>RecurrenceRule</code> 要过一遍 <code>ensure_month_anchor</code>，否则 1 月 31 日的月重复顺延到 2 月后会被截成 28 号，下次物化就再也回不到 31 号；<code>IsDone=0</code> 则防住快照和更新之间的竞态——用户如果在别的窗口完成了它，不能把完成状态改回去。</p>
+<p>撤销走另一条 SQL，按快照恢复 <code>DueDate</code>、<code>RecurrenceRule</code>、<code>SnoozeUntil</code>，同样只更新未完成行。6 秒是产品给的窗口，不是技术限制。真正的保障是快照加条件更新，而不是「祈祷用户别在这 6 秒里操作别的窗口」。</p>
+<h2 id="切换视图时别让列表跳">切换视图时，别让列表跳</h2>
+<p>分类 chip 有一个反直觉的决定：固定列出全部标签，不随当前范围有没有内容增删。如果只列「当前范围里有内容」的标签，用户从今日切到本周时，某个标签会突然消失，列表高度和位置一起变，刚想点的东西就没了。现在条数放在悬浮提示里，不占宽度，列表才稳定。</p>
+<p>搜索只覆盖事件标题、地点和待办标题。备注、子任务、标签名不进来——组件里的搜索是「快速定位」，不是全文检索，范围越大，结果越不像用户想要的那一条。</p>
+<p>点击任意条目会发 <code>open_editor</code>，由宿主开一个独立编辑窗。这里传的日期是「用户点的那一天」，不是系列首日；否则重复日程的「仅此实例」会改到系列第一次发生的那天。年视图没有日 key，才退回事件发生日。</p>
+<p>年视图右侧有十二个月导轨，滚动时用 <code>requestAnimationFrame</code> 节流计算当前月；「今天」按钮只在目标滚出视口时浮出。这些都和 AI 窗的轮次导轨共用同一套交互。</p>
+<p>有一个已知的不一致：本周视图固定从周一开始，不读全局的周起始设置。桌面日历的周视图会读。这是历史实现留下的边界，写在这里，免得后来的人以为两处行为本来就该一样。</p>
+<h2 id="如果重做">如果重做</h2>
+<p>我会把 <code>groups</code> 这个一百七十多行的 <code>useMemo</code> 拆成独立的纯函数模块，输入是 <code>todos</code>、<code>byDay</code>、<code>pinnedIds</code>、<code>todayKey</code>，输出是分组。现在它埋在组件里，只能靠界面回归来验证，没法像 <code>todoOverdue</code> 那样写几条断言就跑。</p>
+<p>另外，周起始的不一致应该在第一版就统一。它不是难改，只是当时没人注意到两个组件用了不同的起点。</p>
+<p>还有一处小债：今日安排的 60 秒刷新是自己起的 interval，没有接 <code>useNow</code> 的 <code>document.hidden</code> 停表。改成 <code>useNow(60_000)</code> 就能少一份生命周期判断，窗口收起后也不会白跑。</p>
+<h2 id="最后">最后</h2>
+<p>这个组件没有用状态管理库，也没有复杂的抽象。核心就是三个纯函数和一个事务：<code>buildDayRows</code> 负责合流，<code>todoOverdue</code> 负责判定，<code>canRescheduleOverdue</code> 负责准入，后端用条件更新保证顺延和撤销不会互相踩。</p>
+<p>真正花时间的，是决定什么该出现、什么该消失。桌面组件的难点从来不是「能不能做」，而是「在 300×380 里，哪些信息必须出现、哪些必须消失、哪些必须在不该出现的时候绝不出现」。</p>
+<p>下一篇写桌面日历：42 格、农历黄历双源，以及一个为什么不用 Dropdown 的右键菜单。</p>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-28 21:46">2026-11-28 21:45</span>&nbsp;
+<a href="https://www.cnblogs.com/ucfar">ucfar</a>&nbsp;
+阅读(<span id="post_view_count">0</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23814295);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Fucfar%2Fp%2F23814295&amp;targetId=23814295&amp;targetType=0" target="_blank">举报</a>
+</div>
+        

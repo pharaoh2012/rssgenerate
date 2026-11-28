@@ -1,0 +1,668 @@
+
+            <h1 class="postTitle">
+                <a id="cb_post_title_url" class="postTitle2 vertical-middle" href="https://www.cnblogs.com/taotaoi/p/23692874" title="发布于 2026-11-28 14:28">
+    
+
+    <span role="heading" aria-level="2">用 DispatchProxy 实现动态代理和拦截器</span>
+    
+
+</a>
+
+            </h1>
+            <div class="clear"></div>
+            <div class="postBody">
+                <div id="cnblogs_post_body" class="blogpost-body cnblogs-markdown">
+<p>整理项目代码时，发现不少应用服务都在重复做几件事方法开始时记日志，结束时统计耗时，有些查询还要先查缓存。单看一个方法，几行代码不算多，但是放到几十个方法里，维护起来就麻烦了下面这个查询就是例子。</p>
+<pre><code class="language-.cs">public async Task&lt;UserDto&gt; GetAsync(Guid id)
+{
+    _logger.LogInformation("开始查询用户：{UserId}", id);
+    var stopwatch = Stopwatch.StartNew();
+
+    var cacheKey = $"user:{id}";
+    if (_cache.TryGetValue(cacheKey, out UserDto? cached))
+        return cached;
+
+    var user = await _repository.GetAsync(id);
+    _cache.Set(cacheKey, user, TimeSpan.FromMinutes(1));
+
+    _logger.LogInformation(
+        "查询用户结束，耗时：{ElapsedMilliseconds}ms",
+        stopwatch.ElapsedMilliseconds);
+
+    return user??new UserDto();
+}
+</code></pre>
+<p>上面这个代码能看出的问题就是真正查询用户的逻辑只有几行，周围却围着日志、计时和缓存。缓存命中时直接返回，结束日志会漏掉，查询抛异常时，耗时也没有去记录。方法一多这些分支就容易处理得不一致。我们可以把固定的执行流程提取出来，让业务方法主要负责查询。</p>
+<p>类似这种问题可以用 AOP 来处理 把重复的操作放到业务方法外面，然后在调用前后统一执行。不过日志、计时和缓存虽然都有可以复用的部分，适用规则也不是完全相同。计时通常比较容易统一，日志要考虑记录哪些参数、哪些字段需要脱敏，缓存还要考虑数据多久过期、更新后咋失效。所以先把调用链搭起来，具体规则约束只做最简单的处理。</p>
+<p>先看两种实现方式。</p>
+<p><strong>1.用委托包装执行流程</strong></p>
+<p>最直接的办法是写一个包装方法，把业务逻辑作为委托传进去。包装的方法负责日志、计时等公共步骤，委托负责具体业务逻辑。调用顺序也很清楚执行 前置逻辑 → 执行业务委托 → 后置逻辑 → 返回结果。这种方式不需要引入代理库，但每次调用时需要我们在代码里面显式使用这个包装方法</p>
+<pre><code class="language-.cs">public static async Task&lt;T&gt; ExecuteWithLogger&lt;T&gt;(ILogger logger,Func&lt;Task&lt;T&gt;&gt; business)
+{
+    logger.LogInformation("开始执行");
+
+    var result = await business();
+
+    logger.LogInformation("执行完成");
+    return result;
+}
+</code></pre>
+<p>这里先演示正常返回的情况，业务委托<code>business()</code>抛异常时，执行完成是不会打印的，异常会继续交给调用方，后面的日志拦截器再补上异常处理。</p>
+<p><strong>2.代理模式（静态代理、动态代理）</strong></p>
+<p>我们也可以通过代理模式来实现，分为静态代理和动态代理两种路线。</p>
+<p>动态代理会在程序运行时自动生成代理类型并创建实例，不需要你提前手写代理类。静态代理的类型在编译期就已确定，可以手写实现，也可以通过源码生成器在编译时生成，可以根据实际场景选择。</p>
+<p>它们的核心思想是将通用的横切逻辑与业务代码解耦，把重复的代码统一收到代理层里面自动执行，让业务代码只关注核心业务流程。简单理解就是代理对象作为业务类的替身，对外面保持和业务类完全一样的调用方式，调用的地方感受不到有什么不同，当调用方法时，代理会先执行框架预设的操作比如日志、计时，然后再把调用转发给真实的业务对象处理。</p>
+<p>在.NET 生态中，有一些成熟的动态代理库，其中 Castle.Core 的 DynamicProxy 应用比较广泛，很多主流框架的 AOP 能力都基于它来实现，并且面向接口的代理场景侵入性非常低，感兴趣的可以深入了解一下。</p>
+<p>在接下来我们使用.NET 框架自带的 <code>DispatchProxy</code> 实现动态代理做日志和缓存，<code>DispatchProxy</code>是一个抽象类，它只解决把接口方法调用转发到统一入口的问题。它没有拦截器、没有责任链、所有 AOP 都需要自己实现，我们为了学习，所以自己手动实现。不过并不能完全替代 Castle.Core 只是为了研究学习。</p>
+<hr>
+<h2 id="1-动态代理到底代理了什么">1. 动态代理到底代理了什么？</h2>
+<p>假设 <code>Controller</code> 注入的是 <code>IUserQueryService</code>：</p>
+<pre><code class="language-.cs">public interface IUserQueryService
+{
+    Task&lt;UserDto&gt; GetAsync(Guid id);
+}
+</code></pre>
+<p>当运行没使用代理时容器是直接给它一个 <code>UserQueryService</code>的实例。</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202608/1264751-20260826134823509-138511325.png" alt="image" loading="lazy"></p>
+<p>用了动态代理后，Controller中注入的<code>IUserQueryService</code>拿到的其实不是原对象，而是运行时生成的代理对象，大白话就是我捏造一个对象，这个对象也是接口的实现，然后我在这个实现中再调用原来的实例，那么我就可以调用这个实例的前后加入一些代码，如果把这个封装一下，就是拦截器了</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202608/1264751-20260826151939987-1635553971.png" alt="image" loading="lazy"></p>
+<p>例如 Controller 调用<code>IUserQueryService</code>接口的 <code>GetAsync</code> 时，先进入代理。代理看下是否有拦截器，然后决定先执行哪些拦截器，最后才调用真实服务。Controller 以为自己调的是 UserQueryService，实际上调的是代理对象，请求像穿洋葱一样一层层剥进去，再一层层包出来。它和中间件看着很像，如果你了解中间件，你肯定知道他们作用的范围是不一样的：</p>
+<ol>
+<li><strong>.NET CORE中间件拦的是 HTTP 请求。</strong></li>
+<li><strong>DispatchProxy拦的是某个接口的方法调用。</strong></li>
+</ol>
+<p>如果要记录每个 HTTP 请求的处理情况，标准做法是放在 ASP.NET Core 中间件里更合适。如果要根据应用服务的方法执行逻辑来读取方法名、参数和返回值，可以使用方法拦截。但是<code>DispatchProxy</code> 只能代理接口，而且调用必须经过代理对象。如果你直接注入最原始的接口，或者直接在代码中<code>new</code>对象他是不会经过代理的，懵逼的话看例子</p>
+<pre><code class="language-.cs">public static void Run()
+{
+        OrderAppService raw = new OrderAppService();
+        IOrderAppService proxy = LoggingProxy&lt;IOrderAppService&gt;.Create(raw);
+        
+        // 经过代理，会打印方法名、参数和返回值
+        proxy.Delete(Guid.NewGuid());
+       
+        // 注入或直接拿原始接口，不会进入 Invoke
+        IOrderAppService injected = raw;
+        injected.Delete(Guid.NewGuid());
+      
+      // 自己 new 出来的对象也没有代理
+        OrderAppService created = new OrderAppService();
+        created.Delete(Guid.NewGuid());
+}
+</code></pre>
+<hr>
+<h2 id="2-实现最小版本">2. 实现最小版本</h2>
+<p>注意先别关注细节，学习并且实现这类东西的时候也是同一个道理，别急着敲代码，先用自己的话说清楚我到底要做什么，列个大纲，不然很容易一上来就陷进 API 细节里，写完也不知道自己写了什么。这里的目标其实就三句话：</p>
+<ol>
+<li>
+<p>造一个壳，它实现了和业务类一模一样的接口，调用方看不出任何区别。</p>
+</li>
+<li>
+<p>壳里存着真实业务对象，外加一串拦截器。</p>
+</li>
+<li>
+<p>所有方法调用都先落到壳的统一入口，在那里按顺序跑拦截器，最后一个拦截器再去调真实对象。</p>
+</li>
+</ol>
+<p>只包一个接口时，这个壳手写就行并不费事。麻烦的是接口和方法会越来越多，每加一个方法就要再写一遍转发。<code>DispatchProxy</code> 的作用就是省掉这部分重复代码，改为在运行时生成。</p>
+<p>拿订单举个例子业务接口叫 <code>IOrderAppService</code>，真实类叫 <code>OrderAppService</code>。我们准备写一个通用代理基类 <code>ServiceProxy&lt;TService&gt;</code>，让框架生成的类型继承它。</p>
+<p>生成出来的类型可以理解成下面这样，额这不是框架实际生成的源码，只是为了看清调用关系，先用同步方法举例</p>
+<pre><code class="language-csharp">public class OrderAppServiceProxy : ServiceProxy&lt;IOrderAppService&gt;, IOrderAppService
+{
+    public string Delete(Guid id)
+    {
+        // 找到接口上的 Delete(Guid) 方法。
+        MethodInfo method = typeof(IOrderAppService)
+            .GetMethod(nameof(Delete), new[] { typeof(Guid) })!;
+
+        // 把本次调用的参数放进数组，交给统一入口处理。
+        object?[] args = new object?[] { id };
+
+        // 生成的方法只负责把调用交给 Invoke。
+        // 是否执行拦截器、何时调用真实对象，由我们在 Invoke 中实现。
+        object? result = Invoke(method, args);
+
+        // 按接口声明的返回类型，把结果转换回 string。
+        return (string)result!;
+    }
+}
+</code></pre>
+<p>调用方通过 <code>IOrderAppService</code> 拿到的是这个生成的代理对象，调用 <code>Delete</code> 时，生成的方法会把方法信息和本次参数交给基类的 <code>Invoke</code>，以后接口再加 <code>Update</code>，框架也会生成对应的转发方法，我们不用再手写一遍。</p>
+<p>到这里，框架帮我们完成的是把接口调用接进来。但是它还不知道真实的 <code>OrderAppService</code> 在哪里，也不知道要执行哪些日志和缓存逻辑。这些需要我们在 <code>ServiceProxy&lt;TService&gt;</code> 中实现。</p>
+<p>这里使用泛型 <code>TService</code>，是为了让保存的真实对象和工厂方法的返回值都使用同一个接口类型。例如代理订单服务时，<code>TService</code> 就是 <code>IOrderAppService</code>。代理基类也可以写成非泛型，这里只是选择了比较方便的一种写法。</p>
+<p>接下来 <code>Invoke</code> 收到一次调用后，先执行哪些操作，什么时候调用真实服务，结果又怎么返回？我们把这些操作写成拦截器，并用 <code>proceed</code> 委托把它们串起来。先定义拦截器接口，再把这条调用链接进代理的 <code>Invoke</code>。</p>
+<h3 id="21-声明拦截器">2.1 声明拦截器</h3>
+<p>拦截器接口只有一行</p>
+<pre><code class="language-cs">public interface IInterceptor
+{
+    object? Intercept(MethodInfo method,object?[] arguments,Func&lt;object?&gt; proceed);
+}
+</code></pre>
+<p>Castle.Core里也是这个思路，其实我最开始看的时候，一直没有理解 为什么 <code>proceed</code> 当参数传进来，而不是给拦截器目标对象 + MethodInfo 让它自己调用</p>
+<pre><code class="language-.cs">public interface IInterceptor
+{
+    object? Intercept(object target, MethodInfo method, object?[] args);
+}
+</code></pre>
+<p>这种得自己写 <code>method.Invoke(target, args)</code>，但是这样只能直接调用真实的方法了，没法串下一个拦截器，但如果传入的是一个委托，实现接口的拦截器只需要直接调用 <code>proceed()</code>就行了，而它可以代表下一个拦截器或者最后那个真实的动作，假设我有2个拦截器，执行时就是下面这样的流程：</p>
+<blockquote>
+<p>拦截器A → 拦截器B → 真实方法</p>
+</blockquote>
+<ul>
+<li>
+<p>当执行到 A 的 <code>Intercept</code>，传给 A 的 <code>proceed</code> 是去执行 B 的 Intercept</p>
+</li>
+<li>
+<p>当执行到 B 的 <code>Intercept</code>，传给 B 的 <code>proceed</code> 是去调用真实方法 method.Invoke</p>
+</li>
+</ul>
+<p>如果你对 .NET Core 中间件，或是 .NET Framework WebAPI 的管道模型有一定了解，应该很快就能反应过来，它们都支持在 HTTP 请求执行链路里，在任意环节插入拦截、自定义逻辑<br>
+.NET Core 中间件就是借助委托实现洋葱式执行，而 WebAPI 的消息处理管道同样是责任链思想，底层也是层层包装下一环，感兴趣可以去看看。</p>
+<p>下面以实现 <code>IMiddleware</code> 时的 <code>InvokeAsync</code> 方法为例：</p>
+<pre><code class="language-.cs">// next 就是这里的 proceed
+public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+{
+    // 前置
+    await next(context); 
+    // 后置
+}
+
+</code></pre>
+<p>接下来我们实现两个拦截器，不往里塞日志和缓存的具体代码，先把调用链路跑通，往里填东西就是锦上添花，但是如果方向错了，填再多代码都没啥用。</p>
+<pre><code class="language-.cs">public sealed class LoggingInterceptor : IInterceptor
+{
+    public object? Intercept(MethodInfo method,object?[] arguments,Func&lt;object?&gt; proceed)
+    {
+        Console.WriteLine("日志拦截器开始");
+        var result = proceed();
+        Console.WriteLine("日志拦截器结束");
+        return result;
+    }
+}
+
+public sealed class CachingInterceptor : IInterceptor
+{
+    public object? Intercept(MethodInfo method,object?[] arguments,Func&lt;object?&gt; proceed)
+    {
+        Console.WriteLine("缓存拦截器开始");
+        var result = proceed();
+        Console.WriteLine("缓存拦截器结束");
+        return result;
+    }
+}
+</code></pre>
+<h3 id="22-实现代理">2.2 实现代理</h3>
+<p>接下里再把代理类实现，代码也不是很多，但每行都对应前面说的一些约定</p>
+<pre><code class="language-.cs">public sealed class ServiceProxy&lt;TService&gt; : DispatchProxy where TService : class
+{
+    private TService _target = default!;
+    private IInterceptor[] _interceptors = [];
+
+    public static TService Create(TService target, params IInterceptor[] interceptors)
+    {
+        var proxy = DispatchProxy.Create&lt;TService, ServiceProxy&lt;TService&gt;&gt;();
+        var serviceProxy = (ServiceProxy&lt;TService&gt;)(object)proxy;
+        serviceProxy._target = target;
+        serviceProxy._interceptors = interceptors;
+        return proxy;
+    }
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        ArgumentNullException.ThrowIfNull(targetMethod);
+        args ??= [];
+        Console.WriteLine("代理执行");
+        Console.WriteLine($"方法名：{targetMethod.Name}，参数：{string.Join(',', args)}");
+        return ExecuteInterceptor(0, targetMethod, args, () =&gt; targetMethod.Invoke(_target, args));
+    }
+
+    private object? ExecuteInterceptor(int index, MethodInfo method, object?[] arguments, Func&lt;object?&gt; proceed)
+    {
+        if (index &gt;= _interceptors.Length) return proceed();
+        return _interceptors[index].Intercept(method, arguments, () =&gt; ExecuteInterceptor(index + 1, method, arguments, proceed));
+    }
+}
+</code></pre>
+<p>分别介绍下这里面的内容和作用</p>
+<ol>
+<li><code>Create()</code>的作用就是利用 DispatchProxy 生成代理实例，再把真实对象和其他拦截器数组塞进去。<code>DispatchProxy</code> 生成的代理实例必须能通过没有参数的构造函数创建，所以不能给 <code>ServiceProxy</code> 加带参数的构造，只能先生成再赋值。</li>
+</ol>
+<p>2.<code>DispatchProxy.Create</code> 的返回值的类型是 <code>TService</code>，但编译器不知道它是 <code>ServiceProxy&lt;TService&gt;</code>，所以先转成 <code>object</code> 再转具体类型，相当于跟编译器保证运行时它就是那个类型。这里不会真的装箱，只是类型检查，对象本来就是那个对象。</p>
+<ol start="3">
+<li>
+<p><code>Invoke()</code> 所有方法调用都会先进这里，然后从第 0 个拦截器开始递归。不管接口里叫 <code>GetAsync</code> 还是 <code>SearchAsync</code>，参数几个，最后都在这一个方法。也是代理对业务代码不侵入的原因。</p>
+</li>
+<li>
+<p><code>ExecuteInterceptor()</code> 就是核心的方法，每个拦截器的 proceed() 就是调用下一个拦截器，直到全部拦截器执行完，才会调用真实方法。终止条件也很简单，当 <code>index &gt;= _interceptors.Length</code> 的时候，<code>proceed()</code> 其实就是 <code>targetMethod.Invoke(_target, args)</code>，它就是真正的业务代码。</p>
+</li>
+</ol>
+<h3 id="23-模拟业务调用">2.3 模拟业务调用</h3>
+<p>先不接依赖注入，手工 new 一个真实服务再包一层代理</p>
+<pre><code class="language-.cs">public interface ICustomService
+{
+    Task ExecuteAsync(string name);
+}
+
+public sealed class CustomService : ICustomService
+{
+    public Task ExecuteAsync(string name)
+    {
+        Console.WriteLine("进入真实业务方法");
+        Console.WriteLine($"Hello {name}");
+        Console.WriteLine("退出真实业务方法");
+        return Task.CompletedTask;
+    }
+}
+</code></pre>
+<pre><code class="language-.cs">//这里为了模拟手动new CustomService 在实际中从容器中拿到的
+var service = new CustomService();
+
+//使用服务代理工厂创建一个代理，然后传入2个上面定义的拦截器
+var proxy = ServiceProxy&lt;ICustomService&gt;.Create(service,new CachingInterceptor(),new LoggingInterceptor());
+
+await proxy.ExecuteAsync("World");
+</code></pre>
+<p>执行顺序是：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202608/1264751-20260826140301746-7987967.png" alt="image" loading="lazy"></p>
+<p>这里我传给 <code>Create</code> 的顺序是 <code>Caching</code> 在前、<code>Logging</code> 在后，所以 <code>Caching</code> 是最外面那层。控制台输出也看出了这一点，进去是"缓存拦截器开始 → 日志拦截器开始 → 进入真实业务方法"，出来倒过来，"退出真实业务方法 → 日志拦截器结束 → 缓存拦截器结束"，一进一出是对称的。也就是说，拦截器的注册顺序本身就是语义，谁在前面，谁就可以决定控制要不要继续。这就是一条最小拦截器链。前面的拦截器像套娃一样把后面的包起来 <code>proceed()</code> 表示继续向下走。到这里你会发现动态代理其实就这点东西。它只是把接口方法调用统一收口到一个 <code>Invoke</code>，再给你一个自己拼装调用链的机会。</p>
+<hr>
+<h2 id="3-真实项目中存在的问题">3. 真实项目中存在的问题</h2>
+<p>上面的 Demo 能说明原理，但不能直接在生产代码中用。因为真实业务方法一般不会像 Demo 一样立即返回 <code>Task.CompletedTask</code>，而是要真正等待数据库：</p>
+<pre><code class="language-cs">public async Task&lt;UserDto?&gt; GetAsync(Guid id)
+{
+    await Task.Delay(500);
+    return await _dbContext.Users.Where(u =&gt; u.Id == id) .Select(u =&gt; new UserDto(u.Id, u.Name)).FirstOrDefaultAsync();
+}
+</code></pre>
+<p>同步拦截器调用 <code>proceed()</code> 会拿到的一个还没完成的 <code>Task</code>，然后会马上打印日志拦截器结束，这时候SQL可能还在跑，直到后续数据库抛异常。</p>
+<p>错误时序会变成：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202608/1264751-20260826142309334-1337860491.png" alt="image" loading="lazy"></p>
+<p>我们真正想要的是：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202608/1264751-20260826142433802-619327723.png" alt="image" loading="lazy"></p>
+<p>另外还有几个问题：</p>
+<ol>
+<li><code>Task&lt;T&gt;</code> 的返回值应该要正确返回回去。</li>
+<li><code>MethodInfo.Invoke</code> 抛出的同步异常要在 <code>TargetInvocationException</code> 中。</li>
+<li>并不是每个方法都需要缓存，要用标记来控制一下。</li>
+<li>代理类的创建和拦截器的创建要能从依赖注入容器中解析，而不是每个 Controller 都手动去使用<code>new</code>来获取实例。</li>
+</ol>
+<p>所以我们直接把它改成异步的版本。</p>
+<hr>
+<h2 id="4-实现异步拦截器链">4. 实现异步拦截器链</h2>
+<blockquote>
+<p>这里只做项目里最常用的 Task、Task<t>。同步方法、ValueTask<t> 暂时不写，后面有需要再加，思路通了，交给 Codex 补代码很快。</t></t></p>
+</blockquote>
+<h3 id="41-调用上下文">4.1 调用上下文</h3>
+<pre><code class="language-cs">public sealed class InvocationContext
+{
+    public required MethodInfo Method { get; init; }
+    public required object?[] Arguments { get; init; }
+    public required Func&lt;Task&lt;object?&gt;&gt; ProceedAsync { get; init; }
+}
+
+public interface IAsyncInterceptor
+{
+    Task&lt;object?&gt; InvokeAsync(InvocationContext context);
+}
+</code></pre>
+<h3 id="42-完整代理">4.2 完整代理</h3>
+<p>下面只贴和 2.2 不一样的地方，<code>Create()</code> 那些重复代码就不贴了：</p>
+<pre><code class="language-cs">ppublic sealed class ServiceProxy&lt;TService&gt; : DispatchProxy where TService : class
+{
+    private TService _target = default!;
+    private IReadOnlyList&lt;IAsyncInterceptor&gt; _interceptors = [];
+
+    // Create 方法和之前保持不变，这里省略
+
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+    {
+        ArgumentNullException.ThrowIfNull(targetMethod);
+        args ??= [];
+
+        var pipelineTask = InvokePipelineAsync(targetMethod, args);
+
+        // 普通 Task
+        if (targetMethod.ReturnType == typeof(Task))
+        {
+            return WrapAsTask(pipelineTask);
+        }
+
+        // Task&lt;T&gt;
+        if (targetMethod.ReturnType.IsGenericType &amp;&amp;
+            targetMethod.ReturnType.GetGenericTypeDefinition() == typeof(Task&lt;&gt;))
+        {
+            var resultType = targetMethod.ReturnType.GetGenericArguments()[0];
+            return WrapAsTaskOfT(pipelineTask, resultType);
+        }
+
+        throw new NotSupportedException($"{typeof(TService).Name}.{targetMethod.Name} 必须返回 Task 或 Task&lt;T&gt;。");
+    }
+
+    // 和原来逻辑一样，没变
+    private Task&lt;object?&gt; InvokePipelineAsync(MethodInfo method, object?[] arguments)
+    {
+    // 从第0个拦截器开始执行
+    return RunInterceptor(0);
+
+    Task&lt;object?&gt; RunInterceptor(int index)
+    {
+        // 所有拦截器跑完了，直接调用真实目标方法
+        if (index &gt;= _interceptors.Count)
+        {
+            return InvokeTargetAsync(method, arguments);
+        }
+
+        var currentInterceptor = _interceptors[index];
+
+        var context = new InvocationContext
+        {
+            Method = method,
+            Arguments = arguments,
+            // 按下Proceed，就跑下一个拦截器
+            ProceedAsync = () =&gt; RunInterceptor(index + 1)
+        };
+
+        return currentInterceptor.InvokeAsync(context);
+    }
+    }
+
+
+    private async Task&lt;object?&gt; InvokeTargetAsync(MethodInfo method, object?[] arguments)
+    {
+        try
+        {
+            var task = (Task)method.Invoke(_target, arguments)!;
+            await task.ConfigureAwait(false);
+
+            return method.ReturnType.IsGenericType
+                ? task.GetType().GetProperty("Result")!.GetValue(task)
+                : null;
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw;
+        }
+    }
+
+    // 包装成 Task
+    private static async Task WrapAsTask(Task&lt;object?&gt; pipeline)
+    {
+        await pipeline;
+    }
+
+    // 动态包装成 Task&lt;T&gt;
+    private static object WrapAsTaskOfT(Task&lt;object?&gt; pipeline, Type resultType)
+    {
+        var method = typeof(ServiceProxy&lt;TService&gt;)
+            .GetMethod(nameof(InternalWrap), BindingFlags.Static | BindingFlags.NonPublic)!
+            .MakeGenericMethod(resultType);
+        return method.Invoke(null, [pipeline])!;
+    }
+
+    private static async Task&lt;T?&gt; InternalWrap&lt;T&gt;(Task&lt;object?&gt; pipeline)
+    {
+        var val = await pipeline;
+        return (T?)val;
+    }
+}
+
+</code></pre>
+<ol>
+<li><code>Invoke()</code> 是 DispatchProxy 固定回调入口。进来先判断返回类型是 Task 直接跑，是 Task<t>反射开泛型,别的直接抛异常，不兼容。</t></li>
+<li><code>InvokeTaskAsync</code> / <code>InvokeTaskOfTAsync</code> 只是适配层。把两种异步返回统一转成 <code>Task&lt;object?&gt;</code> 给管道处理，管道跑完再转回原来的类型。</li>
+<li><code>InvokePipelineAsync</code> 关键代码递归往下走，每个拦截器拿到的 <code>ProceedAsync</code> 就是继续往后跑的委托。全部拦截器走完，才会去调用真实业务方法。</li>
+<li><code>InvokeTargetAsync</code> 真正调用业务方法。await 等任务跑完，不会出现之前那种 “拦截器提前结束、SQL 还在后台跑” 的问题；顺便解包 TargetInvocationException。</li>
+</ol>
+<p>看着代码蛮多的，实际核心是拦截器拿到一个继续执行的按钮。最后一个按钮才会真正调用业务对象。</p>
+<pre><code class="language-cs">return _interceptors[index].InvokeAsync(new InvocationContext
+{
+    Method = method,
+    Arguments = arguments,
+    ProceedAsync = () =&gt; Next(index + 1)
+});
+</code></pre>
+<hr>
+<h2 id="5-查询服务统一加日志和缓存">5. 查询服务统一加日志和缓存</h2>
+<p>下面直接用一个用户查询接口来实现一下，需求如下：</p>
+<blockquote>
+<p>不引入 Castle.Core，所有查询得方法统一记方法名、参数、耗时和异常信息。<br>
+只有明确打了标记的方法才缓存，业务服务里不写日志和缓存代码。</p>
+</blockquote>
+<p>调用链如下：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202608/1264751-20260826150503232-54043033.png" alt="image" loading="lazy"></p>
+<h3 id="51-用-attribute-标记缓存">5.1 用 Attribute 标记缓存</h3>
+<p>不是所有查询都适合缓存，所以不能看到 <code>Task&lt;T&gt;</code> 就全缓存。所以定义一个 <code>Attribute</code>，谁需要谁自己标：</p>
+<pre><code class="language-cs">[AttributeUsage(AttributeTargets.Method)]
+public sealed class QueryCacheAttribute(int seconds) : Attribute
+{
+    public int Seconds { get; } = seconds;
+}
+</code></pre>
+<h3 id="52-日志拦截器">5.2 日志拦截器</h3>
+<pre><code class="language-cs">public sealed class LoggingInterceptor(
+    ILogger&lt;LoggingInterceptor&gt; logger) : IAsyncInterceptor
+{
+    public async Task&lt;object?&gt; InvokeAsync(InvocationContext context)
+    {
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            logger.LogInformation(
+                "开始执行 {Method}，参数：{@Arguments}",
+                context.Method.Name,
+                context.Arguments);
+
+            var result = await context.ProceedAsync();
+
+            logger.LogInformation(
+                "{Method} 执行完成，耗时 {ElapsedMilliseconds}ms",
+                context.Method.Name,
+                stopwatch.ElapsedMilliseconds);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                ex,
+                "{Method} 执行失败，耗时 {ElapsedMilliseconds}ms",
+                context.Method.Name,
+                stopwatch.ElapsedMilliseconds);
+            throw;
+        }
+    }
+}
+</code></pre>
+<p>这里和<code>await context.ProceedAsync()</code>。数据库没执行完，日志就不会提前结束业务异常也会被 <code>catch</code>。</p>
+<h3 id="53-缓存拦截器">5.3 缓存拦截器</h3>
+<p>Demo实现我们使用netcore提供的内存缓存：</p>
+<pre><code class="language-cs">public sealed class CachingInterceptor(
+    IMemoryCache cache,
+    ILogger&lt;CachingInterceptor&gt; logger) : IAsyncInterceptor
+{
+    public async Task&lt;object?&gt; InvokeAsync(InvocationContext context)
+    {
+        var attribute =
+            context.Method.GetCustomAttribute&lt;QueryCacheAttribute&gt;();
+
+        if (attribute is null)
+            return await context.ProceedAsync();
+
+        var cacheKey = BuildCacheKey(
+            context.Method,
+            context.Arguments);
+
+        if (cache.TryGetValue(cacheKey, out object? cached))
+        {
+            logger.LogInformation("缓存命中：{CacheKey}", cacheKey);
+            return cached;
+        }
+
+        logger.LogInformation("缓存未命中：{CacheKey}", cacheKey);
+        var result = await context.ProceedAsync();
+
+        if (result is not null)
+        {
+            cache.Set(
+                cacheKey,
+                result,
+                TimeSpan.FromSeconds(attribute.Seconds));
+        }
+
+        return result;
+    }
+
+    private static string BuildCacheKey(
+        MethodInfo method,
+        object?[] arguments)
+    {
+        var argumentText = JsonSerializer.Serialize(arguments);
+        return $"{method.DeclaringType!.FullName}:{method.Name}:{argumentText}";
+    }
+}
+</code></pre>
+<p>缓存命中时没有调用 <code>ProceedAsync</code>，所以后面的真实服务和数据库都不会执行。</p>
+<h3 id="54-真实查询服务">5.4 真实查询服务</h3>
+<pre><code class="language-cs">public sealed record UserDto(Guid Id, string Name);
+
+public interface IUserQueryService
+{
+    [QueryCache(60)]
+    Task&lt;UserDto?&gt; GetAsync(Guid id);
+
+    Task&lt;IReadOnlyList&lt;UserDto&gt;&gt; SearchAsync(string keyword);
+}
+
+public sealed class UserQueryService(AppDbContext dbContext)
+    : IUserQueryService
+{
+    public Task&lt;UserDto?&gt; GetAsync(Guid id)
+    {
+        return dbContext.Users
+            .AsNoTracking()
+            .Where(u =&gt; u.Id == id)
+            .Select(u =&gt; new UserDto(u.Id, u.Name))
+            .FirstOrDefaultAsync();
+    }
+
+    public async Task&lt;IReadOnlyList&lt;UserDto&gt;&gt; SearchAsync(
+        string keyword)
+    {
+        return await dbContext.Users
+            .AsNoTracking()
+            .Where(u =&gt; EF.Functions.Like(u.Name, $"%{keyword}%"))
+            .Select(u =&gt; new UserDto(u.Id, u.Name))
+            .ToListAsync();
+    }
+}
+</code></pre>
+<p>现在业务方法里只剩查询逻辑：</p>
+<ul>
+<li><code>GetAsync</code> 标了 <code>[QueryCache(60)]</code>，同一个 id 一分钟内命中缓存。</li>
+<li><code>SearchAsync</code> 没标，每次照常查数据库，但仍然会记录日志和耗时。</li>
+</ul>
+<h3 id="55-执行效果">5.5 执行效果</h3>
+<p>第一次调用：</p>
+<div class="mermaid">flowchart LR
+    A["开始执行 GetAsync&lt;br/&gt;参数：xxx..."] --&gt; B{缓存命中？}
+    B -- 未命中 --&gt; C["缓存未命中 IUserQueryService GetAsync"]
+    C --&gt; D["执行数据库查询"]
+    D --&gt; E["执行完成，耗时 38ms"]
+    B -- 命中 --&gt; E
+</div><p>第二次用相同 id 调用：</p>
+<p><img src="https://img2024.cnblogs.com/blog/1264751/202608/1264751-20260826151728691-1756850693.png" alt="image" loading="lazy"></p>
+<p>第二次没进入 <code>UserQueryService</code>，但是外层日志仍然在，因为注册顺序是日志在前、缓存在后。如果把缓存放到日志前面，缓存一旦命中，日志拦截器也不会执行。所以拦截器顺序不可以随便写，先日志、缓存、再真实服务</p>
+<pre><code class="language-text">Logging → Caching → Service
+</code></pre>
+<hr>
+<h2 id="6-接入到net-core-依赖注入">6. 接入到.NET CORE 依赖注入</h2>
+<p>前面解释了 <code>new</code> 只是为了方便看懂。在实际项目里，Controller 应该是正常的注入接口，不应该知道代理的存在。</p>
+<pre><code class="language-cs">builder.Services.AddMemoryCache();
+
+builder.Services.AddTransient&lt;LoggingInterceptor&gt;();
+builder.Services.AddTransient&lt;CachingInterceptor&gt;();
+
+builder.Services.AddScoped&lt;UserQueryService&gt;();
+builder.Services.AddScoped&lt;IUserQueryService&gt;(serviceProvider =&gt;
+{
+    var target =
+        serviceProvider.GetRequiredService&lt;UserQueryService&gt;();
+
+    var interceptors = new IAsyncInterceptor[]
+    {
+        serviceProvider.GetRequiredService&lt;LoggingInterceptor&gt;(),
+        serviceProvider.GetRequiredService&lt;CachingInterceptor&gt;()
+    };
+
+    return ServiceProxy&lt;IUserQueryService&gt;.Create(
+        target,
+        interceptors);
+});
+</code></pre>
+<p>Controller 中不需要任何特殊写法：</p>
+<pre><code class="language-cs">public sealed class UsersController(IUserQueryService userQueryService) : ControllerBase
+{
+    [HttpGet("{id:guid}")]
+    public Task&lt;UserDto?&gt; GetAsync(Guid id)
+    {
+        return userQueryService.GetAsync(id);
+    }
+}
+</code></pre>
+<p>这里Controller它拿到的还是 <code>IUserQueryService</code>。DI 在构建对象时，先拿真实 <code>UserQueryService</code>，再在外面包一层代理。如果项目里有很多接口都要这样注册，可以再写一个扩展方法统一一下子：</p>
+<pre><code class="language-cs">public static class ProxyServiceCollectionExtensions
+{
+    public static IServiceCollection AddProxiedScoped&lt;TService,TImplementation&gt;(this IServiceCollection services) where TService : class  where TImplementation : class, TService
+    {
+        services.AddScoped&lt;TImplementation&gt;();
+        services.AddScoped&lt;TService&gt;(serviceProvider =&gt;
+        {
+            var target = serviceProvider.GetRequiredService&lt;TImplementation&gt;();
+
+            var interceptors = serviceProvider.GetServices&lt;IAsyncInterceptor&gt;();
+
+            return ServiceProxy&lt;TService&gt;.Create(target,interceptors);
+        });
+
+        return services;
+    }
+}
+</code></pre>
+<p>服务和拦截器注册依赖注入容器：</p>
+<pre><code class="language-cs">builder.Services.AddTransient&lt;IAsyncInterceptor,LoggingInterceptor&gt;();
+builder.Services.AddTransient&lt;IAsyncInterceptor,CachingInterceptor&gt;();
+
+//使用我们自定义的扩展注入方法
+builder.Services.AddProxiedScoped&lt;IUserQueryService, UserQueryService&gt;();
+</code></pre>
+<p>不过这里<code>GetServices&lt;IAsyncInterceptor&gt;()</code> 会把所有拦截器套到所有代理接口上。项目大的话，可以加入<code>Scrutor</code>来加入一些匹配规则，它可以程序集扫描和批量注册库，而且支持条件注册。</p>
+<hr>
+<p>上面所分享的不是为了让你自己造一个代理框架。只是一起把 AOP 和代理拆开看一下，搞清楚拦截器为什么能包在业务方法外面。咱们真实项目里日志、缓存、事务、鉴权这类横切的操作肯定优先用现成框架给的功能，因为异步、异常、生命周期这些情况它都给处理好了，而且很多人在用，我们没必要再踩一遍这些坑，因为你自己手写的不一定有人家的好，这个我们之前就搞了很多手搓的，但是基本搞出来的和人家差很多，而且还到处是问题的。</p>
+<p>这次内容和代码适合</p>
+<blockquote>
+<ol>
+<li>学习下洋葱模型代理生成、调用链这些落到自己手里跑一遍，理解会透彻很多</li>
+</ol>
+</blockquote>
+<blockquote>
+<ol start="2">
+<li>框架的拦截器行为不符合预期时，能定位问题看出它在哪里出问题，不只是靠猜</li>
+</ol>
+</blockquote>
+
+
+</div>
+<div class="clear"></div>
+
+            </div>
+            <div class="postDesc">posted @ 
+<span id="post-date" data-last-update-days="0" data-date-updated="2026-11-28 14:28">2026-11-28 14:28</span>&nbsp;
+<a href="https://www.cnblogs.com/taotaoi">yuyuyui</a>&nbsp;
+阅读(<span id="post_view_count">47</span>)&nbsp;
+评论(<span id="post_comment_count">0</span>)&nbsp;
+&nbsp;
+<a href="javascript:void(0)" onclick="AddToWz(23692874);return false;">收藏</a>&nbsp;
+<a href="https://report.cnblogs.com?targetLink=https%3A%2F%2Fwww.cnblogs.com%2Ftaotaoi%2Fp%2F23692874&amp;targetId=23692874&amp;targetType=0" target="_blank">举报</a>
+</div>
+        
